@@ -7,6 +7,47 @@ use tokio::sync::mpsc;
 
 use super::*;
 
+#[test]
+fn screenshot_requests_use_a_shorter_inner_deadline() {
+    let timeout = request_timeout(
+        "browser.exec",
+        &json!({ "actions": [{ "action": "screenshot" }] }),
+    );
+    assert_eq!(timeout, SCREENSHOT_REVERSE_TIMEOUT);
+    assert!(timeout < DEFAULT_REVERSE_TIMEOUT);
+
+    assert_eq!(
+        request_timeout(
+            "browser.exec",
+            &json!({
+                "actions": [
+                    { "action": "listTabs" },
+                    { "action": "screenshot" }
+                ]
+            }),
+        ),
+        SCREENSHOT_REVERSE_TIMEOUT,
+    );
+}
+
+#[test]
+fn unrelated_reverse_requests_keep_the_default_deadline() {
+    assert_eq!(
+        request_timeout(
+            "browser.exec",
+            &json!({ "actions": [{ "action": "listTabs" }] }),
+        ),
+        DEFAULT_REVERSE_TIMEOUT,
+    );
+    assert_eq!(
+        request_timeout(
+            "host.openExternal",
+            &json!({ "actions": [{ "action": "screenshot" }] }),
+        ),
+        DEFAULT_REVERSE_TIMEOUT,
+    );
+}
+
 #[tokio::test]
 async fn request_round_trips_through_a_mock_client() {
     let (out_tx, mut out_rx) = mpsc::channel::<String>(8);

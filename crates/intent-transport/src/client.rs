@@ -77,16 +77,24 @@ pub(crate) fn server_json(
     os: &str,
     arch: &str,
     version: &str,
+    build_commit: Option<&str>,
     is_local: bool,
 ) -> Value {
-    json!({
+    let mut server = json!({
         "locality": if is_local { "local" } else { "remote" },
         "hasDisplay": has_display,
         "osArch": format!("{os}/{arch}"),
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "liveState": true },
-    })
+    });
+    if let Some(build_commit) = build_commit {
+        server
+            .as_object_mut()
+            .expect("server_json literal is an object")
+            .insert("buildCommit".into(), build_commit.into());
+    }
+    server
 }
 
 /// Handle a classified `client.hello`: resolve (or mint) the `clientId`, persist
@@ -122,6 +130,7 @@ pub(crate) async fn handle(
         std::env::consts::OS,
         std::env::consts::ARCH,
         env!("CARGO_PKG_VERSION"),
+        crate::BUILD_COMMIT,
         is_local,
     );
     frame(

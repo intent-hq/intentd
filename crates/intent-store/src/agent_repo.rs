@@ -66,6 +66,17 @@ pub(crate) type AgentUsageRow = (
     Vec<serde_json::Value>,
 );
 
+/// Indexed aggregate counts for delegated children of one parent agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChildAgentCounts {
+    /// Non-terminal children with a live runtime turn (`is_active = 1`).
+    pub active: u64,
+    /// All non-terminal children, including idle and background-waiting agents.
+    pub unsettled: u64,
+    /// Children whose persisted status is pending, active, processing, or waiting.
+    pub running: u64,
+}
+
 /// SQL scalar expression projecting an `agent_message` row's usage object into
 /// the `{"usage": {...}}` shape the tally's per-message fallback consumes.
 /// Mirrors intent-services' `extract_message_usage` precedence: top-level
@@ -3082,33 +3093,25 @@ impl Store {
         row.as_ref().map(map_message_row).transpose()
     }
 
-    /// Number of RUNNING delegated children of `parent_agent_id`: sessions
-    /// carrying this `parent_agent_id` whose status is genuinely in-flight —
-    /// `pending`/`active`/`Processing`/`Waiting`, the same in-flight set as
-    /// the archive guardrail (`is_running_or_queued`); the startup heal
-    /// sweep's `is_stale_in_flight_status` covers the non-queued subset.
-    /// Idle children (`Idle` / `idle`) do NOT count: an idle-but-restorable
-    /// delegate is unsettled lifecycle state, not active work, and counting
-    /// it made `runningSubAgents` stick forever (intent-hq/monorepo#3384).
-    /// Persisted-status-only aggregate: a child sitting `Idle` with
-    /// queued-but-undelivered messages, or a fresh delegate in the window
-    /// before its first turn flips it `Active`, reports as not running — the
-    /// runtime `is_responding` signal the archive guardrail adds on top is
-    /// invisible at the store level, and briefly undercounting is the right
-    /// trade for a field named "running" (do not widen this back toward
-    /// unsettled-counting). An
-    /// allowlist (`IN`), not a terminal-status blocklist, so a future status
-    /// variant defaults to "not running". Deliberately UNSCOPED by
-    /// workspace — a Chief parent can delegate into another workspace
-    /// (`agent.delegate` cross-workspace), and `parent_agent_id` is globally
-    /// unique. One aggregate statement over `idx_agent_parent`, so cost is
-    /// O(this agent's children), never O(workspace sessions). Backs the
-    /// `runningSubAgents` snapshot field.
+    /// Count active, unsettled, and legacy-running delegated children.
+    /// Deliberately UNSCOPED by workspace — a Chief parent can delegate into
+    /// another workspace (`agent.delegate` cross-workspace), and
+    /// `parent_agent_id` is globally unique. One aggregate statement forced
+    /// through `idx_agent_parent`, so cost is O(this agent's children), never
+    /// O(workspace sessions).
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn count_running_child_agents(&self, parent_agent_id: &AgentId) -> Result<u64> {
+    pub async fn count_child_agents(&self, parent_agent_id: &AgentId) -> Result<ChildAgentCounts> {
+        let terminal = [
+            AgentStatus::Completed,
+            AgentStatus::Error,
+            AgentStatus::Deleted,
+        ]
+        .iter()
+        .map(enum_to_db)
+        .collect::<Result<Vec<_>>>()?;
         let running = [
             AgentStatus::Pending,
             AgentStatus::Active,
@@ -3118,20 +3121,44 @@ impl Store {
         .iter()
         .map(enum_to_db)
         .collect::<Result<Vec<_>>>()?;
-        let n: i64 = sqlx::query(
-            "SELECT COUNT(*) AS n FROM agent_session \
-             WHERE parent_agent_id = ? AND status IN (?, ?, ?, ?)",
+        let row = sqlx::query(
+            "SELECT \
+               COALESCE(SUM(CASE WHEN status NOT IN (?1, ?2, ?3) AND is_active = 1 \
+                                 THEN 1 ELSE 0 END), 0) AS active, \
+               COALESCE(SUM(CASE WHEN status NOT IN (?1, ?2, ?3) \
+                                 THEN 1 ELSE 0 END), 0) AS unsettled, \
+               COALESCE(SUM(CASE WHEN status IN (?4, ?5, ?6, ?7) \
+                                 THEN 1 ELSE 0 END), 0) AS running \
+             FROM agent_session INDEXED BY idx_agent_parent \
+             WHERE parent_agent_id = ?8",
         )
-        .bind(&parent_agent_id.0)
+        .bind(&terminal[0])
+        .bind(&terminal[1])
+        .bind(&terminal[2])
         .bind(&running[0])
         .bind(&running[1])
         .bind(&running[2])
         .bind(&running[3])
+        .bind(&parent_agent_id.0)
         .fetch_one(self.read_pool())
         .await
-        .map_err(|e| Error::Internal(format!("count running child agents failed: {e}")))?
-        .get::<i64, _>("n");
-        Ok(n.cast_unsigned())
+        .map_err(|e| Error::Internal(format!("count child agents failed: {e}")))?;
+        Ok(ChildAgentCounts {
+            active: row.get::<i64, _>("active").cast_unsigned(),
+            unsettled: row.get::<i64, _>("unsettled").cast_unsigned(),
+            running: row.get::<i64, _>("running").cast_unsigned(),
+        })
+    }
+
+    /// Compatibility helper for callers that only need the legacy unsettled
+    /// count. New snapshot code uses [`Store::count_child_agents`] so both
+    /// counts come from one indexed aggregate statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_unsettled_child_agents(&self, parent_agent_id: &AgentId) -> Result<u64> {
+        Ok(self.count_child_agents(parent_agent_id).await?.unsettled)
     }
 
     /// Total number of messages logged for an agent (`agent.getConversation`
@@ -9601,6 +9628,87 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
         }
+    }
+
+    #[tokio::test]
+    async fn count_child_agents_distinguishes_active_from_unsettled() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-child-agent-counts");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-parent".to_string());
+        let other_ws = WorkspaceId("ws-child-remote".to_string());
+        insert_test_workspace(&store, &ws).await;
+        insert_test_workspace(&store, &other_ws).await;
+
+        let parent = AgentId("agent-parent".to_string());
+        let children = [
+            ("active", AgentStatus::Active, true, &ws),
+            (
+                "processing-remote",
+                AgentStatus::Processing,
+                true,
+                &other_ws,
+            ),
+            ("idle", AgentStatus::RuntimeIdle, false, &ws),
+            ("hook-waiting", AgentStatus::RuntimeIdle, false, &ws),
+            ("pending", AgentStatus::Pending, false, &ws),
+            ("inactive-active-status", AgentStatus::Active, false, &ws),
+        ];
+        for (suffix, status, is_active, workspace_id) in children {
+            let id = AgentId(format!("agent-child-{suffix}"));
+            let mut session = baseline_test_session(&id, workspace_id, &ts, Some("acp-live"));
+            session.parent_agent_id = Some(parent.clone());
+            session.status = status;
+            session.is_active = is_active;
+            store
+                .insert_agent_session(&session)
+                .await
+                .expect("insert child");
+        }
+
+        for status in [
+            AgentStatus::Completed,
+            AgentStatus::Error,
+            AgentStatus::Deleted,
+        ] {
+            let id = AgentId(format!("agent-terminal-{status:?}"));
+            let mut session = baseline_test_session(&id, &ws, &ts, Some("acp-live"));
+            session.parent_agent_id = Some(parent.clone());
+            session.status = status;
+            session.is_active = true;
+            store
+                .insert_agent_session(&session)
+                .await
+                .expect("insert terminal child");
+        }
+
+        let mut unrelated = baseline_test_session(
+            &AgentId("agent-unrelated".to_string()),
+            &ws,
+            &ts,
+            Some("acp-live"),
+        );
+        unrelated.parent_agent_id = Some(AgentId("agent-other-parent".to_string()));
+        unrelated.status = AgentStatus::Active;
+        unrelated.is_active = true;
+        store
+            .insert_agent_session(&unrelated)
+            .await
+            .expect("insert unrelated child");
+
+        let counts = store.count_child_agents(&parent).await.expect("counts");
+        assert_eq!(counts.active, 2);
+        assert_eq!(counts.unsettled, 6);
+        assert_eq!(counts.running, 4);
+        assert_eq!(
+            store
+                .count_unsettled_child_agents(&parent)
+                .await
+                .expect("legacy count"),
+            counts.unsettled
+        );
     }
 
     /// Insert a minimal workspace row so agent-session FKs resolve.

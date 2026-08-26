@@ -50,6 +50,9 @@ pub struct SystemStatus {
     pub max_agents: usize,
     /// The daemon crate version (`CARGO_PKG_VERSION`).
     pub version: String,
+    /// Source commit embedded at build time. `None` when the build environment
+    /// cannot identify a commit (for example, a source archive without Git metadata).
+    pub build_commit: Option<String>,
     /// Uptime in seconds since daemon start.
     pub uptime_seconds: u64,
     /// Non-loopback IPv4 addresses the host is reachable on (same source as
@@ -272,6 +275,9 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         },
     });
     let obj = v.as_object_mut().expect("status_json literal is an object");
+    if let Some(build_commit) = &status.build_commit {
+        obj.insert("buildCommit".into(), build_commit.clone().into());
+    }
     if let Some(budget) = status.agent_memory_budget_bytes {
         obj.insert("agentMemoryBudgetBytes".into(), budget.into());
     }

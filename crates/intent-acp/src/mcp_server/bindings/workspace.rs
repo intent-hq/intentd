@@ -30,6 +30,8 @@ pub(crate) const PRELUDE: &str = r"
         setAgentName: (name) => host({ method: 'workspace.setAgentName', args: { name } }),
         archive: () => host({ method: 'workspace.archive' }),
         unarchive: () => host({ method: 'workspace.unarchive' }),
+        proposeSibling: (params) =>
+            host({ method: 'workspace.proposeSibling', args: params || {} }),
         context: () => host({ method: 'workspace.context' }),
         timeline: (limit, type) =>
             host({ method: 'workspace.timeline', args: { limit, type } }),
@@ -39,6 +41,16 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'workspace.emitNotification', args: { topic, message, metadata } }),
     };
 ";
+
+const PROPOSE_SIBLING_PRELUDE: &str = "        proposeSibling: (params) =>\n            host({ method: 'workspace.proposeSibling', args: params || {} }),\n";
+
+pub(crate) fn prelude_for(is_sub_agent: bool) -> String {
+    if is_sub_agent {
+        PRELUDE.replacen(PROPOSE_SIBLING_PRELUDE, "", 1)
+    } else {
+        PRELUDE.to_string()
+    }
+}
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -56,6 +68,7 @@ pub(crate) async fn dispatch(
         "setAgentName" => set_agent_name(api, caller_agent_id, args).await,
         "archive" => archive(api, ws, caller_agent_id).await,
         "unarchive" => unarchive(api, ws).await,
+        "proposeSibling" => propose_sibling(api, ws, args).await,
         "context" => {
             Err("ws.workspace.context is not yet available in this daemon port".to_string())
         }
@@ -70,6 +83,180 @@ pub(crate) async fn dispatch(
         ),
         other => Err(format!("host: unknown method `workspace.{other}`")),
     }
+}
+
+const SIBLING_PROPOSAL_ALLOWED_KEYS: &[&str] = &["title", "initialPrompt", "specialist", "baseRef"];
+
+fn strict_non_empty_string(
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String, String> {
+    match args.get(key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        Some(_) => Err(format!("{key} must be a non-empty string")),
+        None => Err(format!("{key} is required and must be a non-empty string")),
+    }
+}
+
+fn strict_optional_string(
+    args: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Ok(Some(value.trim().to_string()))
+        }
+        Some(_) => Err(format!("{key} must be a non-empty string when provided")),
+    }
+}
+
+fn new_sibling_idempotency_key() -> String {
+    format!("sibling-workspace-{}", uuid::Uuid::new_v4())
+}
+
+async fn propose_sibling(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let params = args
+        .as_object()
+        .ok_or_else(|| "proposeSibling requires one options object".to_string())?;
+    if let Some(key) = params
+        .keys()
+        .find(|key| !SIBLING_PROPOSAL_ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "unknown proposeSibling field `{key}`; allowed fields are title, initialPrompt, specialist, baseRef"
+        ));
+    }
+    let title = strict_non_empty_string(params, "title")?;
+    let initial_prompt = strict_non_empty_string(params, "initialPrompt")?;
+    let specialist = strict_optional_string(params, "specialist")?;
+    let base_ref = strict_optional_string(params, "baseRef")?;
+
+    let workspace = api
+        .get_workspace(workspace_id.clone())
+        .await
+        .map_err(map_err)?;
+    let repository_path = workspace
+        .repository_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .filter(|path| std::path::Path::new(path).is_dir())
+        .ok_or_else(|| {
+            "The current workspace has no usable repository; a sibling workspace cannot be proposed"
+                .to_string()
+        })?
+        .to_string();
+
+    let repo_path = repository_path.clone();
+    let default_branch = tokio::task::spawn_blocking(move || {
+        intent_git::branches::repo_default_branch(std::path::Path::new(&repo_path))
+    })
+    .await
+    .map_err(|error| format!("Could not inspect the current workspace repository: {error}"))?
+    .map_err(|_| {
+        "The current workspace has no usable Git repository; a sibling workspace cannot be proposed"
+            .to_string()
+    })?;
+    let resolved_base_ref = base_ref.as_deref().unwrap_or(&default_branch);
+
+    let mut warnings = Vec::new();
+    if let Some(named_ref) = base_ref.as_deref() {
+        let repo_path = repository_path.clone();
+        let canonical = intent_git::refs::canonicalise_base_ref(named_ref);
+        let resolves = tokio::task::spawn_blocking(move || {
+            intent_git::worktree::base_ref_resolves(
+                std::path::Path::new(&repo_path),
+                &canonical,
+                "origin",
+            )
+        })
+        .await
+        .map_err(|error| format!("Could not validate baseRef: {error}"))?
+        .unwrap_or(false);
+        if !resolves {
+            warnings.push(format!(
+                "Base ref '{named_ref}' does not exist in the current repository; applying this proposal will fail until the ref exists"
+            ));
+        }
+    }
+
+    let idempotency_key = new_sibling_idempotency_key();
+    let mut create_params = serde_json::Map::new();
+    create_params.insert("title".to_string(), json!(title));
+    create_params.insert("repositoryPath".to_string(), json!(repository_path));
+    if let Some(owner) = workspace.repository_owner.as_deref() {
+        create_params.insert("repositoryOwner".to_string(), json!(owner));
+    }
+    if let Some(name) = workspace.repository_name.as_deref() {
+        create_params.insert("repositoryName".to_string(), json!(name));
+    }
+    create_params.insert("baseRef".to_string(), json!(resolved_base_ref));
+    let mut initial_agent = serde_json::Map::new();
+    initial_agent.insert("name".to_string(), json!("Coordinator"));
+    initial_agent.insert("prompt".to_string(), json!(initial_prompt));
+    initial_agent.insert("agentType".to_string(), json!("workspace"));
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("isInitialAgent".to_string(), json!(true));
+    if let Some(value) = specialist.as_deref() {
+        initial_agent.insert("specialist".to_string(), json!(value));
+        metadata.insert("specialist".to_string(), json!(value));
+    }
+    initial_agent.insert("metadata".to_string(), Value::Object(metadata));
+    create_params.insert("initialAgent".to_string(), Value::Object(initial_agent));
+    create_params.insert("idempotencyKey".to_string(), json!(idempotency_key));
+
+    let github_url = match (
+        workspace.repository_owner.as_deref(),
+        workspace.repository_name.as_deref(),
+    ) {
+        (Some(owner), Some(name)) => Some(format!("https://github.com/{owner}/{name}")),
+        _ => None,
+    };
+    let mut workspace_create = serde_json::Map::new();
+    workspace_create.insert("mode".to_string(), json!("sibling"));
+    workspace_create.insert("title".to_string(), json!(title));
+    workspace_create.insert("initialPrompt".to_string(), json!(initial_prompt));
+    workspace_create.insert("repoPath".to_string(), json!(repository_path));
+    workspace_create.insert("repoType".to_string(), json!("local"));
+    workspace_create.insert("branch".to_string(), json!(resolved_base_ref));
+    workspace_create.insert("isNewRepo".to_string(), json!(false));
+    if let Some(url) = github_url {
+        workspace_create.insert("githubUrl".to_string(), json!(url));
+    }
+    if let Some(value) = specialist.as_deref() {
+        workspace_create.insert("specialist".to_string(), json!(value));
+    }
+
+    let mut preview = serde_json::Map::new();
+    preview.insert(
+        "title".to_string(),
+        json!(format!("Create workspace: {title}")),
+    );
+    preview.insert(
+        "summary".to_string(),
+        json!("Review this follow-up workspace before creating it."),
+    );
+    preview.insert(
+        "workspaceCreate".to_string(),
+        Value::Object(workspace_create),
+    );
+    if !warnings.is_empty() {
+        preview.insert("warnings".to_string(), json!(warnings));
+    }
+    let proposal = json!({
+        "kind": "workspace-create",
+        "payload": {
+            "operation": "workspace.create",
+            "params": create_params,
+        },
+        "preview": preview,
+    });
+    super::app::workspaces::proposal_result(&proposal)
 }
 
 async fn info(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {

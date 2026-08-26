@@ -26,10 +26,11 @@ use intent_core::{ActorType, Event, EventActor, SessionStats};
 use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{
+    assignment_fence, assignment_repository_path, canonical_assignment_scope,
     ensure_effort_supported_by_model, fetch_auggie_models, fetch_auggie_models_rich,
     fetch_session_stats, finalize_model_rows, last_response_and_digest_from_blocks,
     live_response_and_digest_from_blocks, parse_model_list_json, parse_model_list_output,
-    parse_session_stats_output, resolve_auggie_bin_with,
+    parse_session_stats_output, resolve_auggie_bin_with, scope_overlaps_path,
 };
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
@@ -864,10 +865,10 @@ async fn idle_with_editing_only_queue_delivers_and_retires_watch() {
     );
 }
 
-/// A `report_delivered` watch survives an interim idle and retires (with the
-/// idle wake still suppressed) at the real completion after the queue drains.
+/// A progress-report watch survives an interim idle, then delivers and retires
+/// at the real completion after the queue drains.
 #[tokio::test]
-async fn report_delivered_watch_survives_interim_idle_and_retires_at_completion() {
+async fn progress_report_watch_survives_interim_idle_and_fires_at_completion() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let resp = svc
@@ -889,7 +890,7 @@ async fn report_delivered_watch_survives_interim_idle_and_retires_at_completion(
         .expect("report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
 
-    // Interim idle: a ready-to-send entry keeps the reported-on watch armed.
+    // Interim idle: a ready-to-send entry keeps the progress watch armed.
     let (queued, _) =
         svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
     svc.handle_completion_event(&completion_event(
@@ -902,11 +903,11 @@ async fn report_delivered_watch_survives_interim_idle_and_retires_at_completion(
     assert_eq!(
         svc.find_watches_for_child(&child).len(),
         1,
-        "report_delivered watch survives the interim idle"
+        "progress watch survives the interim idle"
     );
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
 
-    // Real completion after the drain: idle wake still suppressed, watch retired.
+    // Real completion after the drain: terminal wake delivers and retires.
     svc.take_queued_message(&child, &queued.id)
         .expect("drain queue");
     svc.handle_completion_event(&completion_event(
@@ -918,8 +919,8 @@ async fn report_delivered_watch_survives_interim_idle_and_retires_at_completion(
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 1,
-        "idle wake stays suppressed after reportToParent"
+        baseline + 2,
+        "terminal idle wake follows reportToParent progress"
     );
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
@@ -2242,9 +2243,9 @@ async fn fired_completion_watch_does_not_rehydrate() {
 
 /// Regression (intent-hq/monorepo#2842, restart replay): restart recovery
 /// must not re-deliver an already-delivered terminal completion. A child that
-/// reported (immediate parent wake) and completed retires its watch; when the
-/// parent re-arms a watch on the settled child and the daemon restarts, the
-/// boot reconciliation synthesizes the child's HISTORICAL completion — which
+/// reported (immediate progress wake) and completed (terminal wake) retires its
+/// watch; when the parent re-arms a watch on the settled child and the daemon
+/// restarts, the boot reconciliation synthesizes the child's HISTORICAL completion — which
 /// must NOT wake the parent again (the re-armed watch stays armed for a
 /// FUTURE completion), across any number of restarts.
 #[tokio::test]
@@ -2270,13 +2271,12 @@ async fn restart_reconcile_skips_already_delivered_completion() {
             .expect("delegate");
         let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
         let baseline = parent_message_count(&svc, &parent).await;
-        // Immediate report-time wake (marks the delegate watch
-        // report_delivered).
+        // Immediate progress wake leaves the delegate watch armed.
         svc.agent_report_to_parent_op(ws.clone(), json!("shipped"), Some(child.clone()))
             .await
             .expect("report");
         assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
-        // Real completion: the report_delivered watch retires silently.
+        // Real completion delivers the terminal wake and retires the watch.
         svc.handle_completion_event(&completion_event(
             &ws,
             AGENT_IDLE,
@@ -2284,7 +2284,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
             json!({ "agentId": child.0 }),
         ))
         .await;
-        assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+        assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
         assert!(svc.find_watches_for_child(&child).is_empty());
         wait_for_persisted_watches(&svc, 0).await;
         // The parent re-arms a fresh watch on the settled child.
@@ -2328,7 +2328,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
             .expect("heal watches");
         assert_eq!(
             parent_message_count(&restarted, &parent).await,
-            baseline + 1,
+            baseline + 2,
             "restart {restart}: no duplicate completion wake"
         );
         assert_eq!(
@@ -2369,7 +2369,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
         json!({ "agentId": child.0 }),
     ))
     .await;
-    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
     assert!(svc.find_watches_for_child(&child).is_empty());
 
     // Park the child in its terminal state (report retained), then re-watch:
@@ -2389,7 +2389,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
         .expect("re-watch");
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 1,
+        baseline + 2,
         "re-arm must not fire on the historical completion"
     );
     assert_eq!(
@@ -2420,7 +2420,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 2,
+        baseline + 3,
         "future completion delivers exactly one wake"
     );
     assert!(
@@ -2438,7 +2438,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
         .expect("re-watch after delivery-path wake");
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 2,
+        baseline + 3,
         "delivery-path marker suppresses the replayed second completion"
     );
     assert_eq!(
@@ -2471,14 +2471,14 @@ async fn rearmed_watch_dedups_empty_report_completion() {
         .expect("delegate");
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let baseline = parent_message_count(&svc, &parent).await;
-    // Empty report: still persists the report + timestamp and delivers the
-    // immediate report-time wake (marks the delegate watch report_delivered).
+    // Empty report still persists the report + timestamp and delivers the
+    // immediate progress wake without consuming the completion watch.
     svc.agent_report_to_parent_op(ws.clone(), json!(""), Some(child.clone()))
         .await
         .expect("empty report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
-    // Real completion: the report_delivered watch retires silently and the
-    // retirement branch records the marker (keyed on the session timestamp).
+    // Real completion delivers the terminal wake, retires the watch, and records
+    // the marker keyed on the session timestamp.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -2486,7 +2486,7 @@ async fn rearmed_watch_dedups_empty_report_completion() {
         json!({ "agentId": child.0 }),
     ))
     .await;
-    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
     assert!(svc.find_watches_for_child(&child).is_empty());
 
     // Park the child terminal (empty report + timestamp retained), re-watch:
@@ -2507,7 +2507,7 @@ async fn rearmed_watch_dedups_empty_report_completion() {
         .expect("re-watch");
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 1,
+        baseline + 2,
         "re-arm must not fire on the historical empty-report completion"
     );
     assert_eq!(
@@ -2670,15 +2670,10 @@ async fn stale_reported_idle_does_not_suppress_newer_completion() {
     );
 }
 
-/// Regression (intent-hq/monorepo#2889): the immediate ungrouped
-/// reportToParent wake records the report cycle's identity, so a mid-cycle
-/// watch re-arm (which clears `report_delivered`, monorepo#2532 fresh
-/// interest) must NOT let the same settlement's completion wake re-deliver
-/// the identical report body — the parent already heard it at report time.
-/// The suppressed watch stays armed, and a FUTURE report cycle (new
-/// `completion_report_timestamp`) still delivers exactly once.
+/// Re-arming after a progress report adopts the existing watch. The same
+/// cycle's terminal completion still delivers once and retires it.
 #[tokio::test]
-async fn report_wake_then_rearm_suppresses_same_cycle_completion_wake() {
+async fn report_wake_then_rearm_still_delivers_terminal_completion() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let resp = svc
@@ -2701,9 +2696,7 @@ async fn report_wake_then_rearm_suppresses_same_cycle_completion_wake() {
         .expect("report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
 
-    // Mid-cycle re-arm: adoption clears report_delivered (fresh interest in
-    // the NEXT completion — monorepo#2532 Gap A), the exact live hole that
-    // let the settlement re-embed the already-delivered report.
+    // Mid-cycle re-arm adopts the terminal-ready watch without duplicating it.
     svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
         .await
         .expect("re-arm");
@@ -2711,12 +2704,10 @@ async fn report_wake_then_rearm_suppresses_same_cycle_completion_wake() {
     assert_eq!(watches.len(), 1, "adopted, not duplicated");
     assert!(
         !watches[0].report_delivered,
-        "re-arm reset report_delivered"
+        "adopted watch remains terminal-ready"
     );
 
-    // Same-cycle settlement: the idle carries the just-delivered report —
-    // the report-time marker must suppress the duplicate completion wake and
-    // leave the re-armed watch waiting for a future completion.
+    // Same-cycle settlement owns a distinct terminal wake.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -2726,51 +2717,19 @@ async fn report_wake_then_rearm_suppresses_same_cycle_completion_wake() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 1,
-        "same-cycle completion wake must not repeat the delivered report"
-    );
-    assert_eq!(
-        svc.find_watches_for_child(&child).len(),
-        1,
-        "suppressed watch stays armed for a future completion"
-    );
-
-    // A FUTURE report cycle (new timestamp) delivers normally, exactly once.
-    let mut s = svc
-        .store()
-        .get_agent_session(&child)
-        .await
-        .expect("child session");
-    s.completion_report = Some("second".into());
-    s.completion_report_timestamp = Some(now_iso());
-    svc.store()
-        .update_agent_session(&ws, &s)
-        .await
-        .expect("re-report");
-    svc.handle_completion_event(&completion_event(
-        &ws,
-        AGENT_IDLE,
-        &child,
-        json!({ "agentId": child.0, "completionReport": "second" }),
-    ))
-    .await;
-    assert_eq!(
-        parent_message_count(&svc, &parent).await,
         baseline + 2,
-        "a distinct NEW report cycle still delivers"
+        "terminal completion follows the progress report"
     );
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
-        "watch retired at the future completion"
+        "terminal completion retires the watch"
     );
 }
 
-/// Regression (intent-hq/monorepo#2889, incident path): the SUB-1 sender
-/// auto-subscribe re-arms the reported-on watch when the parent messages the
-/// child mid-cycle — the same-cycle settlement must still not re-deliver the
-/// report body the parent already received at report time.
+/// Sender auto-subscribe adopts the progress-report watch and preserves its
+/// terminal completion wake.
 #[tokio::test]
-async fn sender_auto_subscribe_rearm_suppresses_same_cycle_completion_wake() {
+async fn sender_auto_subscribe_after_report_still_gets_terminal_wake() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let resp = svc
@@ -2792,8 +2751,8 @@ async fn sender_auto_subscribe_rearm_suppresses_same_cycle_completion_wake() {
         .expect("report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
 
-    // The parent messages the child mid-cycle: the sender auto-subscribe
-    // reuses the watch and clears report_delivered (monorepo#2532).
+    // The parent messages the child mid-cycle: sender auto-subscribe reuses
+    // the watch, which remained terminal-ready after the progress report.
     let resp = svc
         .agent_watch_completion_for_sender_op(ws.clone(), parent.clone(), child.clone())
         .await
@@ -2801,9 +2760,12 @@ async fn sender_auto_subscribe_rearm_suppresses_same_cycle_completion_wake() {
     assert_eq!(resp["ok"], json!(true));
     let watches = svc.find_watches_for_child(&child);
     assert_eq!(watches.len(), 1, "reused, not duplicated");
-    assert!(!watches[0].report_delivered, "reuse reset report_delivered");
+    assert!(
+        !watches[0].report_delivered,
+        "reused watch remains terminal-ready"
+    );
 
-    // Same-cycle settlement with the identical report: suppressed.
+    // Same-cycle terminal settlement is a distinct wake.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -2813,24 +2775,20 @@ async fn sender_auto_subscribe_rearm_suppresses_same_cycle_completion_wake() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 1,
-        "same-cycle completion wake must not repeat the delivered report"
+        baseline + 2,
+        "terminal completion follows progress"
     );
     assert_eq!(
         svc.find_watches_for_child(&child).len(),
-        1,
-        "suppressed watch stays armed for a future completion"
+        0,
+        "terminal completion retires the adopted watch"
     );
 }
 
-/// Regression (intent-hq/monorepo#2889, PR #1326 review): NO watch exists at
-/// report time — the report wake still delivers unconditionally and must
-/// still record the cycle's identity, so a watch armed only AFTER the report
-/// (fresh interest, `report_delivered` never set) cannot re-deliver the same
-/// cycle's report at settlement. The armed watch stays waiting for a future
-/// completion, which still delivers exactly once.
+/// A watch armed after an unconditional progress report still receives the
+/// same cycle's terminal completion.
 #[tokio::test]
-async fn report_without_watch_then_arm_suppresses_same_cycle_completion_wake() {
+async fn report_without_watch_then_arm_receives_terminal_completion() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     // A parented child with NO completion watch (agent_create_op arms none —
@@ -2855,16 +2813,13 @@ async fn report_without_watch_then_arm_suppresses_same_cycle_completion_wake() {
     );
     let baseline = parent_message_count(&svc, &parent).await;
 
-    // Report with no watch: the wake delivers unconditionally and the marker
-    // records the cycle even though nothing was flipped.
+    // Report with no watch still delivers unconditionally.
     svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(child.clone()))
         .await
         .expect("report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
 
-    // Watch armed only AFTER the report — fresh interest, so the
-    // `report_delivered` flag was never set on it; only the report-time
-    // marker stands between the parent and the duplicate.
+    // Watch armed only AFTER the report is fresh terminal interest.
     svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
         .await
         .expect("arm");
@@ -2875,7 +2830,7 @@ async fn report_without_watch_then_arm_suppresses_same_cycle_completion_wake() {
         "post-report watch starts with report_delivered unset"
     );
 
-    // Same-cycle settlement with the identical report: suppressed.
+    // Same-cycle terminal settlement wakes the newly armed watch.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -2885,42 +2840,12 @@ async fn report_without_watch_then_arm_suppresses_same_cycle_completion_wake() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 1,
-        "same-cycle completion wake must not repeat the delivered report"
-    );
-    assert_eq!(
-        svc.find_watches_for_child(&child).len(),
-        1,
-        "suppressed watch stays armed for a future completion"
-    );
-
-    // A FUTURE report cycle (new timestamp) delivers normally, exactly once.
-    let mut s = svc
-        .store()
-        .get_agent_session(&child)
-        .await
-        .expect("child session");
-    s.completion_report = Some("second".into());
-    s.completion_report_timestamp = Some(now_iso());
-    svc.store()
-        .update_agent_session(&ws, &s)
-        .await
-        .expect("re-report");
-    svc.handle_completion_event(&completion_event(
-        &ws,
-        AGENT_IDLE,
-        &child,
-        json!({ "agentId": child.0, "completionReport": "second" }),
-    ))
-    .await;
-    assert_eq!(
-        parent_message_count(&svc, &parent).await,
         baseline + 2,
-        "a distinct NEW report cycle still delivers"
+        "terminal completion follows the unconditional progress report"
     );
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
-        "watch retired at the future completion"
+        "terminal completion retires the post-report watch"
     );
 }
 
@@ -3010,13 +2935,11 @@ async fn unreported_completion_wake_delivers_with_summary() {
     assert!(svc.find_watches_for_child(&child).is_empty());
 }
 
-/// Regression (intent-hq/monorepo#2889, restart edge): the report wake
-/// delivered pre-restart and the watch was re-armed (`report_delivered`
-/// cleared) BEFORE the settlement — the boot reconcile replaying the
-/// child's reported completion post-restart must not re-embed the report;
-/// the re-armed watch stays armed for a future completion.
+/// If the daemon restarts after a progress report but before terminal idle,
+/// startup reconciliation delivers the distinct terminal wake once and
+/// retires the persisted watch. A second restart does not duplicate it.
 #[tokio::test]
-async fn restart_reconcile_skips_completion_after_report_wake_and_rearm() {
+async fn restart_reconcile_delivers_terminal_after_progress_once() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
     let registry = test_registry_with_default_provider(&tmp);
@@ -3038,9 +2961,7 @@ async fn restart_reconcile_skips_completion_after_report_wake_and_rearm() {
             .expect("delegate");
         let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
         let baseline = parent_message_count(&svc, &parent).await;
-        // Report-time wake delivered (marker recorded), then a mid-cycle
-        // re-arm clears report_delivered — and the daemon dies BEFORE the
-        // child's settlement idle.
+        // Progress wake delivered; daemon dies before the terminal idle.
         svc.agent_report_to_parent_op(ws.clone(), json!("shipped"), Some(child.clone()))
             .await
             .expect("report");
@@ -3083,9 +3004,8 @@ async fn restart_reconcile_skips_completion_after_report_wake_and_rearm() {
             .expect("mark child");
     }
 
-    // Two consecutive restarts: the reconcile replays the child's reported
-    // completion — the report-time marker must suppress it on both, and the
-    // re-armed watch stays armed.
+    // First restart delivers terminal completion; second restart proves the
+    // stable durable delivery and atomic watch retirement are idempotent.
     for restart in 1..=2 {
         let store = Store::open(&tmp.path).await.expect("reopen store");
         let restarted = Services::new(store);
@@ -3095,13 +3015,13 @@ async fn restart_reconcile_skips_completion_after_report_wake_and_rearm() {
             .expect("heal watches");
         assert_eq!(
             parent_message_count(&restarted, &parent).await,
-            baseline + 1,
-            "restart {restart}: no duplicate report delivery"
+            baseline + 2,
+            "restart {restart}: exactly progress + terminal wakes"
         );
         assert_eq!(
             restarted.find_watches_for_child(&child).len(),
-            1,
-            "restart {restart}: re-armed watch stays armed"
+            0,
+            "restart {restart}: terminal watch stays retired"
         );
     }
 }
@@ -3802,13 +3722,10 @@ async fn agent_lite_waiting_projection_excludes_report_delivered_watches() {
     assert_eq!(v["waitingForAgentIds"], json!([other.0]));
 }
 
-/// `agent.reportToParent` marks the parent's ungrouped watches
-/// `report_delivered`, which flips the waiting projection — so it must
-/// publish `agent:subscriptions-changed` with the refreshed flags instead of
-/// leaving clients on a stale `isWaitingForOtherAgents: true` snapshot
-/// (monorepo#1649).
+/// A progress report does not change the completion subscription or waiting
+/// projection, so it must not publish a false subscriptions-changed update.
 #[tokio::test]
-async fn report_to_parent_publishes_refreshed_subscriptions_changed() {
+async fn report_to_parent_keeps_waiting_projection_and_subscription_quiet() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let created = svc
@@ -3843,14 +3760,19 @@ async fn report_to_parent_publishes_refreshed_subscriptions_changed() {
         .await
         .expect("report");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after reportToParent")
-        .expect("batch");
-    let last = batch.last().expect("event");
-    assert_eq!(last.data["agentId"], json!(parent.0));
-    assert_eq!(last.data["isWaitingForOtherAgents"], json!(false));
-    assert_eq!(last.data["waitingForAgentIds"], json!([]));
+    assert!(
+        timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .is_err(),
+        "progress report must not publish a subscription-state change"
+    );
+    let snapshot = serde_json::to_value(
+        svc.agent_get_op(parent, None)
+            .await
+            .expect("parent snapshot"),
+    )
+    .unwrap();
+    assert_eq!(snapshot["isWaitingForOtherAgents"], json!(true));
 }
 
 /// STAB-125: `agent.get` surfaces turn-liveness — `turnInFlight` and
@@ -7064,6 +6986,336 @@ async fn report_to_parent_persists_completion_report() {
     assert_eq!(v["metadata"]["completionReportTimestamp"], r["savedAt"]);
 }
 
+#[test]
+fn assignment_scope_normalization_is_canonical_and_rejects_escape() {
+    let a = canonical_assignment_scope(Some(&[
+        " ./crates//intent-core/ ".to_string(),
+        "crates\\intent-core".to_string(),
+        "crates/intent-services".to_string(),
+    ]))
+    .expect("canonical scope");
+    assert_eq!(a, vec!["crates/intent-core", "crates/intent-services"]);
+    assert!(canonical_assignment_scope(Some(&["../outside".to_string()])).is_err());
+    assert!(canonical_assignment_scope(Some(&["/absolute".to_string()])).is_err());
+    assert!(canonical_assignment_scope(Some(&["  ".to_string()])).is_err());
+}
+
+#[test]
+fn assignment_scope_rejects_multiple_git_repositories() {
+    let root = tempfile::tempdir().expect("root repo");
+    git2::Repository::init(root.path()).expect("init root repo");
+    let nested = root.path().join("nested");
+    std::fs::create_dir(&nested).expect("nested dir");
+    git2::Repository::init(&nested).expect("init nested repo");
+
+    let err = assignment_repository_path(
+        root.path(),
+        &["root-file.txt".into(), "nested/child.txt".into()],
+    )
+    .expect_err("cross-repository scope must fail");
+    assert!(err.to_string().contains("multiple Git repositories"));
+    assert_eq!(
+        assignment_repository_path(root.path(), &["nested/a".into(), "nested/b".into()])
+            .expect("one nested repository"),
+        nested.canonicalize().expect("canonical nested")
+    );
+}
+
+#[test]
+fn assignment_scope_equal_to_nested_repository_root_matches_every_path() {
+    let root = tempfile::tempdir().expect("root repo");
+    git2::Repository::init(root.path()).expect("init root repo");
+    let nested = root.path().join("nested");
+    std::fs::create_dir(&nested).expect("nested dir");
+    git2::Repository::init(&nested).expect("init nested repo");
+
+    let assignment_repo = assignment_repository_path(root.path(), &["nested".into()])
+        .expect("nested repository root scope");
+    let workspace_root = root.path().canonicalize().expect("canonical root");
+    let repo_relative = workspace_root
+        .join("nested")
+        .strip_prefix(&assignment_repo)
+        .expect("scope is inside assignment repository")
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(repo_relative.is_empty());
+    assert!(scope_overlaps_path(&repo_relative, "src/lib.rs"));
+}
+
+#[tokio::test]
+async fn delegated_assignment_fence_survives_progress_and_is_projected() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note_id = seed_task(&svc, &ws, "Fenced task").await;
+    let input = delegate_input(&note_id, None);
+    let delegated = svc
+        .agent_delegate_op(ws.clone(), input, Some(parent))
+        .await
+        .expect("delegate");
+    assert_eq!(delegated["taskRevision"].as_str().unwrap().len(), 64);
+    assert_eq!(delegated["scopeHash"].as_str().unwrap().len(), 64);
+    assert!(delegated["expectedHeadSha"].is_null());
+    let child = AgentId::from(delegated["agentId"].as_str().unwrap());
+
+    let got = svc
+        .agent_get_op(child.clone(), None)
+        .await
+        .expect("get child");
+    let got = serde_json::to_value(got).expect("serialize child");
+    assert_eq!(got["metadata"]["taskRevision"], delegated["taskRevision"]);
+    assert_eq!(got["metadata"]["scopeHash"], delegated["scopeHash"]);
+
+    let mut note = svc.store().get_note(&ws, &note_id).await.expect("task");
+    note.content
+        .push_str("\n\n## Progress\nImplemented one step.\n");
+    svc.store().update_note(&note).await.expect("save progress");
+    let report = svc
+        .agent_report_to_parent_op(ws, json!("done"), Some(child))
+        .await
+        .expect("report after progress");
+    assert_eq!(report["ok"], json!(true), "report: {report}");
+    assert!(report.get("quarantined").is_none());
+}
+
+#[tokio::test]
+async fn assignment_head_accepts_later_descendant_commit() {
+    fn commit(repo: &git2::Repository, path: &str, content: &str) -> String {
+        let full_path = repo.workdir().unwrap().join(path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(full_path, content).expect("write file");
+        let mut index = repo.index().expect("index");
+        index
+            .add_path(std::path::Path::new(path))
+            .expect("add path");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature = git2::Signature::now("Test", "test@example.com").expect("signature");
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .and_then(|id| repo.find_commit(id).ok())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            path,
+            &tree,
+            &parent_refs,
+        )
+        .expect("commit")
+        .to_string()
+    }
+
+    let tmp = TempDb::new();
+    let repo_dir = tempfile::tempdir().expect("repo dir");
+    let repo = git2::Repository::init(repo_dir.path()).expect("init repo");
+    let base = commit(&repo, "scoped/base.txt", "base\n");
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let mut workspace = workspace(&ws);
+    workspace.repository_path = Some(repo_dir.path().to_string_lossy().to_string());
+    workspace.skip_worktree = true;
+    store.insert_workspace(&workspace).await.expect("ws");
+    let registry = test_registry_with_default_provider(&tmp);
+    let svc = Services::new(store).with_settings_registry(registry);
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note_id = seed_task(&svc, &ws, "Git fenced task").await;
+    let mut input = delegate_input(&note_id, None);
+    input.scope = Some(vec!["scoped".into()]);
+    let delegated = svc
+        .agent_delegate_op(ws.clone(), input, Some(parent))
+        .await
+        .expect("delegate");
+    assert_eq!(delegated["expectedHeadSha"], json!(base));
+    let child = AgentId::from(delegated["agentId"].as_str().unwrap());
+    let got = svc
+        .agent_get_op(child.clone(), None)
+        .await
+        .expect("get child");
+    let got = serde_json::to_value(got).expect("serialize child");
+    assert_eq!(got["metadata"]["expectedHeadSha"], json!(base));
+
+    commit(&repo, "unrelated.txt", "later\n");
+    let report = svc
+        .agent_report_to_parent_op(ws.clone(), json!("done"), Some(child.clone()))
+        .await
+        .expect("report on descendant head");
+    assert_eq!(report["ok"], json!(true), "report: {report}");
+
+    commit(&repo, "scoped/later.txt", "changed scope\n");
+    let stale = svc
+        .agent_report_to_parent_op(ws, json!("late"), Some(child))
+        .await
+        .expect("scoped change quarantine");
+    assert_eq!(stale["quarantined"], json!(true), "stale: {stale}");
+    assert_eq!(stale["reason"], json!("scope-changed-since-delegation"));
+}
+
+#[tokio::test]
+async fn report_quarantines_changed_task_meaning_without_side_effects() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note_id = seed_task(&svc, &ws, "Original meaning").await;
+    let delegated = svc
+        .agent_delegate_op(ws.clone(), delegate_input(&note_id, None), Some(parent))
+        .await
+        .expect("delegate");
+    let child = AgentId::from(delegated["agentId"].as_str().unwrap());
+
+    let mut note = svc.store().get_note(&ws, &note_id).await.expect("task");
+    note.title = "Changed meaning".to_string();
+    svc.store().update_note(&note).await.expect("change task");
+    let report = svc
+        .agent_report_to_parent_op(ws.clone(), json!("stale"), Some(child.clone()))
+        .await
+        .expect("quarantine result");
+    assert_eq!(report["ok"], json!(false));
+    assert_eq!(report["quarantined"], json!(true));
+    assert_eq!(report["reason"], json!("task-revision-mismatch"));
+
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(session.completion_report.is_none());
+    let task = svc.store().get_note(&ws, &note_id).await.expect("task");
+    assert_eq!(
+        task.metadata.task.expect("task metadata").status,
+        intent_core::TaskStatus::InProgress
+    );
+
+    let attention = svc
+        .agent_request_attention_op(
+            ws,
+            "blocker".into(),
+            "stale blocker".into(),
+            Some(child.clone()),
+        )
+        .await
+        .expect("attention quarantine result");
+    assert_eq!(attention["quarantined"], json!(true));
+    assert_eq!(attention["reason"], json!("task-revision-mismatch"));
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(session.attention_request_kind.is_none());
+}
+
+#[tokio::test]
+async fn legacy_checkbox_delegate_can_report_and_request_attention() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Checklist".into(),
+                content: Some("- [ ] Ship the fix".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create containing note")
+        .note;
+    assert!(note.metadata.task.is_none());
+    let delegated = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                note_id: Some(note.id.clone()),
+                task_text: Some("Ship the fix".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate checkbox task");
+    let child = AgentId::from(delegated["agentId"].as_str().expect("agentId"));
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert_eq!(session.task_note_id.as_ref(), Some(&note.id));
+    assert!(assignment_fence(&session)
+        .expect("scope fence")
+        .task_note_id
+        .is_none());
+
+    let report = svc
+        .agent_report_to_parent_op(ws.clone(), json!("done"), Some(child.clone()))
+        .await
+        .expect("legacy report");
+    assert_eq!(report["ok"], json!(true));
+    assert!(report.get("quarantined").is_none());
+
+    let attention = svc
+        .agent_request_attention_op(
+            ws,
+            "discussion".into(),
+            "need a decision".into(),
+            Some(child.clone()),
+        )
+        .await
+        .expect("legacy attention request");
+    assert_eq!(attention["ok"], json!(true));
+    assert!(attention.get("quarantined").is_none());
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert_eq!(session.completion_report.as_deref(), Some("done"));
+    assert_eq!(
+        session.attention_request_kind.as_deref(),
+        Some("discussion")
+    );
+}
+
+#[tokio::test]
+async fn superseded_assignment_quarantines_report_and_direct_status_update() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note_id = seed_task(&svc, &ws, "Scoped task").await;
+    let mut first_input = delegate_input(&note_id, None);
+    first_input.agent_instructions = Some("first assignment".into());
+    let first = svc
+        .agent_delegate_op(ws.clone(), first_input, Some(parent.clone()))
+        .await
+        .expect("first delegate");
+    let first_child = AgentId::from(first["agentId"].as_str().unwrap());
+
+    let mut second_input = delegate_input(&note_id, Some(true));
+    second_input.agent_instructions = Some("replacement assignment".into());
+    let second = svc
+        .agent_delegate_op(ws.clone(), second_input, Some(parent))
+        .await
+        .expect("replacement delegate");
+    assert_ne!(first["taskRevision"], second["taskRevision"]);
+    assert_eq!(first["scopeHash"], second["scopeHash"]);
+
+    let report = svc
+        .agent_report_to_parent_op(ws.clone(), json!("old scope"), Some(first_child.clone()))
+        .await
+        .expect("quarantine result");
+    assert_eq!(report["quarantined"], json!(true));
+    assert_eq!(report["reason"], json!("task-revision-superseded"));
+
+    let err = WorkspaceApi::task_update_note_status(
+        &svc,
+        ws.clone(),
+        note_id.clone(),
+        "complete".into(),
+        None,
+        Some(first_child),
+    )
+    .await
+    .expect_err("stale status update must be denied");
+    assert!(err.to_string().contains("assignment update quarantined"));
+    let task = svc.store().get_note(&ws, &note_id).await.expect("task");
+    assert_eq!(
+        task.metadata.task.expect("task metadata").status,
+        intent_core::TaskStatus::InProgress
+    );
+}
+
 /// TASK-B: on `agent.reportToParent`, the caller's linked task note
 /// transitions from a non-terminal status (`in_progress`) to
 /// `review_required`, mirroring the reference reportToParent writer.
@@ -7626,7 +7878,7 @@ async fn watch_completion_dedupe() {
 }
 
 #[tokio::test]
-async fn report_to_parent_delivers_immediate_wake_then_idle_suppressed() {
+async fn report_to_parent_progress_keeps_watch_armed_until_terminal_wake() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     // Immediate-mode delegation arms a completion watch on the child.
@@ -7659,9 +7911,8 @@ async fn report_to_parent_delivers_immediate_wake_then_idle_suppressed() {
         "wake text must carry the report at reportToParent time: {text}"
     );
 
-    // Drive the child's `agent:idle` (mirrors the turn worker's
-    // stream-complete branch). The wake is suppressed because the watch is
-    // marked as report_delivered.
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+    // The terminal idle owns a distinct final wake and one-shot retirement.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -7669,20 +7920,77 @@ async fn report_to_parent_delivers_immediate_wake_then_idle_suppressed() {
         json!({ "agentId": child.0, "report": report }),
     ))
     .await;
-    // No second wake fires — idle suppression working.
-    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
-    // The ungrouped watch is retired at the suppressed completion.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
     assert!(svc.find_watches_for_child(&child).is_empty());
 }
 
-/// issue intent-hq/monorepo#2528: the immediate report wake must say
-/// "reported" (a report is not necessarily a completion) and, when it flips
-/// the parent's ungrouped watch to `report_delivered` (disarming its
-/// `agent:idle` delivery), disclose the disarm — retirement NOTE with the
-/// `ws.agent.watch` re-arm pointer in the text (monorepo#2051 parity) plus
-/// `watchStillArmed: false` on the wake metadata (monorepo#2060 parity).
 #[tokio::test]
-async fn report_wake_says_reported_and_discloses_watch_disarm() {
+async fn durable_completion_wake_retry_reuses_transcript_message_id() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let baseline = parent_message_count(&svc, &parent).await;
+    let wake_id = "completion-wake:test-watch".to_string();
+
+    for _ in 0..2 {
+        svc.deliver_parent_wake_durable(
+            &ws,
+            parent.clone(),
+            "terminal wake".into(),
+            Some(json!({ "type": "event_notification" })),
+            wake_id.clone(),
+        )
+        .await
+        .expect("durable wake delivery");
+    }
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), baseline + 1);
+    assert_eq!(session.messages.last().expect("wake").id, wake_id);
+}
+
+#[tokio::test]
+async fn durable_completion_queue_retry_adopts_existing_message_id() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let wake_id = "completion-wake:test-queued".to_string();
+
+    let (first, first_position) = svc.enqueue_message_with_id_and_origin(
+        &parent,
+        Some(wake_id.clone()),
+        "terminal wake".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    );
+    let (retry, retry_position) = svc.enqueue_message_with_id_and_origin(
+        &parent,
+        Some(wake_id.clone()),
+        "terminal wake".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    );
+
+    assert_eq!(first.id, wake_id);
+    assert_eq!(retry.id, first.id);
+    assert_eq!(retry_position, first_position);
+    assert_eq!(svc.queue_snapshot(&parent).len(), 1);
+}
+
+/// A report is a progress wake: it says "reported", omits terminal retirement,
+/// and exposes that the completion watch is still armed.
+#[tokio::test]
+async fn report_wake_says_reported_and_discloses_watch_is_still_armed() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     // Immediate-mode delegation arms a completion watch on the child.
@@ -7718,25 +8026,17 @@ async fn report_wake_says_reported_and_discloses_watch_disarm() {
         !text.contains("completed. Report:"),
         "a report is not a completion: {text}"
     );
-    assert!(
-        text.contains("consumed your one-shot watch"),
-        "wake text must disclose the watch disarm: {text}"
-    );
-    assert!(
-        text.contains(&format!("ws.agent.watch(\\\"{}\\\")", child.0)),
-        "disarm NOTE must carry the re-arm pointer: {text}"
-    );
+    assert!(!text.contains("consumed your one-shot watch"));
     let metadata = msg.metadata.as_ref().expect("wake metadata");
     assert_eq!(
         metadata["watchStillArmed"],
-        json!(false),
-        "report wake that disarmed a watch carries watchStillArmed: false: {metadata}"
+        json!(true),
+        "progress wake keeps the completion watch armed: {metadata}"
     );
 }
 
-/// issue intent-hq/monorepo#2528: when the report flips NO watch (none exists
-/// for the parent, or a repeat report finds it already `report_delivered`),
-/// the wake carries neither the disarm NOTE nor the `watchStillArmed` key.
+/// Without a watch, report metadata omits `watchStillArmed`. Repeated progress
+/// reports on a watched child continue to disclose the armed watch.
 #[tokio::test]
 async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
     let (_t, svc, ws) = setup().await;
@@ -7781,8 +8081,7 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
         "watchStillArmed key must be absent when no watch was flipped: {metadata}"
     );
 
-    // Case 2: a repeat report — the delegate-armed watch was flipped by the
-    // first report, so the second wake must carry no disclosure either.
+    // Case 2: repeated reports leave the delegate-armed watch intact.
     let resp = svc
         .agent_delegate_op(
             ws.clone(),
@@ -7817,10 +8116,7 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
         "repeat report flips no watch, so no disarm NOTE: {text}"
     );
     let metadata = msg.metadata.as_ref().expect("wake metadata");
-    assert!(
-        metadata.get("watchStillArmed").is_none(),
-        "watchStillArmed key must be absent on a repeat report: {metadata}"
-    );
+    assert_eq!(metadata["watchStillArmed"], json!(true));
 }
 
 /// Regression for PR #237: after a child calls reportToParent (which marks the
@@ -11113,10 +11409,8 @@ async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
 /// Report-time wake: a delegated caller's `reportToParent` delivers an
 /// immediate parent wake containing the report. The report is persisted on the
 /// child session (`completion_report`) and the TS-shaped result is returned.
-/// The watch is marked as `report_delivered`, so the child's subsequent
-/// `agent:idle` does NOT deliver a second wake (suppressed), which is asserted
-/// by the sibling `report_to_parent_delivers_immediate_wake_then_idle_suppressed`
-/// test.
+/// When a terminal watch exists, the progress wake leaves it armed so a later
+/// `agent:idle` can deliver the distinct completion wake.
 #[tokio::test]
 async fn report_to_parent_delivers_for_delegated_caller() {
     let (_t, svc, ws) = setup().await;
@@ -15237,13 +15531,10 @@ async fn report_delivered_watch_does_not_strand_agent_waiting_group_member() {
     assert!(svc.find_watches_for_child(&b).is_empty());
 }
 
-/// Regression (issue intent-hq/monorepo#1643), backstop arm: the inline
-/// retirement of a `report_delivered` watch on its target's idle must run the
-/// watch-removal backstop for the watch's holder — otherwise a holder whose
-/// own idle was deferred for another reason (here a queue-interim idle whose
-/// queue then drained out-of-band) never settles its watcher.
+/// A terminal wake to a deferred holder does not synthesize that holder's own
+/// completion. Its later explicit idle settles its watcher exactly once.
 #[tokio::test]
-async fn report_delivered_watch_retirement_runs_watch_removal_backstop() {
+async fn terminal_watch_chain_requires_each_holder_to_settle() {
     let (_t, svc, ws) = setup().await;
     let a = create_agent(&svc, &ws, "A").await;
     let b = create_agent(&svc, &ws, "B").await;
@@ -15251,10 +15542,8 @@ async fn report_delivered_watch_retirement_runs_watch_removal_backstop() {
 
     svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
         .expect("A watches B");
-    let bc = svc
-        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
         .expect("B watches C");
-    assert!(svc.mark_watch_report_delivered(&bc));
 
     // B idles with a ready-to-send entry: queue-interim, so A's watch defers
     // and the interim-skip marker is recorded.
@@ -15270,8 +15559,7 @@ async fn report_delivered_watch_retirement_runs_watch_removal_backstop() {
     svc.take_queued_message(&b, &queued.id)
         .expect("drain queue");
 
-    // C idles: B's report_delivered watch retires with no wake, and the
-    // backstop synthesizes B's real completion.
+    // C idles: B receives its terminal wake, but B has not settled yet.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -15279,26 +15567,25 @@ async fn report_delivered_watch_retirement_runs_watch_removal_backstop() {
         json!({ "agentId": c.0 }),
     ))
     .await;
-    assert_eq!(
-        parent_message_count(&svc, &a).await,
-        1,
-        "retiring B's last outgoing watch settles A's deferred watch"
-    );
+    assert_eq!(parent_message_count(&svc, &a).await, 0);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 1);
     assert!(
         svc.find_watches_for_child(&b).is_empty(),
         "A's watch retires at the backstop completion"
     );
 }
 
-/// Chained inline retirement (issue intent-hq/monorepo#1643): A holds a
-/// `report_delivered` watch on B and B one on C, with A and B both
-/// deferred. C's idle must cascade — retiring B's watch backstops B's
-/// completion, which retires A's watch and backstops A's — so Z, watching A,
-/// settles from a single event. Pins the recursion contract (one marker
-/// consumed per hop, each watch removed before recursing) as bounded and
-/// wake-exactly-once.
+/// A longer terminal-watch chain also advances only through explicit holder
+/// settlement events; each edge wakes exactly once.
 #[tokio::test]
-async fn chained_report_delivered_retirements_cascade_to_the_outermost_watcher() {
+async fn chained_terminal_watches_advance_one_explicit_settlement_at_a_time() {
     let (_t, svc, ws) = setup().await;
     let z = create_agent(&svc, &ws, "Z").await;
     let a = create_agent(&svc, &ws, "A").await;
@@ -15307,14 +15594,10 @@ async fn chained_report_delivered_retirements_cascade_to_the_outermost_watcher()
 
     svc.register_completion_watch(&ws, &ws, z.clone(), "Z".into(), a.clone(), None)
         .expect("Z watches A");
-    let ab = svc
-        .register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
         .expect("A watches B");
-    let bc = svc
-        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
         .expect("B watches C");
-    assert!(svc.mark_watch_report_delivered(&ab));
-    assert!(svc.mark_watch_report_delivered(&bc));
 
     // Defer B, then A, via queue-interim idles; drain both queues so only the
     // watch retirements remain as triggers.
@@ -15344,6 +15627,16 @@ async fn chained_report_delivered_retirements_cascade_to_the_outermost_watcher()
         json!({ "agentId": c.0 }),
     ))
     .await;
+    assert_eq!(parent_message_count(&svc, &z).await, 0);
+    for agent in [&b, &a] {
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            agent,
+            json!({ "agentId": agent.0 }),
+        ))
+        .await;
+    }
 
     assert_eq!(
         parent_message_count(&svc, &z).await,
@@ -16949,14 +17242,10 @@ async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() 
     );
 }
 
-/// monorepo#2532 Gap A: re-arming via `agent.watch` after a reportToParent
-/// wake ADOPTS the parent's existing watch and must reset `report_delivered`
-/// (fresh interest, mirroring the failure-wake dedup clear), persist the
-/// reset, and fire on the child's next genuine completion. "Next" means a
-/// NEW report cycle (monorepo#2889): the reported cycle itself was already
-/// delivered by the report-time wake, so its replay stays suppressed.
+/// Calling `agent.watch` after progress adopts the already-armed watch without
+/// duplicating it. The persisted watch stays terminal-ready.
 #[tokio::test]
-async fn rearm_after_report_resets_report_delivered_and_fires_next_idle() {
+async fn watch_after_progress_adopts_armed_watch_and_fires_terminal_idle() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let resp = svc
@@ -16979,11 +17268,9 @@ async fn rearm_after_report_resets_report_delivered_and_fires_next_idle() {
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
     let watches = svc.find_watches_for_child(&child);
     assert_eq!(watches.len(), 1);
-    assert!(watches[0].report_delivered, "report disarmed the watch");
+    assert!(!watches[0].report_delivered, "progress keeps watch armed");
 
-    // Re-arm: adoption must reset the report-time disarm, in memory AND in
-    // the persisted row (the durable registration wrappers upsert the
-    // adopted watch's refreshed state).
+    // A repeat watch call adopts the existing row in memory and storage.
     svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
         .await
         .expect("re-arm");
@@ -16991,7 +17278,7 @@ async fn rearm_after_report_resets_report_delivered_and_fires_next_idle() {
     assert_eq!(watches.len(), 1, "adopted, not duplicated");
     assert!(
         !watches[0].report_delivered,
-        "adoption resets report_delivered"
+        "adopted watch remains terminal-ready"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -17010,10 +17297,7 @@ async fn rearm_after_report_resets_report_delivered_and_fires_next_idle() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    // The child's next GENUINE completion (a NEW report cycle — the
-    // monorepo#2889 report-time marker suppresses a replay of the reported
-    // cycle itself) fires the re-armed watch (pre-fix it was skipped by the
-    // stale flag and the watch silently retired).
+    // The child's next genuine completion fires the adopted watch.
     let mut s = svc
         .store()
         .get_agent_session(&child)
@@ -17750,12 +18034,9 @@ async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
     );
 }
 
-/// monorepo#2532 (PR #1250 review): the SUB-1 sender auto-subscribe REUSES a
-/// matching ungrouped watch via `find_and_refresh_ungrouped_watch` — after a
-/// reportToParent wake flipped it to `report_delivered`, sending follow-up
-/// work expresses fresh interest, so the reuse must reset `report_delivered`
-/// (in memory AND persisted) and the child's next genuine idle must wake the
-/// parent instead of silently retiring a dead watch.
+/// The SUB-1 sender auto-subscribe reuses the matching ungrouped watch after a
+/// progress report. The report leaves that watch armed, the reuse does not add
+/// a second durable row, and the child's terminal idle wakes the parent once.
 #[tokio::test]
 async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
     let (_t, svc, ws) = setup().await;
@@ -17773,18 +18054,20 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
         .expect("delegate");
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let baseline = parent_message_count(&svc, &parent).await;
+    let watches = svc.find_watches_for_child(&child);
+    assert_eq!(watches.len(), 1, "delegation armed one watch");
+    let watch_id = watches[0].id.clone();
 
     svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(child.clone()))
         .await
         .expect("report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
     let watches = svc.find_watches_for_child(&child);
-    assert_eq!(watches.len(), 1);
-    assert!(watches[0].report_delivered, "report disarmed the watch");
+    assert_eq!(watches.len(), 1, "progress preserves the existing watch");
+    assert_eq!(watches[0].id, watch_id, "progress preserves watch identity");
+    assert!(!watches[0].report_delivered, "progress keeps watch armed");
 
-    // Follow-up work: the sender auto-subscribe reuses the existing watch
-    // and must re-arm it (fresh-interest reset, mirroring the
-    // insert_watch_in_memory adoption fix).
+    // Follow-up work: sender auto-subscribe must reuse the armed watch.
     let resp = svc
         .agent_watch_completion_for_sender_op(ws.clone(), parent.clone(), child.clone())
         .await
@@ -17792,9 +18075,10 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
     assert_eq!(resp["ok"], json!(true));
     let watches = svc.find_watches_for_child(&child);
     assert_eq!(watches.len(), 1, "reused, not duplicated");
+    assert_eq!(watches[0].id, watch_id, "sender reused the same watch");
     assert!(
         !watches[0].report_delivered,
-        "reuse resets report_delivered"
+        "sender reuse keeps the watch terminal-ready"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -17803,7 +18087,7 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
             .list_completion_watches()
             .await
             .expect("list persisted watches");
-        if rows.len() == 1 && !rows[0].report_delivered {
+        if rows.len() == 1 && rows[0].id == watch_id && !rows[0].report_delivered {
             break;
         }
         assert!(
@@ -17813,8 +18097,7 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    // The child's next genuine idle fires the re-armed watch (pre-fix the
-    // stale report_delivered flag silently retired it without a wake).
+    // The child's terminal idle fires the existing watch exactly once.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -18821,15 +19104,37 @@ async fn wait_for_group_children(
     .expect("delegation group recorded child completions");
 }
 
+async fn wait_for_child_watch_cleanup(svc: &Services, child: &AgentId) {
+    timeout(Duration::from_secs(2), async {
+        while !svc.find_watches_for_child(child).is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("terminal child completion retired its watches");
+}
+
+async fn wait_for_group_cleanup(svc: &Services, parent: &AgentId) {
+    timeout(Duration::from_secs(2), async {
+        while svc.delegation_group_for_parent(parent).is_some()
+            || !svc.list_watches_for_parent(parent).is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("terminal group settlement retired the group and watches");
+}
+
 /// One joined service-level integration test that drives the full
 /// auto-subscription loop through the real `spawn_completion_delivery_loop` worker
 /// and the `EventBus` publish path (not `handle_completion_event` directly):
-///   (a) an immediate delegate registers an ungrouped watch; the child's agent:idle
-///       published on the bus wakes the parent exactly once and the watch is
-///       cleared from the registry;
-///   (b) an `after_all` group of two children yields no wake until the parent
-///       seals on its own agent:idle and both children complete -- a deleted
-///       child still counts -- then exactly one aggregated partial wake;
+///   (a) an immediate delegate registers an ungrouped watch; progress leaves it
+///       armed, then the child's terminal agent:idle wakes the parent and clears
+///       the watch from the registry;
+///   (b) progress leaves an `after_all` group and both watches live; terminal
+///       child events plus the parent's sealing agent:idle then produce exactly
+///       one aggregated partial wake (a deleted child still counts);
 ///   (c) agent.getSubscriptions / agent.cancelSubscriptions reflect the live
 ///       registry across the loop (populated mid-flight, empty after the group
 ///       settles and after an explicit cancel).
@@ -18843,7 +19148,7 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
 
     let parent = create_agent(&svc, &ws, "Parent").await;
 
-    // ---- (a) immediate delegate -> single completion wake + watch cleanup ----
+    // ---- (a) progress retains the watch; terminal idle retires it ----
     let resp = svc
         .agent_delegate_op(
             ws.clone(),
@@ -18866,16 +19171,35 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
     );
     assert_eq!(list[0]["actorIds"], json!([child1.0]));
 
+    svc.agent_report_to_parent_op(
+        ws.clone(),
+        json!("progress before completion"),
+        Some(child1.clone()),
+    )
+    .await
+    .expect("progress report");
+    wait_for_message_count(&svc, &parent, 1).await;
+    assert_eq!(
+        svc.find_watches_for_child(&child1).len(),
+        1,
+        "nonterminal progress keeps the completion watch armed"
+    );
+
     publish_completion(
         &bus,
         &ws,
         AGENT_IDLE,
         &child1,
-        json!({ "agentId": child1.0, "lastResponseSummary": "shipped" }),
+        json!({
+            "agentId": child1.0,
+            "lastResponseSummary": "shipped",
+            "completionReport": "progress before completion",
+        }),
     )
     .await;
-    wait_for_message_count(&svc, &parent, 1).await;
+    wait_for_message_count(&svc, &parent, 2).await;
 
+    wait_for_child_watch_cleanup(&svc, &child1).await;
     assert!(svc.find_watches_for_child(&child1).is_empty());
     let subs = svc
         .agent_get_subscriptions(ws.clone(), parent.clone())
@@ -18903,11 +19227,31 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
         2
     );
 
-    // c1 idle then c2 deleted: both recorded, but no wake while unsealed.
-    publish_completion(&bus, &ws, AGENT_IDLE, &c1, json!({ "agentId": c1.0 })).await;
+    // Grouped reports are progress too: no immediate wake, and the group plus
+    // both watches stay live until terminal child events settle them.
+    svc.agent_report_to_parent_op(ws.clone(), json!("c1 progress"), Some(c1.clone()))
+        .await
+        .expect("c1 progress report");
+    svc.agent_report_to_parent_op(ws.clone(), json!("c2 progress"), Some(c2.clone()))
+        .await
+        .expect("c2 progress report");
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
+    assert!(svc.delegation_group_for_parent(&parent).is_some());
+    assert_eq!(svc.list_watches_for_parent(&parent).len(), 2);
+
+    // c1 idle then c2 deleted: both terminal events are recorded, but no wake
+    // occurs while the group remains unsealed.
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0, "completionReport": "c1 progress" }),
+    )
+    .await;
     publish_completion(&bus, &ws, AGENT_DELETED, &c2, json!({ "agentId": c2.0 })).await;
     wait_for_group_children(&svc, &ws, &parent, 2).await;
-    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
 
     // The parent's own idle seals the group; now complete -> ONE partial wake.
     publish_completion(
@@ -18918,8 +19262,8 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
         json!({ "agentId": parent.0 }),
     )
     .await;
-    wait_for_message_count(&svc, &parent, 2).await;
-    assert_eq!(parent_message_count(&svc, &parent).await, 2);
+    wait_for_message_count(&svc, &parent, 3).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 3);
     assert!(
         parent_messages_text(&svc, &parent)
             .await
@@ -18927,6 +19271,7 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
         "a deleted child should yield a partial aggregated wake"
     );
 
+    wait_for_group_cleanup(&svc, &parent).await;
     assert!(svc.delegation_group_for_parent(&parent).is_none());
     assert!(svc.list_watches_for_parent(&parent).is_empty());
     let subs = svc
@@ -27578,12 +27923,11 @@ async fn report_to_parent_does_not_suppress_third_party_watch_idle_wake() {
         json!({ "agentId": child.0 }),
     ))
     .await;
-    // Parent's idle wake is suppressed (report already delivered); the
-    // third-party watcher still gets its idle wake.
+    // Both completion watches receive their terminal wake.
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        parent_baseline + 1,
-        "parent idle wake suppressed after reportToParent"
+        parent_baseline + 2,
+        "parent receives progress and terminal wakes"
     );
     assert_eq!(
         parent_message_count(&svc, &watcher).await,
@@ -28011,8 +28355,7 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     let child = create_agent(&svc, &ws, "Child").await;
     let other = create_agent(&svc, &ws, "Other").await;
 
-    // Parent linkage: `child` is an actively running delegate of `parent`
-    // (freshly created sessions persist as `Idle`, which does not count).
+    // Parent linkage: `child` is an actively executing delegate of `parent`.
     let mut child_session = svc
         .store()
         .get_agent_session(&child)
@@ -28020,6 +28363,7 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
         .expect("child session");
     child_session.parent_agent_id = Some(parent.clone());
     child_session.status = intent_core::AgentStatus::Active;
+    child_session.is_active = true;
     svc.store()
         .update_agent_session(&ws, &child_session)
         .await
@@ -28057,6 +28401,8 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     assert_eq!(v["agentWatches"], json!(1));
     assert_eq!(v["queuedMessages"], json!(2));
     assert_eq!(v["eventSubscriptions"], json!(1));
+    assert_eq!(v["activeSubAgents"], json!(1));
+    assert_eq!(v["unsettledSubAgents"], json!(1));
     assert_eq!(v["runningSubAgents"], json!(1));
     assert_eq!(v["pendingAttention"], json!("blocker"));
     // Zero-count fields stay omitted.
@@ -28131,32 +28477,77 @@ async fn agent_snapshot_line_gated_by_session_snapshot_not_live_setting() {
     );
 }
 
-/// A settled (terminal) child no longer counts toward `runningSubAgents`.
+/// Completed, failed, and deleted children are settled and omitted from all
+/// child-agent counts, even if their runtime-active flag is stale.
 #[tokio::test]
 async fn agent_snapshot_excludes_settled_children() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
-    let child = create_agent(&svc, &ws, "Child").await;
-    let mut child_session = svc
-        .store()
-        .get_agent_session(&child)
-        .await
-        .expect("child session");
-    child_session.parent_agent_id = Some(parent.clone());
-    child_session.status = intent_core::AgentStatus::Completed;
-    svc.store()
-        .update_agent_session(&ws, &child_session)
-        .await
-        .expect("settle child");
+    for status in [
+        intent_core::AgentStatus::Completed,
+        intent_core::AgentStatus::Error,
+        intent_core::AgentStatus::Deleted,
+    ] {
+        let child = create_agent(&svc, &ws, &format!("Child {status:?}")).await;
+        let mut child_session = svc
+            .store()
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        child_session.parent_agent_id = Some(parent.clone());
+        child_session.status = status;
+        child_session.is_active = true;
+        svc.store()
+            .update_agent_session(&ws, &child_session)
+            .await
+            .expect("settle child");
+    }
 
     let v = svc
         .agent_snapshot_op(ws.clone(), parent.clone())
         .await
         .expect("snapshot");
-    assert!(
-        !v.as_object().unwrap().contains_key("runningSubAgents"),
-        "settled child must not count: {v}"
-    );
+    let obj = v.as_object().unwrap();
+    for key in ["activeSubAgents", "unsettledSubAgents", "runningSubAgents"] {
+        assert!(
+            !obj.contains_key(key),
+            "settled children must not count: {v}"
+        );
+    }
+}
+
+/// Idle children remain unsettled. This includes a child whose runtime turn
+/// ended while a hook keeps future work armed; neither is actively executing.
+#[tokio::test]
+async fn agent_snapshot_counts_idle_and_hook_waiting_children_as_unsettled_only() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    for (name, has_hook) in [("Idle", false), ("Hook waiter", true)] {
+        let child = create_agent(&svc, &ws, name).await;
+        let mut child_session = svc
+            .store()
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        child_session.parent_agent_id = Some(parent.clone());
+        child_session.status = intent_core::AgentStatus::RuntimeIdle;
+        child_session.is_active = false;
+        svc.store()
+            .update_agent_session(&ws, &child_session)
+            .await
+            .expect("link idle child");
+        if has_hook {
+            seed_active_hook(&svc, &ws, &child, "waiting-hook").await;
+        }
+    }
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert!(v.get("activeSubAgents").is_none(), "no live turns: {v}");
+    assert_eq!(v["unsettledSubAgents"], json!(2));
+    assert!(v.get("runningSubAgents").is_none(), "no running turns: {v}");
 }
 
 /// Regression (monorepo#3384): an IDLE child — non-terminal but not doing
@@ -28251,6 +28642,11 @@ async fn agent_snapshot_counts_cross_workspace_children() {
         .agent_snapshot_op(ws.clone(), parent.clone())
         .await
         .expect("snapshot");
+    assert_eq!(
+        v["unsettledSubAgents"],
+        json!(1),
+        "cross-workspace child must be unsettled: {v}"
+    );
     assert_eq!(
         v["runningSubAgents"],
         json!(1),
@@ -28402,6 +28798,17 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
         .expect_err("mixed addressing rejected");
     match &err {
         Error::InvalidParams(msg) => assert!(msg.contains("mutually exclusive"), "{msg}"),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+
+    let mut scoped_batch = batch_input(&[&note_id]);
+    scoped_batch.scope = Some(vec!["crates/intent-core".into()]);
+    let err = svc
+        .agent_delegate_op(ws.clone(), scoped_batch, None)
+        .await
+        .expect_err("batch scope rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(msg.contains("semantic-only"), "{msg}"),
         other => panic!("expected InvalidParams, got {other:?}"),
     }
 
@@ -29580,11 +29987,10 @@ async fn unlinked_child_completion_wake_stamps_flips_only() {
     );
 }
 
-/// `agent.reportToParent` joins the reporting child's flipped completions
-/// into the report wake's trigger stamp (and consumes them) — the report
-/// wake is the cycle's one wake, since it disarms the idle-time delivery.
+/// A progress report leaves flipped-completion trigger facts untouched. The
+/// later terminal wake stamps and consumes them when it retires the watch.
 #[tokio::test]
-async fn report_to_parent_wake_stamps_and_consumes_flips() {
+async fn report_to_parent_progress_preserves_flips_for_terminal_wake() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let resp = svc
@@ -29626,22 +30032,46 @@ async fn report_to_parent_wake_stamps_and_consumes_flips() {
         .metadata
         .as_ref()
         .expect("metadata");
+    assert!(metadata.get(UNBLOCKED_TRIGGER_TASKS_KEY).is_none());
+    assert_eq!(
+        svc.store()
+            .list_agent_flipped_completions(&child)
+            .await
+            .expect("list flips")
+            .len(),
+        1,
+        "progress leaves terminal trigger facts intact"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session after terminal wake");
+    let metadata = session.messages[baseline + 1]
+        .metadata
+        .as_ref()
+        .expect("terminal metadata");
     assert_eq!(
         metadata[UNBLOCKED_TRIGGER_TASKS_KEY],
         json!([
             { "workspaceId": ws.0, "taskNoteId": own.0 },
             { "workspaceId": ws.0, "taskNoteId": flipped.0 },
-        ]),
-        "report wake stamps own task + flip: {metadata}"
+        ])
     );
-    assert!(
-        svc.store()
-            .list_agent_flipped_completions(&child)
-            .await
-            .expect("list flips")
-            .is_empty(),
-        "flips consumed at report time"
-    );
+    assert!(svc
+        .store()
+        .list_agent_flipped_completions(&child)
+        .await
+        .expect("list flips")
+        .is_empty());
 }
 
 /// `after_all` aggregated wake: a settled member's flipped completions are

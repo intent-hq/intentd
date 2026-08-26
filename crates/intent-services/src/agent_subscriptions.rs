@@ -591,9 +591,24 @@ impl Services {
         removed
     }
 
-    /// Mark a watch as having delivered the report wake (report-time wake).
-    /// When marked, `deliver_completion_to_watches` will skip delivery for
-    /// `agent:idle` but still deliver for `agent:failed` / `agent:deleted`.
+    /// Remove a fired watch from memory after its durable retirement
+    /// transaction committed. Unlike [`Services::remove_watch`], this does not
+    /// spawn a second best-effort store delete.
+    pub(crate) fn remove_watch_after_delivery_commit(&self, subscription_id: &str) -> bool {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let before = guard.subscriptions.len();
+        guard
+            .subscriptions
+            .retain(|watch| watch.id != subscription_id);
+        guard.subscriptions.len() != before
+    }
+
+    /// Legacy test helper for waiting-projection compatibility. Production
+    /// progress delivery no longer sets this historical suppression bit.
+    #[cfg(test)]
     pub(crate) fn mark_watch_report_delivered(&self, subscription_id: &str) -> bool {
         let marked = {
             let mut guard = self
@@ -882,65 +897,47 @@ impl Services {
         }
     }
 
-    /// Claim a group for delivery if sealed, complete, and not yet delivered.
-    /// Flips `delivered` in memory, removes from in-memory table, triggers
-    /// best-effort async DB delete, and returns a clone. Returns `None` otherwise.
-    ///
-    /// DURABLE-BEFORE-OBSERVABLE: delete the delegation-group row from the DB before
-    /// returning it for wake delivery. This ensures crash-safety:
-    ///
-    /// - Crash BEFORE delete commits: row still present → rehydration restores the
-    ///   group and re-delivers the wake (correct: wake was never observable).
-    /// - Crash AFTER delete commits: row absent → rehydration skips it, no re-delivery
-    ///   (correct: wake already delivered, or about to be).
-    ///
-    /// The synchronous delete before publish prevents double-wake.
-    pub(crate) async fn take_group_if_ready(&self, group_id: &str) -> Option<DelegationGroup> {
-        // Inside the lock: check readiness and remove from in-memory table.
-        let group = {
-            let mut guard = self
-                .agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned");
-            let idx = guard
-                .delegation_groups
-                .iter()
-                .position(|g| g.group_id == group_id)?;
-            if !(guard.delegation_groups[idx].sealed
-                && !guard.delegation_groups[idx].delivered
-                && is_group_complete(&guard.delegation_groups[idx]))
-            {
-                return None;
-            }
-            guard.delegation_groups.remove(idx)
-        }; // Drop guard before await
-           // DURABLE-BEFORE-OBSERVABLE: delete the row synchronously before returning.
-           // If the delete FAILS, do NOT deliver the wake — put the group back into the
-           // in-memory table (delivered=false) and return None. The next child-completion
-           // or restart retry will attempt the delete again. This makes delete-commit
-           // strictly precede observability in ALL paths.
-        if let Err(e) = self.store.delete_delegation_group(group_id).await {
-            tracing::warn!(
-                "Failed to delete delegation_group row {} (workspace {}): {}. \
-                 Wake NOT delivered; group restored to memory for retry.",
-                group_id,
-                group.workspace_id.0,
-                e
-            );
-            // Restore the group to the in-memory table for retry
-            self.agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned")
-                .delegation_groups
-                .push(group);
+    /// Claim a complete group for delivery without retiring its durable row.
+    /// The in-memory `delivered` bit serializes live attempts; the persisted
+    /// complete group remains the restart-recovery record until the aggregated
+    /// parent wake is durable and final settlement commits.
+    pub(crate) fn take_group_if_ready(&self, group_id: &str) -> Option<DelegationGroup> {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let group = guard
+            .delegation_groups
+            .iter_mut()
+            .find(|g| g.group_id == group_id)?;
+        if !(group.sealed && !group.delivered && is_group_complete(group)) {
             return None;
         }
-        // Delete committed → safe to deliver the wake
-        Some(group)
+        group.delivered = true;
+        Some(group.clone())
     }
 
-    /// Settle a delivered group's watches in one atomic registry pass: every
-    /// completion watch carrying `group_id` is dropped, EXCEPT that watches on
+    /// Release an in-memory delivery claim after delivery or durable settlement
+    /// fails. The persisted row was never retired, so a later event or restart
+    /// can retry the same complete group.
+    pub(crate) fn release_group_delivery(&self, group_id: &str) {
+        if let Some(group) = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .delegation_groups
+            .iter_mut()
+            .find(|g| g.group_id == group_id)
+        {
+            group.delivered = false;
+        }
+    }
+
+    /// Finalize a group after its aggregated wake and the matching store
+    /// settlement are durable. Every completion watch carrying `group_id` is
+    /// dropped, EXCEPT that watches on children listed in `retain_children`
+    /// are converted in place into ungrouped watches. The group is removed in
+    /// the same registry lock, so live readers never observe half-settlement.
     /// children listed in `retain_children` are converted in place into
     /// ungrouped watches (STAB-129: failed-not-deleted members may still be
     /// working, and their eventual real settlement must keep a wake path to
@@ -949,61 +946,40 @@ impl Services {
     /// `wakeOrCreate` watch racing settlement) — since either already gives
     /// the parent a wake path, so the late settlement delivers exactly one
     /// wake. Returns the number of watches retained.
-    pub(crate) fn settle_group_watches(
+    pub(crate) fn finalize_group_delivery(
         &self,
         group_id: &str,
         retain_children: &[AgentId],
     ) -> usize {
         let retain_set: std::collections::HashSet<&AgentId> = retain_children.iter().collect();
-        let mut converted_ids: Vec<String> = Vec::new();
-        let mut dropped_ids: Vec<String> = Vec::new();
-        let retained = {
-            let mut guard = self
-                .agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned");
-            let mut kept: std::collections::HashSet<(AgentId, AgentId)> = guard
-                .subscriptions
-                .iter()
-                .filter(|s| s.group_id.is_none())
-                .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
-                .collect();
-            let mut retained = 0;
-            guard.subscriptions.retain_mut(|s| {
-                if s.group_id.as_deref() != Some(group_id) {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        guard
+            .delegation_groups
+            .retain(|group| group.group_id != group_id);
+        let mut kept: std::collections::HashSet<(AgentId, AgentId)> = guard
+            .subscriptions
+            .iter()
+            .filter(|s| s.group_id.is_none())
+            .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
+            .collect();
+        let mut retained = 0;
+        guard.subscriptions.retain_mut(|watch| {
+            if watch.group_id.as_deref() != Some(group_id) {
+                return true;
+            }
+            if retain_set.contains(&watch.child_agent_id) {
+                let pair = (watch.parent_agent_id.clone(), watch.child_agent_id.clone());
+                if kept.insert(pair) {
+                    watch.group_id = None;
+                    retained += 1;
                     return true;
                 }
-                if retain_set.contains(&s.child_agent_id) {
-                    let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
-                    if kept.insert(pair) {
-                        s.group_id = None;
-                        converted_ids.push(s.id.clone());
-                        retained += 1;
-                        return true;
-                    }
-                }
-                dropped_ids.push(s.id.clone());
-                false
-            });
-            retained
-        };
-        // Best-effort DB sync: converted watches become ungrouped rows,
-        // dropped watches lose their rows (restart durability).
-        if !converted_ids.is_empty() || !dropped_ids.is_empty() {
-            let store = self.store.clone();
-            tokio::spawn(async move {
-                for id in converted_ids {
-                    if let Err(e) = store.ungroup_completion_watch(&id).await {
-                        tracing::warn!("completion_watch ungroup failed {id}: {e}");
-                    }
-                }
-                for id in dropped_ids {
-                    if let Err(e) = store.delete_completion_watch(&id).await {
-                        tracing::warn!("completion_watch delete failed {id}: {e}");
-                    }
-                }
-            });
-        }
+            }
+            false
+        });
         retained
     }
 
@@ -2147,7 +2123,11 @@ fn persisted_to_completion_watch(p: &PersistedCompletionWatch) -> CompletionWatc
         child_agent_id: p.child_agent_id.clone(),
         group_id: p.group_id.clone(),
         created_at: p.created_at.clone(),
-        report_delivered: p.report_delivered,
+        // Compatibility: older daemons persisted this bit after a progress
+        // report and then suppressed the terminal idle wake. Progress no longer
+        // consumes completion interest, so rehydration deliberately re-arms
+        // those legacy rows.
+        report_delivered: false,
         wake_on_attention: p.wake_on_attention,
     }
 }

@@ -572,6 +572,9 @@ mod tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
+                task_revision: None,
+                expected_head_sha: None,
+                scope_hash: None,
             },
         }
     }

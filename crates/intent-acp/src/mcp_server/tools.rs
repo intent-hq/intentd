@@ -167,6 +167,7 @@ API:
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the chief-of-staff workspace.
+  ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
 
   ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
 
@@ -215,7 +216,7 @@ API:
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
   ws.agent.spawnPeer(name, message, opts?) → { ok, id, agentId, name, sponsorAgentId }  // Spawn an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only) and a sponsor preamble telling it of its independent standing is prepended to your message. Peers are FOREGROUND by default (`isBackground: false`); `opts` also takes `specialist`, `model`, `provider`, `reasoningEffort`, `behaviorPrompt`. Top-level agents only, and refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Use `create` instead when you want a child you are woken for; watch a peer explicitly with `watch` if you care about its completion.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, scope?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox. For single-task delegation, `scope` is an optional list of repository-relative paths used to fence stale reports; one delegation cannot span Git repositories. Batch delegation remains semantic-only and rejects `scope`.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
@@ -232,7 +233,7 @@ API:
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries. Check it for an entry with your `fromAgentId` before sending again — the single-pending-message rule on `ws.agent.send` refuses a second send while one is pending.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected. This is the remediation when `ws.agent.send` / `ws.agent.sendToTask` refuse a second send under the single-pending-message rule: remove the pending entry, then re-send ONE combined message.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, actively running child agents (idle/restorable children not counted), pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
@@ -382,6 +383,7 @@ API:
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the chief-of-staff workspace.
+  ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
 
   ws.app.agents.list({ workspaceId?, includeCompleted?, limit?, cursor? }?) → { threads, total, returned, nextCursor? }  // Chief workspace only. Lists readable agent threads across app workspaces; metadata only, no transcript content. Defaults to 50 threads, max 200.
   ws.app.agents.readConversation(workspaceId, agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }?) → { workspaceId, workspaceTitle, agentId, agentName, totalMessages, returnedMessages, startTurn, endTurn, includeToolCalls, taskNoteId?, messages }  // Chief workspace only. Reads a bounded cross-workspace agent conversation. Defaults to last 20 messages, max 100, and excludes tool-call blocks unless `includeToolCalls=true`.
@@ -453,7 +455,7 @@ API:
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
   ws.agent.spawnPeer(name, message, opts?) → { ok, id, agentId, name, sponsorAgentId }  // Spawn an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only) and a sponsor preamble telling it of its independent standing is prepended to your message. Peers are FOREGROUND by default (`isBackground: false`); `opts` also takes `specialist`, `model`, `provider`, `reasoningEffort`, `behaviorPrompt`. Top-level agents only, and refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Use `create` instead when you want a child you are woken for; watch a peer explicitly with `watch` if you care about its completion.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, scope?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox. For single-task delegation, `scope` is an optional list of repository-relative paths used to fence stale reports; one delegation cannot span Git repositories. Batch delegation remains semantic-only and rejects `scope`.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
@@ -468,7 +470,7 @@ API:
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, actively running child agents (idle/restorable children not counted), pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
@@ -679,8 +681,8 @@ const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
 /// whole "Batch form:" continuation line, the `@@@task` fence-attribute
 /// clause of `ws.note.setContent`, and the fence-attribute grammar of
 /// `ws.task.convertBlocks` (rewritten to name only the result shape).
-const TASK_GRAPH_DELEGATE_PARAMS: &str = " skipAutoCommit?, tasks? })";
-const TASK_GRAPH_DELEGATE_PARAMS_OFF: &str = " skipAutoCommit? })";
+const TASK_GRAPH_DELEGATE_PARAMS: &str = " skipAutoCommit?, scope?, tasks? })";
+const TASK_GRAPH_DELEGATE_PARAMS_OFF: &str = " skipAutoCommit?, scope? })";
 const TASK_GRAPH_UNBLOCKED_WAKE_XREF: &str = " Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.";
 const TASK_GRAPH_BATCH_FORM_LINE: &str = "    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.\n";
 const TASK_GRAPH_SETCONTENT_XREF: &str = "; the fence line takes optional `key=` / `dependsOn=` / `conflictsWith=` / `effort=` attributes (see `ws.task.convertBlocks`), and every content-write result (`add` / `edit` / `editLines` / `setContent`) carries the conversion's `createdTasks` + `warnings`";
@@ -832,6 +834,27 @@ pub fn workspace_api_description(
             );
     }
     Cow::Owned(out)
+}
+
+fn workspace_api_description_for_bridge(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
+) -> Cow<'static, str> {
+    let base = workspace_api_description(is_chief, features);
+    if !is_sub_agent {
+        return base;
+    }
+    Cow::Owned(
+        base.lines()
+            .filter(|line| {
+                !line
+                    .trim_start()
+                    .starts_with("ws.workspace.proposeSibling(")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 /// The `Namespaces` index header line as it appears verbatim in both static
@@ -1011,7 +1034,7 @@ pub(super) fn help_namespace(
         .trim_start_matches("ws.")
         .trim_end_matches('*')
         .trim_end_matches('.');
-    let desc = workspace_api_description(is_chief, features);
+    let desc = workspace_api_description_for_bridge(is_chief, features, is_sub_agent);
     if !ns.is_empty() {
         // Direct calls like `ws.help(...)` are documented without a trailing
         // dot, so match both the `ws.<ns>.` and `ws.<ns>(` spellings.
@@ -1090,8 +1113,9 @@ pub(crate) fn workspace_api_description_with_model_options(
     is_chief: bool,
     features: &AgentFeaturesSettings,
     model_options: &[SpecialistModelOptions],
+    is_sub_agent: bool,
 ) -> Cow<'static, str> {
-    let base = workspace_api_description(is_chief, features);
+    let base = workspace_api_description_for_bridge(is_chief, features, is_sub_agent);
     if model_options.is_empty() {
         return base;
     }
@@ -2294,7 +2318,7 @@ mod tests {
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
             for gone in [
-                "skipAutoCommit?, tasks?",
+                "scope?, tasks?",
                 "Batch form:",
                 "unlockPlan",
                 "criticalPathMinutes",
@@ -2314,7 +2338,7 @@ mod tests {
             // included (non-goal: older relation APIs stay documented) —
             // survives untouched.
             for kept in [
-                "ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit? })",
+                "ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, scope? })",
                 "ws.task.convertBlocks(noteId)",
                 "ws.task.setRelations(noteId, { dependsOn?, conflictsWith? })",
                 "ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? })",
@@ -2605,6 +2629,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn snapshot_help_distinguishes_child_agent_counts_and_legacy_field() {
+        for description in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            for field in [
+                "activeSubAgents?",
+                "unsettledSubAgents?",
+                "runningSubAgents?",
+            ] {
+                assert!(description.contains(field), "missing `{field}`");
+            }
+            assert!(description.contains("executing a live turn"));
+            assert!(description.contains("legacy compatibility field"));
+            assert!(description.contains("in an in-flight status"));
+        }
+    }
+
     // The dispatch-deny mapping: gated frame methods name their feature,
     // un-gated methods and enabled toggles pass through.
     #[test]
@@ -2760,7 +2800,7 @@ mod tests {
     fn no_model_options_keeps_description_byte_identical() {
         let features = all_gates_open();
         for is_chief in [false, true] {
-            let got = workspace_api_description_with_model_options(is_chief, &features, &[]);
+            let got = workspace_api_description_with_model_options(is_chief, &features, &[], false);
             assert!(
                 matches!(got, Cow::Borrowed(_)),
                 "no options must not reassemble"
@@ -2785,6 +2825,7 @@ mod tests {
                 is_chief,
                 &features,
                 &sample_options(),
+                false,
             );
             assert!(
                 got.contains("Specialist model options"),
@@ -2856,6 +2897,7 @@ mod tests {
             false,
             &AgentFeaturesSettings::default(),
             &options,
+            false,
         );
         assert!(
             got.contains(
@@ -2875,7 +2917,12 @@ mod tests {
             background_hooks: false,
             ..AgentFeaturesSettings::default()
         };
-        let got = workspace_api_description_with_model_options(false, &features, &sample_options());
+        let got = workspace_api_description_with_model_options(
+            false,
+            &features,
+            &sample_options(),
+            false,
+        );
         assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
         assert!(
             got.contains("implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"),
@@ -2900,6 +2947,7 @@ mod tests {
             false,
             &AgentFeaturesSettings::default(),
             &options,
+            false,
         );
         assert!(
             got.contains("`opencode:kimi-k3` (line one line two)"),
