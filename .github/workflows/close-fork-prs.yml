@@ -26,7 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/github-script@v9
+      # SHA-pinned (not tag-pinned): in a pull_request_target workflow the
+      # action is the one remaining supply-chain path to the elevated token,
+      # and a tag can be moved to malicious code — a full commit SHA cannot.
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const { owner, repo } = context.repo;
