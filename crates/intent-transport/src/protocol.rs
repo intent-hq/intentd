@@ -231,8 +231,10 @@
 //! default (BREAKING; §5.5): an absent / `null` `projection` on
 //! `agent.getConversation` and `chat.subscribe` now serves slim (bounded
 //! tool/image block bodies + the slim page byte budget) instead of full
-//! fidelity, so the unbudgeted full read is unreachable over the wire —
-//! full block bodies are read on demand via `agent.getMessageBlock`;
+//! fidelity, so no unbudgeted read remains on the conversation surfaces
+//! (`agent.getSession` still serves the full `messages` log and is the
+//! remaining known unbudgeted transcript read) — full block bodies are
+//! read on demand via `agent.getMessageBlock`;
 //! `projection: "slim"` remains accepted as an explicit no-op and any other
 //! value stays `-32602`. No method-catalog change — 297 router methods,
 //! 336 total.

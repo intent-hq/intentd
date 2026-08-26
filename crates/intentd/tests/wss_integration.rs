@@ -9270,6 +9270,22 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
         .expect("snapshot blocks");
     assert_slim_blocks(snap_blocks, "slim snapshot");
 
+    // chat.subscribe with NO projection param: slim is the wire default
+    // since v8.0 on the subscription snapshot too, not just the paged read.
+    let default_snap = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"chat.subscribe","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+        8,
+    )
+    .await;
+    let default_snap_blocks = default_snap["messages"][0]["contentBlocks"]
+        .as_array()
+        .expect("defaulted snapshot blocks");
+    assert_slim_blocks(default_snap_blocks, "absent-param snapshot (slim default)");
+
     // A bad projection value is -32602 on both methods.
     let bad = wss_call(
         srv.port,
