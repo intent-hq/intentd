@@ -269,13 +269,32 @@ fn persistence_load_drops_stale_default_pseudo_row() {
     assert_eq!(reloaded.last_good("opencode", "pin@1"), Some(opencode));
 }
 
-/// cortex is un-gated (monorepo#1902): its source serves an open-gate empty
-/// list with no warning — the provider CLI owns model selection.
+/// cortex is hidden by default (gated on `INTENTD_ENABLE_CORTEX`, unset in
+/// the test environment): its source serves an empty list with a gating
+/// warning naming the env var — the default-deny shape.
 #[tokio::test]
-async fn cortex_source_serves_open_gate_empty_list() {
+async fn cortex_source_serves_gated_empty_list_by_default() {
     let r = (source_for("cortex").unwrap().fetch)().await;
     assert_eq!(r.models, Some(Vec::new()));
-    assert_eq!(r.warning, None);
+    let warning = r.warning.expect("gated cortex carries a warning");
+    assert!(
+        warning.contains("INTENTD_ENABLE_CORTEX"),
+        "gate warning names the env var: {warning}"
+    );
+}
+
+/// droid is hidden by default (gated on `INTENTD_ENABLE_DROID`, unset in the
+/// test environment): its source serves an empty list with a gating warning
+/// without probing the droid binary.
+#[tokio::test]
+async fn droid_source_serves_gated_empty_list_by_default() {
+    let r = (source_for("droid").unwrap().fetch)().await;
+    assert_eq!(r.models, Some(Vec::new()));
+    let warning = r.warning.expect("gated droid carries a warning");
+    assert!(
+        warning.contains("INTENTD_ENABLE_DROID"),
+        "gate warning names the env var: {warning}"
+    );
 }
 
 #[test]
