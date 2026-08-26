@@ -5467,7 +5467,8 @@ async fn unclosed_tool_call_never_emits_stalled() {
 }
 
 /// `INTENTD_STREAM_STALL_MS` overrides the stall threshold; absent (or
-/// unparseable) it falls back to the 90s default.
+/// unparseable) it falls back to the 5-minute default, which stays below the
+/// silent-tail-suspect default (stall < silent-tail-suspect < 30-min idle).
 #[test]
 fn stream_stall_ms_env_override_and_default() {
     {
@@ -5476,10 +5477,17 @@ fn stream_stall_ms_env_override_and_default() {
     }
     {
         let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "not-a-number")]);
-        assert_eq!(crate::agent_session::stream_stall_ms(), 90_000);
+        assert_eq!(crate::agent_session::stream_stall_ms(), 300_000);
     }
-    let _env = EnvGuard::apply(&[("INTENTD_STREAM_STALL_MS", None)]);
-    assert_eq!(crate::agent_session::stream_stall_ms(), 90_000);
+    let _env = EnvGuard::apply(&[
+        ("INTENTD_STREAM_STALL_MS", None),
+        ("INTENTD_SILENT_TAIL_SUSPECT_MS", None),
+    ]);
+    assert_eq!(crate::agent_session::stream_stall_ms(), 300_000);
+    assert_eq!(crate::agent_session::silent_tail_suspect_ms(), 480_000);
+    assert!(
+        crate::agent_session::stream_stall_ms() < crate::agent_session::silent_tail_suspect_ms()
+    );
 }
 
 /// STAB-124 guard (intent-hq/monorepo#3466): an anonymous `tool_call_update`
