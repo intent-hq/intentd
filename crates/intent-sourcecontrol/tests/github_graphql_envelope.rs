@@ -21,19 +21,28 @@ struct MockGraphql {
 }
 
 async fn spawn_mock_graphql(body: Value) -> MockGraphql {
+    let body = serde_json::to_string(&body).expect("serialize mock body");
+    spawn_mock_graphql_with(Arc::new(move |_| body.clone())).await
+}
+
+/// Like [`spawn_mock_graphql`], but the response is computed per request from
+/// the raw request text (head + body) — lets a test answer the primary and
+/// fallback shapes of a retried query differently.
+async fn spawn_mock_graphql_with(
+    respond: Arc<dyn Fn(&str) -> String + Send + Sync>,
+) -> MockGraphql {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind mock graphql host");
     let port = listener.local_addr().expect("mock addr").port();
-    let body = Arc::new(serde_json::to_string(&body).expect("serialize mock body"));
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let body = body.clone();
+            let respond = respond.clone();
             tokio::spawn(async move {
-                let _ = serve_conn(stream, &body).await;
+                let _ = serve_conn(stream, respond.as_ref()).await;
             });
         }
     });
@@ -43,8 +52,11 @@ async fn spawn_mock_graphql(body: Value) -> MockGraphql {
 }
 
 /// Minimal HTTP/1.1 handler: read one request (headers + content-length body),
-/// answer with `body` as JSON, and close.
-async fn serve_conn(mut stream: TcpStream, body: &str) -> std::io::Result<()> {
+/// answer with the responder's JSON, and close.
+async fn serve_conn(
+    mut stream: TcpStream,
+    respond: &(dyn Fn(&str) -> String + Send + Sync),
+) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     let (head_end, body_start) = loop {
@@ -74,6 +86,8 @@ async fn serve_conn(mut stream: TcpStream, body: &str) -> std::io::Result<()> {
         }
         buf.extend_from_slice(&tmp[..n]);
     }
+    let request = String::from_utf8_lossy(&buf).to_string();
+    let body = respond(&request);
     let resp = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
@@ -173,4 +187,51 @@ async fn get_review_threads_surfaces_graphql_errors() {
             .contains("Could not resolve to a Repository"),
         "error should carry the GraphQL message: {err}"
     );
+}
+
+/// Schema tolerance for hosts that predate merge queues (older GHES): the
+/// host rejects the WHOLE merge-requirements query over the unknown
+/// `isInMergeQueue` field, and the probe retries once without that selection —
+/// the signal degrades to `None` instead of failing the entire checklist.
+#[tokio::test]
+async fn merge_requirements_retries_without_is_in_merge_queue_on_old_schemas() {
+    let mock = spawn_mock_graphql_with(Arc::new(|request: &str| {
+        if request.contains("isInMergeQueue") {
+            // The primary query names the field the schema lacks.
+            json!({
+                "data": null,
+                "errors": [{
+                    "message": "Field 'isInMergeQueue' doesn't exist on type 'PullRequest'"
+                }]
+            })
+            .to_string()
+        } else {
+            // The degraded retry succeeds with the remaining signals.
+            json!({
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "mergeStateStatus": "CLEAN",
+                            "reviewDecision": "APPROVED",
+                            "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
+                                "contexts": { "nodes": [] }
+                            } } }] }
+                        }
+                    }
+                }
+            })
+            .to_string()
+        }
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+
+    let signals = sc
+        .merge_requirements(&RepoRef::new("intent-hq", "intentd"), 928)
+        .await
+        .expect("degraded retry must succeed");
+    assert_eq!(signals.is_in_merge_queue, None, "signal degrades to None");
+    assert_eq!(signals.merge_state_status.as_deref(), Some("CLEAN"));
+    assert!(signals.checks_known, "the rollup survived the retry");
 }

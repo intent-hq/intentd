@@ -811,6 +811,12 @@ pub struct MergeRequirements {
     /// checklist where `approvals.needed` / `threads.resolutionRequired` are
     /// simply unknown.
     pub rules_known: bool,
+    /// Whether the PR is currently queued in the host's merge queue (GitHub
+    /// GraphQL `isInMergeQueue`). Presence-detected: `Some(true)` exactly when
+    /// the host reports the PR queued; the key is omitted (never null) when
+    /// not queued or unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_in_merge_queue: Option<bool>,
 }
 
 /// The checklist word for a rollup check's state.
@@ -920,6 +926,7 @@ pub(crate) fn merge_requirements(
         merge_state_status,
         merge_blocked_reason: merge_blocked_reason(state, pr.mergeable, mergeable_state),
         rules_known: rules.is_some(),
+        is_in_merge_queue: signals.and_then(|s| s.is_in_merge_queue).filter(|&q| q),
     }
 }
 
@@ -1564,6 +1571,7 @@ mod tests {
                 required_conversation_resolution: Some(true),
                 required_status_checks: vec!["build".into(), "test".into(), "e2e".into()],
             }),
+            is_in_merge_queue: None,
         };
         let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 3);
 
@@ -1619,6 +1627,7 @@ mod tests {
             checks: vec![rollup("build", CheckState::Success, false)],
             checks_known: true,
             branch_rules: None,
+            is_in_merge_queue: None,
         };
         let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 0);
 
@@ -1704,6 +1713,36 @@ mod tests {
         let req = merge_requirements(&unknown, Some(&signals), &[], &agg(0, 0), 0);
         assert!(req.is_behind);
         assert!(!req.has_conflicts);
+    }
+
+    #[test]
+    fn merge_requirements_reports_merge_queue_presence_only_when_queued() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let queued = MergeRequirementSignals {
+            merge_state_status: Some("CLEAN".into()),
+            is_in_merge_queue: Some(true),
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&queued), &[], &agg(0, 0), 0);
+        assert_eq!(req.is_in_merge_queue, Some(true));
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["isInMergeQueue"], serde_json::json!(true));
+
+        // Not queued, host does not report it, or no probe at all: the key
+        // is omitted from the wire, never null.
+        for signals in [
+            Some(MergeRequirementSignals {
+                is_in_merge_queue: Some(false),
+                ..Default::default()
+            }),
+            Some(MergeRequirementSignals::default()),
+            None,
+        ] {
+            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), 0);
+            assert_eq!(req.is_in_merge_queue, None);
+            let wire = serde_json::to_value(&req).unwrap();
+            assert!(wire.get("isInMergeQueue").is_none());
+        }
     }
 
     #[test]
