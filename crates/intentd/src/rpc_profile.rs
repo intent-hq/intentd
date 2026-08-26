@@ -22,13 +22,14 @@
 //! that never touch `SQLite`). The statement-count budget is tiered the same
 //! way: legitimately compound multi-entity ops
 //! ([`is_compound_statement_method`] — `workspace.create`,
-//! `workspace.delete`, `workspace.import.commit`, `workspace.unarchive`)
-//! get a higher default budget
+//! `workspace.delete`, `workspace.import.commit`, `workspace.unarchive`,
+//! `workspace.restore`) get a higher default budget
 //! ([`DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD`]) so their by-design
 //! statement count doesn't drown out the N+1 signal, a compound op whose
 //! legitimate ceiling exceeds even that tier carries its own budget
-//! ([`PER_METHOD_STATEMENT_BUDGETS`] — `agent.sendMessage`), and every other
-//! method keeps the default budget ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
+//! ([`PER_METHOD_STATEMENT_BUDGETS`] — `agent.sendMessage`,
+//! `agent.sendToTask`), and every other method keeps the default budget
+//! ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
 //!
 //! All tier thresholds are overridable via [`STATEMENT_THRESHOLD_ENV`],
 //! [`COMPOUND_STATEMENT_THRESHOLD_ENV`], [`DURATION_THRESHOLD_ENV`], and
@@ -114,12 +115,20 @@ fn is_network_tier_method(method: &str) -> bool {
 /// bounded members. `workspace.unarchive` is a compound lifecycle op —
 /// workspace row update, agent/watcher re-arming, watch re-registration for
 /// the worktree, event emission — that runs ~40 statements
-/// (intent-hq/monorepo#3496).
+/// (intent-hq/monorepo#3496); `workspace.restore` is its wire alias
+/// (`WorkspaceApi::restore_workspace` delegates to `unarchive_workspace`),
+/// so it shares the exact same statement shape and tier. `workspace.archive`
+/// stays on the default tier deliberately: its compound work (interrupt
+/// sweep, hook/PR-monitor cancels, last-activity derive, event emit) runs on
+/// a detached spawned tail (intent-hq/monorepo#1577) outside the dispatch
+/// span, so only the workspace row read + update are counted — well under
+/// the default budget.
 const COMPOUND_STATEMENT_METHODS: &[&str] = &[
     "workspace.create",
     "workspace.delete",
     "workspace.import.commit",
     "workspace.unarchive",
+    "workspace.restore",
 ];
 
 /// Whether `method` is a legitimately compound multi-entity op — it
@@ -141,8 +150,13 @@ fn is_compound_statement_method(method: &str) -> bool {
 /// normal coordinator fan-out (intent-hq/monorepo#3492) — so it gets its own
 /// budget sized above that ceiling with headroom, rather than raising the
 /// shared compound threshold high enough to blunt the N+1 signal for the
-/// bounded members.
-const PER_METHOD_STATEMENT_BUDGETS: &[(&str, u64)] = &[("agent.sendMessage", 250)];
+/// bounded members. `agent.sendToTask` resolves the task's assignee and then
+/// routes through the same delivery path (`agent_send_to_task_op` mirrors
+/// `agent.sendMessage`'s `manager.send_message` / `interrupt_send_message`
+/// routing, DELIV-1), so it carries the same content-scaled shape plus a
+/// task lookup and gets the same budget.
+const PER_METHOD_STATEMENT_BUDGETS: &[(&str, u64)] =
+    &[("agent.sendMessage", 250), ("agent.sendToTask", 250)];
 
 /// The per-method statement budget for `method`, if it has one (see
 /// [`PER_METHOD_STATEMENT_BUDGETS`]). Takes precedence over the tier
@@ -645,6 +659,7 @@ mod tests {
         assert!(is_compound_statement_method("workspace.delete"));
         assert!(is_compound_statement_method("workspace.import.commit"));
         assert!(is_compound_statement_method("workspace.unarchive"));
+        assert!(is_compound_statement_method("workspace.restore"));
         assert!(!is_compound_statement_method("workspace.list"));
         assert!(!is_compound_statement_method("workspace.get"));
         assert!(!is_compound_statement_method("workspace.archive"));
@@ -673,8 +688,16 @@ mod tests {
             DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD
         );
         assert_eq!(
+            layer.statement_threshold_for("workspace.restore"),
+            DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD
+        );
+        assert_eq!(
             layer.statement_threshold_for("agent.sendMessage"),
             per_method_statement_budget("agent.sendMessage").unwrap()
+        );
+        assert_eq!(
+            layer.statement_threshold_for("agent.sendToTask"),
+            per_method_statement_budget("agent.sendToTask").unwrap()
         );
         assert_eq!(
             layer.statement_threshold_for("workspace.list"),
@@ -685,7 +708,7 @@ mod tests {
     #[test]
     fn per_method_budget_matches_exact_members_only() {
         assert_eq!(per_method_statement_budget("agent.sendMessage"), Some(250));
-        assert_eq!(per_method_statement_budget("agent.sendToTask"), None);
+        assert_eq!(per_method_statement_budget("agent.sendToTask"), Some(250));
         assert_eq!(per_method_statement_budget("agent.list"), None);
         assert_eq!(per_method_statement_budget("workspace.create"), None);
     }
@@ -697,6 +720,35 @@ mod tests {
         let layer = RpcProfileLayer::from_env_with(|_| None);
         let warns = run_dispatch(layer, "workspace.unarchive", || {
             for _ in 0..40 {
+                sqlx_event();
+            }
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn restore_at_observed_ceiling_emits_no_warn_under_defaults() {
+        // `workspace.restore` is the wire alias of `workspace.unarchive`
+        // (`WorkspaceApi::restore_workspace` delegates to
+        // `unarchive_workspace`), so the same ~40-statement shape
+        // (intent-hq/monorepo#3496) must fit its budget too.
+        let layer = RpcProfileLayer::from_env_with(|_| None);
+        let warns = run_dispatch(layer, "workspace.restore", || {
+            for _ in 0..40 {
+                sqlx_event();
+            }
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn send_to_task_at_observed_ceiling_emits_no_warn_under_defaults() {
+        // `agent.sendToTask` routes through the same delivery path as
+        // `agent.sendMessage` plus a task lookup, so the same content-scaled
+        // ceiling (intent-hq/monorepo#3492) must fit its budget too.
+        let layer = RpcProfileLayer::from_env_with(|_| None);
+        let warns = run_dispatch(layer, "agent.sendToTask", || {
+            for _ in 0..150 {
                 sqlx_event();
             }
         });
