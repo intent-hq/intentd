@@ -6136,6 +6136,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.hook.get` (MCP-only, no wire method): one hook row by id — the
+    /// full row including `code`, for active AND terminal (retired) hooks,
+    /// so an agent can recover a retired hook's script to re-arm it. Hooks
+    /// belonging to another workspace read as `NotFound`.
+    fn hook_get(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: HookId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, hook_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_get not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `ws.hook.cancel` / wire `hook.cancel`: stop an active hook. `caller`
     /// is the cancelling agent (MCP): an agent may only cancel its own hooks
     /// — a non-owner is rejected — and an owner cancel delivers no self-wake.
