@@ -26,6 +26,30 @@ use tokio::sync::{mpsc, oneshot};
 /// generous than the ACP request timeout.
 pub(crate) const DEFAULT_REVERSE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Screenshot reverse requests must settle before the agent JavaScript tool's
+/// 30-second outer deadline so the caller receives the transport error.
+const SCREENSHOT_REVERSE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Select the reverse deadline without changing the global default. A mixed
+/// `browser.exec` batch uses the screenshot deadline when any action captures
+/// an image because the full batch shares one reverse response.
+pub(crate) fn request_timeout(method: &str, params: &Value) -> Duration {
+    let includes_screenshot = method == "browser.exec"
+        && params
+            .get("actions")
+            .and_then(Value::as_array)
+            .is_some_and(|actions| {
+                actions.iter().any(|action| {
+                    action.get("action").and_then(Value::as_str) == Some("screenshot")
+                })
+            });
+    if includes_screenshot {
+        SCREENSHOT_REVERSE_TIMEOUT
+    } else {
+        DEFAULT_REVERSE_TIMEOUT
+    }
+}
+
 /// A JSON-RPC error returned by the client to a reverse request.
 #[derive(Debug, Clone)]
 pub struct ReverseError {

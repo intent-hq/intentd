@@ -58,4 +58,3 @@ Once approved, run iterations until tests pass:
 - **Current Iteration**: N
 - **Test Feedback**: Latest test output (for passing to next work agent)
 - **Iteration History**: Brief log of each iteration's outcome
-

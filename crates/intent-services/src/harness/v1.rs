@@ -1,4 +1,4 @@
-//! Harness **v1**: today's post-#2457 text set, byte-pinned by
+//! Harness **v1**: the original post-#2457 text set, byte-pinned by
 //! `crate::v1_goldens` and `agent_manager::v1_turn_envelope_goldens`. Every
 //! string here was moved verbatim from `rules.rs` / `agent_manager.rs` /
 //! `lib.rs` / `agent_ops.rs` (H5 byte-neutral refactor); any edit MUST fail
@@ -38,8 +38,7 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
 };
 
 /// Human-readable labels for every `agentFeatures` toggle v1 knows about.
-/// Shared with v1.1 (`super::v1_1::ENTRY`), whose feature surface is
-/// unchanged.
+/// Shared with later harness versions, whose feature surface is unchanged.
 pub(crate) const FEATURE_LABELS: &[(&str, &str)] = &[
     ("backgroundHooks", "Background hooks (ws.hook.*)"),
     ("hostExec", "Host command execution (ws.host.exec)"),

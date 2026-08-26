@@ -40,6 +40,7 @@ macro_rules! instr {
 
 const CHAT: &str = instr!("v1", "chat");
 const COMMON: &str = instr!("v1", "common");
+const V2_COMMON: &str = instr!("v2", "common");
 const DEBUG: &str = instr!("v1", "debug");
 const WORKSPACE: &str = instr!("v1", "workspace");
 const TASK_BREAKDOWN: &str = instr!("v1", "task-breakdown");
@@ -137,6 +138,13 @@ pub(crate) static V1_1: InstructionSet = InstructionSet {
     code_walkthrough: instr!("v1.1", "code-walkthrough"),
     commit_message: instr!("v1.1", "commit-message"),
     pr_description: instr!("v1.1", "pr-description"),
+};
+
+/// Harness v2 keeps every v1.1 instruction body except the common guidance,
+/// which adds scoped sibling-workspace handoffs.
+pub(crate) static V2: InstructionSet = InstructionSet {
+    common: V2_COMMON,
+    ..V1_1
 };
 
 /// Utility agents that don't get the workspace instruction layer (port of
@@ -445,17 +453,40 @@ mod tests {
         defaults()
     }
 
-    /// The LATEST set's common body ([`get_instruction_with_common`] composes
-    /// over the latest set, currently v1.1 — the one body the v1→v1.1
-    /// rewrite changed; every other latest body is a byte-identical v1 copy,
-    /// so the v1 constants still serve those assertions).
-    const COMMON_LATEST: &str = V1_1.common;
+    /// The latest set's common body. Harness v2 keeps v1.1 behavior and adds
+    /// only scoped sibling-workspace guidance.
+    const COMMON_LATEST: &str = V2.common;
 
     #[test]
     fn common_only_is_not_self_wrapped() {
         assert_eq!(
             get_instruction_with_common("common", &all_on()),
             COMMON_LATEST
+        );
+    }
+
+    #[test]
+    fn v2_common_teaches_scoped_sibling_handoffs() {
+        let common = get_instruction_with_common_for(&V2, "common", &all_on());
+        assert!(common.contains(
+            "ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? })"
+        ));
+        assert!(common.contains("clearly separate from the current request"));
+        assert!(common.contains("Make the `initialPrompt` self-contained"));
+        assert!(common.contains("The current repository is inherited and locked"));
+        assert!(common.contains("The user must approve it"));
+        assert!(common.contains("before Apply succeeds"));
+        assert!(common.contains("delegated or background agent"));
+        assert!(common.contains("ws.agent.reportToParent"));
+        assert!(!COMMON.contains("ws.workspace.proposeSibling"));
+        assert!(!V1_1.common.contains("ws.workspace.proposeSibling"));
+        assert_eq!(
+            remove_between(
+                V2_COMMON,
+                "## Follow-up Workspaces",
+                "## GitHub & Git Operations",
+            ),
+            V1_1.common
         );
     }
 
@@ -562,6 +593,8 @@ mod tests {
         assert_eq!(gated_task_breakdown(&V1, &a).as_ref(), TASK_BREAKDOWN);
         assert!(matches!(gated_common(&V1_1, &a), Cow::Borrowed(_)));
         assert_eq!(gated_common(&V1_1, &a).as_ref(), V1_1.common);
+        assert!(matches!(gated_common(&V2, &a), Cow::Borrowed(_)));
+        assert_eq!(gated_common(&V2, &a).as_ref(), V2.common);
     }
 
     #[test]
@@ -584,6 +617,26 @@ mod tests {
         assert_eq!(V1_1.code_walkthrough, V1.code_walkthrough);
         assert_eq!(V1_1.commit_message, V1.commit_message);
         assert_eq!(V1_1.pr_description, V1.pr_description);
+    }
+
+    #[test]
+    fn v2_bodies_match_v1_1_except_common() {
+        assert_ne!(V2.common, V1_1.common);
+        assert_eq!(V2.chat, V1_1.chat);
+        assert_eq!(V2.debug, V1_1.debug);
+        assert_eq!(V2.workspace, V1_1.workspace);
+        assert_eq!(V2.setup_script_generator, V1_1.setup_script_generator);
+        assert_eq!(V2.task_breakdown, V1_1.task_breakdown);
+        assert_eq!(V2.task_debug, V1_1.task_debug);
+        assert_eq!(V2.task_focused, V1_1.task_focused);
+        assert_eq!(V2.task_loop, V1_1.task_loop);
+        assert_eq!(V2.ralph_loop, V1_1.ralph_loop);
+        assert_eq!(V2.workspace_agent, V1_1.workspace_agent);
+        assert_eq!(V2.notes_system_guide, V1_1.notes_system_guide);
+        assert_eq!(V2.code_review, V1_1.code_review);
+        assert_eq!(V2.code_walkthrough, V1_1.code_walkthrough);
+        assert_eq!(V2.commit_message, V1_1.commit_message);
+        assert_eq!(V2.pr_description, V1_1.pr_description);
     }
 
     #[test]
