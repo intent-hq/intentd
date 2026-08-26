@@ -1333,12 +1333,28 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.list`: workspace agents as the stripped [`AgentLite`] projection
-    /// (PROTOCOL §5.5).
+    /// (PROTOCOL §5.5). Excludes soft-retired sessions (`retiredAt` set) —
+    /// the wire `includeRetired: true` variant is
+    /// [`WorkspaceApi::agent_list_including_retired`].
     fn agent_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
         let _ = workspace_id;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.list` with `includeRetired: true` (PROTOCOL §5.5): every
+    /// session including soft-retired ones, whose rows carry `retiredAt`.
+    fn agent_list_including_retired(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_including_retired not implemented".to_string(),
             ))
         })
     }
@@ -2141,6 +2157,54 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Whether `agent_id`'s session is soft-retired (`retiredAt` set) — the
+    /// cheap point read backing the MCP dispatch guard that keeps a caller
+    /// inert for the remainder of the turn that retired it (retirement lands
+    /// mid-turn; the ACP stream only stops at the turn boundary). Missing
+    /// sessions and read errors report `false`: absence is handled by the
+    /// per-method `require_*` guards, and a transient store error must not
+    /// blanket-deny every `workspace_api` call. Default `false` so non-agent
+    /// `WorkspaceApi` impls need not implement it.
+    fn agent_is_retired(&self, agent_id: AgentId) -> BoxFuture<'_, bool> {
+        let _ = agent_id;
+        Box::pin(async { false })
+    }
+
+    /// Soft retire (`ws.agent.retire`): set `retiredAt` on the session,
+    /// keeping the row and its full conversation intact. The retired session
+    /// is inert until `agent.restore` clears the mark. Emits `agent:retired`;
+    /// idempotent on an already-retired session.
+    fn agent_retire(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        reason: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, reason);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_retire not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.restore` (PROTOCOL §5.5): clear a session's `retiredAt`,
+    /// returning it to normal service. Restoring a non-retired session is a
+    /// no-op (`{ success: true, restored: false }`); a real restore emits
+    /// `agent:restored`.
+    fn agent_restore(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_restore not implemented".to_string(),
             ))
         })
     }

@@ -442,11 +442,11 @@ async fn build_rtk_instruction(
 /// text it was created with even after the binary ships a newer doctrine set;
 /// a `None` session resolves to the latest.
 ///
-/// `workspace_api_docs` — the full `workspace_api` tool description for
+/// `workspace_api_docs` — the condensed `workspace_api` reference for
 /// providers whose MCP client truncates long tool descriptions
 /// (`ProviderConfig::truncates_tool_descriptions`): the bridge serves the
-/// compact description, and this carries the full `ws.*` reference into the
-/// prompt under [`intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING`] (the
+/// compact description, and this carries the condensed `ws.*` reference into
+/// the prompt under [`intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING`] (the
 /// section the compact header points at). `None` — every non-flagged
 /// provider — leaves the prompt byte-identical to before.
 #[allow(clippy::too_many_arguments)]
@@ -531,15 +531,15 @@ pub(crate) async fn assemble_system_prompt(
             }
         }
     }
-    // Workspace API reference layer (truncating providers only): the full
-    // `workspace_api` description under the heading the compact tool
+    // Workspace API reference layer (truncating providers only): the
+    // condensed `workspace_api` reference under the heading the compact tool
     // description points at. Placed with the other reference material —
     // after skills, before isolation hint / specialist role.
     if let Some(docs) = workspace_api_docs.map(str::trim).filter(|d| !d.is_empty()) {
         parts.push(format!(
-            "{}\n\nThe full `workspace_api` (ws.*) API reference. The MCP tool description \
-             you see is a compact index of the same surface; consult this section for full \
-             signatures and semantics.\n\n{docs}",
+            "{}\n\nThe `workspace_api` (ws.*) API reference: every method's signature with \
+             a one-line summary. The MCP tool description you see is a compact index of the \
+             same surface; call ws.help(\"<namespace>\") for one namespace's full docs.\n\n{docs}",
             intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING
         ));
     }
@@ -1176,6 +1176,7 @@ This is a test skill.
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),

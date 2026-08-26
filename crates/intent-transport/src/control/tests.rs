@@ -35,6 +35,7 @@ impl FakeControl {
                 uptime_seconds: 123,
                 local_ips: vec!["192.168.1.10".to_string(), "10.0.0.5".to_string()],
                 hostname: "studio.local".to_string(),
+                pretty_hostname: "Clement's Mac Studio".to_string(),
                 cpu_percent: 12.5,
                 memory_bytes: 104_857_600,
                 child_processes: Some(4),
@@ -130,6 +131,7 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["fingerprint"], "AB:CD");
     assert_eq!(local["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
     assert_eq!(local["hostname"], "studio.local");
+    assert_eq!(local["prettyHostname"], "Clement's Mac Studio");
     assert_eq!(local["protocolVersion"], crate::protocol::PROTOCOL_VERSION);
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
@@ -142,6 +144,7 @@ fn status_json_local_vs_remote_locality() {
     // an authenticated WSS client refreshes its host list from system.status.
     assert_eq!(remote["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
     assert_eq!(remote["hostname"], "studio.local");
+    assert_eq!(remote["prettyHostname"], "Clement's Mac Studio");
 }
 
 #[test]
@@ -162,6 +165,7 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         uptime_seconds: 456,
         local_ips: Vec::new(),
         hostname: "intent".to_string(),
+        pretty_hostname: "intent".to_string(),
         cpu_percent: 0.0,
         memory_bytes: 0,
         child_processes: None,
@@ -180,6 +184,10 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     // No routable interfaces still yields an (empty) array, never null.
     assert_eq!(v["localIps"], json!([]));
     assert_eq!(v["hostname"], "intent");
+    assert_eq!(
+        v["prettyHostname"], "intent",
+        "falls back to hostname when no pretty name exists"
+    );
     // An unsampled child tree is explicitly null — never a misleading 0, which
     // a bundle would read as "the daemon has no child processes".
     assert_eq!(v["childProcesses"], Value::Null);

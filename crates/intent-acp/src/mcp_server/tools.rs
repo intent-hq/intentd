@@ -238,6 +238,7 @@ API:
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
+  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session — TERMINAL for you: the call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
 
   ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
@@ -468,6 +469,7 @@ API:
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
+  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session — TERMINAL for you: the call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
 
   ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
@@ -575,10 +577,11 @@ static ALL_TOOLS_CHIEF: &[ToolDef] = &[ToolDef {
 
 /// The `ws.` path prefixes gated by each disabled `[agentFeatures]` toggle.
 /// Namespace-level prefixes end with `.`; method-level prefixes (the
-/// `attentionRequests` pair) name one full method each. Shared by the
-/// description assembler below, the prelude assembler in [`super::bindings`],
-/// and the dispatch deny in [`super::bindings`] (via [`denied_feature`]), so
-/// the three layers cannot drift.
+/// `attentionRequests` pair, the `peerAgents` retire entry) name one full
+/// method each. Shared by the description assembler below, the prelude
+/// assembler in [`super::bindings`], and the dispatch deny in
+/// [`super::bindings`] (via [`denied_feature`]), so the three layers cannot
+/// drift.
 fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
     if !features.background_hooks {
@@ -613,6 +616,11 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
         out.push(("ws.pr.monitors", "agentFeatures.prMonitor"));
         out.push(("ws.pr.monitor", "agentFeatures.prMonitor"));
         out.push(("ws.pr.unmonitor", "agentFeatures.prMonitor"));
+    }
+    if !features.peer_agents {
+        // Method-level: `ws.agent.retire` is the only `ws.agent.*` surface
+        // gated by the opt-in peerAgents toggle (default off).
+        out.push(("ws.agent.retire", "agentFeatures.peerAgents"));
     }
     out
 }
@@ -823,13 +831,14 @@ pub(crate) const NAMESPACE_INDEX_HEADER: &str =
     "Namespaces (index — full signatures in API below):";
 
 /// The header [`compact_workspace_api_description`] swaps in: same index, but
-/// the full signatures live in the system prompt (under
+/// the signatures + one-line summaries live in the system prompt (under
 /// [`WORKSPACE_API_SYSTEM_PROMPT_HEADING`]) rather than below, with
-/// `ws.help()` as the in-tool fallback.
-pub(crate) const NAMESPACE_INDEX_HEADER_COMPACT: &str = "Namespaces (index — full docs: \"Workspace API Reference\" in your system prompt, or ws.help()):";
+/// `ws.help()` as the full-docs fallback.
+pub(crate) const NAMESPACE_INDEX_HEADER_COMPACT: &str = "Namespaces (index — condensed: system-prompt \"Workspace API Reference\"; full docs: ws.help()):";
 
-/// Heading of the system-prompt section that carries the full `ws.*` API
-/// reference for providers whose client truncates long MCP tool descriptions
+/// Heading of the system-prompt section that carries the condensed `ws.*` API
+/// reference (signatures + one-line summaries) for providers whose client
+/// truncates long MCP tool descriptions
 /// (`ProviderConfig::truncates_tool_descriptions`). The compact description's
 /// index header points at this section by name, so the two must not drift.
 pub const WORKSPACE_API_SYSTEM_PROMPT_HEADING: &str = "# Workspace API Reference";
@@ -865,6 +874,94 @@ pub fn compact_workspace_api_description(
     out.push_str(&full[header_start + NAMESPACE_INDEX_HEADER.len()..index_end]);
     out.push('\n');
     out
+}
+
+/// Condensed `workspace_api` reference for the system prompt of providers
+/// whose MCP client silently truncates long tool descriptions
+/// (`ProviderConfig::truncates_tool_descriptions`). Derived mechanically from
+/// the SAME [`workspace_api_description`] assembly as the full text —
+/// chief-ness and `[agentFeatures]` gating apply identically, no second
+/// source — keeping the preamble, `Namespaces` index, and `Examples` block
+/// verbatim and shrinking only the `API:` section: every method line keeps
+/// its full signature but its `//` summary is cut at the first sentence
+/// (see [`first_sentence_end`]), and the wrapped continuation lines are
+/// dropped. `ws.help("<namespace>")` still serves the full doc lines at
+/// runtime. Specialist model options are spliced in AFTER the cut (the same
+/// [`inject_model_options`] block the full rendering uses), so the prompt
+/// copy carries them even though delegate continuation lines are dropped.
+pub fn condensed_workspace_api_description(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+    model_options: &[SpecialistModelOptions],
+) -> String {
+    let full = workspace_api_description(is_chief, features);
+    let mut out = String::with_capacity(full.len() / 2);
+    let mut in_api = false;
+    for line in full.lines() {
+        if in_api && line.starts_with("Examples") {
+            in_api = false;
+        }
+        if !in_api {
+            out.push_str(line);
+            out.push('\n');
+            if line == "API:" {
+                in_api = true;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent >= 4 && !trimmed.is_empty() {
+            // Wrapped continuation line of a method entry — dropped; the
+            // full text stays reachable via ws.help("<namespace>").
+            continue;
+        }
+        out.push_str(condensed_method_line(line));
+        out.push('\n');
+    }
+    inject_model_options(&out, model_options).unwrap_or(out)
+}
+
+/// One `API:` section line of the condensed rendering: a method doc line has
+/// its `//` summary cut at the first sentence end; any other line (blank
+/// separators, lines without a comment) passes through verbatim.
+fn condensed_method_line(line: &str) -> &str {
+    let Some(sep) = line.find("  // ") else {
+        return line;
+    };
+    let comment_start = sep + "  // ".len();
+    match first_sentence_end(&line[comment_start..]) {
+        Some(end) if comment_start + end < line.len() => &line[..comment_start + end],
+        _ => line,
+    }
+}
+
+/// Dotted abbreviations that appear mid-sentence in the method summaries; a
+/// `. ` boundary whose preceding word is one of these is not a sentence end
+/// (e.g. the `(e.g. a submodule's repo)` parenthetical in the
+/// `ws.pr.snapshot` summary).
+const MID_SENTENCE_ABBREVIATIONS: &[&str] = &["e.g", "i.e", "etc", "vs", "cf"];
+
+/// Byte offset just past the `.` ending the first sentence of `comment`, or
+/// `None` when the comment is a single sentence (no `. ` boundary). Skips
+/// ellipsis dots and the [`MID_SENTENCE_ABBREVIATIONS`].
+fn first_sentence_end(comment: &str) -> Option<usize> {
+    for (idx, _) in comment.match_indices(". ") {
+        if idx > 0 && comment.as_bytes()[idx - 1] == b'.' {
+            continue; // ellipsis (`... `), not a sentence end
+        }
+        let before = &comment[..idx];
+        let word_start = before.rfind([' ', '(']).map_or(0, |i| i + 1);
+        let word = &before[word_start..];
+        if MID_SENTENCE_ABBREVIATIONS
+            .iter()
+            .any(|a| word.eq_ignore_ascii_case(a))
+        {
+            continue;
+        }
+        return Some(idx + 1);
+    }
+    None
 }
 
 /// `ws.help()` — the runtime docs index. Returns the `Namespaces` block of
@@ -983,10 +1080,23 @@ pub(crate) fn workspace_api_description_with_model_options(
     if model_options.is_empty() {
         return base;
     }
-    // Anchor on the `ws.agent.delegate` doc line (indent 2) and append the
-    // options block after its indented continuation lines, so the injected
-    // text reads as part of the delegate/create docs. No anchor (the line
-    // can never be feature-pruned today, but stay safe) → unchanged.
+    match inject_model_options(&base, model_options) {
+        Some(out) => Cow::Owned(out),
+        None => base,
+    }
+}
+
+/// Splice the [`model_options_block`] into `base`: anchor on the
+/// `ws.agent.delegate` doc line (indent 2) and append the options block after
+/// its indented continuation lines, so the injected text reads as part of the
+/// delegate/create docs. Returns `None` when `model_options` is empty or the
+/// anchor line is absent (it can never be feature-pruned today, but stay
+/// safe) — callers keep `base` unchanged. Shared by the full and condensed
+/// renderings so the two splices cannot drift.
+fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) -> Option<String> {
+    if model_options.is_empty() {
+        return None;
+    }
     let mut out = String::with_capacity(base.len() + 256);
     let mut in_delegate = false;
     let mut inserted = false;
@@ -1009,12 +1119,12 @@ pub(crate) fn workspace_api_description_with_model_options(
         inserted = true;
     }
     if !inserted {
-        return base;
+        return None;
     }
     if !base.ends_with('\n') {
         out.pop();
     }
-    Cow::Owned(out)
+    Some(out)
 }
 
 /// Render the injected continuation block: one header line plus one line per
@@ -1067,16 +1177,16 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_workspace_api_description, denied_feature, help_index, help_namespace,
-        workspace_api_description, workspace_api_description_with_model_options,
-        AgentFeaturesSettings, Cow, SpecialistModelOption, SpecialistModelOptions,
-        HOOK_HOST_EXEC_DOC_XREF, HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER,
-        NAMESPACE_INDEX_HEADER_COMPACT, PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL,
-        PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE,
-        REPORT_TO_PARENT_ATTENTION_XREF, TASK_GRAPH_BATCH_FORM_LINE,
-        TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF,
-        TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
-        WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+        compact_workspace_api_description, condensed_workspace_api_description, denied_feature,
+        first_sentence_end, help_index, help_namespace, workspace_api_description,
+        workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
+        SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
+        HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT,
+        PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF,
+        PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
+        TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS,
+        TASK_GRAPH_SETCONTENT_XREF, TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION,
+        WORKSPACE_API_DESCRIPTION_CHIEF, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
     };
     use std::collections::HashSet;
 
@@ -1442,6 +1552,7 @@ mod tests {
                 state_snapshot: false,
                 pr_monitor: false,
                 task_graph: false,
+                peer_agents: false,
             },
         ));
         for is_chief in [false, true] {
@@ -1584,6 +1695,241 @@ mod tests {
             "compact index header must name the `{section_name}` system-prompt section"
         );
         assert!(NAMESPACE_INDEX_HEADER_COMPACT.contains("ws.help()"));
+        // The system-prompt section carries the condensed rendering, so the
+        // header must not advertise it as "full docs" — that label belongs to
+        // ws.help() alone.
+        assert!(
+            NAMESPACE_INDEX_HEADER_COMPACT.contains("condensed:"),
+            "compact index header must describe the system-prompt section as condensed"
+        );
+        assert!(
+            NAMESPACE_INDEX_HEADER_COMPACT.contains("full docs: ws.help()"),
+            "compact index header must reserve the full-docs label for ws.help()"
+        );
+    }
+
+    // ---- condensed description (system-prompt reference) tests -------------
+
+    // Split a description into (before `API:`, API section, `Examples`
+    // onward). Panics when either marker is missing — every variant carries
+    // both.
+    fn split_sections(desc: &str) -> (&str, &str, &str) {
+        let api_start = desc.find("\nAPI:\n").expect("API: marker") + 1;
+        let examples_start = desc[api_start..]
+            .find("\nExamples")
+            .map(|i| api_start + i + 1)
+            .expect("Examples marker");
+        (
+            &desc[..api_start],
+            &desc[api_start..examples_start],
+            &desc[examples_start..],
+        )
+    }
+
+    // The condensed rendering is a pure derivation of the full assembly:
+    // preamble and Examples block byte-identical, every indent-2 method line
+    // present with its signature intact and its summary either whole or cut
+    // at a sentence boundary, and no continuation lines in the API section.
+    // Swept across both chief variants and the defaults plus each gating
+    // toggle disabled individually — including `task_graph`, which rewrites
+    // doc lines via `replacen` OFF-variants rather than prefix-pruning — so
+    // the condensed text can never drift from the gated full text.
+    #[test]
+    fn condensed_description_derives_from_full_assembly() {
+        let mut feature_sets: Vec<AgentFeaturesSettings> = vec![AgentFeaturesSettings::default()];
+        for (_, disable) in feature_cases() {
+            let mut features = AgentFeaturesSettings::default();
+            disable(&mut features);
+            feature_sets.push(features);
+        }
+        feature_sets.push(AgentFeaturesSettings {
+            task_graph: false,
+            ..AgentFeaturesSettings::default()
+        });
+        for is_chief in [false, true] {
+            for features in &feature_sets {
+                let full = workspace_api_description(is_chief, features);
+                let condensed = condensed_workspace_api_description(is_chief, features, &[]);
+                let (full_pre, full_api, full_examples) = split_sections(&full);
+                let (cond_pre, cond_api, cond_examples) = split_sections(&condensed);
+                assert_eq!(cond_pre, full_pre, "chief={is_chief}: preamble drifted");
+                assert_eq!(
+                    cond_examples, full_examples,
+                    "chief={is_chief}: Examples block drifted"
+                );
+
+                let full_methods: Vec<&str> = full_api
+                    .lines()
+                    .filter(|l| l.starts_with("  ws."))
+                    .collect();
+                let cond_methods: Vec<&str> = cond_api
+                    .lines()
+                    .filter(|l| l.starts_with("  ws."))
+                    .collect();
+                assert_eq!(
+                    full_methods.len(),
+                    cond_methods.len(),
+                    "chief={is_chief}: condensed API section dropped or grew method lines"
+                );
+                for (full_line, cond_line) in full_methods.iter().zip(&cond_methods) {
+                    assert!(
+                        full_line.starts_with(cond_line),
+                        "chief={is_chief}: condensed line is not a prefix of the full line:\n{cond_line}"
+                    );
+                    if cond_line.len() < full_line.len() {
+                        assert!(
+                            cond_line.ends_with('.'),
+                            "chief={is_chief}: cut line must end at a sentence boundary:\n{cond_line}"
+                        );
+                        assert!(
+                            full_line[cond_line.len()..].starts_with(' '),
+                            "chief={is_chief}: cut must fall before a space:\n{cond_line}"
+                        );
+                        // A mid-abbreviation or mid-parenthetical cut ends
+                        // with '.' too and would slip past the boundary
+                        // checks above — require balanced backticks/parens
+                        // and a non-dotted last word on the kept text.
+                        assert!(
+                            cond_line.matches('`').count() % 2 == 0,
+                            "chief={is_chief}: cut left an unbalanced backtick:\n{cond_line}"
+                        );
+                        if full_line.matches('(').count() == full_line.matches(')').count() {
+                            assert!(
+                                cond_line.matches('(').count() == cond_line.matches(')').count(),
+                                "chief={is_chief}: cut left an unbalanced paren:\n{cond_line}"
+                            );
+                        }
+                        let last_word = cond_line
+                            .trim_end_matches('.')
+                            .rsplit([' ', '('])
+                            .next()
+                            .unwrap_or("");
+                        assert!(
+                            !matches!(
+                                last_word.to_ascii_lowercase().as_str(),
+                                "e.g" | "i.e" | "etc" | "vs" | "cf" | "approx" | "min" | "no"
+                            ),
+                            "chief={is_chief}: cut fell after an abbreviation:\n{cond_line}"
+                        );
+                    }
+                }
+                // A first physical line that wraps mid-sentence into a
+                // continuation line would be kept whole (no `. ` found)
+                // while its continuation is dropped, leaving dangling text:
+                // any full method line owning continuation lines must either
+                // get cut or end with terminal punctuation.
+                let mut full_lines = full_api.lines().peekable();
+                while let Some(line) = full_lines.next() {
+                    if !line.starts_with("  ws.") {
+                        continue;
+                    }
+                    let has_continuation = full_lines.peek().is_some_and(|next| {
+                        let t = next.trim_start();
+                        !t.is_empty() && next.len() - t.len() >= 4
+                    });
+                    if has_continuation {
+                        let cond_line = cond_methods
+                            .iter()
+                            .find(|c| line.starts_with(*c))
+                            .unwrap_or_else(|| {
+                                panic!("chief={is_chief}: no condensed line for:\n{line}")
+                            });
+                        assert!(
+                            cond_line.len() < line.len()
+                                || cond_line.ends_with('.')
+                                || cond_line.ends_with(':'),
+                            "chief={is_chief}: uncut line with dropped continuation does not \
+                             end a sentence:\n{cond_line}"
+                        );
+                    }
+                }
+                for line in cond_api.lines() {
+                    let trimmed = line.trim_start();
+                    assert!(
+                        line.len() - trimmed.len() < 4 || trimmed.is_empty(),
+                        "chief={is_chief}: condensed API section kept a continuation line:\n{line}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Size budget for the system-prompt copy: the all-defaults non-chief
+    // rendering (the common case for truncating providers) stays under 21k
+    // chars — roughly half the ~40k full text.
+    #[test]
+    fn condensed_description_size_budget() {
+        let condensed =
+            condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
+        assert!(
+            condensed.len() < 21_000,
+            "condensed all-on description is {} bytes, over the 21k budget",
+            condensed.len()
+        );
+    }
+
+    // `[agentFeatures]` gating composes: a disabled namespace is absent from
+    // the condensed text (index entry and method lines both).
+    #[test]
+    fn condensed_description_prunes_gated_features() {
+        for (prefixes, disable) in feature_cases() {
+            let mut features = AgentFeaturesSettings::default();
+            disable(&mut features);
+            let condensed = condensed_workspace_api_description(false, &features, &[]);
+            for prefix in prefixes {
+                assert!(
+                    !condensed.contains(prefix),
+                    "condensed description still advertises gated `{prefix}`"
+                );
+            }
+        }
+    }
+
+    // Specialist model options ride the condensed rendering (the compact
+    // tools/list text cannot carry them), spliced under the
+    // `ws.agent.delegate` line by the same injection as the full text.
+    #[test]
+    fn condensed_description_injects_model_options() {
+        let options = vec![SpecialistModelOptions {
+            specialist: "implementor".to_string(),
+            default_model: Some("auggie:claude-opus-5".to_string()),
+            options: vec![SpecialistModelOption {
+                model: "opencode:kimi-k3".to_string(),
+                hint: "cheap".to_string(),
+                reasoning_effort: String::new(),
+            }],
+        }];
+        let condensed =
+            condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &options);
+        assert!(
+            condensed.contains(
+                "implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"
+            ),
+            "condensed description must carry the specialist model options"
+        );
+        let delegate_pos = condensed.find("  ws.agent.delegate(").unwrap();
+        let options_pos = condensed.find("Specialist model options").unwrap();
+        assert!(
+            options_pos > delegate_pos,
+            "options block must sit under the ws.agent.delegate line"
+        );
+    }
+
+    // The sentence splitter's abbreviation guard: a `. ` after `e.g` / `i.e`
+    // etc. is not a sentence end, an ellipsis is skipped, and a
+    // single-sentence comment is returned whole.
+    #[test]
+    fn first_sentence_end_handles_abbreviations() {
+        assert_eq!(first_sentence_end("One sentence only"), None);
+        assert_eq!(first_sentence_end("First. Second."), Some(6));
+        assert_eq!(
+            first_sentence_end("Overrides it (e.g. a submodule's repo); echoed back. More."),
+            Some(52)
+        );
+        assert_eq!(
+            first_sentence_end("Keep watching... then stop. More."),
+            Some(27)
+        );
     }
 
     // ---- ws.help() runtime docs tests --------------------------------------
@@ -1765,13 +2111,15 @@ mod tests {
 
     // The gated `ws.` doc prefixes paired with the mutator that flips their
     // `[agentFeatures]` toggle off. Namespace-level toggles gate one
-    // `ws.<ns>.` prefix; method-level toggles (attentionRequests) gate one
-    // full method name per prefix.
+    // `ws.<ns>.` prefix; method-level toggles (attentionRequests, peerAgents)
+    // gate one full method name per prefix.
     type FeatureCase = (&'static [&'static str], fn(&mut AgentFeaturesSettings));
 
     // Each toggle mapped to the `ws.` doc prefixes it prunes and a mutator
     // that flips it off. Iterated by the assembly tests below so a new toggle
-    // cannot ship without joining the sweep.
+    // cannot ship without joining the sweep. Cases mutate from
+    // [`all_gates_open`], not the defaults — `peerAgents` defaults off, so
+    // the defaults are not the fully-open baseline.
     fn feature_cases() -> Vec<FeatureCase> {
         vec![
             (&["ws.hook."], |f| f.background_hooks = false),
@@ -1788,13 +2136,17 @@ mod tests {
                 &["ws.pr.monitors", "ws.pr.monitor", "ws.pr.unmonitor"],
                 |f| f.pr_monitor = false,
             ),
+            (&["ws.agent.retire"], |f| f.peer_agents = false),
         ]
     }
 
     // Every gate open: the defaults (all toggles on, `taskGraph` included
-    // since the default flip).
+    // since the default flip) plus the opt-in `peerAgents` (default off).
     fn all_gates_open() -> AgentFeaturesSettings {
-        AgentFeaturesSettings::default()
+        AgentFeaturesSettings {
+            peer_agents: true,
+            ..AgentFeaturesSettings::default()
+        }
     }
 
     // Hard requirement: with every gate open (the defaults), the assembled
@@ -1936,10 +2288,10 @@ mod tests {
     #[test]
     fn disabling_one_feature_prunes_only_its_lines() {
         for is_chief in [false, true] {
-            let full = workspace_api_description(is_chief, &AgentFeaturesSettings::default());
+            let full = workspace_api_description(is_chief, &all_gates_open());
             let full_methods = extract_ws_methods(&full);
             for (prefixes, disable) in feature_cases() {
-                let mut features = AgentFeaturesSettings::default();
+                let mut features = all_gates_open();
                 disable(&mut features);
                 let pruned = workspace_api_description(is_chief, &features);
                 for prefix in prefixes {
@@ -1990,6 +2342,7 @@ mod tests {
             state_snapshot: false,
             pr_monitor: false,
             task_graph: false,
+            peer_agents: false,
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
@@ -2196,6 +2549,7 @@ mod tests {
             state_snapshot: false,
             pr_monitor: false,
             task_graph: false,
+            peer_agents: false,
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),
@@ -2243,12 +2597,24 @@ mod tests {
         // Sibling `ws.agent.*` methods pass even with attentionRequests off.
         assert_eq!(denied_feature(&all_off, "agent.reportToParent"), None);
         assert_eq!(denied_feature(&all_off, "agent.list"), None);
+        // `peerAgents` gates exactly `agent.retire` — off by DEFAULT (the
+        // one opt-in toggle), so the defaults deny it too.
+        assert_eq!(
+            denied_feature(&all_off, "agent.retire"),
+            Some("agentFeatures.peerAgents")
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "agent.retire"),
+            Some("agentFeatures.peerAgents")
+        );
+        assert_eq!(denied_feature(&all_gates_open(), "agent.retire"), None);
         // Method-level entries match exactly: a longer method sharing the
         // gated method as a prefix is not over-denied.
         assert_eq!(
             denied_feature(&all_off, "agent.requestDiscussionHistory"),
             None
         );
+        assert_eq!(denied_feature(&all_off, "agent.retireOthers"), None);
         // Enabled toggles never deny.
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "hook.schedule"),

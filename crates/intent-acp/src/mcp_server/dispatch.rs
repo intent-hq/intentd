@@ -764,6 +764,21 @@ async fn workspace_host_dispatch(
             "host: method `{method}` is disabled in settings ({feature} = false)"
         ));
     }
+    // Retired-caller guard: retirement lands mid-turn (`ws.agent.retire` is
+    // terminal by contract, but the ACP stream only stops at the turn
+    // boundary), so without this check the retiring turn could keep issuing
+    // workspace_api calls after the mark landed. Fail closed on every
+    // subsequent frame from a retired caller — the same inertness the
+    // service layer enforces for inbound interaction.
+    if let Some(caller) = caller_agent_id.as_ref() {
+        if api.agent_is_retired(caller.clone()).await {
+            return Err(
+                "host: this agent session is retired — the session is inert and no further \
+                 workspace_api calls run (only the user can restore it via agent.restore)"
+                    .to_string(),
+            );
+        }
+    }
     let args = arg.get("args").cloned().unwrap_or(Value::Null);
     if let Some(v) = super::bindings::try_dispatch(
         &api,

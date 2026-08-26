@@ -99,10 +99,11 @@ pub struct WorkspaceMcpServer {
     is_sub_agent: bool,
     /// Whether `tools/list` serves the compact `workspace_api` description
     /// (`ProviderConfig::truncates_tool_descriptions` — providers whose MCP
-    /// client cuts long descriptions at ~2k chars). The full reference then
-    /// rides the session's system prompt via
-    /// [`Self::full_workspace_api_description`]. Defaults to `false`: every
-    /// non-flagged provider keeps today's full description byte-identical.
+    /// client cuts long descriptions at ~2k chars). The condensed reference
+    /// then rides the session's system prompt via
+    /// [`Self::condensed_workspace_api_description`]. Defaults to `false`:
+    /// every non-flagged provider keeps today's full description
+    /// byte-identical.
     compact_tool_descriptions: bool,
 }
 
@@ -209,8 +210,8 @@ impl WorkspaceMcpServer {
     /// Serve the compact `workspace_api` description from `tools/list` (the
     /// spawn-time wiring point for providers with
     /// `ProviderConfig::truncates_tool_descriptions`). The caller pairs this
-    /// with [`Self::full_workspace_api_description`] appended to the system
-    /// prompt so the full reference survives client-side truncation.
+    /// with [`Self::condensed_workspace_api_description`] appended to the
+    /// system prompt so the reference survives client-side truncation.
     #[must_use]
     pub fn with_compact_tool_descriptions(mut self, compact: bool) -> Self {
         self.compact_tool_descriptions = compact;
@@ -220,9 +221,7 @@ impl WorkspaceMcpServer {
     /// The fully assembled `workspace_api` description for THIS bridge —
     /// chief-ness, effective `[agentFeatures]` gating (sub-agent question
     /// gate folded in), and specialist model options all applied — exactly
-    /// what a non-truncating provider's `tools/list` serves. Used by the
-    /// spawn path to append the full reference to the system prompt when
-    /// `tools/list` serves the compact variant.
+    /// what a non-truncating provider's `tools/list` serves.
     #[must_use]
     pub fn full_workspace_api_description(&self) -> String {
         tools::workspace_api_description_with_model_options(
@@ -232,6 +231,22 @@ impl WorkspaceMcpServer {
             self.is_sub_agent,
         )
         .into_owned()
+    }
+
+    /// The condensed `workspace_api` reference for THIS bridge — the same
+    /// per-agent assembly as [`Self::full_workspace_api_description`]
+    /// (chief-ness, gating, model options) with every API method line cut at
+    /// its first summary sentence and continuation lines dropped (full docs
+    /// stay reachable via `ws.help()`). Used by the spawn path to append the
+    /// reference to the system prompt when `tools/list` serves the compact
+    /// variant.
+    #[must_use]
+    pub fn condensed_workspace_api_description(&self) -> String {
+        tools::condensed_workspace_api_description(
+            self.is_chief,
+            &self.effective_agent_features(),
+            &self.specialist_model_options,
+        )
     }
 
     /// Override the wall-clock budget for one `workspace_api` invocation
@@ -320,8 +335,8 @@ impl WorkspaceMcpServer {
                 // docs; with all defaults on (and no options, top-level) the
                 // assembled text is the static const unchanged. Bridges for
                 // truncating providers serve the compact variant instead —
-                // the full reference rides the system prompt
-                // (`full_workspace_api_description`).
+                // the condensed reference rides the system prompt
+                // (`condensed_workspace_api_description`).
                 let description = if t.name == "workspace_api" {
                     if self.compact_tool_descriptions {
                         tools::compact_workspace_api_description(

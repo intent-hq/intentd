@@ -124,6 +124,13 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     assert!(h["os"].is_string());
     assert!(h["arch"].is_string());
     assert!(h["hostname"].is_string());
+    assert!(
+        !h["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty"
+    );
     assert!(h["hasDisplay"].is_boolean());
 
     // `intentd stop` issues the graceful control RPC then escalates if needed.

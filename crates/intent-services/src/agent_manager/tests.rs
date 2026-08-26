@@ -144,24 +144,6 @@ fn claim_all(_: &AgentId) -> bool {
 fn release_none(_: &AgentId) {}
 
 #[test]
-fn title_case_ascii_capitalizes_first_char() {
-    assert_eq!(super::title_case_ascii("bearer"), "Bearer");
-    assert_eq!(super::title_case_ascii("basic"), "Basic");
-    assert_eq!(super::title_case_ascii("foo"), "Foo");
-    assert_eq!(super::title_case_ascii("a"), "A");
-}
-
-#[test]
-fn title_case_ascii_empty_string_returns_empty() {
-    assert_eq!(super::title_case_ascii(""), "");
-}
-
-#[test]
-fn title_case_ascii_already_capitalized_unchanged() {
-    assert_eq!(super::title_case_ascii("Bearer"), "Bearer");
-}
-
-#[test]
 fn compute_process_cap_reserves_8gb_and_budgets_1gb_per_agent() {
     assert_eq!(compute_process_cap(8 * super::GB), 4);
     assert_eq!(compute_process_cap(16 * super::GB), 8);
@@ -1159,6 +1141,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .unwrap();
@@ -1206,6 +1189,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .unwrap();
@@ -1267,6 +1251,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .unwrap();
@@ -1358,6 +1343,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .unwrap();
@@ -3897,6 +3883,7 @@ async fn seed_agent_with_task_graph(
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     mgr.services
         .store
@@ -5254,6 +5241,13 @@ async fn drain_emits_queue_processing_with_turn_id() {
 /// tests to distinguish slug-shaped vs custom titles).
 async fn seed_agent_with_title(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId, title: &str) {
     seed_agent(mgr, ws, id).await;
+    let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+    session.name_explicitly_set = true;
+    mgr.services
+        .store
+        .update_agent_session(ws, &session)
+        .await
+        .expect("mark agent name explicit");
     let mut workspace = mgr.services.store.get_workspace(ws).await.unwrap();
     workspace.title = title.to_string();
     mgr.services
@@ -7722,6 +7716,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     }
 }
 
@@ -8117,6 +8112,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     mgr.services
         .store
@@ -8596,6 +8592,67 @@ async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
     })
     .await
     .expect("re-check drain delivers the raced wake without an organic kick");
+}
+
+/// Soft-retire wake gate: `deliver_wake_message` must not start a turn on a
+/// retired session — hook dispatches, PR-monitor wakes, and batch-delegate
+/// advisory wakes can all still target one (retiring cancels neither hooks
+/// nor monitors). An idle retired agent parks the wake in the queue
+/// (`retiredParked`), and `agent.restore`'s own drain kick delivers it.
+#[tokio::test]
+async fn retired_session_parks_wake_deliveries_until_restore() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-retired-wake");
+    let id = AgentId::from("a-retired-wake");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    services
+        .agent_retire_op(id.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire");
+
+    // Idle agent + retired session: the wake queues instead of spawning a
+    // turn.
+    let out = services
+        .deliver_wake_message(&ws, &id, "[Background hook \"w\"] fired", None)
+        .await
+        .expect("wake delivery");
+    assert_eq!(out["queued"], json!(true), "wake parks while retired");
+    assert_eq!(
+        out["retiredParked"],
+        json!(true),
+        "retired park is distinguishable from a plain busy-queue fallback"
+    );
+    assert!(!mgr.is_busy(&id), "no turn spawned while retired");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "wake queued behind the retired gate"
+    );
+
+    // Restore itself kicks the drain and delivers the parked wake.
+    services
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("restore");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if services.queue_snapshot(&id).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restore's drain kick delivers the parked wake");
 }
 
 /// Regression (intent-hq/monorepo#2732): an AUTOMATIC `send_message` into an
@@ -12940,6 +12997,81 @@ mod merge_user_mcp_servers_tests {
             }
             other => panic!("expected http, got {other:?}"),
         }
+    }
+
+    /// The reshape path builds its header via the shared
+    /// `McpOauthService::authorization_header`, so an expired bag carrying
+    /// refresh metadata is refreshed before the header is injected.
+    #[tokio::test]
+    async fn reshape_refreshes_expired_oauth_bag_via_shared_service() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = r#"{"access_token":"refreshed-tok","expires_in":3600}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
+        // Server id unique to this test: refresh single-flight/cooldown state
+        // lives in process-wide statics keyed by server id.
+        let server_id = "srv-reshape-refresh";
+        write_servers(
+            &secrets,
+            &json!({
+                "srv-reshape-refresh": {
+                    "id": server_id, "name": "reshape-refresh", "transport": "http",
+                    "url": "https://example.test/mcp", "enabled": true
+                }
+            }),
+        );
+        let expired = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 100;
+        mgr.services
+            .store
+            .set_mcp_oauth_token(
+                server_id,
+                &serde_json::to_string(&json!({
+                    "access_token": "stale-tok",
+                    "token_type": "bearer",
+                    "expires_at": expired,
+                    "refresh_token": "rt-1",
+                    "token_endpoint": format!("http://{addr}/token"),
+                    "client_id": "cid-1",
+                }))
+                .unwrap(),
+                "2026-07-05T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        match out.get("reshape-refresh").expect("http server merged") {
+            NormalizedMcpServer::Http { headers, .. } => {
+                let headers = headers.as_ref().expect("auth header written");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer refreshed-tok"),
+                    "expired bag refreshed through the shared service",
+                );
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+        endpoint.await.unwrap();
     }
 
     #[tokio::test]

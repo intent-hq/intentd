@@ -134,6 +134,8 @@ pub mod workspace_vocabulary;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod v1_1_goldens;
+#[cfg(test)]
 mod v1_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
@@ -1207,8 +1209,8 @@ impl Services {
 
     /// Resolve the default `agent_type` declared by a specialist's `agentType`
     /// frontmatter (§18.2 / SP-B). Used at spawn time to engage the matching
-    /// internal tool denylist (§18.4) — e.g. the `ralph` specialist →
-    /// `ralph-loop`. Returns `None` when the specialist is unknown or declares no
+    /// internal tool denylist (§18.4) — e.g. a specialist declaring `task-loop`.
+    /// Returns `None` when the specialist is unknown or declares no
     /// `agentType`, leaving the caller's default agent type intact.
     pub(crate) fn specialist_agent_type(
         &self,
@@ -1217,6 +1219,27 @@ impl Services {
     ) -> Option<String> {
         self.specialists_service()
             .resolve_agent_type(specialist_id, workspace_path)
+    }
+
+    /// Whether a session's specialist id resolved to a real specialist. New
+    /// sessions carry a frozen identity snapshot; legacy sessions resolve from
+    /// the harness-pinned specialist registry.
+    pub(crate) fn session_has_recognized_specialist(
+        &self,
+        session: &AgentSession,
+        workspace_path: Option<&Path>,
+    ) -> bool {
+        let Some(specialist_id) = session.specialist.as_deref() else {
+            return false;
+        };
+        if Self::session_metadata_str(session, "specialistName").is_some() {
+            return true;
+        }
+        let entry = crate::harness::resolve_entry(&session.harness_version);
+        self.specialists_service()
+            .with_embedded(entry.doctrine.specialists)
+            .resolve_display_name(specialist_id, workspace_path)
+            .is_some()
     }
 
     /// Resolve every non-hidden specialist's delegation `modelOptions`
@@ -19394,6 +19417,17 @@ impl WorkspaceApi for Services {
                 return Err(Error::Internal(format!("Note {note_id} is not a task")));
             };
             let agent = AgentId::from(agent_id.as_str());
+            // Soft-retire inertness: an affirmatively-retired session can
+            // never work the task — reject before any note mutation. Lookup
+            // failures fall through (assignment has never required the
+            // session to exist yet).
+            if let Ok(session) = services.store.get_agent_session_summary(&agent).await {
+                if session.retired_at.is_some() {
+                    return Err(Error::InvalidParams(format!(
+                        "agent {agent} is retired; restore it with agent.restore before assigning"
+                    )));
+                }
+            }
             let already_assigned = task.assigned_agent_ids.contains(&agent);
             let should_update_status = task.status == TaskStatus::NotStarted;
             if already_assigned && !should_update_status {
@@ -22273,6 +22307,13 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_list_op(workspace_id).await })
     }
 
+    fn agent_list_including_retired(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        Box::pin(async move { self.agent_list_including_retired_op(workspace_id).await })
+    }
+
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_list_active_op().await })
     }
@@ -22974,6 +23015,36 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_delete_op(agent_id, workspace_id).await })
+    }
+
+    fn agent_is_retired(&self, agent_id: AgentId) -> BoxFuture<'_, bool> {
+        // Cheap single-column point read; missing rows and store errors
+        // report `false` per the trait contract (absence is handled by the
+        // per-method guards, and a transient read failure must not
+        // blanket-deny every workspace_api call).
+        Box::pin(async move {
+            matches!(
+                self.store.get_agent_session_retired_at(&agent_id).await,
+                Ok(Some(_))
+            )
+        })
+    }
+
+    fn agent_retire(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        reason: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_retire_op(agent_id, workspace_id, reason).await })
+    }
+
+    fn agent_restore(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_restore_op(agent_id, workspace_id).await })
     }
 
     fn agent_schedule_delete(

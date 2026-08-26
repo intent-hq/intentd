@@ -1,11 +1,11 @@
-//! Harness v2: v1 system text with updated common doctrine for scoped sibling
-//! workspace handoffs.
+//! Harness v2: v1.1 doctrine with scoped sibling workspace handoffs added to
+//! the common guidance. Text surfaces and specialist bytes remain unchanged.
 
 use super::{Doctrine, HarnessEntry};
 
 static DOCTRINE: Doctrine = Doctrine {
     instructions: &crate::instructions::V2,
-    specialists: crate::specialists::EMBEDDED_BUNDLED_V1,
+    specialists: crate::specialists::EMBEDDED_BUNDLED_V1_1,
 };
 
 pub(crate) static ENTRY: HarnessEntry = HarnessEntry {

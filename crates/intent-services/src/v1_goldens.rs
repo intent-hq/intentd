@@ -235,6 +235,22 @@ fn golden_empty_wake_attention_reason() {
 #[test]
 fn golden_naming_tool_references() {
     assert_eq!(
+        crate::agent_manager::agent_naming_tool_reference("auggie"),
+        "the `workspace_api_workspace-mcp` tool"
+    );
+    assert_eq!(
+        crate::agent_manager::agent_naming_tool_reference("opencode"),
+        "the `workspace-mcp_workspace_api` tool"
+    );
+    assert_eq!(
+        crate::agent_manager::agent_naming_tool_reference("codex"),
+        crate::agent_manager::GENERIC_AGENT_NAMING_TOOL_REFERENCE
+    );
+    assert_eq!(
+        crate::agent_manager::GENERIC_AGENT_NAMING_TOOL_REFERENCE,
+        "the `workspace_api` tool from the workspace MCP server"
+    );
+    assert_eq!(
         crate::agent_manager::workspace_naming_tool_reference("auggie"),
         "the `set_workspace_title_workspace-mcp` tool"
     );
@@ -249,6 +265,27 @@ fn golden_naming_tool_references() {
     assert_eq!(
         crate::agent_manager::GENERIC_NAMING_TOOL_REFERENCE,
         "the `set_workspace_title` tool from the workspace MCP server"
+    );
+}
+
+#[test]
+fn golden_first_turn_naming_nudges() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.naming_nudge(Some("the `workspace_api_workspace-mcp` tool"), None),
+        "<system>\nThis agent still has a generated name. Early in your first turn, call \
+         `ws.workspace.setAgentName` through the `workspace_api_workspace-mcp` tool with a short 1–5 word \
+         task-specific name. Do this independently of workspace title naming and in parallel \
+         with information-gathering.\n</system>"
+    );
+    assert_eq!(
+        harness.naming_nudge(
+            None,
+            Some("the `set_workspace_title_workspace-mcp` tool"),
+        ),
+        "<system>\nThis workspace needs a title. As your first action, call the \
+         `set_workspace_title_workspace-mcp` tool with a short 3–5 word sentence-case title \
+         describing the task. This can be called in parallel with information-gathering.\n</system>"
     );
 }
 
@@ -1074,6 +1111,7 @@ async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     svc.store()
         .insert_agent_session(&session)
@@ -1555,11 +1593,15 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
     assert!(sub_agent.contains("## Commit Policy"));
 }
 
-/// A session stamped `harnessVersion: "1.0"` keeps the v1 doctrine after v2
-/// becomes latest. An unknown or corrupt stamp falls back to latest instead
-/// of failing.
+/// H2 regression: a session stamped `harnessVersion: "1.0"` (every pre-1.1
+/// session) resolves the v1 doctrine set and assembles the exact bytes the
+/// v1 layout produced — its common layer is the v1 body, not the v1.1
+/// or v2 rewrite (the v1 composition stays byte-pinned by the doctrine hashes
+/// below). A current-stamp session ("2.0") assembles byte-identical to the
+/// session-less (latest) assembly, and an unknown/corrupt stamp falls back
+/// to the latest instead of failing.
 #[tokio::test]
-async fn golden_v1_session_remains_pinned_after_v2() {
+async fn golden_v1_session_assembles_v1_doctrine() {
     let (_t, svc, ws) = setup().await;
     let owner = AgentId::from("agent-h2-pin");
     seed_agent(&svc, &ws, &owner).await;
@@ -1568,7 +1610,11 @@ async fn golden_v1_session_remains_pinned_after_v2() {
         .get_agent_session(&owner)
         .await
         .expect("session");
-    assert_eq!(session.harness_version, "2.0", "new sessions stamp v2");
+    assert_eq!(
+        session.harness_version,
+        intent_core::CURRENT_HARNESS_VERSION,
+        "H1 stamps the current version"
+    );
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: Some("Implement the task.".to_string()),
@@ -1597,12 +1643,40 @@ async fn golden_v1_session_remains_pinned_after_v2() {
             .expect("assembled prompt")
         }
     };
+    let latest = assemble(None).await;
+    let current = assemble(Some(session.clone())).await;
+    assert_eq!(current, latest, "current stamp == latest assembly");
+    // A "1.0"-stamped session (every pre-1.1 session) keeps assembling the
+    // v1 doctrine: its specialization-rules layer is the v1 composition.
     session.harness_version = "1.0".to_string();
     let pinned_v1 = assemble(Some(session.clone())).await;
-    let latest = assemble(None).await;
+    let v1_rules = crate::instructions::get_instruction_with_common_for(
+        &crate::instructions::V1,
+        "task-loop",
+        &features,
+    );
+    assert!(
+        pinned_v1.starts_with(&format!("{v1_rules}\n\n---\n\n")),
+        "1.0 session leads with the v1 specialization rules"
+    );
+    assert_ne!(
+        pinned_v1, latest,
+        "v1 doctrine differs from latest v2 (common.md)"
+    );
     assert!(!pinned_v1.contains("ws.workspace.proposeSibling"));
     assert!(latest.contains("ws.workspace.proposeSibling"));
-    assert_ne!(pinned_v1, latest, "v1 remains distinct from latest v2");
+    // Only the doctrine layer differs: the static layers after the
+    // specialization rules are byte-identical.
+    let latest_rules = crate::instructions::get_instruction_with_common_for(
+        crate::harness::latest_entry().doctrine.instructions,
+        "task-loop",
+        &features,
+    );
+    assert_eq!(
+        pinned_v1.strip_prefix(&v1_rules).expect("v1 prefix"),
+        latest.strip_prefix(&latest_rules).expect("latest prefix"),
+        "static layers identical across versions"
+    );
     // A stale/corrupt stamp falls back to the latest (never fails a spawn).
     session.harness_version = "9.9".to_string();
     let unknown = assemble(Some(session)).await;
@@ -1610,9 +1684,11 @@ async fn golden_v1_session_remains_pinned_after_v2() {
 }
 
 /// The bundled doctrine layers are large; pin them by SHA-256 so any change
-/// to the shipped instruction markdown (or the feature-gating composition)
-/// fails here and forces a harness-version decision. The hashes are of
-/// v1 `get_instruction_with_common_for` output with all-default agent features.
+/// to the shipped v1 instruction markdown (or the feature-gating
+/// composition) fails here and forces a harness-version decision. The
+/// hashes are of the v1-set composition with all-default agent features —
+/// pinned to `instructions::V1` explicitly (NOT the latest set) so the v1
+/// bytes stay frozen across later versions; `v1_1_goldens` pins v1.1.
 #[test]
 fn golden_bundled_doctrine_hashes() {
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
@@ -1763,6 +1839,7 @@ fn golden_isolation_hints() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,

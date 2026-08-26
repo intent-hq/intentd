@@ -70,6 +70,8 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'agent.requestDiscussion', args: { reason } }),
         reportBlocker: (reason) =>
             host({ method: 'agent.reportBlocker', args: { reason } }),
+        retire: (reason) =>
+            host({ method: 'agent.retire', args: { reason } }),
     };
 ";
 
@@ -79,17 +81,31 @@ pub(crate) const PRELUDE: &str = r"
 /// verbatim).
 pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (reason) =>\n            host({ method: 'agent.requestDiscussion', args: { reason } }),\n        reportBlocker: (reason) =>\n            host({ method: 'agent.reportBlocker', args: { reason } }),\n";
 
+/// The `ws.agent.retire` installer lines inside [`PRELUDE`], removed when
+/// `agentFeatures.peerAgents` is off — the default, since the toggle is
+/// opt-in (a unit test guards that this segment still matches the prelude
+/// verbatim).
+pub(crate) const RETIRE_PRELUDE_SEGMENT: &str = "        retire: (reason) =>\n            host({ method: 'agent.retire', args: { reason } }),\n";
+
 /// Feature-aware `ws.agent` prelude: with `agentFeatures.attentionRequests`
-/// off the two attention-request installers are omitted, so agent code
-/// touching them fails with a clear `not a function` `TypeError`. Every other
-/// `ws.agent.*` method (including `reportToParent`) stays un-gated. With the
-/// toggle on — the default — this borrows [`PRELUDE`] byte-identically.
+/// off the two attention-request installers are omitted, and with
+/// `agentFeatures.peerAgents` off (the default — it is the one opt-in
+/// toggle) the `retire` installer is omitted, so agent code touching them
+/// fails with a clear `not a function` `TypeError`. Every other `ws.agent.*`
+/// method (including `reportToParent`) stays un-gated. With both toggles on
+/// this borrows [`PRELUDE`] byte-identically.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str> {
-    if features.attention_requests {
-        Cow::Borrowed(PRELUDE)
-    } else {
-        Cow::Owned(PRELUDE.replacen(ATTENTION_PRELUDE_SEGMENT, "", 1))
+    if features.attention_requests && features.peer_agents {
+        return Cow::Borrowed(PRELUDE);
     }
+    let mut js = PRELUDE.to_string();
+    if !features.attention_requests {
+        js = js.replacen(ATTENTION_PRELUDE_SEGMENT, "", 1);
+    }
+    if !features.peer_agents {
+        js = js.replacen(RETIRE_PRELUDE_SEGMENT, "", 1);
+    }
+    Cow::Owned(js)
 }
 
 pub(crate) async fn dispatch(
@@ -120,6 +136,7 @@ pub(crate) async fn dispatch(
         "reportToParent" => report_to_parent(api, ws, caller, args).await,
         "requestDiscussion" => request_attention(api, ws, caller, "discussion", args).await,
         "reportBlocker" => request_attention(api, ws, caller, "blocker", args).await,
+        "retire" => retire(api, ws, caller, args).await,
         other => Err(format!("host: unknown method `agent.{other}`")),
     }
 }
@@ -592,8 +609,32 @@ async fn unwatch(
 }
 
 async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
+    // Soft retire: `agent_list` excludes retired sessions by default, so the
+    // agent-facing list never shows them (the wire `includeRetired` escape
+    // hatch is FE-only by design).
     let rows = api.agent_list(ws.clone()).await.map_err(map_err)?;
     serde_json::to_value(rows).map_err(|e| e.to_string())
+}
+
+/// Soft-retire inertness on the agent-facing read surface: resolve the
+/// target via `agent_get` (workspace-scoped) and reject retired sessions
+/// with a clear "agent is retired" error. Shared by `status` /
+/// `readConversation` / `summary` / `getQueue` — the wire-level reads
+/// (`agent.get`, `agent.getConversation`) deliberately still serve retired
+/// rows so the FE can render the preserved conversation read-only.
+async fn require_active_target(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<intent_core::AgentLite, String> {
+    let agent = api
+        .agent_get(agent_id.clone(), Some(ws.clone()))
+        .await
+        .map_err(map_err)?;
+    if agent.retired_at.is_some() {
+        return Err(format!("agent {} is retired", agent_id.as_str()));
+    }
+    Ok(agent)
 }
 
 /// `ws.agent.status` merges the target's pending queue into the result
@@ -608,10 +649,7 @@ async fn status(
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
-    let agent = api
-        .agent_get(agent_id.clone(), Some(ws.clone()))
-        .await
-        .map_err(map_err)?;
+    let agent = require_active_target(api, ws, &agent_id).await?;
     let mut out = serde_json::to_value(agent).map_err(|e| e.to_string())?;
     let queue = fetch_presented_queue(api, ws, &agent_id).await?;
     let queue: Vec<Value> = queue.into_iter().map(truncate_entry_content).collect();
@@ -631,6 +669,7 @@ async fn get_queue(
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
+    let _ = require_active_target(api, ws, &agent_id).await?;
     let queue = fetch_presented_queue(api, ws, &agent_id).await?;
     Ok(json!({
         "ok": true,
@@ -757,11 +796,13 @@ async fn read_conversation(
     args: &Value,
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    let _ = require_active_target(api, ws, &agent_id).await?;
     let last_n = args.get("lastN").and_then(Value::as_i64);
     let page_token = opt_str(args, "pageToken");
     let v = api
         .agent_get_conversation(
-            AgentId::from(agent_id_str.as_str()),
+            agent_id,
             last_n,
             Some(ws.clone()),
             page_token,
@@ -780,7 +821,9 @@ async fn summary(
     args: &Value,
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
-    api.agent_summary(ws.clone(), AgentId::from(agent_id_str.as_str()))
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    let _ = require_active_target(api, ws, &agent_id).await?;
+    api.agent_summary(ws.clone(), agent_id)
         .await
         .map_err(map_err)
 }
@@ -818,6 +861,45 @@ async fn request_attention(
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))
+}
+
+/// `ws.agent.retire`: SOFT-retire the CALLER's own agent session (no target
+/// argument; always self-scoped — callers can never retire other agents).
+/// Sets `retiredAt` via the `agent_retire` service op: the session row and
+/// its full conversation survive (still searchable), but the session is
+/// INERT — excluded from default `agent.list` reads, unreachable on the
+/// agent-facing MCP surface, and nothing may start a turn on it — until the
+/// user/FE-initiated `agent.restore` wire method clears the mark. TERMINAL
+/// for the caller: nothing after the call runs. Emits `agent:retired`; the
+/// optional `reason` rides the event payload and the log line — no new
+/// persistence.
+async fn retire(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller = caller.ok_or_else(|| "retire requires an agent caller identity".to_string())?;
+    let reason = opt_str(args, "reason");
+    tracing::info!(
+        agent = %caller,
+        workspace = %ws,
+        reason = reason.as_deref().unwrap_or("(none)"),
+        "agent.retire: soft-retiring agent session"
+    );
+    let v = api
+        .agent_retire(caller.clone(), Some(ws.clone()), reason.clone())
+        .await
+        .map_err(map_err)?;
+    let mut out = merge_ok(v);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("agentId".to_string(), json!(caller.as_str()));
+        obj.insert("retired".to_string(), json!(true));
+        if let Some(r) = reason {
+            obj.insert("reason".to_string(), json!(r));
+        }
+    }
+    Ok(out)
 }
 
 /// Build the `{ type: "agent_message", fromAgentId, fromAgentName }`

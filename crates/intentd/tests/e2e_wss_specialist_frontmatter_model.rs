@@ -358,9 +358,9 @@ async fn specialist_hidden_round_trips_over_wss() {
 }
 
 /// WSS e2e for the embedded bundled catalog: with an empty user tier and no
-/// bundled-dir override, `specialist.list` over WSS returns exactly the eight
-/// embedded reference specialists — `pr-shepherd` is gone from the bundled set
-/// (review thread `PRRT_kwDOS9Wxuc6YSV2u`).
+/// bundled-dir override, `specialist.list` over WSS returns exactly the seven
+/// catalog-visible embedded reference specialists. Retired Ralph stays directly
+/// resolvable for pinned v1 sessions, while `pr-shepherd` remains gone.
 #[tokio::test]
 async fn embedded_bundled_catalog_over_wss() {
     let data_dir = temp_data_dir();
@@ -403,16 +403,25 @@ async fn embedded_bundled_catalog_over_wss() {
             "developer",
             "implementor",
             "pr-reviewer",
-            "ralph",
             "spec-writer",
             "ui-designer",
             "verifier",
         ],
-        "bundled catalog over WSS is exactly the eight embedded ids (no pr-shepherd)"
+        "bundled catalog over WSS is exactly the seven catalog-visible embedded ids"
     );
+    assert!(!ids.contains(&"ralph"), "retired Ralph is not cataloged");
     for spec in specs {
         assert_eq!(spec["source"], "bundled", "{}: embedded tier", spec["id"]);
     }
+
+    let ralph = wss_rpc(&mut ws, 3, "specialist.get", json!({ "id": "ralph" })).await;
+    assert_eq!(ralph["specialist"]["source"], "bundled");
+    assert_eq!(ralph["specialist"]["hidden"], true);
+    assert_eq!(ralph["specialist"]["agentType"], "ralph-loop");
+    assert!(ralph["specialist"]["roleReminder"]
+        .as_str()
+        .unwrap()
+        .starts_with("You are Ralph."));
 
     drop(daemon);
 }

@@ -312,6 +312,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store
             .insert_agent_session(&session1)
@@ -371,6 +372,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store
             .insert_agent_session(&session2)

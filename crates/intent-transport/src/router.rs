@@ -1196,7 +1196,19 @@ async fn dispatch(
         }
         "agent.list" => {
             let ws = require_ws_note(params)?;
-            let agents = api.agent_list(ws).await.map_err(domain_to_rpc)?;
+            // Soft retire (§5.5): retired rows are excluded by default;
+            // `includeRetired: true` serves them too (carrying `retiredAt`).
+            let include_retired = params
+                .get("includeRetired")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let agents = if include_retired {
+                api.agent_list_including_retired(ws)
+                    .await
+                    .map_err(domain_to_rpc)?
+            } else {
+                api.agent_list(ws).await.map_err(domain_to_rpc)?
+            };
             Ok(json!({ "agents": agents }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
@@ -1807,6 +1819,19 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "cancelled": cancelled }))
+        }
+        "agent.restore" => {
+            // Soft retire undo (§5.5): clear `retiredAt`, returning the
+            // session to normal service. User/FE-initiated only — there is
+            // deliberately no MCP binding. Restoring a non-retired session
+            // is the no-op `{ success: true, restored: false }`.
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let result = api
+                .agent_restore(agent_id, ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
         }
         "agent.retry" => {
             let agent_id = require_agent_id(params)?;

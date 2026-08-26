@@ -544,6 +544,11 @@ pub(crate) struct SettingDefinition {
     pub sensitive: bool,
     /// `server.auth.token` is read-only via the API (regenerate, not set).
     pub read_only: bool,
+    /// Approximate prompt-token cost of the feature this setting gates (e.g.
+    /// "~620 tokens/session"), rendered dimmed next to the toggle in the FE.
+    /// Measured per the token-impact methodology (chars/4 on the prompt +
+    /// tool-surface text the toggle adds); omitted from the wire when `None`.
+    pub token_impact: Option<&'static str>,
 }
 
 impl SettingDefinition {
@@ -576,7 +581,17 @@ impl SettingDefinition {
         if self.sensitive {
             m.insert("sensitive".into(), json!(true));
         }
+        if let Some(impact) = self.token_impact {
+            m.insert("tokenImpact".into(), json!(impact));
+        }
         Value::Object(m)
+    }
+
+    /// Attach an approximate token-impact annotation (`tokenImpact` on the
+    /// wire) to this definition.
+    fn with_token_impact(mut self, impact: &'static str) -> Self {
+        self.token_impact = Some(impact);
+        self
     }
 
     /// Validate `value` against this definition (type / enum / min / max).
@@ -661,6 +676,7 @@ fn boolean(
         default_value: Some(json!(default)),
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -680,6 +696,7 @@ fn string(
         default_value: default.map(|s| json!(s)),
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -699,6 +716,7 @@ fn bind_address_definition() -> SettingDefinition {
         default_value: Some(json!("127.0.0.1")),
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -717,6 +735,7 @@ fn secret(
         default_value: None,
         sensitive: true,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -738,6 +757,7 @@ fn number(
         default_value: Some(json!(default)),
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -828,6 +848,7 @@ fn enumerated(
         default_value: Some(json!(default)),
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -847,6 +868,7 @@ fn object(
         default_value: default,
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -1369,6 +1391,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             default_value: None,
             sensitive: false,
             read_only: false,
+            token_impact: None,
         },
         number(
             "agents.maxConcurrentAdapters",
@@ -1378,6 +1401,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(1.0),
             Some(f64::from(intent_core::config::MAX_CONCURRENT_ADAPTERS_LIMIT)),
             f64::from(intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS),
+        ),
+        number(
+            "agents.maxTopLevelAgents",
+            "Max top-level agents",
+            "Cap on live top-level (parentless) agents per workspace, enforced on the peer-spawn path (ws.agent.spawnPeer) as the runaway-spawn guard; user-created agents are never blocked by it (minimum 1; no unlimited value)",
+            "agents",
+            Some(1.0),
+            None,
+            f64::from(intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS),
         ),
         number(
             "agents.idleReapMinutes",
@@ -1434,82 +1466,103 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspaceApi",
             true,
         ),
+        // `tokenImpact` annotations: approximate prompt-token cost per toggle,
+        // measured on intentd main b6c4fe53 (chars/4, rounded to 2 significant
+        // digits). Re-measure when a toggle's prompt/tool surface changes.
         boolean(
             "agentFeatures.backgroundHooks",
             "Background hooks",
             "Expose background hooks (ws.hook.*) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~620 tokens/session"),
         boolean(
             "agentFeatures.hostExec",
             "Host exec",
             "Expose one-shot host command execution (ws.host.exec) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~50 tokens/session"),
         boolean(
             "agentFeatures.scripts",
             "Saved scripts",
             "Expose saved scripts (ws.script.*) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~240 tokens/session"),
         boolean(
             "agentFeatures.terminalAccess",
             "Terminal access",
             "Expose terminal read access (ws.terminal.*) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~50 tokens/session"),
         boolean(
             "agentFeatures.browserAutomation",
             "Browser automation",
             "Expose browser automation (ws.browser.*) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~50 tokens/session"),
         boolean(
             "agentFeatures.richChatBlocks",
             "Rich chat blocks",
             "Include rich chat block guidance (mermaid, ws-block, nav-link) in agent prompts; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~310 tokens/session"),
         boolean(
             "agentFeatures.structuredQuestions",
             "Structured questions",
             "Expose structured questions (ws.app.question.ask) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~180 tokens/session"),
         boolean(
             "agentFeatures.attentionRequests",
             "Attention requests",
             "Expose attention requests (ws.agent.reportBlocker / ws.agent.requestDiscussion) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~340 tokens/session"),
         boolean(
             "agentFeatures.stateSnapshot",
             "State snapshot",
             "Inject the per-turn agent state snapshot line into turn prompts; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~50 tokens/turn"),
         boolean(
             "agentFeatures.prMonitor",
             "PR monitor",
             "Expose centralized PR monitoring (ws.pr.monitor / ws.pr.unmonitor) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~290 tokens/session"),
         boolean(
             "agentFeatures.taskGraph",
             "Task graph teaching",
             "Teach agents the task-graph workflow (batch delegate, dependsOn/conflictsWith, @@@task fence attributes, unblocked-wake hints); docs/prompt only, APIs always work; applies to new sessions only",
             "agentFeatures",
             true,
+        )
+        .with_token_impact("~170 tokens/session + variable per completion wake"),
+        boolean(
+            "agentFeatures.peerAgents",
+            "Peer agents",
+            "Expose independent peer-agent spawning and self-retire (ws.agent.spawnPeer / ws.agent.retire) to agents; applies to new sessions only",
+            "agentFeatures",
+            false,
         ),
         number(
             "prMonitor.debounceSeconds",
@@ -2658,6 +2711,37 @@ mod tests {
         );
     }
 
+    /// `agents.maxTopLevelAgents` is a TOML-backed bounded number (minimum 1,
+    /// no unlimited value, default 20) registered in `KNOWN_PATHS`, and its
+    /// catalog default matches the schema default so the FE never shows a
+    /// default the daemon does not use.
+    #[test]
+    fn max_top_level_agents_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.maxTopLevelAgents")
+            .expect("agents.maxTopLevelAgents missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(1.0),
+                max: None
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(20.0)));
+        assert_eq!(intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS, 20);
+        assert_eq!(
+            SettingsFile::default().agents.max_top_level_agents,
+            intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.maxTopLevelAgents"));
+        def.validate(&json!(1))
+            .expect("the minimum itself is legal");
+        def.validate(&json!(0))
+            .expect_err("0 must be rejected — there is no unlimited value");
+    }
+
     /// `server.maxOutstandingRpcs` is a non-secret TOML-backed bounded number
     /// (0 = unlimited, max 100k, default 256) registered in `KNOWN_PATHS`, and
     /// its description states the restart requirement (the limiter is built
@@ -3004,9 +3088,10 @@ mod tests {
     }
 
     /// The `agentFeatures.*` toggles are TOML-backed booleans — all default
-    /// `true`: each has a catalog entry in the `agentFeatures` category and a
-    /// `KNOWN_PATHS` entry, and each round-trips through the registry-wired
-    /// service (default origin → file override → reset).
+    /// `true` except `peerAgents` (opt-in, default `false`): each has a
+    /// catalog entry in the `agentFeatures` category and a `KNOWN_PATHS`
+    /// entry, and each round-trips through the registry-wired service
+    /// (default origin → file override → reset).
     #[tokio::test]
     async fn agent_features_toggles_round_trip_via_registry() {
         let paths = [
@@ -3021,6 +3106,7 @@ mod tests {
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
             ("agentFeatures.taskGraph", true),
+            ("agentFeatures.peerAgents", false),
         ];
         for (path, default) in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -3087,6 +3173,51 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// Each `agentFeatures.*` toggle carries an approximate `tokenImpact`
+    /// annotation (post-shrink numbers, intentd main b6c4fe53) serialized as
+    /// the optional `tokenImpact` wire field; unannotated definitions omit
+    /// the key entirely.
+    #[test]
+    fn agent_features_toggles_carry_token_impact_annotations() {
+        let expected = [
+            ("agentFeatures.backgroundHooks", "~620 tokens/session"),
+            ("agentFeatures.hostExec", "~50 tokens/session"),
+            ("agentFeatures.scripts", "~240 tokens/session"),
+            ("agentFeatures.terminalAccess", "~50 tokens/session"),
+            ("agentFeatures.browserAutomation", "~50 tokens/session"),
+            ("agentFeatures.richChatBlocks", "~310 tokens/session"),
+            ("agentFeatures.structuredQuestions", "~180 tokens/session"),
+            ("agentFeatures.attentionRequests", "~340 tokens/session"),
+            ("agentFeatures.stateSnapshot", "~50 tokens/turn"),
+            ("agentFeatures.prMonitor", "~290 tokens/session"),
+            (
+                "agentFeatures.taskGraph",
+                "~170 tokens/session + variable per completion wake",
+            ),
+        ];
+        for (path, impact) in expected {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert_eq!(def.token_impact, Some(impact), "{path} token impact");
+            assert_eq!(
+                def.definition_json()["tokenImpact"],
+                json!(impact),
+                "{path} tokenImpact wire field"
+            );
+        }
+
+        // Unannotated definitions omit the wire key entirely.
+        let plain = find_definition("workspaceApi.toonOutput").expect("toonOutput missing");
+        assert_eq!(plain.token_impact, None);
+        assert!(
+            !plain
+                .definition_json()
+                .as_object()
+                .unwrap()
+                .contains_key("tokenImpact"),
+            "unannotated definition must omit tokenImpact"
+        );
     }
 
     /// `[prMonitor]` exposes two TOML-backed numbers with a floor of 10:

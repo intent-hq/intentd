@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.57] - 2026-08-25
+
+### 🚀 Features
+
+- *(acp)* Ws.chat.unread() unread digest behind opt-in unreadSummaries toggle ([#1469](https://github.com/intent-hq/intentd/pull/1469))
+- Peer agent collaboration - agentFeatures settings, soft agent retire ([#1451](https://github.com/intent-hq/intentd/pull/1451))
+
+### 🧪 Testing
+
+- *(intentd)* Deflake sub-threshold dequeue-annotation WSS e2e via measured wait ([#1472](https://github.com/intent-hq/intentd/pull/1472))
+
+### ⚙️ Miscellaneous Tasks
+
+- Revert ws.chat.unread() unread digest ([#1469](https://github.com/intent-hq/intentd/pull/1469)) ([#1475](https://github.com/intent-hq/intentd/pull/1475))
+
+
+## [0.7.56] - 2026-08-25
+
+### 🚀 Features
+
+- *(agents)* Reject explicit watches on an agent already waiting on the caller ([#1456](https://github.com/intent-hq/intentd/pull/1456))
+- *(harness)* Mint harness v1.1 with rewritten feature sections ([#1464](https://github.com/intent-hq/intentd/pull/1464))
+- *(acp)* Condensed ws.* docs rendering for the system prompt ([#1465](https://github.com/intent-hq/intentd/pull/1465))
+- Emit stalled/resumed agent:stream:status events mid-turn ([#1462](https://github.com/intent-hq/intentd/pull/1462))
+- Remove Ralph specialist and ralph-loop agent type ([#1458](https://github.com/intent-hq/intentd/pull/1458))
+- Refresh expired MCP OAuth tokens at header build time ([#1463](https://github.com/intent-hq/intentd/pull/1463))
+- *(settings)* TokenImpact annotations on agentFeatures definitions ([#1467](https://github.com/intent-hq/intentd/pull/1467))
+- *(transport)* Expose prettyHostname on host.status, server.pairingInfo, and system.status ([#1466](https://github.com/intent-hq/intentd/pull/1466))
+
+### 🐛 Bug Fixes
+
+- Restore first-turn self-naming for user-created agents ([#1454](https://github.com/intent-hq/intentd/pull/1454))
+- *(services)* Exclude idle children from runningSubAgents snapshot count ([#1457](https://github.com/intent-hq/intentd/pull/1457))
+- *(events)* Cap event.query response size below the 1 MiB frame warn threshold
+
+### 🧪 Testing
+
+- *(intentd)* Deflake e2e_wss_auto_unarchive by keeping the autoUnarchive frame ([#1460](https://github.com/intent-hq/intentd/pull/1460))
+
+
 ## [0.7.55] - 2026-08-24
 
 ### 🚀 Features

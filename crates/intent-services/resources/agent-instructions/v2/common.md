@@ -17,11 +17,7 @@ ws.agent.delegate({ taskNoteId: "def-456", waitMode: "after_all" })
 
 ### Task relations during delegation
 
-Delegate tasks individually with `ws.agent.delegate({ taskNoteId, specialist, model, ... })`, choosing the specialist and model per task, in the batch sizes your workflow calls for — an individual delegation starts its task as asked, without enforcing relations. Task relations (`dependsOn`/`conflictsWith`) declared on the tasks feed back through batch results and wake messages:
-
-- **Batch results report graph state.** A batch call (`tasks: [taskNoteId, ...]`) starts only the tasks whose relations allow it; each result carries a disposition (`started` / `held:blocked-on-deps` / `held:conflict` / `skipped`; every non-started row names a reason), a top-level `summary` (started/held/skipped/errors counts) plus a `warning` when zero tasks started — read them, not just `ok` — and `unlockPlan` names which held tasks become startable when the running set settles. With effort estimates on the tasks, `unlockPlan.criticalPathMinutes` estimates the serial work remaining — reported when any requested chain carries an explicit estimate, and reflecting only estimated chains, so it can understate when an unestimated chain is longer.
-- **Holds are advisory, not final.** A task held on an unmet dependency or a conflict with a running task is not auto-started later — delegate it yourself when the blocker clears, or proceed deliberately if you know better. A held task whose dependency was cancelled or deleted comes back flagged "decision needed": resolve it with the user rather than re-delegating in a loop. A dependency whose agent failed is not flagged — it stays plain `held:blocked-on-deps`, so check the dependency's task status if a hold persists.
-- **Completion wakes name newly unblocked tasks.** When a delegated task's completion makes other tasks startable, the wake message carries an advisory section — `Tasks now unblocked by this completion: [Title](intent://local/task/{id}) (deps satisfied)` / `(conflict cleared)` — computed fresh when the wake is delivered, so it reflects current task state even if the wake sat queued behind your busy turn; several completions delivered together coalesce into one section headed `Tasks now unblocked by these completions:`. Treat it as a hint, not an action: nothing auto-starts, so delegate the unblocked tasks you want started next. An entry annotated "needs attention" (waiting / discussion_needed / blocked / review_required) is unblocked on relations but sitting in an attention state — delegate will still start it, so resolve the attention state before (re)starting it.
+Individual delegation starts a task as asked; batch calls (`tasks: [...]`) enforce relations (`dependsOn`/`conflictsWith`). Read the batch result — `summary`, per-task dispositions with reasons, `warning` when zero started, `unlockPlan` — not just `ok`. Holds are advisory and never auto-start: delegate a held task yourself when its blocker clears; a hold flagged "decision needed" (dep cancelled/deleted) goes to the user, and a persisting `held:blocked-on-deps` can hide a failed dependency agent. Completion wakes may list newly unblocked tasks — a hint, nothing auto-starts; resolve a "needs attention" annotation before (re)starting that task.
 
 Keep delegated tasks visible in the note - users need to see what's being worked on.
 
@@ -76,16 +72,13 @@ Do **NOT** use `ws.agent.reportToParent` to report a blocker or ask for a discus
 
 ## Waiting on External Conditions
 
-Never block or sleep inside your turn waiting for something external (CI, another repo, a human, a service). A turn with no tool or streaming activity for a sustained period (~30 minutes) hits the inactivity timeout and is killed, so blocking waits (`sleep`, `gh pr checks --watch`, long polling loops) risk terminating your turn mid-wait. The correct way to wait: schedule a `ws.hook.*` background hook, tell the user what you're watching, and end your turn — the hook's wake message resumes you.
+Never block or sleep in your turn waiting for something external (CI, another repo, a human, a service) — an idle turn is killed after ~30 minutes. Instead: schedule a `ws.hook.*` background hook, tell the user what you're watching, and end your turn; the hook's wake resumes you. Mechanics (validation run, `hookState`, `perpetual`, TTL) are in the `ws.hook.schedule` docs.
 
-- **Instantaneous checks only.** Each run has a 60s budget but should take seconds. To detect a change, return `{ dispatch: false, state }` and diff the next run's check against the injected `hookState` global.
-- **Timer** ("continue in X minutes"): schedule a hook with `delayMs` = X minutes whose scheduled run just returns `{ dispatch: true, message }`. Arm it in the immediate validation run: when `hookState` is `undefined`, return `{ dispatch: false, state: { armed: true } }`.
-- **Perpetual hooks** (`perpetual: true`): a dispatch wakes you WITHOUT retiring the hook — it returns to `scheduled` and keeps running on its cadence until its TTL elapses, you cancel it, or a failing run evicts it. Use it when you want a stream of updates from one watch (e.g. every new PR comment) instead of one fire; each fire's wake says both that it fired and that it stays active until `expiresAt`, so cancel it with `ws.hook.cancel` once the watch is no longer useful. Default (omitted / `false`) is one-shot: the first dispatch retires the hook.
-- **Prefer existing primitives** for in-workspace waits: `ws.event.subscribe` for file/task/git events, `ws.agent.watch` for sibling agents. Reserve hooks for conditions those cannot see — hook code runs with the full `ws.*` API, so make the hook self-checking: for PR watching it calls `ws.pr.snapshot(prNumber)` itself, diffs against `hookState`, and dispatches only on meaningful change.
-- **Cross-repo PRs**: `ws.pr.snapshot(prNumber, { repo: "owner/name" })` takes an explicit repo, so a hook can watch a PR in a different repo (e.g. a submodule PR) the same way — diff that snapshot against `hookState`. For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.
-- **Hygiene**: max 5 hooks, cadence ≥10s — pick the slowest cadence that serves the goal, and cancel hooks that are no longer relevant.
-- **Report before waiting** (delegated agents): before ending your turn to wait on a hook, call `ws.agent.reportToParent` describing what you're watching and the expected wake condition, and set your task note status to `waiting` (`ws.task.updateNoteStatus`) so you don't look stalled.
-- **TTL**: every hook expires at most 24 hours after creation. On expiry you're woken with an expiry message and must decide whether to reschedule. Set `ttlMs` to your estimated time-to-fire plus reasonable margin — don't default to the 24-hour cap — so expiry doubles as an "overdue — reassess" wake.
+- Make hooks self-checking and instant: do the check in the hook, diff against `hookState`, dispatch only on meaningful change. For a PR in another repo (e.g. a submodule), `ws.pr.snapshot(prNumber, { repo: "owner/name" })` takes an explicit repo.
+- Timer ("continue in X min"): `delayMs` = X min, return `{dispatch:true,message}`; in the immediate validation run return `{dispatch:false,state:{armed:true}}`.
+- Prefer `ws.event.subscribe` (files/tasks/git), `ws.agent.watch` (sibling agents), `ws.pr.monitor` (PRs) over hooks.
+- Hygiene: max 5 hooks, slowest useful cadence, cancel stale hooks; set `ttlMs` to expected time-to-fire + margin, not the 24 h cap.
+- Delegated agents: before waiting, `ws.agent.reportToParent` what you're watching and set your task note status to `waiting`.
 
 ## Response Organization
 
@@ -114,13 +107,4 @@ Your chat responses render rich blocks directly — not just notes. Supported fe
 | Code reference | `ws-block:reference` | JSON: `{"semanticId": "src/file.ts#symbol:Foo", "description": "..."}` (or `"filePath"`; `#L10-20` line ranges supported) |
 | Navigation link | `nav-link` | JSON: `{"target": "...", "label": "..."}` or shorthand `target \| label` (label optional) |
 
-Use mermaid to sketch architecture/flows, cli for a command the user can run, reference to point at code, nav-link to render a clickable navigation chip. nav-link targets are in-app routes (e.g. `/settings#mcp-servers`) or `intent://` links; only use targets you know exist — unresolvable targets render as plain text with no click affordance. Example:
-
-```mermaid
-flowchart LR
-  A[Client] --> B[Daemon]
-```
-
-Mermaid renders live and invalid source shows a parse error inline — keep node/edge labels plain (no backticks or quotes).
-
-You can also embed workspace image files inline with standard markdown: `![alt](intent://local/file/<workspace-relative-path>)`. Images only (png, jpg/jpeg, gif, webp — no SVG, no video); the path is relative to the workspace root, with special characters percent-encoded. Inline images render in the chat and click to zoom in a lightbox; an `intent://local/file/...` link to a non-image file opens it in the workspace file viewer.
+Use mermaid to sketch architecture/flows (keep node/edge labels plain — no backticks or quotes; invalid source shows a parse error inline), cli for a command the user can run, reference to point at code, nav-link for a clickable navigation chip (targets are in-app routes like `/settings#mcp-servers` or `intent://` links; unresolvable targets render as plain text). Embed workspace images with `![alt](intent://local/file/<workspace-relative-path>)` — png/jpg/gif/webp only, path relative to the workspace root, percent-encoded.
