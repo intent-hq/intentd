@@ -284,6 +284,95 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for specialist aliases (PROTOCOL §5.11): the bundled v1.1
+/// `spec-writer` carries `aliases: ["coordinator"]`, so `agent.create` with
+/// `specialistId: "coordinator"` persists the CANONICAL id (`spec-writer`)
+/// on the session — surfaced as `metadata.specialist` — and resolves the
+/// specialist's display name; `specialist.get` on the alias serves the
+/// canonical resolved view.
+#[tokio::test]
+async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // Pre-seed a workspace (repository_path so project-tier resolution has a
+    // root; the alias itself resolves from the embedded bundled floor).
+    let ws_id = {
+        use intent_core::WorkspaceId;
+        use intent_store::Store;
+        let db_path = data_dir.join("intentd.db");
+        let store = Store::open(&db_path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let mut workspace = workspace_seed(&ws);
+        workspace.repository_path = Some(data_dir.to_string_lossy().to_string());
+        store.insert_workspace(&workspace).await.expect("insert ws");
+        ws.0
+    };
+
+    // Hermetic empty user tier: HOME=data_dir with no specialists written.
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // specialist.get on the alias serves the canonical resolved view.
+    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "coordinator" })).await;
+    assert_eq!(
+        got["specialist"]["id"], "spec-writer",
+        "alias resolves to the canonical def over WSS"
+    );
+    assert_eq!(got["specialist"]["aliases"], json!(["coordinator"]));
+
+    // agent.create with the alias persists the canonical specialist id and
+    // derives the display name from the canonical specialist. The explicit
+    // compound model satisfies provider resolution (the bundled spec-writer
+    // pins no frontmatter model and this hermetic env configures no default
+    // provider) without touching the alias seam under test.
+    let created = wss_rpc(
+        &mut ws,
+        3,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "specialistId": "coordinator",
+            "model": "auggie:opus"
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().expect("agent id");
+    assert_eq!(
+        created["agent"]["metadata"]["specialist"], "spec-writer",
+        "alias create persists the canonical id, not the alias"
+    );
+    assert_eq!(created["agent"]["name"], "Coordinator");
+
+    // agent.get round-trips the canonical id from the persisted row.
+    let get_res = wss_rpc(&mut ws, 4, "agent.get", json!({ "agentId": agent_id })).await;
+    assert_eq!(
+        get_res["agent"]["metadata"]["specialist"], "spec-writer",
+        "persisted session carries the canonical id"
+    );
+
+    drop(daemon);
+}
+
 /// WSS e2e for the optional `hidden` flag (PROTOCOL §5.11): a user-tier
 /// specialist whose frontmatter sets `hidden: true` surfaces the boolean on
 /// `specialist.get` and `specialist.list` over the real WSS transport, while a

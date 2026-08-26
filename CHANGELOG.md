@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.60] - 2026-08-26
+
+### 🚀 Features
+
+- *(providers)* Gate cortex and droid behind enable env vars ([#1482](https://github.com/intent-hq/intentd/pull/1482))
+
+### 🐛 Bug Fixes
+
+- *(services)* Suppress mid-turn stall advisory while a tool call is in flight ([#1481](https://github.com/intent-hq/intentd/pull/1481))
+
+### 🧪 Testing
+
+- *(intentd)* Deflake tunnel oversize 1009 close under parallel suite load ([#1486](https://github.com/intent-hq/intentd/pull/1486))
+
+
 ## [0.7.59] - 2026-08-26
 
 ### 🚀 Features
