@@ -380,6 +380,111 @@ async fn get_subscriptions_stays_within_statement_budget() {
     );
 }
 
+/// Regression test for intent-hq/monorepo#3540: every queue mutation
+/// persists the agent's WHOLE queue write-through, and the persist used to
+/// insert one row per statement — so the Nth send/queue against an N-entry
+/// queue cost O(N) statements (150 statements / 1.2s observed on a single
+/// `agent.sendMessage` at coordinator fan-out scale). The snapshot insert is
+/// now a chunked bulk statement, keeping every queue mutation at a flat
+/// statement count regardless of queue depth.
+///
+/// Hermetic shape: an assistant message carrying a pending-question resource
+/// block arms the question hold, whose drain gate parks automatic-origin
+/// entries (no provider turn ever spawns). 40 `agent.queueMessage` calls then
+/// grow the queue to 40 entries; pre-fix the later dispatches ran 40+
+/// statements each (DELETE + one INSERT per entry), tripping the default
+/// budget of 25 — the batched shape stays at a handful per call.
+#[tokio::test]
+async fn queue_mutations_stay_within_statement_budget_at_depth() {
+    let (_daemon, socket, log_path) = spawn_daemon("itdp-queue", &[]);
+    assert!(await_socket(&socket).await, "daemon did not start");
+
+    let repo = create_repo_with_config("{}");
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.create",
+        json!({ "repositoryPath": repo.0.to_str().unwrap() }),
+    )
+    .await;
+    let workspace_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let resp = rpc_with_params(
+        &socket,
+        "agent.create",
+        json!({ "workspaceId": workspace_id, "name": "Queue Agent", "model": "auggie:sonnet4.5" }),
+    )
+    .await;
+    let agent_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Arm the question hold so queued entries park instead of draining into
+    // a (non-hermetic) provider turn.
+    let question_blocks = json!([{
+        "type": "resource",
+        "resource": {
+            "uri": "intent://question/q-1",
+            "mimeType": "application/vnd.intent.question+json",
+            "text": "{\"questions\":[]}"
+        }
+    }]);
+    let resp = rpc_with_params(
+        &socket,
+        "agent.appendMessage",
+        json!({
+            "workspaceId": workspace_id,
+            "agentId": agent_id,
+            "role": "assistant",
+            "contentBlocks": question_blocks,
+        }),
+    )
+    .await;
+    assert!(resp["error"].is_null(), "question append failed: {resp}");
+
+    for i in 0..40 {
+        let resp = rpc_with_params(
+            &socket,
+            "agent.queueMessage",
+            json!({
+                "workspaceId": workspace_id,
+                "agentId": agent_id,
+                "content": format!("queued message {i}"),
+            }),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "queueMessage {i} failed: {resp}");
+    }
+
+    // All 40 entries are parked (the hold never released).
+    let resp = rpc_with_params(
+        &socket,
+        "agent.getQueue",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["queue"].as_array().map(Vec::len),
+        Some(40),
+        "resp: {resp}"
+    );
+
+    // The WARNs (were they wrongly emitted) land on stderr before each
+    // response frame is written, so a single read after the calls suffices.
+    let log = std::fs::read_to_string(&log_path).expect("read daemon log");
+    assert_eq!(
+        count_lines(
+            &log,
+            &["exceeded SQL statement budget", "method=agent.queueMessage"]
+        ),
+        0,
+        "agent.queueMessage exceeded the statement budget at queue depth, log:\n{log}"
+    );
+}
+
 /// Regression test for intent-hq/monorepo#2994: `workspace.transfer.plan`
 /// used to compute its per-table row stats with 2 statements per
 /// `TRANSFER_TABLES` entry (PRAGMA `table_info` + per-table aggregate, ~56
