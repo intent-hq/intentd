@@ -564,9 +564,12 @@ fn parse_team_agents_frontmatter(raw: &str) -> Option<Vec<Value>> {
 const ALIASES_KEY: &str = "aliases";
 
 /// Strictly validate a wire `aliases` value (`specialist.create`/`edit`
-/// specs): must be a JSON array of non-empty (non-whitespace) strings.
-/// Returns the entries in input order (`None` when the key is absent — the
-/// inherit-on-omit case); any invalid shape → `-32602`.
+/// specs): must be a JSON array of non-empty (non-whitespace) strings, and —
+/// stricter than `teamAgents` — each entry must itself pass `validate_id`
+/// (aliases are looked up exactly like specialist ids, so an entry
+/// `alias_target` could never match, e.g. `"foo/bar"`, would be a silently
+/// dead alias). Returns the entries in input order (`None` when the key is
+/// absent — the inherit-on-omit case); any invalid shape → `-32602`.
 fn validate_aliases_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
     let Some(value) = value else { return Ok(None) };
     let Some(arr) = value.as_array() else {
@@ -577,7 +580,14 @@ fn validate_aliases_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
     let mut out = Vec::with_capacity(arr.len());
     for entry in arr {
         match entry.as_str() {
-            Some(s) if !s.trim().is_empty() => out.push(json!(s)),
+            Some(s) if !s.trim().is_empty() => {
+                validate_id(s).map_err(|_| {
+                    Error::InvalidParams(format!(
+                        "aliases entries must be valid specialist ids: {s:?}"
+                    ))
+                })?;
+                out.push(json!(s));
+            }
             _ => {
                 return Err(Error::InvalidParams(
                     "aliases entries must be non-empty strings".to_string(),
@@ -1824,6 +1834,12 @@ mod tests {
         assert!(validate_aliases_spec(Some(&json!("coordinator"))).is_err());
         assert!(validate_aliases_spec(Some(&json!([""]))).is_err());
         assert!(validate_aliases_spec(Some(&json!([42]))).is_err());
+        // Entries that could never resolve (fail validate_id) are rejected
+        // too — a stored dead alias would silently never match.
+        assert!(validate_aliases_spec(Some(&json!(["foo/bar"]))).is_err());
+        assert!(validate_aliases_spec(Some(&json!(["foo\\bar"]))).is_err());
+        assert!(validate_aliases_spec(Some(&json!([".."]))).is_err());
+        assert!(validate_aliases_spec(Some(&json!(["ok", "."]))).is_err());
         assert!(matches!(validate_aliases_spec(None), Ok(None)));
         assert!(matches!(
             validate_aliases_spec(Some(&json!([]))),

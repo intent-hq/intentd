@@ -966,6 +966,51 @@ async fn alias_create_persists_canonical_specialist_id() {
     );
 }
 
+/// `agent.update` honors the same canonical-id invariant as create
+/// (PROTOCOL §5.11): setting `specialist` to an alias via the update seam
+/// persists the canonical id — a wire client cannot store an alias into
+/// `metadata.specialist` through `agent.update`. Canonical, unknown, and
+/// null values pass through unchanged.
+#[tokio::test]
+async fn alias_update_persists_canonical_specialist_id() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let id = create_agent(&svc, &ws, "TestAgent", None, None).await;
+
+    // Alias → canonical id.
+    svc.agent_update_op(
+        id.clone(),
+        serde_json::json!({ "specialist": "coordinator" }),
+    )
+    .await
+    .expect("update with alias");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
+
+    // A directly-known canonical id is untouched.
+    svc.agent_update_op(
+        id.clone(),
+        serde_json::json!({ "specialist": "implementor" }),
+    )
+    .await
+    .expect("update with canonical id");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+
+    // An unknown id passes through unchanged (lenient, monorepo#3497).
+    svc.agent_update_op(id.clone(), serde_json::json!({ "specialist": "no-such" }))
+        .await
+        .expect("update with unknown id");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("no-such"));
+
+    // Null clears the field.
+    svc.agent_update_op(id.clone(), serde_json::json!({ "specialist": null }))
+        .await
+        .expect("update with null");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist, None);
+}
+
 /// Companion pin: a pre-change-style session (no frozen snapshot keys in its
 /// metadata) resolves live and DOES pick up the file edit — legacy behavior
 /// unchanged.

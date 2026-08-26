@@ -4065,7 +4065,28 @@ impl Services {
                     session.system_prompt = update_optional_string(value, "systemPrompt")?;
                 }
                 "specialist" => {
-                    session.specialist = update_optional_string(value, "specialist")?;
+                    // Same alias canonicalization as `agent_create_op`
+                    // (PROTOCOL §5.11): an alias is rewritten to the claiming
+                    // specialist's canonical id before persistence so
+                    // `metadata.specialist` never carries an alias; a
+                    // directly-known or unknown id passes through unchanged
+                    // (lenient, monorepo#3497).
+                    session.specialist = match update_optional_string(value, "specialist")? {
+                        Some(spec_id) => {
+                            let wp = self
+                                .store
+                                .get_workspace(&session.workspace_id)
+                                .await
+                                .ok()
+                                .and_then(|w| crate::git_ops::worktree_path(&w));
+                            Some(
+                                self.specialists_service()
+                                    .canonical_id(&spec_id, wp.as_deref())
+                                    .unwrap_or(spec_id),
+                            )
+                        }
+                        None => None,
+                    };
                 }
                 "taskNoteId" => {
                     session.task_note_id =
