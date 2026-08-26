@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.2] - 2026-08-26
+
+### 🚀 Features
+
+- *(mcp)* Add ws.hook.get(hookId) binding to recover retired hook scripts ([#1509](https://github.com/intent-hq/intentd/pull/1509))
+- *(transport)* Optional slim projection on note.list (protocol 8.1) ([#1508](https://github.com/intent-hq/intentd/pull/1508))
+
+### 🐛 Bug Fixes
+
+- *(acp)* Stderr drain survives connection drop so dying words are captured ([#1506](https://github.com/intent-hq/intentd/pull/1506))
+- Remove the assignment-fence quarantine from delegated agents ([#1507](https://github.com/intent-hq/intentd/pull/1507))
+- *(services)* Stderr capture hint sweeps the process group before settling ([#1512](https://github.com/intent-hq/intentd/pull/1512))
+
+
 ## [0.8.1] - 2026-08-26
 
 ### 🐛 Bug Fixes
