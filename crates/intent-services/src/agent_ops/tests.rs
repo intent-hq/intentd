@@ -20723,6 +20723,217 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
     assert!(!md["taskNoteId"].as_str().unwrap().is_empty());
 }
 
+/// monorepo#3497 companion: a STALE inherited specialist (persisted before
+/// strict validation, or whose file was since deleted) is dropped with a warn
+/// instead of failing the wake — the strict `-32602` applies only to
+/// client-supplied ids, never to legacy stored state.
+#[tokio::test]
+async fn wake_or_create_drops_stale_inherited_specialist() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Stale").await;
+    let prev = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("prev".into()),
+            None,
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create prev");
+    let prev_id = prev["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone(), None)
+        .await
+        .expect("assign prev");
+    // Simulate a pre-#3497 row: overwrite the persisted specialist with an
+    // id that no longer resolves, and mark the session non-resumable so the
+    // wake falls through to the create branch with this row as the
+    // inheritance source.
+    let mut prev_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .await
+        .expect("load prev");
+    prev_session.specialist = Some("retired-specialist".into());
+    prev_session.status = intent_core::AgentStatus::Deleted;
+    prev_session.updated_at = intent_core::now_iso();
+    svc.store()
+        .update_agent_session(&prev_session.workspace_id.clone(), &prev_session)
+        .await
+        .expect("mark prev deleted");
+
+    let resp = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id,
+            "go".into(),
+            AgentWakeOrCreateInput::default(),
+        )
+        .await
+        .expect("wake succeeds despite the stale inherited specialist");
+    assert_eq!(resp["created"], true);
+    let new_id = resp["agentId"].as_str().unwrap();
+    let session = svc
+        .store()
+        .get_agent_session(&AgentId::from(new_id))
+        .await
+        .expect("load new session");
+    assert_eq!(
+        session.specialist, None,
+        "stale inherited specialist is dropped, not persisted"
+    );
+}
+
+/// monorepo#3497 companion, fallback arm: when the inherited specialist is
+/// stale AND the client supplied a valid `create.specialist`, the drop falls
+/// through to the client value (already strict-validated) instead of no
+/// specialist.
+#[tokio::test]
+async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Fallback").await;
+    let prev = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("prev".into()),
+            None,
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create prev");
+    let prev_id = prev["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone(), None)
+        .await
+        .expect("assign prev");
+    let mut prev_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .await
+        .expect("load prev");
+    prev_session.specialist = Some("retired-specialist".into());
+    prev_session.status = intent_core::AgentStatus::Deleted;
+    prev_session.updated_at = intent_core::now_iso();
+    svc.store()
+        .update_agent_session(&prev_session.workspace_id.clone(), &prev_session)
+        .await
+        .expect("mark prev deleted");
+
+    let input = AgentWakeOrCreateInput {
+        create: Some(intent_core::AgentWakeCreateOptions {
+            specialist: Some("verifier".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "go".into(), input)
+        .await
+        .expect("wake succeeds");
+    assert_eq!(resp["created"], true);
+    let new_id = resp["agentId"].as_str().unwrap();
+    let session = svc
+        .store()
+        .get_agent_session(&AgentId::from(new_id))
+        .await
+        .expect("load new session");
+    assert_eq!(
+        session.specialist.as_deref(),
+        Some("verifier"),
+        "stale inherited id falls back to the validated create.specialist"
+    );
+}
+
+/// monorepo#3497: an unknown client-supplied `create.specialist` rejects the
+/// wakeOrCreate create branch with `-32602` even when a VALID inherited
+/// specialist would win the B4 precedence (client input never bypasses the
+/// validation), and the rejection is side-effect free — the stale-assignment
+/// purge must not have run, so the previous (deleted) agent's task assignment
+/// survives and no new session is persisted.
+#[tokio::test]
+async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Strict").await;
+    let prev = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("prev".into()),
+            None,
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create prev");
+    let prev_id = prev["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone(), None)
+        .await
+        .expect("assign prev");
+    // Mark the session deleted: the wake falls through to the create branch
+    // with this row as both the inheritance source AND a stale assignment
+    // the purge would remove.
+    let mut prev_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .await
+        .expect("load prev");
+    prev_session.status = intent_core::AgentStatus::Deleted;
+    prev_session.updated_at = intent_core::now_iso();
+    svc.store()
+        .update_agent_session(&prev_session.workspace_id.clone(), &prev_session)
+        .await
+        .expect("mark prev deleted");
+    let sessions_before = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list before")
+        .len();
+
+    let input = AgentWakeOrCreateInput {
+        create: Some(intent_core::AgentWakeCreateOptions {
+            specialist: Some("no-such-specialist".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "go".into(), input)
+        .await
+        .expect_err("unknown create.specialist must reject despite a valid inherited one");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("unknown specialist: no-such-specialist"),
+        "error names the id: {err}"
+    );
+
+    let sessions_after = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list after")
+        .len();
+    assert_eq!(sessions_after, sessions_before, "no new session persisted");
+    let task = svc
+        .get_my_task(ws.clone(), note_id)
+        .await
+        .expect("task read-back");
+    assert!(
+        task.assigned_agents.iter().any(|a| a.0 == prev_id),
+        "stale-assignment purge must not run before the rejection: {:?}",
+        task.assigned_agents
+    );
+}
+
 /// B7: `messageMetadata` is folded onto the delivered content block on the
 /// create branch (and by construction the wake branch shares the same helper).
 #[tokio::test]
@@ -28931,6 +29142,77 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
         ),
         other => panic!("expected InvalidParams, got {other:?}"),
     }
+}
+
+/// monorepo#3497: an unknown TOP-LEVEL `specialist` default fails the batch
+/// fast with one call-level `-32602` — before any row can start — instead of
+/// N identical per-row `error` dispositions; no children are persisted. An
+/// unknown per-entry override stays a per-row `error` (other rows still
+/// start), consistent with the other per-entry options.
+#[tokio::test]
+async fn batch_delegate_rejects_unknown_specialist_default_fast() {
+    let (_t, svc, ws) = setup().await;
+    let t1 = seed_task(&svc, &ws, "One").await;
+    let t2 = seed_task(&svc, &ws, "Two").await;
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                specialist: Some("no-such-specialist".into()),
+                ..batch_input(&[&t1, &t2])
+            },
+            None,
+        )
+        .await
+        .expect_err("unknown top-level specialist fails the batch up front");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains("unknown specialist: no-such-specialist"),
+            "{msg}"
+        ),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+    let agents = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list sessions");
+    assert!(agents.is_empty(), "no child persisted: {agents:?}");
+
+    // Per-entry override: only that row errors, the other still starts.
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![
+                    BatchTaskEntry::Options(BatchTaskOptions {
+                        task_note_id: t1.clone(),
+                        specialist: Some("no-such-specialist".into()),
+                        model: None,
+                        provider: None,
+                        reasoning_effort: None,
+                        agent_instructions: None,
+                    }),
+                    BatchTaskEntry::Id(t2.clone()),
+                ]),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("batch runs; the bad row becomes an error disposition");
+    let r1 = row_for(&resp, &t1);
+    assert_eq!(r1["disposition"], "error", "{resp}");
+    assert!(
+        r1["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown specialist: no-such-specialist"),
+        "{resp}"
+    );
+    let r2 = row_for(&resp, &t2);
+    assert_eq!(r2["disposition"], "started", "{resp}");
 }
 
 /// The full batch shape: ready task starts (agent created + assigned),

@@ -370,6 +370,35 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         "persisted session carries the canonical id"
     );
 
+    // An UNKNOWN specialist id is rejected with `-32602` naming the id and
+    // the known catalog ids (monorepo#3497) — no session is created.
+    let rejected = wss_rpc_raw(
+        &mut ws,
+        5,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "specialistId": "no-such-specialist",
+            "model": "auggie:opus"
+        }),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"], -32602,
+        "unknown specialist rejects with invalid-params: {rejected}"
+    );
+    let msg = rejected["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        msg.contains("unknown specialist: no-such-specialist"),
+        "error names the id: {msg}"
+    );
+    assert!(
+        msg.contains("known specialists:") && msg.contains("spec-writer"),
+        "error lists the known ids: {msg}"
+    );
+
     drop(daemon);
 }
 
