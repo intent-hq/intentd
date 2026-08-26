@@ -7673,13 +7673,44 @@ impl AgentManager {
                             } else {
                                 let dead = map.remove(&agent_id);
                                 registry.deregister(&agent_id);
-                                Some((status, dead.and_then(|mut h| h.child.take())))
+                                Some((
+                                    status,
+                                    dead.map(|mut h| (h.child.take(), Arc::clone(&h.connection))),
+                                ))
                             }
                         }
                     }
                 };
-                if let Some((status, dead_child)) = exited {
+                if let Some((status, dead)) = exited {
+                    let (dead_child, dead_conn) =
+                        dead.map_or((None, None), |(child, conn)| (child, Some(conn)));
+                    // The direct child is already reaped (`try_wait` above),
+                    // but same-group descendants can survive it: sweep the
+                    // process group via the spawn-time pid. Swept BEFORE the
+                    // settle await below so a descendant holding the stderr
+                    // write end open is killed first — EOF is then
+                    // deterministic and the capture includes its last output,
+                    // instead of the await burning its full bound and the
+                    // WARN underclaiming (monorepo#3570).
+                    if let Some(dead_child) = dead_child {
+                        kill_child_tree(dead_child, child_pid).await;
+                    }
+                    // Honest capture hint (monorepo#3570): bounded-await the
+                    // stderr drain's settle (EOF + flush — the whole group is
+                    // dead now, so EOF is normally immediate) and only name
+                    // the capture dir when THIS child's connection captured
+                    // stderr (not stale daily files from an earlier run) and
+                    // a capture file actually exists there.
+                    let mut hint = None;
                     if let Some(dir) = &stderr_dir {
+                        if let Some(conn) = &dead_conn {
+                            conn.await_stderr_settled(STDERR_SETTLE_TIMEOUT).await;
+                            if conn.stderr_captured() && stderr_capture_dir_populated(dir) {
+                                hint = Some(dir);
+                            }
+                        }
+                    }
+                    if let Some(dir) = hint {
                         tracing::warn!(
                             agent = %agent_id,
                             exit_status = %status,
@@ -7692,12 +7723,6 @@ impl AgentManager {
                             exit_status = %status,
                             "idle agent child exited unexpectedly; handle reaped"
                         );
-                    }
-                    // The direct child is already reaped (`try_wait` above),
-                    // but same-group descendants can survive it: sweep the
-                    // process group via the spawn-time pid.
-                    if let Some(dead_child) = dead_child {
-                        kill_child_tree(dead_child, child_pid).await;
                     }
                     return true;
                 }
@@ -9065,7 +9090,7 @@ async fn run_message_worker(
                         } else {
                             // STAB-53: on a child-death failure, point at the
                             // captured stderr file so the crash is diagnosable.
-                            match stderr_capture_hint(&mgr, &agent_id, &e) {
+                            match stderr_capture_hint(&mgr, &agent_id, &e).await {
                                 Some(log) => tracing::warn!(
                                     agent = %agent_id,
                                     error = %e,
@@ -9096,7 +9121,7 @@ async fn run_message_worker(
                 }
             }
             Err(e) => {
-                match stderr_capture_hint(&mgr, &agent_id, &e) {
+                match stderr_capture_hint(&mgr, &agent_id, &e).await {
                     Some(log) => tracing::warn!(
                         agent = %agent_id,
                         error = %e,
@@ -10785,7 +10810,16 @@ fn is_benign_turn_error(err: &Error) -> bool {
 /// Matches on the structured `Error::Internal` payload — the transport's
 /// child-death error is always wrapped there (handshake/prompt failures) —
 /// avoiding a Display allocation per check.
-fn stderr_capture_hint(
+///
+/// monorepo#3570: the hint is honest now — it bounded-awaits the stderr
+/// drain's settle signal (the dying child's stderr EOF + capture-file flush)
+/// on the still-installed connection, then names the directory only when
+/// THIS child's connection actually captured stderr (`stderr_captured`) and
+/// a capture file exists there. The per-connection flag keeps stale daily
+/// files an earlier run left in the same per-agent dir from turning a
+/// silent child into a misleading "stderr captured at …" claim; a child
+/// that never wrote stderr gets the plain WARN instead.
+async fn stderr_capture_hint(
     mgr: &AgentManager,
     agent_id: &AgentId,
     err: &Error,
@@ -10793,8 +10827,61 @@ fn stderr_capture_hint(
     if !matches!(err, Error::Internal(msg) if msg.contains("agent stdout closed")) {
         return None;
     }
-    mgr.agent_stderr_log_dir(agent_id)
+    let dir = mgr.agent_stderr_log_dir(agent_id)?;
+    // The teardown (`kill_child_only`) has not run yet at the WARN sites, so
+    // the handle — and its connection's settled watch — is usually still
+    // installed. Spawn-failure paths may have no handle: without a
+    // connection to vouch for a fresh capture, claim nothing.
+    let connection = mgr
+        .handles
+        .lock()
+        .unwrap()
+        .get(agent_id)
+        .map(|h| Arc::clone(&h.connection));
+    let connection = connection?;
+    connection.await_stderr_settled(STDERR_SETTLE_TIMEOUT).await;
+    (connection.stderr_captured() && stderr_capture_dir_populated(&dir)).then_some(dir)
 }
+
+/// Whether the stderr capture dir exists and holds at least one entry —
+/// gates the "agent stderr captured at …" claim (monorepo#3570). The capture
+/// file is created lazily on the first captured line, so an absent/empty dir
+/// means nothing was captured.
+fn stderr_capture_dir_populated(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+#[cfg(test)]
+mod stderr_capture_hint_tests {
+    //! monorepo#3570: the WARN's "stderr captured at" claim is gated on the
+    //! capture dir actually containing a file.
+
+    use super::stderr_capture_dir_populated;
+
+    #[test]
+    fn dir_populated_gate() {
+        let tmp = crate::tests::test_tempdir("intentd-stderr-hint-");
+        let missing = tmp.path().join("nope");
+        assert!(!stderr_capture_dir_populated(&missing), "missing dir");
+
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(!stderr_capture_dir_populated(&empty), "empty dir");
+
+        std::fs::write(empty.join("2026-08-26.log"), "boom\n").unwrap();
+        assert!(
+            stderr_capture_dir_populated(&empty),
+            "dir with a capture file"
+        );
+    }
+}
+
+/// Bound on waiting for the stderr drain to hit EOF + flush before the
+/// terminal-failure/idle-exit WARN names the capture path (monorepo#3570).
+/// The child is dead (stdout closed / exit observed), so its own stderr
+/// write end is already closed — EOF is normally immediate; the bound covers
+/// a same-group descendant holding the pipe open.
+const STDERR_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Whether `run_prompt_turn` already emitted the terminal `agent:failed` +
 /// `agent:stream:end` pair for this error. Its post-prompt failure path wraps

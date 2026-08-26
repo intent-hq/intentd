@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
 use crate::error::{AcpError, AcpResult, JsonRpcError};
@@ -112,15 +112,17 @@ const STDERR_LOG_CHANNEL_CAPACITY: usize = 256;
 /// loops warnings per line.
 struct StderrLogSink {
     tx: mpsc::Sender<String>,
+    writer: JoinHandle<()>,
     drop_warned: bool,
 }
 
 impl StderrLogSink {
     fn new(dir: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel::<String>(STDERR_LOG_CHANNEL_CAPACITY);
-        tokio::spawn(stderr_log_writer(dir, rx));
+        let writer = tokio::spawn(stderr_log_writer(dir, rx));
         Self {
             tx,
+            writer,
             drop_warned: false,
         }
     }
@@ -128,16 +130,27 @@ impl StderrLogSink {
     /// Hand a line to the writer task without ever awaiting: on a full
     /// channel (stalled disk) or a closed one (writer exited after an I/O
     /// error) the line is dropped — capture is best-effort by design.
-    fn send_line(&mut self, line: &str) {
+    /// Returns whether the writer accepted the line.
+    fn send_line(&mut self, line: &str) -> bool {
         match self.tx.try_send(line.to_string()) {
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 if !self.drop_warned {
                     self.drop_warned = true;
                     tracing::warn!("agent stderr log capture dropping lines (writer backlogged)");
                 }
+                false
             }
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
+    }
+
+    /// Close the channel and wait for the writer to drain the backlog and
+    /// flush the capture file (monorepo#3570): called at stderr EOF so
+    /// "settled" means every captured line is durably on disk.
+    async fn finish(self) {
+        drop(self.tx);
+        let _ = self.writer.await;
     }
 }
 
@@ -310,9 +323,17 @@ fn dispatch(
 
 /// A live JSON-RPC connection to a spawned agent over piped stdio.
 ///
-/// Owns the writer/reader/stderr tasks and the pending-request correlation map.
+/// Owns the writer/reader tasks and the pending-request correlation map.
 /// All outbound traffic is serialized through a single writer task; inbound
-/// traffic is routed by [`dispatch`]. Dropping the connection aborts its tasks.
+/// traffic is routed by [`dispatch`]. Dropping the connection aborts the
+/// writer/reader tasks — but NOT the stderr drain task (monorepo#3570): the
+/// drain runs to the child's stderr EOF so the dying words a crashing child
+/// writes right as teardown drops the connection still reach the capture
+/// file. Every teardown path kills the child's whole process group, which
+/// normally closes the pipe promptly — but a descendant that re-`setsid`
+/// into its OWN group survives the `killpg` and can hold the write end open,
+/// so the detached drain (and its capture file) may outlive the connection
+/// until that process exits or the daemon's shutdown sweep reaps it.
 pub struct Connection {
     writer_tx: mpsc::Sender<String>,
     pending: PendingMap,
@@ -322,6 +343,8 @@ pub struct Connection {
     client_request_seq: Arc<AtomicU64>,
     stderr: Arc<Mutex<StderrBuffer>>,
     auth_error: Arc<AtomicBool>,
+    stderr_settled: watch::Receiver<bool>,
+    stderr_captured: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -407,22 +430,46 @@ impl Connection {
             notify_reader.notify_waiters();
         }));
 
-        // Stderr task: ring-buffer recent lines, flag auth-error patterns, and
-        // append every raw line to the per-agent capture file when configured.
+        // Stderr drain task: ring-buffer recent lines, flag auth-error
+        // patterns, and append every raw line to the per-agent capture file
+        // when configured. NOT abort-on-drop (monorepo#3570): the drain runs
+        // to stderr EOF so the dying words a crashing child writes while the
+        // terminal-failure teardown drops the connection are still captured.
+        // Reads bytes + lossy-decodes so one invalid-UTF-8 blob cannot kill
+        // capture for the rest of the child's life. At EOF it finishes the
+        // sink (drain backlog + flush) and then flips the settled watch.
+        let (settled_tx, stderr_settled) = watch::channel(stderr.is_none());
+        let stderr_captured = Arc::new(AtomicBool::new(false));
         if let Some(stderr) = stderr {
             let stderr_buf_task = Arc::clone(&stderr_buf);
             let auth_flag = Arc::clone(&auth_error);
+            let captured_flag = Arc::clone(&stderr_captured);
             let patterns: Vec<String> = hooks
                 .auth_error_patterns
                 .iter()
                 .map(|p| p.to_lowercase())
                 .collect();
             let mut log_sink = hooks.stderr_log_dir.map(StderrLogSink::new);
-            tasks.push(tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    if buf.last() == Some(&b'\n') {
+                        buf.pop();
+                        if buf.last() == Some(&b'\r') {
+                            buf.pop();
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&buf);
                     if let Some(sink) = log_sink.as_mut() {
-                        sink.send_line(&line);
+                        if sink.send_line(&line) {
+                            captured_flag.store(true, Ordering::SeqCst);
+                        }
                     }
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -436,7 +483,11 @@ impl Connection {
                     }
                     stderr_buf_task.lock().unwrap().push(trimmed.to_string());
                 }
-            }));
+                if let Some(sink) = log_sink.take() {
+                    sink.finish().await;
+                }
+                let _ = settled_tx.send(true);
+            });
         }
 
         Self {
@@ -448,6 +499,8 @@ impl Connection {
             client_request_seq,
             stderr: stderr_buf,
             auth_error,
+            stderr_settled,
+            stderr_captured,
             tasks,
         }
     }
@@ -626,10 +679,34 @@ impl Connection {
     pub fn is_alive(&self) -> bool {
         !self.writer_tx.is_closed()
     }
+
+    /// Wait — bounded by `timeout` — until the stderr drain has hit EOF and
+    /// the capture sink has flushed to disk (monorepo#3570). Returns `true`
+    /// when settled (immediately when the connection had no stderr pipe),
+    /// `false` on timeout. Callers about to log "stderr captured at <path>"
+    /// after killing the child should await this first so the claim is true.
+    pub async fn await_stderr_settled(&self, timeout: Duration) -> bool {
+        let mut rx = self.stderr_settled.clone();
+        tokio::time::timeout(timeout, rx.wait_for(|settled| *settled))
+            .await
+            .is_ok_and(|r| r.is_ok())
+    }
+
+    /// Whether THIS connection's child wrote at least one stderr line that
+    /// the capture sink accepted (monorepo#3570). Distinguishes a fresh
+    /// capture from stale daily files an earlier child left in the same
+    /// per-agent dir, so the "stderr captured at <dir>" WARN never points at
+    /// a directory this child contributed nothing to.
+    pub fn stderr_captured(&self) -> bool {
+        self.stderr_captured.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Aborts the writer/reader tasks only; the stderr drain task is
+        // deliberately not owned here — it runs to stderr EOF so the child's
+        // dying words reach the capture file (monorepo#3570).
         for task in &self.tasks {
             task.abort();
         }
