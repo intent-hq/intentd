@@ -1069,6 +1069,27 @@ impl SpecialistsService {
         self.alias_target(id, workspace_path)
     }
 
+    /// Strict form of [`Self::canonical_id`] for the spawn/update seams
+    /// (monorepo#3497): an unknown id is rejected with `-32602` naming the
+    /// id and the known catalog ids, instead of being persisted verbatim
+    /// with no behavior prompt. The known-id list matches [`Self::list`]
+    /// (retired `ralph` excluded).
+    pub(crate) fn canonical_id_or_err(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Result<String> {
+        if let Some(canonical) = self.canonical_id(id, workspace_path) {
+            return Ok(canonical);
+        }
+        let mut catalog = self.collect_catalog(workspace_path);
+        catalog.remove("ralph");
+        let known = catalog.into_keys().collect::<Vec<_>>().join(", ");
+        Err(Error::InvalidParams(format!(
+            "unknown specialist: {id} (known specialists: {known}; aliases are accepted)"
+        )))
+    }
+
     /// The def inherited from the tiers **below** `scope` — the same fold
     /// [`Self::resolve`] applies, stopped before `scope` — so that
     /// `specialist.create`/`edit` responses agree with an immediately-following

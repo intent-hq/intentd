@@ -3149,9 +3149,13 @@ impl Services {
         // rung runs, so display-name/model/effort resolution, the prompt
         // snapshot, and the persisted `session.specialist` (surfaced as
         // `metadata.specialist`) all see the canonical id. A directly-known
-        // id passes through unchanged, and an unknown id is left as-is —
-        // preserving the existing lenient behavior (unknown specialist never
-        // fails the create; monorepo#3497 tracks tightening that everywhere).
+        // id passes through unchanged, and an UNKNOWN id is rejected with
+        // `-32602` naming the id and the known catalog ids (monorepo#3497)
+        // — BEFORE any side effect, so no session row is persisted. Every
+        // spawn seam funnels through here (`agent.create`, the MCP
+        // `create_agent`/`ws.agent.spawnPeer` tools, `agent.delegate`,
+        // `agent.wakeOrCreate`'s create branch, `workspace.create`'s
+        // `initialAgent`), so the validation covers them all.
         // SECURITY: the project tier resolves against the stored workspace
         // record's path, never a client-supplied one (same rationale as the
         // model resolution below).
@@ -3165,8 +3169,7 @@ impl Services {
                     .and_then(|w| crate::git_ops::worktree_path(&w));
                 Some(
                     self.specialists_service()
-                        .canonical_id(&spec_id, wp.as_deref())
-                        .unwrap_or(spec_id),
+                        .canonical_id_or_err(&spec_id, wp.as_deref())?,
                 )
             }
             None => None,
@@ -4256,8 +4259,10 @@ impl Services {
                     // (PROTOCOL §5.11): an alias is rewritten to the claiming
                     // specialist's canonical id before persistence so
                     // `metadata.specialist` never carries an alias; a
-                    // directly-known or unknown id passes through unchanged
-                    // (lenient, monorepo#3497).
+                    // directly-known id passes through unchanged and an
+                    // UNKNOWN id is rejected with `-32602` naming the id and
+                    // the known catalog ids (monorepo#3497) — the session is
+                    // left untouched. Null still clears the field.
                     session.specialist = match update_optional_string(value, "specialist")? {
                         Some(spec_id) => {
                             let wp = self
@@ -4268,8 +4273,7 @@ impl Services {
                                 .and_then(|w| crate::git_ops::worktree_path(&w));
                             Some(
                                 self.specialists_service()
-                                    .canonical_id(&spec_id, wp.as_deref())
-                                    .unwrap_or(spec_id),
+                                    .canonical_id_or_err(&spec_id, wp.as_deref())?,
                             )
                         }
                         None => None,
@@ -7213,6 +7217,16 @@ impl Services {
             &assignment_instructions,
             &assignment_scope,
         );
+        // Specialist validation (monorepo#3497): reject an unknown specialist
+        // id with `-32602` HERE, before provider/effort resolution — an
+        // unknown id would otherwise surface as a confusing provider-
+        // resolution failure (or only fail inside `agent_create_op` after the
+        // resolution rungs silently skipped the specialist tiers). Runs
+        // before any side effect, so a rejection leaves no orphaned child.
+        if let Some(spec_id) = input.specialist.as_deref() {
+            self.specialists_service()
+                .canonical_id_or_err(spec_id, workspace_path.as_deref())?;
+        }
         let delegate_provider = if let Some(provider_param) = input.provider.as_deref() {
             ensure_known_provider("agent.delegate", provider_param)?;
             ensure_provider_available(
@@ -10508,13 +10522,38 @@ impl Services {
             .await?;
         let create_opts = input.create.clone().unwrap_or_default();
 
+        // SECURITY: the project tier comes from the stored workspace record.
+        let workspace_path = self
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
         // B4: specialist/model inheritance — the previous session's specialist
         // wins; the wake-level `model` override wins over both the previous
-        // session's model and the `create.model` fallback.
-        let specialist = inheritance_source
+        // session's model and the `create.model` fallback. An INHERITED
+        // specialist that no longer resolves (a stale id persisted before the
+        // monorepo#3497 strict validation, or a since-deleted user/project
+        // specialist file) is dropped with a warn instead of failing the wake
+        // — the strict `-32602` in `agent_create_op` applies to the
+        // client-supplied `create.specialist`, never to legacy stored state.
+        let inherited_specialist = inheritance_source
             .as_ref()
             .and_then(|s| s.specialist.clone())
-            .or(create_opts.specialist.clone());
+            .filter(|spec_id| {
+                let known = self
+                    .specialists_service()
+                    .canonical_id(spec_id, workspace_path.as_deref())
+                    .is_some();
+                if !known {
+                    tracing::warn!(
+                        specialist = %spec_id,
+                        "agent.wakeOrCreate: dropping inherited specialist that no longer resolves"
+                    );
+                }
+                known
+            });
+        let specialist = inherited_specialist.or(create_opts.specialist.clone());
         let model = input
             .model
             .clone()
@@ -10527,13 +10566,6 @@ impl Services {
         // model option's effort, then the specialist frontmatter. Validated
         // against the cached catalog's `effortLevels` for the resolved model
         // before the child is created, so a `-32602` leaves no orphan.
-        // SECURITY: the project tier comes from the stored workspace record.
-        let workspace_path = self
-            .store
-            .get_workspace(&workspace_id)
-            .await
-            .ok()
-            .and_then(|w| crate::git_ops::worktree_path(&w));
         // Same effective-model rule as `agent.delegate`: fall through to the
         // full default-model resolution (specialist pin, then the settings
         // chain) so a `modelOptions` entry keyed on the settings default
