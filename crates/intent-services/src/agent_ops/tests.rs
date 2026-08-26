@@ -8,8 +8,7 @@ use std::sync::Arc;
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
     now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, NoteCreate, NoteUpdateInput,
-    Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use std::time::Duration;
 
@@ -9606,6 +9605,16 @@ async fn failed_terminal_wake_retries_without_another_event() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
+    let flipped = seed_task(&svc, &ws, "Flipped task").await;
+    svc.task_update_note_status(
+        ws.clone(),
+        flipped.clone(),
+        "complete".into(),
+        None,
+        Some(child.clone()),
+    )
+    .await
+    .expect("record flipped completion");
     let watch_id = svc
         .register_completion_watch_durable(
             &ws,
@@ -9663,6 +9672,21 @@ async fn failed_terminal_wake_retries_without_another_event() {
         format!("completion-wake:{watch_id}"),
         "retry keeps the stable delivery id"
     );
+    let metadata = session.messages[0]
+        .metadata
+        .as_ref()
+        .expect("wake metadata");
+    assert_eq!(
+        metadata[crate::agent_ops::ready_delta::UNBLOCKED_TRIGGER_TASKS_KEY],
+        json!([{ "workspaceId": ws.0, "taskNoteId": flipped.0 }]),
+        "retry preserves consumed flipped-completion triggers"
+    );
+    assert!(svc
+        .store()
+        .list_agent_flipped_completions(&child)
+        .await
+        .expect("list flips")
+        .is_empty());
     svc.handle_completion_event(&event).await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,

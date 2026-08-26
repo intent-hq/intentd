@@ -5809,6 +5809,11 @@ impl Services {
             // linked task — a genuine `agent:idle` completion only; failure
             // and deletion wakes never attribute triggers.
             let mut stamped_triggers = trigger_tasks.clone();
+            for pair in crate::agent_ops::ready_delta::event_trigger_tasks(&event.data) {
+                if !stamped_triggers.contains(&pair) {
+                    stamped_triggers.push(pair);
+                }
+            }
             if event.event_type == AGENT_IDLE && !interim_idle {
                 let flips = if let Some(f) = &taken_flip_triggers {
                     f.clone()
@@ -5824,6 +5829,11 @@ impl Services {
                 }
             }
             crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &stamped_triggers);
+            let mut retry_event = event.clone();
+            crate::agent_ops::ready_delta::stamp_event_trigger_tasks(
+                &mut retry_event.data,
+                &stamped_triggers,
+            );
             if let Err(e) = self
                 .deliver_parent_wake_durable(
                     &parent_ws,
@@ -5843,7 +5853,7 @@ impl Services {
                 self.schedule_completion_delivery_retry(
                     watch.id.clone(),
                     child_id.clone(),
-                    event.clone(),
+                    retry_event.clone(),
                 );
                 continue;
             }
@@ -5868,7 +5878,7 @@ impl Services {
                 self.schedule_completion_delivery_retry(
                     watch.id.clone(),
                     child_id.clone(),
-                    event.clone(),
+                    retry_event,
                 );
                 continue;
             }
