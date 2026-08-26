@@ -25492,6 +25492,16 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.hook_list_op(&workspace_id, agent_id.as_ref()).await })
     }
 
+    /// `hook.get` (MCP-only): one hook row (including `code`) by id, active
+    /// or terminal; hooks from other workspaces read as `NotFound`.
+    fn hook_get(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_get_op(&workspace_id, &hook_id).await })
+    }
+
     /// `hook.cancel`: stop an active hook; an agent caller may only cancel
     /// its own hooks, while the FE path (`caller = None`) cancels any hook
     /// and wakes the owning agent with a notice.

@@ -788,6 +788,23 @@ impl Services {
         Ok(json!({ "hooks": hooks }))
     }
 
+    /// `hook.get` (MCP-only): one hook row by id — the full row including
+    /// `code`, for active AND terminal (retired) hooks, so an agent can
+    /// recover a retired hook's script to re-arm it. A hook belonging to
+    /// another workspace reads as `NotFound` (mirrors `hook.cancel` /
+    /// `hook.runNow`), so hooks are never readable across workspaces.
+    pub(crate) async fn hook_get_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        hook_id: &HookId,
+    ) -> Result<Value> {
+        let hook = self.store.get_hook(hook_id).await?;
+        if &hook.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("hook {} not found", hook_id.0)));
+        }
+        Ok(json!(hook))
+    }
+
     /// Light metadata for `agent_id`'s ACTIVE (`scheduled`/`running`) hooks —
     /// the idle-visibility `waitingOnHooks` payload: one
     /// `{ hookId, name, nextRunAt?, expiresAt? }` object per active hook,
@@ -1564,6 +1581,7 @@ impl Services {
         self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
         let notice = crate::harness::latest().hook_expired_notice(
             &hook.name,
+            &hook.hook_id.0,
             hook.perpetual,
             hook.run_count,
             hook.dispatch_count,
@@ -1637,8 +1655,8 @@ impl Services {
             "dispatched" if dispatch_still_active => {
                 Some(harness.hook_dispatch_active_note(hook.expires_at.as_deref()))
             }
-            "dispatched" => Some(harness.hook_dispatch_retired_note()),
-            "evicted" => Some(harness.hook_evicted_state_note()),
+            "dispatched" => Some(harness.hook_dispatch_retired_note(&hook.hook_id.0)),
+            "evicted" => Some(harness.hook_evicted_state_note(&hook.hook_id.0)),
             _ => None,
         };
         let content = harness.hook_wake_framing(&hook.name, message, state_note.as_deref());
@@ -4539,5 +4557,77 @@ mod tests {
         let logs = logs.unwrap();
         assert!(logs.len() <= HOOK_LOG_MAX_BYTES, "len = {}", logs.len());
         assert!(logs.contains("[hook state dropped:"), "{logs}");
+    }
+
+    /// `hook.get` returns the full row — including `code` — even for a hook
+    /// in a TERMINAL state, so a retired hook's script can be recovered for
+    /// re-arming.
+    #[tokio::test]
+    async fn hook_get_returns_full_row_for_terminal_hooks() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "retired".to_string(),
+            code: "return { dispatch: true, message: 'done' };".to_string(),
+            delay_ms: 10_000,
+            state: HookState::Dispatched,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 1,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: None,
+            perpetual: false,
+            dispatch_count: 1,
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        let row = svc.hook_get_op(&ws, &hook.hook_id).await.unwrap();
+        assert_eq!(row["hookId"], json!(hook.hook_id.0));
+        assert_eq!(row["code"], json!(hook.code));
+        assert_eq!(row["state"], json!("dispatched"));
+    }
+
+    #[tokio::test]
+    async fn hook_get_missing_id_is_not_found() {
+        let (_tmp, _root, svc, ws, _owner) = setup().await;
+        let err = svc.hook_get_op(&ws, &HookId::new()).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+
+    /// A hook belonging to another workspace reads as `NotFound` — hooks are
+    /// never readable across workspaces — while its own workspace still
+    /// resolves it.
+    #[tokio::test]
+    async fn hook_get_from_another_workspace_is_not_found() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "scoped".to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(60_000)),
+            perpetual: false,
+            dispatch_count: 0,
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        let other = WorkspaceId::new();
+        let err = svc.hook_get_op(&other, &hook.hook_id).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        let row = svc.hook_get_op(&ws, &hook.hook_id).await.unwrap();
+        assert_eq!(row["code"], json!(hook.code));
     }
 }

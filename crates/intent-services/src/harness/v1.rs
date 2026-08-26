@@ -734,16 +734,20 @@ impl Harness for V1 {
         )
     }
 
-    fn hook_dispatch_retired_note(&self) -> String {
-        "[This hook is now retired and will not run again — reschedule via \
-         ws.hook.schedule if still needed.]"
-            .to_string()
+    fn hook_dispatch_retired_note(&self, hook_id: &str) -> String {
+        format!(
+            "[This hook is now retired and will not run again — recover its \
+             script via ws.hook.get(\"{hook_id}\") and reschedule via \
+             ws.hook.schedule if still needed.]"
+        )
     }
 
-    fn hook_evicted_state_note(&self) -> String {
-        "[This hook will not run again. Schedule a new hook via \
-         ws.hook.schedule if the condition is still worth watching.]"
-            .to_string()
+    fn hook_evicted_state_note(&self, hook_id: &str) -> String {
+        format!(
+            "[This hook will not run again. Recover its script via \
+             ws.hook.get(\"{hook_id}\") and schedule a new hook via \
+             ws.hook.schedule if the condition is still worth watching.]"
+        )
     }
 
     fn hook_evicted_failed_run_notice(&self, hook_name: &str, error: &str) -> String {
@@ -757,6 +761,7 @@ impl Harness for V1 {
     fn hook_expired_notice(
         &self,
         hook_name: &str,
+        hook_id: &str,
         perpetual: bool,
         run_count: i64,
         dispatch_count: i64,
@@ -778,7 +783,8 @@ impl Harness for V1 {
         };
         format!(
             "Your background hook \"{hook_name}\" expired after reaching its TTL ({tally}). \
-             Schedule a new hook via ws.hook.schedule if the condition is still worth watching."
+             Schedule a new hook via ws.hook.schedule if the condition is still worth \
+             watching — the original script is retrievable via ws.hook.get(\"{hook_id}\")."
         )
     }
 
