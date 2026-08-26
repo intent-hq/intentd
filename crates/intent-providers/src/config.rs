@@ -407,6 +407,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         runtime: ProviderRuntime::Electron,
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        // Hidden by default (not yet well-tested); set INTENTD_ENABLE_CORTEX
+        // in the daemon environment to re-enable (same mechanism as mock's
+        // MOCK_AGENT_SCRIPT_PATH gate).
+        requires_env_var: Some("INTENTD_ENABLE_CORTEX"),
         short_name: "Cortex",
         // Cortex defers ALL MCP tools by default (`settings.toolSearch !==
         // false` — default ON): a names-only reminder ("Schemas are NOT
@@ -484,6 +488,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // ACP request is the only spawn-scoped delivery mechanism.
         supports_session_mcp_servers: true,
         login_docs_url: Some("https://docs.factory.ai/cli/getting-started/overview"),
+        // Hidden by default (not yet well-tested); set INTENTD_ENABLE_DROID
+        // in the daemon environment to re-enable.
+        requires_env_var: Some("INTENTD_ENABLE_DROID"),
         short_name: "Droid",
         // Defensive: droid's remote Statsig feature `mcp_tool_search` defers
         // every non-github MCP server's tools behind a "Deferred tools:"

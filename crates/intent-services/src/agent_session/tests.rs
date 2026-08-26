@@ -4891,6 +4891,32 @@ async fn wait_for_status_phase(
     }
 }
 
+/// Drain the subscription until an event of `event_type` appears at or past
+/// `*cursor`, appending every received batch to `events` and advancing the
+/// cursor past the match.
+async fn wait_for_event_type(
+    sub: &mut crate::events::Subscription,
+    events: &mut Vec<Event>,
+    cursor: &mut usize,
+    event_type: &str,
+) {
+    loop {
+        while *cursor < events.len() {
+            let event = &events[*cursor];
+            *cursor += 1;
+            if event.event_type == event_type {
+                return;
+            }
+        }
+        events.extend(
+            timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for event {event_type:?}"))
+                .expect("subscription open"),
+        );
+    }
+}
+
 /// Mid-turn stall detection (intent-hq/monorepo#3402): a silence past the
 /// (lowered) threshold emits exactly ONE advisory `stalled` status carrying
 /// `silentMs`, the next `session/update` emits `resumed` and re-arms the
@@ -5186,6 +5212,260 @@ async fn sub_threshold_turn_emits_no_stall_status() {
     assert_eq!(phases, vec!["prompt"], "no stall statuses under threshold");
 }
 
+/// Mock agent for the tool-call-aware stall tests (intent-hq/monorepo#3466):
+/// `session/prompt` immediately streams `open_updates` (a `tool_call` start),
+/// goes SILENT (response held) until `release_close` fires, streams
+/// `close_updates` (the terminal `tool_call_update`, when any), goes silent
+/// again until `release_end` fires, then resolves `end_turn`.
+fn spawn_tool_silence_mock_agent<R, W>(
+    read: R,
+    write: W,
+    open_updates: Vec<String>,
+    close_updates: Vec<String>,
+    release_close: tokio::sync::oneshot::Receiver<()>,
+    release_end: tokio::sync::oneshot::Receiver<()>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        let mut releases = Some((release_close, release_end));
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                if let Some((release_close, release_end)) = releases.take() {
+                    for note in &open_updates {
+                        write
+                            .write_all(format!("{note}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    write.flush().await.unwrap();
+                    let _ = release_close.await;
+                    for note in &close_updates {
+                        write
+                            .write_all(format!("{note}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    write.flush().await.unwrap();
+                    let _ = release_end.await;
+                }
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against the tool-silence mock above, returning both release
+/// senders alongside the usual harness.
+fn connect_tool_silence(
+    open_updates: Vec<String>,
+    close_updates: Vec<String>,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (release_close_tx, release_close_rx) = tokio::sync::oneshot::channel();
+    let (release_end_tx, release_end_rx) = tokio::sync::oneshot::channel();
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_tool_silence_mock_agent(
+        c2a_agent,
+        a2c_agent,
+        open_updates,
+        close_updates,
+        release_close_rx,
+        release_end_rx,
+    );
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent, release_close_tx, release_end_tx)
+}
+
+/// The `tool_call` (started) update the tool-aware stall tests open with.
+fn tool_stall_tool_call() -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "Run tests", "kind": "execute", "status": "in_progress",
+                "rawInput": { "path": "." } }
+        }
+    })
+    .to_string()
+}
+
+/// Tool-call-aware stall suppression (intent-hq/monorepo#3466): silence past
+/// the (lowered) threshold while a tool call is IN FLIGHT emits NO `stalled`
+/// advisory — a long tool run is expected silence, not a stall. Once the
+/// terminal `tool_call_update` closes the call, renewed silence past the
+/// threshold stalls again.
+#[tokio::test]
+async fn tool_call_in_flight_suppresses_stall_until_closed() {
+    let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "50")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let tool_done = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed", "rawOutput": { "summary": "12 passed" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent, release_close, release_end) =
+        connect_tool_silence(vec![tool_stall_tool_call()], vec![tool_done]);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    Some("turn-tool-stall"),
+                )
+                .await
+        })
+    };
+
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    // The tool_call was routed — the call is in flight from here on.
+    wait_for_event_type(&mut sub, &mut events, &mut cursor, "agent:tool:call").await;
+    // Silence far past the 50ms threshold with the tool open: suppressed.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Close the tool call; the renewed silence past the threshold stalls.
+    release_close.send(()).expect("mock alive");
+    wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
+    // Release the held response: the turn still resolves normally.
+    release_end.send(()).expect("mock alive");
+    let stop = timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("stalls never fail the turn");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+
+    let phases: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:status")
+        .map(|e| e.data["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["prompt", "stalled"],
+        "no stalled while the tool call was in flight; one after it closed"
+    );
+}
+
+/// Full suppression (intent-hq/monorepo#3466): a tool call that NEVER closes
+/// keeps the stall advisory suppressed for the entire silence — the 30-minute
+/// prompt idle timeout is the backstop for a genuinely hung tool — and the
+/// turn still resolves normally.
+#[tokio::test]
+async fn unclosed_tool_call_never_emits_stalled() {
+    let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "50")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, release_close, release_end) =
+        connect_tool_silence(vec![tool_stall_tool_call()], Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    Some("turn-tool-hung"),
+                )
+                .await
+        })
+    };
+
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    // The tool_call was routed — the call is in flight from here on.
+    wait_for_event_type(&mut sub, &mut events, &mut cursor, "agent:tool:call").await;
+    // Silence far past the 50ms threshold with the tool still open.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Resolve the turn without ever closing the tool call.
+    release_close.send(()).expect("mock alive");
+    release_end.send(()).expect("mock alive");
+    let stop = timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("suppression never fails the turn");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+
+    let phases: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:status")
+        .map(|e| e.data["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["prompt"],
+        "an open tool call suppresses the stall advisory entirely"
+    );
+}
+
 /// `INTENTD_STREAM_STALL_MS` overrides the stall threshold; absent (or
 /// unparseable) it falls back to the 90s default.
 #[test]
@@ -5200,6 +5480,61 @@ fn stream_stall_ms_env_override_and_default() {
     }
     let _env = EnvGuard::apply(&[("INTENTD_STREAM_STALL_MS", None)]);
     assert_eq!(crate::agent_session::stream_stall_ms(), 90_000);
+}
+
+/// STAB-124 guard (intent-hq/monorepo#3466): an anonymous `tool_call_update`
+/// for a toolCallId the turn never saw is dropped by `record_tool` and must
+/// NOT count as an in-flight tool call — the stall advisory still fires on
+/// silence past the threshold.
+#[tokio::test]
+async fn dropped_anonymous_tool_update_does_not_suppress_stall() {
+    let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "50")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let stale = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "stale-1",
+                "status": "in_progress" }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent, release_close, release_end) =
+        connect_tool_silence(vec![stale], Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    Some("turn-tool-stale"),
+                )
+                .await
+        })
+    };
+
+    // The dropped anonymous update never opens a tool call, so the silent
+    // window past the threshold still stalls.
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
+    release_close.send(()).expect("mock alive");
+    release_end.send(()).expect("mock alive");
+    timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("stalls never fail the turn");
 }
 
 /// Turn correlation (monorepo#1022): the failure-arm `agent:failed` emitted by
