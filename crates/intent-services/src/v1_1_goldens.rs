@@ -111,29 +111,38 @@ fn v1_1_specialist_bodies_are_identical_to_v1() {
 }
 
 /// The v1.1 bundle's picker-metadata frontmatter (intent-hq/monorepo#3007):
-/// spec-writer is the orchestrator with its advisory team roster,
-/// implementor/verifier are internal, and every specialist carries an icon.
+/// spec-writer is the orchestrator with its advisory team roster and the
+/// `coordinator` alias, implementor/verifier are internal, and every
+/// specialist carries an icon.
 #[test]
 fn v1_1_specialists_carry_picker_metadata() {
     use serde_json::json;
-    let expectations: &[(&str, Option<&str>, Option<serde_json::Value>, &str)] = &[
-        ("chief-of-staff", None, None, "chief-of-staff"),
-        ("developer", None, None, "verifier"),
-        ("implementor", Some("internal"), None, "implementor"),
-        ("pr-reviewer", None, None, "pr-reviewer"),
-        ("ralph", None, None, "ralph"),
+    type Expectation<'a> = (
+        &'a str,
+        Option<&'a str>,
+        Option<serde_json::Value>,
+        &'a str,
+        Option<serde_json::Value>,
+    );
+    let expectations: &[Expectation] = &[
+        ("chief-of-staff", None, None, "chief-of-staff", None),
+        ("developer", None, None, "verifier", None),
+        ("implementor", Some("internal"), None, "implementor", None),
+        ("pr-reviewer", None, None, "pr-reviewer", None),
+        ("ralph", None, None, "ralph", None),
         (
             "spec-writer",
             Some("orchestrator"),
             Some(json!(r#"["implementor","verifier"]"#)),
             "coordinator",
+            Some(json!(r#"["coordinator"]"#)),
         ),
-        ("ui-designer", None, None, "ui-designer"),
-        ("verifier", Some("internal"), None, "verifier"),
+        ("ui-designer", None, None, "ui-designer", None),
+        ("verifier", Some("internal"), None, "verifier", None),
     ];
     let v1_1 = crate::specialists::EMBEDDED_BUNDLED_V1_1;
     assert_eq!(v1_1.len(), expectations.len());
-    for ((id, content), (exp_id, role, team, icon)) in v1_1.iter().zip(expectations) {
+    for ((id, content), (exp_id, role, team, icon, aliases)) in v1_1.iter().zip(expectations) {
         assert_eq!(id, exp_id);
         let (fm, _) = crate::specialists::parse_frontmatter(content);
         assert_eq!(
@@ -147,6 +156,7 @@ fn v1_1_specialists_carry_picker_metadata() {
             Some(*icon),
             "{id}: icon"
         );
+        assert_eq!(fm.get("aliases"), aliases.as_ref(), "{id}: aliases");
     }
 }
 
