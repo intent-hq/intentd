@@ -1,6 +1,6 @@
 [package]
 name = "intent-search"
-version = "0.7.63"
+version = "0.8.2"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 description = "BE-owned search.*: ripgrep-equivalent content/path search + store adapters (§14)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.7.63" }
+intent-core = { path = "../intent-core", version = "0.8.2" }
 grep = { workspace = true }
 ignore = { workspace = true }
 globset = { workspace = true }

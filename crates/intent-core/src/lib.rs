@@ -63,8 +63,9 @@ pub use model::MAX_DELEGATION_DEPTH;
 pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
-    cap_json_value, last_tool_use_preview, slim_body_size, ConversationProjection,
-    AGENT_LIST_PREVIEW_BUDGET_BYTES, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
+    cap_json_value, last_tool_use_preview, note_list_slim_row, slim_body_size,
+    ConversationProjection, NoteListProjection, AGENT_LIST_PREVIEW_BUDGET_BYTES,
+    NOTE_LIST_PREVIEW_CHARS, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};

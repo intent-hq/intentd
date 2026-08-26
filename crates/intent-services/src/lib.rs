@@ -18785,20 +18785,6 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let new_status = parse_task_status_strict(&status)?;
-            if let Some(caller) = caller_agent_id.as_ref() {
-                if let Ok(session) = store.get_agent_session(caller).await {
-                    if session.workspace_id == workspace_id
-                        && session.task_note_id.as_ref() == Some(&note_id)
-                    {
-                        if let Some(reason) = services.assignment_quarantine_reason(&session).await
-                        {
-                            return Err(Error::InvalidParams(format!(
-                                "assignment update quarantined: {reason}"
-                            )));
-                        }
-                    }
-                }
-            }
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             let Some(mut task) = note.metadata.task.clone() else {
                 return Err(Error::Internal(
@@ -25511,6 +25497,16 @@ impl WorkspaceApi for Services {
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.hook_list_op(&workspace_id, agent_id.as_ref()).await })
+    }
+
+    /// `hook.get` (MCP-only): one hook row (including `code`) by id, active
+    /// or terminal; hooks from other workspaces read as `NotFound`.
+    fn hook_get(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_get_op(&workspace_id, &hook_id).await })
     }
 
     /// `hook.cancel`: stop an active hook; an agent caller may only cancel

@@ -235,7 +235,9 @@ pub(crate) fn monitor_label(m: &PrMonitor) -> String {
 /// does not have), no unresolved threads when resolution is required, no
 /// `merge_blocked_reason`, and no blocked/behind/dirty/unknown
 /// `merge_state_status` (`UNKNOWN` means the forge has not established
-/// mergeability yet, so it never promotes).
+/// mergeability yet, so it never promotes). A PR already queued in the
+/// merge queue is being handled by the queue, not awaiting action, so a
+/// CLEAN-but-queued snapshot stays non-ready too.
 fn requirements_ready(req: &MergeRequirements) -> bool {
     req.state == "open"
         && !req.is_draft
@@ -259,6 +261,7 @@ fn requirements_ready(req: &MergeRequirements) -> bool {
             req.merge_state_status.as_deref(),
             Some("BLOCKED" | "BEHIND" | "DIRTY" | "UNKNOWN")
         )
+        && req.is_in_merge_queue != Some(true)
 }
 
 /// Fold a workspace's monitor rows into the displayStatus PR signals
@@ -454,37 +457,40 @@ fn pr_monitor_wire(m: &PrMonitor) -> Value {
         let r = &s.requirements;
         obj.insert("title".to_string(), Value::String(s.title.clone()));
         obj.insert("url".to_string(), Value::String(s.url.clone()));
-        obj.insert(
-            "lastSnapshot".to_string(),
-            json!({
-                "state": r.state,
-                "isDraft": r.is_draft,
-                "hasConflicts": r.has_conflicts,
-                "isBehind": r.is_behind,
-                "mergeable": r.mergeable,
-                "mergeBlockedReason": r.merge_blocked_reason,
-                "checks": {
-                    "total": r.checks.total,
-                    "passed": r.checks.passed,
-                    "failed": r.checks.failed,
-                    "pending": r.checks.pending,
-                    "failingRequired": r.checks.failing_required,
-                    "pendingRequired": r.checks.pending_required,
-                    "requiredKnown": r.checks.required_known,
-                },
-                "approvals": {
-                    "decision": r.approvals.decision,
-                    "have": r.approvals.have,
-                    "needed": r.approvals.needed,
-                    "changesRequested": r.approvals.changes_requested,
-                },
-                "threads": {
-                    "unresolved": r.threads.unresolved,
-                    "resolutionRequired": r.threads.resolution_required,
-                },
-                "rulesKnown": r.rules_known,
-            }),
-        );
+        let mut last = json!({
+            "state": r.state,
+            "isDraft": r.is_draft,
+            "hasConflicts": r.has_conflicts,
+            "isBehind": r.is_behind,
+            "mergeable": r.mergeable,
+            "mergeBlockedReason": r.merge_blocked_reason,
+            "checks": {
+                "total": r.checks.total,
+                "passed": r.checks.passed,
+                "failed": r.checks.failed,
+                "pending": r.checks.pending,
+                "failingRequired": r.checks.failing_required,
+                "pendingRequired": r.checks.pending_required,
+                "requiredKnown": r.checks.required_known,
+            },
+            "approvals": {
+                "decision": r.approvals.decision,
+                "have": r.approvals.have,
+                "needed": r.approvals.needed,
+                "changesRequested": r.approvals.changes_requested,
+            },
+            "threads": {
+                "unresolved": r.threads.unresolved,
+                "resolutionRequired": r.threads.resolution_required,
+            },
+            "rulesKnown": r.rules_known,
+        });
+        // Presence-detected: the key appears only when the host reported
+        // the PR queued (never null).
+        if let Some(queued) = r.is_in_merge_queue {
+            last["isInMergeQueue"] = json!(queued);
+        }
+        obj.insert("lastSnapshot".to_string(), last);
     }
     out
 }
@@ -2260,6 +2266,7 @@ mod tests {
                     required_conversation_resolution: Some(true),
                     required_status_checks: vec!["build".into()],
                 }),
+                is_in_merge_queue: None,
             })
         }
         async fn list_comments(
@@ -2539,6 +2546,7 @@ mod tests {
                 merge_state_status: Some("BLOCKED".into()),
                 merge_blocked_reason: None,
                 rules_known: true,
+                is_in_merge_queue: None,
             },
         };
         f(&mut s);
@@ -2556,6 +2564,49 @@ mod tests {
         req.approvals.have = 1;
         req.threads.unresolved = 0;
         req.merge_state_status = Some("CLEAN".into());
+    }
+
+    /// A merge-queued PR is being handled by the queue, not awaiting agent
+    /// action: even a CLEAN, fully clear checklist must not read as ready,
+    /// and the queued flag projects into the `lastSnapshot` wire summary
+    /// (presence-detected — absent when not queued or unknown).
+    #[test]
+    fn a_queued_pr_is_not_ready_and_projects_into_last_snapshot() {
+        let mut s = snapshot(|s| ready_requirements(&mut s.requirements));
+        assert!(requirements_ready(&s.requirements), "fixture starts ready");
+        s.requirements.is_in_merge_queue = Some(true);
+        assert!(
+            !requirements_ready(&s.requirements),
+            "a queued PR never reads ready"
+        );
+
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let mut m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: Some(serde_json::to_string(&s).unwrap()),
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        let wire = pr_monitor_wire(&m);
+        assert_eq!(wire["lastSnapshot"]["isInMergeQueue"], json!(true));
+
+        // Not queued / unknown: the key is absent, never null.
+        s.requirements.is_in_merge_queue = None;
+        m.last_snapshot = Some(serde_json::to_string(&s).unwrap());
+        let wire = pr_monitor_wire(&m);
+        assert!(wire["lastSnapshot"].get("isInMergeQueue").is_none());
     }
 
     #[test]
@@ -2635,6 +2686,14 @@ mod tests {
         assert!(diff_snapshots(&base, &behind)
             .iter()
             .any(|c| c == "branch is now behind its base"));
+
+        let queued = snapshot(|s| s.requirements.is_in_merge_queue = Some(true));
+        assert!(diff_snapshots(&base, &queued)
+            .iter()
+            .any(|c| c == "entered the merge queue"));
+        assert!(diff_snapshots(&queued, &base)
+            .iter()
+            .any(|c| c == "left the merge queue"));
 
         let unmergeable = snapshot(|s| s.requirements.mergeable = Some(false));
         assert!(diff_snapshots(&base, &unmergeable)

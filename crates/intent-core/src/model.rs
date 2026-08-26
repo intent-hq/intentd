@@ -2412,6 +2412,62 @@ pub fn last_tool_use_preview(content: &serde_json::Value) -> Option<serde_json::
     Some(Value::Object(preview))
 }
 
+/// The additive `projection` param on `note.list` (PROTOCOL §5.2): full note
+/// rows scale the response with total workspace note content, tripping the
+/// 1 MiB outbound frame warn on note-heavy workspaces (monorepo#3573 — the
+/// oversized-list-response family). `projection: "slim"` serves rows with
+/// `content` omitted, replaced by a bounded `contentPreview` (first
+/// [`NOTE_LIST_PREVIEW_CHARS`] chars) plus `contentLength` (total chars,
+/// matching the `note.listVersions` `contentLength` unit); every other Note
+/// field is unchanged. Absent / `null` / `"full"` keep responses
+/// byte-identical to before — existing clients are unaffected. Serve-time
+/// only; stored rows are untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteListProjection {
+    /// Bounded rows: `content` → `contentPreview` + `contentLength`.
+    Slim,
+}
+
+/// Character budget for the slim `note.list` `contentPreview`: enough for a
+/// list-context summary (first heading + opening lines) while keeping a
+/// slim row's serialized size bounded regardless of note length.
+pub const NOTE_LIST_PREVIEW_CHARS: usize = 500;
+
+/// One slim `note.list` row ([`NoteListProjection::Slim`]): the note's full
+/// wire object with `content` removed and replaced by `contentPreview`
+/// (first [`NOTE_LIST_PREVIEW_CHARS`] chars, char-boundary safe by
+/// construction) and `contentLength` (total chars — Unicode scalar values,
+/// the same unit as the `note.listVersions` summaries' SQL `LENGTH(content)`
+/// for the NUL-free content the daemon writes; on content containing U+0000
+/// this counts every scalar while the SQL `LENGTH` stops at the NUL). All
+/// other fields serialize exactly as the full row does.
+///
+/// Consumes the note and takes `content` out BEFORE serializing, so the
+/// full body is never copied into the JSON value — the transform allocates
+/// only the bounded preview, keeping the hot `note.list` path free of
+/// content-sized work beyond the row fetch itself.
+#[must_use]
+pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
+    let content = std::mem::take(&mut note.content);
+    let mut value = serde_json::to_value(&note).unwrap_or_else(|e| {
+        tracing::warn!(note_id = %note.id.0, error = %e, "note_list_slim_row: serializing note failed; serving null row");
+        serde_json::Value::Null
+    });
+    if let serde_json::Value::Object(map) = &mut value {
+        map.remove("content");
+        let preview: String = content.chars().take(NOTE_LIST_PREVIEW_CHARS).collect();
+        map.insert(
+            "contentPreview".to_string(),
+            serde_json::Value::String(preview),
+        );
+        map.insert(
+            "contentLength".to_string(),
+            serde_json::json!(content.chars().count()),
+        );
+    }
+    value
+}
+
 /// Per-field byte budget for `agent.list` row previews (list-payload cost
 /// contract, extending monorepo#2932): the preview fields exist to render a
 /// one-line summary in list contexts (sidebar rows, HUD cells), so each is
@@ -2919,16 +2975,6 @@ pub struct AgentMetadata {
     /// [`IS_INITIAL_AGENT_KEY`]); omitted for non-peer agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsor_agent_id: Option<String>,
-    /// Semantic identity of the delegated task assignment. Unlike `Note.rev`,
-    /// this excludes progress-only task-note sections.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_revision: Option<String>,
-    /// Repository HEAD recorded when the delegated assignment was created.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_head_sha: Option<String>,
-    /// Hash of the canonical repository-relative assignment scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope_hash: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -3150,24 +3196,6 @@ impl AgentLite {
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
-        let task_revision = session
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("taskRevision"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let expected_head_sha = session
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("expectedHeadSha"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let scope_hash = session
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("scopeHash"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -3188,9 +3216,6 @@ impl AgentLite {
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,
-            task_revision,
-            expected_head_sha,
-            scope_hash,
         };
         Self {
             id: session.id,
@@ -3410,10 +3435,6 @@ pub struct AgentDelegateInput {
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
-    /// Optional repository-relative file/directory scope for assignment
-    /// fencing. The service canonicalizes, sorts, and deduplicates entries
-    /// before hashing and persistence.
-    pub scope: Option<Vec<String>>,
     /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
     /// together — each entry either a bare task-note id or a
     /// [`BatchTaskEntry::Options`] object carrying per-task
@@ -4025,6 +4046,53 @@ mod tests {
     use super::*;
 
     use serde_json::json;
+
+    /// [`note_list_slim_row`] projection (§5.2, monorepo#3573): `content` is
+    /// removed and replaced by `contentPreview` (first
+    /// [`NOTE_LIST_PREVIEW_CHARS`] chars — char-counted, so multibyte
+    /// content never splits) + `contentLength` (total chars); short content
+    /// previews whole; every other field serializes as the full row does.
+    #[test]
+    fn note_list_slim_row_shapes() {
+        let mut note = Note {
+            id: NoteId::from("n1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            title: "Spec".to_string(),
+            content: "# Hi".to_string(),
+            content_type: ContentType::Markdown,
+            tags: vec!["a".to_string()],
+            is_pinned: false,
+            is_archived: false,
+            is_default: true,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: "t0".to_string(),
+            rev: 3,
+            updated_at: "t1".to_string(),
+        };
+
+        // Short content: whole preview, exact char count.
+        let full = serde_json::to_value(&note).unwrap();
+        let row = note_list_slim_row(note.clone());
+        assert!(row.get("content").is_none());
+        assert_eq!(row["contentPreview"], "# Hi");
+        assert_eq!(row["contentLength"], 4);
+        for (k, v) in full.as_object().unwrap() {
+            if k != "content" {
+                assert_eq!(&row[k], v, "field {k} unchanged");
+            }
+        }
+
+        // Long multibyte content: truncated at the char budget, never a
+        // byte split; contentLength counts chars, not bytes.
+        note.content = "é".repeat(NOTE_LIST_PREVIEW_CHARS * 3);
+        let row = note_list_slim_row(note);
+        let preview = row["contentPreview"].as_str().unwrap();
+        assert_eq!(preview.chars().count(), NOTE_LIST_PREVIEW_CHARS);
+        assert_eq!(preview, "é".repeat(NOTE_LIST_PREVIEW_CHARS));
+        assert_eq!(row["contentLength"], NOTE_LIST_PREVIEW_CHARS * 3);
+    }
 
     /// [`last_tool_use_preview`] derivation: the LAST `tool_use` block wins,
     /// an under-budget input passes through whole (no flags), an over-budget

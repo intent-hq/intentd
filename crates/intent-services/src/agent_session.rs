@@ -815,8 +815,10 @@ pub(crate) type LastTurnSilentTails = Arc<Mutex<HashMap<AgentId, u64>>>;
 /// Silent-tail threshold past which a bare `end_turn` is suspected to be a
 /// silently-truncated turn (intent-hq/monorepo#2669): in that incident,
 /// bloated sessions resolved `session/prompt` with a clean `end_turn` after
-/// 11–13 minutes of total silence. 5 minutes sits comfortably past normal
-/// tool-free inference tails while catching the incident signature well
+/// 11–13 minutes of total silence. 8 minutes sits comfortably past normal
+/// tool-free inference tails (and above the 5-minute [`stream_stall_ms`]
+/// advisory, preserving the stall < silent-tail-suspect < 30-minute prompt
+/// idle timeout ordering) while catching the incident signature well
 /// before the 30-minute prompt idle timeout. Advisory only — the annotation
 /// never interrupts or fails the turn, because healthy long silent tails
 /// exist. Overridable via `INTENTD_SILENT_TAIL_SUSPECT_MS` (test seam).
@@ -826,15 +828,17 @@ pub(crate) fn silent_tail_suspect_ms() -> u64 {
             return ms;
         }
     }
-    5 * 60 * 1000
+    8 * 60 * 1000
 }
 
 /// Mid-turn stream-stall threshold (intent-hq/monorepo#3402): after this many
 /// ms of zero `session/update` traffic while `session/prompt` is still in
 /// flight, [`run_prompt_turn`](Services::run_prompt_turn) emits ONE advisory
 /// `agent:stream:status` with `phase: "stalled"` so subscribers can surface
-/// the silence live instead of an indefinite spinner. 90s sits well below the
-/// #2669 silent-tail suspicion window and far below the 30-minute prompt idle
+/// the silence live instead of an indefinite spinner. 5 minutes clears the
+/// silent thinking phases some models run well past 90s while staying below
+/// the 8-minute #2669 silent-tail suspicion window
+/// ([`silent_tail_suspect_ms`]) and far below the 30-minute prompt idle
 /// timeout, which remains the only terminal mechanism — the stall event never
 /// cancels or fails the turn. Tool-call-aware (intent-hq/monorepo#3466):
 /// while ≥1 recorded tool call is still open the stalled advisory is fully
@@ -847,7 +851,7 @@ pub(crate) fn stream_stall_ms() -> u64 {
             return ms;
         }
     }
-    90 * 1000
+    5 * 60 * 1000
 }
 
 /// Per-agent consecutive suspected-truncation auto-redrive counter
@@ -2398,8 +2402,9 @@ impl Services {
         let client_request_watermark = conn.client_request_seq();
         // Mid-turn stall detection (intent-hq/monorepo#3402): a timer arm in
         // the select loop below samples `activity.idle_ms()` on a fraction of
-        // the stall threshold (~15s at the 90s default) and emits ONE advisory
-        // `stalled` status event once the silence crosses [`stream_stall_ms`].
+        // the stall threshold (clamped to 15s at the 5-minute default) and
+        // emits ONE advisory `stalled` status event once the silence crosses
+        // [`stream_stall_ms`].
         // The next received `session/update` emits `resumed` and re-arms the
         // detector, so a later second stall in the same turn reports again.
         // Advisory only: turn resolution is untouched (the 30-minute prompt

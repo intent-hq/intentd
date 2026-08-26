@@ -2233,6 +2233,58 @@ async fn success_results_are_objects() {
     assert!(notes["result"]["notes"].is_array());
 }
 
+/// The `note.list` `projection` param (§5.2, monorepo#3573): absent /
+/// `null` / `"full"` serve identical full rows (structural `Value`
+/// equality), `"slim"` serves rows with `content` replaced by
+/// `contentPreview` + `contentLength` (every other field untouched), and
+/// any other value is `-32602` naming the accepted values.
+#[tokio::test]
+async fn note_list_projection_param() {
+    let full =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"note.list","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.list","params":{"workspaceId":"ws-1","projection":null}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.list","params":{"workspaceId":"ws-1","projection":"full"}}"#,
+    ] {
+        let v = call(msg).await.unwrap();
+        assert_eq!(v["result"], full["result"], "identical full rows: {msg}");
+    }
+    let full_row = &full["result"]["notes"][0];
+    assert_eq!(full_row["content"], "# Hi");
+    assert!(full_row.get("contentPreview").is_none());
+    assert!(full_row.get("contentLength").is_none());
+
+    let slim = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"note.list","params":{"workspaceId":"ws-1","projection":"slim"}}"#,
+    )
+    .await
+    .unwrap();
+    let row = &slim["result"]["notes"][0];
+    assert!(row.get("content").is_none(), "slim omits content: {row}");
+    assert_eq!(row["contentPreview"], "# Hi");
+    assert_eq!(row["contentLength"], 4);
+    // Every other field matches the full row.
+    for (k, v) in full_row.as_object().unwrap() {
+        if k != "content" {
+            assert_eq!(&row[k], v, "field {k} unchanged");
+        }
+    }
+
+    for bad in [r#""compact""#, "5", "true", "{}"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"note.list","params":{{"workspaceId":"ws-1","projection":{bad}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "projection={bad}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("projection must be \"slim\" or \"full\"")
+        );
+    }
+}
+
 #[tokio::test]
 async fn parse_error_is_minus_32700() {
     let v = call("{not json").await.unwrap();

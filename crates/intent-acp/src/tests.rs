@@ -319,6 +319,188 @@ async fn stderr_capture_written_to_daily_log_file() {
     agent.kill().await.ok();
 }
 
+/// Concatenate every daily capture file under `dir` (empty when the dir does
+/// not exist yet). Rotation-proof like the daily-log test above.
+async fn read_capture_dir(dir: &std::path::Path) -> String {
+    let mut content = String::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(c) = tokio::fs::read_to_string(entry.path()).await {
+                content.push_str(&c);
+            }
+        }
+    }
+    content
+}
+
+/// Poll `dir` until the concatenated capture content contains `needle` (or
+/// ~2s elapse), returning the last content read.
+async fn poll_capture_dir_for(dir: &std::path::Path, needle: &str) -> String {
+    let mut content = String::new();
+    for _ in 0..200 {
+        content = read_capture_dir(dir).await;
+        if content.contains(needle) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    content
+}
+
+/// monorepo#3570 regression: a child's dying words — stderr still undrained
+/// when the terminal-failure teardown drops the `Connection` — must still
+/// reach the capture file. Pre-fix, `Connection::drop` aborted the stderr
+/// drain task, losing everything not yet read from the pipe (and when the
+/// dying words were the child's ONLY stderr, the lazily-created capture file
+/// never existed at all, despite the WARN naming its path).
+#[tokio::test]
+async fn stderr_dying_words_survive_connection_drop() {
+    let tmp = test_temp_dir("intent-acp-stderr-drop-");
+    let dir = tmp.path().join("logs");
+    let hooks = ConnectionHooks {
+        stderr_log_dir: Some(dir.clone()),
+        ..ConnectionHooks::default()
+    };
+    let (conn, _responder, mut stderr_w) = connect_mock(hooks);
+
+    // Teardown races the dying words: the connection is dropped (terminal
+    // turn failure → kill_child_only → handle drop) BEFORE the child's final
+    // stderr is written/drained. The drain must run to stderr EOF regardless.
+    drop(conn);
+    let _ = stderr_w.write_all(b"fatal: child dying words\n").await;
+    let _ = stderr_w.flush().await;
+    drop(stderr_w); // child exit → stderr EOF
+
+    let content = poll_capture_dir_for(&dir, "dying words").await;
+    assert!(
+        content.contains("fatal: child dying words"),
+        "stderr written after connection drop must still be captured; got: {content:?}"
+    );
+}
+
+/// monorepo#3570: `await_stderr_settled` resolves `true` once the drain hits
+/// stderr EOF and the capture file is flushed — the content is readable
+/// immediately after, no polling needed. Before EOF it times out (`false`);
+/// with no stderr pipe at all it resolves `true` immediately.
+#[tokio::test]
+async fn await_stderr_settled_signals_flushed_capture() {
+    let tmp = test_temp_dir("intent-acp-stderr-settle-");
+    let dir = tmp.path().join("logs");
+    let hooks = ConnectionHooks {
+        stderr_log_dir: Some(dir.clone()),
+        ..ConnectionHooks::default()
+    };
+    let (conn, _responder, mut stderr_w) = connect_mock(hooks);
+
+    stderr_w.write_all(b"last words\n").await.unwrap();
+    stderr_w.flush().await.unwrap();
+    // Pipe still open → not settled yet.
+    assert!(
+        !conn.await_stderr_settled(Duration::from_millis(50)).await,
+        "not settled while the stderr pipe is open"
+    );
+    drop(stderr_w); // EOF
+    assert!(
+        conn.await_stderr_settled(Duration::from_secs(2)).await,
+        "settled after stderr EOF"
+    );
+    // Settled means flushed: readable without polling.
+    let content = read_capture_dir(&dir).await;
+    assert!(
+        content.contains("last words"),
+        "capture flushed by settle time; got: {content:?}"
+    );
+
+    // No stderr pipe → settled immediately.
+    let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+    let (_a2c_agent, a2c_client) = tokio::io::duplex(4096);
+    let no_stderr = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
+    assert!(
+        no_stderr
+            .await_stderr_settled(Duration::from_millis(50))
+            .await,
+        "no stderr pipe settles immediately"
+    );
+}
+
+/// monorepo#3570 regression: one invalid-UTF-8 blob on stderr must not kill
+/// the drain for the rest of the child's life. Pre-fix the drain loop exited
+/// silently on the first `next_line()` UTF-8 error, so everything after the
+/// bad bytes (including later dying words) was lost.
+#[tokio::test]
+async fn stderr_capture_survives_invalid_utf8() {
+    let tmp = test_temp_dir("intent-acp-stderr-utf8-");
+    let dir = tmp.path().join("logs");
+    let hooks = ConnectionHooks {
+        stderr_log_dir: Some(dir.clone()),
+        ..ConnectionHooks::default()
+    };
+    let (conn, _responder, mut stderr_w) = connect_mock(hooks);
+
+    stderr_w.write_all(b"before bad bytes\n").await.unwrap();
+    stderr_w
+        .write_all(&[0xFF, 0xFE, 0xFD, b'\n'])
+        .await
+        .unwrap();
+    stderr_w.write_all(b"after bad bytes\n").await.unwrap();
+    stderr_w.flush().await.unwrap();
+    drop(stderr_w);
+
+    let content = poll_capture_dir_for(&dir, "after bad bytes").await;
+    assert!(
+        content.contains("before bad bytes"),
+        "line before invalid UTF-8 captured; got: {content:?}"
+    );
+    assert!(
+        content.contains("after bad bytes"),
+        "line after invalid UTF-8 captured (drain survived); got: {content:?}"
+    );
+    drop(conn);
+}
+
+/// monorepo#3570: `stderr_captured` is per-connection — `true` only when THIS
+/// child wrote at least one stderr line the capture sink accepted, so stale
+/// daily files an earlier run left in the same per-agent dir can't turn a
+/// silent child into a misleading "stderr captured at …" WARN claim.
+#[tokio::test]
+async fn stderr_captured_flag_is_per_connection() {
+    let tmp = test_temp_dir("intent-acp-stderr-flag-");
+    let dir = tmp.path().join("logs");
+    // Stale file from a "previous run" of the same agent.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("2020-01-01.log"), "old run\n").unwrap();
+
+    // A child that writes nothing: the flag stays false despite the
+    // populated dir.
+    let hooks = ConnectionHooks {
+        stderr_log_dir: Some(dir.clone()),
+        ..ConnectionHooks::default()
+    };
+    let (conn, _responder, stderr_w) = connect_mock(hooks);
+    drop(stderr_w); // EOF, no output
+    assert!(conn.await_stderr_settled(Duration::from_secs(2)).await);
+    assert!(
+        !conn.stderr_captured(),
+        "silent child must not claim capture (stale dir entries exist)"
+    );
+    drop(conn);
+
+    // A child that writes: the flag flips.
+    let hooks = ConnectionHooks {
+        stderr_log_dir: Some(dir.clone()),
+        ..ConnectionHooks::default()
+    };
+    let (conn, _responder, mut stderr_w) = connect_mock(hooks);
+    stderr_w.write_all(b"fresh crash output\n").await.unwrap();
+    stderr_w.flush().await.unwrap();
+    drop(stderr_w);
+    assert!(conn.await_stderr_settled(Duration::from_secs(2)).await);
+    assert!(
+        conn.stderr_captured(),
+        "child that wrote stderr reports capture"
+    );
+}
+
 /// Minimal portable ACP responder: echoes a `{protocolVersion:1}` result for
 /// every line carrying an integer `id`. Used as a real mock child process.
 #[cfg(unix)]
@@ -8585,9 +8767,6 @@ mod wsapi4_bindings_tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
-                task_revision: None,
-                expected_head_sha: None,
-                scope_hash: None,
             },
         }
     }

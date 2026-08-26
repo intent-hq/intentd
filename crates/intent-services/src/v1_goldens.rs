@@ -578,14 +578,16 @@ async fn golden_hook_dispatch_wake_bytes() {
         .await
         .expect("schedule");
     assert_eq!(out["dispatched"], json!(true));
+    let hook_id = out["hook"]["hookId"].as_str().expect("hookId").to_string();
     let text = wake_texts_when(&svc, &owner, 1).await;
     assert_eq!(
         text,
-        vec!["[Background hook \"ci-watch\"] CI is green\n\
+        vec![format!(
+            "[Background hook \"ci-watch\"] CI is green\n\
              \n\
-             [This hook is now retired and will not run again — reschedule via \
-             ws.hook.schedule if still needed.]"
-            .to_string()]
+             [This hook is now retired and will not run again — recover its script via \
+             ws.hook.get(\"{hook_id}\") and reschedule via ws.hook.schedule if still needed.]"
+        )]
     );
 }
 
@@ -665,6 +667,7 @@ fn merge_requirements(
         merge_state_status: None,
         merge_blocked_reason: None,
         rules_known: true,
+        is_in_merge_queue: None,
     }
 }
 
@@ -767,8 +770,8 @@ fn golden_pr_monitor_diff_lines() {
 }
 
 /// Checklist branch lines beyond the happy path: draft, conflicts, behind,
-/// failing required checks, changes-requested, blocked reason, and the two
-/// rules-unknown renderings. (The per-field diff LINES beyond
+/// merge-queued, failing required checks, changes-requested, blocked reason,
+/// and the two rules-unknown renderings. (The per-field diff LINES beyond
 /// `golden_pr_monitor_diff_lines` are byte-pinned by `pr_monitor::tests::
 /// diff_detects_each_field_class` and companions — exact `assert_eq` on each
 /// line — so they are not re-pinned here.)
@@ -786,6 +789,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
     r.checks.pending_required = vec![];
     r.approvals.changes_requested = 1;
     r.merge_blocked_reason = Some("merge conflicts".to_string());
+    r.is_in_merge_queue = Some(true);
     assert_eq!(
         crate::pr_monitor::render_checklist(&s),
         "- state: open\n\
@@ -795,6 +799,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - unresolved threads: 1 (resolution required to merge)\n\
          - merge conflicts present\n\
          - branch is behind its base\n\
+         - in merge queue\n\
          - blocked: merge conflicts"
     );
     // Rules-unknown: approvals fall back to the bare count, threads drop the
@@ -965,11 +970,13 @@ async fn golden_hook_expiry_notice_bytes() {
         vec![
             "[Background hook \"one-shot\"] Your background hook \"one-shot\" expired after \
              reaching its TTL (2 runs completed without a dispatch). Schedule a new hook via \
-             ws.hook.schedule if the condition is still worth watching."
+             ws.hook.schedule if the condition is still worth watching — the original script \
+             is retrievable via ws.hook.get(\"hook-exp-1\")."
                 .to_string(),
             "[Background hook \"perpetual\"] Your background hook \"perpetual\" expired after \
              reaching its TTL (1 run, 1 dispatch). Schedule a new hook via ws.hook.schedule \
-             if the condition is still worth watching."
+             if the condition is still worth watching — the original script is retrievable \
+             via ws.hook.get(\"hook-exp-2\")."
                 .to_string(),
         ]
     );
@@ -1017,7 +1024,8 @@ async fn golden_hook_eviction_notice_bytes() {
             "[Background hook \"will-throw\"] Your background hook \"will-throw\" was \
              evicted after a failed run: Error: kaput\n\
              \n\
-             [This hook will not run again. Schedule a new hook via ws.hook.schedule \
+             [This hook will not run again. Recover its script via \
+             ws.hook.get(\"hook-evict-1\") and schedule a new hook via ws.hook.schedule \
              if the condition is still worth watching.]"
                 .to_string()
         ]
@@ -1063,11 +1071,34 @@ async fn golden_hook_eviction_internal_error_notice_bytes() {
              evicted after an internal error: scheduler stopped after a store error: \
              internal error: db locked\n\
              \n\
-             [This hook will not run again. Schedule a new hook via ws.hook.schedule \
+             [This hook will not run again. Recover its script via \
+             ws.hook.get(\"hook-evict-2\") and schedule a new hook via ws.hook.schedule \
              if the condition is still worth watching.]"
                 .to_string()
         ]
     );
+}
+
+/// The dispatch-retired and evicted state notes MUST stay single-line
+/// `[This hook …]` paragraphs: the FE strips them with the single-line regex
+/// `(?:\n[ \t]*\n|^)\[This hook [^\n]*\]\s*$` (hook-wake-attribution.ts), so
+/// an embedded newline would leak the note into the rendered message.
+#[test]
+fn golden_hook_state_notes_are_single_line_and_embed_hook_id() {
+    let harness = crate::harness::latest();
+    let hook_id = "hook-shape-1";
+    for note in [
+        harness.hook_dispatch_retired_note(hook_id),
+        harness.hook_evicted_state_note(hook_id),
+    ] {
+        assert!(
+            !note.contains('\n'),
+            "state note must be single-line: {note}"
+        );
+        assert!(note.starts_with("[This hook "), "{note}");
+        assert!(note.ends_with(']'), "{note}");
+        assert!(note.contains("ws.hook.get(\"hook-shape-1\")"), "{note}");
+    }
 }
 
 // ---------------------------------------------------------------------------

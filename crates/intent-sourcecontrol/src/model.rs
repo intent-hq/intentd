@@ -452,4 +452,8 @@ pub struct MergeRequirementSignals {
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
     /// unsupported endpoint) — a degraded but non-fatal probe.
     pub branch_rules: Option<BranchRules>,
+    /// Whether the PR is currently queued in the host's merge queue (GitHub
+    /// GraphQL `isInMergeQueue`). `None` when the host does not report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_in_merge_queue: Option<bool>,
 }

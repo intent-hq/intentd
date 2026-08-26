@@ -26,11 +26,10 @@ use intent_core::{ActorType, Event, EventActor, SessionStats};
 use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{
-    assignment_fence, assignment_repository_path, canonical_assignment_scope,
     ensure_effort_supported_by_model, fetch_auggie_models, fetch_auggie_models_rich,
     fetch_session_stats, finalize_model_rows, last_response_and_digest_from_blocks,
     live_response_and_digest_from_blocks, parse_model_list_json, parse_model_list_output,
-    parse_session_stats_output, resolve_auggie_bin_with, scope_overlaps_path,
+    parse_session_stats_output, resolve_auggie_bin_with,
 };
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
@@ -7253,223 +7252,6 @@ async fn report_to_parent_persists_completion_report() {
     assert_eq!(v["metadata"]["completionReportTimestamp"], r["savedAt"]);
 }
 
-#[test]
-fn assignment_scope_normalization_is_canonical_and_rejects_escape() {
-    let a = canonical_assignment_scope(Some(&[
-        " ./crates//intent-core/ ".to_string(),
-        "crates\\intent-core".to_string(),
-        "crates/intent-services".to_string(),
-    ]))
-    .expect("canonical scope");
-    assert_eq!(a, vec!["crates/intent-core", "crates/intent-services"]);
-    assert!(canonical_assignment_scope(Some(&["../outside".to_string()])).is_err());
-    assert!(canonical_assignment_scope(Some(&["/absolute".to_string()])).is_err());
-    assert!(canonical_assignment_scope(Some(&["  ".to_string()])).is_err());
-}
-
-#[test]
-fn assignment_scope_rejects_multiple_git_repositories() {
-    let root = tempfile::tempdir().expect("root repo");
-    git2::Repository::init(root.path()).expect("init root repo");
-    let nested = root.path().join("nested");
-    std::fs::create_dir(&nested).expect("nested dir");
-    git2::Repository::init(&nested).expect("init nested repo");
-
-    let err = assignment_repository_path(
-        root.path(),
-        &["root-file.txt".into(), "nested/child.txt".into()],
-    )
-    .expect_err("cross-repository scope must fail");
-    assert!(err.to_string().contains("multiple Git repositories"));
-    assert_eq!(
-        assignment_repository_path(root.path(), &["nested/a".into(), "nested/b".into()])
-            .expect("one nested repository"),
-        nested.canonicalize().expect("canonical nested")
-    );
-}
-
-#[test]
-fn assignment_scope_equal_to_nested_repository_root_matches_every_path() {
-    let root = tempfile::tempdir().expect("root repo");
-    git2::Repository::init(root.path()).expect("init root repo");
-    let nested = root.path().join("nested");
-    std::fs::create_dir(&nested).expect("nested dir");
-    git2::Repository::init(&nested).expect("init nested repo");
-
-    let assignment_repo = assignment_repository_path(root.path(), &["nested".into()])
-        .expect("nested repository root scope");
-    let workspace_root = root.path().canonicalize().expect("canonical root");
-    let repo_relative = workspace_root
-        .join("nested")
-        .strip_prefix(&assignment_repo)
-        .expect("scope is inside assignment repository")
-        .to_string_lossy()
-        .replace('\\', "/");
-    assert!(repo_relative.is_empty());
-    assert!(scope_overlaps_path(&repo_relative, "src/lib.rs"));
-}
-
-#[tokio::test]
-async fn delegated_assignment_fence_survives_progress_and_is_projected() {
-    let (_t, svc, ws) = setup().await;
-    let parent = create_agent(&svc, &ws, "Parent").await;
-    let note_id = seed_task(&svc, &ws, "Fenced task").await;
-    let input = delegate_input(&note_id, None);
-    let delegated = svc
-        .agent_delegate_op(ws.clone(), input, Some(parent))
-        .await
-        .expect("delegate");
-    assert_eq!(delegated["taskRevision"].as_str().unwrap().len(), 64);
-    assert_eq!(delegated["scopeHash"].as_str().unwrap().len(), 64);
-    assert!(delegated["expectedHeadSha"].is_null());
-    let child = AgentId::from(delegated["agentId"].as_str().unwrap());
-
-    let got = svc
-        .agent_get_op(child.clone(), None)
-        .await
-        .expect("get child");
-    let got = serde_json::to_value(got).expect("serialize child");
-    assert_eq!(got["metadata"]["taskRevision"], delegated["taskRevision"]);
-    assert_eq!(got["metadata"]["scopeHash"], delegated["scopeHash"]);
-
-    let mut note = svc.store().get_note(&ws, &note_id).await.expect("task");
-    note.content
-        .push_str("\n\n## Progress\nImplemented one step.\n");
-    svc.store().update_note(&note).await.expect("save progress");
-    let report = svc
-        .agent_report_to_parent_op(ws, json!("done"), Some(child))
-        .await
-        .expect("report after progress");
-    assert_eq!(report["ok"], json!(true), "report: {report}");
-    assert!(report.get("quarantined").is_none());
-}
-
-#[tokio::test]
-async fn assignment_head_accepts_later_descendant_commit() {
-    fn commit(repo: &git2::Repository, path: &str, content: &str) -> String {
-        let full_path = repo.workdir().unwrap().join(path);
-        if let Some(parent) = full_path.parent() {
-            std::fs::create_dir_all(parent).expect("create parent");
-        }
-        std::fs::write(full_path, content).expect("write file");
-        let mut index = repo.index().expect("index");
-        index
-            .add_path(std::path::Path::new(path))
-            .expect("add path");
-        index.write().expect("write index");
-        let tree_id = index.write_tree().expect("tree");
-        let tree = repo.find_tree(tree_id).expect("find tree");
-        let signature = git2::Signature::now("Test", "test@example.com").expect("signature");
-        let parents = repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|id| repo.find_commit(id).ok())
-            .into_iter()
-            .collect::<Vec<_>>();
-        let parent_refs = parents.iter().collect::<Vec<_>>();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            path,
-            &tree,
-            &parent_refs,
-        )
-        .expect("commit")
-        .to_string()
-    }
-
-    let tmp = TempDb::new();
-    let repo_dir = tempfile::tempdir().expect("repo dir");
-    let repo = git2::Repository::init(repo_dir.path()).expect("init repo");
-    let base = commit(&repo, "scoped/base.txt", "base\n");
-    let store = Store::open(&tmp.path).await.expect("open store");
-    let ws = WorkspaceId::new();
-    let mut workspace = workspace(&ws);
-    workspace.repository_path = Some(repo_dir.path().to_string_lossy().to_string());
-    workspace.skip_worktree = true;
-    store.insert_workspace(&workspace).await.expect("ws");
-    let registry = test_registry_with_default_provider(&tmp);
-    let svc = Services::new(store).with_settings_registry(registry);
-    let parent = create_agent(&svc, &ws, "Parent").await;
-    let note_id = seed_task(&svc, &ws, "Git fenced task").await;
-    let mut input = delegate_input(&note_id, None);
-    input.scope = Some(vec!["scoped".into()]);
-    let delegated = svc
-        .agent_delegate_op(ws.clone(), input, Some(parent))
-        .await
-        .expect("delegate");
-    assert_eq!(delegated["expectedHeadSha"], json!(base));
-    let child = AgentId::from(delegated["agentId"].as_str().unwrap());
-    let got = svc
-        .agent_get_op(child.clone(), None)
-        .await
-        .expect("get child");
-    let got = serde_json::to_value(got).expect("serialize child");
-    assert_eq!(got["metadata"]["expectedHeadSha"], json!(base));
-
-    commit(&repo, "unrelated.txt", "later\n");
-    let report = svc
-        .agent_report_to_parent_op(ws.clone(), json!("done"), Some(child.clone()))
-        .await
-        .expect("report on descendant head");
-    assert_eq!(report["ok"], json!(true), "report: {report}");
-
-    commit(&repo, "scoped/later.txt", "changed scope\n");
-    let stale = svc
-        .agent_report_to_parent_op(ws, json!("late"), Some(child))
-        .await
-        .expect("scoped change quarantine");
-    assert_eq!(stale["quarantined"], json!(true), "stale: {stale}");
-    assert_eq!(stale["reason"], json!("scope-changed-since-delegation"));
-}
-
-#[tokio::test]
-async fn report_quarantines_changed_task_meaning_without_side_effects() {
-    let (_t, svc, ws) = setup().await;
-    let parent = create_agent(&svc, &ws, "Parent").await;
-    let note_id = seed_task(&svc, &ws, "Original meaning").await;
-    let delegated = svc
-        .agent_delegate_op(ws.clone(), delegate_input(&note_id, None), Some(parent))
-        .await
-        .expect("delegate");
-    let child = AgentId::from(delegated["agentId"].as_str().unwrap());
-
-    let mut note = svc.store().get_note(&ws, &note_id).await.expect("task");
-    note.title = "Changed meaning".to_string();
-    svc.store().update_note(&note).await.expect("change task");
-    let report = svc
-        .agent_report_to_parent_op(ws.clone(), json!("stale"), Some(child.clone()))
-        .await
-        .expect("quarantine result");
-    assert_eq!(report["ok"], json!(false));
-    assert_eq!(report["quarantined"], json!(true));
-    assert_eq!(report["reason"], json!("task-revision-mismatch"));
-
-    let session = svc.store().get_agent_session(&child).await.expect("child");
-    assert!(session.completion_report.is_none());
-    let task = svc.store().get_note(&ws, &note_id).await.expect("task");
-    assert_eq!(
-        task.metadata.task.expect("task metadata").status,
-        intent_core::TaskStatus::InProgress
-    );
-
-    let attention = svc
-        .agent_request_attention_op(
-            ws,
-            "blocker".into(),
-            "stale blocker".into(),
-            Some(child.clone()),
-        )
-        .await
-        .expect("attention quarantine result");
-    assert_eq!(attention["quarantined"], json!(true));
-    assert_eq!(attention["reason"], json!("task-revision-mismatch"));
-    let session = svc.store().get_agent_session(&child).await.expect("child");
-    assert!(session.attention_request_kind.is_none());
-}
-
 #[tokio::test]
 async fn legacy_checkbox_delegate_can_report_and_request_attention() {
     let (_t, svc, ws) = setup().await;
@@ -7505,10 +7287,6 @@ async fn legacy_checkbox_delegate_can_report_and_request_attention() {
     let child = AgentId::from(delegated["agentId"].as_str().expect("agentId"));
     let session = svc.store().get_agent_session(&child).await.expect("child");
     assert_eq!(session.task_note_id.as_ref(), Some(&note.id));
-    assert!(assignment_fence(&session)
-        .expect("scope fence")
-        .task_note_id
-        .is_none());
 
     let report = svc
         .agent_report_to_parent_op(ws.clone(), json!("done"), Some(child.clone()))
@@ -7533,53 +7311,6 @@ async fn legacy_checkbox_delegate_can_report_and_request_attention() {
     assert_eq!(
         session.attention_request_kind.as_deref(),
         Some("discussion")
-    );
-}
-
-#[tokio::test]
-async fn superseded_assignment_quarantines_report_and_direct_status_update() {
-    let (_t, svc, ws) = setup().await;
-    let parent = create_agent(&svc, &ws, "Parent").await;
-    let note_id = seed_task(&svc, &ws, "Scoped task").await;
-    let mut first_input = delegate_input(&note_id, None);
-    first_input.agent_instructions = Some("first assignment".into());
-    let first = svc
-        .agent_delegate_op(ws.clone(), first_input, Some(parent.clone()))
-        .await
-        .expect("first delegate");
-    let first_child = AgentId::from(first["agentId"].as_str().unwrap());
-
-    let mut second_input = delegate_input(&note_id, Some(true));
-    second_input.agent_instructions = Some("replacement assignment".into());
-    let second = svc
-        .agent_delegate_op(ws.clone(), second_input, Some(parent))
-        .await
-        .expect("replacement delegate");
-    assert_ne!(first["taskRevision"], second["taskRevision"]);
-    assert_eq!(first["scopeHash"], second["scopeHash"]);
-
-    let report = svc
-        .agent_report_to_parent_op(ws.clone(), json!("old scope"), Some(first_child.clone()))
-        .await
-        .expect("quarantine result");
-    assert_eq!(report["quarantined"], json!(true));
-    assert_eq!(report["reason"], json!("task-revision-superseded"));
-
-    let err = WorkspaceApi::task_update_note_status(
-        &svc,
-        ws.clone(),
-        note_id.clone(),
-        "complete".into(),
-        None,
-        Some(first_child),
-    )
-    .await
-    .expect_err("stale status update must be denied");
-    assert!(err.to_string().contains("assignment update quarantined"));
-    let task = svc.store().get_note(&ws, &note_id).await.expect("task");
-    assert_eq!(
-        task.metadata.task.expect("task metadata").status,
-        intent_core::TaskStatus::InProgress
     );
 }
 
@@ -29840,17 +29571,6 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
         .expect_err("mixed addressing rejected");
     match &err {
         Error::InvalidParams(msg) => assert!(msg.contains("mutually exclusive"), "{msg}"),
-        other => panic!("expected InvalidParams, got {other:?}"),
-    }
-
-    let mut scoped_batch = batch_input(&[&note_id]);
-    scoped_batch.scope = Some(vec!["crates/intent-core".into()]);
-    let err = svc
-        .agent_delegate_op(ws.clone(), scoped_batch, None)
-        .await
-        .expect_err("batch scope rejected");
-    match &err {
-        Error::InvalidParams(msg) => assert!(msg.contains("semantic-only"), "{msg}"),
         other => panic!("expected InvalidParams, got {other:?}"),
     }
 
