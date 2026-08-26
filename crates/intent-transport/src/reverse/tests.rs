@@ -138,7 +138,7 @@ async fn request_times_out_without_a_reply() {
         .await
         .expect_err("must time out");
     assert!(err.message.contains("timed out"));
-    assert!(reverse.pending.lock().unwrap().is_empty());
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
     assert!(
         !reverse.route_response(&json!({
             "jsonrpc": "2.0", "id": "rev-1", "result": { "late": true }
@@ -168,7 +168,7 @@ async fn request_timeout_includes_outbound_queue_wait() {
         .expect_err("queue wait must time out");
     assert!(err.message.contains("timed out"));
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(reverse.pending.lock().unwrap().is_empty());
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
     assert_eq!(out_rx.recv().await.as_deref(), Some("occupied"));
     assert!(out_rx.try_recv().is_err(), "timed-out frame was cancelled");
 }
@@ -187,7 +187,7 @@ async fn request_fails_when_connection_closed() {
         .await
         .expect_err("closed connection fails");
     assert!(err.message.contains("closed"));
-    assert!(reverse.pending.lock().unwrap().is_empty());
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
 }
 
 #[tokio::test]
@@ -210,7 +210,7 @@ async fn blocked_request_fails_when_connection_closes() {
             )
             .await
     });
-    while reverse.pending.lock().unwrap().is_empty() {
+    while reverse.pending.lock().unwrap().requests.is_empty() {
         tokio::task::yield_now().await;
     }
     drop(out_rx);
@@ -220,7 +220,7 @@ async fn blocked_request_fails_when_connection_closes() {
         .expect("join")
         .expect_err("closed connection wakes blocked sender");
     assert!(err.message.contains("closed"));
-    assert!(reverse.pending.lock().unwrap().is_empty());
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
 }
 
 #[tokio::test]
@@ -246,5 +246,24 @@ async fn accepted_request_fails_when_connection_closes() {
         .expect("join")
         .expect_err("connection close wakes response waiter");
     assert!(err.message.contains("closed"));
-    assert!(reverse.pending.lock().unwrap().is_empty());
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
+}
+
+#[tokio::test]
+async fn request_after_close_fails_without_enqueuing() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let reverse = ReverseChannel::new(out_tx);
+    reverse.close();
+
+    let err = reverse
+        .request(
+            "browser.exec",
+            json!({ "actions": [{ "action": "screenshot" }] }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("closed state is permanent");
+    assert!(err.message.contains("closed"));
+    assert!(out_rx.try_recv().is_err());
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
 }

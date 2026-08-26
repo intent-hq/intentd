@@ -8925,6 +8925,60 @@ async fn wss_disconnect_wakes_accepted_screenshot_request() {
     srv.ws.stop().await;
 }
 
+#[tokio::test]
+async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
+    let srv = start(WsOptions {
+        heartbeat_interval: Duration::from_millis(100),
+        heartbeat_timeout: Duration::from_millis(300),
+        ..WsOptions::default()
+    })
+    .await;
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while srv.reverse_registry.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reverse registration");
+
+    let reverse_registry = srv.reverse_registry.clone();
+    let request = tokio::spawn(async move {
+        reverse_registry
+            .dispatch(
+                "browser.exec",
+                serde_json::json!({ "actions": [{ "action": "screenshot" }] }),
+            )
+            .await
+    });
+    let frame = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).expect("json frame");
+                    if frame["method"] == "browser.exec" {
+                        break frame;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected reverse frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("accepted reverse frame");
+    assert_eq!(frame["params"]["actions"][0]["action"], "screenshot");
+
+    let err = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("heartbeat abort wakes request")
+        .expect("join")
+        .expect_err("request fails on heartbeat abort");
+    assert!(err.to_string().contains("closed"), "unexpected: {err}");
+    assert!(srv.reverse_registry.is_empty());
+    srv.ws.stop().await;
+}
+
 /// Client-called `host.openInEditor` over WSS (PROTOCOL §5.14): a WSS
 /// connection resolves as remote, so the daemon re-dispatches the intent to
 /// the connected client as the FE-served reverse RPC (`id: "rev-<n>"`) and
