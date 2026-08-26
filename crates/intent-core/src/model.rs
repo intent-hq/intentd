@@ -2449,7 +2449,10 @@ pub const NOTE_LIST_PREVIEW_CHARS: usize = 500;
 #[must_use]
 pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
     let content = std::mem::take(&mut note.content);
-    let mut value = serde_json::to_value(&note).unwrap_or(serde_json::Value::Null);
+    let mut value = serde_json::to_value(&note).unwrap_or_else(|e| {
+        tracing::warn!(note_id = %note.id.0, error = %e, "note_list_slim_row: serializing note failed; serving null row");
+        serde_json::Value::Null
+    });
     if let serde_json::Value::Object(map) = &mut value {
         map.remove("content");
         let preview: String = content.chars().take(NOTE_LIST_PREVIEW_CHARS).collect();

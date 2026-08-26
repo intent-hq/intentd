@@ -2234,10 +2234,10 @@ async fn success_results_are_objects() {
 }
 
 /// The `note.list` `projection` param (§5.2, monorepo#3573): absent /
-/// `null` / `"full"` serve the full rows byte-identically, `"slim"` serves
-/// rows with `content` replaced by `contentPreview` + `contentLength`
-/// (every other field untouched), and any other value is `-32602` naming
-/// the accepted values.
+/// `null` / `"full"` serve identical full rows (structural `Value`
+/// equality), `"slim"` serves rows with `content` replaced by
+/// `contentPreview` + `contentLength` (every other field untouched), and
+/// any other value is `-32602` naming the accepted values.
 #[tokio::test]
 async fn note_list_projection_param() {
     let full =
@@ -2249,7 +2249,7 @@ async fn note_list_projection_param() {
         r#"{"jsonrpc":"2.0","id":1,"method":"note.list","params":{"workspaceId":"ws-1","projection":"full"}}"#,
     ] {
         let v = call(msg).await.unwrap();
-        assert_eq!(v["result"], full["result"], "byte-identical: {msg}");
+        assert_eq!(v["result"], full["result"], "identical full rows: {msg}");
     }
     let full_row = &full["result"]["notes"][0];
     assert_eq!(full_row["content"], "# Hi");
