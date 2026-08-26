@@ -270,6 +270,30 @@ impl PendingQuestionMutationLocks {
             .or_default()
             .clone()
     }
+
+    /// Drop the agent's entry from the map (agent deletion —
+    /// monorepo#3179): entries otherwise accumulate for the daemon's
+    /// lifetime. Safe against in-flight mutations: a holder keeps its own
+    /// `Arc` clone of the mutex, so removal never invalidates a held guard,
+    /// and mutations already serialized on the old mutex complete in order.
+    /// A mutation that starts AFTER removal gets a fresh mutex, but by then
+    /// the session row is gone, so it no-ops on the store read — the two
+    /// mutexes never guard conflicting writes.
+    fn remove(&self, agent_id: &AgentId) {
+        self.locks
+            .lock()
+            .expect("pending-question lock map poisoned")
+            .remove(agent_id);
+    }
+
+    /// Whether the map currently holds an entry for the agent (test-only).
+    #[cfg(test)]
+    pub(crate) fn contains(&self, agent_id: &AgentId) -> bool {
+        self.locks
+            .lock()
+            .expect("pending-question lock map poisoned")
+            .contains_key(agent_id)
+    }
 }
 
 /// The concise per-agent state digest behind `ws.agent.snapshot()` and the
@@ -3841,6 +3865,17 @@ impl Services {
         self.clear_failure_streak(&agent_id);
         self.clear_failure_wake_dedup_all_roles(&agent_id);
         self.discard_pending_terminal_error(&agent_id);
+        // Pending-question registries (monorepo#3179): the per-agent marker
+        // mutation lock and the dismissal-notice dedup set are both in-memory
+        // and keyed by agent — drop them with the session so neither map
+        // grows unboundedly on a long-lived daemon. In-flight marker
+        // mutations keep their own Arc clone of the mutex, so ordering is
+        // preserved (see `PendingQuestionMutationLocks::remove`).
+        self.pending_question_mutation_locks.remove(&agent_id);
+        self.dismissal_notices_sent
+            .lock()
+            .expect("dismissal notice registry poisoned")
+            .remove(&agent_id);
         // Drop the deleted agent's event subscriptions (monorepo#937): the
         // wake target is gone, so matching/batching for it is pure leak.
         self.remove_event_subscriptions_for_agent(&agent_id).await;
@@ -5970,16 +6005,47 @@ impl Services {
             }
             return Err(e);
         }
-        self.publish_agent_mutation_event(
-            &workspace_id,
-            &agent_id,
-            AGENT_UPDATED,
-            json!({
+        // Self-contained event (monorepo#3180): carry the session's
+        // pending-questions marker alongside the dismissal marker so clients
+        // can re-derive the hold from this one event without an extra
+        // `agent.get` round-trip. Same projection rule as `AgentLite`:
+        // present when the marker was ever written (the empty string is the
+        // authoritative clear), omitted for legacy marker-less sessions. The
+        // marker is RE-READ and the event published under the per-agent
+        // mutation lock — marker set/clear paths hold that lock across their
+        // write + event, so the value emitted here is coherent with the event
+        // order a client observes; the top-of-op snapshot could be stale by
+        // emit time and would let a client re-derive an already-cleared hold
+        // (PR #1496 review).
+        {
+            let lock = self.pending_question_mutation_locks.lock_for(&agent_id);
+            let _guard = lock.lock().await;
+            let marker_session = match self.store.get_agent_session_summary(&agent_id).await {
+                Ok(fresh) => fresh,
+                Err(e) => {
+                    // Best-effort: the dismissal marker is already persisted,
+                    // so keep the event flowing with the top-of-op snapshot
+                    // rather than failing the dismissal.
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        "failed to re-read pending-questions marker for dismiss event"
+                    );
+                    session
+                }
+            };
+            let mut event_data = json!({
                 "agentId": agent_id.0,
                 "dismissedQuestionsMessageId": message_id,
-            }),
-        )
-        .await;
+            });
+            if marker_session.pending_questions_marker_written() {
+                event_data["pendingQuestionsMessageId"] = json!(marker_session
+                    .pending_questions_message_id()
+                    .unwrap_or_default());
+            }
+            self.publish_agent_mutation_event(&workspace_id, &agent_id, AGENT_UPDATED, event_data)
+                .await;
+        }
         // Dismissing the questions retires the question hold, which can
         // retire the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare.

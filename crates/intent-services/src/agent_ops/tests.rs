@@ -26084,6 +26084,13 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
         .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
         .await
         .expect("append question");
+    // Persist the pending marker the asking turn would have written, so the
+    // dismiss event below can carry it (monorepo#3180). Subscribe AFTER this
+    // write: it emits its own `agent:updated`.
+    assert!(
+        svc.record_pending_questions_marker(&ws, &id, &asked.id)
+            .await
+    );
 
     let mut sub = bus.subscribe(SubscriptionFilter {
         event_types: vec![AGENT_UPDATED.to_string()],
@@ -26123,6 +26130,12 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
         batch[0].data["dismissedQuestionsMessageId"].as_str(),
         Some(asked.id.as_str())
     );
+    // Self-contained (monorepo#3180): the event also carries the session's
+    // pending marker so clients need no `agent.get` round-trip.
+    assert_eq!(
+        batch[0].data["pendingQuestionsMessageId"].as_str(),
+        Some(asked.id.as_str())
+    );
 
     // Idempotent: re-dismissing the same message succeeds.
     let again = svc
@@ -26130,6 +26143,229 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
         .await
         .expect("re-dismiss");
     assert_eq!(again["success"], json!(true));
+}
+
+/// `agent:updated` marker projection on dismissal follows the `AgentLite`
+/// rule (monorepo#3180): a session whose pending-questions marker was never
+/// written OMITS `pendingQuestionsMessageId` entirely (legacy sessions fall
+/// back to the transcript walk), rather than sending a misleading empty
+/// string.
+#[tokio::test]
+async fn dismiss_questions_event_omits_pending_marker_when_never_written() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data["dismissedQuestionsMessageId"].as_str(),
+        Some(asked.id.as_str())
+    );
+    assert!(
+        batch[0].data.get("pendingQuestionsMessageId").is_none(),
+        "marker-less session must omit the field: {:?}",
+        batch[0].data
+    );
+}
+
+/// Regression (PR #1496 review): the dismiss event's pending marker must not
+/// be the stale top-of-op snapshot. A marker clear that commits after the
+/// dismissal's snapshot but before its event would otherwise be followed by
+/// a dismiss event re-announcing the already-cleared marker, letting clients
+/// re-derive a hold that no longer exists. The dismiss op re-reads the marker
+/// under the per-agent mutation lock at emit time, so it publishes the
+/// post-clear value.
+#[tokio::test]
+async fn dismiss_questions_event_reflects_concurrent_marker_clear() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+    assert!(
+        svc.record_pending_questions_marker(&ws, &id, &asked.id)
+            .await
+    );
+
+    // Subscribe AFTER the marker write (it emits its own `agent:updated`).
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    // Hold the agent's mutation lock so the dismiss op parks right before
+    // its emit-time marker re-read.
+    let gate = svc.pending_question_mutation_locks.lock_for(&id);
+    let guard = gate.lock().await;
+
+    let dismissing = {
+        let svc = svc.clone();
+        let ws = ws.clone();
+        let id = id.clone();
+        let message_id = asked.id.clone();
+        tokio::spawn(async move { svc.agent_dismiss_questions_op(ws, id, message_id).await })
+    };
+    // The dismissal marker persists BEFORE the lock acquisition: poll for it
+    // to know the op is parked at the gate.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let session = svc
+            .store()
+            .get_agent_session_summary(&id)
+            .await
+            .expect("session");
+        if session.dismissed_questions_message_id() == Some(asked.id.as_str()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dismissal marker never persisted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Concurrent clear commits while the dismiss is parked (in production the
+    // clear path holds this same lock across its write + event; the direct
+    // store write stands in for a clear that already finished).
+    assert!(svc
+        .store()
+        .set_agent_session_metadata_key(
+            &ws,
+            &id,
+            intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
+            "",
+            None,
+            &now_iso(),
+        )
+        .await
+        .expect("clear marker"));
+
+    drop(guard);
+    dismissing.await.expect("join").expect("dismiss");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data["dismissedQuestionsMessageId"].as_str(),
+        Some(asked.id.as_str())
+    );
+    // The event carries the post-clear value, not the stale snapshot.
+    assert_eq!(
+        batch[0].data["pendingQuestionsMessageId"].as_str(),
+        Some(""),
+        "dismiss event must reflect the concurrent clear: {:?}",
+        batch[0].data
+    );
+}
+
+/// Registry hygiene (monorepo#3179): deleting an agent evicts its entries
+/// from the pending-question mutation-lock map AND the dismissal-notice
+/// registry, so neither in-memory map grows unboundedly as agents churn on a
+/// long-lived daemon.
+#[tokio::test]
+async fn agent_delete_evicts_pending_question_registries() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+
+    // Populate both registries: the marker write takes the mutation lock,
+    // the dismissal records a notice-dedup entry.
+    assert!(
+        svc.record_pending_questions_marker(&ws, &id, &asked.id)
+            .await
+    );
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+    assert!(svc.pending_question_mutation_locks.contains(&id));
+    assert!(svc
+        .dismissal_notices_sent
+        .lock()
+        .expect("dismissal notice registry poisoned")
+        .contains_key(&id));
+
+    svc.agent_delete_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("delete");
+
+    assert!(
+        !svc.pending_question_mutation_locks.contains(&id),
+        "delete must evict the agent's mutation-lock entry"
+    );
+    assert!(
+        !svc.dismissal_notices_sent
+            .lock()
+            .expect("dismissal notice registry poisoned")
+            .contains_key(&id),
+        "delete must evict the agent's dismissal-notice entries"
+    );
+}
+
+/// Concurrent safety of the eviction (monorepo#3179): an in-flight marker
+/// mutation holds its own `Arc` clone of the per-agent mutex, so an eviction
+/// racing it neither invalidates the held guard nor loses the ordering of a
+/// mutation already waiting on the same mutex — both complete normally, in
+/// order, after which the map entry stays gone.
+#[tokio::test]
+async fn pending_question_lock_eviction_preserves_in_flight_ordering() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    // Simulate an in-flight mutation: hold the agent's mutex the way the
+    // marker paths do (an owned handle independent of the map entry).
+    let held = svc.pending_question_mutation_locks.lock_for(&id);
+    let guard = held.lock().await;
+
+    // A second mutation serializes behind the SAME mutex even though the map
+    // entry is evicted while both are in flight.
+    let waiter = svc.pending_question_mutation_locks.lock_for(&id);
+    assert!(Arc::ptr_eq(&held, &waiter), "same gate before eviction");
+
+    svc.pending_question_mutation_locks.remove(&id);
+    assert!(!svc.pending_question_mutation_locks.contains(&id));
+
+    // The waiter still contends on the old mutex: it cannot acquire while
+    // the in-flight guard is held...
+    assert!(
+        waiter.try_lock().is_err(),
+        "ordering preserved post-eviction"
+    );
+    drop(guard);
+    // ...and proceeds once the holder releases, exactly as before.
+    drop(waiter.try_lock().expect("waiter acquires after release"));
+
+    // A mutation starting AFTER the eviction gets a fresh gate (and would
+    // no-op on the store read for a deleted agent), without re-poisoning the
+    // eviction: the map self-repopulates only for live usage.
+    let fresh = svc.pending_question_mutation_locks.lock_for(&id);
+    assert!(!Arc::ptr_eq(&held, &fresh), "fresh gate after eviction");
+    svc.pending_question_mutation_locks.remove(&id);
 }
 
 /// Regression (PR #751 review): if `agent_session.metadata` ever holds a
