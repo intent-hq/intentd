@@ -825,8 +825,18 @@ struct AgentListFilter {
     parent_agent_id: Option<String>,
 }
 
+/// Like `opt_str`, but rejects a present-but-non-string value instead of
+/// silently ignoring it (a typo'd filter must not widen the result set).
+fn opt_str_strict(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!("{key} must be a string, got: {other}")),
+    }
+}
+
 fn parse_agent_list_filter(args: &Value) -> Result<AgentListFilter, String> {
-    let scope = match opt_str(args, "scope").as_deref() {
+    let scope = match opt_str_strict(args, "scope")?.as_deref() {
         None => None,
         Some("top-level") => Some(AgentListScope::TopLevel),
         Some("subagents") => Some(AgentListScope::Subagents),
@@ -836,7 +846,7 @@ fn parse_agent_list_filter(args: &Value) -> Result<AgentListFilter, String> {
             ));
         }
     };
-    let parent_agent_id = opt_str(args, "parentAgentId");
+    let parent_agent_id = opt_str_strict(args, "parentAgentId")?;
     if scope == Some(AgentListScope::TopLevel) && parent_agent_id.is_some() {
         return Err(
             "parentAgentId cannot be combined with scope \"top-level\": top-level agents have no parent. Drop one of the two filters (parentAgentId alone already returns only that agent's sub-agents)."
@@ -1617,6 +1627,17 @@ mod tests {
                 .unwrap();
         assert!(f.retains(AgentStatus::Active, Some("agent-p")));
         assert!(!f.retains(AgentStatus::Active, Some("agent-other")));
+    }
+
+    #[test]
+    fn agent_list_filter_rejects_non_string_scope_and_parent() {
+        let err = parse_agent_list_filter(&json!({ "scope": 5 })).unwrap_err();
+        assert!(err.contains("scope must be a string"), "{err}");
+        let err = parse_agent_list_filter(&json!({ "parentAgentId": 5 })).unwrap_err();
+        assert!(err.contains("parentAgentId must be a string"), "{err}");
+        // Explicit null still means "absent", matching the JS wrapper.
+        let f = parse_agent_list_filter(&json!({ "scope": null, "parentAgentId": null })).unwrap();
+        assert!(f.retains(AgentStatus::Active, None));
     }
 
     #[test]
