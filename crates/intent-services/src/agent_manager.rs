@@ -7704,7 +7704,7 @@ impl AgentManager {
                     let mut hint = None;
                     if let Some(dir) = &stderr_dir {
                         if let Some(conn) = &dead_conn {
-                            conn.await_stderr_settled(STDERR_SETTLE_TIMEOUT).await;
+                            conn.await_stderr_settled(stderr_settle_timeout()).await;
                             if conn.stderr_captured() && stderr_capture_dir_populated(dir) {
                                 hint = Some(dir);
                             }
@@ -10811,14 +10811,16 @@ fn is_benign_turn_error(err: &Error) -> bool {
 /// child-death error is always wrapped there (handshake/prompt failures) —
 /// avoiding a Display allocation per check.
 ///
-/// monorepo#3570: the hint is honest now — it bounded-awaits the stderr
-/// drain's settle signal (the dying child's stderr EOF + capture-file flush)
-/// on the still-installed connection, then names the directory only when
-/// THIS child's connection actually captured stderr (`stderr_captured`) and
-/// a capture file exists there. The per-connection flag keeps stale daily
-/// files an earlier run left in the same per-agent dir from turning a
-/// silent child into a misleading "stderr captured at …" claim; a child
-/// that never wrote stderr gets the plain WARN instead.
+/// monorepo#3570: the hint is honest now — it tears down the child's whole
+/// process group FIRST (so a descendant holding the stderr write end open is
+/// killed and EOF is deterministic), then bounded-awaits the stderr drain's
+/// settle signal (EOF + capture-file flush) on the retained connection, and
+/// names the directory only when THIS child's connection actually captured
+/// stderr (`stderr_captured`) and a capture file exists there. The
+/// per-connection flag keeps stale daily files an earlier run left in the
+/// same per-agent dir from turning a silent child into a misleading "stderr
+/// captured at …" claim; a child that never wrote stderr gets the plain WARN
+/// instead.
 async fn stderr_capture_hint(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -10828,10 +10830,10 @@ async fn stderr_capture_hint(
         return None;
     }
     let dir = mgr.agent_stderr_log_dir(agent_id)?;
-    // The teardown (`kill_child_only`) has not run yet at the WARN sites, so
-    // the handle — and its connection's settled watch — is usually still
-    // installed. Spawn-failure paths may have no handle: without a
-    // connection to vouch for a fresh capture, claim nothing.
+    // The hint runs BEFORE the failure handlers' own teardown, so the handle
+    // — and its connection's settled watch — is usually still installed.
+    // Spawn-failure paths may have no handle: without a connection to vouch
+    // for a fresh capture, claim nothing.
     let connection = mgr
         .handles
         .lock()
@@ -10839,7 +10841,18 @@ async fn stderr_capture_hint(
         .get(agent_id)
         .map(|h| Arc::clone(&h.connection));
     let connection = connection?;
-    connection.await_stderr_settled(STDERR_SETTLE_TIMEOUT).await;
+    // Sweep the child's process group BEFORE awaiting settle (same ordering
+    // as the idle-exit watcher): a same-group descendant holding the stderr
+    // write end open is killed first, so EOF is deterministic and the capture
+    // includes its last output — instead of the await burning its full bound
+    // and the WARN underclaiming. The retained connection Arc keeps the
+    // settled watch alive past the handle's removal, and
+    // `handle_terminal_turn_failure`'s own later `kill_child_only` degrades
+    // to a no-op (the handle is already gone).
+    mgr.kill_child_only(agent_id).await;
+    connection
+        .await_stderr_settled(stderr_settle_timeout())
+        .await;
     (connection.stderr_captured() && stderr_capture_dir_populated(&dir)).then_some(dir)
 }
 
@@ -10882,6 +10895,18 @@ mod stderr_capture_hint_tests {
 /// write end is already closed — EOF is normally immediate; the bound covers
 /// a same-group descendant holding the pipe open.
 const STDERR_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// [`STDERR_SETTLE_TIMEOUT`] with an `INTENTD_STDERR_SETTLE_TIMEOUT_MS` env
+/// override (monorepo#3592): the pipe-holding-descendant e2e widens the bound
+/// and requires the WARN well inside it, proving the hint settles via the
+/// group sweep instead of waiting the bound out — a reordering regression
+/// then fails deterministically instead of racing a 2s timeout.
+fn stderr_settle_timeout() -> Duration {
+    std::env::var("INTENTD_STDERR_SETTLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|ms| ms.trim().parse().ok())
+        .map_or(STDERR_SETTLE_TIMEOUT, Duration::from_millis)
+}
 
 /// Whether `run_prompt_turn` already emitted the terminal `agent:failed` +
 /// `agent:stream:end` pair for this error. Its post-prompt failure path wraps

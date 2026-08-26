@@ -387,6 +387,18 @@ async function handlePrompt(id, params) {
       : 0;
   const attempt = exitGate > 0 || rpcGate > 0 ? getAndIncrementAttempt() : 0;
   if (exitGate > 0 && attempt <= exitGate) {
+    // Pipe-holding descendant (monorepo#3592): on the LAST gated attempt (the
+    // one the daemon classifies as a terminal failure), leave a same-group
+    // `sleep` holding this process's inherited stderr write end open across
+    // the exit, so the daemon's stderr drain cannot hit EOF until its group
+    // sweep kills the descendant — the exact scenario the terminal-failure
+    // capture hint must sweep-then-settle for. Last-attempt-only so earlier
+    // deaths (consumed by the silent redrive) leave no stray holder behind.
+    if (behavior.holdStderrOpenOnExit && attempt === exitGate) {
+      const holder = spawn('sleep', ['300'], { stdio: ['ignore', 'ignore', 'inherit'] });
+      holder.on('error', (err) => log(`stderr holder spawn failed: ${err.message}`));
+      log(`spawned stderr-holding descendant pid=${holder.pid}`);
+    }
     log(`exiting during prompt (attempt ${attempt}/${exitGate})`);
     process.exit(1);
   }
