@@ -7,6 +7,12 @@ on:
   # push-skipped via their `if`s (CI audit, 2026-08).
   push:
     branches: [main]
+  # Fork PRs get no CI: external PRs are not accepted (intent-hq/monorepo#417).
+  # Every job reachable from pull_request carries a same-repo guard
+  # (head.repo.full_name == github.repository) — directly or via the needs
+  # chain — so fork PRs consume zero runner time and can never reach the
+  # self-hosted tinybox; close-fork-prs.yml auto-closes them. Same-repo PRs
+  # are completely unaffected.
   pull_request:
 
 permissions:
@@ -48,7 +54,10 @@ jobs:
     # coverage-all) are push-skipped as redundant (see the `on: push`
     # comment) and the build matrix is intentionally not routed, so the
     # probe would spend API calls placing jobs that never run.
-    if: github.event_name != 'push'
+    # Also skipped on fork PRs (see the `pull_request` trigger comment):
+    # route's skip cascades over the needs chain, skipping check /
+    # coverage-e2e / coverage-all, so fork PRs can never reach tinybox.
+    if: github.event_name != 'push' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -115,8 +124,9 @@ jobs:
   check:
     # Skipped on push to main — redundant re-test of a tree the PR CI already
     # checked (see the `on: push` comment). The expression carries no status
-    # function, so the implicit success() still applies: a route failure
-    # skips this job on pull_request exactly as before.
+    # function, so the implicit success() still applies: a route failure —
+    # or a route skip, as on fork PRs — skips this job on pull_request
+    # exactly as before.
     if: github.event_name != 'push'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
@@ -335,7 +345,9 @@ jobs:
   # an all-steps-skipped success under its required name.
   release-fast-path:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
+    # trigger comment).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     outputs:
       fast_path: ${{ steps.decide.outputs.fast_path }}
@@ -370,9 +382,12 @@ jobs:
     # push the fast-path job is skipped and the output is empty, and a
     # fast-path failure leaves it empty too, so both fall back to running
     # the full job. `!cancelled()` keeps the job from being auto-skipped
-    # when its `needs` dependency was skipped (push).
+    # when its `needs` dependency was skipped (push) — which is exactly why
+    # the fork guard must be explicit here: on a fork PR release-fast-path
+    # is skipped, and without the guard `!cancelled()` would still run this
+    # job on the self-hosted macOS/Windows runners.
     needs: release-fast-path
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -486,8 +501,12 @@ jobs:
     # main — redundant re-test (see the `on: push` comment); the route.result
     # guard would skip it there anyway (route is push-skipped), the explicit
     # event guard just makes the intent visible.
+    # The same-repo clause is belt-and-suspenders for the fork-PR policy
+    # (see the `pull_request` trigger comment): the route.result guard
+    # already skips this job on fork PRs (route is fork-skipped), but this
+    # job can land on tinybox, so it carries the guard explicitly.
     needs: [route, release-fast-path]
-    if: ${{ !cancelled() && github.event_name != 'push' && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    if: ${{ !cancelled() && github.event_name != 'push' && github.event.pull_request.head.repo.full_name == github.repository && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -676,8 +695,12 @@ jobs:
     # main — redundant re-test (see the `on: push` comment); the route.result
     # guard would skip it there anyway (route is push-skipped), the explicit
     # event guard just makes the intent visible.
+    # The same-repo clause is belt-and-suspenders for the fork-PR policy
+    # (see the `pull_request` trigger comment): the route.result guard
+    # already skips this job on fork PRs (route is fork-skipped), but this
+    # job can land on tinybox, so it carries the guard explicitly.
     needs: [route, release-fast-path]
-    if: ${{ !cancelled() && github.event_name != 'push' && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    if: ${{ !cancelled() && github.event_name != 'push' && github.event.pull_request.head.repo.full_name == github.repository && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -857,7 +880,9 @@ jobs:
 
   pr-title:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
+    # trigger comment).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     steps:
       # Intermittent TLS failures reaching api.github.com can kill this action
       # sub-second, before it validates anything — a spurious red that reads
@@ -906,7 +931,9 @@ jobs:
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
+    # trigger comment).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -951,6 +978,9 @@ jobs:
   # preinstalled.
   deb-packaging:
     runs-on: ubuntu-latest
+    # Runs on push and same-repo PRs; skipped on fork PRs (see the
+    # `pull_request` trigger comment).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -986,6 +1016,9 @@ jobs:
   # ubuntu-latest.
   release-scripts:
     runs-on: ubuntu-latest
+    # Runs on push and same-repo PRs; skipped on fork PRs (see the
+    # `pull_request` trigger comment).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -1015,7 +1048,11 @@ jobs:
     # Seconds-long job: pinned to ubuntu-latest (see pr-title).
     runs-on: ubuntu-latest
     permissions: {}
-    if: always()
+    # The same-repo clause skips the gate on fork PRs along with every other
+    # job (see the `pull_request` trigger comment): without it, always()
+    # would run the gate against all-skipped needs and report a spurious
+    # failure on PRs that get no CI by policy.
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: [check, build, coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging, release-scripts]
     steps:
       - name: Check results
