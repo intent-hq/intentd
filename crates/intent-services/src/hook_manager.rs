@@ -1581,6 +1581,7 @@ impl Services {
         self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
         let notice = crate::harness::latest().hook_expired_notice(
             &hook.name,
+            &hook.hook_id.0,
             hook.perpetual,
             hook.run_count,
             hook.dispatch_count,
@@ -1654,8 +1655,8 @@ impl Services {
             "dispatched" if dispatch_still_active => {
                 Some(harness.hook_dispatch_active_note(hook.expires_at.as_deref()))
             }
-            "dispatched" => Some(harness.hook_dispatch_retired_note()),
-            "evicted" => Some(harness.hook_evicted_state_note()),
+            "dispatched" => Some(harness.hook_dispatch_retired_note(&hook.hook_id.0)),
+            "evicted" => Some(harness.hook_evicted_state_note(&hook.hook_id.0)),
             _ => None,
         };
         let content = harness.hook_wake_framing(&hook.name, message, state_note.as_deref());

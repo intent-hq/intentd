@@ -253,18 +253,25 @@ pub(crate) trait Harness: Send + Sync {
     /// State note on a re-armed perpetual dispatch: the hook remains active
     /// until `expires_at` (`None` renders the TTL-elapses fallback).
     fn hook_dispatch_active_note(&self, expires_at: Option<&str>) -> String;
-    /// State note on a one-shot dispatch: the hook is retired.
-    fn hook_dispatch_retired_note(&self) -> String;
-    /// State note on an eviction wake: the hook will not run again.
-    fn hook_evicted_state_note(&self) -> String;
+    /// State note on a one-shot dispatch: the hook is retired, with a
+    /// `ws.hook.get("<hookId>")` pointer for recovering the script. MUST
+    /// stay a single line starting `[This hook` and ending `]` — the FE
+    /// strips it with a single-line regex (`hook-wake-attribution.ts`).
+    fn hook_dispatch_retired_note(&self, hook_id: &str) -> String;
+    /// State note on an eviction wake: the hook will not run again, with a
+    /// `ws.hook.get("<hookId>")` pointer for recovering the script. Same
+    /// single-line `[This hook …]` constraint as the retired note.
+    fn hook_evicted_state_note(&self, hook_id: &str) -> String;
     /// Eviction notice body after a failed run.
     fn hook_evicted_failed_run_notice(&self, hook_name: &str, error: &str) -> String;
     /// Eviction notice body after an internal (store) error.
     fn hook_evicted_internal_error_notice(&self, hook_name: &str, error: &str) -> String;
-    /// TTL-expiry notice body, with the perpetual runs+dispatches tally.
+    /// TTL-expiry notice body, with the perpetual runs+dispatches tally and
+    /// a `ws.hook.get("<hookId>")` pointer for recovering the script.
     fn hook_expired_notice(
         &self,
         hook_name: &str,
+        hook_id: &str,
         perpetual: bool,
         run_count: i64,
         dispatch_count: i64,
