@@ -809,6 +809,30 @@ mod tests {
         );
     }
 
+    /// The poisoned home directory backing [`hermetic_config_git`]: its
+    /// `.gitconfig` (and XDG `git/config`) define github.com credential
+    /// helpers exactly the way `gh auth setup-git` does on dev hosts
+    /// (monorepo#3164). Written once per process and shared read-only by the
+    /// tests in that process — under a per-test-process runner like nextest
+    /// each process writes its own pid-keyed dir. The dirs are not cleaned
+    /// up (a few bytes in the temp dir; a `Drop` guard cannot outlive the
+    /// `'static` sharing).
+    fn poisoned_home() -> &'static Path {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "intent-git-auth-poisoned-home-{}",
+                std::process::id()
+            ));
+            let poison = "[credential \"https://github.com\"]\n\thelper = \n\thelper = !/poisoned/gh auth git-credential\n";
+            std::fs::create_dir_all(dir.join("git")).expect("mkdir poisoned home");
+            std::fs::write(dir.join(".gitconfig"), poison).expect("write poisoned gitconfig");
+            std::fs::write(dir.join("git").join("config"), poison)
+                .expect("write poisoned xdg config");
+            dir
+        })
+    }
+
     /// A `git` command reading config with `params` as the command-line scope
     /// and every host config scope excluded, so assertions see only the
     /// entries under test — e.g. `gh auth setup-git` installs a github.com
@@ -816,14 +840,55 @@ mod tests {
     /// `--get-all` reads (monorepo#3343). `-C /` runs outside any repository
     /// (the same no-repo trick `discover_github_helpers` uses), excluding the
     /// enclosing checkout's local config too.
+    ///
+    /// The exclusions are backstopped by poison rather than by hoping the
+    /// host is clean (monorepo#3164): every config location git would fall
+    /// back to if `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_NOSYSTEM` were dropped
+    /// points at [`poisoned_home`], whose helpers would rank ahead of the
+    /// command scope and fail the assertions — so clean CI hosts exercise
+    /// the isolation on every run (see
+    /// `hermetic_config_git_excludes_poisoned_host_scopes`).
     fn hermetic_config_git(params: &str) -> Command {
+        let poisoned = poisoned_home();
         let mut cmd = Command::new("git");
         cmd.arg("-C")
             .arg("/")
             .env(GIT_CONFIG_PARAMETERS_ENV, params)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", poisoned)
+            .env("XDG_CONFIG_HOME", poisoned)
+            .env("GIT_CONFIG_SYSTEM", poisoned.join(".gitconfig"));
         cmd
+    }
+
+    /// The poison backing [`hermetic_config_git`] is live: the same read with
+    /// either isolation variable dropped sees the poisoned helpers ahead of
+    /// the entry under test — the exact monorepo#3164 failure shape — so the
+    /// hermetic reads staying green proves the isolation, not a clean host.
+    #[test]
+    fn hermetic_config_git_excludes_poisoned_host_scopes() {
+        let params = sq_quote(&format!("{GITHUB_HELPER_KEY}=under-test"));
+        assert_eq!(helper_values_via_git(&params), ["under-test"]);
+
+        for dropped in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"] {
+            let mut cmd = hermetic_config_git(&params);
+            cmd.env_remove(dropped);
+            let out = cmd
+                .args(["config", "--get-all", GITHUB_HELPER_KEY])
+                .output()
+                .expect("git must be runnable");
+            assert!(
+                out.status.success(),
+                "git config read failed without {dropped}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let values = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                values.starts_with("\n!/poisoned/gh auth git-credential\n"),
+                "without {dropped} the poison must leak in ahead: {values:?}"
+            );
+        }
     }
 
     /// Read back the ordered `credential.https://github.com.helper` values a
