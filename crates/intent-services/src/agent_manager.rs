@@ -5009,9 +5009,14 @@ impl AgentManager {
             }),
         };
         crate::publish_event(self.services.event_bus.as_ref(), event).await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.services
-            .schedule_last_activity_event(workspace_id.clone());
+        // Schedule debounced lastActivity event (§10.1) only when the flip
+        // ENDS a turn (transition to a non-active state): lastActivity moves
+        // at turn boundaries, so turn-start/mid-turn status flips must not
+        // churn the workspace ordering.
+        if !is_active {
+            self.services
+                .schedule_last_activity_event(workspace_id.clone());
+        }
     }
 
     /// Persist `agent_session.status` + `is_active` + optional `stop_reason` and
@@ -5083,9 +5088,13 @@ impl AgentManager {
             data,
         };
         crate::publish_event(self.services.event_bus.as_ref(), event).await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.services
-            .schedule_last_activity_event(workspace_id.clone());
+        // Schedule debounced lastActivity event (§10.1) only when the flip
+        // ENDS a turn (transition to a non-active state) — same turn-boundary
+        // gate as [`persist_status`].
+        if !is_active {
+            self.services
+                .schedule_last_activity_event(workspace_id.clone());
+        }
     }
 
     /// Forget a finished worker's join handle.
@@ -5461,6 +5470,13 @@ impl AgentManager {
         self.services
             .publish_agent_message_events(&workspace_id, &agent_id, &message, Some(&turn_id))
             .await;
+        // Schedule debounced lastActivity event (§10.1) for USER-origin sends
+        // only: a human sending into the workspace is a turn boundary, an
+        // internal wake/agent-to-agent delivery is not.
+        if options.origin.is_user() {
+            self.services
+                .schedule_last_activity_event(workspace_id.clone());
+        }
         // Answer intake (PROTOCOL §5.5, question hold): a user row tagged
         // `question_answers` naming the marked assistant message resolves the
         // pending Q&A and clears the marker (a stale/foreign
@@ -5728,6 +5744,7 @@ impl AgentManager {
                 next.file_blocks.as_ref(),
                 next.message_metadata.as_ref(),
                 Some(&next.turn_id),
+                next.user_origin,
             )
             .await
         };
@@ -8721,6 +8738,7 @@ async fn run_message_worker(
                                 None,
                                 Some(&nudge_metadata),
                                 Some(&nudge_turn_id),
+                                false,
                             )
                             .await;
                             content = nudge;
@@ -8881,6 +8899,7 @@ async fn run_message_worker(
                                     None,
                                     None,
                                     Some(&warning_turn_id),
+                                    false,
                                 )
                                 .await;
                                 content = warning;
@@ -9246,6 +9265,7 @@ async fn run_message_worker(
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                     Some(&next.turn_id),
+                    next.user_origin,
                 )
                 .await
             };
@@ -9504,6 +9524,7 @@ async fn run_message_worker(
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                     Some(&next.turn_id),
+                    next.user_origin,
                 )
                 .await
             };
@@ -9695,6 +9716,7 @@ async fn prepare_flush_turn(
             entries[i].file_blocks.as_ref(),
             entries[i].message_metadata.as_ref(),
             Some(&combined_turn_id),
+            entries[i].user_origin,
         )
         .await
         {
@@ -9799,6 +9821,10 @@ async fn prepare_flush_turn(
 /// [`persist_retry_backoff_ms`]); on exhaustion the drain call sites fail
 /// closed — they do NOT start the turn, park the agent in `Error`, and
 /// requeue with `persisted: false` so `agent.retry` re-attempts the append.
+/// `user_origin` marks whether the entry was originated by a human user (the
+/// queue entry's `user_origin` flag): only those appends schedule the
+/// debounced `lastActivity` event (§10.1) — internal wakes, agent-to-agent
+/// deliveries and system-injected turns are not workspace-ordering activity.
 #[allow(clippy::too_many_arguments)]
 async fn persist_user(
     mgr: &AgentManager,
@@ -9809,6 +9835,7 @@ async fn persist_user(
     file_blocks: Option<&Value>,
     message_metadata: Option<&Value>,
     turn_id: Option<&str>,
+    user_origin: bool,
 ) -> bool {
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
@@ -9893,8 +9920,9 @@ async fn persist_user(
         .await
     {
         tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-    } else {
-        // Schedule debounced lastActivity event (§10.1).
+    } else if user_origin {
+        // Schedule debounced lastActivity event (§10.1) for USER-origin
+        // entries only — see the doc comment above.
         mgr.services
             .schedule_last_activity_event(workspace_id.clone());
     }

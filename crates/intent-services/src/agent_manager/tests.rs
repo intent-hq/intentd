@@ -12666,6 +12666,7 @@ async fn persist_user_appends_attachment_blocks_to_transcript_row() {
         Some(&files),
         None,
         None,
+        true,
     )
     .await;
 
@@ -12689,6 +12690,93 @@ async fn persist_user_appends_attachment_blocks_to_transcript_row() {
     assert_eq!(blocks[1]["data"], json!("imgdata"));
     assert_eq!(blocks[2]["type"], json!("file"));
     assert_eq!(blocks[2]["fileName"], json!("f.txt"));
+}
+
+/// Whether a debounced `lastActivity` derivation is pending for `ws` (the
+/// schedule inserts into the debouncers map synchronously; the default 3s
+/// window keeps the entry observable).
+fn last_activity_pending(mgr: &AgentManager, ws: &WorkspaceId) -> bool {
+    mgr.services
+        .last_activity_debouncers
+        .lock()
+        .expect("debouncers lock")
+        .contains_key(ws)
+}
+
+/// Turn-boundary gating (§10.1): a status persist that ENDS a turn
+/// (non-active state) schedules the debounced `lastActivity` event; a
+/// turn-start/mid-turn flip to an active state does not.
+#[tokio::test]
+async fn persist_status_schedules_last_activity_only_on_turn_end() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-la-status"), AgentId::from("a-la-s"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    mgr.persist_status(&id, &ws, AgentStatus::Active, true)
+        .await;
+    assert!(
+        !last_activity_pending(&mgr, &ws),
+        "turn-start flip (is_active) must not schedule lastActivity"
+    );
+
+    mgr.persist_status(&id, &ws, AgentStatus::RuntimeIdle, false)
+        .await;
+    assert!(
+        last_activity_pending(&mgr, &ws),
+        "turn-end flip must schedule lastActivity"
+    );
+}
+
+/// Turn-boundary gating (§10.1) on the stop-reason companion: same
+/// non-active-only rule as [`AgentManager::persist_status`].
+#[tokio::test]
+async fn persist_status_with_stop_reason_schedules_last_activity_only_on_turn_end() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-la-sr"), AgentId::from("a-la-sr"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    mgr.persist_status_with_stop_reason(&id, &ws, AgentStatus::Active, true, Some(None))
+        .await;
+    assert!(
+        !last_activity_pending(&mgr, &ws),
+        "turn-start flip (is_active) must not schedule lastActivity"
+    );
+
+    mgr.persist_status_with_stop_reason(
+        &id,
+        &ws,
+        AgentStatus::Error,
+        false,
+        Some(Some("boom".into())),
+    )
+    .await;
+    assert!(
+        last_activity_pending(&mgr, &ws),
+        "terminal (turn-end) flip must schedule lastActivity"
+    );
+}
+
+/// User-origin gating (§10.1): the queue-drain `persist_user` schedules the
+/// debounced `lastActivity` only for user-origin entries — internal wakes and
+/// agent-to-agent deliveries are not workspace-ordering activity.
+#[tokio::test]
+async fn persist_user_schedules_last_activity_only_for_user_origin() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-la-user");
+    let id = AgentId::from("a-la-u");
+    seed_agent(&mgr, &ws, &id).await;
+
+    super::persist_user(&mgr, &id, &ws, "wake", None, None, None, None, false).await;
+    assert!(
+        !last_activity_pending(&mgr, &ws),
+        "agent-origin entry must not schedule lastActivity"
+    );
+
+    super::persist_user(&mgr, &id, &ws, "human", None, None, None, None, true).await;
+    assert!(
+        last_activity_pending(&mgr, &ws),
+        "user-origin entry must schedule lastActivity"
+    );
 }
 
 #[test]

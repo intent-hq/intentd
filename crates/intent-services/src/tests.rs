@@ -28823,8 +28823,10 @@ mod last_activity_events {
         );
     }
 
-    /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
-    /// when the token tallies actually changed (idempotent re-scan is silent).
+    /// `scan_workspace_token_usage` emits `workspace:tokenUsage-changed` only
+    /// when the token tallies actually changed (idempotent re-scan is silent)
+    /// and — since a token recompute is not a turn boundary — never schedules
+    /// a `workspace:updated { lastActivity }`.
     #[tokio::test]
     async fn token_usage_scan_only_on_change() {
         let _guard = DebounceEnvGuard::new("100");
@@ -28839,17 +28841,18 @@ mod last_activity_events {
             .expect("scan 1");
         assert!(changed1, "first scan changed (none -> zero)");
 
-        // Consume the first scan's events deterministically instead of a
-        // sleep-based drain: under coverage CI the debounced lastActivity
-        // task can fire late and leak into the no-emit assertion below
-        // (monorepo#934). The immediate tokenUsage-changed lands first, then
-        // the debounced workspace:updated { lastActivity } (guaranteed to
-        // emit: the seeded workspace has no stored lastActivity).
+        // The immediate tokenUsage-changed lands; no debounced
+        // workspace:updated { lastActivity } follows (turn-boundary-only
+        // scheduling — a token recompute is mid-turn bookkeeping).
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:tokenUsage-changed");
-        let ev = recv_one(&mut sub).await;
-        assert_envelope(&ev, &h.ws.0, "workspace:updated");
-        assert!(ev["data"]["changes"]["lastActivity"].is_string());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "token recompute must not emit a lastActivity workspace:updated"
+        );
 
         // Second scan (tallies unchanged, no emit).
         let changed2 = h
@@ -28859,8 +28862,8 @@ mod last_activity_events {
             .expect("scan 2");
         assert!(!changed2, "second scan unchanged");
 
-        // Nothing is pending from the first scan anymore, so any event in
-        // this window would be a real over-emit from the idempotent re-scan.
+        // Any event in this window would be a real over-emit from the
+        // idempotent re-scan.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             timeout(Duration::from_millis(50), sub.recv())
