@@ -5523,6 +5523,43 @@ async fn agent_queue_replace_load_delete_round_trip() {
         .is_empty());
 }
 
+/// Regression test for intent-hq/monorepo#3540: the write-through queue
+/// persist used to insert one row per statement, so every send against an
+/// N-entry queue cost O(N) statements. The bulk insert is chunked at 4096
+/// rows per statement — a snapshot crossing the chunk boundary must still
+/// round-trip completely and in order.
+#[tokio::test]
+async fn agent_queue_replace_round_trips_across_chunk_boundary() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .expect("insert session");
+
+    // 4100 rows: one full 4096-row chunk plus a 4-row tail chunk.
+    let rows: Vec<AgentQueueRow> = (0..4100)
+        .map(|i| queue_row(&agent, i, &format!("m{i}")))
+        .collect();
+    store
+        .replace_agent_queue(&agent, &rows)
+        .await
+        .expect("replace queue");
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert_eq!(loaded.len(), 4100);
+    assert!(loaded
+        .iter()
+        .enumerate()
+        .all(|(i, r)| r.position == i64::try_from(i).unwrap()
+            && r.payload["content"] == format!("m{i}").as_str()));
+}
+
 #[tokio::test]
 async fn agent_queue_move_is_atomic_hand_off() {
     let tmp = TempDb::new();
