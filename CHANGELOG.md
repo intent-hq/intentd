@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.64] - 2026-08-26
+
+### 🐛 Bug Fixes
+
+- Evict pending-question registries on agent delete + self-contained dismiss events ([#1496](https://github.com/intent-hq/intentd/pull/1496))
+- Compound/per-method rpc statement budgets for agent.sendMessage + workspace.unarchive ([#1493](https://github.com/intent-hq/intentd/pull/1493))
+
+### 🧪 Testing
+
+- *(intentd)* Deflake tunnel closed-port test by holding the port reservation ([#1492](https://github.com/intent-hq/intentd/pull/1492))
+
+
 ## [0.7.63] - 2026-08-26
 
 ### 🚀 Features
