@@ -301,6 +301,24 @@ async fn retired_agents_are_inert_until_restored() {
         .expect("list all");
     let row = all.iter().find(|a| a.id == id).expect("retired row");
     assert!(row.retired_at.is_some(), "retiredAt missing on wire row");
+    // …the retiredOnly variant serves ONLY the retired row…
+    let retired = svc
+        .agent_list_retired_only_op(ws.clone())
+        .await
+        .expect("list retired");
+    assert_eq!(retired.len(), 1, "retiredOnly serves only retired rows");
+    assert_eq!(retired[0].id, id);
+    assert!(
+        retired[0].retired_at.is_some(),
+        "retiredOnly rows carry retiredAt"
+    );
+    // …the retired count reflects the mark…
+    assert_eq!(
+        svc.agent_retired_count_op(ws.clone())
+            .await
+            .expect("retired count"),
+        1
+    );
     // …and interaction paths fail closed with the retired error.
     let err = svc
         .agent_send_message_op(id.clone(), "hi".into(), None, None, None, None)
@@ -333,6 +351,20 @@ async fn retired_agents_are_inert_until_restored() {
 
     let rows = svc.agent_list_op(ws.clone()).await.expect("list");
     assert!(rows.iter().any(|a| a.id == id), "restored row missing");
+    let retired = svc
+        .agent_list_retired_only_op(ws.clone())
+        .await
+        .expect("list retired");
+    assert!(
+        retired.is_empty(),
+        "restored row must leave the retiredOnly list"
+    );
+    assert_eq!(
+        svc.agent_retired_count_op(ws.clone())
+            .await
+            .expect("retired count"),
+        0
+    );
     svc.agent_send_message_op(id.clone(), "hi again".into(), None, None, None, None)
         .await
         .expect("send after restore");
@@ -386,6 +418,18 @@ async fn retired_sessions_are_excluded_from_default_projection_load() {
     assert_eq!(
         row.message_count, 1,
         "retired row keeps its message projection in the includeRetired read"
+    );
+
+    // The retiredOnly read bypasses the active-only cache the same way, so
+    // its rows keep full message projections too.
+    let retired = svc
+        .agent_list_retired_only_op(ws.clone())
+        .await
+        .expect("list retired");
+    let row = retired.iter().find(|a| a.id == old).expect("retired row");
+    assert_eq!(
+        row.message_count, 1,
+        "retired row keeps its message projection in the retiredOnly read"
     );
 }
 

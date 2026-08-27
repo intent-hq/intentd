@@ -1148,6 +1148,12 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
             .all(|a| a["id"].as_str() != Some(agent_id.as_str())),
         "retired row must be excluded from the default list: {listed}"
     );
+    // …but carries the always-present retiredCount (v8.2)…
+    assert_eq!(
+        listed["result"]["retiredCount"],
+        serde_json::json!(1),
+        "default list carries retiredCount: {listed}"
+    );
     // …includeRetired serves it, carrying retiredAt…
     let list_all_frame = format!(
         r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}","includeRetired":true}}}}"#
@@ -1163,6 +1169,45 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         row["retiredAt"].as_str(),
         Some(retired_at),
         "includeRetired rows carry retiredAt: {row}"
+    );
+    assert_eq!(
+        listed_all["result"]["retiredCount"],
+        serde_json::json!(1),
+        "includeRetired carries retiredCount too: {listed_all}"
+    );
+    // …retiredOnly serves ONLY the retired row (v8.2)…
+    let list_retired_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":15,"method":"agent.list","params":{{"workspaceId":"{ws_id}","retiredOnly":true}}}}"#
+    );
+    let listed_retired = wss_call(srv.port, srv.cfg.clone(), &list_retired_frame).await;
+    let retired_rows = listed_retired["result"]["agents"]
+        .as_array()
+        .expect("agents array");
+    assert_eq!(
+        retired_rows.len(),
+        1,
+        "retiredOnly serves only retired rows: {listed_retired}"
+    );
+    assert_eq!(retired_rows[0]["id"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(
+        retired_rows[0]["retiredAt"].as_str(),
+        Some(retired_at),
+        "retiredOnly rows carry retiredAt: {listed_retired}"
+    );
+    assert_eq!(
+        listed_retired["result"]["retiredCount"],
+        serde_json::json!(1),
+        "retiredOnly carries retiredCount too: {listed_retired}"
+    );
+    // …and the contradictory flag pair is rejected with -32602.
+    let both_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":16,"method":"agent.list","params":{{"workspaceId":"{ws_id}","includeRetired":true,"retiredOnly":true}}}}"#
+    );
+    let both = wss_call(srv.port, srv.cfg.clone(), &both_frame).await;
+    assert_eq!(
+        both["error"]["code"],
+        serde_json::json!(-32602),
+        "includeRetired + retiredOnly is -32602: {both}"
     );
     // …agent.get still serves the retired row (FE renders it read-only)…
     let got = wss_call(
@@ -1211,6 +1256,17 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
     assert!(
         row.get("retiredAt").is_none(),
         "restored rows omit retiredAt: {row}"
+    );
+    assert_eq!(
+        listed["result"]["retiredCount"],
+        serde_json::json!(0),
+        "restore drops retiredCount back to zero: {listed}"
+    );
+    let listed_retired = wss_call(srv.port, srv.cfg.clone(), &list_retired_frame).await;
+    assert_eq!(
+        listed_retired["result"]["agents"],
+        serde_json::json!([]),
+        "restored row must leave the retiredOnly list: {listed_retired}"
     );
     // Idempotent-friendly no-op on a second restore.
     let restored_again = wss_call(srv.port, srv.cfg.clone(), &restore_frame).await;

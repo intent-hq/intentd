@@ -966,6 +966,51 @@ impl Store {
         rows.iter().map(map_session_summary_row).collect()
     }
 
+    /// [`Store::list_agent_session_summaries`] restricted to soft-RETIRED
+    /// sessions — the `agent.list { retiredOnly: true }` read (§5.5). The
+    /// filter runs in SQL (`retired_at IS NOT NULL`), keeping the handler
+    /// cost O(rows returned) per the RPC cost contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_retired_agent_session_summaries(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+             WHERE workspace_id = ? AND retired_at IS NOT NULL ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("list retired agent session summaries failed: {e}"))
+            })?;
+        rows.iter().map(map_session_summary_row).collect()
+    }
+
+    /// Number of soft-retired sessions in a workspace — the `retiredCount`
+    /// field served on every `agent.list` response variant (§5.5). One SQL
+    /// COUNT; no rows are hydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_retired_agent_sessions(&self, workspace_id: &WorkspaceId) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_session \
+             WHERE workspace_id = ? AND retired_at IS NOT NULL",
+        )
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("count retired agent sessions failed: {e}")))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     /// Get message count, whether any assistant message exists, and the total
     /// persisted conversation size in bytes for each session in a workspace,
     /// without hydrating message bodies (finding F1/F3: lightweight

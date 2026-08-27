@@ -255,13 +255,20 @@
 //! no unbounded note-channel frame class left; any other value is `-32602`.
 //! The `task`/`agent` channels are untouched (the param stays an ignored
 //! unknown key there). No method-catalog change — 297 router methods,
+//! 336 total. Version 8.3 adds the `agent.list` retired-bin read
+//! (additive; §5.5): the optional `retiredOnly` param serves ONLY
+//! soft-retired rows (each carrying `retiredAt`, via an SQL-side
+//! `retired_at IS NOT NULL` filter; `includeRetired` + `retiredOnly`
+//! together is `-32602`), and every response variant gains the
+//! always-present `retiredCount` field (one SQL COUNT of the workspace's
+//! soft-retired sessions). No method-catalog change — 297 router methods,
 //! 336 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "8.2";
+pub const PROTOCOL_VERSION: &str = "8.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
