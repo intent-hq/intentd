@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.9] - 2026-08-27
+
+### 🚀 Features
+
+- *(settings)* PeerAgents tokenImpact annotation + label rename ([#1539](https://github.com/intent-hq/intentd/pull/1539))
+
+
 ## [0.8.8] - 2026-08-27
 
 ### 🚀 Features
