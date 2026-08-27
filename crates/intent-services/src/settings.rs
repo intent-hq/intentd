@@ -1405,7 +1405,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "agents.maxTopLevelAgents",
             "Max top-level agents",
-            "Cap on live top-level (parentless) agents per workspace, enforced on the peer-spawn path (ws.agent.spawnPeer) as the runaway-spawn guard; user-created agents are never blocked by it (minimum 1; no unlimited value)",
+            "Cap on live top-level (parentless) agents per workspace, enforced on the top-level-create path (ws.agent.create with topLevel: true) as the runaway-spawn guard; user-created agents are never blocked by it (minimum 1; no unlimited value)",
             "agents",
             Some(1.0),
             None,
@@ -1560,7 +1560,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         boolean(
             "agentFeatures.peerAgents",
             "Peer agents",
-            "Expose independent peer-agent spawning and self-retire (ws.agent.spawnPeer / ws.agent.retire) to agents; applies to new sessions only",
+            "Expose independent top-level-agent creation and self-retire (ws.agent.create with topLevel: true / ws.agent.retire) to agents; applies to new sessions only",
             "agentFeatures",
             false,
         ),

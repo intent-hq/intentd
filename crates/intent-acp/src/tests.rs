@@ -8662,15 +8662,18 @@ mod wsapi4_bindings_tests {
         agent_retire_calls: Mutex<Vec<RetireCall>>,
         agent_create_calls: Mutex<Vec<CreateCall>>,
         /// Count of `agent_watch_completion` (create-path auto-subscribe)
-        /// calls — spawnPeer must never make one.
+        /// calls — `create({ topLevel: true })` must never make one.
         agent_watch_completion_calls: Mutex<u32>,
         /// When set, `agent_list` serves these rows instead of the two
-        /// default top-level stubs (spawnPeer cap-counting tests).
+        /// default top-level stubs (topLevel cap-counting tests).
         agent_list_rows: Mutex<Option<Vec<AgentLite>>>,
         /// When set, `settings_get("agents.maxTopLevelAgents")` serves this
-        /// value (spawnPeer cap tests; the real settings layer normalizes
+        /// value (topLevel cap tests; the real settings layer normalizes
         /// numbers to the float wire shape).
         max_top_level_agents_setting: Mutex<Option<Value>>,
+        /// Agent ids `agent_get` serves with `isBackground: true` metadata
+        /// (background-caller denial tests for `create({ topLevel: true })`).
+        background_agent_ids: Mutex<Vec<String>>,
         /// Agent ids `agent_is_retired` reports as retired (same-turn
         /// dispatch-guard tests).
         retired_agent_ids: Mutex<Vec<String>>,
@@ -8810,11 +8813,14 @@ mod wsapi4_bindings_tests {
             self.agent_get_calls.lock().unwrap().push(id.clone());
             let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string("amber-forest"));
             let error = self.agent_get_error.lock().unwrap().clone();
+            let is_background = self.background_agent_ids.lock().unwrap().contains(&id);
             Box::pin(async move {
                 if let Some(e) = error {
                     return Err(Error::NotFound(e));
                 }
-                Ok(stub_agent(&id, &ws))
+                let mut agent = stub_agent(&id, &ws);
+                agent.metadata.is_background = is_background;
+                Ok(agent)
             })
         }
 
@@ -10499,13 +10505,13 @@ mod wsapi4_bindings_tests {
     }
 
     // ================================================================
-    // agent.spawnPeer
+    // agent.create({ topLevel: true })
     // ================================================================
 
     /// A bridge with `peerAgents` on and an agent caller — the shape every
-    /// functional spawnPeer test starts from (the gate/prelude layers are
-    /// covered by the feature-gating tests).
-    fn spawn_peer_server(caller: &str) -> (WorkspaceMcpServer, Arc<FakeApi>) {
+    /// functional `create({ topLevel: true })` test starts from (the
+    /// gate/prelude layers are covered by the feature-gating tests).
+    fn top_level_create_server(caller: &str) -> (WorkspaceMcpServer, Arc<FakeApi>) {
         let api = Arc::new(FakeApi::default());
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
             .with_agent_features(peer_agents_features())
@@ -10513,15 +10519,19 @@ mod wsapi4_bindings_tests {
         (srv, api)
     }
 
-    /// Happy path: the peer is created parentless (independence seam), its
+    /// Happy path: the agent is created parentless (independence seam), its
     /// metadata carries `sponsorAgentId` (never `createdByAgentId` /
     /// `parentAgentId`), the persisted `initialMessage` equals the delivered
-    /// kickoff (sponsor preamble + caller message), the spawner is NOT
+    /// kickoff (sponsor preamble + caller message), the caller is NOT
     /// auto-subscribed, and the kickoff send is daemon-attributed.
     #[tokio::test]
-    async fn agent_spawn_peer_creates_independent_parentless_peer() {
-        let (srv, api) = spawn_peer_server("caller-1");
-        let resp = call(&srv, "return await ws.agent.spawnPeer('peer', 'go');").await;
+    async fn agent_create_top_level_creates_independent_parentless_agent() {
+        let (srv, api) = top_level_create_server("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('peer', 'go', { topLevel: true });",
+        )
+        .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let v = body(&resp);
         assert_eq!(v["ok"], json!(true));
@@ -10531,7 +10541,7 @@ mod wsapi4_bindings_tests {
         assert_eq!(v["sponsorAgentId"], json!("caller-1"));
         assert!(
             v.get("subscriptionId").is_none(),
-            "spawnPeer must not report a completion-watch subscription"
+            "create with topLevel must not report a completion-watch subscription"
         );
 
         let creates = api.agent_create_calls.lock().unwrap();
@@ -10539,15 +10549,19 @@ mod wsapi4_bindings_tests {
         let (name, specialist, parent, idem, metadata, is_background) = &creates[0];
         assert_eq!(name.as_deref(), Some("peer"));
         assert_eq!(*specialist, None);
-        assert_eq!(*parent, None, "peer must be created parentless");
+        assert_eq!(*parent, None, "top-level agent must be created parentless");
         assert!(idem.is_some(), "an idempotency key is always supplied");
-        assert_eq!(*is_background, Some(false), "peers default to foreground");
+        assert_eq!(
+            *is_background,
+            Some(false),
+            "top-level agents default to foreground"
+        );
         let md = metadata.as_ref().unwrap();
         assert_eq!(md["sponsorAgentId"], json!("caller-1"));
         assert_eq!(md["isBackground"], json!(false));
         assert!(
             md.get("createdByAgentId").is_none() && md.get("parentAgentId").is_none(),
-            "peer metadata must carry no child-linkage fields: {md}"
+            "top-level agent metadata must carry no child-linkage fields: {md}"
         );
         let kickoff = md["initialMessage"].as_str().unwrap();
         assert!(
@@ -10586,12 +10600,16 @@ mod wsapi4_bindings_tests {
     /// floats — an integer-only read would silently ignore user overrides
     /// and fall back to the compiled default of 20).
     #[tokio::test]
-    async fn agent_spawn_peer_enforces_float_normalized_cap() {
-        let (srv, api) = spawn_peer_server("caller-1");
+    async fn agent_create_top_level_enforces_float_normalized_cap() {
+        let (srv, api) = top_level_create_server("caller-1");
         // Two live top-level agents (the default `agent_list` rows) with the
-        // cap overridden to 2.0 → at cap, spawn denied, nothing created.
+        // cap overridden to 2.0 → at cap, creation denied, nothing created.
         *api.max_top_level_agents_setting.lock().unwrap() = Some(json!(2.0));
-        let resp = call(&srv, "return await ws.agent.spawnPeer('peer', 'go');").await;
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('peer', 'go', { topLevel: true });",
+        )
+        .await;
         assert_eq!(resp["result"]["isError"], json!(true));
         let t = text(&resp);
         assert!(
@@ -10600,9 +10618,13 @@ mod wsapi4_bindings_tests {
         );
         assert!(api.agent_create_calls.lock().unwrap().is_empty());
 
-        // Raising the override above the live count admits the spawn.
+        // Raising the override above the live count admits the creation.
         *api.max_top_level_agents_setting.lock().unwrap() = Some(json!(3.0));
-        let resp = call(&srv, "return await ws.agent.spawnPeer('peer', 'go');").await;
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('peer', 'go', { topLevel: true });",
+        )
+        .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         assert_eq!(api.agent_create_calls.lock().unwrap().len(), 1);
     }
@@ -10610,8 +10632,8 @@ mod wsapi4_bindings_tests {
     /// Cap counting includes only LIVE TOP-LEVEL agents: deleted, retired,
     /// parented, and depth>0 rows are all excluded from the population.
     #[tokio::test]
-    async fn agent_spawn_peer_cap_counts_only_live_top_level_agents() {
-        let (srv, api) = spawn_peer_server("caller-1");
+    async fn agent_create_top_level_cap_counts_only_live_top_level_agents() {
+        let (srv, api) = top_level_create_server("caller-1");
         let ws = WorkspaceId::from_string("amber-forest");
         let live = stub_agent("live-1", &ws);
         let mut deleted = stub_agent("gone-1", &ws);
@@ -10623,9 +10645,13 @@ mod wsapi4_bindings_tests {
         let mut deep = stub_agent("deep-1", &ws);
         deep.metadata.delegation_depth = Some(1);
         *api.agent_list_rows.lock().unwrap() = Some(vec![live, deleted, retired, child, deep]);
-        // Cap 2 with only ONE live top-level row → spawn admitted.
+        // Cap 2 with only ONE live top-level row → creation admitted.
         *api.max_top_level_agents_setting.lock().unwrap() = Some(json!(2.0));
-        let resp = call(&srv, "return await ws.agent.spawnPeer('peer', 'go');").await;
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('peer', 'go', { topLevel: true });",
+        )
+        .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         assert_eq!(api.agent_create_calls.lock().unwrap().len(), 1);
     }
@@ -10633,22 +10659,27 @@ mod wsapi4_bindings_tests {
     /// A non-finite or negative settings value is ignored (compiled default
     /// of 20 applies), never truncated into a bogus cap.
     #[tokio::test]
-    async fn agent_spawn_peer_cap_ignores_invalid_setting_values() {
+    async fn agent_create_top_level_cap_ignores_invalid_setting_values() {
         for bad in [json!(-1.0), json!("many"), Value::Null] {
-            let (srv, api) = spawn_peer_server("caller-1");
+            let (srv, api) = top_level_create_server("caller-1");
             *api.max_top_level_agents_setting.lock().unwrap() = Some(bad);
             // 2 live top-level rows < default cap 20 → admitted.
-            let resp = call(&srv, "return await ws.agent.spawnPeer('peer', 'go');").await;
+            let resp = call(
+                &srv,
+                "return await ws.agent.create('peer', 'go', { topLevel: true });",
+            )
+            .await;
             assert_eq!(resp["result"]["isError"], json!(false));
             assert_eq!(api.agent_create_calls.lock().unwrap().len(), 1);
         }
     }
 
-    /// Dispatch defense in depth: a sub-agent's raw `host({...})` frame is
-    /// denied with the top-level-only redirect (NOT a settings complaint),
-    /// even with `peerAgents` on, and nothing is created.
+    /// Dispatch defense in depth: a sub-agent's `create` frame with
+    /// `topLevel: true` is denied with the top-level-only redirect (NOT a
+    /// settings complaint), even with `peerAgents` on, and nothing is
+    /// created.
     #[tokio::test]
-    async fn sub_agent_spawn_peer_frame_denied_at_dispatch() {
+    async fn sub_agent_create_top_level_frame_denied_at_dispatch() {
         let api = Arc::new(FakeApi::default());
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
             .with_agent_features(peer_agents_features())
@@ -10656,14 +10687,13 @@ mod wsapi4_bindings_tests {
             .with_caller_agent_id(Some(AgentId::from("sub-1")));
         let resp = call(
             &srv,
-            "return await host({ method: 'agent.spawnPeer', args: { name: 'peer', message: 'go' } });",
+            "return await ws.agent.create('peer', 'go', { topLevel: true });",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(true));
         let t = text(&resp);
         assert!(
-            t.contains("only available to top-level agents")
-                && t.contains("ws.agent.create or ws.agent.delegate"),
+            t.contains("only available to top-level agents") && t.contains("ws.agent.delegate"),
             "expected the top-level-only redirect, got: {t}"
         );
         assert!(
@@ -10673,21 +10703,128 @@ mod wsapi4_bindings_tests {
         assert!(api.agent_create_calls.lock().unwrap().is_empty());
     }
 
-    /// FE/RPC front door (no caller identity) cannot spawn a peer — the
-    /// sponsor seam requires an agent caller.
+    /// A sub-agent's PLAIN `create` frame (no `topLevel`) still dispatches —
+    /// the arg-conditional gate must not over-deny child creation.
     #[tokio::test]
-    async fn agent_spawn_peer_without_caller_is_rejected() {
+    async fn sub_agent_plain_create_still_dispatches() {
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_agent_features(peer_agents_features())
+            .with_sub_agent(true)
+            .with_caller_agent_id(Some(AgentId::from("sub-1")));
+        let resp = call(&srv, "return await ws.agent.create('child', 'go');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(api.agent_create_calls.lock().unwrap().len(), 1);
+    }
+
+    /// Arg-conditional feature gate: with `peerAgents` OFF (the default),
+    /// `create({ topLevel: true })` is denied naming the toggle, while plain
+    /// `create()` on the same bridge succeeds unchanged.
+    #[tokio::test]
+    async fn peer_agents_off_denies_top_level_but_not_plain_create() {
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_caller_agent_id(Some(AgentId::from("caller-1")));
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('peer', 'go', { topLevel: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let t = text(&resp);
+        assert!(
+            t.contains("agentFeatures.peerAgents"),
+            "expected the peerAgents settings denial, got: {t}"
+        );
+        assert!(api.agent_create_calls.lock().unwrap().is_empty());
+
+        let resp = call(&srv, "return await ws.agent.create('child', 'go');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(api.agent_create_calls.lock().unwrap().len(), 1);
+    }
+
+    /// A BACKGROUND top-level caller is denied at the handler level (the
+    /// caller's persisted `isBackground` metadata), and nothing is created.
+    #[tokio::test]
+    async fn background_caller_create_top_level_is_rejected() {
+        let (srv, api) = top_level_create_server("caller-1");
+        api.background_agent_ids
+            .lock()
+            .unwrap()
+            .push("caller-1".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('peer', 'go', { topLevel: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let t = text(&resp);
+        assert!(
+            t.contains("foreground top-level agents"),
+            "expected the foreground-only denial, got: {t}"
+        );
+        assert!(api.agent_create_calls.lock().unwrap().is_empty());
+    }
+
+    /// `topLevel: true` + `taskNoteId` is rejected — task assignment stays a
+    /// delegation concept; nothing is created or assigned.
+    #[tokio::test]
+    async fn agent_create_top_level_rejects_task_note_id() {
+        let (srv, api) = top_level_create_server("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('peer', 'go', { topLevel: true, taskNoteId: 'tn-1' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let t = text(&resp);
+        assert!(
+            t.contains("cannot be combined with taskNoteId"),
+            "expected the taskNoteId rejection, got: {t}"
+        );
+        assert!(api.agent_create_calls.lock().unwrap().is_empty());
+    }
+
+    /// FE/RPC front door (no caller identity) cannot create a top-level
+    /// agent — the sponsor seam requires an agent caller.
+    #[tokio::test]
+    async fn agent_create_top_level_without_caller_is_rejected() {
         let api = Arc::new(FakeApi::default());
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
             .with_agent_features(peer_agents_features());
         let resp = call(
             &srv,
-            "return await host({ method: 'agent.spawnPeer', args: { name: 'peer', message: 'go' } });",
+            "return await host({ method: 'agent.create', args: { name: 'peer', message: 'go', topLevel: true } });",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("requires an agent caller identity"));
         assert!(api.agent_create_calls.lock().unwrap().is_empty());
+    }
+
+    /// `topLevel: false` is the plain child-create path — parent linkage,
+    /// completion watch, and `subscriptionId` all behave exactly as an
+    /// omitted `topLevel`.
+    #[tokio::test]
+    async fn agent_create_top_level_false_is_plain_create() {
+        let (srv, api) = top_level_create_server("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('child', 'go', { topLevel: false });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["subscriptionId"], json!("watch-1"));
+        assert!(v.get("sponsorAgentId").is_none());
+        assert_eq!(*api.agent_watch_completion_calls.lock().unwrap(), 1);
+        let creates = api.agent_create_calls.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        let (_, _, parent, _, metadata, _) = &creates[0];
+        assert_eq!(parent.as_deref(), Some("caller-1"));
+        let md = metadata.as_ref().unwrap();
+        assert_eq!(md["createdByAgentId"], json!("caller-1"));
+        assert!(md.get("sponsorAgentId").is_none());
     }
 
     // ================================================================

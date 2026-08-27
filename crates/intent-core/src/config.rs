@@ -34,9 +34,10 @@ pub const DEFAULT_MAX_CONCURRENT_ADAPTERS: u32 = 6;
 pub const MAX_CONCURRENT_ADAPTERS_LIMIT: u32 = 64;
 
 /// Default cap on live top-level (depth-0) agents in a workspace
-/// (`agents.maxTopLevelAgents`), enforced on the peer-spawn path
-/// (`ws.agent.spawnPeer`) as a runaway-spawn guard; user-created agents are
-/// never blocked by it. Minimum 1 — there is no unlimited value.
+/// (`agents.maxTopLevelAgents`), enforced on the top-level-create path
+/// (`ws.agent.create({ topLevel: true })`) as a runaway-spawn guard;
+/// user-created agents are never blocked by it. Minimum 1 — there is no
+/// unlimited value.
 pub const DEFAULT_MAX_TOP_LEVEL_AGENTS: u32 = 20;
 
 /// Default ephemeral-event retention TTL in hours (`events.streamRetentionHours`,

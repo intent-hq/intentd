@@ -733,11 +733,12 @@ pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
 pub(super) const SUB_AGENT_PROPOSE_SIBLING_DENIED: &str =
     "ws.workspace.proposeSibling is only available to foreground top-level agents — report the opportunity to your parent with ws.agent.reportToParent";
 
-/// The dispatch-layer denial for a sub-agent's `agent.spawnPeer` frame —
-/// spawning independent top-level peers is a top-level-agent capability.
-pub(super) const SUB_AGENT_SPAWN_PEER_DENIED: &str =
-    "ws.agent.spawnPeer is only available to top-level agents — use \
-     ws.agent.create or ws.agent.delegate to start sub-agents instead";
+/// The dispatch-layer denial for a sub-agent's `agent.create` frame with
+/// `topLevel: true` — creating independent top-level agents is a
+/// top-level-agent capability.
+pub(super) const SUB_AGENT_CREATE_TOP_LEVEL_DENIED: &str =
+    "ws.agent.create with topLevel: true is only available to top-level agents — use \
+     ws.agent.create (without topLevel) or ws.agent.delegate to start sub-agents instead";
 
 /// Route one `host({method, args})` frame to a `WorkspaceApi` method via
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
@@ -766,11 +767,29 @@ async fn workspace_host_dispatch(
     if is_sub_agent && method == "workspace.proposeSibling" {
         return Err(format!("host: {SUB_AGENT_PROPOSE_SIBLING_DENIED}"));
     }
-    // Top-level-only rule for peer spawning: like the question gate, this
-    // redirect must win over the feature-gate denial so a sub-agent gets
-    // the actionable message rather than a settings complaint.
-    if is_sub_agent && method == "agent.spawnPeer" {
-        return Err(format!("host: {SUB_AGENT_SPAWN_PEER_DENIED}"));
+    // Top-level-only rule for creating independent top-level agents (the
+    // arg-conditional `agent.create` + `topLevel: true` path): like the
+    // question gate, this redirect must win over the feature-gate denial so
+    // a sub-agent gets the actionable message rather than a settings
+    // complaint.
+    let create_top_level = method == "agent.create"
+        && arg
+            .get("args")
+            .and_then(|a| a.get("topLevel"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if is_sub_agent && create_top_level {
+        return Err(format!("host: {SUB_AGENT_CREATE_TOP_LEVEL_DENIED}"));
+    }
+    // Arg-conditional `peerAgents` gate for create-with-topLevel: plain
+    // `agent.create` is never feature-gated, so the method-level
+    // `denied_feature` table cannot express this split.
+    if create_top_level && !agent_features.peer_agents {
+        return Err(
+            "host: `agent.create` with topLevel: true is disabled in settings \
+             (agentFeatures.peerAgents = false)"
+                .to_string(),
+        );
     }
     if let Some(feature) = super::tools::denied_feature(agent_features, method) {
         return Err(format!(
