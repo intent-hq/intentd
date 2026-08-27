@@ -10766,6 +10766,27 @@ mod wsapi4_bindings_tests {
         assert!(api.agent_create_calls.lock().unwrap().is_empty());
     }
 
+    /// FAIL CLOSED: a failed caller-session lookup rejects the call instead
+    /// of skipping the foreground-caller check — an unavailable or deleted
+    /// caller session must not bypass the restriction.
+    #[tokio::test]
+    async fn failed_caller_lookup_rejects_create_top_level() {
+        let (srv, api) = top_level_create_server("caller-1");
+        *api.agent_get_error.lock().unwrap() = Some("agent not found".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('peer', 'go', { topLevel: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let t = text(&resp);
+        assert!(
+            t.contains("could not verify the caller's session"),
+            "expected the fail-closed lookup error, got: {t}"
+        );
+        assert!(api.agent_create_calls.lock().unwrap().is_empty());
+    }
+
     /// `topLevel: true` + `taskNoteId` is rejected — task assignment stays a
     /// delegation concept; nothing is created or assigned.
     #[tokio::test]

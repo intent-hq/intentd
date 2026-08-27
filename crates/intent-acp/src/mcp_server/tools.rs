@@ -212,10 +212,10 @@ API:
   ws.primitive.addPatch(noteId, filePath, diff, description) → { ok, primitiveId, noteId }  // Stores a patch block that can be applied in a note.
   ws.primitive.addAgentAction(noteId, agentId, goal, description) → { ok, primitiveId, noteId }  // Adds a triggerable agent action block.
 
-  ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
+  ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create a sub-agent, or with `topLevel: true` an INDEPENDENT top-level agent. Sub-agent creation starts immediately and auto-subscribes you to its completion events — you are woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
-    `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) instead creates an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
+    With `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) the created agent is a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
   ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
@@ -454,10 +454,10 @@ API:
   ws.primitive.addPatch(noteId, filePath, diff, description) → { ok, primitiveId, noteId }  // Stores a patch block that can be applied in a note.
   ws.primitive.addAgentAction(noteId, agentId, goal, description) → { ok, primitiveId, noteId }  // Adds a triggerable agent action block.
 
-  ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
+  ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create a sub-agent, or with `topLevel: true` an INDEPENDENT top-level agent. Sub-agent creation starts immediately and auto-subscribes you to its completion events — you are woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
-    `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) instead creates an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
+    With `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) the created agent is a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
   ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
@@ -1622,6 +1622,31 @@ mod tests {
         for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
             assert!(!desc.contains("spawnPeer"));
             assert!(desc.contains("`topLevel: true`"));
+        }
+    }
+
+    // Discoverability under truncation: `topLevel` must sit in the FIRST
+    // sentence of the primary `ws.agent.create` doc line, because
+    // `condensed_workspace_api_description` drops continuation lines and
+    // cuts each method summary at its first sentence end — an option
+    // documented only on a continuation line would be invisible to agents
+    // on truncating providers.
+    #[test]
+    fn condensed_create_line_mentions_top_level() {
+        let features = AgentFeaturesSettings {
+            peer_agents: true,
+            ..AgentFeaturesSettings::default()
+        };
+        for is_chief in [false, true] {
+            let condensed = condensed_workspace_api_description(is_chief, &features, &[]);
+            let create_line = condensed
+                .lines()
+                .find(|l| l.trim_start().starts_with("ws.agent.create("))
+                .unwrap_or_else(|| panic!("chief={is_chief}: no condensed create line"));
+            assert!(
+                create_line.contains("`topLevel: true`"),
+                "chief={is_chief}: condensed create line must mention topLevel: {create_line}"
+            );
         }
     }
 

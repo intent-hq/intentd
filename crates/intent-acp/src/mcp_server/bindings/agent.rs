@@ -379,13 +379,21 @@ async fn create_top_level(
     // independent top-level peers (parity with proposeSibling). The
     // sub-agent half of the rule is enforced at the dispatch layer; the
     // background half reads the caller's persisted `isBackground` metadata
-    // here. The lookup also serves the sponsor name for the preamble and
-    // kickoff attribution.
-    let caller_lite = api.agent_get(caller.clone(), Some(ws.clone())).await.ok();
-    if caller_lite
-        .as_ref()
-        .is_some_and(|lite| lite.metadata.is_background)
-    {
+    // here. FAIL CLOSED: a failed lookup must not skip the check — an
+    // unavailable/deleted caller session cannot bypass the foreground-caller
+    // restriction. The lookup also serves the sponsor name for the preamble
+    // and kickoff attribution.
+    let caller_lite = api
+        .agent_get(caller.clone(), Some(ws.clone()))
+        .await
+        .map_err(|e| {
+            format!(
+                "create with topLevel: true could not verify the caller's session \
+                 (required for the foreground-caller check): {}",
+                map_err(e)
+            )
+        })?;
+    if caller_lite.metadata.is_background {
         return Err(
             "create with topLevel: true is only available to foreground top-level agents — \
              background agents cannot create independent top-level agents; use ws.agent.create \
@@ -403,7 +411,7 @@ async fn create_top_level(
             "Cannot create top-level agent: the workspace already has {live} live top-level agents, at the `agents.maxTopLevelAgents` cap ({cap}). Retire or delete an agent, or raise the cap in settings."
         ));
     }
-    let sponsor_name = caller_lite.map(|lite| lite.name);
+    let sponsor_name = Some(caller_lite.name);
     // Kickoff = daemon-prepended sponsor preamble, caller message after.
     // Persisted as `metadata.initialMessage` AND delivered, so the stored
     // copy matches what the new agent actually received (parity with the
