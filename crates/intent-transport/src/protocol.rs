@@ -244,13 +244,24 @@
 //! listing rows with `content` omitted, replaced by `contentPreview` (first
 //! 500 chars) plus `contentLength` (total chars, the `note.listVersions`
 //! unit), every other Note field unchanged; any other value is `-32602`.
-//! No method-catalog change — 297 router methods, 336 total.
+//! No method-catalog change — 297 router methods, 336 total. Version 8.2
+//! extends the same optional `projection` param to `note.subscribe`
+//! (additive; §6.9, monorepo#3586 — the subscription half of the note.list
+//! slim story): absent / `null` / `"full"` keep the full rows byte-identical
+//! to before (full stays the default, matching `note.list`); `"slim"`,
+//! fixed for the subscription's lifetime, serves the same bounded slim rows
+//! (`content` → `contentPreview` + `contentLength`) on the seq-0 snapshot
+//! AND every `added`/`updated` delta re-read, so a slim-adopting client has
+//! no unbounded note-channel frame class left; any other value is `-32602`.
+//! The `task`/`agent` channels are untouched (the param stays an ignored
+//! unknown key there). No method-catalog change — 297 router methods,
+//! 336 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "8.1";
+pub const PROTOCOL_VERSION: &str = "8.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
