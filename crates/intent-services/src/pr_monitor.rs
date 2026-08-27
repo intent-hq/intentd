@@ -938,6 +938,45 @@ impl Services {
         }
     }
 
+    /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE PR monitor
+    /// owned by the retiring agent through the shared cancel transition
+    /// ([`Services::cancel_active_pr_monitor`]), mirroring the hook sweep
+    /// ([`Services::cancel_agent_hooks`]) — state persisted to `cancelled`,
+    /// `prMonitor:cancelled` emitted, waiting recomputed (§5.1). NO wake
+    /// notice: the owner retired itself and is inert, so parking a notice
+    /// in its queue is noise (the backstop in `cancel_active_pr_monitor`
+    /// settles any deferred watches directly). Restore does NOT resurrect
+    /// cancelled monitors (mirrors the unarchive precedent) — the agent
+    /// re-registers if the PR still matters. Best-effort per monitor: a
+    /// store failure is logged and the sweep moves on — retiring must not
+    /// fail because one monitor row would not update.
+    pub(crate) async fn cancel_agent_pr_monitors(&self, agent_id: &AgentId) {
+        let monitors = match self.store.list_active_pr_monitors_by_agent(agent_id).await {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "retire pr-monitor sweep: monitor list failed; skipping"
+                );
+                return;
+            }
+        };
+        for monitor in monitors {
+            let monitor_id = monitor.monitor_id.clone();
+            // `Ok(None)` = a concurrent cancel/complete won the CAS between
+            // the list read and the guarded write; no longer active either way.
+            if let Err(e) = self.cancel_active_pr_monitor(monitor, None).await {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    monitor = %monitor_id.0,
+                    error = %e,
+                    "retire pr-monitor sweep: cancel failed; continuing"
+                );
+            }
+        }
+    }
+
     /// Deliver a monitor's pending consolidated wake right now, bypassing the
     /// remaining debounce window, and reset the debounce state. A no-op
     /// (`Ok(false)`) when nothing is pending.
@@ -1569,9 +1608,18 @@ impl Services {
         let monitors = self.store.load_active_pr_monitors().await?;
         let mut resumed = 0;
         for mut monitor in monitors {
-            let owner_gone = match self.store.get_agent_session_status(&monitor.agent_id).await {
-                Ok(AgentStatus::Deleted) | Err(Error::NotFound(_)) => true,
-                Ok(_) => false,
+            // Owner deleted, session row gone, or soft-retired — the
+            // retire-time sweep ([`Services::cancel_agent_pr_monitors`])
+            // could have been missed by a crash window.
+            let owner_gone = match self
+                .store
+                .get_agent_session_summary(&monitor.agent_id)
+                .await
+            {
+                Ok(session) => {
+                    session.status == AgentStatus::Deleted || session.retired_at.is_some()
+                }
+                Err(Error::NotFound(_)) => true,
                 Err(e) => return Err(e),
             };
             if owner_gone {
@@ -3994,6 +4042,82 @@ mod tests {
             .set_agent_session_status(&ws, &owner, AgentStatus::Deleted, false, &now_iso(), None)
             .await
             .expect("delete owner");
+
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 0);
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(row.state, PrMonitorState::Cancelled);
+    }
+
+    /// Retire sweep (`ws.agent.retire`): the retiring agent's ACTIVE PR
+    /// monitors are cancelled with NO wake notice (the owner retired itself
+    /// and is inert); a sibling agent's monitor survives, and
+    /// `agent.restore` does NOT resurrect the cancelled monitor.
+    #[tokio::test]
+    async fn retire_cancels_active_pr_monitors_without_waking_the_owner() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let sibling_monitor = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 7)
+            .await
+            .expect("sibling register")
+            .0;
+
+        let res = svc
+            .agent_retire_op(owner.clone(), None, None)
+            .await
+            .expect("retire");
+        assert_eq!(res["success"], json!(true));
+
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(row.state, PrMonitorState::Cancelled);
+        let row = svc
+            .store()
+            .get_pr_monitor(&sibling_monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(row.state, PrMonitorState::Active, "sibling untouched");
+        // NO wake notice for the retired owner (contrast `pr.unmonitor`'s
+        // app-path notify and the archive sweep's notice).
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("PR monitor"),
+            "no cancellation wake for the retired owner"
+        );
+
+        // Restore does NOT resurrect: the row stays cancelled and boot
+        // rehydration resumes only the sibling's active monitor.
+        svc.agent_restore_op(owner.clone(), None)
+            .await
+            .expect("restore");
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 1);
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(row.state, PrMonitorState::Cancelled);
+    }
+
+    /// Restart backstop: boot rehydration cancels active monitors whose
+    /// owner is soft-retired — a crash window could have missed the
+    /// retire-time sweep ([`Services::cancel_agent_pr_monitors`]).
+    #[tokio::test]
+    async fn rehydration_cancels_monitors_of_retired_owner() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        assert!(svc
+            .store()
+            .set_agent_session_retired_at(&ws, &owner, Some(&now_iso()), &now_iso())
+            .await
+            .unwrap());
 
         assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 0);
         let row = svc

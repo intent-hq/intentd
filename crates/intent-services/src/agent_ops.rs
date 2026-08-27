@@ -71,6 +71,25 @@ use uuid::Uuid;
 
 use crate::Services;
 
+/// "Running a turn" statuses for the retire guard (§5.5, confirmed
+/// decision): a descendant in `pending`/`active`/`Processing` blocks
+/// `ws.agent.retire`; idle/waiting/settled children are cascade-retired.
+fn is_running_turn(status: AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing
+    )
+}
+
+/// Terminal statuses the retire cascade never touches (the same set
+/// `count_child_agents` treats as terminal).
+fn is_terminal_status(status: AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
+    )
+}
+
 /// Per-agent ordering gate for pending-question marker writes and their
 /// matching `agent:updated` events. Different agents never contend.
 #[derive(Clone, Default)]
@@ -3854,6 +3873,12 @@ impl Services {
     /// an already-retired session (the existing timestamp is preserved, no
     /// event re-emitted). Emits `agent:retired` with
     /// `{ agentId, agentName, retiredAt, reason? }`.
+    ///
+    /// GUARDED on active children: the call FAILS (`InvalidParams`, nothing
+    /// mutated) while any descendant — transitive over `parent_agent_id` —
+    /// is still running a turn. On success the whole descendant subtree is
+    /// cascade-retired (see the inline comments), and restoring the parent
+    /// does NOT restore the cascaded children.
     pub(crate) async fn agent_retire_op(
         &self,
         agent_id: AgentId,
@@ -3869,31 +3894,141 @@ impl Services {
         if let Some(existing) = session.retired_at {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
+        // Guard (confirmed decision): retire fails while any descendant —
+        // grandchildren included — is still running a turn
+        // (pending/active/Processing). NOTHING is mutated on rejection (no
+        // partial cascade). Retired descendants are inert and never count;
+        // idle/waiting children pass the guard and are cascade-retired
+        // below.
+        let descendants = self.collect_retire_descendants(&agent_id).await?;
+        let active: Vec<String> = descendants
+            .iter()
+            .filter(|c| c.retired_at.is_none() && is_running_turn(c.status))
+            .map(|c| format!("{} ({})", c.name, c.id.0))
+            .collect();
+        if !active.is_empty() {
+            return Err(Error::InvalidParams(format!(
+                "cannot retire: {} active child agent(s) still running a turn: {}. \
+                 Stop them or wait for them to finish, then retire again.",
+                active.len(),
+                active.join(", ")
+            )));
+        }
+        let mut session = session;
+        let now = loop {
+            if let Some(now) = self.retire_one_session(&session, reason.as_deref()).await? {
+                break now;
+            }
+            // Lost the CAS to a concurrent retire: re-read. While the
+            // winner's mark is set, report `alreadyRetired` with its real
+            // timestamp; if a concurrent restore already cleared it again,
+            // retry the retire instead of fabricating a timestamp for an
+            // agent that is not actually retired.
+            session = self.store.get_agent_session_summary(&agent_id).await?;
+            if let Some(existing) = session.retired_at.clone() {
+                return Ok(
+                    json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }),
+                );
+            }
+        };
+        // Cascade (confirmed decision): every non-terminal,
+        // not-already-retired descendant retires with the parent, each
+        // through the same full cleanup — hooks/PR monitors cancelled,
+        // subscriptions dropped, watches resolved via its own
+        // `agent:retired` emit. Restoring the parent does NOT restore them;
+        // each is individually restorable via `agent.restore`.
+        // Guard-vs-cascade race: a child that started a turn after the
+        // guard passed is SKIPPED (left running, un-retired) rather than
+        // stopped or failed late — the parent's own retire already landed,
+        // and the racing child can retire itself later. Best-effort: a
+        // per-child failure logs and moves on.
+        let cascade_reason = format!("parent {} retired", session.name);
+        for child in &descendants {
+            // Row gone since the snapshot → skip.
+            let Ok(fresh) = self.store.get_agent_session_summary(&child.id).await else {
+                continue;
+            };
+            if fresh.retired_at.is_some()
+                || is_terminal_status(fresh.status)
+                || is_running_turn(fresh.status)
+            {
+                continue;
+            }
+            if let Err(e) = self.retire_one_session(&fresh, Some(&cascade_reason)).await {
+                tracing::warn!(
+                    parent = %agent_id,
+                    child = %fresh.id,
+                    error = %e,
+                    "retire cascade: child retire failed; continuing"
+                );
+            }
+        }
+        Ok(json!({ "success": true, "retiredAt": now }))
+    }
+
+    /// Snapshot the retiring agent's descendant tree, transitive over
+    /// `parent_agent_id` (cross-workspace, like
+    /// [`intent_store::Store::count_child_agents`]). Deleted rows are
+    /// excluded from the returned set (the cascade never touches them) but
+    /// still traversed, so grandchildren under a deleted intermediary are
+    /// found. Cycle-safe via a visited set (parent links cannot cycle in
+    /// practice, but a corrupt row must not hang the retire).
+    async fn collect_retire_descendants(&self, root: &AgentId) -> Result<Vec<AgentSession>> {
+        let mut seen: HashSet<String> = HashSet::from([root.0.clone()]);
+        let mut frontier = vec![root.clone()];
+        let mut out = Vec::new();
+        while let Some(id) = frontier.pop() {
+            for child in self.store.list_child_agent_summaries(&id).await? {
+                if !seen.insert(child.id.0.clone()) {
+                    continue;
+                }
+                frontier.push(child.id.clone());
+                if !matches!(child.status, AgentStatus::Deleted) {
+                    out.push(child);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One session's retire transition + cleanup, shared by the caller path
+    /// and the child cascade of [`Services::agent_retire_op`]. Returns
+    /// `Ok(Some(retiredAt))` when this call performed the transition,
+    /// `Ok(None)` when a concurrent retire won the CAS (nothing re-emitted).
+    async fn retire_one_session(
+        &self,
+        session: &AgentSession,
+        reason: Option<&str>,
+    ) -> Result<Option<String>> {
         let now = now_iso();
         // CAS write: only the request that actually flips NULL → set emits
-        // the event; a concurrent retire that lost the race re-reads the
-        // winner's timestamp and reports `alreadyRetired`.
+        // the event.
         let transitioned = self
             .store
-            .set_agent_session_retired_at(&session.workspace_id, &agent_id, Some(&now), &now)
+            .set_agent_session_retired_at(&session.workspace_id, &session.id, Some(&now), &now)
             .await?;
         if !transitioned {
-            let session = self.store.get_agent_session_summary(&agent_id).await?;
-            let existing = session.retired_at.unwrap_or(now);
-            return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
+            return Ok(None);
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Drop the retired agent's event subscriptions: the wake target is
         // inert, so matching/batching for it is pure leak (same rationale
         // as the delete cascade — monorepo#937). The queue entry is kept:
         // restore may drain it later.
-        self.remove_event_subscriptions_for_agent(&agent_id).await;
+        self.remove_event_subscriptions_for_agent(&session.id).await;
+        // Cancel the retiring agent's active hooks and PR monitors (mirrors
+        // the workspace-archive sweeps): the owner is inert and retired
+        // itself, so NO wake notice is queued. `agent.restore` does NOT
+        // resurrect them (unarchive precedent) — the agent re-registers if
+        // the condition still matters.
+        self.cancel_agent_hooks(&session.id).await;
+        self.cancel_agent_pr_monitors(&session.id).await;
         let mut data = json!({
-            "agentId": agent_id.0,
+            "agentId": session.id.0,
             "agentName": session.name,
             "retiredAt": now,
         });
-        if let Some(r) = reason.as_ref() {
+        if let Some(r) = reason {
             data["reason"] = json!(r);
         }
         crate::publish_event(
@@ -3903,7 +4038,7 @@ impl Services {
                 timestamp: now.clone(),
                 event_type: intent_core::events::AGENT_RETIRED.to_string(),
                 actor: crate::system_actor(),
-                session_id: Some(agent_id.0.clone()),
+                session_id: Some(session.id.0.clone()),
                 correlation_id: None,
                 parent_event_id: None,
                 metadata: None,
@@ -3916,7 +4051,7 @@ impl Services {
         // the row): recompute-and-compare (§6.5 step 0).
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
-        Ok(json!({ "success": true, "retiredAt": now }))
+        Ok(Some(now))
     }
 
     /// `agent.restore` (wire-only; PROTOCOL §5.5): clear `retired_at`,

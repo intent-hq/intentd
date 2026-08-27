@@ -74,10 +74,13 @@ pub(crate) struct EventSubscriptionEntry {
 impl Services {
     /// Validate a caller-supplied subscriber identity before registering
     /// (fail closed, mirroring the monorepo#568 `agent.watchCompletion`
-    /// precedent): the agent must exist and not be deleted, and a subscriber
-    /// outside `workspace_id` is only allowed from the chief workspace (the
-    /// same scope rule as `check_watch_scope`). Transient store errors are
-    /// treated as valid — never reject a live subscribe on a flaky read.
+    /// precedent): the agent must exist and not be deleted or soft-retired
+    /// (a retired wake target is inert — the retire cascade tears
+    /// subscriptions down, so registering a new one against it would just
+    /// leak), and a subscriber outside `workspace_id` is only allowed from
+    /// the chief workspace (the same scope rule as `check_watch_scope`).
+    /// Transient store errors are treated as valid — never reject a live
+    /// subscribe on a flaky read.
     pub(crate) async fn validate_event_subscriber(
         &self,
         workspace_id: &WorkspaceId,
@@ -88,6 +91,13 @@ impl Services {
                 if matches!(session.status, intent_core::AgentStatus::Deleted) {
                     return Err(Error::InvalidParams(format!(
                         "subscriber agent {} is deleted",
+                        subscriber.0
+                    )));
+                }
+                if session.retired_at.is_some() {
+                    return Err(Error::InvalidParams(format!(
+                        "subscriber agent {} is retired; restore it with agent.restore \
+                         before subscribing",
                         subscriber.0
                     )));
                 }
@@ -390,6 +400,25 @@ impl Services {
                     subscription = %p.id,
                     subscriber = %p.subscriber_agent_id.0,
                     "pruning persisted event subscription — subscriber agent gone"
+                );
+                let _ = self.store.delete_event_subscription(&p.id).await;
+                continue;
+            }
+            // A soft-retired subscriber is inert too: the retire-time
+            // teardown (`remove_event_subscriptions_for_agent`) already
+            // dropped the row on the happy path, so a surviving row means a
+            // crash window — prune it rather than rehydrate a delivery task
+            // for a wake target that cannot run. Lookup failures read as
+            // not-retired (conservative, mirrors `agent_is_live`).
+            if let Ok(Some(_)) = self
+                .store
+                .get_agent_session_retired_at(&p.subscriber_agent_id)
+                .await
+            {
+                tracing::info!(
+                    subscription = %p.id,
+                    subscriber = %p.subscriber_agent_id.0,
+                    "pruning persisted event subscription — subscriber agent retired"
                 );
                 let _ = self.store.delete_event_subscription(&p.id).await;
                 continue;

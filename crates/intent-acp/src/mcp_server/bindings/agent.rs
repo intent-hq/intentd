@@ -1181,6 +1181,12 @@ async fn request_attention(
 /// for the caller: nothing after the call runs. Emits `agent:retired`; the
 /// optional `reason` rides the event payload and the log line — no new
 /// persistence.
+///
+/// FAILS (invalid params, nothing mutated) while any descendant child agent
+/// is still running a turn — the error names the active children; stop or
+/// wait for them first. On success the caller's settled descendants are
+/// cascade-retired with it (each with the full retire cleanup), and
+/// restoring the caller later does NOT restore them.
 async fn retire(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,

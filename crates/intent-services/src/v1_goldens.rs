@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::{
     now_iso, ActorType, AgentId, Event, EventActor, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
@@ -368,6 +368,15 @@ fn golden_completion_wake_variants() {
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) was deleted. NOTE: this wake \
          consumed your one-shot watch on this agent — the watch is now retired. The agent \
          was deleted, so it cannot be re-watched."
+    );
+    // Retired: terminal like deleted — no re-arm pointer, states the agent
+    // cannot be re-watched or woken again.
+    let ev = completion_event(AGENT_RETIRED, &child, json!({}));
+    assert_eq!(
+        crate::format_completion_wake(&child, &ev, None, true),
+        "[WORKSPACE EVENTS] Child agent Builder (agent-c1) retired. NOTE: this wake \
+         consumed your one-shot watch on this agent — the watch is now retired. The agent \
+         retired and cannot be re-watched or woken again."
     );
     // Stall suspicion appended only without a rendered report.
     let stall = crate::StallSuspicion {
