@@ -1245,6 +1245,43 @@ impl Services {
             .is_some()
     }
 
+    /// Whether a session's specialist resolves to the `orchestrator` role —
+    /// the spawn-time gate for the orchestrator tool denylist (§18.4,
+    /// [`intent_acp::get_native_tools_to_remove`]). The frozen
+    /// creation-time snapshot (`metadata.specialistIsOrchestrator`, written
+    /// by `agent_create_op` and refreshed by `agent_update_op` on a
+    /// specialist change) wins when present — like the identity snapshot
+    /// keys, so later edits/deletes of specialist files never hand an
+    /// orchestrator its file-editing tools back mid-life. Gated on
+    /// `session.specialist` (mirroring `agent_specialist_injection`'s
+    /// write-side invariant), so a caller-supplied key on a non-specialist
+    /// session stays inert. Legacy sessions (no snapshot) fall through to
+    /// live resolution against the session's harness-pinned embedded floor
+    /// (H2), like the other session-scoped specialist reads; the name-based
+    /// fallback for the historical `spec-writer`/`coordinator` ids lives in
+    /// [`specialists::SpecialistsService::resolve_is_orchestrator`].
+    pub(crate) fn session_specialist_is_orchestrator(
+        &self,
+        session: &AgentSession,
+        workspace_path: Option<&Path>,
+    ) -> bool {
+        let Some(specialist_id) = session.specialist.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        if let Some(frozen) = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("specialistIsOrchestrator"))
+            .and_then(serde_json::Value::as_bool)
+        {
+            return frozen;
+        }
+        let entry = crate::harness::resolve_entry(&session.harness_version);
+        self.specialists_service()
+            .with_embedded(entry.doctrine.specialists)
+            .resolve_is_orchestrator(specialist_id, workspace_path)
+    }
+
     /// Resolve every non-hidden specialist's delegation `modelOptions`
     /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
     /// per-agent `workspace_api` tool description at bridge creation. Each

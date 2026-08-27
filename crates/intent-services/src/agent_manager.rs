@@ -7348,13 +7348,20 @@ impl AgentManager {
             // frontmatter (SP-B); falls back to the default interactive type so
             // plain agents and specialists without `agentType` are unchanged.
             let agent_type = derive_agent_type(&self.services, &session, workspace.as_ref());
-            // §18.4 CLI-side denylist: strip provider-native tools (e.g.
-            // auggie's built-in `str-replace-editor`, `sub-agent-*`) via
-            // `--remove-tool`. MCP-side filtering (§6.8) already blocks
-            // workspace-MCP tools, but the provider's native tools can only be
-            // stripped through this spawn-time flag.
-            opts.tools_to_remove =
-                intent_acp::get_tools_to_remove(session.specialist.as_deref(), &agent_type);
+            // §18.4 CLI-side denylist: strip provider-native tools via the
+            // provider's spawn-time removal flag (auggie `--remove-tool`,
+            // droid `--disabled-tools`). MCP-side
+            // filtering (§6.8) already blocks workspace-MCP tools, but the
+            // provider's native tools can only be stripped through this
+            // spawn-time flag. Tool names are provider-native, so the
+            // resolution is keyed on the provider id. The orchestrator branch
+            // keys off the specialist's resolved `role` (with the historical
+            // name fallback), not a hardcoded specialist name.
+            opts.tools_to_remove = intent_acp::get_native_tools_to_remove(
+                resolved.provider.id,
+                derive_is_orchestrator(&self.services, &session, workspace.as_ref()),
+                &agent_type,
+            );
             self.create_agent(
                 agent_id.clone(),
                 workspace_id.clone(),
@@ -8343,6 +8350,24 @@ fn derive_agent_type(
         }
     }
     DEFAULT_AGENT_TYPE.to_string()
+}
+
+/// Derive whether the session's specialist carries the `orchestrator` role
+/// (registry `role` frontmatter with the historical-name fallback — see
+/// `Services::session_specialist_is_orchestrator`), gating the spawn-time
+/// orchestrator denylist in
+/// [`get_native_tools_to_remove`](intent_acp::get_native_tools_to_remove) (§18.4). The
+/// specialist project tier resolves from the workspace path, like
+/// [`derive_agent_type`].
+fn derive_is_orchestrator(
+    services: &Services,
+    session: &AgentSession,
+    workspace: Option<&intent_core::Workspace>,
+) -> bool {
+    let workspace_path = workspace
+        .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+        .map(PathBuf::from);
+    services.session_specialist_is_orchestrator(session, workspace_path.as_deref())
 }
 
 /// Effective provider id for a session. Provider precedence: when the model

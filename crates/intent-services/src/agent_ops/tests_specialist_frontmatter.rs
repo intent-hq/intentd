@@ -1156,3 +1156,123 @@ async fn legacy_session_without_snapshot_picks_up_file_edit() {
     assert_eq!(inj.specialist_name.as_deref(), Some("Edited Name"));
     assert_eq!(inj.role_reminder.as_deref(), Some("Edited reminder"));
 }
+
+/// Create a specialist file with an explicit `role` frontmatter value.
+fn create_specialist_with_role(dir: &Path, id: &str, role: &str) {
+    let content = format!(
+        "---\nname: \"{id}\"\ndescription: \"Test specialist\"\nrole: \"{role}\"\n---\n\nTest prompt"
+    );
+    std::fs::write(dir.join(format!("{id}.md")), content).expect("write specialist");
+}
+
+/// The creation-time orchestrator-role decision is snapshotted into
+/// `metadata.specialistIsOrchestrator`, and the frozen value keeps gating
+/// `session_specialist_is_orchestrator` after the specialist file is edited
+/// to drop the role or deleted outright — later file changes never hand an
+/// orchestrator its file-editing tools back.
+#[tokio::test]
+async fn orchestrator_snapshot_persisted_and_frozen_across_file_changes() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_role(specialists_dir.path(), "conductor", "orchestrator");
+    create_specialist_without_model(specialists_dir.path(), "plain");
+
+    let orch = create_agent(&svc, &ws, "Orch", None, Some("conductor".into())).await;
+    let plain = create_agent(&svc, &ws, "Plain", None, Some("plain".into())).await;
+
+    let orch_session = svc.store().get_agent_session(&orch).await.expect("session");
+    assert_eq!(
+        orch_session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(true)
+    );
+    let plain_session = svc
+        .store()
+        .get_agent_session(&plain)
+        .await
+        .expect("session");
+    assert_eq!(
+        plain_session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(false)
+    );
+
+    // Edit the file to drop the role, then delete it entirely: the frozen
+    // snapshot keeps the decision stable either way.
+    create_specialist_without_model(specialists_dir.path(), "conductor");
+    assert!(svc.session_specialist_is_orchestrator(&orch_session, None));
+    std::fs::remove_file(specialists_dir.path().join("conductor.md")).expect("delete");
+    assert!(svc.session_specialist_is_orchestrator(&orch_session, None));
+    // And a false snapshot stays false even if the file later gains the role.
+    create_specialist_with_role(specialists_dir.path(), "plain", "orchestrator");
+    assert!(!svc.session_specialist_is_orchestrator(&plain_session, None));
+}
+
+/// A caller-supplied `metadata.specialistIsOrchestrator` never survives the
+/// create: the snapshot write always overwrites it with the daemon-resolved
+/// decision, so the frozen readers never consume caller input as a trusted
+/// role.
+#[tokio::test]
+async fn caller_orchestrator_key_overwritten_at_create() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_without_model(specialists_dir.path(), "plain");
+
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "specialistIsOrchestrator": true })),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some("plain".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(false)
+    );
+}
+
+/// `agent.update` with a `specialist` change refreshes the frozen
+/// orchestrator snapshot for the NEW specialist, and clearing the specialist
+/// retires the key.
+#[tokio::test]
+async fn update_specialist_refreshes_orchestrator_snapshot() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_role(specialists_dir.path(), "conductor", "orchestrator");
+    create_specialist_without_model(specialists_dir.path(), "plain");
+
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("plain".into())).await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(false)
+    );
+
+    svc.agent_update_op(id.clone(), json!({ "specialist": "conductor" }))
+        .await
+        .expect("update to orchestrator");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("conductor"));
+    assert_eq!(
+        session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(true)
+    );
+
+    svc.agent_update_op(id.clone(), json!({ "specialist": null }))
+        .await
+        .expect("clear specialist");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist, None);
+    assert!(session
+        .metadata
+        .as_ref()
+        .is_none_or(|m| m.get("specialistIsOrchestrator").is_none()));
+}

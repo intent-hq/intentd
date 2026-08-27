@@ -445,21 +445,75 @@ fn arg_assembly_dedupes_remove_tool_names() {
 }
 
 #[test]
+fn arg_assembly_emits_comma_joined_denylist_for_droid() {
+    let droid = find_provider("droid").unwrap();
+    assert_eq!(droid.remove_tool_flag, Some("--disabled-tools"));
+    assert_eq!(droid.remove_tool_style, ToolRemovalStyle::CommaJoined);
+    let args = build_provider_args(
+        droid,
+        &ArgInputs {
+            tools_to_remove: &["Edit", "Create", "ApplyPatch", "Task"],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        args,
+        vec![
+            "exec",
+            "--output-format",
+            "acp",
+            "--disabled-tools",
+            "Edit,Create,ApplyPatch,Task",
+        ]
+    );
+}
+
+#[test]
+fn arg_assembly_comma_joined_dedupes_and_skips_empty() {
+    let droid = find_provider("droid").unwrap();
+    // All-empty/duplicate input collapses; an empty result emits no flag.
+    let args = build_provider_args(
+        droid,
+        &ArgInputs {
+            tools_to_remove: &["Edit", "Edit", ""],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        args,
+        vec!["exec", "--output-format", "acp", "--disabled-tools", "Edit"]
+    );
+
+    let args = build_provider_args(
+        droid,
+        &ArgInputs {
+            tools_to_remove: &["", ""],
+            ..Default::default()
+        },
+    );
+    assert_eq!(args, vec!["exec", "--output-format", "acp"]);
+}
+
+#[test]
 fn arg_assembly_skips_remove_tool_for_providers_without_support() {
     // Providers with `remove_tool_flag = None` silently drop the input — we
-    // never pass an unknown flag to claude/codex/cortex/opencode/droid/grok.
+    // never pass an unknown flag to claude/codex/cortex/grok/opencode/pi/mock.
+    // grok is deliberately unset: its `--disallowed-tools` flag is
+    // headless-mode only and clap-rejected on `agent stdio` (see the grok
+    // registry entry).
     for id in [
         "claude-code",
         "codex",
         "cortex",
-        "opencode",
-        "droid",
         "grok",
+        "opencode",
+        "pi",
+        "mock",
     ] {
         let provider = find_provider(id).unwrap();
         assert!(
             provider.remove_tool_flag.is_none(),
-            "{id} unexpectedly opted into --remove-tool"
+            "{id} unexpectedly opted into a tool-removal flag"
         );
         let args = build_provider_args(
             provider,
@@ -469,8 +523,10 @@ fn arg_assembly_skips_remove_tool_for_providers_without_support() {
             },
         );
         assert!(
-            !args.iter().any(|a| a == "--remove-tool"),
-            "{id} unexpectedly received a --remove-tool flag: {args:?}"
+            !args.iter().any(|a| a == "--remove-tool"
+                || a == "--disallowed-tools"
+                || a == "--disabled-tools"),
+            "{id} unexpectedly received a tool-removal flag: {args:?}"
         );
     }
 }
