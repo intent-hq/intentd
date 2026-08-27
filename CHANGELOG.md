@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.10] - 2026-08-27
+
+### 🐛 Bug Fixes
+
+- *(transport)* Release RPC limiter permit before awaiting the outbound send ([#1541](https://github.com/intent-hq/intentd/pull/1541))
+
+### ⚡ Performance
+
+- Strip metadata.initialMessage from the AgentLite projection ([#1542](https://github.com/intent-hq/intentd/pull/1542))
+
+
 ## [0.8.9] - 2026-08-27
 
 ### 🚀 Features
