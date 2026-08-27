@@ -2486,11 +2486,13 @@ impl Services {
         // see a long-but-alive turn advance instead of reading as stalled.
         // Compare parsed instants — RFC-3339 strings carry variable
         // sub-second precision, so lexicographic order is not chronological.
+        // An exact-instant tie prefers the live stamp (refreshed on every
+        // stream event, so at least as fresh), matching the diagnostics path.
         if let Some(live) = lite.last_stream_activity_at.as_ref() {
             let newer = match lite.last_activity.as_deref() {
                 None => true,
                 Some(persisted) => match (parse_iso(live), parse_iso(persisted)) {
-                    (Some(l), Some(p)) => l > p,
+                    (Some(l), Some(p)) => l >= p,
                     _ => false,
                 },
             };
@@ -2935,6 +2937,14 @@ impl Services {
     /// (RPC cost contract): a metadata-only session read plus ONE primary-key
     /// message row read; the transcript is never hydrated.
     ///
+    /// In-progress rows (monorepo#3647): when the message id is not persisted
+    /// but matches the live-turn slot's in-flight message, the block resolves
+    /// from the slot's streamed blocks (O(1) in-memory read) — so a
+    /// slim-truncated block served on the `includeInProgress` tail row is
+    /// hydratable mid-turn, same contract as persisted rows. The persisted
+    /// row wins once the turn ends (checked first), and an unknown id stays
+    /// `InvalidParams` exactly as before.
+    ///
     /// Frame-size note: a block whose serialized response exceeds the
     /// transport's 40 MiB outbound frame cap (`MAX_OUTBOUND_MESSAGE_BYTES`)
     /// surfaces as the standard `-32010` oversized-response error naming
@@ -2961,11 +2971,37 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let message = self
+        let message = match self
             .store
             .get_agent_message_by_id(&agent_id, &message_id)
             .await?
-            .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {message_id}")))?;
+        {
+            Some(m) => m,
+            // In-progress fallback (monorepo#3647): an unpersisted id that
+            // matches the live-turn slot's in-flight message resolves from
+            // the slot's streamed blocks, so blocks slim-truncated on the
+            // `includeInProgress` tail row hydrate mid-turn too.
+            None => match self
+                .live_turn(&agent_id)
+                .filter(|l| l.message_id == message_id)
+            {
+                Some(live) => AgentMessage {
+                    id: live.message_id,
+                    agent_id: agent_id.clone(),
+                    seq: i64::MAX,
+                    role: "assistant".to_string(),
+                    content: Value::Array(live.blocks),
+                    metadata: None,
+                    app_message_id: None,
+                    created_at: live.last_activity_at,
+                },
+                None => {
+                    return Err(Error::InvalidParams(format!(
+                        "unknown message id: {message_id}"
+                    )))
+                }
+            },
+        };
         let message = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
         let block = message
             .content
@@ -9661,13 +9697,15 @@ impl Services {
             // actively streaming through the harness is never flagged stale.
             // Compare parsed instants (`iso_ms`) — RFC-3339 strings carry
             // variable sub-second precision, so lexicographic order is not
-            // chronological.
+            // chronological. `iso_ms` truncates to milliseconds, so a
+            // same-millisecond tie prefers the live stamp — it is refreshed
+            // on every stream event and thus at least as fresh.
             let live_stream_activity = self.live_turn_activity_at(&AgentId(id.clone()));
             let last_activity = match (
                 session.map(|s| s.updated_at.clone()),
                 live_stream_activity.clone(),
             ) {
-                (Some(p), Some(l)) => Some(if iso_ms(&l) > iso_ms(&p) { l } else { p }),
+                (Some(p), Some(l)) => Some(if iso_ms(&l) >= iso_ms(&p) { l } else { p }),
                 (p, l) => p.or(l),
             };
             let last_activity_age = last_activity.as_deref().map(|t| age_ms(now_ms, t));

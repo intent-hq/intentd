@@ -278,11 +278,13 @@
 //! ends at the live tail, the in-flight turn's partial assistant message
 //! (streamed blocks so far, slim-bounded like persisted rows, excluded
 //! from `totalMessages`/pagination) is appended as a trailing
-//! `inProgress: true` row; `AgentLite.lastActivity` is overlaid mid-turn
-//! with the live-turn stream stamp (max of persisted `updatedAt` and
-//! `lastStreamActivityAt`) so it advances on tool-call/stream activity;
-//! and `agent.diagnostics` rows key `staleResponding` on that same
-//! liveness-aware max, additionally serving the raw
+//! `inProgress: true` row (its blocks hydrate via `agent.getMessageBlock`
+//! mid-turn: an unpersisted message id matching the live turn resolves
+//! from the slot's streamed blocks); `AgentLite.lastActivity` is overlaid
+//! mid-turn with the live-turn stream stamp (max of persisted `updatedAt`
+//! and `lastStreamActivityAt`) so it advances on tool-call/stream
+//! activity; and `agent.diagnostics` rows key `staleResponding` on that
+//! same liveness-aware max, additionally serving the raw
 //! `lastStreamActivityAt?` (presence-detected, omitted when no turn is
 //! streaming). No method-catalog change — 297 router methods, 336 total.
 

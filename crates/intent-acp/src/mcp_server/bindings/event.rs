@@ -58,7 +58,11 @@ async fn agent_activity(
     // harness-side edits never produce, so a live tool-heavy turn read as
     // zero events here. `agent:tool:call` rows are persisted per call
     // MID-turn, so this now shows advancing activity while a turn runs.
-    // The wire `event.agentActivity` contract is untouched.
+    // The wire `event.agentActivity` contract is untouched. Zero is
+    // normalized to the 30-minute default BEFORE the query — `event_query`
+    // treats 0 as "no since filter", which would serve unbounded history
+    // instead of the advertised default (the aggregate path below does the
+    // same normalization internally).
     if let Some(agent_id) = agent_id {
         return api
             .event_query(
@@ -66,7 +70,7 @@ async fn agent_activity(
                 EventQueryParams {
                     actor_type: Some("agent".to_string()),
                     actor_id: Some(agent_id),
-                    minutes_ago: minutes_ago.or(Some(30)),
+                    minutes_ago: minutes_ago.filter(|&m| m != 0).or(Some(30)),
                     ..Default::default()
                 },
             )
@@ -224,6 +228,13 @@ mod tests {
             .expect("dispatch");
         assert_eq!(fake.query_calls.lock().unwrap()[1].2, Some(5));
 
+        // Zero normalizes to the 30-minute default — `event_query` treats 0
+        // as "no since filter", which would serve unbounded history.
+        agent_activity(&api, &ws, &json!({ "agentId": "agent-1", "minutesAgo": 0 }))
+            .await
+            .expect("dispatch");
+        assert_eq!(fake.query_calls.lock().unwrap()[2].2, Some(30));
+
         // Without agentId the aggregate wire surface is untouched.
         agent_activity(&api, &ws, &json!({}))
             .await
@@ -232,6 +243,6 @@ mod tests {
             fake.activity_calls.lock().unwrap().as_slice(),
             &[(None, None)]
         );
-        assert_eq!(fake.query_calls.lock().unwrap().len(), 2);
+        assert_eq!(fake.query_calls.lock().unwrap().len(), 3);
     }
 }

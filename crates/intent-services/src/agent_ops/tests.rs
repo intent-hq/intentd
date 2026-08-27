@@ -6090,6 +6090,67 @@ async fn get_message_block_rejects_unknown_ids_and_workspace_mismatch() {
     assert!(matches!(err, Error::NotFound(_)), "{err:?}");
 }
 
+/// monorepo#3647: a block id served on the `includeInProgress` tail row
+/// hydrates mid-turn — the unpersisted message id resolves from the live-turn
+/// slot's streamed blocks, returning the FULL unprojected body (the slim tail
+/// row truncated it). The persisted row wins once the turn ends, and a
+/// non-matching id stays `InvalidParams`.
+#[tokio::test]
+async fn get_message_block_resolves_live_turn_blocks_mid_turn() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "LiveBlocks").await;
+    let big = "x".repeat(64 * 1024);
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![
+            json!({ "type": "text", "id": "msg-live:0", "text": "streaming…" }),
+            json!({ "type": "tool_use", "id": "msg-live:1", "name": "bash", "input": {"cmd": big} }),
+        ],
+    );
+
+    // The oversized live block hydrates in full mid-turn.
+    let res = svc
+        .agent_get_message_block_op(id.clone(), "msg-live".into(), "msg-live:1".into(), None)
+        .await
+        .expect("live block hydrates");
+    assert_eq!(
+        res["block"]["input"]["cmd"].as_str().unwrap().len(),
+        big.len()
+    );
+    assert!(res["block"].get("inputTruncated").is_none());
+
+    // A block id outside the live slot is still InvalidParams.
+    let err = svc
+        .agent_get_message_block_op(id.clone(), "msg-live".into(), "msg-live:9".into(), None)
+        .await
+        .expect_err("unknown live block id");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+
+    // A message id that matches neither a persisted row nor the live slot
+    // stays InvalidParams.
+    let err = svc
+        .agent_get_message_block_op(id.clone(), "msg-other".into(), "msg-other:0".into(), None)
+        .await
+        .expect_err("unknown message id");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+
+    // Turn end: slot cleared, the same id resolves from the persisted row.
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+    let content = json!([{ "type": "text", "id": "msg-live:0", "text": "persisted" }]);
+    svc.store()
+        .append_agent_message_with_id(&id, "msg-live", "assistant", &content, None, &now_iso())
+        .await
+        .expect("append");
+    let res = svc
+        .agent_get_message_block_op(id, "msg-live".into(), "msg-live:0".into(), None)
+        .await
+        .expect("persisted block");
+    assert_eq!(res["block"]["text"], "persisted");
+}
+
 /// monorepo#1114 helper: only id-less object blocks are stamped with the
 /// stable synthetic `{messageId}:{index}`; existing ids are never overwritten,
 /// non-object blocks pass through, and the index counts ALL blocks so it
