@@ -71,6 +71,17 @@ use uuid::Uuid;
 
 use crate::Services;
 
+/// Row scope selecting which sessions an `agent.list` read serves (§5.5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentListScope {
+    /// Default read: active (not soft-retired) sessions only.
+    Active,
+    /// `includeRetired: true`: every session, retired rows carrying `retiredAt`.
+    All,
+    /// `retiredOnly: true`: soft-retired sessions only.
+    RetiredOnly,
+}
+
 /// "Running a turn" statuses for the retire guard (§5.5, confirmed
 /// decision): a descendant in `pending`/`active`/`Processing` blocks
 /// `ws.agent.retire`; idle/waiting/settled children are cascade-retired.
@@ -2146,7 +2157,8 @@ impl Services {
     /// `includeRetired: true` variant is
     /// [`Self::agent_list_including_retired_op`].
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
-        self.agent_list_impl(workspace_id, false).await
+        self.agent_list_impl(workspace_id, AgentListScope::Active)
+            .await
     }
 
     /// `agent.list` with `includeRetired: true` (PROTOCOL §5.5): every
@@ -2155,47 +2167,100 @@ impl Services {
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<AgentLite>> {
-        self.agent_list_impl(workspace_id, true).await
+        self.agent_list_impl(workspace_id, AgentListScope::All)
+            .await
+    }
+
+    /// `agent.list` with `retiredOnly: true` (PROTOCOL §5.5): ONLY
+    /// soft-retired sessions, whose rows carry `retiredAt`. SQL-side
+    /// `retired_at IS NOT NULL` filter on both the summary read AND the
+    /// message-projection aggregate (served from the partial covering index
+    /// `idx_agent_workspace_retired`), and the hook/PR-monitor overlays are
+    /// skipped (retire cancels them, so retired rows always read empty) —
+    /// cost stays O(retired rows returned), never touching the workspace's
+    /// active sessions.
+    pub(crate) async fn agent_list_retired_only_op(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<AgentLite>> {
+        self.agent_list_impl(workspace_id, AgentListScope::RetiredOnly)
+            .await
+    }
+
+    /// `retiredCount` (PROTOCOL §5.5): number of soft-retired sessions in
+    /// the workspace — one SQL COUNT answered from the partial covering
+    /// index `idx_agent_workspace_retired` (O(retired rows), O(1) when the
+    /// bin is empty), attached to every `agent.list` response variant by
+    /// the router.
+    pub(crate) async fn agent_retired_count_op(&self, workspace_id: WorkspaceId) -> Result<u64> {
+        self.store.count_retired_agent_sessions(&workspace_id).await
     }
 
     async fn agent_list_impl(
         &self,
         workspace_id: WorkspaceId,
-        include_retired: bool,
+        scope: AgentListScope,
     ) -> Result<Vec<AgentLite>> {
-        let sessions = if include_retired {
-            self.store
-                .list_agent_session_summaries(&workspace_id)
-                .await?
-        } else {
-            self.store
-                .list_active_agent_session_summaries(&workspace_id)
-                .await?
+        let sessions = match scope {
+            AgentListScope::All => {
+                self.store
+                    .list_agent_session_summaries(&workspace_id)
+                    .await?
+            }
+            AgentListScope::Active => {
+                self.store
+                    .list_active_agent_session_summaries(&workspace_id)
+                    .await?
+            }
+            AgentListScope::RetiredOnly => {
+                self.store
+                    .list_retired_agent_session_summaries(&workspace_id)
+                    .await?
+            }
         };
         // Message projections are the expensive half (full-workspace COUNT
-        // aggregate + preview columns). The default read serves them from the
-        // per-workspace cache (active sessions only, matching the row set
-        // above — cost stays O(rows returned)); invalidated on transcript
-        // writes and session create/delete. `includeRetired` needs retired
-        // rows' projections too, so it loads directly, bypassing the cache
-        // in both directions.
-        let mut projections = if include_retired {
-            self.store
-                .get_agent_session_message_projections(&workspace_id)
-                .await?
-        } else {
-            self.agent_list_cache
-                .get_or_load(&self.store, &workspace_id)
-                .await?
+        // aggregate + preview columns). Each scope loads a projection set
+        // matching exactly its row set (RPC cost contract — O(rows
+        // returned)): the default read serves the active-only set from the
+        // per-workspace cache (invalidated on transcript writes and session
+        // create/delete); `retiredOnly` loads the retired-only SQL variant
+        // directly (never the full-workspace superset); `includeRetired`
+        // loads the full set directly, bypassing the cache in both
+        // directions.
+        let mut projections = match scope {
+            AgentListScope::Active => {
+                self.agent_list_cache
+                    .get_or_load(&self.store, &workspace_id)
+                    .await?
+            }
+            AgentListScope::RetiredOnly => {
+                self.store
+                    .get_retired_agent_session_message_projections(&workspace_id)
+                    .await?
+            }
+            AgentListScope::All => {
+                self.store
+                    .get_agent_session_message_projections(&workspace_id)
+                    .await?
+            }
         };
         // Idle-visibility: overlay each agent's active-hook metadata
-        // (`waitingOnHooks`, omitted when empty) from one workspace-wide
-        // hook query.
-        let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
-        // Idle-visibility (unified external-wait): same overlay for active
-        // PR monitors (`waitingOnPrMonitors`, omitted when empty) from one
-        // workspace-wide monitor query.
-        let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
+        // (`waitingOnHooks`) and active PR monitors (`waitingOnPrMonitors`),
+        // each omitted when empty, from one workspace-wide query apiece.
+        // Retire cancels the owner's hooks and PR monitors
+        // (`retire_one_session`), so retired rows always read empty — the
+        // `retiredOnly` scope skips both workspace-wide queries entirely
+        // rather than hydrating every active agent's hook history for rows
+        // that cannot carry any (RPC cost contract).
+        let (mut hooks_by_agent, mut pr_monitors_by_agent) = if scope == AgentListScope::RetiredOnly
+        {
+            (HashMap::new(), HashMap::new())
+        } else {
+            (
+                self.active_hooks_by_agent(&workspace_id).await,
+                self.active_pr_monitors_by_agent(&workspace_id).await,
+            )
+        };
         Ok(sessions
             .into_iter()
             .map(|s| {

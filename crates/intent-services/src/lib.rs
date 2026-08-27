@@ -22441,6 +22441,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_list_including_retired_op(workspace_id).await })
     }
 
+    fn agent_list_retired_only(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        Box::pin(async move { self.agent_list_retired_only_op(workspace_id).await })
+    }
+
+    fn agent_retired_count(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move { self.agent_retired_count_op(workspace_id).await })
+    }
+
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_list_active_op().await })
     }

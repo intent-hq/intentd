@@ -57,13 +57,11 @@ pub(crate) const SESSION_MESSAGE_PROJECTION_SQL: &str =
 
 /// Workspace-wide projection SQL behind
 /// [`Store::get_agent_session_message_projections`] (see
-/// [`SESSION_MESSAGE_STATS_SQL`] for why it is extracted).
-pub(crate) fn session_message_projections_sql(active_only: bool) -> String {
-    let retired_filter = if active_only {
-        " AND s.retired_at IS NULL"
-    } else {
-        ""
-    };
+/// [`SESSION_MESSAGE_STATS_SQL`] for why it is extracted). `retired_filter`
+/// is one of the compile-time fragments the three projection variants pass
+/// (`""`, `" AND s.retired_at IS NULL"`, `" AND s.retired_at IS NOT NULL"`)
+/// — never caller input.
+pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
     format!(
         "SELECT s.id AS agent_id, s.message_count, \
         s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
@@ -966,6 +964,56 @@ impl Store {
         rows.iter().map(map_session_summary_row).collect()
     }
 
+    /// [`Store::list_agent_session_summaries`] restricted to soft-RETIRED
+    /// sessions — the `agent.list { retiredOnly: true }` read (§5.5). The
+    /// filter runs in SQL (`retired_at IS NOT NULL`), keeping the handler
+    /// cost O(rows returned) per the RPC cost contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_retired_agent_session_summaries(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+             WHERE workspace_id = ? AND retired_at IS NOT NULL ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("list retired agent session summaries failed: {e}"))
+            })?;
+        rows.iter().map(map_session_summary_row).collect()
+    }
+
+    /// Number of soft-retired sessions in a workspace — the `retiredCount`
+    /// field served on every `agent.list` response variant (§5.5). One SQL
+    /// COUNT answered entirely from the partial covering index
+    /// `idx_agent_workspace_retired` (0104) — an index-only scan over exactly
+    /// the retired entries, O(retired rows) and O(1) for the common empty
+    /// bin, never visiting the workspace's active session rows (RPC cost
+    /// contract; same covering-aggregate shape as 0101). No rows are
+    /// hydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_retired_agent_sessions(&self, workspace_id: &WorkspaceId) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_session \
+             WHERE workspace_id = ? AND retired_at IS NOT NULL",
+        )
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("count retired agent sessions failed: {e}")))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     /// Get message count, whether any assistant message exists, and the total
     /// persisted conversation size in bytes for each session in a workspace,
     /// without hydrating message bodies (finding F1/F3: lightweight
@@ -1030,7 +1078,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, false).await
+        self.session_message_projections(workspace_id, "").await
     }
 
     /// [`Store::get_agent_session_message_projections`] restricted to ACTIVE
@@ -1046,15 +1094,37 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, true).await
+        self.session_message_projections(workspace_id, " AND s.retired_at IS NULL")
+            .await
     }
 
+    /// [`Store::get_agent_session_message_projections`] restricted to
+    /// soft-RETIRED sessions — the variant the `agent.list
+    /// { retiredOnly: true }` read loads, so its aggregate cost scales with
+    /// the retired rows that read returns rather than with every active
+    /// session in the workspace (RPC cost contract). The filter runs in SQL
+    /// (`s.retired_at IS NOT NULL`), served from the partial covering index
+    /// `idx_agent_workspace_retired` (0104).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_retired_agent_session_message_projections(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
+        self.session_message_projections(workspace_id, " AND s.retired_at IS NOT NULL")
+            .await
+    }
+
+    /// Shared body of the workspace projection reads; `retired_filter` is
+    /// one of the compile-time SQL fragments above (never caller input).
     async fn session_message_projections(
         &self,
         workspace_id: &WorkspaceId,
-        active_only: bool,
+        retired_filter: &str,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        let sql = session_message_projections_sql(active_only);
+        let sql = session_message_projections_sql(retired_filter);
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
@@ -3818,6 +3888,53 @@ mod tests {
         }
     }
 
+    /// The soft-retire read paths must be answered from the partial covering
+    /// index `idx_agent_workspace_retired` (0104) — never by scanning the
+    /// workspace's session entries — so `retiredCount` and the `retiredOnly`
+    /// reads stay O(retired rows) per the RPC cost contract (PR #1523
+    /// review; same tripwire shape as the 0101 note-aggregate test).
+    #[tokio::test]
+    async fn retired_reads_use_partial_covering_index() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        for (label, sql) in [
+            (
+                "count",
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM agent_session \
+                 WHERE workspace_id = ? AND retired_at IS NOT NULL"
+                    .to_string(),
+            ),
+            (
+                "rows",
+                "EXPLAIN QUERY PLAN SELECT id FROM agent_session \
+                 WHERE workspace_id = ? AND retired_at IS NOT NULL"
+                    .to_string(),
+            ),
+            (
+                "projections",
+                format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    session_message_projections_sql(" AND s.retired_at IS NOT NULL")
+                ),
+            ),
+        ] {
+            let details: Vec<String> = sqlx::query(&sql)
+                .bind("ws-plan")
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.contains("INDEX idx_agent_workspace_retired")),
+                "{label} read must use the partial retired index, plan: {details:?}"
+            );
+        }
+    }
+
     /// A UNIQUE violation on the session id maps to `Internal` naming the
     /// colliding id. Agent ids are server-minted (`agent-{uuid}`), so a
     /// duplicate insert is a server-side anomaly — never a client params
@@ -6307,11 +6424,15 @@ mod tests {
             ),
             (
                 "get_agent_session_message_projections",
-                session_message_projections_sql(false),
+                session_message_projections_sql(""),
             ),
             (
                 "get_active_agent_session_message_projections",
-                session_message_projections_sql(true),
+                session_message_projections_sql(" AND s.retired_at IS NULL"),
+            ),
+            (
+                "get_retired_agent_session_message_projections",
+                session_message_projections_sql(" AND s.retired_at IS NOT NULL"),
             ),
             (
                 "get_agent_session_message_projection",

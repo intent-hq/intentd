@@ -1359,6 +1359,31 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.list` with `retiredOnly: true` (PROTOCOL §5.5): ONLY
+    /// soft-retired sessions, whose rows carry `retiredAt`.
+    fn agent_list_retired_only(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_retired_only not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Number of soft-retired sessions in a workspace — the `retiredCount`
+    /// field attached to every `agent.list` response variant (PROTOCOL §5.5).
+    fn agent_retired_count(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<u64>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_retired_count not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.listActive`: daemon-global mid-turn agent streams (PROTOCOL
     /// §5.5). No workspace id is required because the result spans workspaces.
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
