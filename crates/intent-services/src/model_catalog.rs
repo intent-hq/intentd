@@ -6,7 +6,7 @@
 //! fetches are persisted in the daemon data dir and served as fresh for
 //! [`MODELS_STALE_AFTER`] (empty-but-successful results are served but not
 //! cached). A probe runs on a true cache miss (no entry for the provider
-//! under its current version key), on an **aged** entry (older than the
+//! under its current version key), on an **aged** entry (at or past the
 //! staleness threshold — so newly released provider models appear without a
 //! manual refresh), or on a `force_refresh` read; each falls back to the
 //! last-good list — labeled `stale` with a `warning` — only when the probe
@@ -723,6 +723,16 @@ pub(crate) struct ResolvedModels {
 /// and any success clears the negative entry; a failed probe records a
 /// negative entry and falls back to the last-good list labeled `stale` +
 /// `warning`, or reports nothing to serve.
+///
+/// Empty-success edge: an aged entry whose re-probe returns an **empty
+/// success** serves the empty list (superseding the last-good list in that
+/// response), and because empty successes are never stored and any success
+/// clears the negative entry, every subsequent non-forced read re-probes —
+/// bounded only by single-flighting, with no negative-window suppression.
+/// This is acceptable while every registered empty-success source is a cheap
+/// env-var check (cortex/droid gating; unsloth converts empty to failure);
+/// a future source with a costly probe that can return empty success would
+/// need its own guard (e.g. converting empty to failure like unsloth does).
 pub(crate) async fn resolve_with_cache<F>(
     cache: &ModelCatalogCache,
     provider_id: &str,

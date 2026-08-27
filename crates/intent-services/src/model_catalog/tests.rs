@@ -172,6 +172,36 @@ async fn concurrent_aged_reads_single_flight_one_probe() {
 }
 
 #[tokio::test]
+async fn aged_entry_empty_success_reprobe_serves_empty_uncached() {
+    // Pins the documented empty-success edge (see `resolve_with_cache`): an
+    // aged entry whose re-probe returns an empty success serves the empty
+    // list in that response (superseding the last-good list), stores nothing,
+    // and clears no ground for negative caching — so the next non-forced read
+    // re-probes again. Acceptable while all empty-success sources are cheap
+    // env checks; a costly source must convert empty to failure instead.
+    let cache = ModelCatalogCache::new(None);
+    cache.store("p", "v1", rows("last-good"), 1_000);
+    let now = 1_000 + STALE_MS;
+    let empty_fetch = || {
+        Box::pin(async {
+            ModelFetchResult {
+                models: Some(vec![]),
+                warning: None,
+            }
+        }) as BoxFuture<'static, ModelFetchResult>
+    };
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, empty_fetch).await;
+    assert_eq!(r.models, Some(vec![]));
+    assert!(!r.stale);
+    // Not stored: the last-good list is untouched and still aged, so the next
+    // non-forced read probes again (no negative window suppresses it).
+    assert_eq!(cache.last_good("p", "v1"), Some(rows("last-good")));
+    assert!(cache.test_negative_reason("p", "v1", now).is_none());
+    let r = resolve_with_cache(&cache, "p", "v1", false, now + 1, ok_fetch("recovered")).await;
+    assert_eq!(r.models, Some(rows("recovered")));
+}
+
+#[tokio::test]
 async fn entry_fetched_in_the_future_is_still_served() {
     // System clock moved backwards: age uses saturating subtraction, so a
     // future-stamped entry reads as age zero (fresh) and is served like any
@@ -264,6 +294,15 @@ fn persistence_roundtrips_across_instances() {
     cache.store("p", "v1", rows("persisted"), 1_000);
     let reloaded = ModelCatalogCache::new(Some(path.clone()));
     assert_eq!(reloaded.last_good("p", "v1"), Some(rows("persisted")));
+    // `fetchedAtMs` survives the reload: staleness carries across a daemon
+    // restart — an entry persisted past the threshold is not a fresh hit
+    // (the first read after restart re-probes) while the last-good list
+    // remains available as the failure fallback.
+    assert_eq!(
+        reloaded.fresh_hit("p", "v1", 1_000 + STALE_MS - 1),
+        Some(rows("persisted"))
+    );
+    assert!(reloaded.fresh_hit("p", "v1", 1_000 + STALE_MS).is_none());
     // A version-key bump invalidates the reloaded entry too.
     assert!(reloaded.last_good("p", "v2").is_none());
     // Corrupt files are ignored, not errors.
