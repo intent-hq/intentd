@@ -2640,6 +2640,27 @@ impl Services {
             }
 
             if should_emit {
+                // Existence guard (monorepo#3632): a fire racing
+                // `workspace.delete` can pass the gen/count checks and remove
+                // its own entry while the delete is mid-flight — the delete's
+                // sweep then finds no handle to abort, and this task would
+                // publish a durable `{ idle }` for the deleted id. Ids are
+                // never recycled, so not-found always means "deleted
+                // mid-window"; skip the emit (same shape as
+                // `schedule_last_activity_event`'s NotFound handling,
+                // monorepo#3623). Any other probe error fails open — the row
+                // almost certainly exists and a missed idle flip would strand
+                // clients on `agent_running`.
+                if matches!(
+                    this.store.get_workspace(&ws_id).await,
+                    Err(Error::NotFound(_))
+                ) {
+                    tracing::debug!(
+                        workspace = %ws_id.as_str(),
+                        "schedule_idle_debounce: workspace deleted before the debounce fired; skipping"
+                    );
+                    return;
+                }
                 publish_event(
                     this.event_bus.as_ref(),
                     activity_changed_event(&ws_id, WorkspaceActivity::Idle),
@@ -16118,6 +16139,10 @@ impl WorkspaceApi for Services {
             // schedules an idle flip whose timer would otherwise outlive the
             // workspace and emit a spurious
             // `workspace:activity-changed { idle }` ~3s after deletion.
+            // Residual race: an `agent_activity_end` landing after this sweep
+            // can still re-arm a flip for the deleted id — the timer's
+            // every-exit-path removal self-heals the map entry, and its
+            // emit-time existence guard skips the spurious event.
             services.cancel_idle_debounce(&id);
             // Evict the deleted workspace's last-observed displayStatus
             // baseline so the in-memory map does not leak for the daemon's

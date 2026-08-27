@@ -28570,6 +28570,61 @@ mod last_activity_events {
         );
     }
 
+    /// Regression (monorepo#3632, review): an idle timer that fires against
+    /// an already-deleted workspace — the shape of a fire racing
+    /// `workspace.delete` (the timer passes its gen/count guards and removes
+    /// its own entry before the delete's sweep runs, so the sweep finds no
+    /// handle to abort) — must not emit the spurious `{ idle }` event, and
+    /// must still remove its own map entry.
+    #[tokio::test]
+    async fn idle_timer_firing_against_deleted_workspace_skips_emit() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Last in-flight session ends → idle flip scheduled.
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
+
+        // Delete the row directly in the store, bypassing the services-layer
+        // sweep — the interleaving where the timer fires while the delete is
+        // mid-flight (entry still present, gen/count guards pass, row gone).
+        h.store.delete_workspace(&h.ws).await.expect("row delete");
+
+        // Bounded poll: the timer fires, hits the emit-time existence guard,
+        // and must still sweep its map entry on the way out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = h
+                .services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "idle timer must remove its own debouncers entry after firing \
+                 against a deleted workspace"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // No idle event for the deleted id: the only event is the begin's
+        // agent_running flip.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(ev["data"]["activity"], "agent_running");
+        assert!(
+            timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .is_err(),
+            "no idle event for a deleted workspace"
+        );
+    }
+
     /// After `raise_attention` (which bumps `workspace.updated_at`), a
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]
