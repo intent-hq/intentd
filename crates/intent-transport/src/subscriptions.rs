@@ -20,8 +20,8 @@ use intent_core::events::{
     WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
-    extract_spec_task_ids, now_iso, AgentId, ConversationProjection, Event, Note, NoteId,
-    WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
+    extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, ConversationProjection, Event,
+    Note, NoteId, NoteListProjection, WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -61,10 +61,15 @@ pub(crate) enum SubFastPath {
 /// Parsed params for a workspace-scoped collection channel (`note`/`task`/
 /// `agent`, §6.1). `workspaceId` is required; `replaceGroup` is optional;
 /// `sinceSeq` is reserved for post-v1.0 replay (§6.4) and ignored here.
+/// `projection` is a note-channel-only param ([`parse_note_subscribe_params`],
+/// v8.2 — mirroring `note.list`'s, monorepo#3586): the shared
+/// [`parse_subscribe_params`] leaves it `None`, so the `task`/`agent`
+/// channels keep ignoring the key like any other unknown param.
 #[derive(Debug)]
 pub(crate) struct NoteSubscribeParams {
     pub workspace_id: String,
     pub replace_group: Option<String>,
+    pub projection: Option<NoteListProjection>,
 }
 
 /// Parsed `workspace.subscribe` params (§6.1). The workspace channel is global
@@ -195,8 +200,9 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
     }
 }
 
-/// Validate `note.subscribe` params. A missing/empty `workspaceId` is a
-/// `-32602` error (the note channel is workspace-scoped, §6.2).
+/// Validate the shared workspace-scoped collection-channel params
+/// (`task`/`agent`, and the base of `note`). A missing/empty `workspaceId`
+/// is a `-32602` error (these channels are workspace-scoped, §6.2).
 pub(crate) fn parse_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<NoteSubscribeParams, String> {
@@ -207,7 +213,27 @@ pub(crate) fn parse_subscribe_params(
     Ok(NoteSubscribeParams {
         workspace_id,
         replace_group: replace_group(params),
+        projection: None,
     })
+}
+
+/// Validate `note.subscribe` params: the shared collection-channel params
+/// plus the optional `projection` (v8.2, monorepo#3586), mirroring
+/// `note.list`'s semantics (§5.2): absent / `null` / `"full"` keep the full
+/// rows (`None` — byte-identical to before, so existing clients are
+/// unaffected), `"slim"` serves the bounded listing rows on the seq-0
+/// snapshot and every `added`/`updated` delta, anything else is `-32602`.
+pub(crate) fn parse_note_subscribe_params(
+    params: &Map<String, Value>,
+) -> Result<NoteSubscribeParams, String> {
+    let mut parsed = parse_subscribe_params(params)?;
+    parsed.projection = match params.get("projection") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "full" => None,
+        Some(Value::String(s)) if s == "slim" => Some(NoteListProjection::Slim),
+        Some(_) => return Err("projection must be \"slim\" or \"full\"".to_string()),
+    };
+    Ok(parsed)
 }
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
@@ -343,11 +369,15 @@ pub(crate) fn build_delta_push(subscription_id: &str, seq: u64, delta: &Value) -
 /// Map one `note:*` bus change event to a note-channel delta by re-reading the
 /// latest entity (TB-0 §2.2 option B). `note:created` → `added`, `note:updated`
 /// → `updated`, `note:deleted` → `removedIds`. Returns `None` for events that do
-/// not translate (no `noteId`, unrelated type, or a re-read miss).
+/// not translate (no `noteId`, unrelated type, or a re-read miss). The
+/// subscription's `projection` (v8.2, monorepo#3586) shapes the re-read rows:
+/// slim serves the same bounded [`note_list_slim_row`] as the seq-0 snapshot,
+/// so no note-channel frame class escapes the bound.
 pub(crate) async fn note_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
     event: &Event,
+    projection: Option<NoteListProjection>,
 ) -> Option<Value> {
     let note_id = event.data.get("noteId").and_then(Value::as_str)?;
     match event.event_type.as_str() {
@@ -356,17 +386,28 @@ pub(crate) async fn note_delta(
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "added": [serde_json::to_value(note).ok()?] }))
+            Some(json!({ "added": [note_row(note, projection)?] }))
         }
         NOTE_UPDATED => {
             let note = api
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "updated": [serde_json::to_value(note).ok()?] }))
+            Some(json!({ "updated": [note_row(note, projection)?] }))
         }
         NOTE_DELETED => Some(json!({ "removedIds": [note_id] })),
         _ => None,
+    }
+}
+
+/// Serialize one note-channel row under the subscription's projection: full
+/// (`None`) keeps the complete wire `Note` byte-identical to before;
+/// [`NoteListProjection::Slim`] serves the bounded `note.list` slim row
+/// (`content` → `contentPreview` + `contentLength`, §5.2).
+fn note_row(note: Note, projection: Option<NoteListProjection>) -> Option<Value> {
+    match projection {
+        Some(NoteListProjection::Slim) => Some(note_list_slim_row(note)),
+        None => serde_json::to_value(note).ok(),
     }
 }
 
@@ -1480,7 +1521,10 @@ pub(crate) async fn channel_delta(
     event: &Event,
 ) -> Option<Value> {
     match channel {
-        Channel::Note => note_delta(api, workspace_id, event).await,
+        // The note channel uses the dedicated `forward_note_subscription`
+        // path (which threads the subscription's v8.2 projection), so this
+        // generic arm is unreachable for `Note`; full rows keep it faithful.
+        Channel::Note => note_delta(api, workspace_id, event, None).await,
         Channel::Agent => agent_delta(api, event).await,
         Channel::Workspace => workspace_delta(api, event).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,

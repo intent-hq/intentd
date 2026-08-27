@@ -756,11 +756,12 @@ async fn handle_sub_fast_path(
             id,
             channel: Channel::Note,
             params,
-        } => match subscriptions::parse_subscribe_params(&params) {
+        } => match subscriptions::parse_note_subscribe_params(&params) {
             Ok(p) => {
                 let subscriptions::NoteSubscribeParams {
                     workspace_id,
                     replace_group,
+                    projection,
                 } = p;
                 if let Some(group) = replace_group.as_deref() {
                     subs.remove_group(group);
@@ -795,6 +796,7 @@ async fn handle_sub_fast_path(
                 let handle = tokio::spawn(forward_note_subscription(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
+                    projection,
                     subscription,
                     subscription_id.clone(),
                     out_tx.clone(),
@@ -934,16 +936,29 @@ async fn handle_sub_fast_path(
 /// the snapshot (seq 0) from `list_notes`, then maps each `note:*` change event
 /// to a `{ added, updated, removedIds }` delta (re-reading the entity, §2.2) at
 /// the next seq. Owns `seq`, so strict monotonicity holds without shared state.
-/// Aborted by [`ConnSub`] on unsubscribe / disconnect.
+/// Aborted by [`ConnSub`] on unsubscribe / disconnect. The subscription's
+/// `projection` (v8.2, monorepo#3586 — mirroring `note.list`, §5.2) is fixed
+/// at subscribe time: slim serves bounded `note_list_slim_row`s on the seq-0
+/// snapshot AND every `added`/`updated` delta, so no note-channel frame class
+/// escapes the bound; full (`None`) keeps the rows byte-identical to before.
 async fn forward_note_subscription(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
+    projection: Option<intent_core::NoteListProjection>,
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: OutboundSender,
 ) {
     let snapshot = match api.list_notes(&workspace_id).await {
-        Ok(notes) => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+        Ok(notes) => match projection {
+            Some(intent_core::NoteListProjection::Slim) => Value::Array(
+                notes
+                    .into_iter()
+                    .map(intent_core::note_list_slim_row)
+                    .collect(),
+            ),
+            None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+        },
         Err(_) => Value::Array(Vec::new()),
     };
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
@@ -954,7 +969,7 @@ async fn forward_note_subscription(
     while let Some(batch) = subscription.recv().await {
         for event in batch {
             if let Some(delta) =
-                subscriptions::note_delta(api.as_ref(), &workspace_id, &event).await
+                subscriptions::note_delta(api.as_ref(), &workspace_id, &event, projection).await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 if out_tx.send_bulk(frame).await.is_err() {

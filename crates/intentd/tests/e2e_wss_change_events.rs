@@ -4288,3 +4288,177 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
         "seeded dep: {got}"
     );
 }
+
+/// Regression for monorepo#3586 over the real WSS wire: the `note.subscribe`
+/// seq-0 snapshot (and note-channel deltas) serialized FULL note rows, so a
+/// client that adopted `projection: "slim"` on `note.list` (v8.1,
+/// monorepo#3573) to stay under the 1 MiB outbound cap still received
+/// full-content frames on the subscription surface. `projection: "slim"` on
+/// `note.subscribe` (v8.2) serves the same bounded rows — `content` omitted,
+/// replaced by `contentPreview` (500 chars) + `contentLength` — on the
+/// snapshot AND every `added` / `updated` delta; the default (absent /
+/// `null` / `"full"`) stays full rows byte-identical to before, and any
+/// other value is `-32602`, mirroring `note.list`.
+#[tokio::test]
+async fn note_subscribe_slim_projection_bounds_snapshot_and_deltas() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        1,
+        "workspace.create",
+        json!({ "title": "SlimSub", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // One giant note (~1.1 MiB) reproduces the oversized-frame report.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let big = "x".repeat(1_100_000);
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Giant", "content": big }),
+    )
+    .await;
+    let giant_id = created["note"]["id"].as_str().expect("note id").to_string();
+
+    // Any projection value other than absent/null/"full"/"slim" is -32602.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let bad = wss_rpc_envelope(
+        &mut sub,
+        1,
+        "note.subscribe",
+        json!({ "workspaceId": ws_id, "projection": "bogus" }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    // Slim subscribe: seq-0 snapshot rows are bounded.
+    let slim_res = wss_rpc(
+        &mut sub,
+        2,
+        "note.subscribe",
+        json!({ "workspaceId": ws_id, "projection": "slim" }),
+    )
+    .await;
+    assert!(slim_res["subscriptionId"].is_string(), "sub: {slim_res}");
+    let push = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(push["kind"], json!("snapshot"), "push kind");
+    let snap = push["snapshot"].as_array().expect("snapshot array");
+    let giant = snap
+        .iter()
+        .find(|n| n["id"] == json!(giant_id))
+        .expect("giant note in snapshot");
+    assert!(
+        giant.get("content").is_none(),
+        "slim snapshot omits content: {giant}"
+    );
+    assert_eq!(
+        giant["contentPreview"].as_str().map(str::len),
+        Some(500),
+        "preview bounded: {giant}"
+    );
+    assert_eq!(giant["contentLength"].as_i64(), Some(1_100_000));
+    let frame = serde_json::to_string(&push).expect("serialize");
+    assert!(
+        frame.len() < 256 * 1024,
+        "slim snapshot stays bounded: {} bytes",
+        frame.len()
+    );
+
+    // `added` delta (note:created re-read) is slim too.
+    let big2 = "y".repeat(1_100_000);
+    let created2 = wss_rpc(
+        &mut rpc,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Giant2", "content": big2 }),
+    )
+    .await;
+    let second_id = created2["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    let added = 'added: loop {
+        let push = next_subscription_push(&mut sub, 10).await;
+        assert_eq!(push["kind"], json!("delta"), "push: {push}");
+        if let Some(rows) = push["delta"]["added"].as_array() {
+            for row in rows {
+                if row["id"] == json!(second_id) {
+                    break 'added row.clone();
+                }
+            }
+        }
+    };
+    assert!(
+        added.get("content").is_none(),
+        "slim added delta omits content: {added}"
+    );
+    assert_eq!(
+        added["contentPreview"].as_str().map(str::len),
+        Some(500),
+        "added preview bounded: {added}"
+    );
+    assert_eq!(added["contentLength"].as_i64(), Some(1_100_000));
+
+    // `updated` delta (note:updated re-read) is slim too.
+    let big3 = "z".repeat(1_100_000);
+    wss_rpc(
+        &mut rpc,
+        4,
+        "note.setContent",
+        json!({ "workspaceId": ws_id, "noteId": giant_id, "content": big3 }),
+    )
+    .await;
+    let updated = 'updated: loop {
+        let push = next_subscription_push(&mut sub, 10).await;
+        assert_eq!(push["kind"], json!("delta"), "push: {push}");
+        if let Some(rows) = push["delta"]["updated"].as_array() {
+            for row in rows {
+                if row["id"] == json!(giant_id) {
+                    break 'updated row.clone();
+                }
+            }
+        }
+    };
+    assert!(
+        updated.get("content").is_none(),
+        "slim updated delta omits content: {updated}"
+    );
+    assert_eq!(
+        updated["contentPreview"].as_str().map(str::len),
+        Some(500),
+        "updated preview bounded: {updated}"
+    );
+    assert_eq!(updated["contentLength"].as_i64(), Some(1_100_000));
+
+    // Default (absent projection): full rows, complete content intact — the
+    // pre-8.2 wire shape for existing clients. Explicit "full" matches.
+    for (id, params) in [
+        (1, json!({ "workspaceId": ws_id })),
+        (2, json!({ "workspaceId": ws_id, "projection": "full" })),
+    ] {
+        let mut full_sub = connect_ws(port, cfg.clone()).await;
+        let res = wss_rpc(&mut full_sub, id, "note.subscribe", params).await;
+        assert!(res["subscriptionId"].is_string(), "sub: {res}");
+        let push = next_subscription_push(&mut full_sub, 10).await;
+        assert_eq!(push["kind"], json!("snapshot"), "push kind");
+        let snap = push["snapshot"].as_array().expect("snapshot array");
+        let giant = snap
+            .iter()
+            .find(|n| n["id"] == json!(giant_id))
+            .expect("giant note in snapshot");
+        assert_eq!(
+            giant["content"].as_str().map(str::len),
+            Some(1_100_000),
+            "full snapshot keeps content"
+        );
+        assert!(giant.get("contentPreview").is_none(), "no preview: {giant}");
+    }
+}

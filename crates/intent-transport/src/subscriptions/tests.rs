@@ -308,6 +308,42 @@ fn subscribe_params_require_workspace_id() {
 }
 
 #[test]
+fn note_subscribe_params_projection_mirrors_note_list() {
+    // Absent / null / "full" → full rows (None); "slim" opts in (v8.2,
+    // monorepo#3586 — the same semantics as note.list's param, §5.2).
+    for (raw, want) in [
+        (r#"{"workspaceId":"w"}"#, None),
+        (r#"{"workspaceId":"w","projection":null}"#, None),
+        (r#"{"workspaceId":"w","projection":"full"}"#, None),
+        (
+            r#"{"workspaceId":"w","projection":"slim"}"#,
+            Some(NoteListProjection::Slim),
+        ),
+    ] {
+        let v = parse(raw);
+        let p = parse_note_subscribe_params(v.as_object().unwrap()).unwrap();
+        assert_eq!(p.projection, want, "{raw}");
+        assert_eq!(p.workspace_id, "w");
+    }
+
+    // Any other value is a -32602, never coerced.
+    for bad in [
+        r#"{"workspaceId":"w","projection":"bogus"}"#,
+        r#"{"workspaceId":"w","projection":5}"#,
+    ] {
+        let v = parse(bad);
+        let err = parse_note_subscribe_params(v.as_object().unwrap()).unwrap_err();
+        assert!(err.contains("projection"), "{err}");
+    }
+
+    // The shared parser (task/agent channels) keeps treating the key as an
+    // ignored unknown param — no new validation on those channels.
+    let v = parse(r#"{"workspaceId":"w","projection":"bogus"}"#);
+    let p = parse_subscribe_params(v.as_object().unwrap()).unwrap();
+    assert!(p.projection.is_none());
+}
+
+#[test]
 fn snapshot_push_matches_protocol() {
     let snapshot = json!([{ "id": "spec", "title": "Spec" }]);
     let frame = build_snapshot_push("ws-sub-1", 0, &snapshot);
@@ -1674,6 +1710,37 @@ mod task_delta_re_read {
             },
             data: json!({ "noteId": note_id }),
         }
+    }
+
+    #[tokio::test]
+    async fn note_delta_slim_projection_bounds_re_read_rows() {
+        // The note channel's slim projection (v8.2, monorepo#3586) shapes the
+        // `added`/`updated` delta re-reads like the seq-0 snapshot: `content`
+        // omitted, `contentPreview` (500 chars) + `contentLength` in its
+        // place; full (None) keeps the complete wire Note.
+        let mut note = note_with(None);
+        note.content = "x".repeat(1000);
+        let api = StaticNoteApi::new(Some(note));
+        for (event_type, key) in [(NOTE_CREATED, "added"), (NOTE_UPDATED, "updated")] {
+            let delta = note_delta(
+                &api,
+                &ws(),
+                &note_event(event_type, "n-1"),
+                Some(NoteListProjection::Slim),
+            )
+            .await
+            .expect("delta");
+            let row = &delta[key][0];
+            assert!(row.get("content").is_none(), "slim omits content: {row}");
+            assert_eq!(row["contentPreview"].as_str().map(str::len), Some(500));
+            assert_eq!(row["contentLength"].as_i64(), Some(1000));
+        }
+        let delta = note_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"), None)
+            .await
+            .expect("delta");
+        let row = &delta["updated"][0];
+        assert_eq!(row["content"].as_str().map(str::len), Some(1000));
+        assert!(row.get("contentPreview").is_none(), "full row: {row}");
     }
 
     #[tokio::test]
