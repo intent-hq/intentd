@@ -32,6 +32,64 @@ impl LifecycleCapture {
     fn lines(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
     }
+
+    /// Install `self` as the thread-local default, with the process-global
+    /// [`LifecycleInterestAnchor`] in place first (regression: monorepo#3580).
+    ///
+    /// Without the anchor, `tracing-core`'s callsite interest cache can be
+    /// poisoned to `never` under parallel tests: when its dispatcher registry
+    /// believes there is at most one live dispatcher, a callsite registering on
+    /// another thread rebuilds its interest *without the registry lock* from
+    /// that thread's current default — `NoSubscriber` on a thread with no
+    /// local subscriber, yielding `Interest::never()`. That unlocked store
+    /// races the locked rebuild triggered by this test's `set_default` and can
+    /// land after it (lost update). A cached `never` short-circuits `enabled()`
+    /// entirely, so the capture sees zero events and nothing rebuilds the
+    /// cache before the test asserts. The anchor replaces the `NoSubscriber`
+    /// fallback: every rebuild path now resolves lifecycle interest to at
+    /// least `sometimes`, which forces the per-event `enabled()` check instead
+    /// of dropping events at the callsite.
+    fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
+        static ANCHOR: std::sync::Once = std::sync::Once::new();
+        ANCHOR.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(LifecycleInterestAnchor);
+        });
+        tracing::subscriber::set_default(self.clone())
+    }
+}
+
+/// Process-global fallback dispatcher that pins the lifecycle target's callsite
+/// interest at `sometimes` so it can never be cached as `never` (see
+/// [`LifecycleCapture::set_as_default`]). It consumes nothing itself:
+/// `enabled()` is always `false`, so threads without a thread-local capture
+/// drop lifecycle events exactly as they did with no global default.
+struct LifecycleInterestAnchor;
+
+impl tracing::Subscriber for LifecycleInterestAnchor {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if metadata.target() == "intent_services::stream_lifecycle" {
+            tracing::subscriber::Interest::sometimes()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 impl tracing::Subscriber for LifecycleCapture {
@@ -3250,7 +3308,7 @@ async fn post_output_transport_death_keeps_terminal_events() {
     let (conn, mut note_rx, _agent) = connect_dying(vec![chunk]);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let capture = LifecycleCapture::default();
-    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let _capture_guard = capture.set_as_default();
 
     let err = services
         .run_prompt_turn(
@@ -3381,7 +3439,7 @@ async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
         connect_with_prompt_result(Vec::new(), json!({ "stopReason": "end_turn" }));
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let capture = LifecycleCapture::default();
-    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let _capture_guard = capture.set_as_default();
     services
         .run_prompt_turn(
             &conn,
@@ -3436,7 +3494,7 @@ async fn harness_wake_logs_persist_end_and_idle_with_one_private_correlation() {
     let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
     let (_tx, mut notifications) = mpsc::unbounded_channel();
     let capture = LifecycleCapture::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let _guard = capture.set_as_default();
 
     let outcome = services
         .run_harness_wake_turn(
@@ -3480,7 +3538,7 @@ async fn harness_wake_logs_persist_end_and_idle_with_one_private_correlation() {
 #[test]
 fn turn_mapping_joins_idle_timeout_cap_records_without_raw_ids() {
     let capture = LifecycleCapture::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let _guard = capture.set_as_default();
     crate::agent_session::trace_stream_correlation_mapping(
         "assistant-message-fixture",
         Some("wire-turn-fixture"),
@@ -4256,7 +4314,7 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
         connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let capture = LifecycleCapture::default();
-    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let _capture_guard = capture.set_as_default();
 
     let err = services
         .run_prompt_turn(
