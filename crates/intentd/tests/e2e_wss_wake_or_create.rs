@@ -692,18 +692,19 @@ async fn delegate_with_task_note_id_appends_preamble_over_wss() {
         .to_string();
     assert!(!child_id.is_empty(), "non-empty child agentId");
 
-    // `agent.get` returns `metadata.initialMessage` — the resolved first
-    // message the child sees. Byte-exact match against the reference
-    // composition `${msg}\n\n---\n${preamble}${commitInstruction}` from
+    // `agent.getSession` serves the persisted `initialMessage` — the resolved
+    // first message the child sees (off the lite projection). Byte-exact
+    // match against the reference composition
+    // `${msg}\n\n---\n${preamble}${commitInstruction}` from
     // `agent-interaction-tools.ts`. `skipAutoCommit` unset => empty tail.
     let got = wss_rpc(
         &mut rpc,
         2,
-        "agent.get",
+        "agent.getSession",
         json!({ "workspaceId": ws_id, "agentId": child_id }),
     )
     .await;
-    let initial = got["agent"]["metadata"]["initialMessage"]
+    let initial = got["session"]["initialMessage"]
         .as_str()
         .expect("initialMessage string");
     let expected = format!(
@@ -848,11 +849,11 @@ async fn delegate_with_skip_auto_commit_stays_status_neutral_over_wss() {
     let got = wss_rpc(
         &mut rpc,
         2,
-        "agent.get",
+        "agent.getSession",
         json!({ "workspaceId": ws_id, "agentId": child_id }),
     )
     .await;
-    let initial = got["agent"]["metadata"]["initialMessage"]
+    let initial = got["session"]["initialMessage"]
         .as_str()
         .expect("initialMessage string");
     let expected = format!(

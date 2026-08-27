@@ -15239,7 +15239,9 @@ impl WorkspaceApi for Services {
                     // starts when a prompt exists). The agent is parentless,
                     // non-background (delegate parity: `agent_create_op`). When
                     // the prompt is non-empty it is stored as
-                    // `metadata.initialMessage` and delivered exactly once — all
+                    // `AgentSession.initial_message` (harvested from the
+                    // `metadata.initialMessage` create param; served by
+                    // `agent.getSession` only) and delivered exactly once — all
                     // inside the idempotency scope, so a client retry replays
                     // the stored result instead of re-sending. An empty/missing
                     // prompt persists the row without a message; the FE first
@@ -15253,8 +15255,10 @@ impl WorkspaceApi for Services {
                             .filter(|s| !s.is_empty())
                             .map(str::to_string);
                         // Persist the prompt (when present) as
-                        // `metadata.initialMessage` (delegate parity: a wake-up
-                        // can resume from it) and stamp the reference-parity
+                        // `AgentSession.initial_message` via the
+                        // `metadata.initialMessage` harvest key (delegate
+                        // parity: a wake-up can resume from it) and stamp the
+                        // reference-parity
                         // `isInitialAgent`/`isFirstWorkspaceAgent` flags the
                         // FE surface (`agent-backend-handler.service.ts`,
                         // `instruction-service.ts` prompt-cache `':initial'`
@@ -15277,7 +15281,8 @@ impl WorkspaceApi for Services {
                             "isFirstWorkspaceAgent".to_string(),
                             serde_json::json!(true),
                         );
-                        // Own the `metadata.initialMessage` invariant: when
+                        // Own the initial-message invariant on the
+                        // `metadata.initialMessage` harvest key: when
                         // the daemon has a non-empty prompt, stamp it (delegate
                         // parity — a wake-up can resume from it); otherwise
                         // drop any caller-supplied `initialMessage` so
@@ -15358,8 +15363,8 @@ impl WorkspaceApi for Services {
                         // messages should start a turn, consistent with
                         // agent.sendMessage semantics). The runtime `AgentManager` when
                         // attached, else the store-only persist. Best-effort like the
-                        // delegate path — the agent holds `metadata.initialMessage` for
-                        // resume.
+                        // delegate path — the agent holds
+                        // `AgentSession.initial_message` for resume.
                         let has_content = prompt.is_some()
                             || created_image_blocks.is_some()
                             || created_file_blocks.is_some();

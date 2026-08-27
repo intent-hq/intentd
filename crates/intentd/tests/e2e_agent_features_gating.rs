@@ -1233,8 +1233,9 @@ async fn create_top_level_creates_independent_agent_over_wss() {
     );
 
     // The persisted peer row over WSS `agent.get`: parentless (no
-    // `parentAgentId`, no `createdByAgentId`), foreground, sponsor-attributed,
-    // with the sponsor preamble persisted on `initialMessage`.
+    // `parentAgentId`, no `createdByAgentId`), foreground, sponsor-attributed.
+    // The sponsor preamble persists on the session `initialMessage`, served
+    // by `agent.getSession` (off the lite projection).
     let got = wss_rpc(
         &mut rpc,
         40,
@@ -1261,7 +1262,18 @@ async fn create_top_level_creates_independent_agent_over_wss() {
         json!(false),
         "top-level agents default to foreground: {peer}"
     );
-    let initial = peer["metadata"]["initialMessage"]
+    assert!(
+        peer["metadata"].get("initialMessage").is_none(),
+        "initialMessage stays off the lite projection: {peer}"
+    );
+    let session = wss_rpc(
+        &mut rpc,
+        42,
+        "agent.getSession",
+        json!({ "workspaceId": &ws_id, "agentId": &peer_id }),
+    )
+    .await;
+    let initial = session["result"]["session"]["initialMessage"]
         .as_str()
         .expect("initialMessage persisted");
     assert!(

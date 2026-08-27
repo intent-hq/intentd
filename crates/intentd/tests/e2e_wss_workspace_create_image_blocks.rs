@@ -179,15 +179,20 @@ async fn workspace_create_threads_image_blocks_to_first_turn() {
         "agent.get must omit session-level imageBlocks: {agent_obj}"
     );
 
-    // (2) Verify the orchestration recorded an initialMessage in metadata.
+    // (2) Verify the orchestration recorded an initialMessage on the session.
     // The full image delivery to ACP requires a mock ACP fixture — that's
     // out of scope for STAB-65 which is an intentd-only fix. We've verified
     // that imageBlocks are persisted above; the real test is whether the code
     // path now starts a turn when imageBlocks are present (image-only initial
-    // message support). Check that an initial message was recorded in metadata.
+    // message support). The persisted value is served by `agent.getSession`
+    // only; the lite projection omits it.
     assert!(
-        agent_obj["metadata"]["initialMessage"].as_str().is_some(),
-        "initial message persisted in metadata"
+        full["session"]["initialMessage"].as_str().is_some(),
+        "initial message persisted on the session"
+    );
+    assert!(
+        agent_obj["metadata"].get("initialMessage").is_none(),
+        "initialMessage stays off the lite projection: {agent_obj}"
     );
 
     // (3) STAB-133: the first user transcript row must carry the image block

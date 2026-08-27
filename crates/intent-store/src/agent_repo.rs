@@ -27,14 +27,15 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     harness_features, retired_at";
 
 /// Session metadata needed by the `AgentLite` summary projection.
-/// `system_prompt` and `image_blocks` are intentionally omitted:
-/// `AgentLite::from_session` strips them from the wire, and loading them made
-/// `agent.list` scale with the stored prompt/base64-image bytes.
+/// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
+/// omitted: `AgentLite::from_session` strips them from the wire, and loading
+/// them made `agent.list` scale with the stored prompt/base64-image/spawn
+/// -message bytes.
 const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, \
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
-    initial_message, context_references, file_blocks, is_background, metadata, sandbox_id, \
+    context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
     effort_levels, harness_version, harness_features, retired_at";
 
@@ -1785,7 +1786,8 @@ impl Store {
 
     /// Persist a metadata change: a narrow write of `metadata` and
     /// `updated_at` only. Callers that load a session via the summary
-    /// projection (no `system_prompt` — see [`SESSION_SUMMARY_COLUMNS`]) must
+    /// projection (no `system_prompt` / `image_blocks` / `initial_message` —
+    /// see [`SESSION_SUMMARY_COLUMNS`]) must
     /// use this instead of [`Store::update_agent_session`], whose full-row
     /// write would clear every column absent from the summary. Scoped to
     /// `workspace_id` (defense-in-depth). `NotFound` if the session is absent
@@ -2581,17 +2583,19 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         row,
         col(row, "system_prompt")?,
         json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
+        col(row, "initial_message")?,
     )
 }
 
 fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
-    map_session_row_with_heavy_cols(row, None, None)
+    map_session_row_with_heavy_cols(row, None, None, None)
 }
 
 fn map_session_row_with_heavy_cols(
     row: &SqliteRow,
     system_prompt: Option<String>,
     image_blocks: Option<serde_json::Value>,
+    initial_message: Option<String>,
 ) -> Result<AgentSession> {
     let backend: Option<String> = col(row, "backend_session_id")?;
     let parent: Option<String> = col(row, "parent_agent_id")?;
@@ -2632,7 +2636,7 @@ fn map_session_row_with_heavy_cols(
         attention_request_reason: col(row, "attention_request_reason")?,
         attention_request_timestamp: col(row, "attention_request_timestamp")?,
         delegation_depth: col(row, "delegation_depth")?,
-        initial_message: col(row, "initial_message")?,
+        initial_message,
         context_references: json_col_from_db(
             col(row, "context_references")?,
             "context_references",
@@ -5875,7 +5879,7 @@ mod tests {
             attention_request_reason: None,
             attention_request_timestamp: None,
             delegation_depth: None,
-            initial_message: None,
+            initial_message: Some("spawn-time first message".repeat(1024)),
             context_references: None,
             image_blocks: Some(image_blocks.clone()),
             file_blocks: None,
@@ -5923,6 +5927,10 @@ mod tests {
             "full session reads should retain image_blocks"
         );
         assert_eq!(
+            full[0].initial_message, session.initial_message,
+            "full session reads should retain initial_message"
+        );
+        assert_eq!(
             full[0].messages.len(),
             1,
             "list_agent_sessions should include messages"
@@ -5949,6 +5957,10 @@ mod tests {
             summaries[0].image_blocks, None,
             "summary reads should not load image_blocks"
         );
+        assert_eq!(
+            summaries[0].initial_message, None,
+            "summary reads should not load initial_message"
+        );
         assert!(
             !SESSION_SUMMARY_COLUMNS.contains("system_prompt"),
             "the summary SELECT must not mention system_prompt"
@@ -5956,6 +5968,10 @@ mod tests {
         assert!(
             !SESSION_SUMMARY_COLUMNS.contains("image_blocks"),
             "the summary SELECT must not mention image_blocks"
+        );
+        assert!(
+            !SESSION_SUMMARY_COLUMNS.contains("initial_message"),
+            "the summary SELECT must not mention initial_message"
         );
     }
 

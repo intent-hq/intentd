@@ -413,7 +413,9 @@ async fn create_top_level(
     }
     let sponsor_name = Some(caller_lite.name);
     // Kickoff = daemon-prepended sponsor preamble, caller message after.
-    // Persisted as `metadata.initialMessage` AND delivered, so the stored
+    // Persisted as `AgentSession.initial_message` (harvested from the
+    // `metadata.initialMessage` create param; served by `agent.getSession`
+    // only — off the AgentLite projection) AND delivered, so the stored
     // copy matches what the new agent actually received (parity with the
     // child-create path).
     let kickoff = format!(

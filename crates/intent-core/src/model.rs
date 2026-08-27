@@ -2707,8 +2707,10 @@ pub struct AgentSession {
     /// runaway delegation loops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
-    /// The first message a delegated agent was started with (FE
-    /// `metadata.initialMessage`), persisted so a wake-up can resume.
+    /// The first message a delegated agent was started with (harvested from
+    /// the `metadata.initialMessage` create param), persisted so a wake-up can
+    /// resume. Served by `agent.getSession` only — deliberately absent from
+    /// the `AgentLite` projection (see `AgentMetadata`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_message: Option<String>,
     /// Session-level context references captured at spawn (FE top-level
@@ -2906,9 +2908,15 @@ impl AgentSession {
 /// `isBackground`, `specialist`, `createdByAgentId` (the parent/spawning agent),
 /// and `taskNoteId` — plus the persistence-gap fields the FE writer stored
 /// under `metadata` (`completionReport`, `completionReportTimestamp`,
-/// `delegationDepth`, `initialMessage`; P3-1.2b). `isBackground` is always
+/// `delegationDepth`; P3-1.2b). `isBackground` is always
 /// emitted (iOS reads it with a `false` default) and carries the persisted
 /// session value (G-A1/P3-1.2c); the rest are omitted when absent.
+///
+/// The persisted spawn-time `initialMessage` is deliberately ABSENT from this
+/// projection (extending the monorepo#2932 list carve-out to `agent.get`):
+/// it is the last unbounded `AgentLite` field, no client reads it off agent
+/// rows (the FE is write-only at creation; iOS never references it), and the
+/// detail read `agent.getSession` still serves the full persisted value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMetadata {
@@ -2933,8 +2941,6 @@ pub struct AgentMetadata {
     pub attention_request_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_message: Option<String>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<String>,
@@ -3212,7 +3218,6 @@ impl AgentLite {
             attention_request_reason: session.attention_request_reason,
             attention_request_timestamp: session.attention_request_timestamp,
             delegation_depth: session.delegation_depth,
-            initial_message: session.initial_message,
             sandbox_id: session.sandbox_id.clone(),
             sandbox_path: session.sandbox_path.clone(),
             sandbox_branch: session.sandbox_branch.clone(),

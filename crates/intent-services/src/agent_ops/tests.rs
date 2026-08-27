@@ -7459,9 +7459,10 @@ async fn create_with_name_explicitly_set_false_stays_renameable() {
 /// session-level `contextReferences`, and `metadata.isBackground`
 /// (G-A1/P3-1.2c). Session-level `imageBlocks` persist but stay OFF the lite
 /// projection (list-payload cost contract) — they are served by
-/// `agent.getSession` only. `metadata.initialMessage` is detail-only and
-/// likewise stays OFF `agent.list` rows (monorepo#2932) while `agent.get`
-/// still serves it.
+/// `agent.getSession` only. `metadata.initialMessage` likewise stays OFF the
+/// whole lite projection — `agent.get` AND `agent.list` rows (extending
+/// monorepo#2932) — while `agent.getSession` still serves the persisted
+/// value.
 #[tokio::test]
 async fn create_persists_and_reserves_gap_fields() {
     let (_t, svc, ws) = setup().await;
@@ -7494,7 +7495,10 @@ async fn create_persists_and_reserves_gap_fields() {
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     let v = serde_json::to_value(&got).expect("lite json");
     assert_eq!(v["metadata"]["delegationDepth"], json!(2));
-    assert_eq!(v["metadata"]["initialMessage"], "start here");
+    assert!(
+        v["metadata"].get("initialMessage").is_none(),
+        "initialMessage must stay off the lite projection entirely"
+    );
     assert_eq!(
         v["contextReferences"],
         json!([{ "type": "file", "path": "src/a.rs" }])
@@ -7505,7 +7509,7 @@ async fn create_persists_and_reserves_gap_fields() {
     );
     assert_eq!(v["metadata"]["isBackground"], json!(true));
 
-    // The persisted blocks are still served by the detail read.
+    // The persisted values are still served by the detail read.
     let session = svc
         .agent_get_session_op(id.clone())
         .await
@@ -7514,16 +7518,22 @@ async fn create_persists_and_reserves_gap_fields() {
         session.image_blocks,
         Some(json!([{ "type": "image", "data": "abc" }]))
     );
+    assert_eq!(
+        session.initial_message.as_deref(),
+        Some("start here"),
+        "agent.getSession keeps serving the persisted initialMessage"
+    );
 
-    // And on `agent.list` — except `metadata.initialMessage`, which is
-    // detail-only and omitted from list rows (monorepo#2932).
+    // And on `agent.list` — same projection, so `metadata.initialMessage`
+    // is absent there too.
     let agents = svc.agent_list_op(ws).await.expect("list");
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0].metadata.delegation_depth, Some(2));
     assert!(agents[0].metadata.is_background);
-    assert_eq!(
-        agents[0].metadata.initial_message, None,
-        "initialMessage must stay off agent.list rows (monorepo#2932)"
+    let row = serde_json::to_value(&agents[0]).expect("row json");
+    assert!(
+        row["metadata"].get("initialMessage").is_none(),
+        "initialMessage must stay off agent.list rows"
     );
 }
 
@@ -8882,9 +8892,11 @@ async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
 }
 
 /// `agent.delegate` persists the resolved first message as
-/// `metadata.initialMessage` and the child's `metadata.delegationDepth`
+/// `AgentSession.initial_message` and the child's `metadata.delegationDepth`
 /// (parent depth + 1) so a wake-up can resume (P3-1.2b). Delegated children
-/// are background agents (G-A1/P3-1.2c).
+/// are background agents (G-A1/P3-1.2c). The persisted `initialMessage` is
+/// served by `agent.getSession` only — it stays off the lite projection
+/// (extending monorepo#2932).
 #[tokio::test]
 async fn delegate_persists_initial_message_and_delegation_depth() {
     let (_t, svc, ws) = setup().await;
@@ -8901,9 +8913,17 @@ async fn delegate_persists_initial_message_and_delegation_depth() {
         .await
         .expect("delegate");
     let child = AgentId::from(out["agentId"].as_str().unwrap());
+    let session = svc
+        .agent_get_session_op(child.clone())
+        .await
+        .expect("get child session");
+    assert_eq!(session.initial_message.as_deref(), Some("Do the thing"));
     let got = svc.agent_get_op(child, None).await.expect("get child");
     let v = serde_json::to_value(&got).expect("lite json");
-    assert_eq!(v["metadata"]["initialMessage"], "Do the thing");
+    assert!(
+        v["metadata"].get("initialMessage").is_none(),
+        "initialMessage stays off the lite projection"
+    );
     assert_eq!(v["metadata"]["delegationDepth"], json!(1));
     assert_eq!(v["metadata"]["isBackground"], json!(true));
 }

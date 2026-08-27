@@ -8761,7 +8761,6 @@ mod wsapi4_bindings_tests {
                 attention_request_reason: None,
                 attention_request_timestamp: None,
                 delegation_depth: None,
-                initial_message: None,
                 sandbox_id: None,
                 sandbox_path: None,
                 sandbox_branch: None,

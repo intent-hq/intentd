@@ -954,15 +954,14 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
     srv.ws.stop().await;
 }
 
-/// monorepo#2932 — list-payload cost contract for `metadata.initialMessage`:
-/// the full spawn-time first message persists on the session and is served by
-/// the detail reads (`agent.get` / `agent.getSession`), but `agent.list` rows
-/// OMIT it (absent, never `null`) — it is the single largest per-session
-/// field on real workspaces and has no list-context consumer, so serving it
-/// per row scaled the frame past the 1 MiB outbound warn threshold at ~100
-/// sessions.
+/// Extending monorepo#2932 — `metadata.initialMessage` is stripped from the
+/// whole `AgentLite` projection: the full spawn-time first message persists
+/// on the session and is served by `agent.getSession`, but `agent.get` and
+/// `agent.list` rows OMIT it (absent, never `null`) — it was the last
+/// unbounded per-row field on real workspaces and no client reads it off
+/// agent rows.
 #[tokio::test]
-async fn wss_agent_list_omits_initial_message() {
+async fn wss_agent_lite_omits_initial_message() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
@@ -986,20 +985,36 @@ async fn wss_agent_list_omits_initial_message() {
         .expect("agent id")
         .to_string();
 
-    // Detail read still serves it.
+    // The session detail read still serves the persisted value.
+    let session_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let session = wss_call(srv.port, srv.cfg.clone(), &session_frame).await;
+    assert_eq!(
+        session["result"]["session"]["initialMessage"].as_str(),
+        Some("a long spawn-time first message"),
+        "agent.getSession keeps serving initialMessage: {session}"
+    );
+
+    // `agent.get` omits the field entirely.
     let get_frame = format!(
-        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
     );
     let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
-    assert_eq!(
-        got["result"]["agent"]["metadata"]["initialMessage"].as_str(),
-        Some("a long spawn-time first message"),
-        "agent.get keeps serving metadata.initialMessage: {got}"
+    assert!(
+        got["result"]["agent"]["metadata"].is_object(),
+        "agent.get row must carry a metadata object: {got}"
+    );
+    assert!(
+        got["result"]["agent"]["metadata"]
+            .get("initialMessage")
+            .is_none(),
+        "agent.get rows must omit metadata.initialMessage: {got}"
     );
 
     // The list row omits the field entirely.
     let list_frame = format!(
-        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
     );
     let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
     let row = listed["result"]["agents"]
@@ -1014,7 +1029,7 @@ async fn wss_agent_list_omits_initial_message() {
     );
     assert!(
         row["metadata"].get("initialMessage").is_none(),
-        "agent.list rows must omit metadata.initialMessage (monorepo#2932): {row}"
+        "agent.list rows must omit metadata.initialMessage: {row}"
     );
 
     srv.ws.stop().await;
