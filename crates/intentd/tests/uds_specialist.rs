@@ -248,6 +248,12 @@ async fn specialist_full_crud_and_three_tier_resolution() {
         imp.get("hidden").is_none(),
         "non-hidden specialists omit the field"
     );
+    let scanner = specs
+        .iter()
+        .find(|s| s["id"] == "vulnerability-scanner")
+        .expect("vulnerability scanner listed");
+    assert!(scanner.get("codingAgent").is_none());
+    assert!(scanner.get("model").is_none());
 
     // get — resolved view of a bundled id.
     let got = ok(

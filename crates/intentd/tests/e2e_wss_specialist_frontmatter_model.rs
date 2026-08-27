@@ -546,8 +546,8 @@ async fn embedded_bundled_catalog_over_wss() {
         scanner["description"],
         "Finds real, exploitable security vulnerabilities in code"
     );
-    assert_eq!(scanner["codingAgent"], "auggie");
-    assert_eq!(scanner["model"], "opus4.7");
+    assert!(scanner.get("codingAgent").is_none());
+    assert!(scanner.get("model").is_none());
     assert_eq!(scanner["icon"], "pr-reviewer");
     assert!(scanner["prompt"]
         .as_str()

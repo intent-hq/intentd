@@ -2225,8 +2225,8 @@ mod tests {
             def["description"],
             "Finds real, exploitable security vulnerabilities in code"
         );
-        assert_eq!(def["codingAgent"], "auggie");
-        assert_eq!(def["model"], "opus4.7");
+        assert!(def.get("codingAgent").is_none());
+        assert!(def.get("model").is_none());
         assert_eq!(def["icon"], "pr-reviewer");
         assert!(def["prompt"]
             .as_str()
