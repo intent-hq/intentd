@@ -5304,18 +5304,118 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
 
 #[cfg(unix)]
 #[tokio::test]
-async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
+async fn wss_models_list_legacy_fresh_entry_served_and_forced_failure_stale() {
     // models.list legacy path contract (§5.30) over the real WSS transport:
-    // cached entries are served indefinitely — a NON-forced read whose
-    // persisted entry is arbitrarily old (fetchedAtMs: 0) serves it plainly
-    // (`{ models, source }`, no `stale`, no `warning`, no probe). A FORCED
-    // read whose probe fails serves the same last-good list labeled
-    // `stale: true` + `warning` — exactly `{ models, source, stale, warning }`
-    // with `source: "auggie"`, never a silent static fallback. The fake
-    // auggie appends to a counter file per invocation and always fails,
-    // making CLI spawns observable.
+    // a NON-forced read whose persisted entry is fresh (younger than the 24h
+    // staleness threshold) serves it plainly (`{ models, source }`, no
+    // `stale`, no `warning`, no probe). A FORCED read whose probe fails
+    // serves the same last-good list labeled `stale: true` + `warning` —
+    // exactly `{ models, source, stale, warning }` with `source: "auggie"`,
+    // never a silent static fallback. The fake auggie appends to a counter
+    // file per invocation and always fails, making CLI spawns observable.
     use std::os::unix::fs::PermissionsExt;
     let dir = test_tempdir("intentd-wss-models-stale-");
+    let count = dir.path().join("count");
+    let bin = dir.path().join("auggie");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\necho x >> {}\nexit 1\n", count.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let calls = || std::fs::read_to_string(&count).map_or(0, |s| s.lines().count());
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis(),
+    )
+    .expect("unix ms fits in u64");
+    let last_good = serde_json::json!({
+        "version": 2,
+        "entries": {
+            "auggie": {
+                "versionKey": AUGGIE_CATALOG_VERSION,
+                "fetchedAtMs": now_ms,
+                "models": [ { "id": "lg", "name": "LG", "provider": "auggie" } ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&last_good).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        Some(bin),
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+
+    // Non-forced: the fresh persisted entry is a plain cache hit.
+    let frame = r#"{"jsonrpc":"2.0","id":45,"method":"models.list"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 45);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["source"], "auggie");
+    assert_eq!(
+        resp["result"]["models"],
+        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
+    );
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["models", "source"], "{resp}");
+    assert_eq!(
+        calls(),
+        0,
+        "non-forced fresh cache hit must not spawn the CLI"
+    );
+
+    // Forced: the probe runs, fails, and the last-good list is served stale.
+    let frame =
+        r#"{"jsonrpc":"2.0","id":46,"method":"models.list","params":{"forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 46);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["source"], "auggie");
+    assert_eq!(resp["result"]["stale"], true, "{resp}");
+    assert!(resp["result"]["warning"].is_string(), "{resp}");
+    assert_eq!(
+        resp["result"]["models"],
+        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
+    );
+    // Legacy shape plus the documented degradation labels — no providerId.
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
+    assert!(calls() > 0, "forced read must spawn the CLI");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
+    // models.list legacy path staleness contract (§5.30) over the real WSS
+    // transport: a NON-forced read whose persisted entry is past the 24h
+    // staleness threshold (fetchedAtMs: 0) re-probes; when the probe fails,
+    // the last-good list keeps being served labeled `stale: true` +
+    // `warning` — exactly `{ models, source, stale, warning }` with
+    // `source: "auggie"`, never a silent static fallback. The fake auggie
+    // appends to a counter file per invocation and always fails, making CLI
+    // spawns observable.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = test_tempdir("intentd-wss-models-aged-");
     let count = dir.path().join("count");
     let bin = dir.path().join("auggie");
     std::fs::write(
@@ -5347,31 +5447,11 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
     )
     .await;
 
-    // Non-forced: the arbitrarily old persisted entry is a plain cache hit.
-    let frame = r#"{"jsonrpc":"2.0","id":45,"method":"models.list"}"#;
+    // Non-forced: the aged entry triggers a re-probe; the probe fails, so
+    // the last-good list is served with the degradation labels.
+    let frame = r#"{"jsonrpc":"2.0","id":47,"method":"models.list"}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
-    assert_eq!(resp["id"], 45);
-    assert!(resp.get("error").is_none(), "{resp}");
-    assert_eq!(resp["result"]["source"], "auggie");
-    assert_eq!(
-        resp["result"]["models"],
-        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
-    );
-    let mut keys: Vec<_> = resp["result"]
-        .as_object()
-        .expect("result object")
-        .keys()
-        .cloned()
-        .collect();
-    keys.sort();
-    assert_eq!(keys, ["models", "source"], "{resp}");
-    assert_eq!(calls(), 0, "non-forced cache hit must not spawn the CLI");
-
-    // Forced: the probe runs, fails, and the last-good list is served stale.
-    let frame =
-        r#"{"jsonrpc":"2.0","id":46,"method":"models.list","params":{"forceRefresh":true}}"#;
-    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
-    assert_eq!(resp["id"], 46);
+    assert_eq!(resp["id"], 47);
     assert!(resp.get("error").is_none(), "{resp}");
     assert_eq!(resp["result"]["source"], "auggie");
     assert_eq!(resp["result"]["stale"], true, "{resp}");
@@ -5380,7 +5460,6 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
         resp["result"]["models"],
         serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
     );
-    // Legacy shape plus the documented degradation labels — no providerId.
     let mut keys: Vec<_> = resp["result"]
         .as_object()
         .expect("result object")
@@ -5389,7 +5468,22 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
-    assert!(calls() > 0, "forced read must spawn the CLI");
+    assert!(calls() > 0, "aged non-forced read must spawn the CLI");
+    let after_probe = calls();
+
+    // Within the negative window: the stale last-good list keeps being
+    // served without re-spawning the CLI.
+    let frame = r#"{"jsonrpc":"2.0","id":48,"method":"models.list"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 48);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["source"], "auggie");
+    assert_eq!(resp["result"]["stale"], true, "{resp}");
+    assert_eq!(
+        calls(),
+        after_probe,
+        "negative window must suppress the re-probe"
+    );
     srv.ws.stop().await;
 }
 

@@ -273,8 +273,10 @@ pub struct Services {
     /// `agent:session-stats-changed` only when the rollup actually moved (§6.5).
     session_stats_cache: Arc<Mutex<HashMap<AgentId, SessionStats>>>,
     /// The one `models.list` model cache (PROTOCOL §5.30): entries keyed by
-    /// provider id + registry-derived version key, served indefinitely (a
-    /// probe runs only on a cache miss or `forceRefresh`), persisted in
+    /// provider id + registry-derived version key, re-probed once aged (a
+    /// probe runs on a cache miss, on an entry at or past the 24h staleness
+    /// threshold, or on `forceRefresh`; a failed re-probe serves the
+    /// last-good list labeled stale), persisted in
     /// the daemon data dir when configured via
     /// [`Services::with_models_cache_dir`]; also holds the per-provider
     /// single-flight and negative-cache state. Both the per-provider path

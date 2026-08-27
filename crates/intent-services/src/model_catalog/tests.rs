@@ -1,6 +1,7 @@
 //! Unit tests for the generic per-provider model cache (PROTOCOL §5.30):
-//! indefinite serving, version-key invalidation, forceRefresh bypass, failure
-//! fallback, single-flighting, negative caching, and persistence.
+//! fresh-window serving, age-based re-probe ([`MODELS_STALE_AFTER`]),
+//! version-key invalidation, forceRefresh bypass, failure fallback,
+//! single-flighting, negative caching, and persistence.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -57,13 +58,13 @@ fn counting_fetch(
     }
 }
 
-// `try_from` is not const-callable; the TTL is far below `u64::MAX` millis.
+// `try_from` is not const-callable; the TTLs are far below `u64::MAX` millis.
 #[allow(clippy::cast_possible_truncation)]
 const NEG_TTL_MS: u64 = super::MODELS_NEGATIVE_TTL.as_millis() as u64;
 
-/// An arbitrarily large age (~10 years in ms): cached entries have no TTL,
-/// so an entry this old must still be served without a probe.
-const OLD_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1_000;
+/// The staleness threshold in millis (see `NEG_TTL_MS` for the cast note).
+#[allow(clippy::cast_possible_truncation)]
+const STALE_MS: u64 = super::MODELS_STALE_AFTER.as_millis() as u64;
 
 #[test]
 fn auggie_catalog_version_invalidates_pre_legacy_cache() {
@@ -83,21 +84,128 @@ async fn cache_hit_skips_fetch() {
 }
 
 #[tokio::test]
-async fn arbitrarily_old_entry_is_served_without_probe() {
-    // Regression (no more 5-minute TTL): an entry of any age is a cache hit —
-    // a non-forced read must never spawn a probe when an entry exists.
+async fn entry_below_stale_threshold_is_served_without_probe() {
+    // Just under the staleness threshold the entry is still a plain hit — a
+    // non-forced read must not spawn a probe while the entry is fresh.
     let cache = ModelCatalogCache::new(None);
-    cache.store("p", "v1", rows("old"), 1_000);
-    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000 + OLD_MS, panicking_fetch()).await;
-    assert_eq!(r.models, Some(rows("old")));
+    cache.store("p", "v1", rows("aging"), 1_000);
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        false,
+        1_000 + STALE_MS - 1,
+        panicking_fetch(),
+    )
+    .await;
+    assert_eq!(r.models, Some(rows("aging")));
     assert!(!r.stale);
     assert!(r.warning.is_none());
 }
 
 #[tokio::test]
+async fn aged_entry_triggers_reprobe_and_stores_result() {
+    // Regression (intent-hq/intent#3682): an entry at or past
+    // MODELS_STALE_AFTER is re-probed on a non-forced read, so newly released
+    // provider models show up without a manual forced refresh.
+    let cache = ModelCatalogCache::new(None);
+    cache.store("p", "v1", rows("old"), 1_000);
+    let now = 1_000 + STALE_MS;
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, ok_fetch("refreshed")).await;
+    assert_eq!(r.models, Some(rows("refreshed")));
+    assert!(!r.stale);
+    assert!(r.warning.is_none());
+    // The re-probe result was stored: the entry is fresh again, so the next
+    // read is a plain hit with no probe.
+    let r = resolve_with_cache(&cache, "p", "v1", false, now + 1, panicking_fetch()).await;
+    assert_eq!(r.models, Some(rows("refreshed")));
+}
+
+#[tokio::test]
+async fn aged_entry_failed_reprobe_serves_stale_last_good() {
+    // An aged entry whose re-probe fails keeps serving: the last-good list is
+    // served labeled stale + warning, never an error or an empty list.
+    let cache = ModelCatalogCache::new(None);
+    cache.store("p", "v1", rows("last-good"), 1_000);
+    let now = 1_000 + STALE_MS;
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, failing_fetch()).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    let warning = r.warning.expect("stale data must be labeled");
+    assert!(warning.contains("probe failed"), "{warning}");
+    // The failure armed the negative window: within it, non-forced reads keep
+    // serving the stale last-good list without re-spawning the probe.
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        false,
+        now + NEG_TTL_MS - 1,
+        panicking_fetch(),
+    )
+    .await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    assert!(r.warning.is_some());
+}
+
+#[tokio::test]
+async fn concurrent_aged_reads_single_flight_one_probe() {
+    // Aged-entry re-probes coalesce exactly like cold-miss probes: one fetch
+    // runs, everyone shares its result.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("old"), 1_000);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let cache = cache.clone();
+            let fetch = counting_fetch(&calls, "refreshed");
+            tokio::spawn(async move {
+                resolve_with_cache(&cache, "p", "v1", false, 1_000 + STALE_MS, fetch).await
+            })
+        })
+        .collect();
+    for h in handles {
+        assert_eq!(h.await.expect("join").models, Some(rows("refreshed")));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one probe runs");
+}
+
+#[tokio::test]
+async fn aged_entry_empty_success_reprobe_serves_empty_uncached() {
+    // Pins the documented empty-success edge (see `resolve_with_cache`): an
+    // aged entry whose re-probe returns an empty success serves the empty
+    // list in that response (superseding the last-good list), stores nothing,
+    // and clears no ground for negative caching — so the next non-forced read
+    // re-probes again. Acceptable while all empty-success sources are cheap
+    // env checks; a costly source must convert empty to failure instead.
+    let cache = ModelCatalogCache::new(None);
+    cache.store("p", "v1", rows("last-good"), 1_000);
+    let now = 1_000 + STALE_MS;
+    let empty_fetch = || {
+        Box::pin(async {
+            ModelFetchResult {
+                models: Some(vec![]),
+                warning: None,
+            }
+        }) as BoxFuture<'static, ModelFetchResult>
+    };
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, empty_fetch).await;
+    assert_eq!(r.models, Some(vec![]));
+    assert!(!r.stale);
+    // Not stored: the last-good list is untouched and still aged, so the next
+    // non-forced read probes again (no negative window suppresses it).
+    assert_eq!(cache.last_good("p", "v1"), Some(rows("last-good")));
+    assert!(cache.test_negative_reason("p", "v1", now).is_none());
+    let r = resolve_with_cache(&cache, "p", "v1", false, now + 1, ok_fetch("recovered")).await;
+    assert_eq!(r.models, Some(rows("recovered")));
+}
+
+#[tokio::test]
 async fn entry_fetched_in_the_future_is_still_served() {
-    // System clock moved backwards: with no age-based expiry there is nothing
-    // for a future-stamped entry to outlive, so it is served like any hit.
+    // System clock moved backwards: age uses saturating subtraction, so a
+    // future-stamped entry reads as age zero (fresh) and is served like any
+    // hit; the wall clock eventually catches up and the TTL applies again.
     let cache = ModelCatalogCache::new(None);
     cache.store("p", "v1", rows("future"), 10_000);
     let r = resolve_with_cache(&cache, "p", "v1", false, 5_000, panicking_fetch()).await;
@@ -186,6 +294,15 @@ fn persistence_roundtrips_across_instances() {
     cache.store("p", "v1", rows("persisted"), 1_000);
     let reloaded = ModelCatalogCache::new(Some(path.clone()));
     assert_eq!(reloaded.last_good("p", "v1"), Some(rows("persisted")));
+    // `fetchedAtMs` survives the reload: staleness carries across a daemon
+    // restart — an entry persisted past the threshold is not a fresh hit
+    // (the first read after restart re-probes) while the last-good list
+    // remains available as the failure fallback.
+    assert_eq!(
+        reloaded.fresh_hit("p", "v1", 1_000 + STALE_MS - 1),
+        Some(rows("persisted"))
+    );
+    assert!(reloaded.fresh_hit("p", "v1", 1_000 + STALE_MS).is_none());
     // A version-key bump invalidates the reloaded entry too.
     assert!(reloaded.last_good("p", "v2").is_none());
     // Corrupt files are ignored, not errors.
