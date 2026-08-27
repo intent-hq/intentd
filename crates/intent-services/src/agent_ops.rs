@@ -3364,6 +3364,25 @@ impl Services {
                     }
                 }
             }
+            // Orchestrator-role snapshot: freeze the creation-time role
+            // decision alongside the identity snapshot so later edits or
+            // deletes of specialist files never flip this agent's tool
+            // denylist on respawn/session-open
+            // (`session_specialist_is_orchestrator` prefers this key).
+            // Written for EVERY specialist session — including one whose id
+            // did not resolve above (the fail-closed name fallback decides)
+            // — and always overwrites any caller-supplied value, so the
+            // frozen readers never consume caller input as a trusted role.
+            let frozen_is_orchestrator = self
+                .specialists_service()
+                .resolve_is_orchestrator(spec_id, spec_wp.as_deref());
+            let meta_value = metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(obj) = meta_value.as_object_mut() {
+                obj.insert(
+                    "specialistIsOrchestrator".to_string(),
+                    json!(frozen_is_orchestrator),
+                );
+            }
         }
         // Harness stamp (intent-hq/monorepo#2459): every new session gets the
         // CURRENT harness version and a snapshot of the effective
@@ -4251,20 +4270,45 @@ impl Services {
                     // UNKNOWN id is rejected with `-32602` naming the id and
                     // the known catalog ids (monorepo#3497) — the session is
                     // left untouched. Null still clears the field.
-                    session.specialist = match update_optional_string(value, "specialist")? {
-                        Some(spec_id) => {
-                            let wp = self
-                                .store
-                                .get_workspace(&session.workspace_id)
-                                .await
-                                .ok()
-                                .and_then(|w| crate::git_ops::worktree_path(&w));
-                            Some(
-                                self.specialists_service()
-                                    .canonical_id_or_err(&spec_id, wp.as_deref())?,
-                            )
+                    session.specialist = if let Some(spec_id) =
+                        update_optional_string(value, "specialist")?
+                    {
+                        let wp = self
+                            .store
+                            .get_workspace(&session.workspace_id)
+                            .await
+                            .ok()
+                            .and_then(|w| crate::git_ops::worktree_path(&w));
+                        let canonical = self
+                            .specialists_service()
+                            .canonical_id_or_err(&spec_id, wp.as_deref())?;
+                        // Refresh the frozen orchestrator-role snapshot
+                        // (`specialistIsOrchestrator`, written at create)
+                        // for the NEW specialist so the session-open
+                        // denylist decision tracks the identity change
+                        // instead of the stale creation-time role.
+                        let is_orchestrator = self
+                            .specialists_service()
+                            .resolve_is_orchestrator(&canonical, wp.as_deref());
+                        let meta = session
+                            .metadata
+                            .get_or_insert_with(|| json!(serde_json::Map::new()));
+                        if let Some(obj) = meta.as_object_mut() {
+                            obj.insert(
+                                "specialistIsOrchestrator".to_string(),
+                                json!(is_orchestrator),
+                            );
                         }
-                        None => None,
+                        Some(canonical)
+                    } else {
+                        // A cleared specialist retires the snapshot: a
+                        // plain agent has no role and the stale key must
+                        // not survive a later re-assignment.
+                        if let Some(obj) = session.metadata.as_mut().and_then(Value::as_object_mut)
+                        {
+                            obj.remove("specialistIsOrchestrator");
+                        }
+                        None
                     };
                 }
                 "taskNoteId" => {
