@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::config::{ProviderConfig, ProviderRuntime};
+use crate::config::{ProviderConfig, ProviderRuntime, ToolRemovalStyle};
 use intent_core::path_utils;
 
 /// Sentinel model id meaning "let the provider pick" — never passed as a real
@@ -84,9 +84,11 @@ pub struct ArgInputs<'a> {
     /// Whether to append the provider's quiet flag (simple/background requests).
     pub quiet: bool,
     /// Provider-native tools to strip via the provider's `--remove-tool`
-    /// equivalent. Emitted once per name, deduped, and gated on
+    /// equivalent. Deduped and gated on
     /// [`ProviderConfig::remove_tool_flag`] — unknown providers ignore this
-    /// input rather than receive a flag they don't understand.
+    /// input rather than receive a flag they don't understand. Emission shape
+    /// follows [`ProviderConfig::remove_tool_style`]: repeated flag per name
+    /// (auggie) or one flag with a comma-joined value (grok, droid).
     pub tools_to_remove: &'a [&'a str],
 }
 
@@ -138,8 +140,20 @@ pub fn build_provider_args(config: &ProviderConfig, inputs: &ArgInputs) -> Vec<S
                 continue;
             }
             seen.push(tool);
-            args.push(flag.to_string());
-            args.push((*tool).to_string());
+        }
+        if !seen.is_empty() {
+            match config.remove_tool_style {
+                ToolRemovalStyle::Repeated => {
+                    for tool in seen {
+                        args.push(flag.to_string());
+                        args.push(tool.to_string());
+                    }
+                }
+                ToolRemovalStyle::CommaJoined => {
+                    args.push(flag.to_string());
+                    args.push(seen.join(","));
+                }
+            }
         }
     }
 

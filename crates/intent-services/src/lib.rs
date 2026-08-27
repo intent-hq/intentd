@@ -1245,7 +1245,7 @@ impl Services {
 
     /// Whether a session's specialist resolves to the `orchestrator` role —
     /// the spawn-time gate for the orchestrator tool denylist (§18.4,
-    /// [`intent_acp::get_tools_to_remove`]). Resolution runs against the
+    /// [`intent_acp::get_native_tools_to_remove`]). Resolution runs against the
     /// session's harness-pinned embedded floor (H2), like the other
     /// session-scoped specialist reads; the name-based fallback for the
     /// historical `spec-writer`/`coordinator` ids lives in

@@ -1165,7 +1165,7 @@ impl SpecialistsService {
 
     /// Whether a specialist id resolves to the `orchestrator` role — the
     /// spawn-time gate for the orchestrator tool denylist (§18.4,
-    /// `intent_acp::get_tools_to_remove`). An explicitly resolved role
+    /// `intent_acp::get_native_tools_to_remove`). An explicitly resolved role
     /// decides directly; when no role resolves, the historical orchestrator
     /// ids `spec-writer`/`coordinator` fall back to orchestrator by name.
     /// The fallback exists because sessions can carry those ids without a

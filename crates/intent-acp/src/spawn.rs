@@ -417,25 +417,43 @@ mod build_args_tests {
     }
 
     #[test]
+    fn build_args_propagates_tools_to_remove_for_grok_and_droid() {
+        // grok/droid take a single comma-joined denylist flag.
+        let grok = intent_providers::find_provider("grok").unwrap();
+        let mut opts = SpawnOptions::new(grok);
+        opts.tools_to_remove = vec!["search_replace", "write", "task", "Agent"];
+        let args = build_args(&opts);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--disallowed-tools", "search_replace,write,task,Agent"]),
+            "grok spawn args missing comma-joined denylist: {args:?}"
+        );
+
+        let droid = intent_providers::find_provider("droid").unwrap();
+        let mut opts = SpawnOptions::new(droid);
+        opts.tools_to_remove = vec!["Edit", "Create", "ApplyPatch", "Task"];
+        let args = build_args(&opts);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--disabled-tools", "Edit,Create,ApplyPatch,Task"]),
+            "droid spawn args missing comma-joined denylist: {args:?}"
+        );
+    }
+
+    #[test]
     fn build_args_omits_remove_tool_flags_for_non_supporting_providers() {
-        // claude-code / codex etc. don't advertise --remove-tool support; the
-        // spawn layer must not leak an unknown flag to them.
-        for id in [
-            "claude-code",
-            "codex",
-            "cortex",
-            "opencode",
-            "droid",
-            "grok",
-            "mock",
-        ] {
+        // claude-code / codex etc. don't advertise a spawn-time tool-removal
+        // flag; the spawn layer must not leak an unknown flag to them.
+        for id in ["claude-code", "codex", "cortex", "opencode", "pi", "mock"] {
             let provider = intent_providers::find_provider(id).unwrap();
             let mut opts = SpawnOptions::new(provider);
             opts.tools_to_remove = vec!["str-replace-editor"];
             let args = build_args(&opts);
             assert!(
-                !args.iter().any(|a| a == "--remove-tool"),
-                "{id} spawn args unexpectedly include --remove-tool: {args:?}"
+                !args.iter().any(|a| a == "--remove-tool"
+                    || a == "--disallowed-tools"
+                    || a == "--disabled-tools"),
+                "{id} spawn args unexpectedly include a tool-removal flag: {args:?}"
             );
         }
     }
