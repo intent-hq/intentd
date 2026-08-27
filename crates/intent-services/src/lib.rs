@@ -133,6 +133,8 @@ mod workspace_status;
 pub mod workspace_vocabulary;
 
 #[cfg(test)]
+mod test_tracing;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod v1_1_goldens;

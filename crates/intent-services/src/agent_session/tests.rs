@@ -33,63 +33,13 @@ impl LifecycleCapture {
         self.0.lock().unwrap().clone()
     }
 
-    /// Install `self` as the thread-local default, with the process-global
-    /// [`LifecycleInterestAnchor`] in place first (regression: monorepo#3580).
-    ///
-    /// Without the anchor, `tracing-core`'s callsite interest cache can be
-    /// poisoned to `never` under parallel tests: when its dispatcher registry
-    /// believes there is at most one live dispatcher, a callsite registering on
-    /// another thread rebuilds its interest *without the registry lock* from
-    /// that thread's current default — `NoSubscriber` on a thread with no
-    /// local subscriber, yielding `Interest::never()`. That unlocked store
-    /// races the locked rebuild triggered by this test's `set_default` and can
-    /// land after it (lost update). A cached `never` short-circuits `enabled()`
-    /// entirely, so the capture sees zero events and nothing rebuilds the
-    /// cache before the test asserts. The anchor replaces the `NoSubscriber`
-    /// fallback: every rebuild path now resolves lifecycle interest to at
-    /// least `sometimes`, which forces the per-event `enabled()` check instead
-    /// of dropping events at the callsite.
+    /// Install `self` as the thread-local default via
+    /// [`crate::test_tracing::set_capture_default`], which anchors the
+    /// callsite interest cache first (regression: monorepo#3580 — see the
+    /// `test_tracing` module docs for the race).
     fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
-        static ANCHOR: std::sync::Once = std::sync::Once::new();
-        ANCHOR.call_once(|| {
-            let _ = tracing::subscriber::set_global_default(LifecycleInterestAnchor);
-        });
-        tracing::subscriber::set_default(self.clone())
+        crate::test_tracing::set_capture_default(self.clone())
     }
-}
-
-/// Process-global fallback dispatcher that pins the lifecycle target's callsite
-/// interest at `sometimes` so it can never be cached as `never` (see
-/// [`LifecycleCapture::set_as_default`]). It consumes nothing itself:
-/// `enabled()` is always `false`, so threads without a thread-local capture
-/// drop lifecycle events exactly as they did with no global default.
-struct LifecycleInterestAnchor;
-
-impl tracing::Subscriber for LifecycleInterestAnchor {
-    fn register_callsite(
-        &self,
-        metadata: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        if metadata.target() == "intent_services::stream_lifecycle" {
-            tracing::subscriber::Interest::sometimes()
-        } else {
-            tracing::subscriber::Interest::never()
-        }
-    }
-
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        false
-    }
-
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, _: &tracing::Event<'_>) {}
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 impl tracing::Subscriber for LifecycleCapture {
