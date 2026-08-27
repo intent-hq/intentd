@@ -1572,6 +1572,7 @@ mod tests {
                 required_status_checks: vec!["build".into(), "test".into(), "e2e".into()],
             }),
             is_in_merge_queue: None,
+            merge_queue_removal: None,
         };
         let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 3);
 
@@ -1628,6 +1629,7 @@ mod tests {
             checks_known: true,
             branch_rules: None,
             is_in_merge_queue: None,
+            merge_queue_removal: None,
         };
         let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 0);
 

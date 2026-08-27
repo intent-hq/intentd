@@ -2219,6 +2219,7 @@ mod tests {
                     required_status_checks: vec!["build".into()],
                 }),
                 is_in_merge_queue: None,
+                merge_queue_removal: None,
             })
         }
         async fn list_comments(

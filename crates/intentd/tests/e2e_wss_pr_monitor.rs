@@ -341,6 +341,7 @@ impl SourceControl for StubForge {
                     .collect(),
             }),
             is_in_merge_queue: in_merge_queue,
+            merge_queue_removal: None,
         })
     }
     async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
