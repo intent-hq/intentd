@@ -4201,6 +4201,180 @@ async fn app_agents_ask_adopts_generic_watch_without_weakening_or_duplication() 
 }
 
 #[tokio::test]
+async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+
+    svc.app_agents_ask_op(
+        chief_ws,
+        chief.clone(),
+        target.clone(),
+        "finish the audit".into(),
+        None,
+    )
+    .await
+    .expect("Chief ask");
+    let watch = svc
+        .list_watches_for_parent(&chief)
+        .pop()
+        .expect("ask watch");
+    assert!(watch.completion_only, "ask watch is completion-only");
+    let chief_before = svc
+        .store()
+        .get_agent_session(&chief)
+        .await
+        .expect("Chief session")
+        .messages
+        .len();
+
+    svc.agent_request_attention_op(
+        target_ws.clone(),
+        "discussion".into(),
+        "Need a decision".into(),
+        Some(target.clone()),
+    )
+    .await
+    .expect("attention request");
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&chief)
+            .await
+            .expect("Chief after attention")
+            .messages
+            .len(),
+        chief_before
+    );
+    assert_eq!(svc.list_watches_for_parent(&chief).len(), 1);
+
+    let mut target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    target_session.status = AgentStatus::RuntimeIdle;
+    target_session.completion_report = Some("audit complete".into());
+    target_session.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&target_ws, &target_session)
+        .await
+        .expect("mark target complete");
+    svc.handle_completion_event(&completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0, "completionReport": "audit complete" }),
+    ))
+    .await;
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&chief)
+            .await
+            .expect("Chief after completion")
+            .messages
+            .len(),
+        chief_before + 1
+    );
+    assert!(svc.list_watches_for_parent(&chief).is_empty());
+}
+
+#[tokio::test]
+async fn app_agents_ask_does_not_adopt_an_unrelated_after_all_group() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+    let group_id = svc.get_or_create_delegation_group(&chief_ws, &chief);
+    svc.enroll_child_in_group(&group_id, &target);
+    let grouped_id = svc
+        .register_completion_watch(
+            &chief_ws,
+            &target_ws,
+            chief.clone(),
+            "Chief thread".into(),
+            target.clone(),
+            Some(group_id.clone()),
+        )
+        .expect("grouped watch");
+
+    let asked = svc
+        .app_agents_ask_op(
+            chief_ws,
+            chief.clone(),
+            target.clone(),
+            "finish now".into(),
+            None,
+        )
+        .await
+        .expect("Chief ask");
+    let ask_id = asked["watch"]["results"][0]["subscriptionId"]
+        .as_str()
+        .expect("ask watch id");
+    assert_ne!(ask_id, grouped_id);
+    let watches = svc.list_watches_for_parent(&chief);
+    assert_eq!(watches.len(), 2);
+    assert!(watches
+        .iter()
+        .any(|watch| { watch.id == ask_id && watch.group_id.is_none() && watch.completion_only }));
+    assert!(watches.iter().any(|watch| {
+        watch.id == grouped_id
+            && watch.group_id.as_deref() == Some(group_id.as_str())
+            && !watch.completion_only
+    }));
+
+    let chief_before = svc
+        .store()
+        .get_agent_session(&chief)
+        .await
+        .expect("Chief session")
+        .messages
+        .len();
+    let mut target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    target_session.status = AgentStatus::RuntimeIdle;
+    target_session.completion_report = Some("finished now".into());
+    target_session.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&target_ws, &target_session)
+        .await
+        .expect("mark target complete");
+    svc.handle_completion_event(&completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0, "completionReport": "finished now" }),
+    ))
+    .await;
+
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&chief)
+            .await
+            .expect("Chief after completion")
+            .messages
+            .len(),
+        chief_before + 1,
+        "the ask wake does not wait for the unsealed after_all group"
+    );
+    let group = svc
+        .delegation_group_for_parent(&chief)
+        .expect("unrelated group remains");
+    assert!(!group.sealed);
+    assert!(!group.delivered);
+    assert!(group.completed_agent_ids.contains(&target));
+}
+
+#[tokio::test]
 async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
     let tmp = TempDb::new();
     let target_ws = WorkspaceId::new();
@@ -4242,6 +4416,10 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
             .await
             .expect("persisted watches");
         assert_eq!(persisted.len(), 1, "ask returns after durable registration");
+        assert!(
+            persisted[0].completion_only,
+            "ask semantics survive restart"
+        );
         (chief, target)
     };
 
@@ -4359,6 +4537,94 @@ async fn app_agents_ask_fails_closed_when_completion_watch_persistence_fails() {
         }),
         "the documented send-before-registration side effect remains"
     );
+}
+
+#[tokio::test]
+async fn strict_ask_registration_is_durable_before_in_memory_visibility() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    let mut blocker = svc
+        .store()
+        .write_pool()
+        .acquire()
+        .await
+        .expect("writer connection");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *blocker)
+        .await
+        .expect("hold writer lock");
+
+    let registration_svc = svc.clone();
+    let registration_chief = chief.clone();
+    let registration_target = target.clone();
+    let registration_target_ws = target_ws.clone();
+    let registration = tokio::spawn(async move {
+        registration_svc
+            .register_completion_watch_strict_durable(
+                &chief_ws,
+                &registration_target_ws,
+                registration_chief,
+                "Chief thread".into(),
+                registration_target,
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !registration.is_finished(),
+        "registration waits for durability"
+    );
+    assert!(
+        svc.list_watches_for_parent(&chief).is_empty(),
+        "a blocked insert is never visible to completion delivery"
+    );
+
+    sqlx::query("COMMIT")
+        .execute(&mut *blocker)
+        .await
+        .expect("release writer lock");
+    drop(blocker);
+    timeout(Duration::from_secs(10), registration)
+        .await
+        .expect("registration unblocked")
+        .expect("registration task")
+        .expect("registration succeeds");
+    assert_eq!(svc.list_watches_for_parent(&chief).len(), 1);
+    assert_eq!(
+        svc.store()
+            .list_completion_watches()
+            .await
+            .expect("persisted watches")
+            .len(),
+        1
+    );
+
+    let mut target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    target_session.status = AgentStatus::RuntimeIdle;
+    target_session.completion_report = Some("complete after registration".into());
+    target_session.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&target_ws, &target_session)
+        .await
+        .expect("mark target complete");
+    svc.handle_completion_event(&completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({
+            "agentId": target.0,
+            "completionReport": "complete after registration",
+        }),
+    ))
+    .await;
+    assert!(svc.list_watches_for_parent(&chief).is_empty());
+    wait_for_persisted_watches(&svc, 0).await;
 }
 
 async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
@@ -13681,6 +13947,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
                 group_id: None,
                 report_delivered: false,
                 wake_on_attention: false,
+                completion_only: false,
                 created_at: created_at.to_string(),
             })
             .await
@@ -16954,6 +17221,7 @@ async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
         group_id: None,
         report_delivered,
         wake_on_attention: false,
+        completion_only: false,
         created_at: now_iso(),
     };
     restarted

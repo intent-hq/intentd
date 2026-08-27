@@ -859,7 +859,7 @@ agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
 agent_flipped_completion: agent_id, workspace_id, task_note_id, recorded_at
 delegation_group: group_id, workspace_id, parent_agent_id, await_mode, expected_agent_ids, completed_agent_ids, deleted_agent_ids, sealed, delivered, event_summaries, raw_events, created_at, updated_at
-completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, report_delivered, wake_on_attention, created_at
+completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, report_delivered, wake_on_attention, created_at, completion_only
 event_subscription: id, workspace_id, subscriber_agent_id, event_types, exclude_self, batch_window_ms, created_at
 hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, expires_at, perpetual, dispatch_count
 pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot

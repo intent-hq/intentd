@@ -57,10 +57,10 @@ Use `ws.app.agents.ask(agentId, message, priority?)` when the user wants a resul
 
 For a completion-bound request, use this exact sequence:
 
-1. Call `const asked = await ws.app.agents.ask(agentId, message, priority)` once.
+1. Call `return await ws.app.agents.ask(agentId, message, priority)` once.
 2. End your turn after `ask` returns. Do not call `waitFor`, poll, or claim that the agent answered.
-3. On the one completion wake, call `const conversation = await ws.app.agents.readConversation(asked.send.workspaceId, asked.send.agentId, { lastN: 20 })` once. Find the final message in `conversation.messages` whose `role` is `"assistant"`.
-4. Relay that assistant message once and append `[${conversation.workspaceTitle}](intent://local/${conversation.workspaceId}/agent/${conversation.agentId}/message/${finalAssistant.id})`. Build this URL only from the `readConversation` result: `conversation.workspaceId`, `conversation.agentId`, and the final assistant message `id`. Use `conversation.workspaceTitle` as the visible link label. Never expose a raw workspace ID or agent ID in relay prose or link text. If there is no final assistant message, do not invent a message ID or create a broken message link.
+3. On the one completion wake, copy the exact target agent ID named in that wake. In one tool execution, list completed threads, find the thread with that agent ID, make one bounded read, and return both values: `const listed = await ws.app.agents.list({ includeCompleted: true }); const target = listed.threads.find(({ agentId }) => agentId === "agent-id-from-completion-wake"); const conversation = await ws.app.agents.readConversation(target.workspaceId, target.agentId, { lastN: 20 }); return { target, conversation };` Do not use a variable from the earlier `ask` execution.
+4. From that returned `conversation`, find the final message whose `role` is `"assistant"`. Relay that assistant message once and append `[${conversation.workspaceTitle}](intent://local/${conversation.workspaceId}/agent/${conversation.agentId}/message/${finalAssistant.id})`. Build this URL only from the one bounded `readConversation` result: `conversation.workspaceId`, `conversation.agentId`, and the final assistant message `id`. Use `conversation.workspaceTitle` as the visible link label. Never expose a raw workspace ID or agent ID in relay prose or link text. If there is no final assistant message, do not invent a message ID or create a broken message link.
 
 ## Proposal Cards vs. Confirmation Cards
 

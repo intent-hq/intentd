@@ -2443,15 +2443,30 @@ mod tests {
                 "{version}: one completion wake"
             );
             assert!(
-                prompt.contains("ws.app.agents.readConversation(asked.send.workspaceId, asked.send.agentId, { lastN: 20 })` once"),
+                prompt.contains("return await ws.app.agents.ask(agentId, message, priority)"),
+                "{version}: ask result is returned without a cross-turn local"
+            );
+            assert!(
+                !prompt.contains("const asked") && !prompt.contains("asked."),
+                "{version}: no ask-local reference survives across executions"
+            );
+            assert!(
+                prompt.contains("ws.app.agents.readConversation(target.workspaceId, target.agentId, { lastN: 20 })"),
                 "{version}: one bounded conversation read"
+            );
+            assert!(
+                prompt.contains("agentId === \"agent-id-from-completion-wake\"")
+                    && prompt.contains("return { target, conversation }")
+                    && prompt.contains("Do not use a variable from the earlier `ask` execution"),
+                "{version}: wake identity and conversation are resolved in one execution"
             );
             assert!(
                 prompt.contains("[${conversation.workspaceTitle}](intent://local/${conversation.workspaceId}/agent/${conversation.agentId}/message/${finalAssistant.id})"),
                 "{version}: exact target-message link with title label"
             );
             assert!(
-                prompt.contains("Build this URL only from the `readConversation` result"),
+                prompt
+                    .contains("Build this URL only from the one bounded `readConversation` result"),
                 "{version}: link identifiers come from the conversation read"
             );
             assert!(

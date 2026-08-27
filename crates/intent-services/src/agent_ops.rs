@@ -7060,17 +7060,18 @@ impl Services {
             }
         }
         // 6. monorepo#1229: attention fan-out to the caller's watchers. Every
-        // active completion watch is woken — auto-registered
+        // ordinary active completion watch is woken — auto-registered
         // (wakeOrCreate/delegate SUB-1) watches included, not just explicit
         // `agent.watch` registrations (monorepo#3443 widened the fan-out past
-        // the old `wake_on_attention` filter). The caller's parent is
+        // the old `wake_on_attention` filter). Completion-only Chief asks wait
+        // for terminal completion. The caller's parent is
         // excluded — step 5 already woke it directly — so a parent that ALSO
         // watches its child never receives a duplicate attention wake.
         // Watches are left in place (attention is not a completion).
         for watch in self
             .find_watches_for_child(&caller)
             .into_iter()
-            .filter(|w| Some(&w.parent_agent_id) != parent.as_ref())
+            .filter(|w| !w.completion_only && Some(&w.parent_agent_id) != parent.as_ref())
         {
             // Attention is not a completion, so the watch is left in place —
             // say so explicitly (issue monorepo#2051) to avoid reading as
@@ -9030,7 +9031,6 @@ impl Services {
                 caller_agent_id.clone(),
                 caller.name,
                 target_agent_id.clone(),
-                None,
             )
             .await?;
         self.publish_subscriptions_changed(&workspace_id, &caller_agent_id)
