@@ -28533,6 +28533,167 @@ mod last_activity_events {
         }
     }
 
+    /// Regression (monorepo#3632): `workspace.delete` sweeps the pending
+    /// idle debouncer. Without the sweep the timer outlives the workspace,
+    /// emits a spurious `workspace:activity-changed { idle }` ~3s after
+    /// deletion, and its `(gen, AbortHandle)` map entry lingers.
+    #[tokio::test]
+    async fn delete_workspace_cancels_pending_idle_debounce() {
+        use intent_core::WorkspaceApi;
+        // Debounce window far longer than the test: the delete must land
+        // while the idle flip is still pending.
+        let _guard = DebounceEnvGuard::new("30000");
+        let h = harness().await;
+
+        // Last in-flight session ends → idle flip scheduled.
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
+        assert!(
+            h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "idle flip must be pending before the delete"
+        );
+
+        h.services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("delete workspace");
+
+        assert!(
+            !h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "workspace.delete must sweep the pending idle debouncer"
+        );
+    }
+
+    /// Regression (monorepo#3632): an idle timer whose fire is suppressed —
+    /// agents back in flight when the guard runs — must still remove its own
+    /// `(gen, AbortHandle)` entry from the debouncers map. Without the
+    /// every-exit-path removal the entry would linger until the next
+    /// `agent_activity_begin`/`schedule_idle_debounce` for the workspace —
+    /// for a deleted id, the daemon's lifetime (ids are never recycled).
+    #[tokio::test]
+    async fn suppressed_idle_timer_cleans_up_map_entry() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Last in-flight session ends → idle flip scheduled.
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
+        assert!(
+            h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "idle flip must be pending before the timer fires"
+        );
+
+        // Force the suppressed-fire path deterministically: make the
+        // in-flight count non-zero WITHOUT going through
+        // `agent_activity_begin` (which would cancel the entry itself) —
+        // the shape of a begin racing the timer's fire-time guard.
+        h.services
+            .agent_activity
+            .lock()
+            .expect("activity lock")
+            .insert(h.ws.clone(), 1);
+
+        // Bounded poll: the timer fires after the debounce window, takes the
+        // suppressed path, and must still sweep its map entry on the way out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = h
+                .services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "suppressed idle timer must remove its own debouncers entry"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The suppression itself still holds: no idle event was emitted
+        // (the only event is the begin's agent_running flip).
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(ev["data"]["activity"], "agent_running");
+        assert!(
+            timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .is_err(),
+            "no idle event on the suppressed-fire path"
+        );
+    }
+
+    /// Regression (monorepo#3632, review): an idle timer that fires against
+    /// an already-deleted workspace — the shape of a fire racing
+    /// `workspace.delete` (the timer passes its gen/count guards and removes
+    /// its own entry before the delete's sweep runs, so the sweep finds no
+    /// handle to abort) — must not emit the spurious `{ idle }` event, and
+    /// must still remove its own map entry.
+    #[tokio::test]
+    async fn idle_timer_firing_against_deleted_workspace_skips_emit() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Last in-flight session ends → idle flip scheduled.
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
+
+        // Delete the row directly in the store, bypassing the services-layer
+        // sweep — the interleaving where the timer fires while the delete is
+        // mid-flight (entry still present, gen/count guards pass, row gone).
+        h.store.delete_workspace(&h.ws).await.expect("row delete");
+
+        // Bounded poll: the timer fires, hits the emit-time existence guard,
+        // and must still sweep its map entry on the way out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = h
+                .services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "idle timer must remove its own debouncers entry after firing \
+                 against a deleted workspace"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // No idle event for the deleted id: the only event is the begin's
+        // agent_running flip.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(ev["data"]["activity"], "agent_running");
+        assert!(
+            timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .is_err(),
+            "no idle event for a deleted workspace"
+        );
+    }
+
     /// After `raise_attention` (which bumps `workspace.updated_at`), a
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]

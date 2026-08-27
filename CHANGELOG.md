@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.5] - 2026-08-27
+
+### 🚀 Features
+
+- *(acp)* Merge spawnPeer into agent.create with topLevel option ([#1520](https://github.com/intent-hq/intentd/pull/1520))
+- *(transport)* Slim projection for note.subscribe snapshot and deltas ([#1526](https://github.com/intent-hq/intentd/pull/1526))
+- *(services)* Persist auto-unarchive notice and inject it into the triggering turn prompt ([#1521](https://github.com/intent-hq/intentd/pull/1521))
+- *(transport)* Agent.list retiredOnly param and retiredCount field ([#1523](https://github.com/intent-hq/intentd/pull/1523))
+
+### 🐛 Bug Fixes
+
+- *(services)* Cancel pending last-activity schedule on workspace delete ([#1522](https://github.com/intent-hq/intentd/pull/1522))
+- *(services)* Deflake harness_wake lifecycle capture under parallel tests ([#1525](https://github.com/intent-hq/intentd/pull/1525))
+
+### ⚡ Performance
+
+- *(store)* Trigger-maintained per-session message stats counters ([#1524](https://github.com/intent-hq/intentd/pull/1524))
+
+
 ## [0.8.4] - 2026-08-27
 
 ### 🚀 Features

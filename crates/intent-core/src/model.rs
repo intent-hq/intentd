@@ -3605,6 +3605,20 @@ pub struct FileStatus {
 
 /// `git.status` result (`GitStatus` in `src/shared/types.ts`). `diverged` is true
 /// only when the branch is both ahead and behind its upstream.
+///
+/// `files` served over the wire is capped (monorepo#3635): when the working
+/// tree carries more entries than the per-response cap, the list is truncated
+/// (tracked changes preferred over untracked) and the additive truncation
+/// markers are set — `filesTruncated: true` plus `totalFiles` carrying the
+/// full pre-cap count. Both are omitted from the wire on an untruncated
+/// result, so the pre-#3635 shape is preserved byte-for-byte. Aggregate flags
+/// (`hasUncommittedChanges`, `hasUntrackedFiles`) always reflect the full
+/// scan, never the truncated list.
+///
+/// The bools mirror the wire contract 1:1 (each an independent flag on the
+/// `git.status` result), so folding them into enums would diverge the model
+/// from the protocol shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatus {
@@ -3615,6 +3629,14 @@ pub struct GitStatus {
     pub files: Vec<FileStatus>,
     pub has_uncommitted_changes: bool,
     pub has_untracked_files: bool,
+    /// `true` when `files` was truncated to the per-response cap
+    /// (monorepo#3635). Omitted from the wire when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub files_truncated: bool,
+    /// Full working-tree entry count before the cap was applied. Present only
+    /// alongside `filesTruncated: true`; omitted on an untruncated result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_files: Option<usize>,
 }
 
 /// `git.getBranches` result (`{ branches, remoteBranches, currentBranch,

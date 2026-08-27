@@ -12,6 +12,70 @@ use intent_core::{FileStatus, GitFileStatus, GitStatus, Result};
 
 use crate::map_git_err;
 
+/// Per-response cap on `GitStatus.files` entries served over the wire
+/// (monorepo#3635). A worktree with ~100k untracked files (mid-build
+/// generated trees, nested worktrees) otherwise produces multi-megabyte
+/// `git.status` frames — far past the transport's 1 MiB outbound warn
+/// threshold. 5000 entries keeps the frame well under that bound while
+/// remaining far more than any UI renders.
+pub const MAX_STATUS_FILES: usize = 5000;
+
+/// Project a wire `GitStatus` with `files` capped at [`MAX_STATUS_FILES`]
+/// entries (monorepo#3635), preferring tracked changes (staged / modified /
+/// deleted / renamed…) over untracked entries so real work is never pushed
+/// out of the list by untracked noise. Relative order within each group is
+/// preserved (libgit2's path order). On truncation, `files_truncated` is set
+/// and `total_files` carries the full pre-cap count; an under-cap status is
+/// cloned unchanged, keeping the pre-#3635 wire shape byte-for-byte.
+/// Aggregate flags are untouched — they were computed over the full scan.
+///
+/// Takes the (typically cached) status by reference and clones only the
+/// entries that survive the cap, so a ~100k-entry cached scan costs one
+/// counting pass plus O(cap) clones per read — not a full-list clone that is
+/// immediately discarded (the RPC cost contract's O(rows returned) rule).
+#[must_use]
+pub fn cap_status_files(status: &GitStatus) -> GitStatus {
+    let total = status.files.len();
+    if total <= MAX_STATUS_FILES {
+        return status.clone();
+    }
+    let is_tracked = |f: &&FileStatus| f.status != GitFileStatus::Untracked;
+    let tracked_kept = status
+        .files
+        .iter()
+        .filter(is_tracked)
+        .count()
+        .min(MAX_STATUS_FILES);
+    let mut files = Vec::with_capacity(MAX_STATUS_FILES);
+    files.extend(
+        status
+            .files
+            .iter()
+            .filter(is_tracked)
+            .take(tracked_kept)
+            .cloned(),
+    );
+    files.extend(
+        status
+            .files
+            .iter()
+            .filter(|f| f.status == GitFileStatus::Untracked)
+            .take(MAX_STATUS_FILES - tracked_kept)
+            .cloned(),
+    );
+    GitStatus {
+        branch: status.branch.clone(),
+        ahead: status.ahead,
+        behind: status.behind,
+        diverged: status.diverged,
+        files,
+        has_uncommitted_changes: status.has_uncommitted_changes,
+        has_untracked_files: status.has_untracked_files,
+        files_truncated: true,
+        total_files: Some(total),
+    }
+}
+
 /// The empty status returned for remote workspaces and non-repositories,
 /// matching the TS `getStatus` fallback (`branch:""`, everything zeroed).
 #[must_use]
@@ -24,6 +88,8 @@ pub fn empty_status() -> GitStatus {
         files: Vec::new(),
         has_uncommitted_changes: false,
         has_untracked_files: false,
+        files_truncated: false,
+        total_files: None,
     }
 }
 
@@ -61,6 +127,8 @@ pub fn status(worktree_path: &Path) -> Result<GitStatus> {
         files,
         has_uncommitted_changes,
         has_untracked_files,
+        files_truncated: false,
+        total_files: None,
     })
 }
 
@@ -401,5 +469,121 @@ mod tests {
         assert_eq!(sub.mode.as_deref(), Some("160000"));
         assert_eq!(sub.old_sha.as_deref(), Some(old_sha));
         assert_eq!(sub.new_sha, None, "blob OID must not leak as a pin SHA");
+    }
+
+    fn file(path: &str, status: GitFileStatus, staged: bool) -> FileStatus {
+        FileStatus {
+            path: path.to_string(),
+            status,
+            staged,
+            mode: None,
+            old_sha: None,
+            new_sha: None,
+        }
+    }
+
+    fn status_with_files(files: Vec<FileStatus>) -> GitStatus {
+        GitStatus {
+            files,
+            has_uncommitted_changes: true,
+            has_untracked_files: true,
+            ..empty_status()
+        }
+    }
+
+    /// Under the cap the status passes through untouched: no truncation
+    /// markers, files identical (the pre-#3635 wire shape).
+    #[test]
+    fn cap_leaves_under_cap_status_untouched() {
+        let files: Vec<_> = (0..10)
+            .map(|i| file(&format!("f{i}.txt"), GitFileStatus::Untracked, false))
+            .collect();
+        let capped = cap_status_files(&status_with_files(files.clone()));
+        assert_eq!(capped.files, files);
+        assert!(!capped.files_truncated);
+        assert_eq!(capped.total_files, None);
+    }
+
+    /// An exactly-at-cap list is not truncated (the cap is inclusive).
+    #[test]
+    fn cap_is_inclusive_at_the_boundary() {
+        let files: Vec<_> = (0..MAX_STATUS_FILES)
+            .map(|i| file(&format!("f{i}"), GitFileStatus::Untracked, false))
+            .collect();
+        let capped = cap_status_files(&status_with_files(files));
+        assert_eq!(capped.files.len(), MAX_STATUS_FILES);
+        assert!(!capped.files_truncated);
+        assert_eq!(capped.total_files, None);
+    }
+
+    /// Over the cap, tracked changes are all retained ahead of untracked
+    /// entries, the list is capped, and the truncation markers carry the full
+    /// pre-cap count. Aggregate flags stay as computed over the full scan.
+    #[test]
+    fn cap_prefers_tracked_changes_over_untracked() {
+        let mut files = Vec::new();
+        for i in 0..MAX_STATUS_FILES {
+            files.push(file(
+                &format!("untracked{i}"),
+                GitFileStatus::Untracked,
+                false,
+            ));
+        }
+        // Tracked entries interleaved after the untracked block: they must
+        // survive the cap even though they come last in scan order.
+        files.push(file("staged.txt", GitFileStatus::Modified, true));
+        files.push(file("deleted.txt", GitFileStatus::Deleted, false));
+        let total = files.len();
+
+        let capped = cap_status_files(&status_with_files(files));
+        assert_eq!(capped.files.len(), MAX_STATUS_FILES);
+        assert!(capped.files_truncated);
+        assert_eq!(capped.total_files, Some(total));
+        assert!(capped.has_uncommitted_changes);
+        assert!(capped.has_untracked_files);
+        assert!(capped.files.iter().any(|f| f.path == "staged.txt"));
+        assert!(capped.files.iter().any(|f| f.path == "deleted.txt"));
+        // Tracked entries lead the list; untracked fill the remainder in
+        // their original relative order.
+        assert_eq!(capped.files[0].path, "staged.txt");
+        assert_eq!(capped.files[1].path, "deleted.txt");
+        assert_eq!(capped.files[2].path, "untracked0");
+        let untracked_kept = capped
+            .files
+            .iter()
+            .filter(|f| f.status == GitFileStatus::Untracked)
+            .count();
+        assert_eq!(untracked_kept, MAX_STATUS_FILES - 2);
+    }
+
+    /// A pathological all-tracked overflow still enforces the cap.
+    #[test]
+    fn cap_applies_even_when_tracked_alone_overflows() {
+        let files: Vec<_> = (0..MAX_STATUS_FILES + 7)
+            .map(|i| file(&format!("m{i}"), GitFileStatus::Modified, false))
+            .collect();
+        let capped = cap_status_files(&status_with_files(files));
+        assert_eq!(capped.files.len(), MAX_STATUS_FILES);
+        assert!(capped.files_truncated);
+        assert_eq!(capped.total_files, Some(MAX_STATUS_FILES + 7));
+    }
+
+    /// The truncation markers serialize additively: absent on an untruncated
+    /// status (pre-#3635 shape byte-for-byte), present when truncated.
+    #[test]
+    fn truncation_markers_are_additive_on_the_wire() {
+        let untruncated = serde_json::to_value(status_with_files(vec![])).unwrap();
+        assert!(untruncated.get("filesTruncated").is_none());
+        assert!(untruncated.get("totalFiles").is_none());
+
+        let files: Vec<_> = (0..=MAX_STATUS_FILES)
+            .map(|i| file(&format!("f{i}"), GitFileStatus::Untracked, false))
+            .collect();
+        let truncated = serde_json::to_value(cap_status_files(&status_with_files(files))).unwrap();
+        assert_eq!(truncated["filesTruncated"], serde_json::json!(true));
+        assert_eq!(
+            truncated["totalFiles"],
+            serde_json::json!(MAX_STATUS_FILES + 1)
+        );
     }
 }
