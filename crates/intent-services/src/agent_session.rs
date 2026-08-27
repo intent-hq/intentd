@@ -2047,27 +2047,50 @@ impl Services {
     /// `orchestrator` role — the SAME decision that gates the spawn-time
     /// CLI-side denylist (`derive_is_orchestrator` in `agent_manager`, §18.4),
     /// re-resolved here for the session-open paths because they run after
-    /// spawn with only the stored session at hand. The workspace read supplies
-    /// the path for project-tier specialist resolution and is best-effort: a
-    /// failure resolves embedded/user-tier specialists only (never fails the
-    /// session open). Plain agents (no specialist) skip the read entirely.
-    async fn resolve_session_is_orchestrator(&self, stored: &AgentSession) -> bool {
+    /// spawn with only the stored session at hand. Only the claude-code
+    /// `_meta` branch of [`build_session_meta`] consumes the decision — the
+    /// other providers apply their denylists at spawn time — so any other
+    /// `provider_id` short-circuits to `false` without touching the store.
+    /// The frozen creation-time snapshot
+    /// (`metadata.specialistIsOrchestrator`) also skips the workspace read
+    /// (the path only feeds the legacy live-resolution project tier). The
+    /// workspace read is best-effort: a failure resolves embedded/user-tier
+    /// specialists only (never fails the session open). Plain agents (no
+    /// specialist) skip the read entirely.
+    async fn resolve_session_is_orchestrator(
+        &self,
+        provider_id: &str,
+        stored: &AgentSession,
+    ) -> bool {
+        if provider_id != "claude-code" {
+            return false;
+        }
         if stored.specialist.as_deref().is_none_or(str::is_empty) {
             return false;
         }
-        let workspace_path = match self.store.get_workspace(&stored.workspace_id).await {
-            Ok(ws) => ws
-                .path
-                .clone()
-                .or_else(|| ws.worktree_path.clone())
-                .map(PathBuf::from),
-            Err(e) => {
-                tracing::debug!(
-                    workspace = %stored.workspace_id,
-                    error = %e,
-                    "orchestrator role resolution: workspace read failed; resolving without project tier"
-                );
-                None
+        let has_snapshot = stored
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("specialistIsOrchestrator"))
+            .and_then(serde_json::Value::as_bool)
+            .is_some();
+        let workspace_path = if has_snapshot {
+            None
+        } else {
+            match self.store.get_workspace(&stored.workspace_id).await {
+                Ok(ws) => ws
+                    .path
+                    .clone()
+                    .or_else(|| ws.worktree_path.clone())
+                    .map(PathBuf::from),
+                Err(e) => {
+                    tracing::debug!(
+                        workspace = %stored.workspace_id,
+                        error = %e,
+                        "orchestrator role resolution: workspace read failed; resolving without project tier"
+                    );
+                    None
+                }
             }
         };
         self.session_specialist_is_orchestrator(stored, workspace_path.as_deref())
@@ -2101,7 +2124,9 @@ impl Services {
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
-        let is_orchestrator = self.resolve_session_is_orchestrator(&stored).await;
+        let is_orchestrator = self
+            .resolve_session_is_orchestrator(&provider_id, &stored)
+            .await;
         let meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
@@ -2172,7 +2197,9 @@ impl Services {
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
-        let is_orchestrator = self.resolve_session_is_orchestrator(&stored).await;
+        let is_orchestrator = self
+            .resolve_session_is_orchestrator(&provider_id, &stored)
+            .await;
         let meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
@@ -2294,7 +2321,9 @@ impl Services {
         }
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
-        let is_orchestrator = self.resolve_session_is_orchestrator(&stored).await;
+        let is_orchestrator = self
+            .resolve_session_is_orchestrator(&provider_id, &stored)
+            .await;
         let meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),

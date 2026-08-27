@@ -7826,3 +7826,69 @@ fn assert_result_ids_match_transcript(events: &[Event], blocks: &[Value]) {
         );
     }
 }
+
+/// The session-open orchestrator resolution is gated on the provider: only
+/// the claude-code `_meta` branch consumes the decision, so every other
+/// provider short-circuits to `false` — even for a specialist whose role
+/// resolves (or snapshots) as orchestrator.
+#[tokio::test]
+async fn resolve_session_is_orchestrator_gated_on_provider() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let mut stored = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    // Historical orchestrator id with no snapshot: the name fallback decides.
+    stored.specialist = Some("spec-writer".to_string());
+    assert!(
+        services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await
+    );
+    for provider in ["auggie", "droid", "grok", "codex", "mock"] {
+        assert!(
+            !services
+                .resolve_session_is_orchestrator(provider, &stored)
+                .await,
+            "{provider} must skip orchestrator resolution"
+        );
+    }
+    // Plain agents resolve false even on claude-code.
+    stored.specialist = None;
+    assert!(
+        !services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await
+    );
+}
+
+/// The frozen creation-time snapshot (`metadata.specialistIsOrchestrator`)
+/// decides the session-open resolution without live specialist resolution:
+/// a `false` snapshot overrides the historical-name fallback and a `true`
+/// snapshot holds without any resolvable specialist file.
+#[tokio::test]
+async fn resolve_session_is_orchestrator_prefers_frozen_snapshot() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let mut stored = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    stored.specialist = Some("spec-writer".to_string());
+    stored.metadata = Some(json!({ "specialistIsOrchestrator": false }));
+    assert!(
+        !services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await,
+        "a false snapshot beats the historical-name fallback"
+    );
+    stored.specialist = Some("custom-orch".to_string());
+    stored.metadata = Some(json!({ "specialistIsOrchestrator": true }));
+    assert!(
+        services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await,
+        "a true snapshot holds without a resolvable specialist file"
+    );
+}
