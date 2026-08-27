@@ -12,6 +12,11 @@
 //! an `id` gets `-32011 "Server overloaded"` with the echoed id, a notification
 //! is dropped without a response (PROTOCOL §9).
 //!
+//! A permit covers handler execution only: the spawn sites release it before
+//! awaiting the outbound enqueue (`conn::finish_slow_path_rpc`), so a stalled
+//! connection's outbound backpressure cannot pin slots and starve every other
+//! client.
+//!
 //! Fairness tradeoff: the pool is global with no per-connection reservation,
 //! so one flooding client can consume every slot and other connections —
 //! including the FE's own UDS traffic — then see `-32011` until it drains. That
@@ -73,8 +78,11 @@ impl RpcLimiter {
 
     /// Try to claim one slot. `Ok(None)` means the limiter is unlimited;
     /// `Ok(Some(permit))` hands the caller a permit that MUST be moved into
-    /// the spawned task so the slot is released when that task ends (including
-    /// panic unwinds); `Err(Overloaded)` means the cap is reached.
+    /// the spawned task and dropped as soon as the handler completes — before
+    /// awaiting the outbound enqueue (see `conn::finish_slow_path_rpc`), so a
+    /// stalled connection's backpressure never pins slots; a panic unwind
+    /// through the task still releases it. `Err(Overloaded)` means the cap is
+    /// reached.
     pub(crate) fn try_acquire(&self) -> Result<Option<OwnedSemaphorePermit>, Overloaded> {
         let Some(semaphore) = self.semaphore.clone() else {
             return Ok(None);

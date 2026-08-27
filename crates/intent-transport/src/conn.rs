@@ -14,8 +14,9 @@ use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 
 use crate::browser;
@@ -255,7 +256,9 @@ impl ConnSubs {
 /// (`server.maxOutstandingRpcs`) first; when the cap is reached the request is
 /// rejected immediately with `-32011 "Server overloaded"` (notifications are
 /// dropped silently) rather than queued. The permit is moved into the spawned
-/// task, so the slot is released when the task ends — panic unwinds included.
+/// task and released as soon as the handler completes — BEFORE the response
+/// is enqueued outbound (see [`finish_slow_path_rpc`]) — and a panic unwind
+/// through the task still drops it.
 /// Frames that fail parse/envelope validation are exempt: they are answered
 /// inline with the router's `-32700`/`-32600`, so the error matrix does not
 /// change under load.
@@ -372,19 +375,17 @@ pub(crate) async fn process_frame(
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                // Held for the whole task, so the slot is released when it
-                // ends — including a panic unwind through `guard_frame`.
-                let _permit = permit;
                 crate::context::with_connection_context(is_tcp, async {
-                    if let Some(frame) = panic_guard::guard_frame(
-                        &method,
-                        rpc_id,
-                        host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse),
+                    finish_slow_path_rpc(
+                        permit,
+                        panic_guard::guard_frame(
+                            &method,
+                            rpc_id,
+                            host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse),
+                        ),
+                        &out,
                     )
-                    .await
-                    {
-                        let _ = out.send_priority(frame).await;
-                    }
+                    .await;
                 })
                 .await;
             });
@@ -406,14 +407,13 @@ pub(crate) async fn process_frame(
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                let _permit = permit;
                 crate::context::with_connection_context(is_tcp, async {
-                    if let Some(frame) =
-                        panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse))
-                            .await
-                    {
-                        let _ = out.send_priority(frame).await;
-                    }
+                    finish_slow_path_rpc(
+                        permit,
+                        panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse)),
+                        &out,
+                    )
+                    .await;
                 })
                 .await;
             });
@@ -515,17 +515,41 @@ pub(crate) async fn process_frame(
     let raw = raw.to_string();
     let is_tcp = crate::context::is_tcp_connection();
     tokio::spawn(async move {
-        let _permit = permit;
         crate::context::with_connection_context(is_tcp, async {
-            if let Some(response) =
-                panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)).await
-            {
-                let _ = out_tx.send_priority(response).await;
-            }
+            finish_slow_path_rpc(
+                permit,
+                panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)),
+                &out_tx,
+            )
+            .await;
         })
         .await;
     });
     true
+}
+
+/// Finish one detached slow-path RPC: await the guarded `handler`, release
+/// the limiter slot, then enqueue the response frame (if any) on the
+/// priority lane.
+///
+/// The release ordering is the point: the permit covers handler execution
+/// only, NOT the outbound enqueue. When a connection's writer stalls, its
+/// priority lane fills and `send_priority` blocks — holding the permit across
+/// that await would let one slow connection pin every `maxOutstandingRpcs`
+/// slot and reject all other clients with `-32011`; bounding queued responses
+/// is the lane capacity's job. Panic safety is unchanged: `guard_frame`
+/// already catches handler panics, and the permit is owned by this future, so
+/// an unwind that does escape still drops it when the spawned task dies.
+async fn finish_slow_path_rpc(
+    permit: Option<OwnedSemaphorePermit>,
+    handler: impl Future<Output = Option<String>>,
+    out_tx: &OutboundSender,
+) {
+    let frame = handler.await;
+    drop(permit);
+    if let Some(frame) = frame {
+        let _ = out_tx.send_priority(frame).await;
+    }
 }
 
 /// Whether a generic frame can actually reach a service handler, i.e. it
@@ -1422,6 +1446,63 @@ mod tests {
             rx.priority.try_recv().is_err() && rx.bulk.try_recv().is_err(),
             "notifications get no response"
         );
+    }
+
+    /// Regression: a completed RPC releases its limiter slot BEFORE awaiting
+    /// the outbound enqueue. With the priority lane full (stalled writer),
+    /// completed handlers park on `send_priority` — but their permits must
+    /// already be free, so a subsequent RPC still acquires a slot instead of
+    /// being rejected with `-32011`. Moving the drop in
+    /// [`finish_slow_path_rpc`] back after the send makes this test fail.
+    #[tokio::test]
+    async fn permits_are_released_before_the_outbound_send() {
+        let limiter = RpcLimiter::new(2);
+        let (tx, mut rx) = outbound_channel();
+        // Stall the writer: fill the priority lane so response sends block.
+        for _ in 0..PRIORITY_CAPACITY {
+            tx.send_priority("stall".to_string()).await.unwrap();
+        }
+        // Two RPCs claim both slots and complete their handlers; their
+        // response sends park on the full lane.
+        let mut tasks = Vec::new();
+        for i in 0..2 {
+            let permit = limiter.try_acquire().expect("slot");
+            let out = tx.clone();
+            tasks.push(tokio::spawn(async move {
+                finish_slow_path_rpc(permit, async move { Some(format!("resp-{i}")) }, &out).await;
+            }));
+        }
+        // Both permits come free while the sends are still blocked.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while limiter.available_permits() != Some(2) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "permits must be released while the outbound sends are blocked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        for task in &tasks {
+            assert!(
+                !task.is_finished(),
+                "the response send must still be parked on the full lane"
+            );
+        }
+        // A subsequent RPC acquires a freed slot instead of `-32011`.
+        let regained = limiter.try_acquire().expect("freed slot").expect("permit");
+        drop(regained);
+        // Once the writer drains, the parked responses deliver intact.
+        for _ in 0..PRIORITY_CAPACITY {
+            assert_eq!(rx.recv().await.as_deref(), Some("stall"));
+        }
+        let mut got = vec![
+            rx.recv().await.expect("first response"),
+            rx.recv().await.expect("second response"),
+        ];
+        got.sort();
+        assert_eq!(got, ["resp-0", "resp-1"]);
+        for task in tasks {
+            task.await.unwrap();
+        }
     }
 
     /// Only frames that survive envelope validation are gated by the limiter;
