@@ -2529,7 +2529,12 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
               return await ws.app.agents.ask(target.agentId, 'Complete the requested work');";
     let relay_js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
                     const target = listing.threads.find((t) => t.agentName === 'Chief Ask Target');\n\
-                    return { relayTurn: true, targetAgentId: target.agentId };";
+                    const conversation = await ws.app.agents.readConversation(target.workspaceId, target.agentId, { lastN: 20 });\n\
+                    const finalAssistant = [...conversation.messages].reverse().find((message) => message.role === 'assistant' && typeof message.id === 'string' && message.id.length > 0);\n\
+                    if (!finalAssistant) throw new Error('target has no final assistant message');\n\
+                    const answer = (finalAssistant.contentBlocks || []).filter((block) => block.type === 'text').map((block) => block.text).join('');\n\
+                    const href = 'intent://local/' + conversation.workspaceId + '/agent/' + conversation.agentId + '/message/' + finalAssistant.id;\n\
+                    return { conversationRead: true, finalAssistantId: finalAssistant.id, relay: 'E2E_FINAL_USER_VISIBLE_RELAY: ' + answer + ' [' + conversation.workspaceTitle + '](' + href + ')' };";
     let behavior = json!({
         "response": "target turn complete",
         "rules": [
@@ -2542,9 +2547,9 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
                 "ifPromptContains": "[WORKSPACE EVENTS] Child agent Chief Ask Target",
                 "toolCall": {
                     "name": "workspace_api",
-                    "arguments": { "code": relay_js, "summary": "Mark Chief completion relay turn" },
+                    "arguments": { "code": relay_js, "summary": "Read target result and build Chief relay" },
                 },
-                "response": "E2E_FINAL_USER_VISIBLE_RELAY: Chief Ask Target completed",
+                "responseFromToolResultField": "relay",
                 "emitToolBlocks": true,
             },
             {
@@ -2691,13 +2696,18 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
         1,
         "one ask must deliver exactly one completion wake"
     );
-    let relay_turn = poll_conversation(&mut rpc, 600, &chief_id, "Chief relay worker turn", |m| {
+    let relay_read = poll_conversation(&mut rpc, 600, &chief_id, "Chief relay worker turn", |m| {
         tool_result_jsons(m)
             .into_iter()
-            .find(|value| value["relayTurn"] == json!(true))
+            .find(|value| value["conversationRead"] == json!(true))
     })
     .await;
-    assert_eq!(relay_turn["targetAgentId"], json!(target_id));
+    let final_assistant_id = relay_read["finalAssistantId"]
+        .as_str()
+        .expect("relay read final assistant id");
+    let canonical_url =
+        format!("intent://local/{target_ws}/agent/{target_id}/message/{final_assistant_id}");
+    assert!(canonical_url.ends_with(final_assistant_id));
 
     let relay_messages = poll_conversation(
         &mut rpc,
@@ -2714,7 +2724,7 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
     assert_eq!(
         tool_result_jsons(&relay_messages)
             .iter()
-            .filter(|value| value["relayTurn"] == json!(true))
+            .filter(|value| value["conversationRead"] == json!(true))
             .count(),
         1,
         "the completion wake must run exactly one Chief worker turn"
@@ -2733,6 +2743,30 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
             .count(),
         1,
         "the Chief worker turn must emit one final user-visible relay"
+    );
+    let relay_text = relay_messages
+        .as_array()
+        .expect("Chief relay messages")
+        .iter()
+        .find(|message| {
+            message["role"] == json!("assistant")
+                && serde_json::to_string(message)
+                    .expect("serialize Chief relay message")
+                    .contains("E2E_FINAL_USER_VISIBLE_RELAY")
+        })
+        .and_then(|message| message["contentBlocks"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<String>();
+    assert!(
+        relay_text.contains(&format!("[Chief Ask Workspace]({canonical_url})")),
+        "final relay must link the exact target assistant message: {relay_text}"
+    );
+    let visible_relay = relay_text.replace(&canonical_url, "");
+    assert!(
+        !visible_relay.contains(&target_ws) && !visible_relay.contains(&target_id),
+        "final relay prose and link label must not expose raw identifiers: {relay_text}"
     );
 
     let resp = wss_rpc_envelope(
