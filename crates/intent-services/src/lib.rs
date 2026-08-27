@@ -2004,6 +2004,19 @@ impl Services {
         }
     }
 
+    /// Cancel the pending debounced idle flip for a workspace, if any
+    /// (monorepo#3632): called from `workspace.delete` so the timer does not
+    /// outlive the workspace and emit a spurious
+    /// `workspace:activity-changed { idle }` for the deleted id ~3s after
+    /// the delete.
+    pub(crate) fn cancel_idle_debounce(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut debouncers) = self.idle_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(workspace_id) {
+                handle.abort();
+            }
+        }
+    }
+
     /// Populate a workspace's card aggregates (`taskStats`/`agentSummary`/
     /// `cowSupported`) for the `workspace.list` / `workspace.get` emit path (§9.1).
     /// Each is computed from live state (notes / agents / FS capability) and
@@ -2602,24 +2615,52 @@ impl Services {
                 gen_valid && count_zero
             };
 
-            if should_emit {
-                // Remove debouncer entry before emitting so reads stop reporting grace.
-                // Race note: an `agent_activity_begin` that lands after the
-                // should_emit check finds no handle to abort, so the client
-                // can observe `agent_running` followed by this stale `idle`
-                // activity event (pre-existing inversion). The displayStatus
-                // recompute below is safe against it: it re-reads
-                // `workspace_activity()` at emit time (count already 1 →
-                // `in_progress`) and the dedup cache suppresses a bogus
-                // demotion.
-                if let Ok(mut map) = debouncers.lock() {
-                    if let Some((current_gen, _)) = map.get(&ws_id) {
-                        if *current_gen == gen {
-                            map.remove(&ws_id);
-                        }
+            // Remove ourselves from the debouncers map (gen-guarded) on EVERY
+            // exit path, not just the emitting one (monorepo#3632): a
+            // suppressed fire — agents back in flight at fire time — must not
+            // strand this task's `(gen, AbortHandle)` entry for the daemon's
+            // lifetime (ids are never recycled, and nothing later removes an
+            // entry whose timer has already finished). On the emitting path
+            // the removal runs before the publish so reads stop reporting
+            // grace first.
+            // Race note: an `agent_activity_begin` that lands after the
+            // should_emit check finds no handle to abort, so the client
+            // can observe `agent_running` followed by this stale `idle`
+            // activity event (pre-existing inversion). The displayStatus
+            // recompute below is safe against it: it re-reads
+            // `workspace_activity()` at emit time (count already 1 →
+            // `in_progress`) and the dedup cache suppresses a bogus
+            // demotion.
+            if let Ok(mut map) = debouncers.lock() {
+                if let Some((current_gen, _)) = map.get(&ws_id) {
+                    if *current_gen == gen {
+                        map.remove(&ws_id);
                     }
                 }
+            }
 
+            if should_emit {
+                // Existence guard (monorepo#3632): a fire racing
+                // `workspace.delete` can pass the gen/count checks and remove
+                // its own entry while the delete is mid-flight — the delete's
+                // sweep then finds no handle to abort, and this task would
+                // publish a durable `{ idle }` for the deleted id. Ids are
+                // never recycled, so not-found always means "deleted
+                // mid-window"; skip the emit (same shape as
+                // `schedule_last_activity_event`'s NotFound handling,
+                // monorepo#3623). Any other probe error fails open — the row
+                // almost certainly exists and a missed idle flip would strand
+                // clients on `agent_running`.
+                if matches!(
+                    this.store.get_workspace(&ws_id).await,
+                    Err(Error::NotFound(_))
+                ) {
+                    tracing::debug!(
+                        workspace = %ws_id.as_str(),
+                        "schedule_idle_debounce: workspace deleted before the debounce fired; skipping"
+                    );
+                    return;
+                }
                 publish_event(
                     this.event_bus.as_ref(),
                     activity_changed_event(&ws_id, WorkspaceActivity::Idle),
@@ -16093,6 +16134,16 @@ impl WorkspaceApi for Services {
             // not-found WARN. After the row delete, so a schedule placed
             // by the teardown above is swept too.
             services.cancel_last_activity_schedule(&id);
+            // Sweep the pending idle debouncer the same way (monorepo#3632):
+            // an `agent_activity_end` during the agent teardown above
+            // schedules an idle flip whose timer would otherwise outlive the
+            // workspace and emit a spurious
+            // `workspace:activity-changed { idle }` ~3s after deletion.
+            // Residual race: an `agent_activity_end` landing after this sweep
+            // can still re-arm a flip for the deleted id — the timer's
+            // every-exit-path removal self-heals the map entry, and its
+            // emit-time existence guard skips the spurious event.
+            services.cancel_idle_debounce(&id);
             // Evict the deleted workspace's last-observed displayStatus
             // baseline so the in-memory map does not leak for the daemon's
             // lifetime (and a same-id recreate seeds fresh).
