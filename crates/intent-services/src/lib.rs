@@ -20631,7 +20631,7 @@ impl WorkspaceApi for Services {
             // preferred over untracked, additive `filesTruncated`/`totalFiles`
             // markers set — so a ~100k-untracked-file worktree can no longer
             // produce a multi-megabyte outbound frame.
-            status.map(|s| intent_git::status::cap_status_files((*s).clone()))
+            status.map(|s| intent_git::status::cap_status_files(&s))
         })
     }
 
