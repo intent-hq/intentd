@@ -186,8 +186,12 @@ pub(crate) fn background_agent_types() -> &'static [&'static str] {
 /// (port of `getToolRestrictionsForAgent` in the reference `acp-provider.ts`).
 ///
 /// Precedence:
-/// 1. Coordinator / spec-writer specialist: [`FILE_WRITE_TOOLS`] +
-///    [`SUBAGENT_TOOLS`] + [`CONFLICTING_BUILTIN_TOOLS`]. Note: the reference
+/// 1. Orchestrator-role specialist (`is_orchestrator` — resolved by the
+///    caller from the specialist registry's `role` frontmatter, with a
+///    name-based fallback for the historical `spec-writer`/`coordinator`
+///    ids; see `SpecialistsService::resolve_is_orchestrator` in
+///    `intent-services`): [`FILE_WRITE_TOOLS`] + [`SUBAGENT_TOOLS`] +
+///    [`CONFLICTING_BUILTIN_TOOLS`]. Note: the reference
 ///    comment mentions `EXECUTION_TOOLS` should also be removed here, but the
 ///    reference **code** does not include it — we match the code to preserve
 ///    parity (documented in the PR).
@@ -201,8 +205,8 @@ pub(crate) fn background_agent_types() -> &'static [&'static str] {
 ///    sub-agents have no UI representation, so every agent must go through the
 ///    workspace `ws.agent.*` surface instead of the auggie-native sub-agent.
 #[must_use]
-pub fn get_tools_to_remove(specialist: Option<&str>, agent_type: &str) -> Vec<&'static str> {
-    if matches!(specialist, Some("spec-writer" | "coordinator")) {
+pub fn get_tools_to_remove(is_orchestrator: bool, agent_type: &str) -> Vec<&'static str> {
+    if is_orchestrator {
         let mut out = Vec::with_capacity(
             FILE_WRITE_TOOLS.len() + SUBAGENT_TOOLS.len() + CONFLICTING_BUILTIN_TOOLS.len(),
         );
@@ -235,25 +239,18 @@ mod tests {
     }
 
     #[test]
-    fn spec_writer_removes_file_write_and_subagents() {
-        let tools = get_tools_to_remove(Some("spec-writer"), "interactive");
+    fn orchestrator_removes_file_write_and_subagents() {
+        let tools = get_tools_to_remove(true, "interactive");
         assert!(contains_all(&tools, FILE_WRITE_TOOLS));
         assert!(contains_all(&tools, SUBAGENT_TOOLS));
         assert!(contains_all(&tools, CONFLICTING_BUILTIN_TOOLS));
-        // Reference code does NOT include EXECUTION_TOOLS for spec-writer.
+        // Reference code does NOT include EXECUTION_TOOLS for orchestrators.
         assert!(!tools.contains(&"launch-process"));
     }
 
     #[test]
-    fn coordinator_alias_matches_spec_writer() {
-        let a = get_tools_to_remove(Some("spec-writer"), "interactive");
-        let b = get_tools_to_remove(Some("coordinator"), "interactive");
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn background_task_loop_gets_subagent_block_plus_conflicts() {
-        let tools = get_tools_to_remove(None, "task-loop");
+        let tools = get_tools_to_remove(false, "task-loop");
         assert!(contains_all(&tools, SUBAGENT_TOOLS));
         assert!(contains_all(&tools, CONFLICTING_BUILTIN_TOOLS));
         // task-loop denylist is SUBAGENT_TOOLS only — no file-write.
@@ -262,7 +259,7 @@ mod tests {
 
     #[test]
     fn background_pure_text_agent_gets_full_denylist() {
-        let tools = get_tools_to_remove(None, "commit-message");
+        let tools = get_tools_to_remove(false, "commit-message");
         assert!(contains_all(&tools, FILE_WRITE_TOOLS));
         assert!(contains_all(&tools, EXECUTION_TOOLS));
         assert!(contains_all(&tools, SUBAGENT_TOOLS));
@@ -271,7 +268,9 @@ mod tests {
 
     #[test]
     fn interactive_agent_gets_global_subagent_block() {
-        let tools = get_tools_to_remove(None, "interactive");
+        // Non-orchestrator agents (plain or non-orchestrator specialist)
+        // take the global fallback path.
+        let tools = get_tools_to_remove(false, "interactive");
         assert!(contains_all(&tools, SUBAGENT_TOOLS));
         assert!(contains_all(&tools, CONFLICTING_BUILTIN_TOOLS));
         // Non-restricted agents keep file-write, execution, etc.
@@ -280,18 +279,10 @@ mod tests {
     }
 
     #[test]
-    fn implementor_specialist_gets_global_only() {
-        // Non-coordinator specialists take the global fallback path.
-        let tools = get_tools_to_remove(Some("implementor"), "interactive");
-        assert!(contains_all(&tools, SUBAGENT_TOOLS));
-        assert!(!tools.contains(&"str-replace-editor"));
-    }
-
-    #[test]
-    fn specialist_beats_background_agent_type() {
-        // spec-writer running as a background task-loop still gets the
-        // spec-writer restrictions (specialist check runs first).
-        let tools = get_tools_to_remove(Some("spec-writer"), "task-loop");
+    fn orchestrator_beats_background_agent_type() {
+        // An orchestrator running as a background task-loop still gets the
+        // orchestrator restrictions (the orchestrator check runs first).
+        let tools = get_tools_to_remove(true, "task-loop");
         assert!(contains_all(&tools, FILE_WRITE_TOOLS));
     }
 

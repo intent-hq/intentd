@@ -305,8 +305,11 @@ pub(crate) fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// value, an explicit empty value (`model: ""`) clears it, and an explicit
 /// non-empty value overrides it.
 /// `role` is the picker-orchestration enum (`orchestrator` | `internal`;
-/// absent = standard) and `icon` names a client-side avatar design; both are
-/// render-only metadata for pickers (never consulted at delegation time).
+/// absent = standard) and `icon` names a client-side avatar design. `icon`
+/// is render-only picker metadata; `role` additionally gates the spawn-time
+/// orchestrator tool denylist (§18.4,
+/// [`SpecialistsService::resolve_is_orchestrator`]) but is still never
+/// consulted at delegation time.
 /// `role` is validated on `specialist.create`/`edit` ([`validate_role_spec`])
 /// but read leniently — an out-of-enum on-disk value is normalized to
 /// omitted (which inherits), so `list`/`get` never serve a value the strict
@@ -1144,6 +1147,41 @@ impl SpecialistsService {
         })
     }
 
+    /// Resolve a specialist's `role` frontmatter enum (PROTOCOL §5.11:
+    /// `orchestrator` | `internal`) through the 3-tier order (project >
+    /// user > bundled). Returns `None` when the specialist is unknown or
+    /// carries no effective role (omitted, explicitly cleared, or
+    /// normalized-out on read — an explicit `role: ""` clear folds to an
+    /// absent key inside `resolve()`, so it is indistinguishable from
+    /// omission here).
+    pub(crate) fn resolve_role(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
+        self.resolve(id, workspace_path).and_then(|def| {
+            def.get("role")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
+    /// Whether a specialist id resolves to the `orchestrator` role — the
+    /// spawn-time gate for the orchestrator tool denylist (§18.4,
+    /// `intent_acp::get_tools_to_remove`). An explicitly resolved role
+    /// decides directly; when no role resolves, the historical orchestrator
+    /// ids `spec-writer`/`coordinator` fall back to orchestrator by name.
+    /// The fallback exists because sessions can carry those ids without a
+    /// resolvable role: the v1 embedded floor predates the `role` key
+    /// (picker metadata landed in v1.1), and a session's specialist may no
+    /// longer resolve at all (deleted custom file, [`REPLACEMENT_DIR_ENV`]
+    /// base replacement, v1 floor without the `coordinator` alias) —
+    /// dropping the restriction there would silently hand an orchestrator
+    /// its file-editing tools back.
+    pub(crate) fn resolve_is_orchestrator(&self, id: &str, workspace_path: Option<&Path>) -> bool {
+        match self.resolve_role(id, workspace_path) {
+            Some(role) => role == "orchestrator",
+            None => matches!(id, "spec-writer" | "coordinator"),
+        }
+    }
+
     /// Resolve a specialist's display name (frontmatter `name`, defaulting to
     /// the id inside `resolve()`) through the 3-tier order (project > user >
     /// bundled), used at spawn time to derive a created agent's name when the
@@ -1763,6 +1801,80 @@ mod tests {
         );
         let def = svc.resolve("implementor", None).expect("resolves");
         assert_eq!(def["name"], "File Implementor");
+    }
+
+    /// Role-based orchestrator resolution (§18.4): an explicit
+    /// `role: "orchestrator"` on any custom specialist engages the
+    /// orchestrator gate; `internal` and role-less specialists do not.
+    #[test]
+    fn resolve_is_orchestrator_keys_off_role_frontmatter() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "planner",
+            "---\nname: \"Planner\"\ndescription: \"d\"\nrole: \"orchestrator\"\n---\n\nbody",
+        );
+        dir.write(
+            "helper",
+            "---\nname: \"Helper\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        dir.write(
+            "plain",
+            "---\nname: \"Plain\"\ndescription: \"d\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir);
+        assert_eq!(
+            svc.resolve_role("planner", None).as_deref(),
+            Some("orchestrator")
+        );
+        assert!(svc.resolve_is_orchestrator("planner", None));
+        assert!(!svc.resolve_is_orchestrator("helper", None));
+        assert!(!svc.resolve_is_orchestrator("plain", None));
+    }
+
+    /// The bundled orchestrator still resolves as one via its v1.1 `role`
+    /// frontmatter — including through the `coordinator` alias — while the
+    /// bundled internal specialists do not.
+    #[test]
+    fn resolve_is_orchestrator_bundled_spec_writer_and_alias() {
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        assert!(svc.resolve_is_orchestrator("spec-writer", None));
+        assert!(svc.resolve_is_orchestrator("coordinator", None));
+        assert!(!svc.resolve_is_orchestrator("implementor", None));
+    }
+
+    /// Name-based fallback: sessions can carry an orchestrator id without a
+    /// resolvable role — a v1-pinned floor predates the `role` key, and an
+    /// id may no longer resolve at all (no `coordinator` alias in the v1
+    /// floor, deleted custom file). The historical ids stay orchestrators;
+    /// unknown ids do not.
+    #[test]
+    fn resolve_is_orchestrator_name_fallback_when_role_unresolvable() {
+        static V1_LIKE: &[(&str, &str)] = &[(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\n---\n\nbody",
+        )];
+        let empty = TempSpecialistsDir::new();
+        let svc = service_over(&empty).with_embedded(V1_LIKE);
+        // Resolves, but the pinned floor carries no `role` key.
+        assert!(svc.resolve_is_orchestrator("spec-writer", None));
+        // Does not resolve at all (no alias in the pinned floor).
+        assert!(svc.resolve_is_orchestrator("coordinator", None));
+        // Unknown non-orchestrator id takes no fallback.
+        assert!(!svc.resolve_is_orchestrator("mystery", None));
+    }
+
+    /// An explicit non-orchestrator role on a historical orchestrator id
+    /// wins over the name fallback.
+    #[test]
+    fn resolve_is_orchestrator_explicit_role_overrides_name_fallback() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir);
+        assert!(!svc.resolve_is_orchestrator("spec-writer", None));
     }
 
     /// Alias resolution (PROTOCOL §5.11): an `aliases` entry resolves to the

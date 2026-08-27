@@ -1243,6 +1243,27 @@ impl Services {
             .is_some()
     }
 
+    /// Whether a session's specialist resolves to the `orchestrator` role —
+    /// the spawn-time gate for the orchestrator tool denylist (§18.4,
+    /// [`intent_acp::get_tools_to_remove`]). Resolution runs against the
+    /// session's harness-pinned embedded floor (H2), like the other
+    /// session-scoped specialist reads; the name-based fallback for the
+    /// historical `spec-writer`/`coordinator` ids lives in
+    /// [`specialists::SpecialistsService::resolve_is_orchestrator`].
+    pub(crate) fn session_specialist_is_orchestrator(
+        &self,
+        session: &AgentSession,
+        workspace_path: Option<&Path>,
+    ) -> bool {
+        let Some(specialist_id) = session.specialist.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let entry = crate::harness::resolve_entry(&session.harness_version);
+        self.specialists_service()
+            .with_embedded(entry.doctrine.specialists)
+            .resolve_is_orchestrator(specialist_id, workspace_path)
+    }
+
     /// Resolve every non-hidden specialist's delegation `modelOptions`
     /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
     /// per-agent `workspace_api` tool description at bridge creation. Each
