@@ -3,12 +3,15 @@
 //! One cache implementation serves every provider: entries are keyed by
 //! provider id and carry a version key (e.g. a pinned ACP adapter version) so
 //! a pin bump invalidates the cached list automatically. Successful non-empty
-//! fetches are persisted in the daemon data dir and served **indefinitely** —
-//! there is no age-based expiry (empty-but-successful results are served but
-//! not cached). A probe runs only on a true cache miss (no entry for the
-//! provider under its current version key) or on a `force_refresh` read;
-//! either falls back to the last-good list — labeled with a `warning` — only
-//! when the probe fails.
+//! fetches are persisted in the daemon data dir and served as fresh for
+//! [`MODELS_STALE_AFTER`] (empty-but-successful results are served but not
+//! cached). A probe runs on a true cache miss (no entry for the provider
+//! under its current version key), on an **aged** entry (older than the
+//! staleness threshold — so newly released provider models appear without a
+//! manual refresh), or on a `force_refresh` read; each falls back to the
+//! last-good list — labeled `stale` with a `warning` — only when the probe
+//! fails, so an aged entry whose provider is unreachable never degrades
+//! below the last-good list.
 //!
 //! Probes are bounded two ways so a broken adapter cannot be re-spawned on
 //! every `models.list` call: concurrent fetches for one (provider, version
@@ -42,6 +45,15 @@ pub(crate) const MODELS_CACHE_FILE: &str = "models-cache.json";
 /// probe spawns an adapter/CLI, so a persistent failure must not be retried
 /// on every `models.list` call (PROTOCOL §5.30).
 pub(crate) const MODELS_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a cached success is served as fresh before a non-forced read
+/// re-probes the provider (age-based staleness threshold): without it a
+/// cached catalog is served forever and newly released provider models never
+/// appear until a manual forced refresh (intent-hq/intent#3682). A failed
+/// re-probe never degrades service — the aged entry keeps being served,
+/// labeled `stale` + `warning` (PROTOCOL §5.30).
+pub(crate) const MODELS_STALE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Outcome of one provider model probe: `models: None` means the probe failed
 /// (CLI unavailable / nothing parseable) and the caller may fall back;
@@ -352,12 +364,28 @@ impl ModelCatalogCache {
 
     /// The last successfully fetched rows for `provider_id` regardless of
     /// age, provided they were fetched under `version_key` — a version-pin
-    /// bump invalidates automatically. This is the cache-hit read: entries
-    /// never expire by age, so it doubles as the failure fallback source.
+    /// bump invalidates automatically. This is the failure fallback source:
+    /// entries never expire by age for fallback purposes (the fresh-serving
+    /// read is [`Self::fresh_hit`]).
     fn last_good(&self, provider_id: &str, version_key: &str) -> Option<Vec<Value>> {
         let entries = self.entries.lock().expect("model catalog cache poisoned");
         let entry = entries.get(provider_id)?;
         (entry.version_key == version_key).then(|| entry.models.clone())
+    }
+
+    /// The cache-hit read: [`Self::last_good`] restricted to entries younger
+    /// than [`MODELS_STALE_AFTER`]. Age is a saturating subtraction, so an
+    /// entry stamped ahead of `now` (system clock moved backwards) reads as
+    /// age zero — served as fresh until the wall clock catches up.
+    fn fresh_hit(&self, provider_id: &str, version_key: &str, now_ms: u64) -> Option<Vec<Value>> {
+        let entries = self.entries.lock().expect("model catalog cache poisoned");
+        let entry = entries.get(provider_id)?;
+        if entry.version_key != version_key {
+            return None;
+        }
+        let age = now_ms.saturating_sub(entry.fetched_at_ms);
+        (age < u64::try_from(MODELS_STALE_AFTER.as_millis()).unwrap_or(u64::MAX))
+            .then(|| entry.models.clone())
     }
 
     /// Cached-catalog ownership evidence for one provider (monorepo#607):
@@ -367,11 +395,12 @@ impl ModelCatalogCache {
     /// version-key mismatch — stale-pin entries are not evidence).
     /// Synchronous and read-only: no probe, no negative-cache interaction —
     /// the bare-model ownership guard must never block on or trigger a fetch.
-    /// Trade-off of serving entries regardless of age: a `Some(false)`
+    /// Trade-off of consulting entries regardless of age: a `Some(false)`
     /// disproof can outlive the provider's real catalog (e.g. a model added
-    /// upstream after the last fetch keeps being rejected until a forced
-    /// `models.list` refresh replaces the entry); a compound `provider:model`
-    /// id always bypasses the bare-model guard, so callers are never wedged.
+    /// upstream after the last fetch keeps being rejected until the entry
+    /// ages past [`MODELS_STALE_AFTER`] and a `models.list` read — or a
+    /// forced refresh — replaces it); a compound `provider:model` id always
+    /// bypasses the bare-model guard, so callers are never wedged.
     pub(crate) fn cached_catalog_claims(&self, provider_id: &str, bare_id: &str) -> Option<bool> {
         let source = source_for(provider_id)?;
         let version_key = (source.version_key)();
@@ -681,10 +710,12 @@ pub(crate) struct ResolvedModels {
 }
 
 /// The single cache policy every provider goes through (PROTOCOL §5.30):
-/// non-forced reads serve a cached entry indefinitely — regardless of age —
-/// so a probe runs only on a true miss (no entry under the current version
-/// key) or a forced read; a fresh negative entry (recent probe failure)
-/// short-circuits a miss to the failure fallback without re-probing
+/// non-forced reads serve a cached entry while it is fresh (younger than
+/// [`MODELS_STALE_AFTER`]), so a probe runs on a true miss (no entry under
+/// the current version key), on an aged entry, or on a forced read; a fresh
+/// negative entry (recent probe failure) short-circuits a miss or aged read
+/// to the failure fallback without re-probing — an aged entry within the
+/// negative window keeps being served as the stale-labeled last-good list
 /// (`force_refresh` skips both cache reads). Concurrent probes for one
 /// (provider, version key) are single-flighted — one fetch runs, everyone
 /// shares its result. A successful non-empty probe is stored (empty successes
@@ -704,7 +735,7 @@ where
     F: FnOnce() -> BoxFuture<'static, ModelFetchResult>,
 {
     if !force_refresh {
-        if let Some(models) = cache.last_good(provider_id, version_key) {
+        if let Some(models) = cache.fresh_hit(provider_id, version_key, now_ms) {
             return ResolvedModels {
                 models: Some(models),
                 stale: false,
