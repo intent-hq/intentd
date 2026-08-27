@@ -4786,10 +4786,7 @@ impl AgentManager {
                 // block the turn.
                 self.persist_auto_unarchive_notice(agent_id, workspace_id)
                     .await;
-                self.auto_unarchived
-                    .lock()
-                    .unwrap()
-                    .insert(agent_id.clone());
+                self.arm_auto_unarchive_flag_if_slot_held(agent_id);
             }
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
@@ -4834,6 +4831,27 @@ impl AgentManager {
         // later unrelated turn.
         self.auto_unarchived.lock().unwrap().remove(agent_id);
         Some(self.agent_ws.lock().unwrap().remove(agent_id))
+    }
+
+    /// Arm the one-shot auto-unarchive prompt flag, but only while the agent
+    /// still holds its in-flight slot — decided atomically under the `busy`
+    /// lock (lock order busy → `auto_unarchived`, matching
+    /// [`Self::release_slot_sync`]). The flag is armed AFTER the awaits on
+    /// `auto_unarchive_on_turn_start` / `persist_auto_unarchive_notice`, so
+    /// a concurrent stop/teardown can run `release_slot_sync` in that window;
+    /// its clear finds nothing, and an unconditional insert landing after it
+    /// would leak the notice into a later, non-triggering turn. Holding
+    /// `busy` while inserting closes the window: either this claim still owns
+    /// the slot (insert precedes the release's clear) or the slot is gone
+    /// (insert is skipped entirely).
+    fn arm_auto_unarchive_flag_if_slot_held(&self, agent_id: &AgentId) {
+        let busy = self.busy.lock().unwrap();
+        if busy.contains(agent_id) {
+            self.auto_unarchived
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone());
+        }
     }
 
     /// Release the in-flight slot, recomputing the owning workspace's derived

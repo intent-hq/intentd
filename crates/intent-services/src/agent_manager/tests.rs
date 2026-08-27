@@ -2200,6 +2200,56 @@ async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
     mgr.end_turn(&id).await;
 }
 
+/// The arm-skipped-after-release interleaving: `try_begin_outcome` arms the
+/// prompt flag only while THIS claim still holds the slot, decided under the
+/// `busy` lock. A concurrent stop/teardown releasing the slot during the
+/// awaits between the claim and the arm (`release_slot_sync` clears nothing)
+/// must cause the late arm to be SKIPPED — an unconditional insert would
+/// leave a stale flag that leaks the notice into a later, non-triggering
+/// turn. Drives `arm_auto_unarchive_flag_if_slot_held` at both edges of the
+/// race window.
+#[tokio::test]
+async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-arm-race");
+    let id = AgentId::from("a-arm-race");
+    seed_agent(&mgr, &ws, &id).await;
+
+    // Slot held: the arm lands.
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.arm_auto_unarchive_flag_if_slot_held(&id);
+    assert!(
+        mgr.auto_unarchived.lock().unwrap().contains(&id),
+        "the arm lands while the claim holds the slot"
+    );
+    mgr.end_turn(&id).await;
+    assert!(
+        !mgr.auto_unarchived.lock().unwrap().contains(&id),
+        "the release clears the armed flag"
+    );
+
+    // The race: the slot was released (concurrent stop/teardown) before the
+    // arm ran — the late arm must be skipped, not inserted after the clear.
+    mgr.arm_auto_unarchive_flag_if_slot_held(&id);
+    assert!(
+        !mgr.auto_unarchived.lock().unwrap().contains(&id),
+        "a late arm after the slot release must be skipped"
+    );
+
+    // The next turn's prompt stays clean.
+    assert!(mgr.try_begin(&id, &ws).await, "next claim wins");
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    assert!(
+        !serde_json::to_string(&prompt)
+            .unwrap()
+            .contains("automatically unarchived"),
+        "no stale notice leaks into the later, non-triggering turn"
+    );
+    mgr.end_turn(&id).await;
+}
+
 /// A winning `try_begin` whose workspace row is MISSING (unarchivable) must
 /// still start the turn — the auto-unarchive is best-effort and never
 /// blocks or fails the claim.
