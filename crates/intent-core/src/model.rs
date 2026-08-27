@@ -3089,7 +3089,9 @@ pub struct AgentLite {
     pub created_at: String,
     pub updated_at: String,
     /// Most-recent activity timestamp; derived from `updated_at` (iOS falls back
-    /// to this after `updatedAt`).
+    /// to this after `updatedAt`). Mid-turn the service projection overlays the
+    /// live-turn stream stamp when newer (monorepo#3647), so it advances on
+    /// tool-call/stream activity while nothing has persisted yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
     pub message_count: u64,

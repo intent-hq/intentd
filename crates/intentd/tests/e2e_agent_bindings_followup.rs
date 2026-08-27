@@ -297,6 +297,7 @@ async fn agent_read_conversation_returns_messages() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("get conversation");

@@ -4454,7 +4454,7 @@ async fn get_conversation_surfaces_turn_liveness() {
 
     // Idle: turnInFlight false, lastStreamActivityAt null (always present).
     let res = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(res["turnInFlight"], false);
@@ -4468,7 +4468,7 @@ async fn get_conversation_surfaces_turn_liveness() {
         vec![json!({ "type": "text", "id": "msg-1:0", "text": "streaming…" })],
     );
     let res = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(res["turnInFlight"], true);
@@ -4481,11 +4481,230 @@ async fn get_conversation_surfaces_turn_liveness() {
     svc.clear_live_turn(&id);
     svc.set_test_busy(&id, false);
     let res = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(res["turnInFlight"], false);
     assert!(res["lastStreamActivityAt"].is_null());
+}
+
+/// monorepo#3647: with `includeInProgress`, a tail-page conversation read
+/// mid-turn appends the in-flight turn's partial assistant message as a
+/// trailing `inProgress: true` row — outside `totalMessages`/pagination —
+/// while opted-out reads and non-tail pages stay byte-identical.
+#[tokio::test]
+async fn get_conversation_appends_in_progress_tail_when_opted_in() {
+    use intent_core::ConversationProjection;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Streamer").await;
+    for i in 0..3 {
+        let c = json!([{ "type": "text", "text": format!("m{i}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![
+            json!({ "type": "text", "id": "msg-live:0", "text": "streaming…" }),
+            json!({ "type": "tool_use", "id": "msg-live:1", "name": "bash", "input": {"cmd": "ls"} }),
+        ],
+    );
+
+    // Opted in, tail page: persisted rows + one trailing inProgress row.
+    let res = svc
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, true)
+        .await
+        .expect("conv");
+    assert_eq!(res["totalMessages"], 3, "synthetic row not counted");
+    assert_eq!(res["truncated"], false);
+    let messages = res["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4, "3 persisted + in-progress tail");
+    let tail = &messages[3];
+    assert_eq!(tail["inProgress"], true);
+    assert_eq!(tail["id"], "msg-live");
+    assert_eq!(tail["role"], "assistant");
+    assert_eq!(tail["contentBlocks"][0]["text"], "streaming…");
+    assert_eq!(tail["contentBlocks"][1]["name"], "bash");
+    assert!(
+        messages[..3].iter().all(|m| m.get("inProgress").is_none()),
+        "persisted rows never carry the flag"
+    );
+
+    // Opted out: byte-identical to before — no synthetic row.
+    let res = svc
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
+        .await
+        .expect("conv");
+    assert_eq!(res["messages"].as_array().unwrap().len(), 3);
+
+    // Non-tail page (older continuation): never carries the row even when
+    // opted in — only the page that ends at the live tail does.
+    let tail_page = svc
+        .agent_get_conversation_op(id.clone(), Some(1), None, None, None, None, None, true)
+        .await
+        .expect("tail page");
+    assert_eq!(tail_page["messages"].as_array().unwrap().len(), 2);
+    let older_token = tail_page["nextToken"].as_str().expect("token").to_string();
+    let older = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(1),
+            None,
+            Some(older_token),
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("older page");
+    let older_msgs = older["messages"].as_array().unwrap();
+    assert!(
+        older_msgs.iter().all(|m| m.get("inProgress").is_none()),
+        "older page has no in-progress row: {older_msgs:?}"
+    );
+
+    // The row runs through the slim projection like persisted rows: an
+    // oversized tool input arrives truncated with a stable block id.
+    let big = "x".repeat(64 * 1024);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({ "type": "tool_use", "id": "msg-live:0", "name": "bash", "input": {"cmd": big} })],
+    );
+    let res = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ConversationProjection::Slim),
+            true,
+        )
+        .await
+        .expect("slim conv");
+    let messages = res["messages"].as_array().unwrap();
+    let tail = messages.last().unwrap();
+    assert_eq!(tail["inProgress"], true);
+    assert_eq!(tail["contentBlocks"][0]["inputTruncated"], true);
+
+    // Turn end: the tail row disappears even with the param set.
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+    let res = svc
+        .agent_get_conversation_op(id, None, None, None, None, None, None, true)
+        .await
+        .expect("conv");
+    assert_eq!(res["messages"].as_array().unwrap().len(), 3);
+}
+
+/// monorepo#3647: `AgentLite.lastActivity` is overlaid with the live-turn
+/// stream stamp mid-turn, so pollers watching it see a long-but-alive turn
+/// advance instead of a value frozen at turn start.
+#[tokio::test]
+async fn agent_lite_last_activity_overlays_live_stream_stamp() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Streamer").await;
+
+    // Freeze the persisted stamp in the past — a long turn's updated_at.
+    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    s.updated_at = "2000-01-01T00:00:00Z".to_string();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("backdate");
+    let v = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(v["lastActivity"], "2000-01-01T00:00:00Z");
+
+    // Mid-turn: the newer stream stamp wins.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-1",
+        vec![json!({ "type": "text", "id": "msg-1:0", "text": "thinking…" })],
+    );
+    let v = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    let stream = v["lastStreamActivityAt"].as_str().expect("stream stamp");
+    assert_eq!(
+        v["lastActivity"].as_str().unwrap(),
+        stream,
+        "lastActivity overlaid with the live stream stamp: {v}"
+    );
+
+    // Turn end: back to the persisted stamp.
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+    let v = serde_json::to_value(svc.agent_get_op(id, None).await.expect("get")).unwrap();
+    assert_eq!(v["lastActivity"], "2000-01-01T00:00:00Z");
+}
+
+/// monorepo#3647: `agent.diagnostics` keys `staleResponding` on the
+/// liveness-aware activity (max of persisted `updatedAt` and the live-turn
+/// stream stamp) and serves the raw `lastStreamActivityAt` — an agent
+/// actively streaming a long turn is never flagged stale.
+#[tokio::test]
+async fn diagnostics_stale_responding_respects_live_stream_activity() {
+    use serde_json::Value;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "LongTurn").await;
+
+    // Responding status with a long-stale persisted stamp.
+    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    s.status = intent_core::AgentStatus::Active;
+    s.updated_at = "2000-01-01T00:00:00Z".to_string();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark responding stale");
+
+    let find_row = |result: &Value| -> Value {
+        result["diagnostics"]["agents"]
+            .as_array()
+            .expect("agents")
+            .iter()
+            .find(|a| a["id"] == id.0.as_str())
+            .expect("row")
+            .clone()
+    };
+
+    // No live turn: persisted staleness stands.
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let row = find_row(&result);
+    assert_eq!(row["staleResponding"], true);
+    assert!(row.get("lastStreamActivityAt").is_none());
+
+    // Mid-turn stream activity: fresh liveness overrides the frozen
+    // persisted stamp — not stale, and the raw stream stamp is served.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-1",
+        vec![json!({ "type": "text", "id": "msg-1:0", "text": "still working…" })],
+    );
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics live");
+    let row = find_row(&result);
+    assert_eq!(
+        row["staleResponding"], false,
+        "streaming agent is not stale: {row}"
+    );
+    let stream = row["lastStreamActivityAt"].as_str().expect("stream stamp");
+    assert_eq!(
+        row["lastActivity"].as_str().unwrap(),
+        stream,
+        "lastActivity keyed on the liveness-aware max"
+    );
 }
 
 #[tokio::test]
@@ -4626,7 +4845,7 @@ async fn get_conversation_truncates_to_limit() {
             .expect("append");
     }
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(res["totalMessages"], 5);
@@ -4657,7 +4876,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 1: newest two, oldest→newest within the page, nextToken present.
     let p1 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("p1");
     assert_eq!(p1["totalMessages"], 5);
@@ -4672,7 +4891,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 2 follows the token to the next-older window.
     let p2 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t1), None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t1), None, None, None, false)
         .await
         .expect("p2");
     let m2 = p2["messages"].as_array().unwrap();
@@ -4682,7 +4901,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 3 is the final page: oldest message, no further token.
     let p3 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t2), None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t2), None, None, None, false)
         .await
         .expect("p3");
     let m3 = p3["messages"].as_array().unwrap();
@@ -4694,13 +4913,13 @@ async fn get_conversation_paginates_with_opaque_next_token() {
     // No limit → default page returns all five with no token; an over-max limit
     // clamps to 200 and likewise fits all five in one page.
     let all = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("all");
     assert_eq!(all["messages"].as_array().unwrap().len(), 5);
     assert!(all["nextToken"].is_null());
     let clamped = svc
-        .agent_get_conversation_op(id, Some(10_000), None, None, None, None, None)
+        .agent_get_conversation_op(id, Some(10_000), None, None, None, None, None, false)
         .await
         .expect("clamped");
     assert_eq!(clamped["messages"].as_array().unwrap().len(), 5);
@@ -4737,6 +4956,7 @@ async fn get_conversation_seeks_around_message_id() {
             Some(ids[5].clone()),
             None,
             None,
+            false,
         )
         .await
         .expect("seek");
@@ -4757,7 +4977,16 @@ async fn get_conversation_seeks_around_message_id() {
 
     // nextToken continues into strictly older rows (ordinary backward paging).
     let older = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(next), None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(next),
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect("older");
     let mo = older["messages"].as_array().unwrap();
@@ -4770,7 +4999,16 @@ async fn get_conversation_seeks_around_message_id() {
 
     // prevToken walks newer to the live tail; the tail page has no prev.
     let newer = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(prev), None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(prev),
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect("newer");
     let mn = newer["messages"].as_array().unwrap();
@@ -4812,6 +5050,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
             Some(ids[0].clone()),
             None,
             None,
+            false,
         )
         .await
         .expect("oldest seek");
@@ -4832,6 +5071,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
             Some(ids[5].clone()),
             None,
             None,
+            false,
         )
         .await
         .expect("newest seek");
@@ -4842,7 +5082,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
 
     // Precedence: aroundMessageId wins when a token is also supplied.
     let token = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("mint token")["nextToken"]
         .as_str()
@@ -4857,6 +5097,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
             Some(ids[0].clone()),
             None,
             None,
+            false,
         )
         .await
         .expect("seek beats token");
@@ -4894,6 +5135,7 @@ async fn get_conversation_seek_unknown_message_id_is_invalid_params() {
             Some("msg-nope".into()),
             None,
             None,
+            false,
         )
         .await
         .expect_err("unknown id");
@@ -4902,13 +5144,22 @@ async fn get_conversation_seek_unknown_message_id_is_invalid_params() {
         "error names the unknown id: {err:?}"
     );
     // A message id from another agent's log is equally unknown here.
-    svc.agent_get_conversation_op(id.clone(), None, None, None, Some(foreign.id), None, None)
-        .await
-        .expect_err("foreign message id");
+    svc.agent_get_conversation_op(
+        id.clone(),
+        None,
+        None,
+        None,
+        Some(foreign.id),
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect_err("foreign message id");
 
     // Seek-free reads stay byte-compatible: no prevToken key is added.
     let plain = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("plain");
     assert!(plain.get("prevToken").is_none());
@@ -4933,7 +5184,7 @@ async fn get_conversation_seeks_around_index() {
     // Seek to ordinal 5 with limit 4: page is [m3..m7), both cursors minted
     // — identical to the aroundMessageId seek targeting the same row.
     let seek = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(5), None)
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(5), None, false)
         .await
         .expect("seek");
     let m = seek["messages"].as_array().unwrap();
@@ -4952,7 +5203,16 @@ async fn get_conversation_seeks_around_index() {
 
     // nextToken continues into strictly older rows (ordinary backward paging).
     let older = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(next), None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(next),
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect("older");
     let mo = older["messages"].as_array().unwrap();
@@ -4961,7 +5221,16 @@ async fn get_conversation_seeks_around_index() {
 
     // prevToken walks newer to the live tail; the tail page has no prev.
     let newer = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(prev), None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(prev),
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect("newer");
     let mn = newer["messages"].as_array().unwrap();
@@ -4988,7 +5257,7 @@ async fn get_conversation_around_index_clamps_out_of_range() {
 
     // Oldest edge: index 0 pins to the start of history.
     let oldest = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(0), None)
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(0), None, false)
         .await
         .expect("oldest seek");
     let m = oldest["messages"].as_array().unwrap();
@@ -4999,7 +5268,16 @@ async fn get_conversation_around_index_clamps_out_of_range() {
 
     // Overshoot: index far past the end clamps to the newest window.
     let newest = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(1_000_000), None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            None,
+            None,
+            Some(1_000_000),
+            None,
+            false,
+        )
         .await
         .expect("overshoot clamps");
     let m = newest["messages"].as_array().unwrap();
@@ -5009,14 +5287,23 @@ async fn get_conversation_around_index_clamps_out_of_range() {
 
     // Ordinal seek wins over a simultaneously supplied token.
     let token = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("mint token")["nextToken"]
         .as_str()
         .expect("token")
         .to_string();
     let both = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(token), None, Some(0), None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(token),
+            None,
+            Some(0),
+            None,
+            false,
+        )
         .await
         .expect("seek beats token");
     assert_eq!(
@@ -5034,7 +5321,7 @@ async fn get_conversation_around_index_clamps_out_of_range() {
             .expect("append");
     }
     let small = svc
-        .agent_get_conversation_op(small_id, Some(10), None, None, None, Some(1), None)
+        .agent_get_conversation_op(small_id, Some(10), None, None, None, Some(1), None, false)
         .await
         .expect("small seek");
     assert_eq!(small["messages"].as_array().unwrap().len(), 3);
@@ -5067,7 +5354,7 @@ async fn get_conversation_reads_only_the_requested_page_from_store() {
         .expect("corrupt older rows");
 
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("newest page must not decode rows outside its window");
     assert_eq!(res["totalMessages"], 5);
@@ -5079,7 +5366,7 @@ async fn get_conversation_reads_only_the_requested_page_from_store() {
     // Following the token into the corrupted region decodes those rows and
     // fails — confirming the corruption is real and only page rows decode.
     let t = res["nextToken"].as_str().expect("token").to_string();
-    svc.agent_get_conversation_op(id, Some(2), None, Some(t), None, None, None)
+    svc.agent_get_conversation_op(id, Some(2), None, Some(t), None, None, None, false)
         .await
         .expect_err("older page decodes the corrupted rows");
 }
@@ -5113,7 +5400,7 @@ async fn get_conversation_strips_anonymous_tool_use_pairs() {
         .expect("append");
 
     let res = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let blocks = res["messages"][0]["contentBlocks"].as_array().unwrap();
@@ -5157,7 +5444,7 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
 
     // Absent param: byte-identical full fidelity, no flags anywhere.
     let full = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("full conv");
     let full_blocks = full["messages"][0]["contentBlocks"].as_array().unwrap();
@@ -5176,6 +5463,7 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
             None,
             None,
             Some(ConversationProjection::Slim),
+            false,
         )
         .await
         .expect("slim conv");
@@ -5269,6 +5557,7 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
             None,
             None,
             Some(ConversationProjection::Slim),
+            false,
         )
         .await
         .expect("slim conv");
@@ -5340,7 +5629,7 @@ async fn get_conversation_slim_pages_are_byte_budgeted() {
 
     // Full projection: never budgeted — all 12 in one default page.
     let full = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("full conv");
     let all: Vec<String> = full["messages"]
@@ -5367,6 +5656,7 @@ async fn get_conversation_slim_pages_are_byte_budgeted() {
                 None,
                 None,
                 Some(ConversationProjection::Slim),
+                false,
             )
             .await
             .expect("slim page");
@@ -5436,6 +5726,7 @@ async fn get_conversation_slim_single_overbudget_message_still_serves() {
             None,
             None,
             Some(ConversationProjection::Slim),
+            false,
         )
         .await
         .expect("page 1");
@@ -5452,6 +5743,7 @@ async fn get_conversation_slim_single_overbudget_message_still_serves() {
             None,
             None,
             Some(ConversationProjection::Slim),
+            false,
         )
         .await
         .expect("page 2");
@@ -5494,6 +5786,7 @@ async fn get_conversation_slim_seek_budget_keeps_target_and_reminted_cursors() {
             Some(target.clone()),
             None,
             slim,
+            false,
         )
         .await
         .expect("seek page");
@@ -5518,7 +5811,7 @@ async fn get_conversation_slim_seek_budget_keeps_target_and_reminted_cursors() {
     let mut token = seek["nextToken"].as_str().map(str::to_string);
     while let Some(t) = token {
         let page = svc
-            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim)
+            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim, false)
             .await
             .expect("older page");
         let ids: Vec<String> = page["messages"]
@@ -5534,7 +5827,7 @@ async fn get_conversation_slim_seek_budget_keeps_target_and_reminted_cursors() {
     let mut fwd = seek["prevToken"].as_str().map(str::to_string);
     while let Some(t) = fwd {
         let page = svc
-            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim)
+            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim, false)
             .await
             .expect("newer page");
         let ids: Vec<String> = page["messages"]
@@ -5843,7 +6136,7 @@ async fn get_conversation_stamps_synthetic_block_ids() {
         .expect("append assistant");
 
     let res = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let messages = res["messages"].as_array().unwrap();
@@ -5863,7 +6156,7 @@ async fn get_conversation_stamps_synthetic_block_ids() {
     // Serve-time only: a second read re-derives the same ids from unmutated
     // stored rows.
     let again = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv again");
     assert_eq!(again["messages"], res["messages"]);
@@ -9043,7 +9336,7 @@ async fn send_message_delivers_when_agent_exists() {
     assert_eq!(r["queued"], false);
     assert_eq!(r["messageId"], "m1");
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -9402,7 +9695,7 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
         .expect("send");
     assert_eq!(r["queued"], false);
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let content = &conv["messages"][0]["contentBlocks"];
@@ -9450,7 +9743,7 @@ async fn send_queued_message_now_op_persists_attachment_blocks_in_transcript() {
         "the dequeued entry left the queue"
     );
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let content = &conv["messages"][0]["contentBlocks"];
@@ -9485,7 +9778,7 @@ async fn send_queued_message_now_op_not_found_has_no_side_effects() {
     let queue = svc.queue_snapshot(&id);
     assert_eq!(queue.len(), 1, "queue untouched: {queue:?}");
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(
@@ -13884,7 +14177,7 @@ async fn delegate_delivers_agent_instructions_as_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1, "child got exactly one message");
@@ -13913,7 +14206,7 @@ async fn delegate_falls_back_to_task_text_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -13973,7 +14266,7 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -14330,7 +14623,7 @@ async fn delegate_without_message_source_delivers_nothing() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child, None, None, None, None, None, None)
+        .agent_get_conversation_op(child, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 0, "no message delivered");
@@ -21105,7 +21398,7 @@ async fn wake_or_create_delivers_message_metadata_on_block() {
         .expect("wake");
     let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(new_id, None, None, None, None, None, None)
+        .agent_get_conversation_op(new_id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     // The delivered message is the first user message; its content block
@@ -21140,7 +21433,7 @@ async fn wake_or_create_store_only_persists_row_level_metadata() {
         .expect("wake");
     let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(new_id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(new_id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let msg = &conv["messages"][0];
@@ -21368,7 +21661,7 @@ async fn deliv1_wake_or_create_persists_block_metadata_alongside_runtime_drive()
         .expect("wake");
     let agent_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let msg = &conv["messages"][0];
@@ -21403,7 +21696,7 @@ async fn deliv1_wake_runtime_idle_branch_persists_row_level_metadata() {
     assert_eq!(resp["ok"], true);
     let agent_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let msg = &conv["messages"][0];
@@ -21637,7 +21930,16 @@ async fn agent_ops_reject_cross_workspace_bare_id_probes() {
     assert!(matches!(err, Error::NotFound(_)), "get: {err:?}");
 
     let err = svc
-        .agent_get_conversation_op(id.clone(), None, Some(ws_b.clone()), None, None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            Some(ws_b.clone()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect_err("cross-ws conversation must not observe");
     assert!(matches!(err, Error::NotFound(_)), "conversation: {err:?}");

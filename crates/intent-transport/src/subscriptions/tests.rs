@@ -1989,6 +1989,7 @@ mod chat_snapshot_bounded {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             // The snapshot must ask for the newest page (no cursor) and must
@@ -2153,6 +2154,7 @@ mod chat_snapshot_bounded {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             self.seen.lock().unwrap().push(projection);
             Box::pin(async move {
@@ -2226,6 +2228,7 @@ mod chat_message_delta {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.projections.lock().unwrap().push(projection);
@@ -2636,6 +2639,7 @@ mod chat_snapshot_interrupt_window {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             let flushed = self.phase() == Phase::Flushed;
             Box::pin(async move {
@@ -2707,6 +2711,7 @@ mod chat_snapshot_interrupt_window {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2762,6 +2767,7 @@ mod chat_snapshot_interrupt_window {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2820,6 +2826,7 @@ mod chat_snapshot_interrupt_window {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -3077,6 +3084,7 @@ mod chat_terminal_message_id_fallback {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();
@@ -3286,6 +3294,7 @@ mod chat_terminal_reconcile_failure {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();
