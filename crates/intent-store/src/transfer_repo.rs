@@ -327,6 +327,14 @@ impl Store {
     /// schema. Nothing is visible unless the whole batch commits. Returns
     /// the number of rows inserted.
     ///
+    /// Invariant the caller owns: `agent_session` rows must arrive with the
+    /// 0103 stats counter columns (`message_count`,
+    /// `assistant_message_count`, `conversation_bytes`) zeroed — the
+    /// `agent_message` inserts in the same batch rebuild them through the
+    /// 0103 triggers, so importing exported values double-counts. The
+    /// production transform (`transfer_import.rs::transform_rows`) does
+    /// this; any new direct caller must too.
+    ///
     /// # Errors
     ///
     /// Returns `Error::InvalidParams` when a row names a table outside the transfer set, is not a JSON object, or carries a key with no matching column; `Error::Internal` if the transaction fails.

@@ -6455,6 +6455,81 @@ mod tests {
         assert_eq!(n, 0, "cascade removed the messages");
     }
 
+    /// The 0103 backfill UPDATE sets the counters correctly for rows shaped
+    /// like the pre-0103 state. A fresh test DB backfills an empty
+    /// `agent_message`, so without this test a defect in the backfill's
+    /// `UPDATE ... FROM` join would pass every trigger test while
+    /// permanently mis-setting counters on existing databases (incremental
+    /// counters never self-heal). Exercised 0031-style: seed sessions with
+    /// messages, corrupt the counters directly, re-run the backfill
+    /// statement extracted from the migration file, and assert equality
+    /// with a live recompute.
+    #[tokio::test]
+    async fn session_stats_backfill_recomputes_existing_rows() {
+        use intent_core::now_iso;
+        let migration = include_str!("../migrations/0103_agent_session_stats_counters.sql");
+        let backfill_start = migration
+            .rfind("UPDATE agent_session SET")
+            .expect("0103 must contain the backfill UPDATE");
+        let backfill = &migration[backfill_start..];
+
+        let tmp = TempDb::new("test-stats-backfill");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-stats-backfill".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let with_msgs = AgentId("agent-backfill-msgs".to_string());
+        let empty = AgentId("agent-backfill-empty".to_string());
+        for agent in [&with_msgs, &empty] {
+            store
+                .insert_agent_session(&baseline_test_session(agent, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        for (role, text) in [("user", "q1"), ("assistant", "a1"), ("assistant", "a2")] {
+            store
+                .append_agent_message(
+                    &with_msgs,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+        let live = live_message_stats(&store, &with_msgs).await;
+
+        // Corrupt the counters to the pre-backfill shape (columns exist but
+        // hold garbage relative to agent_message).
+        sqlx::query(
+            "UPDATE agent_session SET message_count = 999, \
+             assistant_message_count = 999, conversation_bytes = 999 WHERE id = ?",
+        )
+        .bind(&with_msgs.0)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt counters");
+
+        sqlx::raw_sql(backfill)
+            .execute(store.write_pool())
+            .await
+            .expect("re-run 0103 backfill");
+
+        assert_eq!(
+            counter_cols(&store, &with_msgs).await,
+            live,
+            "backfill must recompute counters from agent_message"
+        );
+        assert_eq!(
+            counter_cols(&store, &empty).await,
+            (0, 0, 0),
+            "zero-message session keeps its column-default zeros"
+        );
+    }
+
     /// `get_agent_messages_page` returns exactly the `offset..offset+limit`
     /// window of the chronological log — matching what a caller would get by
     /// slicing `get_agent_messages` — with correct boundary behavior (first

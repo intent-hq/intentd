@@ -13,7 +13,10 @@
 -- append (INSERT), the agent.replaceMessages swap (DELETE + re-INSERT),
 -- agent.delete's ON DELETE CASCADE sweep of agent_message (cascade deletes
 -- fire the AFTER DELETE trigger before the session row itself goes away),
--- and direct content/role UPDATEs.
+-- and direct content/role UPDATEs. NOT covered: re-parenting a message by
+-- updating agent_id (no such path exists today) — the UPDATE trigger below
+-- deliberately fires only on role/content, so a future re-parenting path
+-- must be DELETE + re-INSERT, or add an UPDATE OF agent_id trigger pair.
 --
 -- Transfer note: agent_session rows ride the archive with these columns, but
 -- the import transform zeroes them — the target re-inserts agent_message rows
