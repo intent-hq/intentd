@@ -764,6 +764,20 @@ pub struct MergeRequirementsApprovals {
     pub changes_requested: i64,
 }
 
+/// The `mergeQueueEjection` block: the PR's latest merge-queue removal event
+/// (when the queue ejected the PR and why). Mirrors
+/// [`intent_sourcecontrol::MergeQueueRemoval`] onto the wire.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeQueueEjection {
+    /// When the removal happened (RFC 3339).
+    pub at: String,
+    /// The host's raw removal reason (e.g. `failed_checks`); omitted when
+    /// the host does not report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// The `threads` block of the checklist.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -817,6 +831,12 @@ pub struct MergeRequirements {
     /// not queued or unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_in_merge_queue: Option<bool>,
+    /// The PR's latest merge-queue removal event; omitted when the host does
+    /// not report one (no merge-queue support) or the PR was never ejected.
+    /// Serde-defaulted so persisted monitor baselines written before the
+    /// field existed still parse (without phantom diff lines).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_ejection: Option<MergeQueueEjection>,
 }
 
 /// The checklist word for a rollup check's state.
@@ -927,6 +947,12 @@ pub(crate) fn merge_requirements(
         merge_blocked_reason: merge_blocked_reason(state, pr.mergeable, mergeable_state),
         rules_known: rules.is_some(),
         is_in_merge_queue: signals.and_then(|s| s.is_in_merge_queue).filter(|&q| q),
+        merge_queue_ejection: signals
+            .and_then(|s| s.merge_queue_removal.as_ref())
+            .map(|r| MergeQueueEjection {
+                at: r.at.clone(),
+                reason: r.reason.clone(),
+            }),
     }
 }
 
@@ -1745,6 +1771,50 @@ mod tests {
             let wire = serde_json::to_value(&req).unwrap();
             assert!(wire.get("isInMergeQueue").is_none());
         }
+    }
+
+    /// The probe's removal event maps onto the wire as `mergeQueueEjection`
+    /// — raw reason value preserved — and the key is omitted when the host
+    /// reports no event.
+    #[test]
+    fn merge_requirements_carries_merge_queue_ejection_raw_on_the_wire() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let signals = MergeRequirementSignals {
+            merge_queue_removal: Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-01-02T03:04:05Z".into(),
+                reason: Some("failed_checks".into()),
+            }),
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), 0);
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            wire["mergeQueueEjection"],
+            serde_json::json!({ "at": "2026-01-02T03:04:05Z", "reason": "failed_checks" })
+        );
+
+        // No event, or no probe at all: the key is omitted, never null.
+        for signals in [Some(MergeRequirementSignals::default()), None] {
+            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), 0);
+            assert_eq!(req.merge_queue_ejection, None);
+            let wire = serde_json::to_value(&req).unwrap();
+            assert!(wire.get("mergeQueueEjection").is_none());
+        }
+
+        // A reason-less event omits `reason` inside the block.
+        let no_reason = MergeRequirementSignals {
+            merge_queue_removal: Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-01-02T03:04:05Z".into(),
+                reason: None,
+            }),
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&no_reason), &[], &agg(0, 0), 0);
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            wire["mergeQueueEjection"],
+            serde_json::json!({ "at": "2026-01-02T03:04:05Z" })
+        );
     }
 
     #[test]

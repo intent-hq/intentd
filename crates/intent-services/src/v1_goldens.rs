@@ -659,6 +659,7 @@ fn merge_requirements(
         merge_blocked_reason: None,
         rules_known: true,
         is_in_merge_queue: None,
+        merge_queue_ejection: None,
     }
 }
 

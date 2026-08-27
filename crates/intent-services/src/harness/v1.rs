@@ -995,6 +995,23 @@ impl Harness for V1 {
                 "left the merge queue".to_string()
             });
         }
+        // Keyed on the event identity (`at`), not the queued flag: an
+        // enter→eject pair that nets out on `isInMergeQueue` still yields
+        // this reportable line.
+        let ejection_at = |r: &crate::pr_ops::MergeRequirements| {
+            r.merge_queue_ejection.as_ref().map(|e| e.at.clone())
+        };
+        if ejection_at(o) != ejection_at(n) {
+            if let Some(e) = &n.merge_queue_ejection {
+                changes.push(match &e.reason {
+                    Some(reason) => format!(
+                        "removed from the merge queue ({})",
+                        reason.replace('_', " ")
+                    ),
+                    None => "removed from the merge queue".to_string(),
+                });
+            }
+        }
         if o.mergeable != n.mergeable {
             changes.push(format!(
                 "mergeable: {} → {}",

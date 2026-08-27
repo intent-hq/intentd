@@ -490,6 +490,10 @@ fn pr_monitor_wire(m: &PrMonitor) -> Value {
         if let Some(queued) = r.is_in_merge_queue {
             last["isInMergeQueue"] = json!(queued);
         }
+        // Same presence rule: only when the host reported an ejection event.
+        if let Some(ejection) = &r.merge_queue_ejection {
+            last["mergeQueueEjection"] = serde_json::to_value(ejection).expect("serialize");
+        }
         obj.insert("lastSnapshot".to_string(), last);
     }
     out
@@ -2500,6 +2504,7 @@ mod tests {
                 merge_blocked_reason: None,
                 rules_known: true,
                 is_in_merge_queue: None,
+                merge_queue_ejection: None,
             },
         };
         f(&mut s);
@@ -2560,6 +2565,18 @@ mod tests {
         m.last_snapshot = Some(serde_json::to_string(&s).unwrap());
         let wire = pr_monitor_wire(&m);
         assert!(wire["lastSnapshot"].get("isInMergeQueue").is_none());
+        // Same presence rule for the ejection event.
+        assert!(wire["lastSnapshot"].get("mergeQueueEjection").is_none());
+        s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+            at: "2026-01-02T03:04:05Z".into(),
+            reason: Some("failed_checks".into()),
+        });
+        m.last_snapshot = Some(serde_json::to_string(&s).unwrap());
+        let wire = pr_monitor_wire(&m);
+        assert_eq!(
+            wire["lastSnapshot"]["mergeQueueEjection"],
+            json!({ "at": "2026-01-02T03:04:05Z", "reason": "failed_checks" })
+        );
     }
 
     #[test]
@@ -2666,6 +2683,67 @@ mod tests {
         assert!(diff_snapshots(&blocked, &base)
             .iter()
             .any(|c| c == "merge is no longer blocked"));
+    }
+
+    /// The ejection diff is keyed on the event identity (`at`): a new event
+    /// fires (with the reason humanized, underscores → spaces), an unchanged
+    /// event stays quiet, and an enter→eject pair that nets out on
+    /// `isInMergeQueue` still yields a reportable change.
+    #[test]
+    fn diff_reports_merge_queue_ejection_keyed_on_event_identity() {
+        let base = snapshot(|_| {});
+        let ejected = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-01-02T03:04:05Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+        });
+        assert!(diff_snapshots(&base, &ejected)
+            .iter()
+            .any(|c| c == "removed from the merge queue (failed checks)"));
+
+        // Unchanged event: nothing to report.
+        assert!(diff_snapshots(&ejected, &ejected).is_empty());
+
+        // A later ejection is a new event and fires again; no reason drops
+        // the parenthetical.
+        let re_ejected = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-01-03T00:00:00Z".into(),
+                reason: None,
+            });
+        });
+        assert!(diff_snapshots(&ejected, &re_ejected)
+            .iter()
+            .any(|c| c == "removed from the merge queue"));
+
+        // Enter→eject within one window: `isInMergeQueue` nets out to its
+        // baseline (absent on both sides), so no entered/left line — but the
+        // fresh ejection event still yields a reportable change.
+        let changes = diff_snapshots(&base, &ejected);
+        assert!(!changes
+            .iter()
+            .any(|c| c == "entered the merge queue" || c == "left the merge queue"));
+        assert_eq!(
+            changes,
+            vec!["removed from the merge queue (failed checks)"]
+        );
+    }
+
+    /// A persisted baseline written before `mergeQueueEjection` existed still
+    /// parses (serde default) and produces no phantom diff line against a
+    /// fresh snapshot that also has no event.
+    #[test]
+    fn old_baseline_without_ejection_field_parses_without_phantom_diff() {
+        let mut wire = serde_json::to_value(snapshot(|_| {})).unwrap();
+        let req = wire["requirements"].as_object_mut().unwrap();
+        assert!(
+            !req.contains_key("mergeQueueEjection"),
+            "omitted when absent"
+        );
+        let old: PrMonitorSnapshot = serde_json::from_value(wire).unwrap();
+        assert_eq!(old.requirements.merge_queue_ejection, None);
+        assert!(diff_snapshots(&old, &snapshot(|_| {})).is_empty());
     }
 
     #[test]
