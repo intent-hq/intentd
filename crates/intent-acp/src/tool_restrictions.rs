@@ -118,6 +118,41 @@ pub const SUBAGENT_TOOLS: &[&str] = &[
 /// always removed (the MCP versions integrate with the agent lifecycle).
 pub(crate) const CONFLICTING_BUILTIN_TOOLS: &[&str] = &["create_agent"];
 
+/// Claude Agent SDK built-in file-write tools disallowed for orchestrator-role
+/// agents on the claude-code provider, delivered via
+/// `_meta.claudeCode.options.disallowedTools` on `session/new`/`session/load`
+/// (the claude-code counterpart of [`FILE_WRITE_TOOLS`], whose auggie-native /
+/// MCP names the SDK never exposes). Bare names remove the tool from the
+/// model's context entirely — no tool schema, no permission prompt.
+///
+/// Names match Claude Agent SDK 0.3.220 (pinned by claude-agent-acp 0.66.0):
+/// `Edit` covers single- and multi-edit (the SDK has no separate `MultiEdit`),
+/// `Write` creates/overwrites files, `NotebookEdit` edits notebook cells.
+/// `Task` (native subagents) is denied separately for EVERY claude-code agent,
+/// not just orchestrators (see `build_session_meta` in `intent-services`).
+/// `Bash` is deliberately NOT listed: orchestrators legitimately run read-only
+/// commands (git status, builds, searches), and the role prompt — not tool
+/// removal — governs not-editing-via-shell.
+pub const CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
+
+/// Grok built-in tools disallowed for orchestrator-role agents, delivered via
+/// grok's `--disallowed-tools` spawn flag (comma-separated denylist of
+/// built-in tool IDs; xai-grok-shell README / docs.x.ai CLI reference).
+/// `search_replace` is the file-edit tool, `write` the file-create/write tool
+/// (the `[features] write_file` setting names it), `task` launches subagent
+/// sessions, and the special `Agent` entry blocks ALL subagent spawning.
+/// `run_terminal_cmd` (bash) is deliberately NOT listed — orchestrators
+/// legitimately run read-only commands, mirroring the claude-code list above.
+pub const GROK_ORCHESTRATOR_DISALLOWED_TOOLS: &[&str] =
+    &["search_replace", "write", "task", "Agent"];
+
+/// Droid built-in tools disallowed for orchestrator-role agents, delivered via
+/// droid's `--disabled-tools` spawn flag (comma-separated list of tool IDs;
+/// docs.factory.ai CLI reference). `Edit`/`Create`/`ApplyPatch` are the
+/// file-write tools, `Task` spawns subagents. `Execute` (shell) is
+/// deliberately NOT listed — same rationale as the claude-code/grok lists.
+pub const DROID_ORCHESTRATOR_DISALLOWED_TOOLS: &[&str] = &["Edit", "Create", "ApplyPatch", "Task"];
+
 /// The full set of categories denied for pure text-generation/analysis agents.
 fn full_denylist() -> Vec<&'static str> {
     let mut out = Vec::new();
@@ -230,6 +265,37 @@ pub fn get_tools_to_remove(is_orchestrator: bool, agent_type: &str) -> Vec<&'sta
     out
 }
 
+/// Resolve the provider-NATIVE tools to strip via the provider's spawn-time
+/// removal flag (`ProviderConfig::remove_tool_flag`). Each provider names its
+/// built-in tools differently, so the generic categories (file-write,
+/// sub-agents) map to per-provider name lists — this mapping lives here (not
+/// in `intent-providers`) because it extends the §18.4 denylist policy that
+/// this module owns.
+///
+/// - `auggie`: the full [`get_tools_to_remove`] resolution (orchestrator,
+///   background-type, and global-fallback paths — auggie-native + MCP names).
+/// - `grok` / `droid`: orchestrator-role agents get the provider's file-write
+///   and subagent tool IDs ([`GROK_ORCHESTRATOR_DISALLOWED_TOOLS`] /
+///   [`DROID_ORCHESTRATOR_DISALLOWED_TOOLS`]); everyone else gets nothing —
+///   MCP-side filtering (§6.8) still covers workspace tools, and the
+///   background-agent denylist names are auggie/MCP-specific.
+/// - every other provider: nothing (claude-code delivers its orchestrator
+///   denylist via `session/new` `_meta` instead — see
+///   [`CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS`]).
+#[must_use]
+pub fn get_native_tools_to_remove(
+    provider_id: &str,
+    is_orchestrator: bool,
+    agent_type: &str,
+) -> Vec<&'static str> {
+    match provider_id {
+        "auggie" => get_tools_to_remove(is_orchestrator, agent_type),
+        "grok" if is_orchestrator => GROK_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec(),
+        "droid" if is_orchestrator => DROID_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +350,44 @@ mod tests {
         // orchestrator restrictions (the orchestrator check runs first).
         let tools = get_tools_to_remove(true, "task-loop");
         assert!(contains_all(&tools, FILE_WRITE_TOOLS));
+    }
+
+    #[test]
+    fn native_resolution_maps_auggie_to_full_denylist_flow() {
+        assert_eq!(
+            get_native_tools_to_remove("auggie", true, "interactive"),
+            get_tools_to_remove(true, "interactive")
+        );
+        assert_eq!(
+            get_native_tools_to_remove("auggie", false, "task-loop"),
+            get_tools_to_remove(false, "task-loop")
+        );
+    }
+
+    #[test]
+    fn native_resolution_grok_droid_orchestrator_only() {
+        assert_eq!(
+            get_native_tools_to_remove("grok", true, "interactive"),
+            GROK_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec()
+        );
+        assert_eq!(
+            get_native_tools_to_remove("droid", true, "interactive"),
+            DROID_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec()
+        );
+        // Non-orchestrator agents on grok/droid get no CLI-side stripping —
+        // MCP-side filtering (§6.8) still applies.
+        assert!(get_native_tools_to_remove("grok", false, "interactive").is_empty());
+        assert!(get_native_tools_to_remove("droid", false, "task-loop").is_empty());
+    }
+
+    #[test]
+    fn native_resolution_other_providers_get_nothing() {
+        for id in ["claude-code", "codex", "cortex", "opencode", "pi", "mock"] {
+            assert!(
+                get_native_tools_to_remove(id, true, "interactive").is_empty(),
+                "{id} unexpectedly received native tools to remove"
+            );
+        }
     }
 
     #[test]

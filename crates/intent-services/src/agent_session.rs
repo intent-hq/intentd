@@ -25,8 +25,8 @@ use intent_core::events::{
     AGENT_STREAM_STATUS, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA,
 };
 use intent_core::{
-    now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, UsageCost, WorkspaceId,
-    WorkspaceStatus,
+    now_epoch_ms, now_iso, ActorType, AgentId, AgentSession, Error, EventActor, Result, UsageCost,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -1260,14 +1260,25 @@ fn select_entry<'a>(
 }
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
-/// assembled system prompt (§18.1) and the agent's name (task-derived for
-/// delegated agents; may be user-assigned or renamed). Returns
+/// assembled system prompt (§18.1), the agent's name (task-derived for
+/// delegated agents; may be user-assigned or renamed), and the session
+/// specialist's resolved orchestrator role (§18.4). Returns
 /// `None` for providers that do not use `_meta` injection (auggie, droid,
 /// opencode, cortex, pi, grok, mock use other mechanisms).
 /// Provider-specific shapes:
-/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": "<prompt>"? }`
+/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": [...] } }, "systemPrompt": "<prompt>"? }`
 ///   (disallowedTools always present; systemPrompt present only when non-blank
-///   prompt). A string `systemPrompt` fully REPLACES the `claude_code` preset
+///   prompt). `disallowedTools` carries `Task` for every agent (native-subagent
+///   denial) plus, for orchestrator-role agents, the SDK's built-in file-write
+///   tools ([`intent_acp::CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS`]) — bare
+///   names remove the tool from the model's context entirely. Merge behavior
+///   verified against the pinned adapter 0.66.0: `createSession` (shared by
+///   `session/new` and `session/load`) spread-merges user-provided entries with
+///   its own additions — `[...(userProvidedOptions?.disallowedTools || []),
+///   ...internal]` — rather than overwriting them (the drop-user-entries
+///   regression tracked upstream in claude-agent-acp #294/#334 is fixed there);
+///   re-verify on adapter bumps.
+///   A string `systemPrompt` fully REPLACES the `claude_code` preset
 ///   prompt (verified against adapter 0.66.0: a string `_meta.systemPrompt` is
 ///   passed to the SDK as-is, and SDK 0.3.220 treats a string as a custom
 ///   prompt) — the model sees only our assembled prompt, with none of the
@@ -1282,19 +1293,26 @@ fn build_session_meta(
     provider_id: &str,
     system_prompt: Option<&str>,
     session_title: Option<&str>,
+    is_orchestrator: bool,
 ) -> Option<Meta> {
     match provider_id {
         "claude-code" => {
             let mut meta = Meta::new();
 
-            // Always add disallowedTools to prevent provider-native Task tool
-            // (verified against @agentclientprotocol/claude-agent-acp 0.59.0;
-            // disallowedTools are merged with ACP's internal deny rules).
+            // Native tool denylist: `Task` always (agents must delegate via
+            // the workspace `ws.agent.*` surface, not provider-native
+            // subagents); orchestrators additionally lose the SDK's built-in
+            // file-write tools — the same resolved role decision that gates
+            // the spawn-time CLI-side denylist (`get_tools_to_remove`, §18.4).
+            let mut disallowed = vec!["Task"];
+            if is_orchestrator {
+                disallowed.extend_from_slice(intent_acp::CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS);
+            }
             meta.insert(
                 "claudeCode".to_string(),
                 serde_json::json!({
                     "options": {
-                        "disallowedTools": ["Task"]
+                        "disallowedTools": disallowed
                     }
                 }),
             );
@@ -2025,6 +2043,36 @@ impl Services {
         }
     }
 
+    /// Resolve whether the stored session's specialist carries the
+    /// `orchestrator` role — the SAME decision that gates the spawn-time
+    /// CLI-side denylist (`derive_is_orchestrator` in `agent_manager`, §18.4),
+    /// re-resolved here for the session-open paths because they run after
+    /// spawn with only the stored session at hand. The workspace read supplies
+    /// the path for project-tier specialist resolution and is best-effort: a
+    /// failure resolves embedded/user-tier specialists only (never fails the
+    /// session open). Plain agents (no specialist) skip the read entirely.
+    async fn resolve_session_is_orchestrator(&self, stored: &AgentSession) -> bool {
+        if stored.specialist.as_deref().is_none_or(str::is_empty) {
+            return false;
+        }
+        let workspace_path = match self.store.get_workspace(&stored.workspace_id).await {
+            Ok(ws) => ws
+                .path
+                .clone()
+                .or_else(|| ws.worktree_path.clone())
+                .map(PathBuf::from),
+            Err(e) => {
+                tracing::debug!(
+                    workspace = %stored.workspace_id,
+                    error = %e,
+                    "orchestrator role resolution: workspace read failed; resolving without project tier"
+                );
+                None
+            }
+        };
+        self.session_specialist_is_orchestrator(stored, workspace_path.as_deref())
+    }
+
     /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
     /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
     /// modes the provider advertised in `session/new` (used by the caller to
@@ -2053,10 +2101,12 @@ impl Services {
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
+        let is_orchestrator = self.resolve_session_is_orchestrator(&stored).await;
         let meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             Some(&stored.name),
+            is_orchestrator,
         );
         self.publish_status_event(
             &workspace_id,
@@ -2122,10 +2172,12 @@ impl Services {
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
+        let is_orchestrator = self.resolve_session_is_orchestrator(&stored).await;
         let meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             Some(&stored.name),
+            is_orchestrator,
         );
         self.publish_status_event(
             &workspace_id,
@@ -2242,7 +2294,13 @@ impl Services {
         }
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
-        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref(), None);
+        let is_orchestrator = self.resolve_session_is_orchestrator(&stored).await;
+        let meta = build_session_meta(
+            &provider_id,
+            stored.system_prompt.as_deref(),
+            None,
+            is_orchestrator,
+        );
         self.publish_status_event(
             &workspace_id,
             agent_id,
