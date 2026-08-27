@@ -1209,9 +1209,17 @@ async fn dispatch(
             // Soft retire (§5.5): retired rows are excluded by default;
             // `includeRetired: true` serves them too, `retiredOnly: true`
             // serves ONLY them (retired rows carrying `retiredAt`). The two
-            // flags together are contradictory → `-32602`. Every variant
-            // additionally carries `retiredCount` (one SQL COUNT of the
-            // workspace's soft-retired sessions, v8.2).
+            // flags together are contradictory → `-32602`. Both flags are
+            // deliberately lenient — a non-bool value coerces to `false`
+            // (documented `includeRetired` precedent), it is NOT `-32602`
+            // like v8.1 `note.list` `projection`. Every variant additionally
+            // carries `retiredCount` (one covering-index SQL COUNT of the
+            // workspace's soft-retired sessions, v8.2). The count is a
+            // second statement after the rows read, with no snapshot
+            // isolation across the two: a retire/restore landing between
+            // them can skew `retiredCount` off the returned rows by one —
+            // tolerated by design, since the paired `agent:retired` /
+            // `agent:restored` events let clients reconcile.
             let include_retired = params
                 .get("includeRetired")
                 .and_then(Value::as_bool)

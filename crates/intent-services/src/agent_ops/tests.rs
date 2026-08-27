@@ -408,6 +408,23 @@ async fn retired_sessions_are_excluded_from_default_projection_load() {
         "retired session must not be loaded by the default projection read"
     );
 
+    // …and the retired-only store read is the exact mirror: it omits the
+    // active session entirely (PR review: the retiredOnly path must never
+    // pay the full-workspace projection cost).
+    let retired_projections = svc
+        .store()
+        .get_retired_agent_session_message_projections(&ws)
+        .await
+        .expect("retired projections");
+    assert!(
+        retired_projections.contains_key(&old.0),
+        "retired session projected"
+    );
+    assert!(
+        !retired_projections.contains_key(&live.0),
+        "active session must not be loaded by the retired-only projection read"
+    );
+
     // includeRetired still serves the retired row WITH its projections
     // (message_count from the direct, cache-bypassing load).
     let all = svc
@@ -420,7 +437,7 @@ async fn retired_sessions_are_excluded_from_default_projection_load() {
         "retired row keeps its message projection in the includeRetired read"
     );
 
-    // The retiredOnly read bypasses the active-only cache the same way, so
+    // The retiredOnly read serves the retired-only projection variant, so
     // its rows keep full message projections too.
     let retired = svc
         .agent_list_retired_only_op(ws.clone())
