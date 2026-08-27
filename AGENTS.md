@@ -204,10 +204,10 @@ breaking-change footer token" or similar instead.
 
 ## Filing issues
 
-File bugs on [intent-hq/monorepo](https://github.com/intent-hq/monorepo/issues) — the
+File bugs on [intent-hq/intent](https://github.com/intent-hq/intent/issues) — the
 single tracker for all components; never track issues in markdown files. Use labels
 `component:intentd` + `agent-filed`. See the [root `AGENTS.md`](../../AGENTS.md) →
 Filing Issues for the full conventions (dedup, cross-referencing,
-`Fixes intent-hq/monorepo#N` — the release notifier is completeness-gated: it comments
+`Fixes intent-hq/intent#N` — the release notifier is completeness-gated: it comments
 on the issue only once every linked intentd fix PR is merged and contained in the
 released tag).

@@ -3,8 +3,9 @@
 #
 # Usage: notify-fixed-issues.sh [--dry-run] <component> <version> <from-ref> <to-ref>
 #
-# Collects ISSUES_REPO issue references (intent-hq/monorepo#N or the full
-# issue URL) from commit messages in <from-ref>..<to-ref>, additionally
+# Collects ISSUES_REPO issue references (intent-hq/intent#N or the full
+# issue URL; the tracker's pre-rename name intent-hq/monorepo is accepted
+# too) from commit messages in <from-ref>..<to-ref>, additionally
 # resolving squash-merge "(#N)" subject suffixes to PR bodies on SOURCE_REPO
 # via the GitHub API and scanning those too. Posts one channel-free
 # "This fix is included in <component> vX.Y.Z." comment per referenced
@@ -43,7 +44,7 @@
 # Env:
 #   SOURCE_REPO      repo the range's PRs live on (default: intent-hq/intentd)
 #   ISSUES_REPO      repo whose issues are commented on
-#                    (default: intent-hq/monorepo)
+#                    (default: intent-hq/intent)
 #   ISSUES_GH_TOKEN  token with issues:write on ISSUES_REPO AND
 #                    pull-requests:read on SOURCE_REPO (the completeness
 #                    gate enumerates the issue's linked SOURCE_REPO PRs, so
@@ -80,7 +81,7 @@ VERSION="${2:?$usage}"
 FROM_REF="${3:?$usage}"
 TO_REF="${4:?$usage}"
 SOURCE_REPO="${SOURCE_REPO:-intent-hq/intentd}"
-ISSUES_REPO="${ISSUES_REPO:-intent-hq/monorepo}"
+ISSUES_REPO="${ISSUES_REPO:-intent-hq/intent}"
 ISSUES_GH_TOKEN="${ISSUES_GH_TOKEN:-}"
 
 VERSION="${VERSION#v}"
@@ -126,8 +127,18 @@ gh_issues() {
 }
 
 range="${FROM_REF}..${TO_REF}"
-issues_repo_re=${ISSUES_REPO//./\\.}
-issue_ref_re="(${issues_repo_re}#|https://github\\.com/${issues_repo_re}/issues/)[0-9]+"
+# The tracker was renamed intent-hq/monorepo -> intent-hq/intent; refs written
+# with either name point at the same issues (GitHub redirects the old name),
+# so the extraction regex permanently accepts both.
+issue_repo_names=("$ISSUES_REPO")
+if [[ "$ISSUES_REPO" == "intent-hq/intent" ]]; then
+  issue_repo_names+=("intent-hq/monorepo")
+fi
+issues_repo_re=""
+for name in "${issue_repo_names[@]}"; do
+  issues_repo_re+="${issues_repo_re:+|}${name//./\\.}"
+done
+issue_ref_re="((${issues_repo_re})#|https://github\\.com/(${issues_repo_re})/issues/)[0-9]+"
 
 refs_file=$(mktemp)
 trap 'rm -f "$refs_file"' EXIT
