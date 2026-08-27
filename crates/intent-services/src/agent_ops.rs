@@ -2137,7 +2137,10 @@ impl Services {
     /// — the full spawn-time first message, the single largest per-session
     /// field on real workspaces — is stripped from the whole [`AgentLite`]
     /// projection (`agent.list` AND `agent.get`; no client reads it off
-    /// agent rows) and is served by `agent.getSession` only.
+    /// agent rows) and is served by `agent.getSession` only. The strip is
+    /// SQL-deep: the summary SELECT behind these reads omits the
+    /// `initial_message` column entirely (like `system_prompt` /
+    /// `image_blocks`), so the bytes are never fetched or decoded.
     /// The remaining preview fields (`lastAgentResponse`,
     /// `lastUserMessage`, `lastToolUse`, `digest`,
     /// `metadata.completionReport` — read by list consumers like the HUD, so
