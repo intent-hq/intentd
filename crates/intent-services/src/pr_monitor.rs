@@ -95,6 +95,15 @@ pub(crate) struct PrMonitorSnapshot {
     pub conversation_count: i64,
     pub review_comment_count: i64,
     pub requirements: MergeRequirements,
+    /// Whether this snapshot's `mergeQueueEjection` field reflects an actual
+    /// merge-requirements probe answer (directly, or inherited through the
+    /// degraded-probe hold in [`SharedPrSnapshot::materialize`]).
+    /// Serde-defaulted so a baseline persisted before ejection tracking
+    /// existed reads as UNTRACKED: any event the first tracked poll sees is
+    /// history relative to such a baseline, not news, and the poll adopts it
+    /// silently instead of emitting a false post-upgrade wake.
+    #[serde(default)]
+    pub ejection_tracked: bool,
 }
 
 impl PrMonitorSnapshot {
@@ -118,13 +127,33 @@ pub(crate) struct SharedPrSnapshot {
     conversation_count: Option<i64>,
     review_comment_count: i64,
     requirements: MergeRequirements,
+    /// Whether the merge-requirements probe answered this poll. The probe is
+    /// the only source of `mergeQueueEjection`, so `false` means that field
+    /// is "unknown", not "no ejection" (see [`Self::materialize`]).
+    ejection_known: bool,
 }
 
 impl SharedPrSnapshot {
     /// Materialize a per-monitor snapshot: a degraded conversation-comment
     /// read keeps the monitor's previous count rather than fabricating a
-    /// "comments removed" change.
+    /// "comments removed" change, and a degraded merge-requirements probe
+    /// keeps the monitor's previously observed merge-queue ejection event
+    /// rather than silently dropping it from the pending set (the event is
+    /// monotonic — always reaches the wake — per intent-hq/monorepo#3479).
     pub(crate) fn materialize(&self, previous: Option<&PrMonitorSnapshot>) -> PrMonitorSnapshot {
+        let mut requirements = self.requirements.clone();
+        let ejection_tracked = if self.ejection_known {
+            true
+        } else {
+            if requirements.merge_queue_ejection.is_none() {
+                requirements.merge_queue_ejection =
+                    previous.and_then(|p| p.requirements.merge_queue_ejection.clone());
+            }
+            // The hold carries the observation forward, so tracked-ness
+            // carries with it; an untracked previous stays untracked until
+            // a probe actually answers.
+            previous.is_some_and(|p| p.ejection_tracked)
+        };
         PrMonitorSnapshot {
             title: self.title.clone(),
             url: self.url.clone(),
@@ -133,7 +162,8 @@ impl SharedPrSnapshot {
                 .conversation_count
                 .unwrap_or_else(|| previous.map_or(0, |p| p.conversation_count)),
             review_comment_count: self.review_comment_count,
-            requirements: self.requirements.clone(),
+            requirements,
+            ejection_tracked,
         }
     }
 }
@@ -146,7 +176,7 @@ pub(crate) async fn fetch_shared_snapshot(
     repo_ref: &RepoRef,
     number: u64,
 ) -> Result<SharedPrSnapshot> {
-    let (pr, requirements, review_comment_count) =
+    let (pr, requirements, review_comment_count, ejection_known) =
         pr_ops::fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
     let conversation_count = match sc.list_comments(repo_ref, number).await {
         Ok(comments) => Some(i64::try_from(comments.len()).expect("value fits in i64")),
@@ -166,6 +196,7 @@ pub(crate) async fn fetch_shared_snapshot(
         conversation_count,
         review_comment_count,
         requirements,
+        ejection_known,
     })
 }
 
@@ -489,6 +520,10 @@ fn pr_monitor_wire(m: &PrMonitor) -> Value {
         // the PR queued (never null).
         if let Some(queued) = r.is_in_merge_queue {
             last["isInMergeQueue"] = json!(queued);
+        }
+        // Same presence rule: only when the host reported an ejection event.
+        if let Some(ejection) = &r.merge_queue_ejection {
+            last["mergeQueueEjection"] = serde_json::to_value(ejection).expect("serialize");
         }
         obj.insert("lastSnapshot".to_string(), last);
     }
@@ -1206,11 +1241,30 @@ impl Services {
         monitor: &PrMonitor,
         shared: &SharedPrSnapshot,
     ) -> Result<bool> {
-        let previous: Option<PrMonitorSnapshot> = monitor
+        let mut previous: Option<PrMonitorSnapshot> = monitor
             .last_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
         let fresh = shared.materialize(previous.as_ref());
+
+        // Upgrade backfill: an anchor persisted before ejection tracking
+        // existed has no event field at all, so the first tracked poll would
+        // misread whatever historical removal event the probe now reports as
+        // news and emit a false post-upgrade wake. Adopt the fresh event
+        // into UNTRACKED anchors silently (persisted via the baseline
+        // write-back below) — only ejections observed after tracking began
+        // are reportable.
+        let backfill = |s: &mut PrMonitorSnapshot| {
+            if fresh.ejection_tracked && !s.ejection_tracked {
+                s.requirements
+                    .merge_queue_ejection
+                    .clone_from(&fresh.requirements.merge_queue_ejection);
+                s.ejection_tracked = true;
+            }
+        };
+        if let Some(prev) = previous.as_mut() {
+            backfill(prev);
+        }
 
         // Per-poll activity (fresh vs the LAST POLL's snapshot) anchors the
         // debounce quiet-window; the pending set below is computed against
@@ -1223,11 +1277,14 @@ impl Services {
         // registration). A row missing one (unparseable column) anchors on
         // the last poll's snapshot; a row with neither adopts the fresh
         // snapshot below, with nothing pending.
-        let baseline: Option<PrMonitorSnapshot> = monitor
+        let mut baseline: Option<PrMonitorSnapshot> = monitor
             .baseline_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .or(previous);
+        if let Some(base) = baseline.as_mut() {
+            backfill(base);
+        }
 
         // The coalesced net set: REPLACED (never accumulated) each poll, so
         // a field that reverted to its baseline value drops out and A→B→C
@@ -2016,6 +2073,7 @@ mod tests {
 
     /// Mutable forge state one test can advance between polls.
     #[derive(Clone)]
+    #[allow(clippy::struct_excessive_bools)]
     struct ForgeState {
         pr_state: PrState,
         draft: bool,
@@ -2026,8 +2084,10 @@ mod tests {
         approvals: Vec<String>,
         threads: Vec<ReviewThread>,
         checks: Vec<RollupCheck>,
+        merge_queue_removal: Option<intent_sourcecontrol::MergeQueueRemoval>,
         fail_get_pr: bool,
         fail_list_comments: bool,
+        fail_merge_requirements: bool,
         /// PR number whose `get_pr` pends forever (hung-connection regression).
         hang_get_pr: Option<u64>,
     }
@@ -2049,8 +2109,10 @@ mod tests {
                     is_required: true,
                     url: None,
                 }],
+                merge_queue_removal: None,
                 fail_get_pr: false,
                 fail_list_comments: false,
+                fail_merge_requirements: false,
                 hang_get_pr: None,
             }
         }
@@ -2256,6 +2318,11 @@ mod tests {
             _: u64,
         ) -> intent_sourcecontrol::Result<MergeRequirementSignals> {
             let s = self.state.lock().unwrap().clone();
+            if s.fail_merge_requirements {
+                return Err(intent_sourcecontrol::Error::Unsupported(
+                    "probe down".into(),
+                ));
+            }
             Ok(MergeRequirementSignals {
                 merge_state_status: Some(s.mergeable_state.to_uppercase()),
                 review_decision: (!s.approvals.is_empty()).then_some(ReviewDecision::Approved),
@@ -2267,6 +2334,7 @@ mod tests {
                     required_status_checks: vec!["build".into()],
                 }),
                 is_in_merge_queue: None,
+                merge_queue_removal: s.merge_queue_removal.clone(),
             })
         }
         async fn list_comments(
@@ -2547,7 +2615,9 @@ mod tests {
                 merge_blocked_reason: None,
                 rules_known: true,
                 is_in_merge_queue: None,
+                merge_queue_ejection: None,
             },
+            ejection_tracked: true,
         };
         f(&mut s);
         s
@@ -2607,6 +2677,18 @@ mod tests {
         m.last_snapshot = Some(serde_json::to_string(&s).unwrap());
         let wire = pr_monitor_wire(&m);
         assert!(wire["lastSnapshot"].get("isInMergeQueue").is_none());
+        // Same presence rule for the ejection event.
+        assert!(wire["lastSnapshot"].get("mergeQueueEjection").is_none());
+        s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+            at: "2026-01-02T03:04:05Z".into(),
+            reason: Some("failed_checks".into()),
+        });
+        m.last_snapshot = Some(serde_json::to_string(&s).unwrap());
+        let wire = pr_monitor_wire(&m);
+        assert_eq!(
+            wire["lastSnapshot"]["mergeQueueEjection"],
+            json!({ "at": "2026-01-02T03:04:05Z", "reason": "failed_checks" })
+        );
     }
 
     #[test]
@@ -2713,6 +2795,120 @@ mod tests {
         assert!(diff_snapshots(&blocked, &base)
             .iter()
             .any(|c| c == "merge is no longer blocked"));
+    }
+
+    /// The ejection diff is keyed on the event identity (`at`): a new event
+    /// fires (with the reason humanized, underscores → spaces), an unchanged
+    /// event stays quiet, and an enter→eject pair that nets out on
+    /// `isInMergeQueue` still yields a reportable change.
+    #[test]
+    fn diff_reports_merge_queue_ejection_keyed_on_event_identity() {
+        let base = snapshot(|_| {});
+        let ejected = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-01-02T03:04:05Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+        });
+        assert!(diff_snapshots(&base, &ejected)
+            .iter()
+            .any(|c| c == "removed from the merge queue (failed checks)"));
+
+        // Unchanged event: nothing to report.
+        assert!(diff_snapshots(&ejected, &ejected).is_empty());
+
+        // A later ejection is a new event and fires again; no reason drops
+        // the parenthetical.
+        let re_ejected = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-01-03T00:00:00Z".into(),
+                reason: None,
+            });
+        });
+        assert!(diff_snapshots(&ejected, &re_ejected)
+            .iter()
+            .any(|c| c == "removed from the merge queue"));
+
+        // Enter→eject within one window: `isInMergeQueue` nets out to its
+        // baseline (absent on both sides), so no entered/left line — but the
+        // fresh ejection event still yields a reportable change.
+        let changes = diff_snapshots(&base, &ejected);
+        assert!(!changes
+            .iter()
+            .any(|c| c == "entered the merge queue" || c == "left the merge queue"));
+        assert_eq!(
+            changes,
+            vec!["removed from the merge queue (failed checks)"]
+        );
+    }
+
+    /// A persisted baseline written before `mergeQueueEjection` existed still
+    /// parses (serde default) and produces no phantom diff line against a
+    /// fresh snapshot that also has no event — and reads as UNTRACKED, so
+    /// the poll's upgrade backfill knows to adopt history silently.
+    #[test]
+    fn old_baseline_without_ejection_field_parses_without_phantom_diff() {
+        let mut wire = serde_json::to_value(snapshot(|_| {})).unwrap();
+        wire.as_object_mut().unwrap().remove("ejectionTracked");
+        let req = wire["requirements"].as_object_mut().unwrap();
+        assert!(
+            !req.contains_key("mergeQueueEjection"),
+            "omitted when absent"
+        );
+        let old: PrMonitorSnapshot = serde_json::from_value(wire).unwrap();
+        assert_eq!(old.requirements.merge_queue_ejection, None);
+        assert!(!old.ejection_tracked, "pre-upgrade rows read as untracked");
+        assert!(diff_snapshots(&old, &snapshot(|_| {})).is_empty());
+    }
+
+    /// [`SharedPrSnapshot`] with the [`snapshot`] fixture's fields; the
+    /// materialize tests vary `ejection_known` and the previous snapshot.
+    fn shared_from(s: &PrMonitorSnapshot, ejection_known: bool) -> SharedPrSnapshot {
+        SharedPrSnapshot {
+            title: s.title.clone(),
+            url: s.url.clone(),
+            head_sha: s.head_sha.clone(),
+            conversation_count: Some(s.conversation_count),
+            review_comment_count: s.review_comment_count,
+            requirements: s.requirements.clone(),
+            ejection_known,
+        }
+    }
+
+    /// A degraded merge-requirements probe (`ejection_known == false`) must
+    /// not read as "no ejection": materialize holds the monitor's previously
+    /// observed event (and its tracked-ness), while an answering probe is
+    /// authoritative on both.
+    #[test]
+    fn materialize_holds_previous_ejection_through_a_degraded_probe() {
+        let event = pr_ops::MergeQueueEjection {
+            at: "2026-01-02T03:04:05Z".into(),
+            reason: Some("failed_checks".into()),
+        };
+        let prev = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(event.clone());
+        });
+        let degraded = shared_from(&snapshot(|_| {}), false);
+        let m = degraded.materialize(Some(&prev));
+        assert_eq!(
+            m.requirements.merge_queue_ejection,
+            Some(event.clone()),
+            "the held event survives the degraded poll"
+        );
+        assert!(m.ejection_tracked, "tracked-ness carries with the hold");
+
+        // An untracked previous (pre-upgrade baseline) stays untracked
+        // through a degraded probe — only a real probe answer flips it.
+        let untracked = snapshot(|s| s.ejection_tracked = false);
+        assert!(!degraded.materialize(Some(&untracked)).ejection_tracked);
+        assert!(!degraded.materialize(None).ejection_tracked);
+
+        // An answering probe is authoritative: its (absent) event replaces
+        // the previous one and the result is tracked.
+        let known = shared_from(&snapshot(|_| {}), true);
+        let m = known.materialize(Some(&prev));
+        assert_eq!(m.requirements.merge_queue_ejection, None);
+        assert!(m.ejection_tracked);
     }
 
     #[test]
@@ -4031,6 +4227,197 @@ mod tests {
                 .count(),
             1,
             "exactly one wake: the legacy delivery"
+        );
+    }
+
+    /// Strip the ejection-tracking fields from a monitor's persisted
+    /// snapshot columns, forging a row written before the upgrade.
+    async fn strip_ejection_tracking(svc: &Services, id: &PrMonitorId) {
+        let row = svc.store().get_pr_monitor(id).await.unwrap();
+        let strip = |col: &Option<String>| -> Option<String> {
+            let mut v: Value = serde_json::from_str(col.as_deref()?).ok()?;
+            let obj = v.as_object_mut()?;
+            obj.remove("ejectionTracked");
+            obj.get_mut("requirements")?
+                .as_object_mut()?
+                .remove("mergeQueueEjection");
+            serde_json::to_string(&v).ok()
+        };
+        let (last, baseline) = (strip(&row.last_snapshot), strip(&row.baseline_snapshot));
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                id,
+                PrMonitorPollUpdate {
+                    last_snapshot: last.as_deref(),
+                    baseline_snapshot: baseline.as_deref(),
+                    pending_changes: &row.pending_changes,
+                    pending_since: row.pending_since.as_deref(),
+                    last_change_at: row.last_change_at.as_deref(),
+                    last_polled_at: row.last_polled_at.as_deref(),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+    }
+
+    /// The upgrade path for ejection tracking: a baseline persisted before
+    /// `mergeQueueEjection` existed carries no event, so the first
+    /// post-upgrade poll would misread whatever HISTORICAL removal event the
+    /// probe reports as news and emit a false wake. The poll must adopt the
+    /// event into the pre-upgrade baseline silently; only a LATER event (new
+    /// `at`) is reportable.
+    #[tokio::test]
+    async fn a_pre_upgrade_baseline_adopts_a_historical_ejection_silently() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS);
+        let monitor = register(&svc, &ws, &owner).await;
+        strip_ejection_tracking(&svc, &monitor.monitor_id).await;
+
+        // The PR was ejected long before the upgrade: the probe reports the
+        // stale event on the first post-upgrade poll.
+        forge.edit(|s| {
+            s.merge_queue_removal = Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2020-01-01T00:00:00Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            !row.pending_changes
+                .iter()
+                .any(|c| c.contains("merge queue")),
+            "the historical event is adopted, not reported: {:?}",
+            row.pending_changes
+        );
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("PR monitor"),
+            "no false post-upgrade wake"
+        );
+
+        // A NEW ejection after adoption is real news: it enters the pending
+        // set (the debounce window then carries it to the wake as usual).
+        forge.edit(|s| {
+            s.merge_queue_removal = Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-02-03T04:05:06Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "removed from the merge queue (failed checks)"),
+            "a post-adoption ejection is reportable: {:?}",
+            row.pending_changes
+        );
+    }
+
+    /// A transient merge-requirements probe failure after an ejection was
+    /// observed must not read as "no ejection": the pending line survives
+    /// the degraded poll, reaches the wake exactly once, and does not
+    /// re-report after the probe recovers with the same event.
+    #[tokio::test]
+    async fn a_degraded_probe_holds_an_observed_ejection_until_the_wake() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        forge.edit(|s| {
+            s.merge_queue_removal = Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-01-02T03:04:05Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+        });
+        svc.poll_pr_monitors().await;
+
+        // The probe degrades (get_pr still answers): the observed event
+        // must survive the recompute instead of emptying the pending set.
+        forge.edit(|s| s.fail_merge_requirements = true);
+        svc.poll_pr_monitors().await;
+        let held = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            held.pending_changes
+                .iter()
+                .any(|c| c == "removed from the merge queue (failed checks)"),
+            "the ejection line survives the degraded probe: {:?}",
+            held.pending_changes
+        );
+
+        // Recovery reports the SAME event: still pending, not duplicated.
+        forge.edit(|s| s.fail_merge_requirements = false);
+        svc.poll_pr_monitors().await;
+        let recovered = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .pending_changes
+                .iter()
+                .filter(|c| c.contains("merge queue"))
+                .count(),
+            1,
+            "one ejection line, no duplicate: {:?}",
+            recovered.pending_changes
+        );
+
+        // The window closes: the wake carries the ejection exactly once.
+        let svc = svc.with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS);
+        let stale = now_iso();
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: recovered.last_snapshot.as_deref(),
+                    baseline_snapshot: recovered.baseline_snapshot.as_deref(),
+                    pending_changes: &recovered.pending_changes,
+                    pending_since: Some("2020-01-01T00:00:00Z"),
+                    last_change_at: Some("2020-01-01T00:00:00Z"),
+                    last_polled_at: Some(&stale),
+                    last_error: None,
+                    updated_at: &stale,
+                    expected_updated_at: &recovered.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+        svc.poll_pr_monitors().await;
+        let text = owner_messages(&svc, &owner).await;
+        assert_eq!(
+            text.matches("removed from the merge queue (failed checks)")
+                .count(),
+            1,
+            "the held event reaches the wake exactly once: {text}"
+        );
+
+        // Post-wake polls with the same event stay quiet.
+        svc.poll_pr_monitors().await;
+        let text = owner_messages(&svc, &owner).await;
+        assert_eq!(
+            text.matches("removed from the merge queue (failed checks)")
+                .count(),
+            1,
+            "no re-report after the wake: {text}"
         );
     }
 

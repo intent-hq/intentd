@@ -17,10 +17,10 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
-    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
-    NewPullRequest, Page, PageParams, PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, Repo,
-    RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
-    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
+    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment, ReviewDecision,
+    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
 
@@ -747,6 +747,14 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
     pullRequest(number: $prNumber) {
       mergeStateStatus
       isInMergeQueue
+      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          ... on RemovedFromMergeQueueEvent {
+            createdAt
+            reason
+          }
+        }
+      }
       reviewDecision
       baseRefName
       commits(last: 1) {
@@ -780,23 +788,61 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
 }
 ";
 
-/// [`MERGE_REQUIREMENTS_QUERY`] minus the `isInMergeQueue` selection, for
-/// hosts whose GraphQL schema predates merge queues (older GHES): GraphQL
-/// rejects the WHOLE query on an unknown field, so the probe retries once
-/// with this selection and the signal degrades to `None` instead of failing
-/// the entire checklist.
+/// The merge-queue removal-event selection of [`MERGE_REQUIREMENTS_QUERY`],
+/// verbatim, so the schema fallback can strip it. The `last: 1` timeline
+/// window fetches only the LATEST removal event — the one the monitor diffs
+/// on — in the same round trip as the rest of the probe.
+const MERGE_QUEUE_TIMELINE_SELECTION: &str = "
+      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          ... on RemovedFromMergeQueueEvent {
+            createdAt
+            reason
+          }
+        }
+      }";
+
+/// [`MERGE_REQUIREMENTS_QUERY`] minus the merge-queue selections
+/// (`isInMergeQueue` and the removal-event timeline items), for hosts whose
+/// GraphQL schema predates merge queues (older GHES): GraphQL rejects the
+/// WHOLE query on an unknown field, so the probe retries once with this
+/// selection and the signals degrade to `None` instead of failing the entire
+/// checklist. A schema lacking `isInMergeQueue` also lacks
+/// `RemovedFromMergeQueueEvent`, so both go together.
 fn merge_requirements_query_without_merge_queue() -> String {
-    MERGE_REQUIREMENTS_QUERY.replace("\n      isInMergeQueue", "")
+    MERGE_REQUIREMENTS_QUERY
+        .replace("\n      isInMergeQueue", "")
+        .replace(MERGE_QUEUE_TIMELINE_SELECTION, "")
 }
 
-/// True when a merge-requirements probe error is GraphQL rejecting the
-/// `isInMergeQueue` selection as unknown (the schema-validation wording is
-/// `Field 'isInMergeQueue' doesn't exist on type 'PullRequest'`; octocrab
-/// folds GraphQL errors into their message text, which [`From`] maps onto
-/// [`Error::Api`]). Any other error — auth, rate limit, network — stays a
-/// hard failure.
+/// True when a merge-requirements probe error is GraphQL rejecting one of the
+/// merge-queue selections as unknown (the schema-validation wording is
+/// `Field 'isInMergeQueue' doesn't exist on type 'PullRequest'`, and a schema
+/// without merge queues likewise rejects the `RemovedFromMergeQueueEvent`
+/// timeline selection; octocrab folds GraphQL errors into their message text,
+/// which [`From`] maps onto [`Error::Api`]). Any other error — auth, rate
+/// limit, network — stays a hard failure.
 fn merge_queue_field_unsupported(err: &Error) -> bool {
-    matches!(err, Error::Api(msg) if msg.contains("isInMergeQueue"))
+    matches!(
+        err,
+        Error::Api(msg) if msg.contains("isInMergeQueue")
+            || msg.contains("RemovedFromMergeQueueEvent")
+            || msg.contains("REMOVED_FROM_MERGE_QUEUE_EVENT")
+    )
+}
+
+/// Extract the PR's latest merge-queue removal event from the probe's
+/// `timelineItems` selection. `None` when the host does not report the
+/// selection (schema fallback), the PR was never ejected, or the node lacks
+/// `createdAt`; a missing `reason` degrades to `None` on the event instead.
+fn parse_merge_queue_removal(pr: Option<&Value>) -> Option<MergeQueueRemoval> {
+    let nodes = pr?.pointer("/timelineItems/nodes")?.as_array()?;
+    nodes.iter().rev().find_map(|node| {
+        Some(MergeQueueRemoval {
+            at: node.get("createdAt")?.as_str()?.to_string(),
+            reason: node.get("reason").and_then(Value::as_str).map(String::from),
+        })
+    })
 }
 
 /// The GraphQL pointer to the PR's status-check rollup contexts (the last
@@ -1354,6 +1400,7 @@ impl SourceControl for GitHubSourceControl {
         let is_in_merge_queue = pr
             .and_then(|p| p.get("isInMergeQueue"))
             .and_then(Value::as_bool);
+        let merge_queue_removal = parse_merge_queue_removal(pr);
         let rollup = data
             .pointer(ROLLUP_CONTEXTS_POINTER)
             .and_then(Value::as_array);
@@ -1396,6 +1443,7 @@ impl SourceControl for GitHubSourceControl {
             checks_known: rollup.is_some(),
             branch_rules,
             is_in_merge_queue,
+            merge_queue_removal,
         })
     }
 
@@ -1853,12 +1901,19 @@ mod tests {
     }
 
     #[test]
-    fn merge_queue_fallback_query_drops_only_that_selection() {
+    fn merge_queue_fallback_query_drops_only_those_selections() {
         // The degraded query differs from the primary by exactly the
-        // `isInMergeQueue` line — everything else survives verbatim.
+        // `isInMergeQueue` line and the removal-event timeline block —
+        // everything else survives verbatim.
         let fallback = merge_requirements_query_without_merge_queue();
         assert!(!fallback.contains("isInMergeQueue"));
+        assert!(!fallback.contains("timelineItems"));
+        assert!(!fallback.contains("RemovedFromMergeQueueEvent"));
         assert!(MERGE_REQUIREMENTS_QUERY.contains("isInMergeQueue"));
+        assert!(
+            MERGE_REQUIREMENTS_QUERY.contains(MERGE_QUEUE_TIMELINE_SELECTION),
+            "the strip target must match the primary query verbatim"
+        );
         for kept in [
             "mergeStateStatus",
             "reviewDecision",
@@ -1869,8 +1924,10 @@ mod tests {
         }
         assert_eq!(
             fallback.lines().count(),
-            MERGE_REQUIREMENTS_QUERY.lines().count() - 1,
-            "exactly one line removed"
+            MERGE_REQUIREMENTS_QUERY.lines().count()
+                - 1
+                - MERGE_QUEUE_TIMELINE_SELECTION.matches('\n').count(),
+            "exactly the merge-queue lines removed"
         );
     }
 
@@ -1883,6 +1940,17 @@ mod tests {
             "GraphQL Error: Field 'isInMergeQueue' doesn't exist on type 'PullRequest'".into(),
         );
         assert!(merge_queue_field_unsupported(&schema));
+        // The removal-event selection is rejected with the same wording on
+        // hosts that lack it.
+        let timeline =
+            Error::Api("GraphQL Error: Field 'RemovedFromMergeQueueEvent' doesn't exist".into());
+        assert!(merge_queue_field_unsupported(&timeline));
+        let item_type = Error::Api(
+            "GraphQL Error: Value 'REMOVED_FROM_MERGE_QUEUE_EVENT' doesn't exist in \
+             'PullRequestTimelineItemsItemType' enum"
+                .into(),
+        );
+        assert!(merge_queue_field_unsupported(&item_type));
 
         // Any other failure — auth, rate limit, unrelated API error — stays
         // a hard failure rather than triggering the degraded retry.
@@ -2021,10 +2089,16 @@ mod tests {
                 required_status_checks: vec!["build".into()],
             }),
             is_in_merge_queue: Some(true),
+            merge_queue_removal: Some(MergeQueueRemoval {
+                at: "2026-08-27T00:00:00Z".into(),
+                reason: Some("failed_checks".into()),
+            }),
         };
         let wire = serde_json::to_value(&signals).unwrap();
         assert_eq!(wire["mergeStateStatus"], "BLOCKED");
         assert_eq!(wire["isInMergeQueue"], true);
+        assert_eq!(wire["mergeQueueRemoval"]["at"], "2026-08-27T00:00:00Z");
+        assert_eq!(wire["mergeQueueRemoval"]["reason"], "failed_checks");
         assert_eq!(wire["reviewDecision"], "review_required");
         assert_eq!(wire["checksKnown"], true);
         assert_eq!(wire["checks"][0]["isRequired"], true);
@@ -2041,9 +2115,65 @@ mod tests {
             json!(["build"])
         );
 
-        // A host that does not report the merge-queue flag omits the key.
+        // A host that does not report the merge-queue signals omits the keys.
         let wire = serde_json::to_value(MergeRequirementSignals::default()).unwrap();
         assert!(wire.get("isInMergeQueue").is_none());
+        assert!(wire.get("mergeQueueRemoval").is_none());
+
+        // A persisted payload predating the removal field still parses.
+        let old: MergeRequirementSignals = serde_json::from_value(json!({
+            "mergeStateStatus": "CLEAN",
+            "reviewDecision": null,
+            "checks": [],
+            "checksKnown": false,
+            "branchRules": null,
+        }))
+        .unwrap();
+        assert_eq!(old.merge_queue_removal, None);
+    }
+
+    #[test]
+    fn parses_latest_merge_queue_removal_event() {
+        let pr = json!({
+            "timelineItems": { "nodes": [{
+                "createdAt": "2026-08-26T22:26:36Z",
+                "reason": "failed_checks"
+            }] }
+        });
+        assert_eq!(
+            parse_merge_queue_removal(Some(&pr)),
+            Some(MergeQueueRemoval {
+                at: "2026-08-26T22:26:36Z".into(),
+                reason: Some("failed_checks".into()),
+            })
+        );
+
+        // A host that reports the event without a reason still yields it.
+        let no_reason = json!({
+            "timelineItems": { "nodes": [{ "createdAt": "2026-08-26T22:26:36Z" }] }
+        });
+        assert_eq!(
+            parse_merge_queue_removal(Some(&no_reason))
+                .expect("event without reason")
+                .reason,
+            None
+        );
+    }
+
+    #[test]
+    fn merge_queue_removal_degrades_to_none_without_event() {
+        // Never ejected: the timeline window is empty.
+        let empty = json!({ "timelineItems": { "nodes": [] } });
+        assert_eq!(parse_merge_queue_removal(Some(&empty)), None);
+        // Schema fallback: the selection is absent entirely.
+        let absent = json!({ "mergeStateStatus": "CLEAN" });
+        assert_eq!(parse_merge_queue_removal(Some(&absent)), None);
+        assert_eq!(parse_merge_queue_removal(None), None);
+        // A malformed node (no createdAt) degrades rather than panics.
+        let malformed = json!({
+            "timelineItems": { "nodes": [{ "reason": "failed_checks" }] }
+        });
+        assert_eq!(parse_merge_queue_removal(Some(&malformed)), None);
     }
 
     #[test]

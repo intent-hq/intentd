@@ -23751,7 +23751,7 @@ impl WorkspaceApi for Services {
             // `prMonitor.list` summaries all describe a PR with the same
             // object — this registers nothing and triggers no monitoring.
             // Every forge sub-read inside degrades on its own.
-            let (requirements, review_comment_count) =
+            let (requirements, review_comment_count, _ejection_known) =
                 pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await;
             let unresolved_thread_count = requirements.threads.unresolved;
             // The conversation-comment count is not part of the checklist; a
