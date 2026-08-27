@@ -28380,6 +28380,90 @@ mod last_activity_events {
         }
     }
 
+    /// Regression (monorepo#3623): `workspace.delete` cancels the pending
+    /// debounced lastActivity derivation. Without the cancel the timer
+    /// outlives the workspace, fires against the deleted row, and logs a
+    /// spurious `get_workspace failed ... not found` WARN.
+    #[tokio::test]
+    async fn delete_workspace_cancels_pending_last_activity_schedule() {
+        use intent_core::WorkspaceApi;
+        // Debounce window far longer than the test: the delete must land
+        // while the schedule is still pending.
+        let _guard = DebounceEnvGuard::new("30000");
+        let h = harness().await;
+
+        h.services.schedule_last_activity_event(h.ws.clone());
+        assert!(
+            h.services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "schedule must be pending before the delete"
+        );
+
+        h.services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("delete workspace");
+
+        assert!(
+            !h.services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "workspace.delete must cancel the pending last-activity schedule"
+        );
+    }
+
+    /// Regression (monorepo#3623, review): a timer that fires against an
+    /// already-deleted workspace — the shape a bump racing the delete takes
+    /// when it re-arms a schedule after `workspace.delete`'s cancel — must
+    /// still remove its own `(gen, AbortHandle)` entry from the debouncers
+    /// map. Without the shared tail cleanup the early `NotFound` return would
+    /// strand the entry for the daemon's lifetime (ids are never recycled).
+    #[tokio::test]
+    async fn stray_timer_on_deleted_workspace_cleans_up_map_entry() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+
+        // Delete the row directly in the store, bypassing the services-layer
+        // cancel — then schedule, simulating a schedule re-armed after the
+        // delete's cancel already ran.
+        h.store.delete_workspace(&h.ws).await.expect("row delete");
+        h.services.schedule_last_activity_event(h.ws.clone());
+        assert!(
+            h.services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "schedule must be pending before the timer fires"
+        );
+
+        // Bounded poll: the timer fires after the debounce window, takes the
+        // NotFound arm, and must still sweep its map entry on the way out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = h
+                .services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stray timer must remove its own debouncers entry after firing \
+                 against a deleted workspace"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// After `raise_attention` (which bumps `workspace.updated_at`), a
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]
