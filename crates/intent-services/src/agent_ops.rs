@@ -7140,7 +7140,9 @@ impl Services {
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         // Resolve the child's first message up front so it can be persisted as
-        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
+        // `AgentSession.initial_message` on the created session (harvested from
+        // the `metadata.initialMessage` create param; served by
+        // `agent.getSession` only — P3-1.2b; the FE
         // stored it so a wake-up can resume). Source priority mirrors the TS
         // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
         // then the linked task note's content (falling back to its title).
@@ -7645,7 +7647,7 @@ impl Services {
             }
         }
         // Deliver the child's first message (resolved above, persisted as
-        // `metadata.initialMessage`) and start its turn (PROTOCOL §5.5).
+        // `AgentSession.initial_message`) and start its turn (PROTOCOL §5.5).
         // Without this the child stays `Pending` and never runs. `wait_mode` is
         // already honored by the completion-watch registration above; the child
         // turn itself starts unconditionally.

@@ -2707,8 +2707,10 @@ pub struct AgentSession {
     /// runaway delegation loops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
-    /// The first message a delegated agent was started with (FE
-    /// `metadata.initialMessage`), persisted so a wake-up can resume.
+    /// The first message a delegated agent was started with (harvested from
+    /// the `metadata.initialMessage` create param), persisted so a wake-up can
+    /// resume. Served by `agent.getSession` only — deliberately absent from
+    /// the `AgentLite` projection (see `AgentMetadata`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_message: Option<String>,
     /// Session-level context references captured at spawn (FE top-level
