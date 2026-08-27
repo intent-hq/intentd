@@ -17,10 +17,11 @@
 //! every `models.list` call: concurrent fetches for one (provider, version
 //! key) are **single-flighted** (one probe runs, everyone shares its result),
 //! and a failed probe is **negatively cached** for [`MODELS_NEGATIVE_TTL`] —
-//! within that window a non-forced miss reports nothing to serve without
-//! re-probing (a matching last-good entry would have been a plain cache hit
-//! before the negative window is even consulted). `force_refresh` bypasses
-//! the negative entry but still single-flights.
+//! within that window a non-forced read that is not a fresh hit skips the
+//! probe and serves what the cache has: the stale-labeled last-good list for
+//! an aged entry (a fresh entry is a plain hit before the negative window is
+//! even consulted), or nothing to serve on a true miss. `force_refresh`
+//! bypasses the negative entry but still single-flights.
 //!
 //! The registry lists every provider with a daemon-side model source: auggie
 //! (rich CLI fetch), cortex (empty catalog — the provider CLI owns model
