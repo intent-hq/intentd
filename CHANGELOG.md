@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.6] - 2026-08-27
+
+### 🚀 Features
+
+- *(intentd)* Log version, build commit, and protocol at serve startup ([#1531](https://github.com/intent-hq/intentd/pull/1531))
+
+### 🐛 Bug Fixes
+
+- *(services)* Sweep pending idle debouncer on workspace delete ([#1528](https://github.com/intent-hq/intentd/pull/1528))
+- *(git)* Cap git.status files list at 5000 entries with additive truncation markers ([#1530](https://github.com/intent-hq/intentd/pull/1530))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update monorepo references for the intent-hq/intent rename ([#1534](https://github.com/intent-hq/intentd/pull/1534))
+
+
 ## [0.8.5] - 2026-08-27
 
 ### 🚀 Features
