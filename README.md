@@ -5,7 +5,7 @@ workspaces, notes, tasks, comments, agents, git, pull requests, scripts, termina
 and events — and exposes it over a **JSON-RPC 2.0** API. Clients (a desktop UI, a CLI, or an
 agent acting as an MCP client) are thin: all business logic lives in the daemon.
 
-This repo is consumed as a git submodule by [intent-hq/monorepo](https://github.com/intent-hq/monorepo).
+This repo is consumed as a git submodule by [intent-hq/intent](https://github.com/intent-hq/intent).
 
 ## What it is
 
@@ -622,6 +622,6 @@ The design docs live in the monorepo under `docs/`:
 
 ## Related Repositories
 
-- [intent-hq/monorepo](https://github.com/intent-hq/monorepo) — engineering monorepo
+- [intent-hq/intent](https://github.com/intent-hq/intent) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
 

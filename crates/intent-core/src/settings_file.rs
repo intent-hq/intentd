@@ -1447,7 +1447,7 @@ level = "info"
 [agents]
 # What an agent subtree actually costs, and what each knob below does and does
 # not bound, is written up under "Agent process-tree memory" in
-# docs/ARCHITECTURE.md of the intent-hq/monorepo repo. Every figure quoted in
+# docs/ARCHITECTURE.md of the intent-hq/intent repo. Every figure quoted in
 # this table is measured (monorepo#2062, #2063, #2109).
 # Max concurrent agents -- concurrent agent session cap (0 = auto based on
 # system RAM; changes apply on daemon restart; max 200). This is a concurrency

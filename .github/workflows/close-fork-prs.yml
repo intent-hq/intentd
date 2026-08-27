@@ -45,7 +45,7 @@ jobs:
                 "",
                 "If you've found a bug or have a feature request, we'd still love to",
                 "hear about it — please open an issue on our tracker at",
-                "https://github.com/intent-hq/monorepo/issues and we'll take a look.",
+                "https://github.com/intent-hq/intent/issues and we'll take a look.",
               ].join("\n"),
             });
             await github.rest.pulls.update({
