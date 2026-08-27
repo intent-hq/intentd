@@ -23443,6 +23443,46 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn app_agents_send(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.app_agents_send_op(
+                workspace_id,
+                caller_agent_id,
+                target_agent_id,
+                message,
+                priority,
+            )
+            .await
+        })
+    }
+
+    fn app_agents_ask(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.app_agents_ask_op(
+                workspace_id,
+                caller_agent_id,
+                target_agent_id,
+                message,
+                priority,
+            )
+            .await
+        })
+    }
+
     fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             let rows = self.store.list_interrupted_agents().await?;

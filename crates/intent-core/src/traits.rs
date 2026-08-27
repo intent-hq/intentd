@@ -2592,6 +2592,57 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `app.agents.send` (the Chief-only `ws.app.agents.send` MCP binding):
+    /// resolve a target agent across workspaces and deliver an automatically
+    /// attributed message through the ordinary agent message path.
+    fn app_agents_send(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            caller_agent_id,
+            target_agent_id,
+            message,
+            priority,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_agents_send not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `app.agents.ask` (the Chief-only `ws.app.agents.ask` MCP binding):
+    /// deliver an attributed message through the ordinary send path and arm
+    /// one durable completion watch. Direct replies remain ordinary messages;
+    /// only target settlement consumes the watch and wakes the Chief.
+    fn app_agents_ask(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            caller_agent_id,
+            target_agent_id,
+            message,
+            priority,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_agents_ask not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.cancelSubscriptions`: cancel an agent's subscriptions —
     /// everything when unscoped, or just the named completion watch
     /// (`subscription_id`) / delegation group (`group_id`) when scoped;

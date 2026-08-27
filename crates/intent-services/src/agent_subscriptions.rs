@@ -222,6 +222,61 @@ impl Services {
         Ok(id)
     }
 
+    /// Ask-only durable registration. Unlike the generic registration paths,
+    /// an ask must not report a registered watch when its durable upsert fails.
+    /// Roll back the in-memory insertion (or adoption mutation) and propagate
+    /// the store error so the binding cannot return `ok: true`.
+    pub(crate) async fn register_completion_watch_strict_durable(
+        &self,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        parent_agent_name: String,
+        child_agent_id: AgentId,
+        group_id: Option<String>,
+    ) -> Result<String> {
+        let previous = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .find(|watch| {
+                watch.parent_agent_id == parent_agent_id && watch.child_agent_id == child_agent_id
+            })
+            .cloned();
+        let watch = self.insert_watch_in_memory(
+            parent_workspace_id,
+            child_workspace_id,
+            parent_agent_id,
+            parent_agent_name,
+            child_agent_id,
+            group_id,
+            false,
+        )?;
+        let id = watch.id.clone();
+        let persisted = completion_watch_to_persisted(&watch);
+        if let Err(error) = self.store.upsert_completion_watch(&persisted).await {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            if let Some(previous) = previous {
+                if let Some(current) = guard
+                    .subscriptions
+                    .iter_mut()
+                    .find(|candidate| candidate.id == id)
+                {
+                    *current = previous;
+                }
+            } else {
+                guard.subscriptions.retain(|candidate| candidate.id != id);
+            }
+            return Err(error);
+        }
+        Ok(id)
+    }
+
     /// Explicit `agent.watch` registration (monorepo#1229): an ungrouped
     /// watch with an AWAITED persist (the registration is the caller's
     /// durable contract). Attention wakes reach every active watch

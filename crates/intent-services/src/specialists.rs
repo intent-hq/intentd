@@ -2432,6 +2432,42 @@ mod tests {
     }
 
     #[test]
+    fn bundled_chief_prompts_pin_exact_completion_relay_contract() {
+        for (version, bundle) in [("v1", EMBEDDED_BUNDLED_V1), ("v1.1", EMBEDDED_BUNDLED_V1_1)] {
+            let prompt = bundle
+                .iter()
+                .find_map(|(id, content)| (*id == "chief-of-staff").then_some(*content))
+                .expect("bundled Chief prompt exists");
+            assert!(
+                prompt.contains("On the one completion wake"),
+                "{version}: one completion wake"
+            );
+            assert!(
+                prompt.contains("ws.app.agents.readConversation(asked.send.workspaceId, asked.send.agentId, { lastN: 20 })` once"),
+                "{version}: one bounded conversation read"
+            );
+            assert!(
+                prompt.contains("[${conversation.workspaceTitle}](intent://local/${conversation.workspaceId}/agent/${conversation.agentId}/message/${finalAssistant.id})"),
+                "{version}: exact target-message link with title label"
+            );
+            assert!(
+                prompt.contains("Build this URL only from the `readConversation` result"),
+                "{version}: link identifiers come from the conversation read"
+            );
+            assert!(
+                prompt.contains(
+                    "Never expose a raw workspace ID or agent ID in relay prose or link text"
+                ),
+                "{version}: raw IDs stay out of user-visible relay text"
+            );
+            assert!(
+                prompt.contains("Relay that assistant message once"),
+                "{version}: one final relay"
+            );
+        }
+    }
+
+    #[test]
     fn user_file_overrides_embedded_bundled() {
         let dir = TempSpecialistsDir::new();
         dir.write(
