@@ -28380,6 +28380,43 @@ mod last_activity_events {
         }
     }
 
+    /// Regression (monorepo#3623): `workspace.delete` cancels the pending
+    /// debounced lastActivity derivation. Without the cancel the timer
+    /// outlives the workspace, fires against the deleted row, and logs a
+    /// spurious `get_workspace failed ... not found` WARN.
+    #[tokio::test]
+    async fn delete_workspace_cancels_pending_last_activity_schedule() {
+        use intent_core::WorkspaceApi;
+        // Debounce window far longer than the test: the delete must land
+        // while the schedule is still pending.
+        let _guard = DebounceEnvGuard::new("30000");
+        let h = harness().await;
+
+        h.services.schedule_last_activity_event(h.ws.clone());
+        assert!(
+            h.services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "schedule must be pending before the delete"
+        );
+
+        h.services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("delete workspace");
+
+        assert!(
+            !h.services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "workspace.delete must cancel the pending last-activity schedule"
+        );
+    }
+
     /// After `raise_attention` (which bumps `workspace.updated_at`), a
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]

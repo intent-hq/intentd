@@ -1883,6 +1883,17 @@ impl Services {
             // Get the current workspace and capture its old lastActivity.
             let mut ws = match this.store.get_workspace(&ws_id).await {
                 Ok(w) => w,
+                Err(Error::NotFound(_)) => {
+                    // Expected shape, not a failure (monorepo#3623): the
+                    // workspace was deleted while the timer was pending —
+                    // `workspace.delete` cancels the schedule, but a bump
+                    // racing the delete can still re-arm one after the
+                    // cancel. Ids are never recycled, so not-found here
+                    // always means "deleted mid-window"; there is nothing
+                    // left to derive against.
+                    tracing::debug!(workspace = %ws_id.as_str(), "schedule_last_activity_event: workspace deleted before the debounce fired; skipping");
+                    return;
+                }
                 Err(e) => {
                     tracing::warn!(workspace = %ws_id.as_str(), error = %e, "schedule_last_activity_event: get_workspace failed");
                     return;
@@ -1955,6 +1966,18 @@ impl Services {
                 }
             } else {
                 // Our generation is older; abort this task immediately.
+                handle.abort();
+            }
+        }
+    }
+
+    /// Cancel the pending debounced lastActivity derivation for a workspace,
+    /// if any (monorepo#3623): called from `workspace.delete` so the timer
+    /// does not outlive the workspace, fire against the deleted row, and log
+    /// a spurious not-found WARN.
+    pub(crate) fn cancel_last_activity_schedule(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut debouncers) = self.last_activity_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(workspace_id) {
                 handle.abort();
             }
         }
@@ -16043,6 +16066,12 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             }
+            // Cancel any pending debounced lastActivity derivation
+            // (monorepo#3623): the timer must not outlive the workspace —
+            // it would fire against the deleted row and log a spurious
+            // not-found WARN. After the row delete, so a schedule placed
+            // by the teardown above is swept too.
+            services.cancel_last_activity_schedule(&id);
             // Evict the deleted workspace's last-observed displayStatus
             // baseline so the in-memory map does not leak for the daemon's
             // lifetime (and a same-id recreate seeds fresh).
