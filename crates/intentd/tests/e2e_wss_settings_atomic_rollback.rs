@@ -482,6 +482,7 @@ async fn agent_features_token_impact_over_wss() {
             "agentFeatures.taskGraph",
             "~170 tokens/session + variable per completion wake",
         ),
+        ("agentFeatures.peerAgents", "~80 tokens/session"),
     ] {
         assert_eq!(
             entry(path)["tokenImpact"],
