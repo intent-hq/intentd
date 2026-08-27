@@ -20675,7 +20675,14 @@ impl WorkspaceApi for Services {
                     "git.status: working-tree status scan"
                 );
             }
-            status.map(|s| (*s).clone())
+            // The wire response is capped (monorepo#3635): the cached status
+            // keeps the full-fidelity file list for internal consumers
+            // (auto-commit selection, accept-changes, `git.changes`), and only
+            // this `git.status` projection truncates — tracked changes
+            // preferred over untracked, additive `filesTruncated`/`totalFiles`
+            // markers set — so a ~100k-untracked-file worktree can no longer
+            // produce a multi-megabyte outbound frame.
+            status.map(|s| intent_git::status::cap_status_files(&s))
         })
     }
 
