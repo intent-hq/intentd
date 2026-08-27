@@ -9796,6 +9796,40 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
     .await;
     assert_eq!(bad_sub["error"]["code"], -32602);
 
+    // `includeInProgress` (§5.5, monorepo#3647): boolean values are
+    // accepted — with no turn in flight both shapes match the opted-out
+    // read — and a non-boolean is `-32602`.
+    let opted_in = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","includeInProgress":true}}}}"#
+        ),
+    )
+    .await;
+    let opted_out = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","includeInProgress":false}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        opted_in["result"], opted_out["result"],
+        "idle agent: includeInProgress adds nothing"
+    );
+    assert!(opted_in["result"]["messages"][0]["inProgress"].is_null());
+    let bad_flag = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","includeInProgress":"yes"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_flag["error"]["code"], -32602);
+
     srv.ws.stop().await;
 }
 

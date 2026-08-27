@@ -22531,6 +22531,7 @@ impl WorkspaceApi for Services {
         around_message_id: Option<String>,
         around_index: Option<i64>,
         projection: Option<intent_core::ConversationProjection>,
+        include_in_progress: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.agent_get_conversation_op(
@@ -22541,6 +22542,7 @@ impl WorkspaceApi for Services {
                 around_message_id,
                 around_index,
                 projection,
+                include_in_progress,
             )
             .await
         })

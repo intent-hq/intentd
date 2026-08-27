@@ -1803,6 +1803,58 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         conv["lastStreamActivityAt"].is_string(),
         "mid-turn getConversation carries lastStreamActivityAt: {conv}"
     );
+    // Opted out, the parked turn's streamed content is absent from the page
+    // (nothing persisted yet) — the pre-`includeInProgress` shape.
+    let opted_out_len = conv["messages"].as_array().expect("messages array").len();
+    assert!(
+        conv["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .all(|m| m.get("inProgress").is_none()),
+        "opted-out page carries no in-progress row: {conv}"
+    );
+
+    // In-progress tail over the wire (monorepo#3647): opting in appends the
+    // parked turn's REAL streamed blocks as a trailing `inProgress: true`
+    // row — same page otherwise, excluded from `totalMessages`.
+    let conv_live = wss_rpc(
+        &mut rpc,
+        23,
+        "agent.getConversation",
+        json!({ "agentId": agent_id, "includeInProgress": true }),
+    )
+    .await;
+    let live_msgs = conv_live["messages"].as_array().expect("messages array");
+    assert_eq!(
+        live_msgs.len(),
+        opted_out_len + 1,
+        "opted-in page appends exactly the in-progress row: {conv_live}"
+    );
+    let live_row = live_msgs.last().expect("in-progress row");
+    assert_eq!(
+        live_row["inProgress"], true,
+        "trailing row flagged inProgress: {live_row}"
+    );
+    assert_eq!(
+        live_row["role"], "assistant",
+        "in-progress row is assistant: {live_row}"
+    );
+    assert!(
+        live_row["contentBlocks"]
+            .as_array()
+            .expect("content blocks")
+            .iter()
+            .any(|b| b["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")),
+        "in-progress row carries the actually-streamed chunk: {live_row}"
+    );
+    assert_eq!(
+        conv_live["totalMessages"], conv["totalMessages"],
+        "synthetic row not counted in totalMessages: {conv_live}"
+    );
 
     // Stop the agent mid-turn — interrupt (not kill); terminal stream:end fires
     // carrying `stopReason: "interrupted"` + the interrupted row's `messageId`

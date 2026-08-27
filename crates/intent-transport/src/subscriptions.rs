@@ -570,7 +570,16 @@ pub(crate) async fn chat_snapshot(
     projection: Option<ConversationProjection>,
 ) -> Value {
     let mut snapshot = match api
-        .agent_get_conversation(agent_id.clone(), None, None, None, None, None, projection)
+        .agent_get_conversation(
+            agent_id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            projection,
+            false,
+        )
         .await
     {
         Ok(v) => v,
@@ -604,8 +613,18 @@ pub(crate) async fn chat_recovery_snapshot(
     agent_id: &AgentId,
     projection: Option<ConversationProjection>,
 ) -> Option<Value> {
-    let read =
-        || api.agent_get_conversation(agent_id.clone(), None, None, None, None, None, projection);
+    let read = || {
+        api.agent_get_conversation(
+            agent_id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            projection,
+            false,
+        )
+    };
     let mut snapshot = match read().await {
         Ok(v) => v,
         Err(_) => read().await.ok()?,
@@ -989,6 +1008,7 @@ impl ChatDeltaState {
                 None,
                 None,
                 self.projection,
+                false,
             )
             .await
             .ok()?;
@@ -1302,6 +1322,7 @@ impl ChatDeltaState {
                 None,
                 None,
                 self.projection,
+                false,
             )
         };
         let conv = match read().await {

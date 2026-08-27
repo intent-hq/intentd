@@ -193,6 +193,9 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
     } else {
         normalize_limit(last_n, DEFAULT_READ_LIMIT, MAX_READ_LIMIT)?
     };
+    // No in-progress tail here (monorepo#3647): this reader window-slices by
+    // transcript position against `totalMessages`, and a serve-time synthetic
+    // row would skew that arithmetic.
     let first_page = api
         .agent_get_conversation(
             agent_id.clone(),
@@ -202,6 +205,7 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
             None,
             None,
             Some(intent_core::ConversationProjection::Slim),
+            false,
         )
         .await
         .map_err(map_err)?;
@@ -272,6 +276,7 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
                 None,
                 None,
                 Some(intent_core::ConversationProjection::Slim),
+                false,
             )
             .await
             .map_err(map_err)?;
@@ -541,6 +546,7 @@ mod tests {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             let messages = self.conversation_messages.lock().unwrap().clone();
             Box::pin(async move { Ok(json!({ "messages": messages })) })

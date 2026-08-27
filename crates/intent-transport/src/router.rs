@@ -1290,6 +1290,18 @@ async fn dispatch(
             // v8.0 — absent / null and the explicit `"slim"` all serve
             // bounded tool/image block bodies; any other value is `-32602`.
             let projection = parse_projection(params)?;
+            // Additive `includeInProgress` param (§5.5, monorepo#3647):
+            // opt-in to the in-flight turn's partial assistant message as a
+            // trailing `inProgress: true` row on tail pages. Absent / null /
+            // false keep responses byte-identical; any non-boolean is
+            // `-32602`.
+            let include_in_progress = match params.get("includeInProgress") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(invalid_params("includeInProgress must be a boolean"));
+                }
+            };
             match api
                 .agent_get_conversation(
                     agent_id,
@@ -1299,6 +1311,7 @@ async fn dispatch(
                     around_message_id,
                     around_index,
                     projection,
+                    include_in_progress,
                 )
                 .await
             {

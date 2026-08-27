@@ -2479,6 +2479,27 @@ impl Services {
         lite.waiting_for_agent_ids = waiting_for_agent_ids;
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
+        // Liveness overlay on `lastActivity` (monorepo#3647): the persisted
+        // `updated_at` freezes at turn start (nothing persists until the turn
+        // ends), so mid-turn the live-turn slot's stream stamp is the newer
+        // truth. Serve the max of the two so pollers watching `lastActivity`
+        // see a long-but-alive turn advance instead of reading as stalled.
+        // Compare parsed instants — RFC-3339 strings carry variable
+        // sub-second precision, so lexicographic order is not chronological.
+        // An exact-instant tie prefers the live stamp (refreshed on every
+        // stream event, so at least as fresh), matching the diagnostics path.
+        if let Some(live) = lite.last_stream_activity_at.as_ref() {
+            let newer = match lite.last_activity.as_deref() {
+                None => true,
+                Some(persisted) => match (parse_iso(live), parse_iso(persisted)) {
+                    (Some(l), Some(p)) => l >= p,
+                    _ => false,
+                },
+            };
+            if newer {
+                lite.last_activity = Some(live.clone());
+            }
+        }
         lite.session_corrupted = session_corrupted;
         lite.pending_delete_at = pending_delete_at;
         if let Some((live_response, live_digest)) = live_overlay {
@@ -2649,6 +2670,20 @@ impl Services {
     /// / `truncated` semantics are unchanged (transcript-wide, not
     /// page-length). Slim is the wire default since v8.0; an unbudgeted full
     /// read (`projection: None`) survives only as an internal test seam.
+    ///
+    /// In-progress tail (monorepo#3647): with `include_in_progress` set and
+    /// an in-flight turn (`turnInFlight` true), a page that ends at the live
+    /// tail additionally carries the in-flight turn's partial assistant
+    /// message — the live-turn slot's streamed blocks so far — appended as a
+    /// trailing row marked `inProgress: true`. The row is serve-time only
+    /// (nothing persists until the turn ends), runs through the same slim
+    /// bounding as persisted rows, and is excluded from `totalMessages` /
+    /// pagination (`truncated`, tokens). Non-tail pages (older continuations
+    /// and seeks that do not reach the tail) never carry it. Absent the
+    /// param, responses are byte-identical to before. Its `created_at` is
+    /// the slot's stream stamp, so unlike persisted rows it advances across
+    /// successive reads of the same turn — deliberate: the row IS the
+    /// liveness signal, and the id is the stable reconciliation key.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
@@ -2659,6 +2694,7 @@ impl Services {
         around_message_id: Option<String>,
         around_index: Option<i64>,
         projection: Option<ConversationProjection>,
+        include_in_progress: bool,
     ) -> Result<Value> {
         // Metadata-only scope check — the transcript is never hydrated here.
         let session = self.store.get_agent_session_summary(&agent_id).await?;
@@ -2725,6 +2761,13 @@ impl Services {
             let w = crate::pagination::page_window(total, limit, page_token.as_deref());
             (w.start, w.end, w.next_token, None)
         };
+        // Global indices of the served page — updated by a budget trim
+        // below; `page_end == total` means the page ends at the live tail
+        // (where the in-progress row may be appended), and `page_start`
+        // anchors token re-minting after the in-progress append's own
+        // re-budget pass.
+        let mut page_start = start;
+        let mut page_end = end;
         let mut page: Vec<AgentMessage> = self
             .store
             .get_agent_messages_page(
@@ -2778,15 +2821,96 @@ impl Services {
             if (lo, hi) != (0, page.len()) {
                 page.truncate(hi);
                 page.drain(..lo);
+                page_start = start + lo;
+                page_end = start + hi;
                 next_token = crate::pagination::remint_backward_token(start + lo);
                 if prev_token.is_some() {
                     prev_token = Some(crate::pagination::remint_forward_token(start + hi, total));
                 }
             }
         }
+        let mut messages = serde_json::to_value(&page).expect("messages serialize");
+        // In-progress tail (monorepo#3647): append the in-flight turn's
+        // partial assistant message when the caller opted in and this page
+        // ends at the live tail, so a mid-turn read shows the tool calls and
+        // text streamed so far instead of only persisted completed messages.
+        // `turn_in_flight` already gates on a busy worker + open slot and
+        // terminal statuses; the row is serve-time only and deliberately
+        // outside `totalMessages`/pagination. Idempotent against the
+        // persist/slot-clear race: if the turn's message already persisted
+        // (id present in the served page) the append is skipped, mirroring
+        // the seq-0 snapshot merge (`merge_live_turn`), so a read in that
+        // window never duplicates the row.
+        if include_in_progress && turn_in_flight && page_end == total {
+            if let Some(live) = self.live_turn(&agent_id) {
+                let arr = messages.as_array_mut().expect("messages is an array");
+                let already_persisted = arr
+                    .iter()
+                    .any(|m| m.get("id").and_then(Value::as_str) == Some(live.message_id.as_str()));
+                if !already_persisted {
+                    let row = AgentMessage {
+                        id: live.message_id.clone(),
+                        agent_id: agent_id.clone(),
+                        seq: i64::try_from(total).unwrap_or(i64::MAX),
+                        role: "assistant".to_string(),
+                        content: Value::Array(live.blocks),
+                        metadata: None,
+                        app_message_id: None,
+                        created_at: live.last_activity_at.clone(),
+                    };
+                    let mut row = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(row));
+                    if projection == Some(ConversationProjection::Slim) {
+                        row = apply_slim_projection(row, None);
+                    }
+                    let mut row = serde_json::to_value(row).expect("in-progress row serialize");
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert("inProgress".to_string(), json!(true));
+                    }
+                    arr.push(row);
+                    // Re-apply the slim page budget after the append (§5.5),
+                    // mirroring the seq-0 snapshot's `rebudget_merged_page`:
+                    // `apply_slim_projection` caps block bodies but not block
+                    // count, and the motivating scenario — a long tool-heavy
+                    // turn — is exactly one that accumulates hundreds of
+                    // capped blocks in the live slot, so appended beside an
+                    // at-budget persisted page the response could blow the
+                    // budget the read path just enforced. The live row is the
+                    // newest and always serves; oldest persisted rows are
+                    // evicted until the page fits, with `nextToken` re-minted
+                    // at the first evicted row. The page's own anchor (a
+                    // forward page's oldest row, a seek's target) is never
+                    // evicted — dropping it would re-mint a cursor at the
+                    // anchor itself and loop the client — so those pages
+                    // bound at their already-budgeted anchor..tail suffix
+                    // plus the live row. Full (absent-projection) reads are
+                    // never budgeted, as above.
+                    if projection == Some(ConversationProjection::Slim) {
+                        let protect_rel = match slim_anchor {
+                            crate::pagination::BudgetAnchor::Newest => None,
+                            crate::pagination::BudgetAnchor::Oldest => Some(0),
+                            crate::pagination::BudgetAnchor::Target(global) => {
+                                Some(global.saturating_sub(page_start))
+                            }
+                        };
+                        let sizes: Vec<usize> =
+                            arr.iter().map(crate::pagination::serialized_size).collect();
+                        let (lo, _hi) = crate::pagination::budget_page(
+                            &sizes,
+                            crate::pagination::BudgetAnchor::Newest,
+                            SLIM_PAGE_BUDGET_BYTES,
+                        );
+                        let lo = protect_rel.map_or(lo, |p| lo.min(p));
+                        if lo > 0 {
+                            arr.drain(..lo);
+                            next_token = crate::pagination::remint_backward_token(page_start + lo);
+                        }
+                    }
+                }
+            }
+        }
         let mut result = json!({
             "agentId": agent_id,
-            "messages": page,
+            "messages": messages,
             "truncated": next_token.is_some(),
             "totalMessages": total,
             "nextToken": next_token,
@@ -2812,6 +2936,14 @@ impl Services {
     /// the returned block is always the full, unprojected body. Bounded cost
     /// (RPC cost contract): a metadata-only session read plus ONE primary-key
     /// message row read; the transcript is never hydrated.
+    ///
+    /// In-progress rows (monorepo#3647): when the message id is not persisted
+    /// but matches the live-turn slot's in-flight message, the block resolves
+    /// from the slot's streamed blocks (O(1) in-memory read) — so a
+    /// slim-truncated block served on the `includeInProgress` tail row is
+    /// hydratable mid-turn, same contract as persisted rows. The persisted
+    /// row wins once the turn ends (checked first), and an unknown id stays
+    /// `InvalidParams` exactly as before.
     ///
     /// Frame-size note: a block whose serialized response exceeds the
     /// transport's 40 MiB outbound frame cap (`MAX_OUTBOUND_MESSAGE_BYTES`)
@@ -2839,11 +2971,37 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let message = self
+        let message = match self
             .store
             .get_agent_message_by_id(&agent_id, &message_id)
             .await?
-            .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {message_id}")))?;
+        {
+            Some(m) => m,
+            // In-progress fallback (monorepo#3647): an unpersisted id that
+            // matches the live-turn slot's in-flight message resolves from
+            // the slot's streamed blocks, so blocks slim-truncated on the
+            // `includeInProgress` tail row hydrate mid-turn too.
+            None => match self
+                .live_turn(&agent_id)
+                .filter(|l| l.message_id == message_id)
+            {
+                Some(live) => AgentMessage {
+                    id: live.message_id,
+                    agent_id: agent_id.clone(),
+                    seq: i64::MAX,
+                    role: "assistant".to_string(),
+                    content: Value::Array(live.blocks),
+                    metadata: None,
+                    app_message_id: None,
+                    created_at: live.last_activity_at,
+                },
+                None => {
+                    return Err(Error::InvalidParams(format!(
+                        "unknown message id: {message_id}"
+                    )))
+                }
+            },
+        };
         let message = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
         let block = message
             .content
@@ -9531,7 +9689,25 @@ impl Services {
             } else {
                 None
             };
-            let last_activity = session.map(|s| s.updated_at.clone());
+            // Liveness-aware activity stamp (monorepo#3647): the persisted
+            // `updated_at` freezes at turn start, so a long healthy turn
+            // would read stale off it alone. Overlay the live-turn slot's
+            // stream stamp (refreshed on every chunk/tool call) and key the
+            // stale-responding heuristic on the max of the two — an agent
+            // actively streaming through the harness is never flagged stale.
+            // Compare parsed instants (`iso_ms`) — RFC-3339 strings carry
+            // variable sub-second precision, so lexicographic order is not
+            // chronological. `iso_ms` truncates to milliseconds, so a
+            // same-millisecond tie prefers the live stamp — it is refreshed
+            // on every stream event and thus at least as fresh.
+            let live_stream_activity = self.live_turn_activity_at(&AgentId(id.clone()));
+            let last_activity = match (
+                session.map(|s| s.updated_at.clone()),
+                live_stream_activity.clone(),
+            ) {
+                (Some(p), Some(l)) => Some(if iso_ms(&l) >= iso_ms(&p) { l } else { p }),
+                (p, l) => p.or(l),
+            };
             let last_activity_age = last_activity.as_deref().map(|t| age_ms(now_ms, t));
             let stale_responding = status == "responding"
                 && match last_activity_age {
@@ -9584,6 +9760,12 @@ impl Services {
             );
             if let Some(la) = &last_activity {
                 row.insert("lastActivity".into(), json!(la));
+            }
+            // Additive (monorepo#3647): the raw live-turn stream stamp, so
+            // diagnostics consumers can distinguish harness liveness from
+            // persisted-row churn. Omitted when no turn is streaming.
+            if let Some(ls) = &live_stream_activity {
+                row.insert("lastStreamActivityAt".into(), json!(ls));
             }
             if let Some(hooks) = hooks_by_agent.remove(id.as_str()) {
                 if !hooks.is_empty() {
@@ -9729,9 +9911,15 @@ impl Services {
         let mut workspace_archived: Option<bool> = None;
         for q in &queues {
             let aid = q["agentId"].as_str().unwrap_or_default();
+            // Liveness-aware, like `staleResponding` above (monorepo#3647):
+            // a mid-turn agent's `updated_at` is frozen, so also accept the
+            // live-turn stream stamp as proof of active draining.
             let actively_responding = session_by_id.get(aid).is_some_and(|s| {
                 agent_status_wire(s.status) == Some("responding")
-                    && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                    && (age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                        || self
+                            .live_turn_activity_at(&AgentId(aid.to_string()))
+                            .is_some_and(|t| age_ms(now_ms, &t) <= stale_after_ms))
             });
             if actively_responding {
                 continue;
@@ -9864,7 +10052,10 @@ impl Services {
                     && pending_ids.iter().all(|id| {
                         session_by_id.get(*id).is_some_and(|s| {
                             agent_status_wire(s.status) == Some("responding")
-                                && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                                && (age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                                    || self
+                                        .live_turn_activity_at(&AgentId((*id).to_string()))
+                                        .is_some_and(|t| age_ms(now_ms, &t) <= stale_after_ms))
                         })
                     });
                 let severity = if g["subscriptionMissing"].as_bool() == Some(true) {

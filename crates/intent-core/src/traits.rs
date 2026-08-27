@@ -1417,8 +1417,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// `[0, totalMessages - 1]`. The two seek params are mutually exclusive
     /// (enforced at the transport boundary). The optional `projection`
     /// requests bounded tool/image block bodies
-    /// ([`crate::ConversationProjection`]); absent all optional params,
-    /// behavior is byte-identical to before.
+    /// ([`crate::ConversationProjection`]). When `include_in_progress` is
+    /// `true` and the served page ends at the live tail, the in-flight
+    /// turn's partial assistant message (streamed blocks so far) is appended
+    /// as a trailing `inProgress: true` row (monorepo#3647); absent all
+    /// optional params, behavior is byte-identical to before.
     #[allow(clippy::too_many_arguments)]
     fn agent_get_conversation(
         &self,
@@ -1429,6 +1432,7 @@ pub trait WorkspaceApi: Send + Sync {
         around_message_id: Option<String>,
         around_index: Option<i64>,
         projection: Option<crate::ConversationProjection>,
+        include_in_progress: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             agent_id,
@@ -1438,6 +1442,7 @@ pub trait WorkspaceApi: Send + Sync {
             around_message_id,
             around_index,
             projection,
+            include_in_progress,
         );
         Box::pin(async {
             Err(Error::Internal(

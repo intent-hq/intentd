@@ -271,13 +271,28 @@
 //! byte-for-byte; aggregate flags (`hasUncommittedChanges`,
 //! `hasUntrackedFiles`) still reflect the full scan, and `git.changes` is
 //! deliberately uncapped. No method-catalog change — 297 router methods,
-//! 336 total.
+//! 336 total. Version 8.5 adds agent liveness observability
+//! (additive; §5.5, monorepo#3647): the optional `includeInProgress`
+//! boolean param on `agent.getConversation` (absent / `null` / `false`
+//! byte-identical; non-boolean `-32602`) — when `true` and the served page
+//! ends at the live tail, the in-flight turn's partial assistant message
+//! (streamed blocks so far, slim-bounded like persisted rows, excluded
+//! from `totalMessages`/pagination) is appended as a trailing
+//! `inProgress: true` row (its blocks hydrate via `agent.getMessageBlock`
+//! mid-turn: an unpersisted message id matching the live turn resolves
+//! from the slot's streamed blocks); `AgentLite.lastActivity` is overlaid
+//! mid-turn with the live-turn stream stamp (max of persisted `updatedAt`
+//! and `lastStreamActivityAt`) so it advances on tool-call/stream
+//! activity; and `agent.diagnostics` rows key `staleResponding` on that
+//! same liveness-aware max, additionally serving the raw
+//! `lastStreamActivityAt?` (presence-detected, omitted when no turn is
+//! streaming). No method-catalog change — 297 router methods, 336 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "8.4";
+pub const PROTOCOL_VERSION: &str = "8.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

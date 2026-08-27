@@ -1107,7 +1107,10 @@ async fn read_conversation(
     let page_token = opt_str(args, "pageToken");
     // Slim projection (§5.5): agents get bounded tool/image bodies like every
     // other consumer since v8.0; full blocks are read on demand via
-    // `agent.getMessageBlock`.
+    // `agent.getMessageBlock`. The binding always opts into the in-progress
+    // tail (monorepo#3647): a coordinator reading a mid-turn child sees the
+    // in-flight turn's streamed blocks so far as a trailing
+    // `inProgress: true` row instead of a transcript frozen at turn start.
     let v = api
         .agent_get_conversation(
             agent_id,
@@ -1117,6 +1120,7 @@ async fn read_conversation(
             None,
             None,
             Some(intent_core::ConversationProjection::Slim),
+            true,
         )
         .await
         .map_err(map_err)?;
