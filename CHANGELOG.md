@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.8] - 2026-08-27
+
+### 🚀 Features
+
+- Enforce orchestrator tool restrictions across providers via specialist role ([#1532](https://github.com/intent-hq/intentd/pull/1532))
+
+### 🐛 Bug Fixes
+
+- *(models)* Re-probe provider model catalogs older than 24h on models.list ([#1538](https://github.com/intent-hq/intentd/pull/1538))
+
+
 ## [0.8.7] - 2026-08-27
 
 ### 🚀 Features
