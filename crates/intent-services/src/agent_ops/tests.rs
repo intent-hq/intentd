@@ -4604,6 +4604,129 @@ async fn get_conversation_appends_in_progress_tail_when_opted_in() {
     assert_eq!(res["messages"].as_array().unwrap().len(), 3);
 }
 
+/// monorepo#3647 persist/slot-clear race: when the live turn's message has
+/// already persisted (its id is in the served page) but the slot has not yet
+/// cleared, the in-progress append is skipped — never a duplicate row
+/// (mirrors the seq-0 snapshot merge's idempotency guard).
+#[tokio::test]
+async fn get_conversation_in_progress_tail_skips_already_persisted_message() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Racer").await;
+    let content = json!([{ "type": "text", "id": "msg-live:0", "text": "done" }]);
+    svc.store()
+        .append_agent_message_with_id(&id, "msg-live", "assistant", &content, None, &now_iso())
+        .await
+        .expect("append");
+    // The persist happened but the slot is still published (the race window).
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({ "type": "text", "id": "msg-live:0", "text": "done" })],
+    );
+    let res = svc
+        .agent_get_conversation_op(id, None, None, None, None, None, None, true)
+        .await
+        .expect("conv");
+    let messages = res["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "no duplicate of the persisted row");
+    assert_eq!(messages[0]["id"], "msg-live");
+    assert!(
+        messages[0].get("inProgress").is_none(),
+        "the persisted row is served, not the synthetic one"
+    );
+}
+
+/// monorepo#3647 slim budget after the in-progress append: a block-heavy live
+/// row appended beside an at-budget persisted page re-budgets the merged page
+/// (live row anchored, oldest persisted rows evicted, `nextToken` re-minted at
+/// the first evicted row) so an opted-in tail read never exceeds the §5.5
+/// budget the read path just enforced (mirrors `rebudget_merged_page` on the
+/// seq-0 snapshot path).
+#[tokio::test]
+async fn get_conversation_in_progress_tail_rebudgets_slim_page() {
+    use intent_core::{ConversationProjection, SLIM_PAGE_BUDGET_BYTES};
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "HeavyStreamer").await;
+    // 6 persisted messages of ~100KB: the slim page-budget pass serves an
+    // at-budget newest suffix of these.
+    let chunk = "y".repeat(100 * 1024);
+    for i in 0..6 {
+        let c = json!([{ "type": "text", "id": format!("b{i}"), "text": format!("{i}:{chunk}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+    // A live turn with hundreds of individually-capped blocks — the
+    // motivating long tool-heavy turn; heavy in aggregate, not per block.
+    let live_blocks: Vec<serde_json::Value> = (0..300)
+        .map(|i| json!({ "type": "text", "id": format!("msg-live:{i}"), "text": "z".repeat(1024) }))
+        .collect();
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(&id, "msg-live", live_blocks);
+
+    let res = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ConversationProjection::Slim),
+            true,
+        )
+        .await
+        .expect("slim conv");
+    let messages = res["messages"].as_array().unwrap();
+    let tail = messages.last().unwrap();
+    assert_eq!(tail["inProgress"], true, "live row always serves (anchor)");
+    let page_bytes = serde_json::to_string(&res["messages"]).unwrap().len();
+    assert!(
+        page_bytes <= SLIM_PAGE_BUDGET_BYTES + 110 * 1024,
+        "merged page bounded by budget + one message: {page_bytes}"
+    );
+    // Rows evicted by the re-budget stay reachable: the re-minted token
+    // resumes at the first evicted row and a token walk reconstructs all 6
+    // persisted messages with no gaps or duplicates.
+    let evicted = 6 + 1 - messages.len();
+    assert!(evicted > 0, "the live row forced evictions");
+    assert_eq!(res["truncated"], true);
+    let mut walked: Vec<String> = messages[..messages.len() - 1]
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    let mut token = res["nextToken"].as_str().map(str::to_string);
+    while let Some(t) = token {
+        let page = svc
+            .agent_get_conversation_op(
+                id.clone(),
+                None,
+                None,
+                Some(t),
+                None,
+                None,
+                Some(ConversationProjection::Slim),
+                true,
+            )
+            .await
+            .expect("older slim page");
+        let msgs = page["messages"].as_array().unwrap();
+        assert!(
+            msgs.iter().all(|m| m.get("inProgress").is_none()),
+            "older pages never carry the in-progress row"
+        );
+        let ids: Vec<String> = msgs
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        walked.splice(0..0, ids);
+        token = page["nextToken"].as_str().map(str::to_string);
+    }
+    assert_eq!(walked.len(), 6, "token walk reaches every persisted row");
+}
+
 /// monorepo#3647: `AgentLite.lastActivity` is overlaid with the live-turn
 /// stream stamp mid-turn, so pollers watching it see a long-but-alive turn
 /// advance instead of a value frozen at turn start.

@@ -278,7 +278,7 @@
 //! ends at the live tail, the in-flight turn's partial assistant message
 //! (streamed blocks so far, slim-bounded like persisted rows, excluded
 //! from `totalMessages`/pagination) is appended as a trailing
-//! `inProgress: true` row; `AgentLite.lastActivityAt` is overlaid mid-turn
+//! `inProgress: true` row; `AgentLite.lastActivity` is overlaid mid-turn
 //! with the live-turn stream stamp (max of persisted `updatedAt` and
 //! `lastStreamActivityAt`) so it advances on tool-call/stream activity;
 //! and `agent.diagnostics` rows key `staleResponding` on that same

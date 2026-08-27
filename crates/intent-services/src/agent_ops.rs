@@ -2479,10 +2479,10 @@ impl Services {
         lite.waiting_for_agent_ids = waiting_for_agent_ids;
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
-        // Liveness overlay on `lastActivityAt` (monorepo#3647): the persisted
+        // Liveness overlay on `lastActivity` (monorepo#3647): the persisted
         // `updated_at` freezes at turn start (nothing persists until the turn
         // ends), so mid-turn the live-turn slot's stream stamp is the newer
-        // truth. Serve the max of the two so pollers watching `lastActivityAt`
+        // truth. Serve the max of the two so pollers watching `lastActivity`
         // see a long-but-alive turn advance instead of reading as stalled.
         // Compare parsed instants — RFC-3339 strings carry variable
         // sub-second precision, so lexicographic order is not chronological.
@@ -2678,7 +2678,10 @@ impl Services {
     /// bounding as persisted rows, and is excluded from `totalMessages` /
     /// pagination (`truncated`, tokens). Non-tail pages (older continuations
     /// and seeks that do not reach the tail) never carry it. Absent the
-    /// param, responses are byte-identical to before.
+    /// param, responses are byte-identical to before. Its `created_at` is
+    /// the slot's stream stamp, so unlike persisted rows it advances across
+    /// successive reads of the same turn — deliberate: the row IS the
+    /// liveness signal, and the id is the stable reconciliation key.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
@@ -2756,9 +2759,12 @@ impl Services {
             let w = crate::pagination::page_window(total, limit, page_token.as_deref());
             (w.start, w.end, w.next_token, None)
         };
-        // Global index one past the page's last served row — updated by a
-        // budget trim below; `page_end == total` means the page ends at the
-        // live tail (where the in-progress row may be appended).
+        // Global indices of the served page — updated by a budget trim
+        // below; `page_end == total` means the page ends at the live tail
+        // (where the in-progress row may be appended), and `page_start`
+        // anchors token re-minting after the in-progress append's own
+        // re-budget pass.
+        let mut page_start = start;
         let mut page_end = end;
         let mut page: Vec<AgentMessage> = self
             .store
@@ -2813,6 +2819,7 @@ impl Services {
             if (lo, hi) != (0, page.len()) {
                 page.truncate(hi);
                 page.drain(..lo);
+                page_start = start + lo;
                 page_end = start + hi;
                 next_token = crate::pagination::remint_backward_token(start + lo);
                 if prev_token.is_some() {
@@ -2827,31 +2834,76 @@ impl Services {
         // text streamed so far instead of only persisted completed messages.
         // `turn_in_flight` already gates on a busy worker + open slot and
         // terminal statuses; the row is serve-time only and deliberately
-        // outside `totalMessages`/pagination.
+        // outside `totalMessages`/pagination. Idempotent against the
+        // persist/slot-clear race: if the turn's message already persisted
+        // (id present in the served page) the append is skipped, mirroring
+        // the seq-0 snapshot merge (`merge_live_turn`), so a read in that
+        // window never duplicates the row.
         if include_in_progress && turn_in_flight && page_end == total {
             if let Some(live) = self.live_turn(&agent_id) {
-                let row = AgentMessage {
-                    id: live.message_id.clone(),
-                    agent_id: agent_id.clone(),
-                    seq: i64::try_from(total).unwrap_or(i64::MAX),
-                    role: "assistant".to_string(),
-                    content: Value::Array(live.blocks),
-                    metadata: None,
-                    app_message_id: None,
-                    created_at: live.last_activity_at.clone(),
-                };
-                let mut row = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(row));
-                if projection == Some(ConversationProjection::Slim) {
-                    row = apply_slim_projection(row, None);
+                let arr = messages.as_array_mut().expect("messages is an array");
+                let already_persisted = arr
+                    .iter()
+                    .any(|m| m.get("id").and_then(Value::as_str) == Some(live.message_id.as_str()));
+                if !already_persisted {
+                    let row = AgentMessage {
+                        id: live.message_id.clone(),
+                        agent_id: agent_id.clone(),
+                        seq: i64::try_from(total).unwrap_or(i64::MAX),
+                        role: "assistant".to_string(),
+                        content: Value::Array(live.blocks),
+                        metadata: None,
+                        app_message_id: None,
+                        created_at: live.last_activity_at.clone(),
+                    };
+                    let mut row = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(row));
+                    if projection == Some(ConversationProjection::Slim) {
+                        row = apply_slim_projection(row, None);
+                    }
+                    let mut row = serde_json::to_value(row).expect("in-progress row serialize");
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert("inProgress".to_string(), json!(true));
+                    }
+                    arr.push(row);
+                    // Re-apply the slim page budget after the append (§5.5),
+                    // mirroring the seq-0 snapshot's `rebudget_merged_page`:
+                    // `apply_slim_projection` caps block bodies but not block
+                    // count, and the motivating scenario — a long tool-heavy
+                    // turn — is exactly one that accumulates hundreds of
+                    // capped blocks in the live slot, so appended beside an
+                    // at-budget persisted page the response could blow the
+                    // budget the read path just enforced. The live row is the
+                    // newest and always serves; oldest persisted rows are
+                    // evicted until the page fits, with `nextToken` re-minted
+                    // at the first evicted row. The page's own anchor (a
+                    // forward page's oldest row, a seek's target) is never
+                    // evicted — dropping it would re-mint a cursor at the
+                    // anchor itself and loop the client — so those pages
+                    // bound at their already-budgeted anchor..tail suffix
+                    // plus the live row. Full (absent-projection) reads are
+                    // never budgeted, as above.
+                    if projection == Some(ConversationProjection::Slim) {
+                        let protect_rel = match slim_anchor {
+                            crate::pagination::BudgetAnchor::Newest => None,
+                            crate::pagination::BudgetAnchor::Oldest => Some(0),
+                            crate::pagination::BudgetAnchor::Target(global) => {
+                                Some(global.saturating_sub(page_start))
+                            }
+                        };
+                        let sizes: Vec<usize> =
+                            arr.iter().map(crate::pagination::serialized_size).collect();
+                        let (lo, _hi) = crate::pagination::budget_page(
+                            &sizes,
+                            crate::pagination::BudgetAnchor::Newest,
+                            SLIM_PAGE_BUDGET_BYTES,
+                        );
+                        let lo = protect_rel.map_or(lo, |p| lo.min(p));
+                        if lo > 0 {
+                            arr.drain(..lo);
+                            next_token = crate::pagination::remint_backward_token(page_start + lo);
+                        }
+                    }
                 }
-                let mut row = serde_json::to_value(row).expect("in-progress row serialize");
-                if let Some(obj) = row.as_object_mut() {
-                    obj.insert("inProgress".to_string(), json!(true));
-                }
-                messages
-                    .as_array_mut()
-                    .expect("messages is an array")
-                    .push(row);
             }
         }
         let mut result = json!({
