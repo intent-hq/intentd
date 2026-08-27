@@ -2135,9 +2135,10 @@ impl Services {
     ///
     /// List-payload cost contract (monorepo#2932): `metadata.initialMessage`
     /// — the full spawn-time first message, the single largest per-session
-    /// field on real workspaces — is detail-only (no list-context consumer)
-    /// and is OMITTED from every row here; `agent.get` / `agent.getSession`
-    /// still serve it. The remaining preview fields (`lastAgentResponse`,
+    /// field on real workspaces — is stripped from the whole [`AgentLite`]
+    /// projection (`agent.list` AND `agent.get`; no client reads it off
+    /// agent rows) and is served by `agent.getSession` only.
+    /// The remaining preview fields (`lastAgentResponse`,
     /// `lastUserMessage`, `lastToolUse`, `digest`,
     /// `metadata.completionReport` — read by list consumers like the HUD, so
     /// capped rather than omitted) are bounded per row to the render-sized
@@ -2146,11 +2147,11 @@ impl Services {
     /// Together these keep a ~250-session response well under the 1 MiB
     /// outbound frame warn threshold.
     ///
-    /// Deliberate asymmetry (same shape as the #2932 `initialMessage`
-    /// omission): the agent channel's seq-0 snapshot goes through this op
-    /// (capped rows), while per-agent deltas re-read via `agent.get` (full
-    /// values) — the bound is a property of list-shaped reads, not a channel
-    /// invariant. Delta frames are single-agent, so the size goal holds.
+    /// Deliberate asymmetry: the agent channel's seq-0 snapshot goes through
+    /// this op (capped rows), while per-agent deltas re-read via `agent.get`
+    /// (full values) — the bound is a property of list-shaped reads, not a
+    /// channel invariant. Delta frames are single-agent, so the size goal
+    /// holds.
     ///
     /// Soft retire: the default read excludes retired sessions (SQL-side
     /// `retired_at IS NULL` filter — cost stays O(rows returned)); the wire
@@ -2271,9 +2272,6 @@ impl Services {
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
                 lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
-                // monorepo#2932: detail-only — omitted from list rows (see
-                // the doc comment above); `agent.get` still serves it.
-                lite.metadata.initial_message = None;
                 // List-payload cost contract: bound the render-preview
                 // fields per row (see the doc comment above); the detail
                 // reads keep full values. Applied AFTER the runtime overlay

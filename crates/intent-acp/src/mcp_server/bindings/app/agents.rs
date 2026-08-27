@@ -690,7 +690,6 @@ mod tests {
                 attention_request_reason: None,
                 attention_request_timestamp: None,
                 delegation_depth: None,
-                initial_message: None,
                 sandbox_id: None,
                 sandbox_branch: None,
                 sandbox_path: None,
