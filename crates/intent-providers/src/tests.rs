@@ -445,29 +445,6 @@ fn arg_assembly_dedupes_remove_tool_names() {
 }
 
 #[test]
-fn arg_assembly_emits_comma_joined_denylist_for_grok() {
-    let grok = find_provider("grok").unwrap();
-    assert_eq!(grok.remove_tool_flag, Some("--disallowed-tools"));
-    assert_eq!(grok.remove_tool_style, ToolRemovalStyle::CommaJoined);
-    let args = build_provider_args(
-        grok,
-        &ArgInputs {
-            tools_to_remove: &["search_replace", "write", "task", "Agent"],
-            ..Default::default()
-        },
-    );
-    assert_eq!(
-        args,
-        vec![
-            "agent",
-            "stdio",
-            "--disallowed-tools",
-            "search_replace,write,task,Agent",
-        ]
-    );
-}
-
-#[test]
 fn arg_assembly_emits_comma_joined_denylist_for_droid() {
     let droid = find_provider("droid").unwrap();
     assert_eq!(droid.remove_tool_flag, Some("--disabled-tools"));
@@ -493,32 +470,46 @@ fn arg_assembly_emits_comma_joined_denylist_for_droid() {
 
 #[test]
 fn arg_assembly_comma_joined_dedupes_and_skips_empty() {
-    let grok = find_provider("grok").unwrap();
+    let droid = find_provider("droid").unwrap();
     // All-empty/duplicate input collapses; an empty result emits no flag.
     let args = build_provider_args(
-        grok,
+        droid,
         &ArgInputs {
-            tools_to_remove: &["write", "write", ""],
+            tools_to_remove: &["Edit", "Edit", ""],
             ..Default::default()
         },
     );
-    assert_eq!(args, vec!["agent", "stdio", "--disallowed-tools", "write"]);
+    assert_eq!(
+        args,
+        vec!["exec", "--output-format", "acp", "--disabled-tools", "Edit"]
+    );
 
     let args = build_provider_args(
-        grok,
+        droid,
         &ArgInputs {
             tools_to_remove: &["", ""],
             ..Default::default()
         },
     );
-    assert_eq!(args, vec!["agent", "stdio"]);
+    assert_eq!(args, vec!["exec", "--output-format", "acp"]);
 }
 
 #[test]
 fn arg_assembly_skips_remove_tool_for_providers_without_support() {
     // Providers with `remove_tool_flag = None` silently drop the input — we
-    // never pass an unknown flag to claude/codex/cortex/opencode/pi/mock.
-    for id in ["claude-code", "codex", "cortex", "opencode", "pi", "mock"] {
+    // never pass an unknown flag to claude/codex/cortex/grok/opencode/pi/mock.
+    // grok is deliberately unset: its `--disallowed-tools` flag is
+    // headless-mode only and clap-rejected on `agent stdio` (see the grok
+    // registry entry).
+    for id in [
+        "claude-code",
+        "codex",
+        "cortex",
+        "grok",
+        "opencode",
+        "pi",
+        "mock",
+    ] {
         let provider = find_provider(id).unwrap();
         assert!(
             provider.remove_tool_flag.is_none(),

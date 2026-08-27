@@ -98,9 +98,9 @@ pub enum InjectionMechanism {
 pub enum ToolRemovalStyle {
     /// Flag repeated once per tool name (auggie: `--remove-tool X --remove-tool Y`).
     Repeated,
-    /// Single flag with a comma-joined value (grok: `--disallowed-tools X,Y`;
-    /// droid: `--disabled-tools X,Y` — droid's list flags accept comma or
-    /// space separation, comma is used for a single argv entry).
+    /// Single flag with a comma-joined value (droid: `--disabled-tools X,Y`
+    /// — droid's list flags accept comma or space separation, comma is used
+    /// for a single argv entry).
     CommaJoined,
 }
 
@@ -175,7 +175,7 @@ pub struct ProviderConfig {
     /// Flag for quiet mode (e.g., `--quiet`).
     pub quiet_flag: Option<&'static str>,
     /// Flag for removing provider-native tools at spawn time (auggie
-    /// `--remove-tool`, grok `--disallowed-tools`, droid `--disabled-tools`).
+    /// `--remove-tool`, droid `--disabled-tools`).
     /// Emission shape is governed by [`Self::remove_tool_style`]. `None` when
     /// the provider exposes no equivalent knob — spawn-time tool restrictions
     /// are dropped for that provider (MCP-side filtering, §6.8, still
@@ -558,13 +558,14 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // with empty `args` (Node shell:true style). intentd argv-only spawn
         // would ENOENT that string; shell-wrap on terminal/create instead.
         terminal_requires_shell: true,
-        // Spawn-time tool stripping (§18.4): grok's `--disallowed-tools`
-        // takes a comma-separated denylist of built-in tool IDs and supports
-        // `Agent` entries to block subagent spawning (docs.x.ai CLI
-        // reference). Appended after `base_args`, i.e. `agent stdio
-        // --disallowed-tools X,Y`.
-        remove_tool_flag: Some("--disallowed-tools"),
-        remove_tool_style: ToolRemovalStyle::CommaJoined,
+        // No spawn-time tool stripping: grok's `--disallowed-tools` is a
+        // top-level headless-mode (`grok -p …`) flag only — it is not defined
+        // on the `agent` subcommand's args and is consumed solely by the
+        // headless single-turn path, so `agent stdio --disallowed-tools X,Y`
+        // would be rejected by clap as an unknown flag (verified against the
+        // xai-org/grok-build source: `PagerArgs.cli_disallowed_tools` vs
+        // `AgentArgs`). Orchestrator restrictions on grok are prompt-only;
+        // MCP-side filtering (§6.8) still covers workspace tools.
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {

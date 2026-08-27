@@ -7241,7 +7241,7 @@ impl AgentManager {
             let agent_type = derive_agent_type(&self.services, &session, workspace.as_ref());
             // §18.4 CLI-side denylist: strip provider-native tools via the
             // provider's spawn-time removal flag (auggie `--remove-tool`,
-            // grok `--disallowed-tools`, droid `--disabled-tools`). MCP-side
+            // droid `--disabled-tools`). MCP-side
             // filtering (§6.8) already blocks workspace-MCP tools, but the
             // provider's native tools can only be stripped through this
             // spawn-time flag. Tool names are provider-native, so the

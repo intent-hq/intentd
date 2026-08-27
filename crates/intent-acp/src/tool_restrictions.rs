@@ -135,22 +135,18 @@ pub(crate) const CONFLICTING_BUILTIN_TOOLS: &[&str] = &["create_agent"];
 /// removal — governs not-editing-via-shell.
 pub const CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
-/// Grok built-in tools disallowed for orchestrator-role agents, delivered via
-/// grok's `--disallowed-tools` spawn flag (comma-separated denylist of
-/// built-in tool IDs; xai-grok-shell README / docs.x.ai CLI reference).
-/// `search_replace` is the file-edit tool, `write` the file-create/write tool
-/// (the `[features] write_file` setting names it), `task` launches subagent
-/// sessions, and the special `Agent` entry blocks ALL subagent spawning.
-/// `run_terminal_cmd` (bash) is deliberately NOT listed — orchestrators
-/// legitimately run read-only commands, mirroring the claude-code list above.
-pub const GROK_ORCHESTRATOR_DISALLOWED_TOOLS: &[&str] =
-    &["search_replace", "write", "task", "Agent"];
-
 /// Droid built-in tools disallowed for orchestrator-role agents, delivered via
-/// droid's `--disabled-tools` spawn flag (comma-separated list of tool IDs;
-/// docs.factory.ai CLI reference). `Edit`/`Create`/`ApplyPatch` are the
-/// file-write tools, `Task` spawns subagents. `Execute` (shell) is
-/// deliberately NOT listed — same rationale as the claude-code/grok lists.
+/// droid's `--disabled-tools` spawn flag (comma-separated list of tool IDs).
+/// `Edit`/`Create`/`ApplyPatch` are the file-write tools, `Task` spawns
+/// subagents. `Execute` (shell) is deliberately NOT listed — same rationale
+/// as the claude-code list above.
+///
+/// Naming: tool IDs are case-sensitive `PascalCase`, sourced from
+/// docs.factory.ai (custom-droid `tools` arrays like `["Read", "Edit",
+/// "Execute"]`, hook matchers `Execute`/`Read`/`Edit`/`Create`/`ApplyPatch`/
+/// `Task`, and the sandbox enforcement table) — no droid binary was available
+/// to run `droid exec --list-tools` against; re-verify if a droid release
+/// renames its built-ins.
 pub const DROID_ORCHESTRATOR_DISALLOWED_TOOLS: &[&str] = &["Edit", "Create", "ApplyPatch", "Task"];
 
 /// The full set of categories denied for pure text-generation/analysis agents.
@@ -274,14 +270,22 @@ pub fn get_tools_to_remove(is_orchestrator: bool, agent_type: &str) -> Vec<&'sta
 ///
 /// - `auggie`: the full [`get_tools_to_remove`] resolution (orchestrator,
 ///   background-type, and global-fallback paths — auggie-native + MCP names).
-/// - `grok` / `droid`: orchestrator-role agents get the provider's file-write
-///   and subagent tool IDs ([`GROK_ORCHESTRATOR_DISALLOWED_TOOLS`] /
-///   [`DROID_ORCHESTRATOR_DISALLOWED_TOOLS`]); everyone else gets nothing —
-///   MCP-side filtering (§6.8) still covers workspace tools, and the
-///   background-agent denylist names are auggie/MCP-specific.
-/// - every other provider: nothing (claude-code delivers its orchestrator
-///   denylist via `session/new` `_meta` instead — see
-///   [`CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS`]).
+/// - `droid`: orchestrator-role agents get the provider's file-write and
+///   subagent tool IDs ([`DROID_ORCHESTRATOR_DISALLOWED_TOOLS`]); everyone
+///   else gets nothing — MCP-side filtering (§6.8) still covers workspace
+///   tools, and the background-agent denylist names are auggie/MCP-specific.
+///   Deliberate scope cut: unlike auggie (global fallback strips
+///   [`SUBAGENT_TOOLS`] for every agent) and claude-code (`Task` denied for
+///   every agent in `build_session_meta`), droid's `Task` is only stripped
+///   for orchestrators here — non-orchestrator droid agents keep native
+///   sub-agent spawning until a follow-up extends the denylist.
+/// - every other provider: nothing. claude-code delivers its orchestrator
+///   denylist via `session/new` `_meta` instead (see
+///   [`CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS`]); grok has no reachable
+///   spawn-time knob — its `--disallowed-tools` flag is headless-mode
+///   (`grok -p …`) only and is not defined on the `agent stdio` (ACP)
+///   subcommand (see the grok entry in `intent-providers`' registry), so
+///   grok orchestrator restrictions are prompt-only.
 #[must_use]
 pub fn get_native_tools_to_remove(
     provider_id: &str,
@@ -290,7 +294,6 @@ pub fn get_native_tools_to_remove(
 ) -> Vec<&'static str> {
     match provider_id {
         "auggie" => get_tools_to_remove(is_orchestrator, agent_type),
-        "grok" if is_orchestrator => GROK_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec(),
         "droid" if is_orchestrator => DROID_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec(),
         _ => Vec::new(),
     }
@@ -365,24 +368,31 @@ mod tests {
     }
 
     #[test]
-    fn native_resolution_grok_droid_orchestrator_only() {
-        assert_eq!(
-            get_native_tools_to_remove("grok", true, "interactive"),
-            GROK_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec()
-        );
+    fn native_resolution_droid_orchestrator_only() {
         assert_eq!(
             get_native_tools_to_remove("droid", true, "interactive"),
             DROID_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec()
         );
-        // Non-orchestrator agents on grok/droid get no CLI-side stripping —
+        // Non-orchestrator agents on droid get no CLI-side stripping —
         // MCP-side filtering (§6.8) still applies.
-        assert!(get_native_tools_to_remove("grok", false, "interactive").is_empty());
+        assert!(get_native_tools_to_remove("droid", false, "interactive").is_empty());
         assert!(get_native_tools_to_remove("droid", false, "task-loop").is_empty());
     }
 
     #[test]
     fn native_resolution_other_providers_get_nothing() {
-        for id in ["claude-code", "codex", "cortex", "opencode", "pi", "mock"] {
+        // grok included: its `--disallowed-tools` flag is headless-only and
+        // unreachable from `agent stdio`, so grok must resolve to nothing
+        // even for orchestrators.
+        for id in [
+            "claude-code",
+            "codex",
+            "cortex",
+            "grok",
+            "opencode",
+            "pi",
+            "mock",
+        ] {
             assert!(
                 get_native_tools_to_remove(id, true, "interactive").is_empty(),
                 "{id} unexpectedly received native tools to remove"
