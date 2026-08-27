@@ -663,9 +663,10 @@ pub struct AgentsSettings {
     /// fixed (monorepo#2062).
     pub max_concurrent_adapters: u32,
     /// `agents.maxTopLevelAgents` — cap on live top-level (parentless)
-    /// agents per workspace, enforced on the peer-spawn path
-    /// (`ws.agent.spawnPeer`) as the runaway-spawn guard; user/FE-created
-    /// agents are never blocked by it (minimum 1; no unlimited value).
+    /// agents per workspace, enforced on the top-level-create path
+    /// (`ws.agent.create({ topLevel: true })`) as the runaway-spawn guard;
+    /// user/FE-created agents are never blocked by it (minimum 1; no
+    /// unlimited value).
     pub max_top_level_agents: u32,
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
@@ -879,9 +880,9 @@ pub struct AgentFeaturesSettings {
     /// Defaults **on** like the other toggles (originally opt-in —
     /// intent-hq/monorepo#2445 — before the default flipped).
     pub task_graph: bool,
-    /// `agentFeatures.peerAgents` — expose peer-agent spawning
-    /// (`ws.agent.spawnPeer`) to agents. Defaults **off** (opt-in), unlike
-    /// the other toggles.
+    /// `agentFeatures.peerAgents` — expose independent top-level-agent
+    /// creation (`ws.agent.create({ topLevel: true })`) to agents. Defaults
+    /// **off** (opt-in), unlike the other toggles.
     pub peer_agents: bool,
     /// `agentFeatures.mcpTools` — expose the user's external MCP servers'
     /// tools to agents (`ws.mcp.*`). Unlike the prompt-gating toggles, this

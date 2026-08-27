@@ -3014,7 +3014,7 @@ impl Services {
         // `-32602` naming the id and the known catalog ids (monorepo#3497)
         // — BEFORE any side effect, so no session row is persisted. Every
         // spawn seam funnels through here (`agent.create`, the MCP
-        // `create_agent`/`ws.agent.spawnPeer` tools, `agent.delegate`,
+        // `create_agent`/`ws.agent.create` tools, `agent.delegate`,
         // `agent.wakeOrCreate`'s create branch, `workspace.create`'s
         // `initialAgent`), so the validation covers them all.
         // SECURITY: the project tier resolves against the stored workspace
@@ -8267,7 +8267,7 @@ impl Services {
             );
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
-        // SUB-1 independent-peer suppression (spawnPeer): a top-level
+        // SUB-1 independent-peer suppression: a top-level
         // FOREGROUND target is a co-equal peer, not a worker — messaging it
         // must not passively subscribe the sender to its completion (peers
         // are watched explicitly with `agent.watch`). The auto-watch is
