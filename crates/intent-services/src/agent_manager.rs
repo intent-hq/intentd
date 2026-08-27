@@ -91,6 +91,17 @@ use crate::harness::v1::DEQUEUE_WAIT_NOTE_PREFIX;
 /// annotated unchanged (PROTOCOL §5.5).
 const DEQUEUE_WAIT_ANNOTATION_MIN_MS: i128 = 5_000;
 
+/// Transcript text of the `auto_unarchived` system row persisted when a turn
+/// start auto-unarchives an archived workspace (spec Contract wording).
+pub(crate) const AUTO_UNARCHIVE_NOTICE_TEXT: &str =
+    "Workspace was automatically unarchived because a message was sent to this agent.";
+
+/// Trailing prompt block injected into the SAME turn that triggered the
+/// auto-unarchive so the model knows the workspace flipped (spec Contract
+/// wording). Never replayed on later turns.
+pub(crate) const AUTO_UNARCHIVE_PROMPT_NOTICE: &str =
+    "[SYSTEM NOTICE] This workspace was archived; it has been automatically unarchived because this message was sent.";
+
 /// [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`] with an `INTENTD_DEQUEUE_WAIT_MIN_MS`
 /// env override (whole milliseconds). Primarily for tests/CI — the e2e
 /// suites park entries behind short (~2s) mock busy turns and assert the
@@ -2188,6 +2199,15 @@ pub struct AgentManager {
     /// `agent.diagnostics` can serve per-agent subtree attribution whether or
     /// not a budget is configured. Absent in tests / bare wiring.
     tree_probe: std::sync::OnceLock<Arc<dyn TreeMemoryProbe>>,
+    /// Agents whose current claim's turn start actually auto-unarchived the
+    /// workspace (the #1216 flip persisted). Armed by
+    /// [`AgentManager::try_begin_outcome`] on a confirmed flip, consumed by
+    /// [`AgentManager::build_turn_prompt`] so the SAME turn's outbound prompt
+    /// carries one trailing `[SYSTEM NOTICE]` block — never replayed on later
+    /// turns. A claim that never builds a prompt (harness wake turns) has the
+    /// stale flag cleared by [`AgentManager::release_slot_sync`] when the
+    /// slot is released. In-memory only, same gap as `recreated`.
+    auto_unarchived: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl AgentManager {
@@ -2258,6 +2278,7 @@ impl AgentManager {
             stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
+            auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -3835,6 +3856,16 @@ impl AgentManager {
                 }
             }
         }
+        // Auto-unarchive prompt notice: the claim that started THIS turn
+        // actually flipped the workspace from Archived to Active
+        // (`try_begin_outcome` armed the one-shot flag on the confirmed
+        // flip), so the model is told via one trailing text block. Consumed
+        // here so only the triggering turn carries it — the persisted
+        // `auto_unarchived` system row stays excluded from history replay
+        // like every system row.
+        if self.auto_unarchived.lock().unwrap().remove(agent_id) {
+            blocks.extend(text_prompt(AUTO_UNARCHIVE_PROMPT_NOTICE));
+        }
         blocks
     }
 
@@ -4742,10 +4773,20 @@ impl AgentManager {
             // triggers this. Suppressed (`auto_unarchive = false`) only by
             // the worker's raced re-claim, whose own post-claim archived
             // re-check parks instead of un-archiving (monorepo#2513).
-            if auto_unarchive {
-                self.services
+            if auto_unarchive
+                && self
+                    .services
                     .auto_unarchive_on_turn_start(workspace_id, agent_id)
+                    .await
+            {
+                // The flip actually persisted: record the `auto_unarchived`
+                // system transcript row and arm the one-shot prompt-notice
+                // flag so THIS turn's outbound prompt tells the model the
+                // workspace was auto-unarchived. Both best-effort — never
+                // block the turn.
+                self.persist_auto_unarchive_notice(agent_id, workspace_id)
                     .await;
+                self.arm_auto_unarchive_flag_if_slot_held(agent_id);
             }
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
@@ -4784,7 +4825,33 @@ impl AgentManager {
         if !busy.remove(agent_id) {
             return None;
         }
+        // Drop a stale auto-unarchive prompt flag with the slot: a claim
+        // whose turn never built a prompt (harness wake turns, a persist
+        // failure releasing before spawn) must not leak the notice into a
+        // later unrelated turn.
+        self.auto_unarchived.lock().unwrap().remove(agent_id);
         Some(self.agent_ws.lock().unwrap().remove(agent_id))
+    }
+
+    /// Arm the one-shot auto-unarchive prompt flag, but only while the agent
+    /// still holds its in-flight slot — decided atomically under the `busy`
+    /// lock (lock order busy → `auto_unarchived`, matching
+    /// [`Self::release_slot_sync`]). The flag is armed AFTER the awaits on
+    /// `auto_unarchive_on_turn_start` / `persist_auto_unarchive_notice`, so
+    /// a concurrent stop/teardown can run `release_slot_sync` in that window;
+    /// its clear finds nothing, and an unconditional insert landing after it
+    /// would leak the notice into a later, non-triggering turn. Holding
+    /// `busy` while inserting closes the window: either this claim still owns
+    /// the slot (insert precedes the release's clear) or the slot is gone
+    /// (insert is skipped entirely).
+    fn arm_auto_unarchive_flag_if_slot_held(&self, agent_id: &AgentId) {
+        let busy = self.busy.lock().unwrap();
+        if busy.contains(agent_id) {
+            self.auto_unarchived
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone());
+        }
     }
 
     /// Release the in-flight slot, recomputing the owning workspace's derived
@@ -6998,6 +7065,48 @@ impl AgentManager {
                 .await
             {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to commit last-turn model");
+            }
+        }
+    }
+
+    /// Persist the informational `auto_unarchived` transcript row when this
+    /// turn's start actually auto-unarchived the workspace (the #1216 flip
+    /// persisted — [`AgentManager::try_begin_outcome`] calls this only on a
+    /// confirmed flip, never on the suppressed re-claim or an unarchive
+    /// failure). The row is `role: "system"` — excluded from supervisor-XML
+    /// history replay like the model-change notice — with metadata
+    /// `{ type: "auto_unarchived", reason: "agent_activity" }`. Emits
+    /// `agent:message` so clients update live. Entirely best-effort: an
+    /// append/publish failure is logged and the turn proceeds.
+    async fn persist_auto_unarchive_notice(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) {
+        let content = json!([{
+            "type": "text",
+            "text": AUTO_UNARCHIVE_NOTICE_TEXT,
+        }]);
+        let metadata = json!({
+            "type": "auto_unarchived",
+            "reason": "agent_activity",
+        });
+        match self
+            .services
+            .store
+            .append_agent_message_with_metadata(
+                agent_id,
+                "system",
+                &content,
+                Some(&metadata),
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(message) => {
+                self.services.invalidate_agent_list_cache(workspace_id);
+                self.services
+                    .publish_agent_message_events(workspace_id, agent_id, &message, None)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to persist auto-unarchive notice");
             }
         }
     }

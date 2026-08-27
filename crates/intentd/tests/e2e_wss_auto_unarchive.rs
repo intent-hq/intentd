@@ -9,7 +9,15 @@
 //!   `changes: { archived: false, status: "Active", archivedAt: null,
 //!   autoUnarchive: { reason: "agent_activity", agentId, agentName } }`
 //!   (unrelated activity deltas may interleave on the same event type),
-//! - a follow-up `workspace.get` shows the row Active with no `archivedAt`.
+//! - the flip persists ONE informational system transcript row (spec
+//!   Contract wording, metadata `{ type: "auto_unarchived", reason:
+//!   "agent_activity" }`) whose persist emits `agent:message` with
+//!   `role: "system"`, and the SAME turn's outbound prompt carries the
+//!   trailing `[SYSTEM NOTICE]` block (asserted via the mock fixture's
+//!   `MOCK_AGENT_PROMPT_LOG` seam),
+//! - a follow-up `workspace.get` shows the row Active with no `archivedAt`,
+//! - a follow-up turn in the now-Active workspace persists NO new notice
+//!   row and its prompt carries NO injected block (never replayed).
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -36,6 +44,14 @@ use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+
+/// Spec Contract: transcript text of the `auto_unarchived` system row.
+const NOTICE_ROW_TEXT: &str =
+    "Workspace was automatically unarchived because a message was sent to this agent.";
+
+/// Spec Contract: trailing prompt block injected into the triggering turn.
+const NOTICE_PROMPT_TEXT: &str =
+    "[SYSTEM NOTICE] This workspace was archived; it has been automatically unarchived because this message was sent.";
 
 /// Live `intentd serve` process; killed (whole process group) and its data
 /// dir removed on drop, with the daemon log echoed for post-mortems.
@@ -323,7 +339,12 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// A direct `agent.sendMessage` into an ARCHIVED workspace starts the turn
 /// AND auto-unarchives the workspace: the §6.5 `workspace:updated` delta
 /// carries the additive `autoUnarchive` stamp naming the triggering agent,
-/// the turn runs to a normal completion, and `workspace.get` shows Active.
+/// the turn runs to a normal completion, `workspace.get` shows Active, the
+/// flip persists exactly one `auto_unarchived` system row (whose persist
+/// emits `agent:message` with `role: "system"`), and only the triggering
+/// turn's outbound prompt carries the trailing `[SYSTEM NOTICE]` block — a
+/// follow-up turn in the Active workspace gets neither a new row nor the
+/// injected block.
 #[tokio::test]
 async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
     let Some(script) = gate("WSS auto-unarchive E2E") else {
@@ -332,12 +353,15 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "auto-unarchive ok" }).to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
     ];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
@@ -410,14 +434,16 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Collect the stamped delta and the turn's normal completion; relative
-    // order is unspecified. Keep only the workspace:updated frame carrying
-    // the autoUnarchive stamp — under load unrelated activity deltas (e.g.
-    // a bare lastActivity change) interleave on the same event type.
+    // Collect the stamped delta, the notice row's system agent:message echo,
+    // and the turn's normal completion; relative order is unspecified. Keep
+    // only the workspace:updated frame carrying the autoUnarchive stamp —
+    // under load unrelated activity deltas (e.g. a bare lastActivity change)
+    // interleave on the same event type.
     let mut unarchive_delta = None;
+    let mut notice_event = None;
     let mut stream_end = None;
     for _ in 0..80 {
-        if unarchive_delta.is_some() && stream_end.is_some() {
+        if unarchive_delta.is_some() && notice_event.is_some() && stream_end.is_some() {
             break;
         }
         let frame = wss_event(&mut sub, 30).await;
@@ -429,6 +455,9 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
                 {
                     unarchive_delta = Some(event["data"].clone());
                 }
+            }
+            Some("agent:message") if event["data"]["role"] == "system" => {
+                notice_event = Some(event["data"].clone());
             }
             Some("agent:stream:end") => {
                 stream_end = Some(event["data"].clone());
@@ -484,5 +513,162 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
     assert!(
         fetched["workspace"].get("archivedAt").is_none(),
         "archivedAt cleared: {fetched}"
+    );
+
+    // The confirmed flip persisted the informational notice row: its persist
+    // emitted `agent:message` with `role: "system"` naming the transcript row.
+    let notice_event = notice_event.expect("the notice persist emitted a system agent:message");
+    assert_eq!(
+        notice_event["agentId"],
+        json!(agent_id),
+        "system agent:message names the triggering agent: {notice_event}"
+    );
+    let notice_message_id = notice_event["messageId"]
+        .as_str()
+        .expect("system agent:message carries messageId")
+        .to_string();
+
+    // agent.getConversation serves exactly ONE auto_unarchived system row —
+    // the spec Contract shape: role, text, and metadata, byte-for-byte —
+    // and it is the row the agent:message event named.
+    let conv = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("conversation messages");
+    let notices: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["metadata"]["type"] == "auto_unarchived")
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "exactly one auto_unarchived notice row: {messages:?}"
+    );
+    let notice = notices[0];
+    assert_eq!(notice["role"], "system", "notice is a system row: {notice}");
+    assert_eq!(
+        notice["metadata"],
+        json!({ "type": "auto_unarchived", "reason": "agent_activity" }),
+        "notice metadata per spec Contract: {notice}"
+    );
+    let blocks = notice["contentBlocks"]
+        .as_array()
+        .expect("notice content blocks");
+    assert_eq!(
+        blocks.len(),
+        1,
+        "notice content is a single block: {notice}"
+    );
+    assert_eq!(blocks[0]["type"], "text", "notice block type: {notice}");
+    assert_eq!(
+        blocks[0]["text"],
+        json!(NOTICE_ROW_TEXT),
+        "notice block carries the Contract text: {notice}"
+    );
+    assert_eq!(
+        notice["id"],
+        json!(notice_message_id),
+        "agent:message named the persisted notice row: {notice}"
+    );
+
+    // Outbound-prompt contract: the SAME turn that triggered the unarchive
+    // carries one trailing `[SYSTEM NOTICE]` text block (the fixture logs
+    // each prompt before resolving it, so the observed stream:end guarantees
+    // the line is on disk).
+    let log = std::fs::read_to_string(&prompt_log).expect("prompt log written");
+    let prompts: Vec<Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("prompt log line"))
+        .collect();
+    assert_eq!(prompts.len(), 1, "one prompt so far: {prompts:?}");
+    let first_text = prompts[0]["text"].as_str().expect("prompt text");
+    assert!(
+        first_text.contains("hello"),
+        "triggering prompt carries the user message: {first_text:?}"
+    );
+    assert!(
+        first_text.ends_with(NOTICE_PROMPT_TEXT),
+        "triggering prompt ends with the trailing injected notice: {first_text:?}"
+    );
+
+    // Follow-up turn in the now-Active workspace: NO new notice row (no
+    // system agent:message in the turn's event window, and the transcript
+    // still holds exactly one) and NO injected prompt block (never replayed).
+    let sent2 = wss_rpc(
+        &mut rpc,
+        22,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "follow-up" }),
+    )
+    .await;
+    assert_eq!(sent2["success"], true, "follow-up sendMessage ok: {sent2}");
+    let mut second_end = None;
+    for _ in 0..80 {
+        if second_end.is_some() {
+            break;
+        }
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        match event["type"].as_str() {
+            Some("agent:message") if event["data"]["role"] == "system" => {
+                panic!(
+                    "follow-up turn must not persist a new system notice: {}",
+                    event["data"]
+                );
+            }
+            Some("workspace:updated") => {
+                assert!(
+                    event["data"]["changes"].get("autoUnarchive").is_none(),
+                    "no autoUnarchive stamp on an Active workspace: {}",
+                    event["data"]
+                );
+            }
+            Some("agent:stream:end") => {
+                second_end = Some(event["data"].clone());
+            }
+            _ => {}
+        }
+    }
+    let second_end = second_end.expect("the follow-up turn emitted its stream:end");
+    assert!(
+        second_end.get("stopReason").is_none(),
+        "follow-up turn completed normally: {second_end}"
+    );
+
+    let conv2 = wss_rpc(
+        &mut rpc,
+        23,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages2 = conv2["messages"].as_array().expect("conversation messages");
+    assert_eq!(
+        messages2
+            .iter()
+            .filter(|m| m["metadata"]["type"] == "auto_unarchived")
+            .count(),
+        1,
+        "still exactly one auto_unarchived row after the follow-up: {messages2:?}"
+    );
+
+    let log2 = std::fs::read_to_string(&prompt_log).expect("prompt log written");
+    let prompts2: Vec<Value> = log2
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("prompt log line"))
+        .collect();
+    assert_eq!(prompts2.len(), 2, "two prompts total: {prompts2:?}");
+    let second_text = prompts2[1]["text"].as_str().expect("prompt text");
+    assert!(
+        second_text.contains("follow-up"),
+        "second prompt carries the follow-up message: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("[SYSTEM NOTICE]"),
+        "no injected notice on the follow-up turn: {second_text:?}"
     );
 }

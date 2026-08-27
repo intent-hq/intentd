@@ -7982,9 +7982,11 @@ mod change_event_parity {
             .await
             .expect("insert session");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
+        assert!(flipped, "a persisted flip reports true");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
@@ -8022,9 +8024,11 @@ mod change_event_parity {
         let agent_id = AgentId::from("agent-noop");
         let before = h.store.get_workspace(&h.ws).await.expect("row");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
+        assert!(!flipped, "no flip on an active workspace");
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
@@ -8045,13 +8049,75 @@ mod change_event_parity {
         let agent_id = AgentId::from("agent-fail");
         let missing = WorkspaceId::from("ws-does-not-exist");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&missing, &agent_id)
             .await;
+        assert!(!flipped, "a failed read reports no flip");
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "failed read must emit nothing, got: {quiet:?}"
+        );
+    }
+
+    /// The losing racer on the auto path: when the conditional store flip
+    /// declines (the row is already Active — another turn start or a manual
+    /// unarchive won the race between this caller's `archived: true` read
+    /// and its write), the call reports `flipped = false` and emits NOTHING
+    /// — the winner's stamped delta already announced the flip, and the
+    /// loser must not persist a notice for a flip it did not perform.
+    /// Exercised via `unarchive_workspace_inner` directly: the in-race
+    /// interleaving (read archived → lose the write) is not otherwise
+    /// reachable deterministically.
+    #[tokio::test]
+    async fn auto_unarchive_losing_racer_reports_no_flip_and_emits_nothing() {
+        let h = harness().await;
+        // The row is Active — the state the losing racer's conditional
+        // write observes after the winner's flip.
+        let mut sub = subscribe(&h);
+        let stamp = json!({
+            "reason": "agent_activity",
+            "agentId": "agent-loser",
+            "agentName": "Builder",
+        });
+        let (ws, flipped) = h
+            .services
+            .unarchive_workspace_inner(h.ws.clone(), Some(stamp))
+            .await
+            .expect("losing racer still succeeds");
+        assert!(!flipped, "the losing racer must not claim the flip");
+        assert!(!ws.archived, "the returned row reflects the Active state");
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "the losing racer must emit nothing, got: {quiet:?}"
+        );
+    }
+
+    /// The manual RPC stays idempotent: `unarchive_workspace` on an
+    /// already-Active workspace still succeeds and still emits the delta
+    /// (no stamp) — the flipped-only short-circuit is auto-path-only.
+    #[tokio::test]
+    async fn manual_unarchive_on_active_workspace_stays_idempotent() {
+        use intent_core::WorkspaceApi;
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let ws = h
+            .services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("idempotent unarchive");
+        assert!(!ws.archived);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"]["changes"],
+            json!({
+                "archived": false,
+                "status": "Active",
+                "archivedAt": null,
+            })
         );
     }
 
@@ -8069,9 +8135,11 @@ mod change_event_parity {
         h.store.update_workspace(&ws).await.expect("archive row");
         let agent_id = AgentId::from("agent-no-row");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
+        assert!(flipped, "the flip persists despite the missing session row");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(

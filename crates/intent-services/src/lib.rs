@@ -16599,8 +16599,12 @@ impl WorkspaceApi for Services {
         let this = self.clone();
         // Manual unarchive (`workspace.unarchive` / `workspace.restore`):
         // no `autoUnarchive` stamp on the emitted delta (absent ≠
-        // present-false, PROTOCOL §6.5).
-        Box::pin(async move { this.unarchive_workspace_inner(id, None).await })
+        // present-false, PROTOCOL §6.5). The flip bool is auto-path-only.
+        Box::pin(async move {
+            this.unarchive_workspace_inner(id, None)
+                .await
+                .map(|(ws, _)| ws)
+        })
     }
 
     fn duplicate_workspace(
@@ -25675,23 +25679,45 @@ impl Services {
     /// on the turn-start trigger — is embedded additively in the delta's
     /// `changes` as `autoUnarchive: { reason, agentId, agentName }`; manual
     /// callers pass `None` and the field is absent (PROTOCOL §6.5).
+    ///
+    /// Returns the workspace plus whether THIS call performed the
+    /// Archived → Active flip: the row write is conditional
+    /// (`unarchive_workspace_if_archived`, `WHERE archived = 1`), so
+    /// concurrent unarchivers serialize at the statement and exactly one
+    /// caller reports `true`. A declined flip (already Active) still
+    /// succeeds for the manual RPCs (idempotent unarchive, delta still
+    /// emitted) but skips the emit entirely on the auto path — the losing
+    /// racer must not re-announce a flip it did not perform (the winner's
+    /// stamped delta already went out).
     async fn unarchive_workspace_inner(
         &self,
         id: WorkspaceId,
         auto_unarchive: Option<serde_json::Value>,
-    ) -> Result<Workspace> {
+    ) -> Result<(Workspace, bool)> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let manager = self.agent_manager();
         if id.is_chief() {
-            return Ok(chief_workspace());
+            return Ok((chief_workspace(), false));
         }
+        // Conditional flip: writes only when the row is currently archived,
+        // so two racing unarchivers (concurrent turn starts, or a manual
+        // unarchive racing the turn-start auto-unarchive) resolve to
+        // exactly one `flipped = true`.
+        let flipped = store
+            .unarchive_workspace_if_archived(&id, &now_iso())
+            .await?;
         let mut ws = store.get_workspace(&id).await?;
-        ws.status = WorkspaceStatus::Active;
-        ws.archived = false;
-        ws.archived_at = None;
-        ws.updated_at = now_iso();
-        store.update_workspace(&ws).await?;
+        // The losing racer on the auto path stops here: the winner (a
+        // concurrent turn start or a manual unarchive) already kicked the
+        // parked drains and emitted its delta, so re-running the tail would
+        // only duplicate the announcement for a flip this call never made.
+        // Manual callers fall through — the manual RPC stays idempotent
+        // (unarchiving an Active workspace still re-derives and re-emits).
+        if auto_unarchive.is_some() && !flipped {
+            ws.activity = self.workspace_activity(&ws.id);
+            return Ok((ws, false));
+        }
         // Re-engage queues parked by the archived gates
         // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
         // background agent's drain organically, so without this a queue
@@ -25745,7 +25771,7 @@ impl Services {
             changes["autoUnarchive"] = stamp;
         }
         publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
-        Ok(ws)
+        Ok((ws, flipped))
     }
 
     /// Best-effort auto-unarchive at the turn-start choke point
@@ -25755,11 +25781,12 @@ impl Services {
     /// stamped `autoUnarchive: { reason: "agent_activity", agentId,
     /// agentName }`.
     ///
-    /// Not serialized across concurrent turn starts: two agents winning
-    /// `try_begin` near-simultaneously in the same archived workspace can
-    /// each observe `archived: true` and both emit a stamped delta. The
-    /// row writes are idempotent; consumers keying UI (e.g. a toast) on
-    /// the stamp should dedup per workspace.
+    /// Concurrent turn starts serialize at the store's conditional flip
+    /// (`unarchive_workspace_if_archived`, `WHERE archived = 1`): two agents
+    /// winning `try_begin` near-simultaneously in the same archived
+    /// workspace can each read `archived: true`, but exactly one write
+    /// affects the row — only that winner emits the stamped delta and
+    /// reports `true` here; the loser skips the emit and reports `false`.
     ///
     /// Non-archived workspaces cost one point read (`archived` is part of
     /// the workspace row already fetched by callers of the send path, but
@@ -25770,6 +25797,13 @@ impl Services {
     /// better than a lost turn, and the archived drain gates keep parking
     /// follow-on wakes until a later trigger succeeds.
     ///
+    /// Returns `true` only when THIS call actually flipped the workspace
+    /// from Archived to Active (the conditional write affected the row);
+    /// `false` on the chief skip, a non-archived workspace, a read failure,
+    /// a lost flip race, or an unarchive failure — the caller uses the flip
+    /// to persist the `auto_unarchived` transcript notice and inject the
+    /// triggering turn's prompt block.
+    ///
     /// Returns a [`BoxFuture`] (rather than `async fn`) to break the async
     /// type cycle: this helper is awaited inside `try_begin`, and the
     /// unarchive's drain kick re-enters `try_begin` (bounded at runtime —
@@ -25779,14 +25813,14 @@ impl Services {
         &'a self,
         workspace_id: &'a WorkspaceId,
         agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, bool> {
         Box::pin(async move {
             if workspace_id.is_chief() {
-                return;
+                return false;
             }
             match self.store.get_workspace(workspace_id).await {
                 Ok(ws) if ws.archived => {}
-                Ok(_) => return,
+                Ok(_) => return false,
                 Err(e) => {
                     tracing::warn!(
                         workspace = %workspace_id.as_str(),
@@ -25794,7 +25828,7 @@ impl Services {
                         error = %e,
                         "auto-unarchive: workspace read failed; turn proceeds in archived workspace"
                     );
-                    return;
+                    return false;
                 }
             }
             // Name lookup is display-only: a lookup failure (or a session
@@ -25815,17 +25849,25 @@ impl Services {
                 .unarchive_workspace_inner(workspace_id.clone(), Some(stamp))
                 .await
             {
-                Ok(_) => tracing::info!(
-                    workspace = %workspace_id.as_str(),
-                    agent = %agent_id,
-                    "auto-unarchived workspace on agent turn start"
-                ),
-                Err(e) => tracing::warn!(
-                    workspace = %workspace_id.as_str(),
-                    agent = %agent_id,
-                    error = %e,
-                    "auto-unarchive failed; turn proceeds in archived workspace"
-                ),
+                Ok((_, flipped)) => {
+                    if flipped {
+                        tracing::info!(
+                            workspace = %workspace_id.as_str(),
+                            agent = %agent_id,
+                            "auto-unarchived workspace on agent turn start"
+                        );
+                    }
+                    flipped
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        agent = %agent_id,
+                        error = %e,
+                        "auto-unarchive failed; turn proceeds in archived workspace"
+                    );
+                    false
+                }
             }
         })
     }

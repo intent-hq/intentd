@@ -317,6 +317,52 @@ async fn workspace_round_trip_and_archive_filter() {
     assert!(!got.archived);
 }
 
+/// `unarchive_workspace_if_archived` is a single atomic flip: the archived
+/// row flips exactly once (`true`), a repeat call — or one against an
+/// already-Active row — declines (`false`, row untouched), and a missing
+/// workspace reports `NotFound`.
+#[tokio::test]
+async fn workspace_conditional_unarchive_flips_exactly_once() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&id, "Archived WS", true))
+        .await
+        .expect("insert archived");
+
+    let ts = now_iso();
+    let flipped = store
+        .unarchive_workspace_if_archived(&id, &ts)
+        .await
+        .expect("first flip");
+    assert!(flipped, "the archived row flips");
+    let row = store.get_workspace(&id).await.expect("row after flip");
+    assert!(!row.archived);
+    assert_eq!(row.status, WorkspaceStatus::Active);
+    assert_eq!(row.archived_at, None);
+    assert_eq!(row.updated_at, ts);
+
+    // The losing racer: the row is Active now, so the guard declines and
+    // nothing (including `updated_at`) is rewritten.
+    let again = store
+        .unarchive_workspace_if_archived(&id, &now_iso())
+        .await
+        .expect("second call");
+    assert!(!again, "an Active row declines the flip");
+    let row = store.get_workspace(&id).await.expect("row after decline");
+    assert_eq!(row.updated_at, ts, "a declined flip touches nothing");
+
+    let missing = store
+        .unarchive_workspace_if_archived(&WorkspaceId::new(), &now_iso())
+        .await;
+    assert!(
+        matches!(missing, Err(Error::NotFound(_))),
+        "missing workspace reports NotFound, got {missing:?}"
+    );
+}
+
 /// `bump_workspace_last_activity` (monorepo#1580) is scoped and monotonic:
 /// it writes only `last_activity` (never `updated_at` or any other column),
 /// declines a stale or equal timestamp, fills a NULL column, overwrites a
