@@ -327,6 +327,14 @@ impl Store {
     /// schema. Nothing is visible unless the whole batch commits. Returns
     /// the number of rows inserted.
     ///
+    /// Invariant the caller owns: `agent_session` rows must arrive with the
+    /// 0103 stats counter columns (`message_count`,
+    /// `assistant_message_count`, `conversation_bytes`) zeroed — the
+    /// `agent_message` inserts in the same batch rebuild them through the
+    /// 0103 triggers, so importing exported values double-counts. The
+    /// production transform (`transfer_import.rs::transform_rows`) does
+    /// this; any new direct caller must too.
+    ///
     /// # Errors
     ///
     /// Returns `Error::InvalidParams` when a row names a table outside the transfer set, is not a JSON object, or carries a key with no matching column; `Error::Internal` if the transaction fails.
@@ -659,8 +667,18 @@ mod tests {
     /// `draft` rows are emptied first — drafts FK onto `client`, which is not
     /// part of the transfer set, so the import transform layer drops them
     /// (transient UI state; the owning client never exists on the target).
+    /// The `agent_session` 0103 stats counters are zeroed first for the same
+    /// reason: the transform layer zeroes them so the target's triggers
+    /// rebuild them from the re-inserted `agent_message` rows (importing the
+    /// exported values would double-count); the rebuilt values are asserted
+    /// separately, then normalized out of the losslessness diff.
     #[tokio::test]
     async fn transfer_rows_round_trip_between_stores() {
+        const COUNTERS: [&str; 3] = [
+            "message_count",
+            "assistant_message_count",
+            "conversation_bytes",
+        ];
         let src_db = TempDb::new();
         let src = Store::open(&src_db.path).await.expect("open source");
         seed(&src, "ws-rt").await;
@@ -673,6 +691,13 @@ mod tests {
                 assert_eq!(rows.len(), 1, "seed must have exercised draft export");
                 rows.clear();
             }
+            if table == "agent_session" {
+                for row in rows.iter_mut() {
+                    for counter in COUNTERS {
+                        row[counter] = serde_json::json!(0);
+                    }
+                }
+            }
         }
         let total: usize = exported.iter().map(|(_, rows)| rows.len()).sum();
         assert!(total > 0);
@@ -682,7 +707,22 @@ mod tests {
         let inserted = dst.transfer_import_rows(&exported).await.expect("import");
         assert_eq!(inserted, total);
 
-        let re_exported = dst.transfer_export_rows(&ws).await.expect("re-export");
+        let mut re_exported = dst.transfer_export_rows(&ws).await.expect("re-export");
+        for (table, rows) in &mut re_exported {
+            if table != "agent_session" {
+                continue;
+            }
+            for row in rows.iter_mut() {
+                // Seed appends one user message with content "[]": the
+                // target's triggers must have rebuilt exactly that.
+                assert_eq!(row["message_count"], 1, "counters rebuilt on target");
+                assert_eq!(row["assistant_message_count"], 0);
+                assert_eq!(row["conversation_bytes"], 2);
+                for counter in COUNTERS {
+                    row[counter] = serde_json::json!(0);
+                }
+            }
+        }
         assert_eq!(exported, re_exported, "round-trip must be lossless");
     }
 
@@ -813,7 +853,7 @@ note_version: note_id, workspace_id, v, date, author_id, author_name, author_typ
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes
 agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails
 agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason

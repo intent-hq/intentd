@@ -1201,6 +1201,11 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///   in-flight statuses (`active`/`Processing`/`Waiting`) become `idle` with
 ///   a stop reason, and each such agent gains an `interrupted_agent` row
 ///   (`resolution='pending'`) so `agent.listInterrupted` offers resumption.
+///   The 0103 stats counters (`message_count` / `assistant_message_count` /
+///   `conversation_bytes`) are zeroed: the target re-inserts the transferred
+///   `agent_message` rows through the counter triggers, which rebuild them
+///   from zero — importing the exported values would double-count (same
+///   rebuild-on-target approach as the FTS index).
 /// - **sandbox**: `path` rewritten under the target root.
 /// - **script**: absolute `cwd` rewritten under the target root.
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
@@ -1244,6 +1249,13 @@ fn transform_rows(
                     map.insert("acp_session_id".into(), serde_json::Value::Null);
                     map.insert("backend_session_id".into(), serde_json::Value::Null);
                     map.insert("is_active".into(), serde_json::json!(0));
+                    for counter in [
+                        "message_count",
+                        "assistant_message_count",
+                        "conversation_bytes",
+                    ] {
+                        map.insert(counter.into(), serde_json::json!(0));
+                    }
                     let status = map
                         .get("status")
                         .and_then(|v| v.as_str())
@@ -1463,6 +1475,9 @@ mod tests {
             assert_eq!(s["acp_session_id"], serde_json::Value::Null);
             assert_eq!(s["backend_session_id"], serde_json::Value::Null);
             assert_eq!(s["is_active"], 0);
+            assert_eq!(s["message_count"], 0, "0103 counters zeroed for rebuild");
+            assert_eq!(s["assistant_message_count"], 0);
+            assert_eq!(s["conversation_bytes"], 0);
         }
         assert!(sessions[..3].iter().all(|s| s["status"] == "idle"));
         assert!(sessions[..3]
@@ -1864,12 +1879,30 @@ mod tests {
             ),
             (
                 "agent_session",
+                // Exported 0103 counter values are deliberately wrong (999):
+                // the import transform zeroes them and the agent_message
+                // re-inserts below rebuild them through the triggers.
                 vec![serde_json::json!({
                     "id": "agent-live", "workspace_id": ws.0, "name": "A",
                     "status": "active", "is_active": 1,
                     "acp_session_id": "acp-1", "backend_session_id": "b-1",
+                    "message_count": 999, "assistant_message_count": 999,
+                    "conversation_bytes": 999,
                     "created_at": t, "updated_at": t
                 })],
+            ),
+            (
+                "agent_message",
+                vec![
+                    serde_json::json!({
+                        "id": "m-1", "agent_id": "agent-live", "seq": 1,
+                        "role": "user", "content": "[\"hi\"]", "created_at": t
+                    }),
+                    serde_json::json!({
+                        "id": "m-2", "agent_id": "agent-live", "seq": 2,
+                        "role": "assistant", "content": "[\"hello\"]", "created_at": t
+                    }),
+                ],
             ),
             (
                 "hook",
@@ -1986,6 +2019,19 @@ mod tests {
             .expect("session");
         assert_eq!(session.status, intent_core::AgentStatus::RuntimeIdle);
         assert!(session.acp_session_id.is_none());
+
+        // 0103 stats counters rebuilt from the re-inserted messages by the
+        // triggers — not the exported 999s, and not doubled.
+        let stats = svc
+            .store
+            .get_agent_session_message_stats(&ws)
+            .await
+            .expect("message stats");
+        assert_eq!(
+            stats.get("agent-live"),
+            Some(&(2, true, ("[\"hi\"]".len() + "[\"hello\"]".len()) as u64)),
+            "counters must equal a live recompute of the imported messages"
+        );
         assert_eq!(
             committed["interruptedAgents"],
             serde_json::json!(["agent-live"])
