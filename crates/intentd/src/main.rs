@@ -1233,24 +1233,22 @@ fn resolve_config() -> anyhow::Result<Config> {
     Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
-/// One-line build-identity banner logged first thing in `cmd_serve` so every
-/// log file opens with which build produced it (monorepo#3649). Same values
-/// `system.info` exposes; dev builds without an embedded commit log "unknown".
-fn startup_banner(version: &str, build_commit: Option<&str>, protocol_version: &str) -> String {
-    format!(
-        "intentd v{version} starting (build commit {}, protocol {protocol_version})",
-        build_commit.unwrap_or("unknown")
-    )
+/// Build-commit value for the serve startup banner (monorepo#3649): the
+/// embedded commit when present, "unknown" for builds without one — the same
+/// `Option` `system.info` maps into its `build_commit` field.
+fn banner_build_commit(build_commit: Option<&str>) -> &str {
+    build_commit.unwrap_or("unknown")
 }
 
 async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyhow::Result<()> {
+    // Build-identity banner as the first serve log line so every log file
+    // opens with which build produced it (monorepo#3649). Same identity
+    // values `system.info` and the hello handshake expose.
     tracing::info!(
-        "{}",
-        startup_banner(
-            env!("CARGO_PKG_VERSION"),
-            intent_transport::BUILD_COMMIT,
-            intent_transport::PROTOCOL_VERSION,
-        )
+        version = env!("CARGO_PKG_VERSION"),
+        build_commit = banner_build_commit(intent_transport::BUILD_COMMIT),
+        protocol = intent_transport::PROTOCOL_VERSION,
+        "intentd starting"
     );
     // Insecure dev mode: `--insecure` OR `INTENTD_INSECURE=1` disables TLS and
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
@@ -5551,19 +5549,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startup_banner_includes_version_commit_and_protocol() {
-        assert_eq!(
-            startup_banner("1.2.3", Some("abc1234"), "8.2"),
-            "intentd v1.2.3 starting (build commit abc1234, protocol 8.2)"
-        );
+    fn banner_build_commit_passes_through_embedded_commit() {
+        assert_eq!(banner_build_commit(Some("abc1234")), "abc1234");
     }
 
     #[test]
-    fn startup_banner_falls_back_to_unknown_commit() {
-        assert_eq!(
-            startup_banner("1.2.3", None, "8.2"),
-            "intentd v1.2.3 starting (build commit unknown, protocol 8.2)"
-        );
+    fn banner_build_commit_falls_back_to_unknown() {
+        assert_eq!(banner_build_commit(None), "unknown");
     }
 
     #[test]
