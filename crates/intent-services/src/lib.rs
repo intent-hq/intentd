@@ -1880,66 +1880,85 @@ impl Services {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
 
-            // Get the current workspace and capture its old lastActivity.
-            let mut ws = match this.store.get_workspace(&ws_id).await {
-                Ok(w) => w,
-                Err(Error::NotFound(_)) => {
-                    // Expected shape, not a failure (monorepo#3623): the
-                    // workspace was deleted while the timer was pending —
-                    // `workspace.delete` cancels the schedule, but a bump
-                    // racing the delete can still re-arm one after the
-                    // cancel. Ids are never recycled, so not-found here
-                    // always means "deleted mid-window"; there is nothing
-                    // left to derive against.
-                    tracing::debug!(workspace = %ws_id.as_str(), "schedule_last_activity_event: workspace deleted before the debounce fired; skipping");
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(workspace = %ws_id.as_str(), error = %e, "schedule_last_activity_event: get_workspace failed");
-                    return;
-                }
-            };
-            let old_activity = ws.last_activity.clone();
-
-            // Recompute lastActivity via the existing aggregation.
-            this.derive_last_activity(&mut ws).await;
-            let new_activity = ws.last_activity.clone();
-
-            // Emit only when the derived value changed.
-            if old_activity != new_activity {
-                if let Some(new_val) = &new_activity {
-                    // Persist the derived value (monorepo#1580). Without this
-                    // the column keeps whatever the last full-row write left
-                    // behind, so cheap read paths that do not derive
-                    // (`list_workspaces_lite`, the `workspace.subscribe` seq-0
-                    // snapshot) serve a stale `lastActivity` after a restart.
-                    // Scoped + monotonic: only this column moves, and an
-                    // out-of-order late timer can never walk the value back.
-                    // A declined bump (a concurrent writer already persisted
-                    // something newer) still emits below — the event is a
-                    // change signal, and the concurrent task's own event
-                    // carries the newer value.
-                    if let Err(e) = this
-                        .store
-                        .bump_workspace_last_activity(&ws_id, new_val)
-                        .await
-                    {
-                        tracing::warn!(
-                            workspace = %ws_id.as_str(),
-                            error = %e,
-                            "schedule_last_activity_event: persist lastActivity failed"
-                        );
+            // Inner block so the gen-guarded self-removal below runs on every
+            // exit path — an early return here must not strand this task's
+            // `(gen, AbortHandle)` entry in the map (monorepo#3623: a timer
+            // re-armed by a bump racing the delete would otherwise leak its
+            // entry for the daemon's lifetime, since ids are never recycled
+            // and the delete's own cancel has already run).
+            async {
+                // Get the current workspace and capture its old lastActivity.
+                let mut ws = match this.store.get_workspace(&ws_id).await {
+                    Ok(w) => w,
+                    Err(Error::NotFound(_)) => {
+                        // Expected shape, not a failure (monorepo#3623): the
+                        // workspace was deleted while the timer was pending —
+                        // `workspace.delete` cancels the schedule, but a bump
+                        // racing the delete can still re-arm one after the
+                        // cancel. Ids are never recycled, so not-found here
+                        // always means "deleted mid-window"; there is nothing
+                        // left to derive against.
+                        tracing::debug!(workspace = %ws_id.as_str(), "schedule_last_activity_event: workspace deleted before the debounce fired; skipping");
+                        return;
                     }
-                    publish_event(
-                        this.event_bus.as_ref(),
-                        workspace_updated_event(
-                            &ws_id,
-                            &serde_json::json!({ "lastActivity": new_val }),
-                        ),
-                    )
-                    .await;
+                    Err(e) => {
+                        tracing::warn!(workspace = %ws_id.as_str(), error = %e, "schedule_last_activity_event: get_workspace failed");
+                        return;
+                    }
+                };
+                let old_activity = ws.last_activity.clone();
+
+                // Recompute lastActivity via the existing aggregation.
+                this.derive_last_activity(&mut ws).await;
+                let new_activity = ws.last_activity.clone();
+
+                // Emit only when the derived value changed.
+                if old_activity != new_activity {
+                    if let Some(new_val) = &new_activity {
+                        // Persist the derived value (monorepo#1580). Without this
+                        // the column keeps whatever the last full-row write left
+                        // behind, so cheap read paths that do not derive
+                        // (`list_workspaces_lite`, the `workspace.subscribe` seq-0
+                        // snapshot) serve a stale `lastActivity` after a restart.
+                        // Scoped + monotonic: only this column moves, and an
+                        // out-of-order late timer can never walk the value back.
+                        // A declined bump (a concurrent writer already persisted
+                        // something newer) still emits below — the event is a
+                        // change signal, and the concurrent task's own event
+                        // carries the newer value.
+                        match this
+                            .store
+                            .bump_workspace_last_activity(&ws_id, new_val)
+                            .await
+                        {
+                            // Same deleted-mid-window shape as above, through
+                            // the narrower window between the successful
+                            // `get_workspace` and this persist (monorepo#3623).
+                            Err(Error::NotFound(_)) => {
+                                tracing::debug!(workspace = %ws_id.as_str(), "schedule_last_activity_event: workspace deleted before lastActivity persisted; skipping");
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    workspace = %ws_id.as_str(),
+                                    error = %e,
+                                    "schedule_last_activity_event: persist lastActivity failed"
+                                );
+                            }
+                            Ok(_) => {}
+                        }
+                        publish_event(
+                            this.event_bus.as_ref(),
+                            workspace_updated_event(
+                                &ws_id,
+                                &serde_json::json!({ "lastActivity": new_val }),
+                            ),
+                        )
+                        .await;
+                    }
                 }
             }
+            .await;
 
             // Remove ourselves from the debouncers map only if we're still the current task.
             if let Ok(mut map) = debouncers.lock() {
