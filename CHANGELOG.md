@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.7] - 2026-08-27
+
+### 🚀 Features
+
+- *(services)* Agent liveness observability for long tool-heavy turns ([#1535](https://github.com/intent-hq/intentd/pull/1535))
+
+
 ## [0.8.6] - 2026-08-27
 
 ### 🚀 Features
