@@ -25720,6 +25720,12 @@ impl Services {
     /// better than a lost turn, and the archived drain gates keep parking
     /// follow-on wakes until a later trigger succeeds.
     ///
+    /// Returns `true` only when the workspace was actually flipped from
+    /// Archived to Active (the unarchive persisted); `false` on the chief
+    /// skip, a non-archived workspace, a read failure, or an unarchive
+    /// failure — the caller uses the flip to persist the `auto_unarchived`
+    /// transcript notice and inject the triggering turn's prompt block.
+    ///
     /// Returns a [`BoxFuture`] (rather than `async fn`) to break the async
     /// type cycle: this helper is awaited inside `try_begin`, and the
     /// unarchive's drain kick re-enters `try_begin` (bounded at runtime —
@@ -25729,14 +25735,14 @@ impl Services {
         &'a self,
         workspace_id: &'a WorkspaceId,
         agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, bool> {
         Box::pin(async move {
             if workspace_id.is_chief() {
-                return;
+                return false;
             }
             match self.store.get_workspace(workspace_id).await {
                 Ok(ws) if ws.archived => {}
-                Ok(_) => return,
+                Ok(_) => return false,
                 Err(e) => {
                     tracing::warn!(
                         workspace = %workspace_id.as_str(),
@@ -25744,7 +25750,7 @@ impl Services {
                         error = %e,
                         "auto-unarchive: workspace read failed; turn proceeds in archived workspace"
                     );
-                    return;
+                    return false;
                 }
             }
             // Name lookup is display-only: a lookup failure (or a session
@@ -25765,17 +25771,23 @@ impl Services {
                 .unarchive_workspace_inner(workspace_id.clone(), Some(stamp))
                 .await
             {
-                Ok(_) => tracing::info!(
-                    workspace = %workspace_id.as_str(),
-                    agent = %agent_id,
-                    "auto-unarchived workspace on agent turn start"
-                ),
-                Err(e) => tracing::warn!(
-                    workspace = %workspace_id.as_str(),
-                    agent = %agent_id,
-                    error = %e,
-                    "auto-unarchive failed; turn proceeds in archived workspace"
-                ),
+                Ok(_) => {
+                    tracing::info!(
+                        workspace = %workspace_id.as_str(),
+                        agent = %agent_id,
+                        "auto-unarchived workspace on agent turn start"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        agent = %agent_id,
+                        error = %e,
+                        "auto-unarchive failed; turn proceeds in archived workspace"
+                    );
+                    false
+                }
             }
         })
     }

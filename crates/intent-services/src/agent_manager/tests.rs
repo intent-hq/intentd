@@ -2036,6 +2036,167 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
         "stamped §6.5 delta"
     );
 
+    // The confirmed flip persisted exactly one `auto_unarchived` system row
+    // (spec Contract text + metadata) and emitted `agent:message`.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1, "exactly one notice row");
+    let notice = &messages[0];
+    assert_eq!(notice.role, "system");
+    assert_eq!(
+        notice.content,
+        json!([{ "type": "text", "text": super::AUTO_UNARCHIVE_NOTICE_TEXT }])
+    );
+    assert_eq!(
+        notice.metadata,
+        Some(json!({ "type": "auto_unarchived", "reason": "agent_activity" }))
+    );
+    let msg_event = events
+        .iter()
+        .find(|e| e.event_type == "agent:message")
+        .expect("notice emitted agent:message");
+    assert_eq!(msg_event.data["role"], json!("system"));
+    assert_eq!(msg_event.data["messageId"], json!(notice.id));
+
+    // THIS turn's outbound prompt carries the trailing notice block…
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
+    assert_eq!(last["text"], json!(super::AUTO_UNARCHIVE_PROMPT_NOTICE));
+    mgr.end_turn(&id).await;
+
+    // …and the NEXT turn's does not (the flag was consumed).
+    assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
+    let next = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    assert!(
+        !serde_json::to_string(&next)
+            .unwrap()
+            .contains("automatically unarchived"),
+        "the notice must not replay on later turns"
+    );
+    mgr.end_turn(&id).await;
+}
+
+/// A claim in a NON-archived workspace persists no `auto_unarchived` notice
+/// and injects nothing into the turn's prompt.
+#[tokio::test]
+async fn winning_try_begin_in_active_workspace_persists_no_notice() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-active-no-notice");
+    let id = AgentId::from("a-active-no-notice");
+    seed_agent(&mgr, &ws, &id).await;
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert!(messages.is_empty(), "no notice row on an active workspace");
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    assert!(
+        !serde_json::to_string(&prompt)
+            .unwrap()
+            .contains("automatically unarchived"),
+        "no prompt notice on an active workspace"
+    );
+    mgr.end_turn(&id).await;
+}
+
+/// The suppressed re-claim (`auto_unarchive = false`, the worker's raced
+/// end-of-turn re-check) never persists the notice nor arms the prompt flag
+/// — the workspace stays archived and the transcript stays clean.
+#[tokio::test]
+async fn suppressed_reclaim_persists_no_notice() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-suppressed-reclaim");
+    let id = AgentId::from("a-suppressed-reclaim");
+    seed_agent(&mgr, &ws, &id).await;
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.status = WorkspaceStatus::Archived;
+    row.archived = true;
+    row.archived_at = Some(now_iso());
+    mgr.services
+        .store
+        .update_workspace(&row)
+        .await
+        .expect("archive row");
+
+    assert_eq!(
+        mgr.try_begin_outcome(&id, &ws, false).await,
+        super::TryBeginOutcome::Started
+    );
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert!(
+        after.archived,
+        "suppressed claim leaves the workspace archived"
+    );
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert!(
+        messages.is_empty(),
+        "no notice row on the suppressed re-claim"
+    );
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    assert!(
+        !serde_json::to_string(&prompt)
+            .unwrap()
+            .contains("automatically unarchived"),
+        "no prompt notice on the suppressed re-claim"
+    );
+    mgr.end_turn(&id).await;
+}
+
+/// A stale prompt flag never leaks across a slot release: a claim whose turn
+/// never built a prompt clears the flag when the slot releases, so the next
+/// claim's prompt is clean.
+#[tokio::test]
+async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-flag-hygiene");
+    let id = AgentId::from("a-flag-hygiene");
+    seed_agent(&mgr, &ws, &id).await;
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.status = WorkspaceStatus::Archived;
+    row.archived = true;
+    row.archived_at = Some(now_iso());
+    mgr.services
+        .store
+        .update_workspace(&row)
+        .await
+        .expect("archive row");
+
+    // The claim flips the workspace and arms the flag, but the turn ends
+    // without ever building a prompt (e.g. a harness wake turn).
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.end_turn(&id).await;
+
+    assert!(mgr.try_begin(&id, &ws).await, "next claim wins");
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    assert!(
+        !serde_json::to_string(&prompt)
+            .unwrap()
+            .contains("automatically unarchived"),
+        "the stale flag must not leak into the next turn's prompt"
+    );
     mgr.end_turn(&id).await;
 }
 

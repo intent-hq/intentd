@@ -7982,9 +7982,11 @@ mod change_event_parity {
             .await
             .expect("insert session");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
+        assert!(flipped, "a persisted flip reports true");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
@@ -8022,9 +8024,11 @@ mod change_event_parity {
         let agent_id = AgentId::from("agent-noop");
         let before = h.store.get_workspace(&h.ws).await.expect("row");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
+        assert!(!flipped, "no flip on an active workspace");
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
@@ -8045,9 +8049,11 @@ mod change_event_parity {
         let agent_id = AgentId::from("agent-fail");
         let missing = WorkspaceId::from("ws-does-not-exist");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&missing, &agent_id)
             .await;
+        assert!(!flipped, "a failed read reports no flip");
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
@@ -8069,9 +8075,11 @@ mod change_event_parity {
         h.store.update_workspace(&ws).await.expect("archive row");
         let agent_id = AgentId::from("agent-no-row");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
+        assert!(flipped, "the flip persists despite the missing session row");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
