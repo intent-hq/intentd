@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.4] - 2026-08-27
+
+### 🚀 Features
+
+- *(services)* Retire cancels hooks and PR monitors, resolves watches, and cascades to settled descendants ([#1517](https://github.com/intent-hq/intentd/pull/1517))
+
+
 ## [0.8.3] - 2026-08-26
 
 ### 🚀 Features
