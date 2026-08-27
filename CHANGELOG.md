@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.3] - 2026-08-26
+
+### 🚀 Features
+
+- *(acp)* Scope filters on ws.agent.list and honor includeCompleted ([#1513](https://github.com/intent-hq/intentd/pull/1513))
+
+
 ## [0.8.2] - 2026-08-26
 
 ### 🚀 Features
