@@ -972,37 +972,42 @@ pub(crate) async fn fetch_merge_requirements(
     repo_ref: &RepoRef,
     number: u64,
 ) -> Result<MergeRequirements> {
-    let (_, requirements, _) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
+    let (_, requirements, _, _) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
     Ok(requirements)
 }
 
-/// [`fetch_merge_requirements`] plus the two by-products the PR monitor needs
+/// [`fetch_merge_requirements`] plus the by-products the PR monitor needs
 /// for its own snapshot — the [`PullRequest`] the checklist was composed from
-/// (title / url / head SHA) and the review-comment count from the same thread
-/// fetch — so a poll never repeats the `get_pr` / thread reads.
+/// (title / url / head SHA), the review-comment count from the same thread
+/// fetch, and the probe-answered flag (see [`merge_requirements_for_pr`]) —
+/// so a poll never repeats the `get_pr` / thread reads.
 pub(crate) async fn fetch_merge_requirements_detailed(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-) -> Result<(PullRequest, MergeRequirements, i64)> {
+) -> Result<(PullRequest, MergeRequirements, i64, bool)> {
     let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
-    let (requirements, review_comments) =
+    let (requirements, review_comments, ejection_known) =
         merge_requirements_for_pr(sc, repo_ref, number, &pr).await;
-    Ok((pr, requirements, review_comments))
+    Ok((pr, requirements, review_comments, ejection_known))
 }
 
 /// [`fetch_merge_requirements_detailed`] for a [`PullRequest`] the caller
 /// already read — the composition shared by the PR monitor and the one-shot
 /// `ws.pr.snapshot`, so both surfaces describe a PR with the same object.
 /// Infallible: every forge sub-read degrades on its own (see
-/// [`fetch_merge_requirements`]). Returns the checklist plus the
-/// review-comment count from the same thread fetch.
+/// [`fetch_merge_requirements`]). Returns the checklist, the review-comment
+/// count from the same thread fetch, and whether the merge-requirements
+/// probe itself answered — the probe is the ONLY source of the merge-queue
+/// ejection signal, so `false` means the checklist's `mergeQueueEjection` is
+/// "unknown", not "no ejection" (the PR monitor keeps its previously
+/// observed event instead of dropping it).
 pub(crate) async fn merge_requirements_for_pr(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
     pr: &PullRequest,
-) -> (MergeRequirements, i64) {
+) -> (MergeRequirements, i64, bool) {
     let (signals, reviews) = tokio::join!(
         sc.merge_requirements(repo_ref, number),
         sc.list_reviews(repo_ref, number)
@@ -1016,6 +1021,9 @@ pub(crate) async fn merge_requirements_for_pr(
             );
         })
         .ok();
+    // Captured BEFORE the review-decision backfill below can fabricate a
+    // stub `signals` for a failed probe.
+    let ejection_known = signals.is_some();
     let agg = aggregate_reviews(&reviews.unwrap_or_default());
 
     // The probe carries the forge's `reviewDecision`; when it did not — no
@@ -1087,7 +1095,7 @@ pub(crate) async fn merge_requirements_for_pr(
     };
 
     let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
-    (requirements, review_comments)
+    (requirements, review_comments, ejection_known)
 }
 
 // ===========================================================================
