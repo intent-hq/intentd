@@ -25,6 +25,9 @@ use intent_core::{
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::events::IdInfo;
 
@@ -415,6 +418,139 @@ fn note_row(note: Note, projection: Option<NoteListProjection>) -> Option<Value>
 /// `workspace` is per-user/global; every other v1.0 channel is workspace-scoped.
 pub(crate) fn channel_is_global(channel: Channel) -> bool {
     matches!(channel, Channel::Workspace)
+}
+
+/// The wire name of a channel, for log fields.
+pub(crate) fn channel_name(channel: Channel) -> &'static str {
+    match channel {
+        Channel::Note => "note",
+        Channel::Task => "task",
+        Channel::Agent => "agent",
+        Channel::Workspace => "workspace",
+        Channel::Comment => "comment",
+        Channel::Chat => "chat",
+    }
+}
+
+/// Default duration threshold in milliseconds for a subscribe fast-path
+/// snapshot: a subscription whose seq-0 snapshot takes longer than this from
+/// request receipt to being queued on the outbound lane draws a WARN.
+///
+/// The fast-path is intercepted in [`crate::conn::process_frame`] BEFORE the
+/// JSON-RPC dispatcher, so it never enters the `rpc_dispatch` span the
+/// `RpcProfileLayer` duration guardrail watches — this threshold is its
+/// equivalent for snapshot emission (intent-hq/intent#3707).
+pub const DEFAULT_SNAPSHOT_DURATION_WARN_MS: u64 = 200;
+/// Env override for the subscribe fast-path snapshot duration threshold in
+/// milliseconds (u64). Read once on first use; unparseable values fall back
+/// to [`DEFAULT_SNAPSHOT_DURATION_WARN_MS`] (same convention as the
+/// `rpc_profile` thresholds).
+pub const SNAPSHOT_DURATION_WARN_ENV: &str = "INTENTD_SUBSCRIBE_SNAPSHOT_WARN_MS";
+
+/// Target the snapshot-timing WARN events are emitted under.
+const SNAPSHOT_WARN_TARGET: &str = "intent_transport::subscribe_profile";
+
+/// Parse an override value into the snapshot duration threshold, falling back
+/// to the default when absent or unparseable.
+fn snapshot_warn_threshold_from(raw: Option<String>) -> Duration {
+    Duration::from_millis(
+        raw.and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_SNAPSHOT_DURATION_WARN_MS),
+    )
+}
+
+/// The process-wide snapshot duration threshold, honoring the
+/// [`SNAPSHOT_DURATION_WARN_ENV`] override (read once).
+fn snapshot_warn_threshold() -> Duration {
+    static THRESHOLD: OnceLock<Duration> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        snapshot_warn_threshold_from(std::env::var(SNAPSHOT_DURATION_WARN_ENV).ok())
+    })
+}
+
+/// Process-wide count of subscribe fast-path snapshots currently in flight
+/// (request received, seq-0 snapshot not yet queued). Lets a slow-snapshot
+/// WARN distinguish concurrent-load slowness from a request that is slow in
+/// isolation.
+static SNAPSHOT_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Emit the slow-snapshot WARN when `elapsed` exceeds `threshold`. Returns
+/// whether the WARN fired (unit-testable without a subscriber).
+fn maybe_warn_slow_snapshot(
+    channel: &'static str,
+    scope: &str,
+    elapsed: Duration,
+    threshold: Duration,
+    in_flight: u64,
+) -> bool {
+    if elapsed <= threshold {
+        return false;
+    }
+    let as_ms =
+        |d: Duration| u64::try_from(d.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+    tracing::warn!(
+        target: SNAPSHOT_WARN_TARGET,
+        channel,
+        scope,
+        elapsed_ms = as_ms(elapsed),
+        threshold_ms = as_ms(threshold),
+        in_flight,
+        "subscribe fast-path snapshot exceeded duration budget"
+    );
+    true
+}
+
+/// Times one subscribe fast-path request from receipt to its seq-0 snapshot
+/// frame being queued on the outbound lane, warning above the threshold
+/// (intent-hq/intent#3707). Started by the connection task when the request
+/// is handled and carried into the spawned forwarder, so the measured
+/// interval covers bus wiring, response enqueue, task spawn scheduling, AND
+/// snapshot materialization. `scope` is the workspace id (or the agent id
+/// for the chat channel; `"global"` for the global workspace channel).
+///
+/// Hot-path cost is one `Instant::now()` plus two relaxed atomic ops on the
+/// process-wide in-flight counter; dropping without [`Self::snapshot_emitted`]
+/// (send failure / connection gone) just releases the counter.
+pub(crate) struct SnapshotTimer {
+    channel: &'static str,
+    scope: String,
+    started: Instant,
+    finished: bool,
+}
+
+impl SnapshotTimer {
+    pub(crate) fn start(channel: Channel, scope: &str) -> Self {
+        SNAPSHOT_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            channel: channel_name(channel),
+            scope: scope.to_string(),
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    /// Record that the seq-0 snapshot frame was queued for this subscription,
+    /// warning when the interval since [`Self::start`] exceeded the
+    /// threshold. `in_flight` in the log includes this request itself.
+    pub(crate) fn snapshot_emitted(mut self) {
+        self.finished = true;
+        let in_flight = SNAPSHOT_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        maybe_warn_slow_snapshot(
+            self.channel,
+            &self.scope,
+            self.started.elapsed(),
+            snapshot_warn_threshold(),
+            in_flight,
+        );
+    }
+}
+
+impl Drop for SnapshotTimer {
+    fn drop(&mut self) {
+        if !self.finished {
+            SNAPSHOT_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The bus event types a channel tails for deltas (TB-0 §3). The `agent:stream:*`

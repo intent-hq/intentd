@@ -831,6 +831,10 @@ async fn handle_sub_fast_path(
                 if let Some(group) = replace_group.as_deref() {
                     subs.remove_group(group);
                 }
+                // Time the request-to-snapshot interval (intent-hq/intent#3707):
+                // the fast-path never enters the `rpc_dispatch` span, so this
+                // timer is its duration guardrail.
+                let timer = subscriptions::SnapshotTimer::start(Channel::Note, &workspace_id);
                 // Subscribe before the snapshot so a mutation racing the read is
                 // captured and re-emitted as a delta (idempotent over-delivery,
                 // §1.3). Each matched event is delivered individually (no
@@ -865,6 +869,7 @@ async fn handle_sub_fast_path(
                     subscription,
                     subscription_id.clone(),
                     out_tx.clone(),
+                    timer,
                 ));
                 subs.insert(subscription_id, handle, replace_group);
                 true
@@ -894,6 +899,8 @@ async fn handle_sub_fast_path(
                 if let Some(group) = replace_group.as_deref() {
                     subs.remove_group(group);
                 }
+                // Time the request-to-snapshot interval (intent-hq/intent#3707).
+                let timer = subscriptions::SnapshotTimer::start(Channel::Chat, &agent_id);
                 // The chat channel is per-agent, not workspace-scoped, so the
                 // bus filter carries no `workspaceId`; the forwarder narrows the
                 // stream family to this agent (cross-agent isolation).
@@ -922,6 +929,7 @@ async fn handle_sub_fast_path(
                     subscription,
                     subscription_id.clone(),
                     out_tx.clone(),
+                    timer,
                 ));
                 subs.insert(subscription_id, handle, replace_group);
                 true
@@ -946,6 +954,11 @@ async fn handle_sub_fast_path(
                     if let Some(group) = replace_group.as_deref() {
                         subs.remove_group(group);
                     }
+                    // Time the request-to-snapshot interval (intent-hq/intent#3707).
+                    let timer = subscriptions::SnapshotTimer::start(
+                        channel,
+                        workspace_id.as_deref().unwrap_or("global"),
+                    );
                     let filter_ws = if subscriptions::channel_is_global(channel) {
                         None
                     } else {
@@ -976,6 +989,7 @@ async fn handle_sub_fast_path(
                         subscription,
                         subscription_id.clone(),
                         out_tx.clone(),
+                        timer,
                     ));
                     subs.insert(subscription_id, handle, replace_group);
                     true
@@ -1013,6 +1027,7 @@ async fn forward_note_subscription(
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: OutboundSender,
+    timer: subscriptions::SnapshotTimer,
 ) {
     let snapshot = match api.list_notes(&workspace_id).await {
         Ok(notes) => match projection {
@@ -1030,6 +1045,7 @@ async fn forward_note_subscription(
     if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
+    timer.snapshot_emitted();
     let mut seq: u64 = 1;
     while let Some(batch) = subscription.recv().await {
         for event in batch {
@@ -1105,6 +1121,7 @@ async fn forward_chat_subscription(
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: OutboundSender,
+    timer: subscriptions::SnapshotTimer,
 ) {
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
@@ -1121,6 +1138,7 @@ async fn forward_chat_subscription(
     if out_tx.send(frame).await.is_err() {
         return;
     }
+    timer.snapshot_emitted();
     let mut state = subscriptions::ChatDeltaState::new(&agent_id, delta_encoding, projection);
     // Mid-turn resume (CS-0 D5): if the snapshot carried an in-flight message,
     // seed the delta state from it so the next chunk continues the streamed text
@@ -1387,6 +1405,7 @@ fn parse_channel_params(
 /// [`subscriptions::task_delta`] pair so spec-body edits refresh flipped
 /// `specLinked` flags (monorepo#2407). Owns `seq` for strict monotonicity;
 /// aborted by [`ConnSub`] on unsubscribe / disconnect.
+#[allow(clippy::too_many_arguments)]
 async fn forward_channel_subscription(
     api: Arc<dyn WorkspaceApi>,
     channel: Channel,
@@ -1395,6 +1414,7 @@ async fn forward_channel_subscription(
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: OutboundSender,
+    timer: subscriptions::SnapshotTimer,
 ) {
     // The task channel's delta mapper is stateful: it tracks the spec's
     // task-link set so a spec-body edit can re-emit the rows whose
@@ -1413,6 +1433,7 @@ async fn forward_channel_subscription(
     if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
+    timer.snapshot_emitted();
     let mut seq: u64 = 1;
     while let Some(batch) = subscription.recv().await {
         for event in batch {

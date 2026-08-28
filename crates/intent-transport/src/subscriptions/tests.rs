@@ -246,6 +246,102 @@ fn workspace_params_are_global() {
 }
 
 #[test]
+fn channel_name_covers_every_channel() {
+    assert_eq!(channel_name(Channel::Note), "note");
+    assert_eq!(channel_name(Channel::Task), "task");
+    assert_eq!(channel_name(Channel::Agent), "agent");
+    assert_eq!(channel_name(Channel::Workspace), "workspace");
+    assert_eq!(channel_name(Channel::Comment), "comment");
+    assert_eq!(channel_name(Channel::Chat), "chat");
+}
+
+#[test]
+fn slow_snapshot_warn_fires_only_above_threshold() {
+    let threshold = Duration::from_millis(200);
+    assert!(
+        maybe_warn_slow_snapshot("chat", "agent-1", Duration::from_millis(201), threshold, 1),
+        "above the threshold must WARN"
+    );
+    assert!(
+        !maybe_warn_slow_snapshot("chat", "agent-1", Duration::from_millis(200), threshold, 1),
+        "at the threshold must not WARN"
+    );
+    assert!(
+        !maybe_warn_slow_snapshot("note", "ws-1", Duration::from_millis(3), threshold, 1),
+        "below the threshold must not WARN"
+    );
+}
+
+#[test]
+fn slow_snapshot_warn_carries_channel_scope_and_counts() {
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        maybe_warn_slow_snapshot(
+            "chat",
+            "agent-1",
+            Duration::from_millis(950),
+            Duration::from_millis(200),
+            3,
+        );
+    });
+    assert_eq!(lines.len(), 1, "exactly one WARN event: {lines:?}");
+    let (level, rendered) = &lines[0];
+    assert_eq!(*level, tracing::Level::WARN);
+    for needle in [
+        "channel=\"chat\"",
+        "scope=\"agent-1\"",
+        "elapsed_ms=950",
+        "threshold_ms=200",
+        "in_flight=3",
+        "exceeded duration budget",
+    ] {
+        assert!(
+            rendered.contains(needle),
+            "missing `{needle}` in {rendered}"
+        );
+    }
+}
+
+#[test]
+fn snapshot_warn_threshold_parses_override_and_falls_back() {
+    assert_eq!(
+        snapshot_warn_threshold_from(Some("50".to_string())),
+        Duration::from_millis(50)
+    );
+    assert_eq!(
+        snapshot_warn_threshold_from(Some(" 75 ".to_string())),
+        Duration::from_millis(75)
+    );
+    assert_eq!(
+        snapshot_warn_threshold_from(Some("nonsense".to_string())),
+        Duration::from_millis(DEFAULT_SNAPSHOT_DURATION_WARN_MS)
+    );
+    assert_eq!(
+        snapshot_warn_threshold_from(None),
+        Duration::from_millis(DEFAULT_SNAPSHOT_DURATION_WARN_MS)
+    );
+}
+
+#[test]
+fn snapshot_timer_tracks_in_flight_count() {
+    let base = SNAPSHOT_IN_FLIGHT.load(Ordering::Relaxed);
+    let t1 = SnapshotTimer::start(Channel::Chat, "agent-1");
+    let t2 = SnapshotTimer::start(Channel::Note, "ws-1");
+    assert_eq!(SNAPSHOT_IN_FLIGHT.load(Ordering::Relaxed), base + 2);
+    t1.snapshot_emitted();
+    assert_eq!(
+        SNAPSHOT_IN_FLIGHT.load(Ordering::Relaxed),
+        base + 1,
+        "a completed snapshot releases its slot"
+    );
+    drop(t2);
+    assert_eq!(
+        SNAPSHOT_IN_FLIGHT.load(Ordering::Relaxed),
+        base,
+        "an abandoned timer (send failure) still releases its slot"
+    );
+}
+
+#[test]
 fn channel_event_types_exclude_chat_stream() {
     let agent = channel_event_types(Channel::Agent);
     assert!(agent.iter().any(|t| t == "agent:deleted"));
