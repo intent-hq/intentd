@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.11] - 2026-08-28
+
+### 🚀 Features
+
+- *(transport)* Time subscribe fast-path snapshot emission, WARN above threshold ([#1545](https://github.com/intent-hq/intentd/pull/1545))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Use monotonic clock for WSS heartbeat pong bookkeeping ([#1547](https://github.com/intent-hq/intentd/pull/1547))
+
+
 ## [0.8.10] - 2026-08-27
 
 ### 🐛 Bug Fixes
