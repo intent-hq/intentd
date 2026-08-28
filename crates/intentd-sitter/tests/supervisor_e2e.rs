@@ -1576,6 +1576,217 @@ fn sighup_during_crash_backoff_respawns_the_state_json_version() {
     assert_eq!(status.code(), Some(0));
 }
 
+/// SIGUSR1 ("update now"): the on-demand check installs a newer published
+/// version and restarts the daemon on it — an update-triggered respawn, so
+/// it must carry the update-restart marker — without exiting the sitter.
+#[test]
+fn sigusr1_installs_newer_version_and_restarts_with_update_env() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_env_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    // Hour-long check interval: only the SIGUSR1 may check and restart.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(UPDATE_RESTART_ENV)
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Publish 0.2.0, then `kill -USR1`: the sitter must check immediately,
+    // install it, and restart the daemon on it.
+    let archive = make_tar_xz(long_running_env_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    send_signal(&sitter, "USR1");
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the update restart"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset".to_string(),
+            "start 0.2.0 update_restart=1".to_string(),
+        ],
+        "the SIGUSR1 update respawn must carry the env var"
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("SIGUSR1 received; checking for updates now"),
+        "stderr: {stderr}"
+    );
+}
+
+/// SIGUSR1 when the channel has nothing newer: the check runs (one extra
+/// manifest fetch) but the daemon is left untouched — no restart, no exit.
+#[test]
+fn sigusr1_when_already_current_leaves_daemon_running() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(routes);
+
+    // Hour-long check interval: only the SIGUSR1 may trigger a check.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+    let startup_requests = requests.lock().unwrap().len();
+
+    let stderr = stderr_path(dir.path());
+    send_signal(&sitter, "USR1");
+    wait_until(
+        "the SIGUSR1 check against the 0.1.0 manifest",
+        Duration::from_secs(15),
+        || {
+            requests.lock().unwrap().len() > startup_requests
+                && read_or_empty(&stderr).contains("intentd 0.1.0 is already current")
+        },
+    );
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "an already-current check must not exit the sitter"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let starts = read_or_empty(&log_path)
+        .lines()
+        .filter(|line| line.starts_with("start "))
+        .count();
+    assert_eq!(starts, 1, "an already-current SIGUSR1 must not restart");
+}
+
+/// A SIGUSR1 that lands during a crash-backoff sleep cuts the wait short:
+/// the check runs immediately, installs the published fix, and respawns it
+/// well before the backoff would have elapsed.
+#[test]
+fn sigusr1_during_crash_backoff_checks_and_respawns_the_fix() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // 0.1.0 crash-loops; a 30s backoff (never elapsing within the test)
+    // guarantees the SIGUSR1 below lands during the backoff sleep.
+    preinstall(&paths, "0.1.0", &crash_script(7));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(BACKOFF_INITIAL_ENV, "30000")
+        .env(BACKOFF_CAP_ENV, "30000")
+        .env(GIVE_UP_AFTER_ENV, "10000")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    let stderr = stderr_path(dir.path());
+    wait_until(
+        "the crashed daemon to enter backoff",
+        Duration::from_secs(15),
+        || {
+            read_or_empty(&log_path).contains("run")
+                && read_or_empty(&stderr).contains("respawning intentd in")
+        },
+    );
+
+    // Publish the fixed 0.2.0, then `kill -USR1` while the sitter is still
+    // deep in its 30s backoff sleep.
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    send_signal(&sitter, "USR1");
+    // Well under the 30s backoff: the SIGUSR1 must cut the sleep short,
+    // check, install 0.2.0, and respawn it.
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the update restart"
+    );
+    let runs = read_or_empty(&log_path)
+        .lines()
+        .filter(|line| *line == "run")
+        .count();
+    assert_eq!(runs, 1, "crashing 0.1.0 must not have been respawned");
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+}
+
 #[test]
 fn one_shot_subcommand_nonzero_exit_passes_through_without_respawn() {
     let dir = tempfile::tempdir().unwrap();

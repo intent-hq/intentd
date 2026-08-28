@@ -64,6 +64,15 @@
 //!    version from `state.json`, and resets the backoff. Serve mode
 //!    advertises itself for this via `<data_dir>/sitter/sitter.pid`,
 //!    written before the supervision loop and removed on exit
+//! 9. SIGUSR1 (unix only) runs the update check immediately — the same
+//!    path as the periodic check, rescheduling it — and, when a newer
+//!    version installs (or a concurrently installed one is found), stops
+//!    the child gracefully and respawns it on the new version (an
+//!    update-triggered respawn, so [`UPDATE_RESTART_ENV`] is set) with
+//!    the backoff and failure counter reset. Already current (or a
+//!    failed check, which is logged and non-fatal) leaves the daemon
+//!    running. A SIGUSR1 during a crash-backoff sleep cuts the wait
+//!    short, checks, and respawns
 //!
 //! When the startup channel came from `config.toml` or the stable default
 //! (not the `--sitter-channel` flag or `INTENTD_CHANNEL` env), every update
@@ -534,6 +543,17 @@ impl Supervisor {
                             failures = 0;
                             continue;
                         }
+                        #[cfg(unix)]
+                        BackoffOutcome::CheckNowRequested => {
+                            if let Some(version) =
+                                self.check_now(&current_version, &mut next_check_at).await
+                            {
+                                current_version = version;
+                            }
+                            backoff = self.config.backoff_initial;
+                            failures = 0;
+                            continue;
+                        }
                         BackoffOutcome::Elapsed => continue,
                     }
                 }
@@ -617,6 +637,16 @@ impl Supervisor {
                                 backoff = self.config.backoff_initial;
                                 failures = 0;
                             }
+                            #[cfg(unix)]
+                            BackoffOutcome::CheckNowRequested => {
+                                if let Some(version) =
+                                    self.check_now(&current_version, &mut next_check_at).await
+                                {
+                                    current_version = version;
+                                }
+                                backoff = self.config.backoff_initial;
+                                failures = 0;
+                            }
                             BackoffOutcome::Elapsed => {}
                         }
                         break; // respawn (possibly a new version after SIGHUP)
@@ -664,6 +694,31 @@ impl Supervisor {
                                 backoff = self.config.backoff_initial;
                                 failures = 0;
                                 break; // respawn (possibly a new version)
+                            }
+                            // `kill -USR1` (update now): run the update
+                            // check immediately — the same path as the
+                            // periodic check, rescheduling it — and
+                            // restart the daemon only when a different
+                            // version installed; already current or a
+                            // failed check leaves it running. One-shots
+                            // have no updater.
+                            #[cfg(unix)]
+                            SignalEvent::CheckNow => {
+                                if !supervised {
+                                    eprintln!("intentd-sitter: ignoring SIGUSR1 (one-shot invocation)");
+                                    continue;
+                                }
+                                eprintln!("intentd-sitter: SIGUSR1 received; checking for updates now");
+                                match self.check_now(&current_version, &mut next_check_at).await {
+                                    Some(version) => {
+                                        self.graceful_stop(&mut child).await;
+                                        current_version = version;
+                                        backoff = self.config.backoff_initial;
+                                        failures = 0;
+                                        break; // respawn the new version
+                                    }
+                                    None => continue, // daemon untouched
+                                }
                             }
                             SignalEvent::Shutdown(signal) => signal,
                         };
@@ -755,17 +810,29 @@ impl Supervisor {
         signals: &mut Signals,
         next_check_at: &mut Instant,
     ) -> FailedStartCheck {
-        let outcome = tokio::select! {
-            outcome = self.check() => outcome,
-            event = signals.recv() => {
-                return match event {
-                    SignalEvent::Shutdown(signal) => FailedStartCheck::Shutdown(128 + signal),
+        let check = self.check();
+        tokio::pin!(check);
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut check => break outcome,
+                event = signals.recv() => match event {
+                    SignalEvent::Shutdown(signal) => {
+                        return FailedStartCheck::Shutdown(128 + signal);
+                    }
                     #[cfg(unix)]
                     SignalEvent::Restart => {
                         eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
-                        FailedStartCheck::RestartRequested
+                        return FailedStartCheck::RestartRequested;
                     }
-                };
+                    // A check is already in flight, which is exactly what
+                    // SIGUSR1 asks for: let it finish.
+                    #[cfg(unix)]
+                    SignalEvent::CheckNow => {
+                        eprintln!(
+                            "intentd-sitter: SIGUSR1 received; an update check is already running"
+                        );
+                    }
+                },
             }
         };
         *next_check_at = self.schedule_next_check();
@@ -795,6 +862,49 @@ impl Supervisor {
             Err(e) => {
                 eprintln!("intentd-sitter: update check failed: {e}");
                 FailedStartCheck::NothingNewer
+            }
+        }
+    }
+
+    /// The SIGUSR1 ("update now") check: one immediate on-demand check on
+    /// top of the periodic schedule (which it re-arms, persisting
+    /// `state.json` exactly like a periodic check). Returns the version to
+    /// respawn when the check installed a newer one — or found a version a
+    /// concurrent updater (e.g. `sitter channel --redownload`) installed —
+    /// and `None` when the channel is already current or the check failed,
+    /// both of which are non-fatal: the caller leaves the daemon alone.
+    #[cfg(unix)]
+    async fn check_now(
+        &self,
+        current_version: &str,
+        next_check_at: &mut Instant,
+    ) -> Option<String> {
+        let outcome = self.check().await;
+        *next_check_at = self.schedule_next_check();
+        match outcome {
+            Ok(UpdateOutcome::Installed { version, previous }) => {
+                eprintln!(
+                    "intentd-sitter: installed intentd {version} (was {}); restarting daemon",
+                    previous.as_deref().unwrap_or("none")
+                );
+                Some(version)
+            }
+            Ok(UpdateOutcome::AlreadyCurrent { version })
+                if version != current_version && self.paths.daemon_binary(&version).exists() =>
+            {
+                eprintln!(
+                    "intentd-sitter: found concurrently installed intentd {version} \
+                     (was {current_version}); restarting daemon"
+                );
+                Some(version)
+            }
+            Ok(UpdateOutcome::AlreadyCurrent { version }) => {
+                eprintln!("intentd-sitter: intentd {version} is already current");
+                None
+            }
+            Err(e) => {
+                eprintln!("intentd-sitter: update check failed: {e}");
+                None
             }
         }
     }
@@ -853,6 +963,11 @@ impl Supervisor {
                     eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
                     BackoffOutcome::RestartRequested
                 }
+                #[cfg(unix)]
+                SignalEvent::CheckNow => {
+                    eprintln!("intentd-sitter: SIGUSR1 received; checking for updates now");
+                    BackoffOutcome::CheckNowRequested
+                }
             },
         }
     }
@@ -910,6 +1025,12 @@ enum BackoffOutcome {
     /// before respawning.
     #[cfg(unix)]
     RestartRequested,
+    /// An update-now request (SIGUSR1) cut the wait short; the caller must
+    /// run the check ([`Supervisor::check_now`]) and respawn — the new
+    /// version when one installed, the current one otherwise — with the
+    /// backoff reset.
+    #[cfg(unix)]
+    CheckNowRequested,
     /// A shutdown signal arrived; exit with this code.
     Shutdown(i32),
 }
@@ -923,6 +1044,10 @@ enum SignalEvent {
     /// (SIGHUP, sent by `intentd restart`).
     #[cfg(unix)]
     Restart,
+    /// Run the update check immediately, restarting the child only when a
+    /// different version installs (SIGUSR1).
+    #[cfg(unix)]
+    CheckNow,
 }
 
 /// Signals the sitter reacts to. `recv()` resolves to the requested
@@ -932,6 +1057,7 @@ struct Signals {
     term: tokio::signal::unix::Signal,
     int: tokio::signal::unix::Signal,
     hup: tokio::signal::unix::Signal,
+    usr1: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
@@ -942,6 +1068,7 @@ impl Signals {
             term: signal(SignalKind::terminate())?,
             int: signal(SignalKind::interrupt())?,
             hup: signal(SignalKind::hangup())?,
+            usr1: signal(SignalKind::user_defined1())?,
         })
     }
 
@@ -950,6 +1077,7 @@ impl Signals {
             _ = self.term.recv() => SignalEvent::Shutdown(nix::sys::signal::Signal::SIGTERM as i32),
             _ = self.int.recv() => SignalEvent::Shutdown(nix::sys::signal::Signal::SIGINT as i32),
             _ = self.hup.recv() => SignalEvent::Restart,
+            _ = self.usr1.recv() => SignalEvent::CheckNow,
         }
     }
 }
