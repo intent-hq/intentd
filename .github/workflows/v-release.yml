@@ -51,11 +51,11 @@ jobs:
   plan:
     # LOCAL CUSTOMIZATION: fork PRs get no CI — external PRs are not accepted
     # (intent-hq/monorepo#417; close-fork-prs.yml auto-closes them). Skipping
-    # plan cascades over the needs chain to every other job, so a fork PR can
-    # never reach the self-hosted tinybox runner. Tag pushes and same-repo
-    # PRs are unaffected. Re-apply this after any `dist generate`.
+    # plan cascades over the needs chain to every other job, so a fork PR
+    # never runs any of this workflow's jobs. Tag pushes and same-repo PRs
+    # are unaffected. Re-apply this after any `dist generate`.
     if: ${{ !github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: "tinybox"
+    runs-on: "ubuntu-latest"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -185,7 +185,7 @@ jobs:
           EOF
           sudo chmod 0755 /usr/local/bin/apt-get
         shell: "bash"
-      - name: "Provision Rust toolchain and matrix targets (self-hosted runners)"
+      - name: "Provision Rust toolchain and matrix targets"
         run: |
           if ! command -v rustup >/dev/null 2>&1; then
             if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
@@ -256,7 +256,7 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
-    runs-on: "tinybox"
+    runs-on: "ubuntu-latest"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
@@ -307,7 +307,7 @@ jobs:
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: "tinybox"
+    runs-on: "ubuntu-latest"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
@@ -381,7 +381,7 @@ jobs:
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "tinybox"
+    runs-on: "ubuntu-latest"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
