@@ -33,7 +33,11 @@
 //! the watcher and serves `watch`/`unwatch` commands. Subscribing and
 //! unsubscribing are pure in-memory bookkeeping plus a channel send, so they
 //! never block a caller and a failed registration is logged and skipped without
-//! affecting the other roots or the other groups. Because one `notify` watcher
+//! affecting the other roots or the other groups. Watcher creation failure does
+//! not kill a group either: the registrar keeps serving commands (settling
+//! incoming registrations as failed so waiters never hang) and retries creation
+//! with capped exponential backoff, re-registering the group's roots once it
+//! succeeds. Because one `notify` watcher
 //! is a single object, a group's registrations are serialized on its own thread;
 //! isolation is therefore per group, which is the useful granularity — a wedged
 //! backend is a property of the volume the group's roots live on, and every
@@ -49,6 +53,15 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::root_watch::{canonical_root, find_existing_ancestor};
+
+/// Event callback a group's watcher invokes with each raw result; boxed so the
+/// watcher factory below can be swapped out.
+type EventCallback = Box<dyn FnMut(notify::Result<notify::Event>) + Send>;
+
+/// Builds one group's watcher. Production is [`notify::recommended_watcher`];
+/// tests inject failing factories to exercise the creation-retry path.
+type WatcherFactory =
+    dyn Fn(EventCallback) -> notify::Result<Box<dyn Watcher + Send>> + Send + Sync;
 
 /// One demux destination: raw events whose paths fall under `root` are cloned
 /// into `tx`.
@@ -131,9 +144,10 @@ struct HubState {
 /// Owns the shared streams and the demux table. Held by the
 /// [`super::registry::WatcherRegistry`] for the daemon's lifetime; dropping it
 /// drops every group, which ends the registrar threads and the streams.
-#[derive(Default)]
 pub(super) struct SharedWatchHub {
     state: Mutex<HubState>,
+    /// Builds each group's watcher; injectable so tests can fail creation.
+    factory: Arc<WatcherFactory>,
 }
 
 /// A live subscription. Dropping it removes the sink and, when the root has no
@@ -226,7 +240,18 @@ impl Drop for SubHandle {
 
 impl SharedWatchHub {
     pub(super) fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::with_factory(Arc::new(|callback: EventCallback| {
+            notify::recommended_watcher(callback).map(|w| Box::new(w) as Box<dyn Watcher + Send>)
+        }))
+    }
+
+    /// Hub with an injected watcher factory, so tests can fail creation
+    /// deterministically. Production goes through [`Self::new`].
+    fn with_factory(factory: Arc<WatcherFactory>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::default(),
+            factory,
+        })
     }
 
     /// Subscribe to raw events under `root`, joining (or starting) the shared
@@ -268,7 +293,11 @@ impl SharedWatchHub {
         let group = state.groups.entry(group_key.clone()).or_insert_with(|| {
             let sinks: Arc<Mutex<Vec<Sink>>> = Arc::new(Mutex::new(Vec::new()));
             Group {
-                cmd: spawn_registrar(Arc::clone(&sinks), group_key.clone()),
+                cmd: spawn_registrar(
+                    Arc::clone(&sinks),
+                    group_key.clone(),
+                    Arc::clone(&self.factory),
+                ),
                 roots: HashMap::new(),
                 sinks,
             }
@@ -381,43 +410,47 @@ impl SharedWatchHub {
     }
 }
 
+/// First delay before retrying a failed watcher creation; doubles per failure.
+const CREATE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Ceiling for the creation-retry backoff, so a persistent failure (fd
+/// exhaustion, intent-hq/intent#3708) keeps probing about once a minute.
+const CREATE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Start a group's registrar: a DETACHED OS thread that builds the shared
 /// watcher and then serves `watch`/`unwatch` commands. Detached rather than
 /// `spawn_blocking` for the intent-hq/monorepo#1572 reason — the runtime waits
 /// for the blocking pool on shutdown, so a registration parked inside a wedged
 /// backend would turn a startup stall into a shutdown hang. Failures are logged
-/// and skipped; one bad root never stops the others.
-fn spawn_registrar(sinks: Arc<Mutex<Vec<Sink>>>, group: PathBuf) -> std::sync::mpsc::Sender<Cmd> {
+/// and skipped; one bad root never stops the others. Watcher creation failure
+/// does not end the thread either — see [`build_watcher_serving`].
+fn spawn_registrar(
+    sinks: Arc<Mutex<Vec<Sink>>>,
+    group: PathBuf,
+    factory: Arc<WatcherFactory>,
+) -> std::sync::mpsc::Sender<Cmd> {
     let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
     std::thread::spawn(move || {
-        let mut watcher = match notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| match res {
-                Ok(event) => demux(&sinks, &event),
-                Err(e) => {
-                    tracing::warn!(error = %e, "shared watcher callback error; events may be missed");
-                }
-            },
-        ) {
-            Ok(watcher) => watcher,
-            Err(e) => {
-                tracing::warn!(group = %group.display(), error = %e, "shared watcher creation failed; roots in this group are unwatched");
-                return;
-            }
+        let make = move || {
+            let sinks = Arc::clone(&sinks);
+            factory(Box::new(
+                move |res: notify::Result<notify::Event>| match res {
+                    Ok(event) => demux(&sinks, &event),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "shared watcher callback error; events may be missed");
+                    }
+                },
+            ))
+        };
+        let Some(mut watcher) = build_watcher_serving(&rx, make, &group) else {
+            // Every sender dropped: the group was retired before a watcher
+            // could be built.
+            return;
         };
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 Cmd::Watch(root, registration) => {
-                    // Settled either way, so waiters do not hang on a failure;
-                    // the failed state is distinct so a later subscriber to the
-                    // same root can retry it rather than inheriting a dead
-                    // channel.
-                    match watcher.watch(&root, RecursiveMode::Recursive) {
-                        Ok(()) => registration.settle(true),
-                        Err(e) => {
-                            tracing::warn!(root = %root.display(), error = %e, "shared watch registration failed");
-                            registration.settle(false);
-                        }
-                    }
+                    register(watcher.as_mut(), &root, &registration);
                 }
                 Cmd::Unwatch(root) => {
                     if let Err(e) = watcher.unwatch(&root) {
@@ -428,6 +461,83 @@ fn spawn_registrar(sinks: Arc<Mutex<Vec<Sink>>>, group: PathBuf) -> std::sync::m
         }
     });
     tx
+}
+
+/// Obtain the group's watcher, surviving creation failure. On failure the
+/// registrar does NOT return: it keeps serving the command channel — every
+/// incoming `Cmd::Watch` settles as failed immediately, so waiters never hang,
+/// and `Cmd::Unwatch` drops the root — while creation is retried with
+/// exponential backoff capped at [`CREATE_RETRY_CAP`]. Roots settled as failed
+/// while no watcher existed are re-registered once creation succeeds, because
+/// the hub only re-sends `Cmd::Watch` when a NEW subscriber joins a failed root
+/// ([`SharedWatchHub::subscribe`]'s retry) — without the re-registration a root
+/// whose subscribers all predate the recovery would stay dead forever. `None`
+/// when every sender dropped, i.e. the group was retired.
+fn build_watcher_serving(
+    rx: &std::sync::mpsc::Receiver<Cmd>,
+    make: impl Fn() -> notify::Result<Box<dyn Watcher + Send>>,
+    group: &Path,
+) -> Option<Box<dyn Watcher + Send>> {
+    let mut backoff = CREATE_RETRY_INITIAL;
+    let mut failures = 0u64;
+    let mut pending: Vec<(PathBuf, Arc<Registration>)> = Vec::new();
+    loop {
+        match make() {
+            Ok(mut watcher) => {
+                if failures > 0 {
+                    tracing::info!(
+                        group = %group.display(),
+                        failed_attempts = failures,
+                        "shared watcher created after earlier failures; re-registering its roots"
+                    );
+                }
+                for (root, registration) in pending {
+                    register(watcher.as_mut(), &root, &registration);
+                }
+                return Some(watcher);
+            }
+            Err(e) => {
+                failures += 1;
+                tracing::warn!(
+                    group = %group.display(),
+                    error = %e,
+                    retry_in = ?backoff,
+                    "shared watcher creation failed; roots in this group are unwatched until a retry succeeds"
+                );
+            }
+        }
+        let deadline = std::time::Instant::now() + backoff;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(Cmd::Watch(root, registration)) => {
+                    registration.settle(false);
+                    pending.retain(|(r, _)| r != &root);
+                    pending.push((root, registration));
+                }
+                Ok(Cmd::Unwatch(root)) => pending.retain(|(r, _)| r != &root),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+        backoff = (backoff * 2).min(CREATE_RETRY_CAP);
+    }
+}
+
+/// One deferred `watcher.watch()`. Settled either way, so waiters do not hang
+/// on a failure; the failed state is distinct so a later subscriber to the
+/// same root can retry it rather than inheriting a dead channel.
+fn register(watcher: &mut dyn Watcher, root: &Path, registration: &Registration) {
+    match watcher.watch(root, RecursiveMode::Recursive) {
+        Ok(()) => registration.settle(true),
+        Err(e) => {
+            tracing::warn!(root = %root.display(), error = %e, "shared watch registration failed");
+            registration.settle(false);
+        }
+    }
 }
 
 /// Route one raw event to every sink whose root contains any of its paths,
@@ -911,5 +1021,70 @@ mod tests {
             !entry.registration.failed(),
             "joining a failed root must re-request the watch, not inherit the failure"
         );
+    }
+
+    /// Watcher-creation failure must not permanently kill the group
+    /// (intent-hq/intent#3708): registrations arriving while no watcher exists
+    /// settle as failed rather than hang, the registrar keeps serving its
+    /// command channel and retries creation with backoff, and once the factory
+    /// recovers the failed roots are re-registered and deliver events.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn watcher_creation_failure_settles_registrations_and_recovers() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parent = TempDir::new("create-fail");
+        let root = parent.path.join("ws");
+        std::fs::create_dir_all(&root).expect("mk ws");
+
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail_in_factory = Arc::clone(&fail);
+        let hub = SharedWatchHub::with_factory(Arc::new(move |callback: EventCallback| {
+            if fail_in_factory.load(Ordering::SeqCst) {
+                Err(notify::Error::generic("injected creation failure"))
+            } else {
+                notify::recommended_watcher(callback)
+                    .map(|w| Box::new(w) as Box<dyn Watcher + Send>)
+            }
+        }));
+
+        let (sub, mut rx, canonical) = hub.subscribe(&root);
+        // (a) The registration settles as failed instead of hanging forever.
+        sub.wait_established(LIVENESS).await;
+        assert!(
+            sub.registration.settled(),
+            "registration must settle while creation keeps failing"
+        );
+        assert!(
+            sub.registration.failed(),
+            "creation failure must settle the registration as failed"
+        );
+
+        // (b) Once the factory recovers, the registrar's backoff retry builds
+        // the watcher and re-registers the root — no new subscriber needed.
+        fail.store(false, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while !sub.registration.settled() || sub.registration.failed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watch must go live after the factory recovers"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // The re-registered watch actually delivers. Probe until delivery
+        // flows; budget sized against `LIVENESS` like the sibling test.
+        let attempts = LIVENESS.as_millis() / 500;
+        for attempt in 0..attempts {
+            std::fs::write(root.join(".probe"), format!("{attempt}")).expect("write probe");
+            if next_for(&mut rx, &canonical, ".probe", Duration::from_millis(500))
+                .await
+                .is_some()
+            {
+                return;
+            }
+        }
+        panic!("recovered watch never delivered events");
     }
 }
