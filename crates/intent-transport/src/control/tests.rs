@@ -49,6 +49,11 @@ impl FakeControl {
                 queued_spawns: Some(1),
                 workspaces_disk_available_bytes: Some(250_000_000_000),
                 workspaces_disk_total_bytes: Some(1_000_000_000_000),
+                file_watch: Some(FileWatchStatus {
+                    active_streams: 2,
+                    total_roots: 5,
+                    failed_roots: 0,
+                }),
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
@@ -200,6 +205,7 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         queued_spawns: None,
         workspaces_disk_available_bytes: None,
         workspaces_disk_total_bytes: None,
+        file_watch: None,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -227,6 +233,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     // No disk sample ⇒ the disk fields are ABSENT (presence-detected), not null.
     assert!(!obj.contains_key("workspacesDiskAvailableBytes"));
     assert!(!obj.contains_key("workspacesDiskTotalBytes"));
+    // Watcher registry not started yet ⇒ fileWatch is ABSENT, not null.
+    assert!(!obj.contains_key("fileWatch"));
 }
 
 /// The descendant-tree fields ride `system.status` so a debug
@@ -278,6 +286,29 @@ fn status_json_carries_the_workspaces_disk_fields_when_sampled() {
     let v = status_json(&FakeControl::new().status, true);
     assert_eq!(v["workspacesDiskAvailableBytes"], 250_000_000_000u64);
     assert_eq!(v["workspacesDiskTotalBytes"], 1_000_000_000_000u64);
+}
+
+/// The fileWatch object rides `system.status` once the watcher registry is
+/// live (intent-hq/intent#3708), so a client — and a debug bundle — can see
+/// whether the daemon's watch coverage is degraded (`failedRoots > 0` means
+/// file events under those roots are silently missed) rather than digging
+/// WARN lines out of the daemon log.
+#[test]
+fn status_json_carries_the_file_watch_coverage_when_available() {
+    let v = status_json(&FakeControl::new().status, true);
+    assert_eq!(v["fileWatch"]["activeStreams"], 2);
+    assert_eq!(v["fileWatch"]["totalRoots"], 5);
+    assert_eq!(v["fileWatch"]["failedRoots"], 0);
+
+    // Degraded coverage renders the failed count verbatim.
+    let mut status = FakeControl::new().status;
+    status.file_watch = Some(FileWatchStatus {
+        active_streams: 1,
+        total_roots: 5,
+        failed_roots: 3,
+    });
+    let v = status_json(&status, true);
+    assert_eq!(v["fileWatch"]["failedRoots"], 3);
 }
 
 #[tokio::test]

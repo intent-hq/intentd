@@ -21,11 +21,11 @@ use intent_core::{
     TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
     WorkspaceId, WorkspaceStatus,
 };
-use intent_services::{EventBus, Services};
+use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
 use intent_transport::{
-    ensure_tls_certificate, serve_uds, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
-    MAX_INBOUND_MESSAGE_BYTES,
+    ensure_tls_certificate, serve_uds, AsyncTokenStore, FileWatchStatus, SystemControl,
+    SystemStatus, TokenStore, WsApiServer, WsOptions, MAX_INBOUND_MESSAGE_BYTES,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -12510,4 +12510,166 @@ async fn wss_unacceptable_extension_offer_declines_to_plain_connection() {
     );
     let _ = ws.close(None).await;
     srv.ws.stop().await;
+}
+
+/// Minimal [`SystemControl`] whose `fileWatch` comes from a real
+/// [`WatchHealth`] handle — the same mapping the composition root (main.rs)
+/// performs — so the WSS e2e below exercises the real
+/// registry → hub → snapshot → render path. Every other field is a fixed
+/// plausible value; only `fileWatch` is under test.
+struct WatchHealthControl {
+    health: WatchHealth,
+}
+
+impl SystemControl for WatchHealthControl {
+    fn status(&self) -> SystemStatus {
+        SystemStatus {
+            listen_mode: "both".to_string(),
+            uds: true,
+            tcp: true,
+            port: None,
+            clients: 1,
+            agents: 0,
+            fingerprint: None,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            has_display: false,
+            max_agents: 1,
+            version: "0.0.0-test".to_string(),
+            build_commit: None,
+            uptime_seconds: 0,
+            local_ips: Vec::new(),
+            hostname: "test".to_string(),
+            pretty_hostname: "test".to_string(),
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+            child_processes: None,
+            child_memory_bytes: None,
+            child_memory_peak_bytes: None,
+            agent_memory_budget_bytes: None,
+            agent_memory_charged_bytes: None,
+            queued_spawns: None,
+            workspaces_disk_available_bytes: None,
+            workspaces_disk_total_bytes: None,
+            file_watch: self.health.snapshot().map(|s| FileWatchStatus {
+                active_streams: s.active_streams,
+                total_roots: s.total_roots,
+                failed_roots: s.failed_roots,
+            }),
+        }
+    }
+    fn request_shutdown(&self) {}
+    fn request_update(&self) -> std::result::Result<(), String> {
+        Err("not supported in this test".to_string())
+    }
+    fn import_legacy(
+        &self,
+        _force: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
+    > {
+        Box::pin(async { Err("not supported in this test".to_string()) })
+    }
+    fn git_credential(
+        &self,
+        _client_pid: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
+    {
+        Box::pin(async { None })
+    }
+}
+
+/// Watch-coverage health over the real WSS transport (intent-hq/intent#3708):
+/// `fileWatch` is absent from `system.status` until the watcher registry
+/// attaches the [`WatchHealth`] handle, then present — including when healthy
+/// (`failedRoots: 0`) — through the same TLS + bearer-auth upgrade path
+/// production clients use. The degraded (watcher-creation-failure) shape is
+/// covered end-to-end over UDS in `uds_control.rs`; both transports share one
+/// render path (`status_json`), so this presence/shape proof carries over.
+#[tokio::test]
+async fn system_status_surfaces_file_watch_coverage_over_wss() {
+    let dir = test_tempdir("intentd-wss-fw-");
+    let store = Store::open(&dir.path().join("intentd.db"))
+        .await
+        .expect("open store");
+    let bus = EventBus::new(store.clone());
+    let workspaces_root = dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir workspaces root");
+    let registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("load settings registry"),
+    );
+    let services = Services::new(store.clone())
+        .with_assets_root(dir.path().join("assets"))
+        .with_workspaces_root(workspaces_root)
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    let status_cache = services.git_status_cache();
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+
+    // Health handle created BEFORE the registry, as in the composition root:
+    // registry init is backgrounded in production, so `fileWatch` must read as
+    // absent until attachment.
+    let health = WatchHealth::default();
+    let control: Arc<dyn SystemControl> = Arc::new(WatchHealthControl {
+        health: health.clone(),
+    });
+
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let opts = WsOptions {
+        base_port: 0,
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
+        ..WsOptions::default()
+    };
+    let ws = WsApiServer::new(
+        api.clone(),
+        bus.clone(),
+        &tls,
+        &token_store,
+        opts,
+        Some(control),
+    )
+    .expect("server");
+    let cfg = client_config(&tls.fingerprint256);
+    let port = ws.start().await.expect("start");
+
+    // Before the registry starts: the whole `fileWatch` object is absent, not
+    // null — presence-detected on the wire.
+    let frame = r#"{"jsonrpc":"2.0","id":1,"method":"system.status"}"#;
+    let resp = wss_call(port, cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 1, "id echoed: {resp}");
+    assert!(
+        resp["result"].is_object(),
+        "system.status over WSS returns a result: {resp}"
+    );
+    assert!(
+        resp["result"].get("fileWatch").is_none(),
+        "fileWatch must be absent before the registry attaches: {resp}"
+    );
+
+    // Start the real watcher registry (attaches `health` to the hub). No
+    // workspaces exist, so the healthy snapshot is present with zero counts —
+    // present-when-healthy is the contract, letting clients distinguish
+    // "healthy" from "not yet measurable".
+    let refresher = Arc::new(GitStatusRefresher::start(
+        bus.clone(),
+        api.clone(),
+        status_cache,
+    ));
+    let _watcher_registry =
+        WatcherRegistry::start_with_health(bus.clone(), api.clone(), refresher, &health).await;
+
+    let resp = wss_call(port, cfg, frame).await;
+    let fw = &resp["result"]["fileWatch"];
+    assert!(
+        fw.is_object(),
+        "fileWatch must appear once the registry attaches: {resp}"
+    );
+    assert_eq!(fw["failedRoots"], 0, "healthy daemon: {resp}");
+    assert!(fw["activeStreams"].is_u64(), "activeStreams: {resp}");
+    assert!(fw["totalRoots"].is_u64(), "totalRoots: {resp}");
+    ws.stop().await;
 }
