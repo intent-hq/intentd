@@ -877,11 +877,11 @@ fn header_str(value: &[u8]) -> Option<String> {
 
 /// Milliseconds elapsed on the **monotonic** clock since this process first
 /// called it. Used for heartbeat pong bookkeeping instead of wall-clock time:
-/// `Instant` never jumps on wall-clock skew and (on the platforms we ship,
-/// via `CLOCK_MONOTONIC` / `mach_continuous_time` semantics) does not race
-/// ahead while the host is suspended, so a sleep/resume cannot make every
-/// client look 60s+ stale and get reaped on the first post-resume tick
-/// (intent-hq/intent#3712).
+/// `Instant` never jumps on wall-clock skew and (on the platforms we ship —
+/// `CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` / `mach_absolute_time` on
+/// Darwin) does not advance while the host is suspended, so a sleep/resume
+/// cannot make every client look 60s+ stale and get reaped on the first
+/// post-resume tick (intent-hq/intent#3712).
 pub(crate) fn mono_ms() -> i64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = *EPOCH.get_or_init(Instant::now);
