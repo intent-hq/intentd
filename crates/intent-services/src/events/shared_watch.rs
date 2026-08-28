@@ -52,10 +52,17 @@
 //! incoming registrations as failed so waiters never hang) and retries creation
 //! with capped exponential backoff, re-registering the group's roots once it
 //! succeeds. Because one `notify` watcher
-//! is a single object, a group's registrations are serialized on its own thread;
-//! isolation is therefore per group, which is the useful granularity — a wedged
-//! backend is a property of the volume the group's roots live on, and every
-//! other group (and the runtime) keeps making progress.
+//! is a single object, a group's registrations are serialized on its own
+//! thread, so isolation is per group. On macOS that granularity is per parent
+//! directory — a wedged backend is a property of the volume a group's roots
+//! live on, and every other group (and the runtime) keeps making progress. On
+//! Linux the single global group makes registration serialization global: one
+//! slow or wedged registration (a huge tree on a slow or hung volume) delays
+//! every other root's registration daemon-wide. That trade-off is deliberate:
+//! registrations are rare workspace lifecycle events that already run off
+//! every caller's thread, and steady-state event delivery is unaffected —
+//! only initial coverage of a newly-registered root can lag behind a slow
+//! neighbour.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -147,6 +154,10 @@ struct Group {
     cmd: std::sync::mpsc::Sender<Cmd>,
     roots: HashMap<PathBuf, Root>,
     sinks: Arc<Mutex<Vec<Sink>>>,
+    /// Set by the registrar once its OS watcher is actually created. The group
+    /// exists — and retries creation — before that, so [`WatchHealth`] must
+    /// not count it as an active stream until then.
+    watcher_live: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
@@ -172,7 +183,10 @@ pub(super) struct SharedWatchHub {
 /// degradation into something a client can see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchHealthSnapshot {
-    /// Live shared streams (groups) — one OS watcher each.
+    /// Shared streams (groups) whose OS watcher is actually created — one
+    /// `notify` watcher each. A group stuck in the creation-retry loop is NOT
+    /// counted, so this reads 0 while `total_roots > 0` in the
+    /// watcher-creation-failure degradation this snapshot exists to surface.
     pub active_streams: usize,
     /// Roots currently requested across every group, whatever their state.
     pub total_roots: usize,
@@ -220,9 +234,13 @@ impl WatchHealth {
             Ok(state) => state,
             Err(e) => e.into_inner(),
         };
+        let mut active_streams = 0;
         let mut total_roots = 0;
         let mut failed_roots = 0;
         for group in state.groups.values() {
+            if group.watcher_live.load(Ordering::Acquire) {
+                active_streams += 1;
+            }
             for root in group.roots.values() {
                 total_roots += 1;
                 if root.registration.failed() {
@@ -231,7 +249,7 @@ impl WatchHealth {
             }
         }
         Some(WatchHealthSnapshot {
-            active_streams: state.groups.len(),
+            active_streams,
             total_roots,
             failed_roots,
         })
@@ -317,6 +335,22 @@ impl Drop for SubHandle {
         if drop_root {
             group.roots.remove(&self.root);
             let _ = group.cmd.send(Cmd::Unwatch(self.root.clone()));
+            // `notify`'s recursive inotify unwatch removes the target AND every
+            // descendant descriptor without per-root ref-counting, so retiring
+            // this root silently strips coverage from any still-subscribed
+            // root nested under it (a Linux global-group concern; on macOS
+            // nested roots under distinct parents live in distinct groups).
+            // Re-register the survivors: reset each one's registration and
+            // re-send `Cmd::Watch`, which the registrar serves after the
+            // `Unwatch` above (the channel is ordered).
+            for (nested, root) in &group.roots {
+                if nested.starts_with(&self.root) {
+                    root.registration.reset();
+                    let _ = group
+                        .cmd
+                        .send(Cmd::Watch(nested.clone(), Arc::clone(&root.registration)));
+                }
+            }
         }
         if group.roots.is_empty() {
             // Dropping the group drops the command sender, so the registrar
@@ -411,14 +445,17 @@ impl SharedWatchHub {
         state.next_id += 1;
         let group = state.groups.entry(group_key.clone()).or_insert_with(|| {
             let sinks: Arc<Mutex<Vec<Sink>>> = Arc::new(Mutex::new(Vec::new()));
+            let watcher_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
             Group {
                 cmd: spawn_registrar(
                     Arc::clone(&sinks),
                     group_key.clone(),
                     Arc::clone(&self.factory),
+                    Arc::clone(&watcher_live),
                 ),
                 roots: HashMap::new(),
                 sinks,
+                watcher_live,
             }
         });
         if let Ok(mut sinks) = group.sinks.lock() {
@@ -547,6 +584,7 @@ fn spawn_registrar(
     sinks: Arc<Mutex<Vec<Sink>>>,
     group: PathBuf,
     factory: Arc<WatcherFactory>,
+    watcher_live: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::sync::mpsc::Sender<Cmd> {
     let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
     std::thread::spawn(move || {
@@ -566,6 +604,10 @@ fn spawn_registrar(
             // could be built.
             return;
         };
+        // Flag the stream live only now: the group exists (and this thread
+        // retries creation) before any OS watcher does, and `WatchHealth`
+        // must not count a stream that is not there yet.
+        watcher_live.store(true, Ordering::Release);
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 Cmd::Watch(root, registration) => {
@@ -1045,7 +1087,42 @@ mod tests {
         assert_eq!(hub.stream_count(), 0, "the empty global group must retire");
     }
 
-    /// macOS keeps parent-directory grouping: the FSEvents stream rebuild on
+    /// Retiring a root must not strip coverage from a still-subscribed root
+    /// nested under it. `notify`'s recursive inotify `unwatch` removes the
+    /// target and every descendant descriptor without per-root ref-counting,
+    /// so on Linux (one global group) the co-tenant nested root would go
+    /// silently dead without the re-registration in `SubHandle::drop`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dropping_an_outer_root_keeps_a_nested_root_covered() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("nested-unwatch");
+        let outer = base.path.join("outer");
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(&nested).expect("mk nested");
+
+        let hub = SharedWatchHub::new();
+        let (sub_nested, mut rx_nested, root_nested) = hub.subscribe(&nested);
+        let (sub_outer, _rx_outer, _) = hub.subscribe(&outer);
+        hub.wait_all_established(2, LIVENESS).await;
+
+        // Retiring the outer root recursively unwatches the nested root too
+        // when both ride one watcher; the drop path must re-register it.
+        drop(sub_outer);
+        sub_nested.wait_established(LIVENESS).await;
+
+        std::fs::write(root_nested.join("still-covered.txt"), b"x").expect("write");
+        assert!(
+            next_for(&mut rx_nested, &root_nested, "still-covered.txt", LIVENESS)
+                .await
+                .is_some(),
+            "the nested root must keep delivering after its outer co-tenant retires"
+        );
+    }
+
+    /// macOS keeps parent-directory grouping: the `FSEvents` stream rebuild on
     /// every `watch`/`unwatch` is per group, so distinct-parent roots must NOT
     /// collapse into one global group there.
     #[cfg(target_os = "macos")]
@@ -1389,17 +1466,21 @@ mod tests {
             snap.failed_roots, 1,
             "creation failure must surface as a failed root"
         );
+        assert_eq!(
+            snap.active_streams, 0,
+            "a group whose watcher never got created is not an active stream"
+        );
 
         fail.store(false, Ordering::SeqCst);
         let deadline = tokio::time::Instant::now() + LIVENESS;
         loop {
             let snap = health.snapshot().expect("snapshot during recovery");
-            if snap.failed_roots == 0 && snap.total_roots == 1 {
+            if snap.failed_roots == 0 && snap.total_roots == 1 && snap.active_streams == 1 {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "failed-root count must drain once the factory recovers, still {snap:?}"
+                "failed roots must drain and the stream go active once the factory recovers, still {snap:?}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

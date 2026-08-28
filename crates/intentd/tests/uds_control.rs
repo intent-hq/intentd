@@ -283,5 +283,9 @@ async fn system_status_surfaces_file_watch_coverage_and_degradation() {
         fw["totalRoots"].as_u64().unwrap() >= fw["failedRoots"].as_u64().unwrap(),
         "failedRoots is a subset of totalRoots: {resp}"
     );
+    assert_eq!(
+        fw["activeStreams"], 0,
+        "no watcher can be created under the seam, so no stream is active: {resp}"
+    );
     drop(degraded);
 }

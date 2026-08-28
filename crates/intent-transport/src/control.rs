@@ -136,7 +136,9 @@ pub struct SystemStatus {
 /// instance exhaustion, `fseventsd` load).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileWatchStatus {
-    /// Live shared OS watch streams (one `notify` watcher each).
+    /// Shared OS watch streams whose watcher is actually created (one `notify`
+    /// watcher each). A stream stuck retrying watcher creation is not counted,
+    /// so this reads 0 while `total_roots > 0` under creation failure.
     pub active_streams: usize,
     /// Watch roots currently requested, whatever their registration state.
     pub total_roots: usize,
