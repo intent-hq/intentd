@@ -8,22 +8,36 @@
 //! project-tier skills/specialists watches are counted — which is what loads
 //! `fseventsd`.
 //!
-//! [`SharedWatchHub`] collapses that fan-out. Workspace roots are grouped by
-//! their parent directory, each group owns ONE `notify` watcher, and every root
-//! in the group is added to it with a further `watch()` call (`notify` appends
-//! to the same stream rather than creating another). Consumers no longer create
-//! watchers at all: they [`SharedWatchHub::subscribe`] to a root and receive the
-//! raw `notify` events whose paths fall under it, demuxed in-process by path
-//! prefix. Filtering, debouncing and publishing stay exactly where they were, so
-//! the `file:*` wire shape is untouched.
+//! [`SharedWatchHub`] collapses that fan-out. Roots are assigned to groups (see
+//! [`group_key`] for the per-OS keying), each group owns ONE `notify` watcher,
+//! and every root in the group is added to it with a further `watch()` call
+//! (`notify` appends to the same stream rather than creating another).
+//! Consumers no longer create watchers at all: they
+//! [`SharedWatchHub::subscribe`] to a root and receive the raw `notify` events
+//! whose paths fall under it, demuxed in-process by path prefix. Filtering,
+//! debouncing and publishing stay exactly where they were, so the `file:*` wire
+//! shape is untouched.
 //!
-//! The trade-off is that `notify`'s macOS backend rebuilds a group's stream on
-//! every `watch`/`unwatch` (`watch_inner` stops the run loop, appends the path
-//! and starts again), so registering or retiring one root briefly interrupts
-//! delivery for the group's other roots. That was already true per workspace,
-//! and the transitions that trigger it are rare workspace lifecycle events
-//! (create/open/close/delete, archive/unarchive) — none of them a steady-state
-//! path.
+//! How coarse the grouping is depends on the backend's cost model:
+//!
+//! - **macOS (`FSEvents`)**: roots are grouped by their parent directory. The
+//!   trade-off is that `notify`'s macOS backend rebuilds a group's stream on
+//!   every `watch`/`unwatch` (`watch_inner` stops the run loop, appends the
+//!   path and starts again), so registering or retiring one root briefly
+//!   interrupts delivery for the group's other roots. That was already true
+//!   per workspace, and the transitions that trigger it are rare workspace
+//!   lifecycle events (create/open/close/delete, archive/unarchive) — none of
+//!   them a steady-state path. Grouping any coarser would widen the blast
+//!   radius of each rebuild for no fd savings (`FSEvents` streams are not fds).
+//! - **Linux (inotify)**: ALL roots share a single global group. inotify has
+//!   no rebuild trade-off — `watch`/`unwatch` on one instance is independent
+//!   per root — while every `notify` watcher costs one inotify instance (one
+//!   fd, capped by `fs.inotify.max_user_instances`, default 128). Workspace
+//!   roots live under per-workspace parent directories, so parent-dir grouping
+//!   made the instance count scale with the workspace count and exhausted the
+//!   cap on multi-workspace hosts (intent-hq/intent#3708). One global group
+//!   keeps it at one instance total; co-tenant isolation is preserved by the
+//!   demux, which already narrows each event to the sink's own root.
 //!
 //! Registration never runs on the caller's thread — the reasoning of
 //! intent-hq/monorepo#1572 applies unchanged: a `notify` registration can park
@@ -238,6 +252,28 @@ impl Drop for SubHandle {
     }
 }
 
+/// Which shared watcher `root` rides — the grouping decision the module header
+/// documents.
+///
+/// On Linux every root maps to one global group ("/"): inotify `watch`/
+/// `unwatch` is independent per root, so coarser grouping has no rebuild cost,
+/// and each additional group would cost another inotify instance fd
+/// (intent-hq/intent#3708). On macOS (and any other OS) roots group by parent
+/// directory, bounding the blast radius of the `FSEvents` stream rebuild that
+/// every `watch`/`unwatch` triggers there.
+fn group_key(root: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = root;
+        PathBuf::from("/")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        root.parent()
+            .map_or_else(|| root.to_path_buf(), Path::to_path_buf)
+    }
+}
+
 impl SharedWatchHub {
     pub(super) fn new() -> Arc<Self> {
         Self::with_factory(Arc::new(|callback: EventCallback| {
@@ -279,9 +315,7 @@ impl SharedWatchHub {
                 root.to_path_buf()
             }
         };
-        let group_key = root
-            .parent()
-            .map_or_else(|| root.clone(), Path::to_path_buf);
+        let group_key = group_key(&root);
         let (tx, rx) = mpsc::unbounded_channel();
 
         let mut state = match self.state.lock() {
@@ -856,6 +890,68 @@ mod tests {
             hub.stream_count(),
             0,
             "stream must be retired once nothing consumes it"
+        );
+    }
+
+    /// The intent-hq/intent#3708 invariant: on Linux every root rides ONE
+    /// global group regardless of its parent directory, so the inotify
+    /// instance count does not scale with the workspace count. Retirement
+    /// still works at root granularity — the group survives until its last
+    /// root drops, then retires.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn distinct_parent_roots_share_one_global_group_on_linux() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("global-group");
+        let hub = SharedWatchHub::new();
+        let mut subs = Vec::new();
+        for i in 0..4 {
+            let root = base.path.join(format!("parent-{i}")).join("ws");
+            std::fs::create_dir_all(&root).expect("mk ws");
+            let (sub, rx, _) = hub.subscribe(&root);
+            subs.push((sub, rx));
+            assert_eq!(
+                hub.stream_count(),
+                1,
+                "distinct-parent roots must collapse into a single global group"
+            );
+        }
+        while subs.len() > 1 {
+            subs.pop();
+            assert_eq!(
+                hub.stream_count(),
+                1,
+                "the global group must survive while any root remains"
+            );
+        }
+        subs.pop();
+        assert_eq!(hub.stream_count(), 0, "the empty global group must retire");
+    }
+
+    /// macOS keeps parent-directory grouping: the FSEvents stream rebuild on
+    /// every `watch`/`unwatch` is per group, so distinct-parent roots must NOT
+    /// collapse into one global group there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn distinct_parent_roots_get_distinct_groups_on_macos() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("per-parent");
+        let a = base.path.join("parent-a").join("ws");
+        let b = base.path.join("parent-b").join("ws");
+        std::fs::create_dir_all(&a).expect("mk a");
+        std::fs::create_dir_all(&b).expect("mk b");
+
+        let hub = SharedWatchHub::new();
+        let (_sub_a, _rx_a, _) = hub.subscribe(&a);
+        let (_sub_b, _rx_b, _) = hub.subscribe(&b);
+        assert_eq!(
+            hub.stream_count(),
+            2,
+            "distinct parents must keep distinct FSEvents groups on macOS"
         );
     }
 

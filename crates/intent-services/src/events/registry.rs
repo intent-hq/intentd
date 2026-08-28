@@ -1118,8 +1118,9 @@ mod tests {
     /// stream count. Before this change each workspace registered its own file
     /// watcher, `.git` watcher (two roots) and four project-tier skills /
     /// specialists watches — roughly five or six OS streams each, so eight
-    /// workspaces meant ~40+. Now every root under a shared parent joins ONE
-    /// stream, so the count follows the number of distinct parent directories.
+    /// workspaces meant ~40+. Now roots join shared streams (per parent
+    /// directory on macOS, one global group on Linux — see
+    /// `shared_watch::group_key`), so sibling workspaces ride ONE stream.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn many_workspaces_share_a_single_stream_per_parent_directory() {
