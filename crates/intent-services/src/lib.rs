@@ -22852,6 +22852,15 @@ impl WorkspaceApi for Services {
                 // row or `agent.dismissQuestions` releases the hold).
                 if !origin.is_user() && self.question_hold_active(&agent_id).await {
                     self.require_agent_session(&agent_id).await?;
+                    // A2A sender header (monorepo#1015): this hold-park
+                    // bypasses `agent_send_message_op`'s prepend, so the
+                    // queued entry is annotated here — the drain persist
+                    // then inherits it.
+                    let mut content = content;
+                    crate::agent_ops::annotate_sender_attribution(
+                        &mut content,
+                        message_metadata.as_ref(),
+                    );
                     let (queued, position) = self.enqueue_message(
                         &agent_id,
                         content,

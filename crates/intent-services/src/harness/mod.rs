@@ -155,9 +155,7 @@ pub(crate) trait Harness: Send + Sync {
     fn dequeue_wait_note(&self, queued_at: &str, waited: &str) -> String;
     /// `[MESSAGE FROM AGENT {name} ({agent_id})]` sender-attribution header
     /// prepended to agent-origin (A2A) sends; an absent `name` renders
-    /// `[MESSAGE FROM AGENT ({agent_id})]`. Consumed by the goldens until
-    /// the delivery-path prepend lands.
-    #[allow(dead_code)]
+    /// `[MESSAGE FROM AGENT ({agent_id})]`.
     fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String;
     /// Human-readable wait for [`Harness::dequeue_wait_note`]: `Ns` under a
     /// minute, then `Nm Ss`, then `Nh Mm`; negative waits clamp to `0s`.

@@ -1192,9 +1192,11 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .iter()
         .map(|e| e["content"].as_str().unwrap())
         .collect();
+    // Agent-origin content carries the A2A sender header (monorepo#1015)
+    // prepended at the send front door; the caller's text follows it.
     assert!(
-        contents[0].starts_with("replacement:"),
-        "only the atomic replacement parked: {contents:?}"
+        contents[0].starts_with("[MESSAGE FROM AGENT") && contents[0].contains("replacement:"),
+        "only the atomic replacement parked (with sender header): {contents:?}"
     );
 
     manager.shutdown().await;

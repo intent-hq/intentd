@@ -82,9 +82,7 @@ pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message wa
 /// Stable prefix of [`Harness::a2a_sender_note`], used by the agent-origin
 /// send paths as an idempotency guard (an entry whose content already
 /// carries a sender header is never re-annotated — same contract as the
-/// dequeue-wait note). Consumed by the goldens until the delivery-path
-/// prepend lands.
-#[allow(dead_code)]
+/// dequeue-wait note).
 pub(crate) const A2A_SENDER_NOTE_PREFIX: &str = "[MESSAGE FROM AGENT";
 
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict

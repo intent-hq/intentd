@@ -32283,3 +32283,87 @@ mod resume_continuation {
         assert_eq!(text, RESUME_CONTINUATION_FALLBACK_TEXT);
     }
 }
+
+/// A2A sender-attribution header (monorepo#1015):
+/// [`crate::agent_ops::annotate_sender_attribution`] prepends the harness
+/// `a2a_sender_note` + blank line to agent-origin content (metadata carries a
+/// daemon-stamped `fromAgentId`), is a strict no-op for user/FE sends, and is
+/// idempotent — content already carrying the prefix is never re-annotated.
+mod sender_attribution {
+    use crate::agent_ops::annotate_sender_attribution;
+    use crate::harness::v1::A2A_SENDER_NOTE_PREFIX;
+    use serde_json::json;
+
+    #[test]
+    fn prepends_header_with_name_and_id() {
+        let mut content = "please review".to_string();
+        let md = json!({ "fromAgentId": "agent-abc", "fromAgentName": "Coordinator" });
+        annotate_sender_attribution(&mut content, Some(&md));
+        assert_eq!(
+            content,
+            "[MESSAGE FROM AGENT Coordinator (agent-abc)]\n\nplease review"
+        );
+    }
+
+    #[test]
+    fn prepends_header_without_name() {
+        let mut content = "ping".to_string();
+        let md = json!({ "fromAgentId": "agent-abc" });
+        annotate_sender_attribution(&mut content, Some(&md));
+        assert_eq!(content, "[MESSAGE FROM AGENT (agent-abc)]\n\nping");
+    }
+
+    #[test]
+    fn non_string_name_is_treated_as_absent() {
+        // `merge_sender_attribution` stamps `fromAgentName: null` when the
+        // caller's name did not resolve — that must render the nameless form.
+        let mut content = "ping".to_string();
+        let md = json!({ "fromAgentId": "agent-abc", "fromAgentName": null });
+        annotate_sender_attribution(&mut content, Some(&md));
+        assert_eq!(content, "[MESSAGE FROM AGENT (agent-abc)]\n\nping");
+    }
+
+    #[test]
+    fn user_sends_stay_byte_identical() {
+        // No metadata at all.
+        let mut content = "hello".to_string();
+        annotate_sender_attribution(&mut content, None);
+        assert_eq!(content, "hello");
+        // Metadata without attribution (e.g. FE tags).
+        let md = json!({ "type": "event_notification" });
+        annotate_sender_attribution(&mut content, Some(&md));
+        assert_eq!(content, "hello");
+        // Non-string fromAgentId is not attribution.
+        let md = json!({ "fromAgentId": 42 });
+        annotate_sender_attribution(&mut content, Some(&md));
+        assert_eq!(content, "hello");
+        // Non-object metadata carries no attribution.
+        let md = json!("agent-abc");
+        annotate_sender_attribution(&mut content, Some(&md));
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn annotation_is_idempotent() {
+        let mut content = "work item".to_string();
+        let md = json!({ "fromAgentId": "agent-abc", "fromAgentName": "Coordinator" });
+        annotate_sender_attribution(&mut content, Some(&md));
+        let once = content.clone();
+        assert!(content.starts_with(A2A_SENDER_NOTE_PREFIX));
+        // Layered front doors (runtime send → store-only op) and requeues
+        // must not stack a second header.
+        annotate_sender_attribution(&mut content, Some(&md));
+        assert_eq!(content, once, "already-annotated content is untouched");
+    }
+
+    #[test]
+    fn metadata_is_never_modified() {
+        // The guard/ownership surfaces key on metadata — the annotation only
+        // rewrites content.
+        let md = json!({ "fromAgentId": "agent-abc", "fromAgentName": "Coordinator" });
+        let before = md.clone();
+        let mut content = "msg".to_string();
+        annotate_sender_attribution(&mut content, Some(&md));
+        assert_eq!(md, before);
+    }
+}

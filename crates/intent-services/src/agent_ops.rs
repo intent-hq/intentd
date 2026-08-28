@@ -1559,6 +1559,38 @@ pub(crate) fn is_interrupt_priority(priority: Option<&str>) -> bool {
     priority == Some("interrupt")
 }
 
+/// A2A sender-attribution header (monorepo#1015): prepends
+/// [`crate::harness::Harness::a2a_sender_note`] (+ blank line) to an
+/// agent-origin send's content when `message_metadata` is an object carrying
+/// a string `fromAgentId` — daemon-stamped by the MCP bindings, never
+/// caller-controlled — using `fromAgentName` when present. No-op otherwise,
+/// so user/FE sends stay byte-identical. Applied at the send front doors
+/// (BEFORE persist/enqueue), so immediate deliveries, auto-queue fallbacks
+/// and queued entries all inherit the header and drain/flush/redrive never
+/// need to re-annotate; content already starting with
+/// [`A2A_SENDER_NOTE_PREFIX`] is never re-annotated (idempotent across the
+/// layered front doors and requeues — same contract as the dequeue-wait
+/// note), and `persisted: true` requeues are untouched by construction (the
+/// annotation never runs at drain time). Metadata is not modified: the
+/// single-pending-message guard, `removeQueuedMessage` ownership and
+/// `question_answers` intake all key on metadata and are unaffected.
+pub(crate) fn annotate_sender_attribution(content: &mut String, message_metadata: Option<&Value>) {
+    let Some(from_agent_id) = message_metadata
+        .and_then(|md| md.get("fromAgentId"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    if content.starts_with(crate::harness::v1::A2A_SENDER_NOTE_PREFIX) {
+        return;
+    }
+    let name = message_metadata
+        .and_then(|md| md.get("fromAgentName"))
+        .and_then(Value::as_str);
+    let note = crate::harness::latest().a2a_sender_note(name, from_agent_id);
+    *content = format!("{note}\n\n{content}");
+}
+
 /// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5): every entry
 /// must carry EXACTLY one of inline `data` (base64 payload) or an
 /// attachment-registry `attachmentId` reference, both non-empty strings when
@@ -5477,7 +5509,7 @@ impl Services {
     pub(crate) async fn agent_send_message_op(
         &self,
         agent_id: AgentId,
-        content: String,
+        mut content: String,
         message_id: Option<String>,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
@@ -5491,6 +5523,12 @@ impl Services {
                 )));
             }
         }
+        // A2A sender header (monorepo#1015): the store-only front door —
+        // mirrors the runtime `AgentManager::send_message` prepend so both
+        // wirings persist identical agent-origin content. Idempotent: the
+        // runtime path may already have annotated (delegate kickoff), and
+        // the prefix guard makes the second application a no-op.
+        annotate_sender_attribution(&mut content, message_metadata.as_ref());
         // Attachment-reference validation (PROTOCOL §5.5): every file and
         // image block must carry exactly one of `data` / `attachmentId`,
         // rejected before any state change.
@@ -10279,6 +10317,12 @@ impl Services {
                 // definition, so an active hold parks the message instead
                 // of persisting a user row that buries the pending Q&A.
                 if self.question_hold_active(&agent).await {
+                    // A2A sender header (monorepo#1015): this hold-park
+                    // bypasses `agent_send_message_op`'s prepend, so the
+                    // queued entry is annotated here — the drain persist
+                    // then inherits it.
+                    let mut message = message;
+                    annotate_sender_attribution(&mut message, options.message_metadata.as_ref());
                     let (queued, position) = self.enqueue_message(
                         &agent,
                         message,
@@ -11004,6 +11048,17 @@ impl Services {
                 agent_id.0
             )));
         }
+        // A2A sender header (monorepo#1015): the wake front door — the
+        // `agent.wakeOrCreate` context message carries the daemon-stamped
+        // attribution, and this path persists/enqueues directly (it never
+        // routes through `send_message`/`agent_send_message_op`), so the
+        // prepend happens here, before every branch below.
+        let annotated = {
+            let mut c = content.to_string();
+            annotate_sender_attribution(&mut c, message_metadata);
+            c
+        };
+        let content = annotated.as_str();
         let build_block = || match message_metadata {
             Some(md) => json!({ "type": "text", "text": content, "messageMetadata": md }),
             None => json!({ "type": "text", "text": content }),
