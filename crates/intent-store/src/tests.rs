@@ -100,7 +100,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105
         ]
     );
     assert_eq!(
@@ -110,7 +110,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105
         ]
     );
 }
@@ -315,6 +315,52 @@ async fn workspace_round_trip_and_archive_filter() {
     assert_eq!(got.path, Some("/tmp/ws-meta".to_string()));
     assert_eq!(got.repository_path, Some("/tmp/repo".to_string()));
     assert!(!got.archived);
+}
+
+/// `unarchive_workspace_if_archived` is a single atomic flip: the archived
+/// row flips exactly once (`true`), a repeat call — or one against an
+/// already-Active row — declines (`false`, row untouched), and a missing
+/// workspace reports `NotFound`.
+#[tokio::test]
+async fn workspace_conditional_unarchive_flips_exactly_once() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&id, "Archived WS", true))
+        .await
+        .expect("insert archived");
+
+    let ts = now_iso();
+    let flipped = store
+        .unarchive_workspace_if_archived(&id, &ts)
+        .await
+        .expect("first flip");
+    assert!(flipped, "the archived row flips");
+    let row = store.get_workspace(&id).await.expect("row after flip");
+    assert!(!row.archived);
+    assert_eq!(row.status, WorkspaceStatus::Active);
+    assert_eq!(row.archived_at, None);
+    assert_eq!(row.updated_at, ts);
+
+    // The losing racer: the row is Active now, so the guard declines and
+    // nothing (including `updated_at`) is rewritten.
+    let again = store
+        .unarchive_workspace_if_archived(&id, &now_iso())
+        .await
+        .expect("second call");
+    assert!(!again, "an Active row declines the flip");
+    let row = store.get_workspace(&id).await.expect("row after decline");
+    assert_eq!(row.updated_at, ts, "a declined flip touches nothing");
+
+    let missing = store
+        .unarchive_workspace_if_archived(&WorkspaceId::new(), &now_iso())
+        .await;
+    assert!(
+        matches!(missing, Err(Error::NotFound(_))),
+        "missing workspace reports NotFound, got {missing:?}"
+    );
 }
 
 /// `bump_workspace_last_activity` (monorepo#1580) is scoped and monotonic:

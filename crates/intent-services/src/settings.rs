@@ -1405,7 +1405,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "agents.maxTopLevelAgents",
             "Max top-level agents",
-            "Cap on live top-level (parentless) agents per workspace, enforced on the peer-spawn path (ws.agent.spawnPeer) as the runaway-spawn guard; user-created agents are never blocked by it (minimum 1; no unlimited value)",
+            "Cap on live top-level (parentless) agents per workspace, enforced on the top-level-create path (ws.agent.create with topLevel: true) as the runaway-spawn guard; user-created agents are never blocked by it (minimum 1; no unlimited value)",
             "agents",
             Some(1.0),
             None,
@@ -1559,11 +1559,12 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         .with_token_impact("~170 tokens/session + variable per completion wake"),
         boolean(
             "agentFeatures.peerAgents",
-            "Peer agents",
-            "Expose independent peer-agent spawning and self-retire (ws.agent.spawnPeer / ws.agent.retire) to agents; applies to new sessions only",
+            "Top-level agent spawning & retirement",
+            "Expose spawning independent top-level agents (ws.agent.create with topLevel: true) and agent-initiated retirement (ws.agent.retire) to agents; applies to new sessions only",
             "agentFeatures",
             false,
-        ),
+        )
+        .with_token_impact("~80 tokens/session"),
         boolean(
             "agentFeatures.mcpTools",
             "External MCP tools",
@@ -3185,9 +3186,11 @@ mod tests {
     }
 
     /// Each `agentFeatures.*` toggle carries an approximate `tokenImpact`
-    /// annotation (post-shrink numbers, intentd main b6c4fe53) serialized as
-    /// the optional `tokenImpact` wire field; unannotated definitions omit
-    /// the key entirely.
+    /// annotation (post-shrink numbers, intentd main b6c4fe53; peerAgents
+    /// measured the same way on main d671bca9 — the condensed-description
+    /// delta of the `ws.agent.retire` doc line, chars/4) serialized as the
+    /// optional `tokenImpact` wire field; unannotated definitions omit the
+    /// key entirely.
     #[test]
     fn agent_features_toggles_carry_token_impact_annotations() {
         let expected = [
@@ -3205,6 +3208,7 @@ mod tests {
                 "agentFeatures.taskGraph",
                 "~170 tokens/session + variable per completion wake",
             ),
+            ("agentFeatures.peerAgents", "~80 tokens/session"),
         ];
         for (path, impact) in expected {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

@@ -27,16 +27,50 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     harness_features, retired_at";
 
 /// Session metadata needed by the `AgentLite` summary projection.
-/// `system_prompt` and `image_blocks` are intentionally omitted:
-/// `AgentLite::from_session` strips them from the wire, and loading them made
-/// `agent.list` scale with the stored prompt/base64-image bytes.
+/// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
+/// omitted: `AgentLite::from_session` strips them from the wire, and loading
+/// them made `agent.list` scale with the stored prompt/base64-image/spawn
+/// -message bytes.
 const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, \
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
-    initial_message, context_references, file_blocks, is_background, metadata, sandbox_id, \
+    context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
     effort_levels, harness_version, harness_features, retired_at";
+
+/// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
+/// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
+/// (intent-hq/monorepo#3587 regression guard: this hot read must never scan
+/// `agent_message` — it reads the trigger-maintained counters from 0103).
+pub(crate) const SESSION_MESSAGE_STATS_SQL: &str = "SELECT s.id AS agent_id, \
+    s.message_count, s.assistant_message_count, s.conversation_bytes \
+    FROM agent_session s \
+    WHERE s.workspace_id = ?";
+
+/// Single-session projection SQL behind
+/// [`Store::get_agent_session_message_projection`] (see
+/// [`SESSION_MESSAGE_STATS_SQL`] for why it is extracted).
+pub(crate) const SESSION_MESSAGE_PROJECTION_SQL: &str =
+    "SELECT s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
+    s.last_message_id, s.last_tool_use_preview, s.message_count \
+    FROM agent_session s WHERE s.id = ?";
+
+/// Workspace-wide projection SQL behind
+/// [`Store::get_agent_session_message_projections`] (see
+/// [`SESSION_MESSAGE_STATS_SQL`] for why it is extracted). `retired_filter`
+/// is one of the compile-time fragments the three projection variants pass
+/// (`""`, `" AND s.retired_at IS NULL"`, `" AND s.retired_at IS NOT NULL"`)
+/// — never caller input.
+pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
+    format!(
+        "SELECT s.id AS agent_id, s.message_count, \
+        s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
+        s.last_message_id, s.last_tool_use_preview \
+        FROM agent_session s \
+        WHERE s.workspace_id = ?{retired_filter}"
+    )
+}
 
 /// SQL predicate selecting an **unread top-level session** row (§5.1): a
 /// non-deleted, non-background `agent_session` with no parent whose newest
@@ -931,14 +965,66 @@ impl Store {
         rows.iter().map(map_session_summary_row).collect()
     }
 
+    /// [`Store::list_agent_session_summaries`] restricted to soft-RETIRED
+    /// sessions — the `agent.list { retiredOnly: true }` read (§5.5). The
+    /// filter runs in SQL (`retired_at IS NOT NULL`), keeping the handler
+    /// cost O(rows returned) per the RPC cost contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_retired_agent_session_summaries(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+             WHERE workspace_id = ? AND retired_at IS NOT NULL ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("list retired agent session summaries failed: {e}"))
+            })?;
+        rows.iter().map(map_session_summary_row).collect()
+    }
+
+    /// Number of soft-retired sessions in a workspace — the `retiredCount`
+    /// field served on every `agent.list` response variant (§5.5). One SQL
+    /// COUNT answered entirely from the partial covering index
+    /// `idx_agent_workspace_retired` (0104) — an index-only scan over exactly
+    /// the retired entries, O(retired rows) and O(1) for the common empty
+    /// bin, never visiting the workspace's active session rows (RPC cost
+    /// contract; same covering-aggregate shape as 0101). No rows are
+    /// hydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_retired_agent_sessions(&self, workspace_id: &WorkspaceId) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_session \
+             WHERE workspace_id = ? AND retired_at IS NOT NULL",
+        )
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("count retired agent sessions failed: {e}")))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     /// Get message count, whether any assistant message exists, and the total
     /// persisted conversation size in bytes for each session in a workspace,
     /// without hydrating message bodies (finding F1/F3: lightweight
-    /// alternative to full message-log fetch for `agent.diagnostics`). One aggregate
-    /// statement — the LEFT JOIN keeps zero-message sessions — instead of two
-    /// queries per session (monorepo#958). The byte total sums
-    /// `OCTET_LENGTH(content)` — raw stored bytes read from the row header,
-    /// never decoded as JSON and never loading overflow pages — so
+    /// alternative to full message-log fetch for `agent.diagnostics`). One
+    /// statement over `agent_session` alone: the counts and byte total are
+    /// the trigger-maintained 0103 counter columns, so the read never touches
+    /// `agent_message` — the previous live aggregate scanned every message
+    /// row per call and grew past 3s on message-heavy workspaces
+    /// (intent-hq/monorepo#3587). `conversation_bytes` still means raw stored
+    /// content bytes (`OCTET_LENGTH`, summed at write time by the triggers) so
     /// coordinators can see session-size pressure before turns start dying
     /// under context bloat (intent-hq/monorepo#2669). Returns a map keyed
     /// by `agent_id` with `(message_count, has_assistant, conversation_bytes)`
@@ -951,14 +1037,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, (u64, bool, u64)>> {
-        let sql = "SELECT s.id AS agent_id, COUNT(m.id) AS message_count, \
-            COALESCE(SUM(m.role = 'assistant'), 0) AS assistant_count, \
-            COALESCE(SUM(OCTET_LENGTH(m.content)), 0) AS conversation_bytes \
-            FROM agent_session s \
-            LEFT JOIN agent_message m ON m.agent_id = s.id \
-            WHERE s.workspace_id = ? \
-            GROUP BY s.id";
-        let rows = sqlx::query(sql)
+        let rows = sqlx::query(SESSION_MESSAGE_STATS_SQL)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -967,13 +1046,13 @@ impl Store {
         for row in rows {
             let agent_id: String = row.get("agent_id");
             let message_count: i64 = row.get("message_count");
-            let assistant_count: i64 = row.get("assistant_count");
+            let assistant_count: i64 = row.get("assistant_message_count");
             let conversation_bytes: i64 = row.get("conversation_bytes");
             stats.insert(
                 agent_id,
                 (
-                    message_count.cast_unsigned(),
-                    assistant_count != 0,
+                    message_count.max(0).cast_unsigned(),
+                    assistant_count > 0,
                     conversation_bytes.max(0).cast_unsigned(),
                 ),
             );
@@ -982,16 +1061,16 @@ impl Store {
     }
 
     /// Per-session `AgentLite` projection inputs for every session in a
-    /// workspace, in one bounded statement (monorepo#958, 0066): an aggregate
-    /// message count (LEFT JOIN, so zero-message sessions still appear with
-    /// count 0) plus the persisted `last_assistant_preview` /
-    /// `last_user_preview` columns maintained at message-write time — read
-    /// cost no longer scales with transcript or message size, and
-    /// `agent_message.content` is never touched on this path. A NULL or
-    /// corrupt column degrades to `None` ([`decode_preview_col`]) rather than
-    /// being repaired; it converges the next time a message is appended.
-    /// Returns a map keyed by `agent_id` with one entry per session in the
-    /// workspace.
+    /// workspace, in one bounded statement (monorepo#958, 0066): the
+    /// trigger-maintained `message_count` counter (0103,
+    /// intent-hq/monorepo#3587 — zero-message sessions carry 0) plus the
+    /// persisted `last_assistant_preview` / `last_user_preview` columns
+    /// maintained at message-write time — read cost no longer scales with
+    /// transcript or message size, and `agent_message` is never touched on
+    /// this path. A NULL or corrupt column degrades to `None`
+    /// ([`decode_preview_col`]) rather than being repaired; it converges the
+    /// next time a message is appended. Returns a map keyed by `agent_id`
+    /// with one entry per session in the workspace.
     ///
     /// # Errors
     ///
@@ -1000,7 +1079,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, false).await
+        self.session_message_projections(workspace_id, "").await
     }
 
     /// [`Store::get_agent_session_message_projections`] restricted to ACTIVE
@@ -1016,28 +1095,37 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, true).await
+        self.session_message_projections(workspace_id, " AND s.retired_at IS NULL")
+            .await
     }
 
+    /// [`Store::get_agent_session_message_projections`] restricted to
+    /// soft-RETIRED sessions — the variant the `agent.list
+    /// { retiredOnly: true }` read loads, so its aggregate cost scales with
+    /// the retired rows that read returns rather than with every active
+    /// session in the workspace (RPC cost contract). The filter runs in SQL
+    /// (`s.retired_at IS NOT NULL`), served from the partial covering index
+    /// `idx_agent_workspace_retired` (0104).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_retired_agent_session_message_projections(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
+        self.session_message_projections(workspace_id, " AND s.retired_at IS NOT NULL")
+            .await
+    }
+
+    /// Shared body of the workspace projection reads; `retired_filter` is
+    /// one of the compile-time SQL fragments above (never caller input).
     async fn session_message_projections(
         &self,
         workspace_id: &WorkspaceId,
-        active_only: bool,
+        retired_filter: &str,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        let retired_filter = if active_only {
-            " AND s.retired_at IS NULL"
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT s.id AS agent_id, COUNT(m.id) AS message_count, \
-            s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
-            s.last_message_id, s.last_tool_use_preview \
-            FROM agent_session s \
-            LEFT JOIN agent_message m ON m.agent_id = s.id \
-            WHERE s.workspace_id = ?{retired_filter} \
-            GROUP BY s.id"
-        );
+        let sql = session_message_projections_sql(retired_filter);
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
@@ -1050,7 +1138,7 @@ impl Store {
             projections.insert(
                 agent_id,
                 SessionMessageProjection {
-                    message_count: message_count.cast_unsigned(),
+                    message_count: message_count.max(0).cast_unsigned(),
                     last_assistant_text_blocks: decode_preview_col(
                         row.get("last_assistant_preview"),
                     ),
@@ -1067,9 +1155,9 @@ impl Store {
     /// Bounded `AgentLite` projection inputs for a single session
     /// (monorepo#981): the per-session variant of
     /// [`Store::get_agent_session_message_projections`] — one row reading the
-    /// persisted preview columns (0066) plus a correlated message count. A
-    /// session with no messages (or an unknown agent id) returns the zero
-    /// projection.
+    /// persisted preview columns (0066) plus the trigger-maintained
+    /// `message_count` counter (0103). A session with no messages (or an
+    /// unknown agent id) returns the zero projection.
     ///
     /// # Errors
     ///
@@ -1078,11 +1166,7 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<SessionMessageProjection> {
-        let sql = "SELECT s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
-            s.last_message_id, s.last_tool_use_preview, \
-            (SELECT COUNT(*) FROM agent_message m WHERE m.agent_id = s.id) AS message_count \
-            FROM agent_session s WHERE s.id = ?";
-        let Some(row) = sqlx::query(sql)
+        let Some(row) = sqlx::query(SESSION_MESSAGE_PROJECTION_SQL)
             .bind(&agent_id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -1092,7 +1176,7 @@ impl Store {
         };
         let message_count: i64 = row.get("message_count");
         Ok(SessionMessageProjection {
-            message_count: message_count.cast_unsigned(),
+            message_count: message_count.max(0).cast_unsigned(),
             last_assistant_text_blocks: decode_preview_col(row.get("last_assistant_preview")),
             last_user_text_blocks: decode_preview_col(row.get("last_user_preview")),
             last_message_role: row.get("last_message_role"),
@@ -1702,7 +1786,8 @@ impl Store {
 
     /// Persist a metadata change: a narrow write of `metadata` and
     /// `updated_at` only. Callers that load a session via the summary
-    /// projection (no `system_prompt` — see [`SESSION_SUMMARY_COLUMNS`]) must
+    /// projection (no `system_prompt` / `image_blocks` / `initial_message` —
+    /// see [`SESSION_SUMMARY_COLUMNS`]) must
     /// use this instead of [`Store::update_agent_session`], whose full-row
     /// write would clear every column absent from the summary. Scoped to
     /// `workspace_id` (defense-in-depth). `NotFound` if the session is absent
@@ -2498,17 +2583,19 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         row,
         col(row, "system_prompt")?,
         json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
+        col(row, "initial_message")?,
     )
 }
 
 fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
-    map_session_row_with_heavy_cols(row, None, None)
+    map_session_row_with_heavy_cols(row, None, None, None)
 }
 
 fn map_session_row_with_heavy_cols(
     row: &SqliteRow,
     system_prompt: Option<String>,
     image_blocks: Option<serde_json::Value>,
+    initial_message: Option<String>,
 ) -> Result<AgentSession> {
     let backend: Option<String> = col(row, "backend_session_id")?;
     let parent: Option<String> = col(row, "parent_agent_id")?;
@@ -2549,7 +2636,7 @@ fn map_session_row_with_heavy_cols(
         attention_request_reason: col(row, "attention_request_reason")?,
         attention_request_timestamp: col(row, "attention_request_timestamp")?,
         delegation_depth: col(row, "delegation_depth")?,
-        initial_message: col(row, "initial_message")?,
+        initial_message,
         context_references: json_col_from_db(
             col(row, "context_references")?,
             "context_references",
@@ -3198,6 +3285,33 @@ impl Store {
         })
     }
 
+    /// List the summary rows (no message logs, no prompt/image payloads) of
+    /// every delegated child of `parent_agent_id`. Deliberately UNSCOPED by
+    /// workspace for the same reason as [`Store::count_child_agents`] —
+    /// delegation can cross workspaces and `parent_agent_id` is globally
+    /// unique. Forced through `idx_agent_parent`, so cost is O(this agent's
+    /// children). Used by the retire guard/cascade to walk the descendant
+    /// tree (§5.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_child_agent_summaries(
+        &self,
+        parent_agent_id: &AgentId,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session INDEXED BY idx_agent_parent \
+             WHERE parent_agent_id = ? ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&parent_agent_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list child agent summaries failed: {e}")))?;
+        rows.iter().map(map_session_summary_row).collect()
+    }
+
     /// Compatibility helper for callers that only need the legacy unsettled
     /// count. New snapshot code uses [`Store::count_child_agents`] so both
     /// counts come from one indexed aggregate statement.
@@ -3775,6 +3889,53 @@ mod tests {
                 sidecar.push(suffix);
                 let _ = std::fs::remove_file(&sidecar);
             }
+        }
+    }
+
+    /// The soft-retire read paths must be answered from the partial covering
+    /// index `idx_agent_workspace_retired` (0104) — never by scanning the
+    /// workspace's session entries — so `retiredCount` and the `retiredOnly`
+    /// reads stay O(retired rows) per the RPC cost contract (PR #1523
+    /// review; same tripwire shape as the 0101 note-aggregate test).
+    #[tokio::test]
+    async fn retired_reads_use_partial_covering_index() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        for (label, sql) in [
+            (
+                "count",
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM agent_session \
+                 WHERE workspace_id = ? AND retired_at IS NOT NULL"
+                    .to_string(),
+            ),
+            (
+                "rows",
+                "EXPLAIN QUERY PLAN SELECT id FROM agent_session \
+                 WHERE workspace_id = ? AND retired_at IS NOT NULL"
+                    .to_string(),
+            ),
+            (
+                "projections",
+                format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    session_message_projections_sql(" AND s.retired_at IS NOT NULL")
+                ),
+            ),
+        ] {
+            let details: Vec<String> = sqlx::query(&sql)
+                .bind("ws-plan")
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.contains("INDEX idx_agent_workspace_retired")),
+                "{label} read must use the partial retired index, plan: {details:?}"
+            );
         }
     }
 
@@ -5718,7 +5879,7 @@ mod tests {
             attention_request_reason: None,
             attention_request_timestamp: None,
             delegation_depth: None,
-            initial_message: None,
+            initial_message: Some("spawn-time first message".repeat(1024)),
             context_references: None,
             image_blocks: Some(image_blocks.clone()),
             file_blocks: None,
@@ -5766,6 +5927,10 @@ mod tests {
             "full session reads should retain image_blocks"
         );
         assert_eq!(
+            full[0].initial_message, session.initial_message,
+            "full session reads should retain initial_message"
+        );
+        assert_eq!(
             full[0].messages.len(),
             1,
             "list_agent_sessions should include messages"
@@ -5792,6 +5957,10 @@ mod tests {
             summaries[0].image_blocks, None,
             "summary reads should not load image_blocks"
         );
+        assert_eq!(
+            summaries[0].initial_message, None,
+            "summary reads should not load initial_message"
+        );
         assert!(
             !SESSION_SUMMARY_COLUMNS.contains("system_prompt"),
             "the summary SELECT must not mention system_prompt"
@@ -5799,6 +5968,10 @@ mod tests {
         assert!(
             !SESSION_SUMMARY_COLUMNS.contains("image_blocks"),
             "the summary SELECT must not mention image_blocks"
+        );
+        assert!(
+            !SESSION_SUMMARY_COLUMNS.contains("initial_message"),
+            "the summary SELECT must not mention initial_message"
         );
     }
 
@@ -6247,6 +6420,250 @@ mod tests {
         assert!(
             bytes2 > bytes1,
             "agent2's 3-message conversation should outweigh agent1's 1 message"
+        );
+    }
+
+    /// Regression guard for intent-hq/monorepo#3587: the hot per-workspace
+    /// stats/projection reads must never touch `agent_message` — the persisted
+    /// `agent_session` counters (0103) answer them. `EXPLAIN QUERY PLAN` on
+    /// the exact production SQL fails this test the moment a scan or search
+    /// of `agent_message` reappears in any of these statements.
+    #[tokio::test]
+    async fn session_stats_queries_never_touch_agent_message() {
+        let tmp = TempDb::new("test-stats-plan");
+        let store = Store::open(&tmp).await.expect("create test store");
+
+        let statements: Vec<(&str, String)> = vec![
+            (
+                "get_agent_session_message_stats",
+                SESSION_MESSAGE_STATS_SQL.to_string(),
+            ),
+            (
+                "get_agent_session_message_projections",
+                session_message_projections_sql(""),
+            ),
+            (
+                "get_active_agent_session_message_projections",
+                session_message_projections_sql(" AND s.retired_at IS NULL"),
+            ),
+            (
+                "get_retired_agent_session_message_projections",
+                session_message_projections_sql(" AND s.retired_at IS NOT NULL"),
+            ),
+            (
+                "get_agent_session_message_projection",
+                SESSION_MESSAGE_PROJECTION_SQL.to_string(),
+            ),
+        ];
+        for (name, sql) in statements {
+            let plan_rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .bind("ws-any")
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain query plan");
+            for row in plan_rows {
+                let detail: String = row.get("detail");
+                assert!(
+                    !detail.contains("agent_message"),
+                    "{name} query plan touches agent_message (\"{detail}\") — \
+                     the intent-hq/monorepo#3587 hot path must read the \
+                     persisted agent_session counters instead"
+                );
+            }
+        }
+    }
+
+    /// Recompute one session's stats live from `agent_message` — the ground
+    /// truth the 0103 trigger-maintained counters must always agree with.
+    async fn live_message_stats(store: &Store, agent_id: &AgentId) -> (i64, i64, i64) {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(role = 'assistant'), 0) AS a, \
+             COALESCE(SUM(OCTET_LENGTH(content)), 0) AS bytes \
+             FROM agent_message WHERE agent_id = ?",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("live stats");
+        (row.get("n"), row.get("a"), row.get("bytes"))
+    }
+
+    /// Read one session's persisted 0103 counter columns.
+    async fn counter_cols(store: &Store, agent_id: &AgentId) -> (i64, i64, i64) {
+        let row = sqlx::query(
+            "SELECT message_count, assistant_message_count, conversation_bytes \
+             FROM agent_session WHERE id = ?",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("counter columns");
+        (
+            row.get("message_count"),
+            row.get("assistant_message_count"),
+            row.get("conversation_bytes"),
+        )
+    }
+
+    /// The 0103 counter columns stay consistent with a live recompute across
+    /// every `agent_message` write path: append (INSERT), the
+    /// `agent.replaceMessages` swap (DELETE + re-INSERT), a direct
+    /// content/role UPDATE, and `agent.delete`'s cascade (session row and
+    /// counters go away together, no error from the delete trigger).
+    #[tokio::test]
+    async fn session_stats_counters_track_all_message_write_paths() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-stats-counters");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-stats-counters".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-stats-counters".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        assert_eq!(counter_cols(&store, &agent).await, (0, 0, 0));
+
+        // Append path.
+        for (role, text) in [("user", "q1"), ("assistant", "a1"), ("tool", "t1")] {
+            store
+                .append_agent_message(
+                    &agent,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+        let live = live_message_stats(&store, &agent).await;
+        assert_eq!(counter_cols(&store, &agent).await, live);
+        assert_eq!(live.0, 3);
+        assert_eq!(live.1, 1);
+
+        // Replace path (DELETE + re-INSERT inside one transaction).
+        let replacement = serde_json::json!([{"type": "text", "text": "swapped, longer body"}]);
+        store
+            .replace_agent_messages(
+                &agent,
+                &[
+                    ReplaceMessage {
+                        role: "assistant",
+                        content: &replacement,
+                        metadata: None,
+                        created_at: &ts,
+                    },
+                    ReplaceMessage {
+                        role: "assistant",
+                        content: &replacement,
+                        metadata: None,
+                        created_at: &ts,
+                    },
+                ],
+            )
+            .await
+            .expect("replace");
+        let live = live_message_stats(&store, &agent).await;
+        assert_eq!(counter_cols(&store, &agent).await, live);
+        assert_eq!(live.0, 2);
+        assert_eq!(live.1, 2);
+
+        // Direct content/role UPDATE (the 0074-style repair path).
+        sqlx::query("UPDATE agent_message SET role = 'user', content = '[]' WHERE agent_id = ?")
+            .bind(&agent.0)
+            .execute(store.write_pool())
+            .await
+            .expect("direct update");
+        let live = live_message_stats(&store, &agent).await;
+        assert_eq!(counter_cols(&store, &agent).await, live);
+        assert_eq!(live.1, 0);
+
+        // Session delete: cascade removes messages; the delete trigger's
+        // UPDATE matches no session row and the whole sweep still succeeds.
+        assert!(store
+            .delete_agent_session(&ws_id, &agent)
+            .await
+            .expect("delete session"));
+        let (n, _, _) = live_message_stats(&store, &agent).await;
+        assert_eq!(n, 0, "cascade removed the messages");
+    }
+
+    /// The 0103 backfill UPDATE sets the counters correctly for rows shaped
+    /// like the pre-0103 state. A fresh test DB backfills an empty
+    /// `agent_message`, so without this test a defect in the backfill's
+    /// `UPDATE ... FROM` join would pass every trigger test while
+    /// permanently mis-setting counters on existing databases (incremental
+    /// counters never self-heal). Exercised 0031-style: seed sessions with
+    /// messages, corrupt the counters directly, re-run the backfill
+    /// statement extracted from the migration file, and assert equality
+    /// with a live recompute.
+    #[tokio::test]
+    async fn session_stats_backfill_recomputes_existing_rows() {
+        use intent_core::now_iso;
+        let migration = include_str!("../migrations/0103_agent_session_stats_counters.sql");
+        let backfill_start = migration
+            .rfind("UPDATE agent_session SET")
+            .expect("0103 must contain the backfill UPDATE");
+        let backfill = &migration[backfill_start..];
+
+        let tmp = TempDb::new("test-stats-backfill");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-stats-backfill".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let with_msgs = AgentId("agent-backfill-msgs".to_string());
+        let empty = AgentId("agent-backfill-empty".to_string());
+        for agent in [&with_msgs, &empty] {
+            store
+                .insert_agent_session(&baseline_test_session(agent, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        for (role, text) in [("user", "q1"), ("assistant", "a1"), ("assistant", "a2")] {
+            store
+                .append_agent_message(
+                    &with_msgs,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+        let live = live_message_stats(&store, &with_msgs).await;
+
+        // Corrupt the counters to the pre-backfill shape (columns exist but
+        // hold garbage relative to agent_message).
+        sqlx::query(
+            "UPDATE agent_session SET message_count = 999, \
+             assistant_message_count = 999, conversation_bytes = 999 WHERE id = ?",
+        )
+        .bind(&with_msgs.0)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt counters");
+
+        sqlx::raw_sql(backfill)
+            .execute(store.write_pool())
+            .await
+            .expect("re-run 0103 backfill");
+
+        assert_eq!(
+            counter_cols(&store, &with_msgs).await,
+            live,
+            "backfill must recompute counters from agent_message"
+        );
+        assert_eq!(
+            counter_cols(&store, &empty).await,
+            (0, 0, 0),
+            "zero-message session keeps its column-default zeros"
         );
     }
 
@@ -9757,6 +10174,90 @@ mod tests {
                 .expect("legacy count"),
             counts.unsettled
         );
+    }
+
+    /// `list_child_agent_summaries` returns every direct child — any status,
+    /// any workspace (delegation crosses workspaces) — and nothing else.
+    #[tokio::test]
+    async fn list_child_agent_summaries_returns_direct_children_across_workspaces() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-list-child-summaries");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-parent".to_string());
+        let other_ws = WorkspaceId("ws-child-remote".to_string());
+        insert_test_workspace(&store, &ws).await;
+        insert_test_workspace(&store, &other_ws).await;
+
+        let parent = AgentId("agent-parent".to_string());
+        for (suffix, status, workspace_id) in [
+            ("local", AgentStatus::RuntimeIdle, &ws),
+            ("remote", AgentStatus::Active, &other_ws),
+            ("terminal", AgentStatus::Completed, &ws),
+        ] {
+            let id = AgentId(format!("agent-child-{suffix}"));
+            let mut session = baseline_test_session(&id, workspace_id, &ts, Some("acp-live"));
+            session.parent_agent_id = Some(parent.clone());
+            session.status = status;
+            store
+                .insert_agent_session(&session)
+                .await
+                .expect("insert child");
+        }
+        // A grandchild (child of a child) is NOT a direct child of `parent`.
+        let mut grandchild = baseline_test_session(
+            &AgentId("agent-grandchild".to_string()),
+            &ws,
+            &ts,
+            Some("acp-live"),
+        );
+        grandchild.parent_agent_id = Some(AgentId("agent-child-local".to_string()));
+        store
+            .insert_agent_session(&grandchild)
+            .await
+            .expect("insert grandchild");
+        // An unrelated agent with a different parent.
+        let mut unrelated = baseline_test_session(
+            &AgentId("agent-unrelated".to_string()),
+            &ws,
+            &ts,
+            Some("acp-live"),
+        );
+        unrelated.parent_agent_id = Some(AgentId("agent-other-parent".to_string()));
+        store
+            .insert_agent_session(&unrelated)
+            .await
+            .expect("insert unrelated child");
+
+        let children = store
+            .list_child_agent_summaries(&parent)
+            .await
+            .expect("list children");
+        let mut ids: Vec<&str> = children.iter().map(|s| s.id.0.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "agent-child-local",
+                "agent-child-remote",
+                "agent-child-terminal"
+            ]
+        );
+        // Summaries carry the fields the retire guard/cascade reads.
+        let remote = children
+            .iter()
+            .find(|s| s.id.0 == "agent-child-remote")
+            .unwrap();
+        assert_eq!(remote.workspace_id, other_ws);
+        assert_eq!(remote.status, AgentStatus::Active);
+        assert!(remote.retired_at.is_none());
+
+        let none = store
+            .list_child_agent_summaries(&AgentId("agent-child-remote".to_string()))
+            .await
+            .expect("leaf has no children");
+        assert!(none.is_empty());
     }
 
     /// Insert a minimal workspace row so agent-session FKs resolve.

@@ -349,8 +349,11 @@ pub(crate) fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// value, an explicit empty value (`model: ""`) clears it, and an explicit
 /// non-empty value overrides it.
 /// `role` is the picker-orchestration enum (`orchestrator` | `internal`;
-/// absent = standard) and `icon` names a client-side avatar design; both are
-/// render-only metadata for pickers (never consulted at delegation time).
+/// absent = standard) and `icon` names a client-side avatar design. `icon`
+/// is render-only picker metadata; `role` additionally gates the spawn-time
+/// orchestrator tool denylist (§18.4,
+/// [`SpecialistsService::resolve_is_orchestrator`]) but is still never
+/// consulted at delegation time.
 /// `role` is validated on `specialist.create`/`edit` ([`validate_role_spec`])
 /// but read leniently — an out-of-enum on-disk value is normalized to
 /// omitted (which inherits), so `list`/`get` never serve a value the strict
@@ -385,6 +388,46 @@ const INHERITED_CONFIG_KEYS: &[&str] = &[
 /// from the New Workspace modal's single-agent picker only), or the
 /// explicit-clear empty string.
 const ROLE_VALUES: &[&str] = &["orchestrator", "internal", ""];
+
+/// The tier-folded resolution state of a specialist's `role` frontmatter
+/// ([`SpecialistsService::resolve_role_state`]): the wire def drops the
+/// explicit `role: ""` clear (it folds to an absent key), but the
+/// orchestrator gate needs to tell that deliberate clear apart from a role
+/// that was never set (fail-closed historical-name fallback, §18.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RoleResolution {
+    /// The highest role-bearing tier set a non-empty in-enum role.
+    Role(String),
+    /// The highest role-bearing tier wrote the explicit `role: ""` clear.
+    Cleared,
+    /// The specialist resolves but no tier ever touched the key (an
+    /// out-of-enum on-disk value reads as untouched, like the lenient wire
+    /// normalization in [`build_def_inheriting`]).
+    Absent,
+    /// The id does not resolve to any specialist.
+    Unknown,
+}
+
+/// Fold one tier's raw frontmatter into a role resolution `state`
+/// ([`SpecialistsService::resolve_role_state`]): a valid in-enum `role`
+/// value overrides (empty ⇒ [`RoleResolution::Cleared`], non-empty ⇒
+/// [`RoleResolution::Role`]); an omitted or out-of-enum value leaves the
+/// lower tiers' state untouched — the same per-key inherit-on-omit /
+/// lenient-read semantics as [`build_def_inheriting`].
+fn fold_role_directive(state: &mut RoleResolution, content: &str) {
+    let (fm, _) = parse_frontmatter(content);
+    if let Some(v) = fm
+        .get("role")
+        .and_then(Value::as_str)
+        .filter(|v| ROLE_VALUES.contains(v))
+    {
+        *state = if v.is_empty() {
+            RoleResolution::Cleared
+        } else {
+            RoleResolution::Role(v.to_string())
+        };
+    }
+}
 
 /// The picker/routing-metadata frontmatter keys (PROTOCOL §5.11) — the only
 /// frontmatter allowed to diverge between the v1 and v1.1 bundled specialist
@@ -1188,6 +1231,83 @@ impl SpecialistsService {
         })
     }
 
+    /// Resolve a specialist's `role` frontmatter enum (PROTOCOL §5.11:
+    /// `orchestrator` | `internal`) through the 3-tier order (project >
+    /// user > bundled). Returns `None` when the specialist is unknown or
+    /// carries no effective role (omitted, explicitly cleared, or
+    /// normalized-out on read); callers that must tell the explicit
+    /// `role: ""` clear apart from omission use [`Self::resolve_role_state`]
+    /// — the sole production reader ([`Self::resolve_is_orchestrator`]) now
+    /// does, leaving this wire-shaped view test-only.
+    #[cfg(test)]
+    pub(crate) fn resolve_role(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
+        match self.resolve_role_state(id, workspace_path) {
+            RoleResolution::Role(role) => Some(role),
+            _ => None,
+        }
+    }
+
+    /// The tier-folded resolution state of a specialist's `role` frontmatter
+    /// (PROTOCOL §5.11), distinguishing the explicit `role: ""` clear from a
+    /// role that was never set. The wire def cannot make that distinction —
+    /// the clear folds to an absent key inside `resolve()` — but the
+    /// orchestrator gate must: an explicit clear is a deliberate opt-out of
+    /// the historical-name fallback, plain omission stays fail-closed
+    /// ([`Self::resolve_is_orchestrator`]). The fold mirrors
+    /// [`build_def_inheriting`]'s per-key inheritance: raw frontmatter is
+    /// read tier by tier from the embedded floor upward, an omitted (or
+    /// out-of-enum, read-leniently) key keeps the lower tiers' state, and
+    /// the highest tier that touches the key decides.
+    pub(crate) fn resolve_role_state(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> RoleResolution {
+        let Some(canonical) = self.canonical_id(id, workspace_path) else {
+            return RoleResolution::Unknown;
+        };
+        let mut state = RoleResolution::Absent;
+        if let Some((_, content)) = self.embedded.iter().find(|(k, _)| *k == canonical) {
+            fold_role_directive(&mut state, content);
+        }
+        let project = workspace_path.map(project_dir);
+        let tiers = [
+            self.bundled_dir.as_deref(),
+            self.user_dir.as_deref(),
+            project.as_deref(),
+        ];
+        for dir in tiers.into_iter().flatten() {
+            if let Ok(content) = std::fs::read_to_string(dir.join(format!("{canonical}.md"))) {
+                fold_role_directive(&mut state, &content);
+            }
+        }
+        state
+    }
+
+    /// Whether a specialist id resolves to the `orchestrator` role — the
+    /// spawn-time gate for the orchestrator tool denylist (§18.4,
+    /// `intent_acp::get_native_tools_to_remove`). An explicitly resolved role
+    /// decides directly, and an explicit `role: ""` clear reads as NOT an
+    /// orchestrator (the user deliberately cleared the inherited role); only
+    /// when no tier ever touched the key — or the id no longer resolves at
+    /// all — do the historical orchestrator ids `spec-writer`/`coordinator`
+    /// fall back to orchestrator by name. The fallback exists because
+    /// sessions can carry those ids without a resolvable role: the v1
+    /// embedded floor predates the `role` key (picker metadata landed in
+    /// v1.1), and a session's specialist may no longer resolve at all
+    /// (deleted custom file, [`REPLACEMENT_DIR_ENV`] base replacement, v1
+    /// floor without the `coordinator` alias) — dropping the restriction
+    /// there would silently hand an orchestrator its file-editing tools back.
+    pub(crate) fn resolve_is_orchestrator(&self, id: &str, workspace_path: Option<&Path>) -> bool {
+        match self.resolve_role_state(id, workspace_path) {
+            RoleResolution::Role(role) => role == "orchestrator",
+            RoleResolution::Cleared => false,
+            RoleResolution::Absent | RoleResolution::Unknown => {
+                matches!(id, "spec-writer" | "coordinator")
+            }
+        }
+    }
+
     /// Resolve a specialist's display name (frontmatter `name`, defaulting to
     /// the id inside `resolve()`) through the 3-tier order (project > user >
     /// bundled), used at spawn time to derive a created agent's name when the
@@ -1809,6 +1929,151 @@ mod tests {
         assert_eq!(def["name"], "File Implementor");
     }
 
+    /// Role-based orchestrator resolution (§18.4): an explicit
+    /// `role: "orchestrator"` on any custom specialist engages the
+    /// orchestrator gate; `internal` and role-less specialists do not.
+    #[test]
+    fn resolve_is_orchestrator_keys_off_role_frontmatter() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "planner",
+            "---\nname: \"Planner\"\ndescription: \"d\"\nrole: \"orchestrator\"\n---\n\nbody",
+        );
+        dir.write(
+            "helper",
+            "---\nname: \"Helper\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        dir.write(
+            "plain",
+            "---\nname: \"Plain\"\ndescription: \"d\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir);
+        assert_eq!(
+            svc.resolve_role("planner", None).as_deref(),
+            Some("orchestrator")
+        );
+        assert!(svc.resolve_is_orchestrator("planner", None));
+        assert!(!svc.resolve_is_orchestrator("helper", None));
+        assert!(!svc.resolve_is_orchestrator("plain", None));
+    }
+
+    /// The bundled orchestrator still resolves as one via its v1.1 `role`
+    /// frontmatter — including through the `coordinator` alias — while the
+    /// bundled internal specialists do not.
+    #[test]
+    fn resolve_is_orchestrator_bundled_spec_writer_and_alias() {
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        assert!(svc.resolve_is_orchestrator("spec-writer", None));
+        assert!(svc.resolve_is_orchestrator("coordinator", None));
+        assert!(!svc.resolve_is_orchestrator("implementor", None));
+    }
+
+    /// Name-based fallback: sessions can carry an orchestrator id without a
+    /// resolvable role — a v1-pinned floor predates the `role` key, and an
+    /// id may no longer resolve at all (no `coordinator` alias in the v1
+    /// floor, deleted custom file). The historical ids stay orchestrators;
+    /// unknown ids do not.
+    #[test]
+    fn resolve_is_orchestrator_name_fallback_when_role_unresolvable() {
+        static V1_LIKE: &[(&str, &str)] = &[(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\n---\n\nbody",
+        )];
+        let empty = TempSpecialistsDir::new();
+        let svc = service_over(&empty).with_embedded(V1_LIKE);
+        // Resolves, but the pinned floor carries no `role` key.
+        assert!(svc.resolve_is_orchestrator("spec-writer", None));
+        // Does not resolve at all (no alias in the pinned floor).
+        assert!(svc.resolve_is_orchestrator("coordinator", None));
+        // Unknown non-orchestrator id takes no fallback.
+        assert!(!svc.resolve_is_orchestrator("mystery", None));
+    }
+
+    /// An explicit non-orchestrator role on a historical orchestrator id
+    /// wins over the name fallback.
+    #[test]
+    fn resolve_is_orchestrator_explicit_role_overrides_name_fallback() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir);
+        assert!(!svc.resolve_is_orchestrator("spec-writer", None));
+    }
+
+    /// An explicit `role: ""` clear is a deliberate opt-out: it reads as
+    /// [`RoleResolution::Cleared`] (not `Absent`) and defeats the
+    /// historical-name orchestrator fallback, while plain omission stays
+    /// fail-closed.
+    #[test]
+    fn resolve_is_orchestrator_explicit_clear_defeats_name_fallback() {
+        let dir = TempSpecialistsDir::new();
+        // A user-tier spec-writer override that explicitly clears the role.
+        dir.write(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\nrole: \"\"\n---\n\nbody",
+        );
+        // A plain override that never touches the key inherits the bundled
+        // v1.1 `role: "orchestrator"` and stays an orchestrator.
+        dir.write(
+            "coordinator-like",
+            "---\nname: \"C\"\ndescription: \"d\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir);
+        assert_eq!(
+            svc.resolve_role_state("spec-writer", None),
+            RoleResolution::Cleared
+        );
+        assert!(!svc.resolve_is_orchestrator("spec-writer", None));
+        // The wire-facing resolve_role still reads the clear as no role.
+        assert_eq!(svc.resolve_role("spec-writer", None), None);
+        assert_eq!(
+            svc.resolve_role_state("coordinator-like", None),
+            RoleResolution::Absent
+        );
+        assert!(!svc.resolve_is_orchestrator("coordinator-like", None));
+    }
+
+    /// The cleared state folds tier by tier like the other config scalars:
+    /// a higher tier that re-sets the role overrides a lower-tier clear, an
+    /// out-of-enum on-disk value is read leniently as untouched, and an
+    /// unknown id reads as [`RoleResolution::Unknown`] (name fallback stays
+    /// fail-closed there).
+    #[test]
+    fn resolve_role_state_folds_across_tiers() {
+        static FLOOR: &[(&str, &str)] = &[(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\nrole: \"orchestrator\"\n---\n\nbody",
+        )];
+        let dir = TempSpecialistsDir::new();
+        // The user/project file re-sets the role above an embedded floor.
+        dir.write(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        // Out-of-enum value: lenient read leaves the floor's state in place.
+        dir.write(
+            "bogus-role",
+            "---\nname: \"B\"\ndescription: \"d\"\nrole: \"captain\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir).with_embedded(FLOOR);
+        assert_eq!(
+            svc.resolve_role_state("spec-writer", None),
+            RoleResolution::Role("internal".to_string())
+        );
+        assert_eq!(
+            svc.resolve_role_state("bogus-role", None),
+            RoleResolution::Absent
+        );
+        assert_eq!(
+            svc.resolve_role_state("missing", None),
+            RoleResolution::Unknown
+        );
+        assert!(!svc.resolve_is_orchestrator("missing", None));
+    }
+
     /// Alias resolution (PROTOCOL §5.11): an `aliases` entry resolves to the
     /// claiming specialist's def — the def's `id` carries the CANONICAL id,
     /// never the alias — and `canonical_id` maps id-or-alias accordingly.
@@ -2233,6 +2498,57 @@ mod tests {
             .is_some_and(|body| body.starts_with("## Vulnerability Scanner\n")));
         assert_eq!(def["source"], "bundled");
         assert_eq!(def["isCustomized"], false);
+    }
+
+    #[test]
+    fn bundled_chief_prompts_pin_exact_completion_relay_contract() {
+        for (version, bundle) in [("v1", EMBEDDED_BUNDLED_V1), ("v1.1", EMBEDDED_BUNDLED_V1_1)] {
+            let prompt = bundle
+                .iter()
+                .find_map(|(id, content)| (*id == "chief-of-staff").then_some(*content))
+                .expect("bundled Chief prompt exists");
+            assert!(
+                prompt.contains("On the one completion wake"),
+                "{version}: one completion wake"
+            );
+            assert!(
+                prompt.contains("return await ws.app.agents.ask(agentId, message, priority)"),
+                "{version}: ask result is returned without a cross-turn local"
+            );
+            assert!(
+                !prompt.contains("const asked") && !prompt.contains("asked."),
+                "{version}: no ask-local reference survives across executions"
+            );
+            assert!(
+                prompt.contains("ws.app.agents.readConversation(target.workspaceId, target.agentId, { lastN: 20 })"),
+                "{version}: one bounded conversation read"
+            );
+            assert!(
+                prompt.contains("agentId === \"agent-id-from-completion-wake\"")
+                    && prompt.contains("return { target, conversation }")
+                    && prompt.contains("Do not use a variable from the earlier `ask` execution"),
+                "{version}: wake identity and conversation are resolved in one execution"
+            );
+            assert!(
+                prompt.contains("[${conversation.workspaceTitle}](intent://local/${conversation.workspaceId}/agent/${conversation.agentId}/message/${finalAssistant.id})"),
+                "{version}: exact target-message link with title label"
+            );
+            assert!(
+                prompt
+                    .contains("Build this URL only from the one bounded `readConversation` result"),
+                "{version}: link identifiers come from the conversation read"
+            );
+            assert!(
+                prompt.contains(
+                    "Never expose a raw workspace ID or agent ID in relay prose or link text"
+                ),
+                "{version}: raw IDs stay out of user-visible relay text"
+            );
+            assert!(
+                prompt.contains("Relay that assistant message once"),
+                "{version}: one final relay"
+            );
+        }
     }
 
     #[test]

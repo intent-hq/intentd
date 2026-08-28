@@ -1,5 +1,6 @@
 //! System control fast-path: `system.status`, `system.shutdown`,
-//! `system.importLegacy` (§5.7), and `system.gitCredential` (monorepo#884).
+//! `system.importLegacy` (§5.7), `system.gitCredential` (monorepo#884), and
+//! `system.requestUpdate` (§5.7).
 //!
 //! These control methods surface live daemon state, request graceful shutdown,
 //! and run legacy import. They sit above the domain [`WorkspaceApi`] router because
@@ -122,6 +123,28 @@ pub struct SystemStatus {
     /// Total bytes of the volume containing the workspaces root. `None`
     /// alongside `workspaces_disk_available_bytes`.
     pub workspaces_disk_total_bytes: Option<u64>,
+    /// File-watch coverage snapshot (intent-hq/intent#3708): `None` until the
+    /// backgrounded watcher registry has started (and again after it is torn
+    /// down), so the whole `fileWatch` object is presence-detected on the
+    /// wire — absent when `None`, never null.
+    pub file_watch: Option<FileWatchStatus>,
+}
+
+/// Live file-watch coverage for `system.status` (intent-hq/intent#3708):
+/// whether the roots the daemon *wants* watched are actually registered with
+/// the OS. `failed_roots > 0` means lost coverage — file events under those
+/// roots are silently missed until a retry recovers them (e.g. inotify
+/// instance exhaustion, `fseventsd` load).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileWatchStatus {
+    /// Shared OS watch streams whose watcher is actually created (one `notify`
+    /// watcher each). A stream stuck retrying watcher creation is not counted,
+    /// so this reads 0 while `total_roots > 0` under creation failure.
+    pub active_streams: usize,
+    /// Watch roots currently requested, whatever their registration state.
+    pub total_roots: usize,
+    /// Roots whose OS registration failed; 0 when coverage is healthy.
+    pub failed_roots: usize,
 }
 
 /// A `(username, password)` pair resolved for `system.gitCredential`.
@@ -136,6 +159,16 @@ pub trait SystemControl: Send + Sync {
     /// Request a graceful shutdown (idempotent). Returns immediately; the daemon
     /// tears the listeners down asynchronously.
     fn request_shutdown(&self);
+    /// Ask the supervising `intentd-sitter` to run an update check now
+    /// (`system.requestUpdate`): locate the sitter pidfile, verify the pid is
+    /// live, and send it SIGUSR1.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the daemon is not
+    /// sitter-supervised (or signaling is unsupported on this platform);
+    /// the handler maps it to `-32603`.
+    fn request_update(&self) -> Result<(), String>;
     /// Import legacy workspaces into the daemon's live store.
     fn import_legacy(
         &self,
@@ -156,6 +189,7 @@ pub trait SystemControl: Send + Sync {
 pub(crate) enum SystemMethod {
     Status,
     Shutdown,
+    RequestUpdate,
     ImportLegacy {
         force: Result<bool, ()>,
     },
@@ -192,6 +226,7 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
     let method = match method {
         "system.status" => SystemMethod::Status,
         "system.shutdown" => SystemMethod::Shutdown,
+        "system.requestUpdate" => SystemMethod::RequestUpdate,
         "system.importLegacy" => {
             let force = match obj.get("params") {
                 None | Some(Value::Null) => Ok(false),
@@ -293,6 +328,16 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     if let Some(total) = status.workspaces_disk_total_bytes {
         obj.insert("workspacesDiskTotalBytes".into(), total.into());
     }
+    if let Some(fw) = &status.file_watch {
+        obj.insert(
+            "fileWatch".into(),
+            json!({
+                "activeStreams": fw.active_streams,
+                "totalRoots": fw.total_roots,
+                "failedRoots": fw.failed_roots,
+            }),
+        );
+    }
     v
 }
 
@@ -312,7 +357,10 @@ pub(crate) fn git_credential_scope_ok(protocol: Option<&str>, host: Option<&str>
 /// returns `{ credential: { username, password } }` when a credential is
 /// available and `{ credential: null }` otherwise (scope gate failed / setting
 /// off / no token) — the distinction between those cases is never surfaced on
-/// the wire.
+/// the wire. `system.requestUpdate` is served on BOTH transports (a remote
+/// client is exactly who needs to trigger an update): success returns
+/// `{ ok: true }`, and a daemon that is not sitter-supervised gets `-32603`
+/// with the reason.
 pub(crate) async fn handle(
     req: SystemRequest,
     control: &dyn SystemControl,
@@ -329,6 +377,10 @@ pub(crate) async fn handle(
             control.request_shutdown();
             Ok(json!({ "ok": true, "stopping": true }))
         }
+        SystemMethod::RequestUpdate => control
+            .request_update()
+            .map(|()| json!({ "ok": true }))
+            .map_err(|message| (-32603, message)),
         SystemMethod::ImportLegacy { .. } if !is_uds => Err((
             -32001,
             "system.importLegacy is available over UDS only".to_string(),

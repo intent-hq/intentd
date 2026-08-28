@@ -871,6 +871,8 @@ impl WorkspaceApi for FakeApi {
                     files: vec![],
                     has_uncommitted_changes: false,
                     has_untracked_files: false,
+                    files_truncated: false,
+                    total_files: None,
                 });
             }
             if force_refresh {
@@ -882,6 +884,8 @@ impl WorkspaceApi for FakeApi {
                     files: vec![],
                     has_uncommitted_changes: false,
                     has_untracked_files: false,
+                    files_truncated: false,
+                    total_files: None,
                 });
             }
             if workspace_id.as_str() == "empty" {
@@ -893,6 +897,8 @@ impl WorkspaceApi for FakeApi {
                     files: vec![],
                     has_uncommitted_changes: false,
                     has_untracked_files: false,
+                    files_truncated: false,
+                    total_files: None,
                 });
             }
             Ok(GitStatus {
@@ -910,6 +916,8 @@ impl WorkspaceApi for FakeApi {
                 }],
                 has_uncommitted_changes: true,
                 has_untracked_files: false,
+                files_truncated: false,
+                total_files: None,
             })
         })
     }
@@ -3655,6 +3663,18 @@ async fn agent_methods_validate_required_params() {
     assert_eq!(
         v["error"]["message"],
         serde_json::json!("workspaceId is required")
+    );
+
+    // agent.list with the contradictory includeRetired + retiredOnly pair.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","includeRetired":true,"retiredOnly":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("includeRetired and retiredOnly are mutually exclusive")
     );
 
     // agent.get without agentId.

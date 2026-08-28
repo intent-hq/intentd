@@ -232,6 +232,59 @@ async fn merge_requirements_retries_without_is_in_merge_queue_on_old_schemas() {
         .await
         .expect("degraded retry must succeed");
     assert_eq!(signals.is_in_merge_queue, None, "signal degrades to None");
+    assert_eq!(
+        signals.merge_queue_removal, None,
+        "removal event degrades to None alongside the flag"
+    );
     assert_eq!(signals.merge_state_status.as_deref(), Some("CLEAN"));
     assert!(signals.checks_known, "the rollup survived the retry");
+}
+
+/// The success path fetches the PR's latest merge-queue removal event in the
+/// same round trip and surfaces it as `merge_queue_removal`; an empty
+/// timeline window (never ejected) yields `None`.
+#[tokio::test]
+async fn merge_requirements_parses_merge_queue_removal_event() {
+    let envelope = |timeline_nodes: Value| {
+        json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "mergeStateStatus": "CLEAN",
+                        "isInMergeQueue": false,
+                        "timelineItems": { "nodes": timeline_nodes },
+                        "reviewDecision": "APPROVED",
+                        "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
+                            "contexts": { "nodes": [] }
+                        } } }] }
+                    }
+                }
+            }
+        })
+    };
+
+    let mock = spawn_mock_graphql(envelope(json!([{
+        "createdAt": "2026-08-26T22:26:36Z",
+        "reason": "failed_checks"
+    }])))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+    let signals = sc
+        .merge_requirements(&RepoRef::new("intent-hq", "intentd"), 1517)
+        .await
+        .expect("merge requirements");
+    let removal = signals.merge_queue_removal.expect("removal event surfaced");
+    assert_eq!(removal.at, "2026-08-26T22:26:36Z");
+    assert_eq!(removal.reason.as_deref(), Some("failed_checks"));
+    assert_eq!(signals.is_in_merge_queue, Some(false));
+
+    let mock = spawn_mock_graphql(envelope(json!([]))).await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+        .expect("build github client");
+    let signals = sc
+        .merge_requirements(&RepoRef::new("intent-hq", "intentd"), 1517)
+        .await
+        .expect("merge requirements");
+    assert_eq!(signals.merge_queue_removal, None, "never ejected");
 }

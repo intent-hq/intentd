@@ -21,11 +21,11 @@ use intent_core::{
     TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
     WorkspaceId, WorkspaceStatus,
 };
-use intent_services::{EventBus, Services};
+use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
 use intent_transport::{
-    ensure_tls_certificate, serve_uds, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
-    MAX_INBOUND_MESSAGE_BYTES,
+    ensure_tls_certificate, serve_uds, AsyncTokenStore, FileWatchStatus, SystemControl,
+    SystemStatus, TokenStore, WsApiServer, WsOptions, MAX_INBOUND_MESSAGE_BYTES,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -202,6 +202,11 @@ async fn make_services(
     if let Some(cache_dir) = models_cache_dir {
         services = services.with_models_cache_dir(&cache_dir);
     }
+    // Mirror the production composition root (main.rs): the AS-3
+    // completion-delivery worker turns agent completion events
+    // (idle/failed/deleted/retired) into watcher wakes. Detached — the task
+    // ends when the bus is dropped with the harness.
+    let _completion_worker = services.spawn_completion_delivery_loop();
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     (api, bus, store, registry, dir)
 }
@@ -949,15 +954,14 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
     srv.ws.stop().await;
 }
 
-/// monorepo#2932 — list-payload cost contract for `metadata.initialMessage`:
-/// the full spawn-time first message persists on the session and is served by
-/// the detail reads (`agent.get` / `agent.getSession`), but `agent.list` rows
-/// OMIT it (absent, never `null`) — it is the single largest per-session
-/// field on real workspaces and has no list-context consumer, so serving it
-/// per row scaled the frame past the 1 MiB outbound warn threshold at ~100
-/// sessions.
+/// Extending monorepo#2932 — `metadata.initialMessage` is stripped from the
+/// whole `AgentLite` projection: the full spawn-time first message persists
+/// on the session and is served by `agent.getSession`, but `agent.get` and
+/// `agent.list` rows OMIT it (absent, never `null`) — it was the last
+/// unbounded per-row field on real workspaces and no client reads it off
+/// agent rows.
 #[tokio::test]
-async fn wss_agent_list_omits_initial_message() {
+async fn wss_agent_lite_omits_initial_message() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
@@ -981,20 +985,36 @@ async fn wss_agent_list_omits_initial_message() {
         .expect("agent id")
         .to_string();
 
-    // Detail read still serves it.
+    // The session detail read still serves the persisted value.
+    let session_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let session = wss_call(srv.port, srv.cfg.clone(), &session_frame).await;
+    assert_eq!(
+        session["result"]["session"]["initialMessage"].as_str(),
+        Some("a long spawn-time first message"),
+        "agent.getSession keeps serving initialMessage: {session}"
+    );
+
+    // `agent.get` omits the field entirely.
     let get_frame = format!(
-        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
     );
     let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
-    assert_eq!(
-        got["result"]["agent"]["metadata"]["initialMessage"].as_str(),
-        Some("a long spawn-time first message"),
-        "agent.get keeps serving metadata.initialMessage: {got}"
+    assert!(
+        got["result"]["agent"]["metadata"].is_object(),
+        "agent.get row must carry a metadata object: {got}"
+    );
+    assert!(
+        got["result"]["agent"]["metadata"]
+            .get("initialMessage")
+            .is_none(),
+        "agent.get rows must omit metadata.initialMessage: {got}"
     );
 
     // The list row omits the field entirely.
     let list_frame = format!(
-        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
     );
     let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
     let row = listed["result"]["agents"]
@@ -1009,7 +1029,7 @@ async fn wss_agent_list_omits_initial_message() {
     );
     assert!(
         row["metadata"].get("initialMessage").is_none(),
-        "agent.list rows must omit metadata.initialMessage (monorepo#2932): {row}"
+        "agent.list rows must omit metadata.initialMessage: {row}"
     );
 
     srv.ws.stop().await;
@@ -1143,6 +1163,12 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
             .all(|a| a["id"].as_str() != Some(agent_id.as_str())),
         "retired row must be excluded from the default list: {listed}"
     );
+    // …but carries the always-present retiredCount (v8.2)…
+    assert_eq!(
+        listed["result"]["retiredCount"],
+        serde_json::json!(1),
+        "default list carries retiredCount: {listed}"
+    );
     // …includeRetired serves it, carrying retiredAt…
     let list_all_frame = format!(
         r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}","includeRetired":true}}}}"#
@@ -1158,6 +1184,45 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         row["retiredAt"].as_str(),
         Some(retired_at),
         "includeRetired rows carry retiredAt: {row}"
+    );
+    assert_eq!(
+        listed_all["result"]["retiredCount"],
+        serde_json::json!(1),
+        "includeRetired carries retiredCount too: {listed_all}"
+    );
+    // …retiredOnly serves ONLY the retired row (v8.2)…
+    let list_retired_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":15,"method":"agent.list","params":{{"workspaceId":"{ws_id}","retiredOnly":true}}}}"#
+    );
+    let listed_retired = wss_call(srv.port, srv.cfg.clone(), &list_retired_frame).await;
+    let retired_rows = listed_retired["result"]["agents"]
+        .as_array()
+        .expect("agents array");
+    assert_eq!(
+        retired_rows.len(),
+        1,
+        "retiredOnly serves only retired rows: {listed_retired}"
+    );
+    assert_eq!(retired_rows[0]["id"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(
+        retired_rows[0]["retiredAt"].as_str(),
+        Some(retired_at),
+        "retiredOnly rows carry retiredAt: {listed_retired}"
+    );
+    assert_eq!(
+        listed_retired["result"]["retiredCount"],
+        serde_json::json!(1),
+        "retiredOnly carries retiredCount too: {listed_retired}"
+    );
+    // …and the contradictory flag pair is rejected with -32602.
+    let both_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":16,"method":"agent.list","params":{{"workspaceId":"{ws_id}","includeRetired":true,"retiredOnly":true}}}}"#
+    );
+    let both = wss_call(srv.port, srv.cfg.clone(), &both_frame).await;
+    assert_eq!(
+        both["error"]["code"],
+        serde_json::json!(-32602),
+        "includeRetired + retiredOnly is -32602: {both}"
     );
     // …agent.get still serves the retired row (FE renders it read-only)…
     let got = wss_call(
@@ -1207,12 +1272,373 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         row.get("retiredAt").is_none(),
         "restored rows omit retiredAt: {row}"
     );
+    assert_eq!(
+        listed["result"]["retiredCount"],
+        serde_json::json!(0),
+        "restore drops retiredCount back to zero: {listed}"
+    );
+    let listed_retired = wss_call(srv.port, srv.cfg.clone(), &list_retired_frame).await;
+    assert_eq!(
+        listed_retired["result"]["agents"],
+        serde_json::json!([]),
+        "restored row must leave the retiredOnly list: {listed_retired}"
+    );
     // Idempotent-friendly no-op on a second restore.
     let restored_again = wss_call(srv.port, srv.cfg.clone(), &restore_frame).await;
     assert_eq!(
         restored_again["result"]["restored"],
         serde_json::json!(false),
         "second restore is the documented no-op: {restored_again}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// Retire cascade + cleanup over the real WSS transport (PROTOCOL §5.5):
+/// retiring a parent with an ACTIVE child is rejected (`InvalidParams`
+/// naming the child, nothing mutated); after the child settles the retire
+/// succeeds and cascades — parent AND child emit `agent:retired` to an
+/// `events.subscribe` subscriber (the child's reason names the parent), the
+/// parent's active hook is cancelled (`hook:cancelled`, no owner wake), and
+/// a watcher on the child receives the one-shot retired-notice wake (its
+/// completion watch is consumed). `agent.restore` resurrects neither the
+/// cancelled hook nor the consumed watch. PR-monitor cancellation is
+/// asserted at the unit level (`agent_ops` tests); this e2e covers the
+/// hook + watch sweeps.
+#[tokio::test]
+async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
+    /// Next `events.event` frame of any type, bounded by `deadline`.
+    async fn next_event_any(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        deadline: tokio::time::Instant,
+    ) -> Value {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for events.event")
+    }
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Retire Cascade"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let workspace_id = WorkspaceId(ws_id.clone());
+    let create_agent = |name: &str, id: i64| {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"{name}"}}}}"#
+        );
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        async move {
+            let created = wss_call(port, cfg, &frame).await;
+            created["result"]["agent"]["id"]
+                .as_str()
+                .expect("agent id")
+                .to_string()
+        }
+    };
+    let parent_id = create_agent("Coordinator", 2).await;
+    let child_id = create_agent("Junior", 3).await;
+    let watcher_id = create_agent("Watcher", 4).await;
+    let parent = intent_core::AgentId::from(parent_id.as_str());
+    let child = intent_core::AgentId::from(child_id.as_str());
+    let watcher = intent_core::AgentId::from(watcher_id.as_str());
+
+    // Link the child under the parent and mark it mid-turn (Active).
+    let mut child_session = srv.store.get_agent_session(&child).await.expect("child");
+    child_session.parent_agent_id = Some(parent.clone());
+    srv.store
+        .update_agent_session(&workspace_id, &child_session)
+        .await
+        .expect("link child to parent");
+    srv.store
+        .set_agent_session_status(
+            &workspace_id,
+            &child,
+            intent_core::AgentStatus::Active,
+            true,
+            &now_iso(),
+            None,
+        )
+        .await
+        .expect("set child active");
+
+    // Guard: retire fails while a descendant is running a turn — the error
+    // names the child and NOTHING is mutated.
+    let err = srv
+        .api
+        .agent_retire(parent.clone(), Some(workspace_id.clone()), None)
+        .await
+        .expect_err("retire with an active child must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("active child agent(s) still running a turn") && msg.contains("Junior"),
+        "guard error names the active child: {msg}"
+    );
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.get","params":{{"agentId":"{parent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        got["result"]["agent"].get("retiredAt").is_none(),
+        "rejected retire mutates nothing: {got}"
+    );
+
+    // Watcher arms a completion watch on the still-active child (an idle
+    // nothing-pending target would be rejected), then the child settles
+    // idle with no event — the watch stays armed for the retire.
+    let watch_result = srv
+        .api
+        .agent_watch(workspace_id.clone(), watcher.clone(), child.clone())
+        .await
+        .expect("watch child");
+    assert_eq!(
+        watch_result["ok"],
+        serde_json::json!(true),
+        "{watch_result}"
+    );
+    srv.store
+        .set_agent_session_status(
+            &workspace_id,
+            &child,
+            intent_core::AgentStatus::RuntimeIdle,
+            false,
+            &now_iso(),
+            None,
+        )
+        .await
+        .expect("settle child");
+
+    // Seed an ACTIVE hook owned by the retiring parent.
+    let hook_id = "hook-retire-cascade-e2e";
+    srv.store
+        .insert_hook(&intent_core::Hook {
+            hook_id: intent_core::HookId::from(hook_id),
+            workspace_id: workspace_id.clone(),
+            agent_id: parent.clone(),
+            name: "retire-watchdog".to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 600_000,
+            state: intent_core::HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: Some(now_iso()),
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some("2999-01-01T00:00:00Z".to_string()),
+            perpetual: false,
+            dispatch_count: 0,
+        })
+        .await
+        .expect("seed hook");
+
+    // Subscribe BEFORE the retire so no event can be missed.
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub.send(Message::Text(
+        format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"events.subscribe","params":{{"eventTypes":["agent:retired","hook:cancelled"],"workspaceId":"{ws_id}"}}}}"#
+        )
+        .into(),
+    ))
+    .await
+    .expect("send subscribe");
+    loop {
+        match sub.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                if v.get("id") == Some(&serde_json::json!(6)) {
+                    assert!(v["result"]["subscriptionId"].is_string(), "subscribe: {v}");
+                    break;
+                }
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    // Retire the parent: guard passes now, the cascade retires the child.
+    let retired = srv
+        .api
+        .agent_retire(
+            parent.clone(),
+            Some(workspace_id.clone()),
+            Some("shutting down".to_string()),
+        )
+        .await
+        .expect("retire parent");
+    assert_eq!(retired["success"], serde_json::json!(true), "{retired}");
+
+    // Collect the three lifecycle events (relative order not asserted).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (mut parent_retired, mut child_retired, mut hook_cancelled) = (None, None, None);
+    while parent_retired.is_none() || child_retired.is_none() || hook_cancelled.is_none() {
+        let ev = next_event_any(&mut sub, deadline).await;
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:retired" if ev["data"]["agentId"] == serde_json::json!(parent_id) => {
+                parent_retired = Some(ev);
+            }
+            "agent:retired" if ev["data"]["agentId"] == serde_json::json!(child_id) => {
+                child_retired = Some(ev);
+            }
+            "hook:cancelled" if ev["data"]["hookId"] == serde_json::json!(hook_id) => {
+                hook_cancelled = Some(ev);
+            }
+            _ => {}
+        }
+    }
+    let parent_retired = parent_retired.expect("parent agent:retired");
+    assert_eq!(parent_retired["data"]["agentName"], "Coordinator");
+    assert_eq!(parent_retired["data"]["reason"], "shutting down");
+    let child_retired = child_retired.expect("child agent:retired");
+    assert_eq!(child_retired["data"]["agentName"], "Junior");
+    assert_eq!(
+        child_retired["data"]["reason"], "parent Coordinator retired",
+        "cascade reason names the parent: {child_retired}"
+    );
+    let hook_cancelled = hook_cancelled.expect("hook:cancelled");
+    assert_eq!(
+        hook_cancelled["data"]["state"], "cancelled",
+        "{hook_cancelled}"
+    );
+
+    // Both rows are inert: excluded from the default list, retiredAt served.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    let listed_ids: Vec<&str> = listed["result"]["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .filter_map(|a| a["id"].as_str())
+        .collect();
+    assert!(
+        !listed_ids.contains(&parent_id.as_str()) && !listed_ids.contains(&child_id.as_str()),
+        "retired parent+child excluded from the default list: {listed}"
+    );
+
+    // The watcher's one-shot watch settles with the retired-notice wake. No
+    // AgentManager is attached in this harness, so the wake persists
+    // directly to the watcher's transcript — poll agent.getConversation.
+    let notice = "The agent retired and cannot be re-watched or woken again";
+    let conv_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getConversation","params":{{"agentId":"{watcher_id}"}}}}"#
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let wake_text = loop {
+        let conv = wss_call(srv.port, srv.cfg.clone(), &conv_frame).await;
+        let found = conv["result"]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .find_map(|m| {
+                let text = serde_json::to_string(&m["contentBlocks"]).unwrap_or_default();
+                text.contains(notice).then_some(text)
+            });
+        if let Some(text) = found {
+            break text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retired-notice wake never reached the watcher: {conv}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(
+        wake_text.contains("Junior"),
+        "the wake names the retired agent: {wake_text}"
+    );
+
+    // The consumed watch is gone from the watcher's subscriptions.
+    let subs_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"agent.getSubscriptions","params":{{"workspaceId":"{ws_id}","agentId":"{watcher_id}"}}}}"#
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let subs = wss_call(srv.port, srv.cfg.clone(), &subs_frame).await;
+        let remaining = subs["result"]["subscriptions"]
+            .as_array()
+            .expect("subscriptions array");
+        if remaining.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "consumed watch still listed: {subs}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Restore BOTH sessions: neither the cancelled hook nor the consumed
+    // watch is resurrected, and restoring the parent earlier would not have
+    // restored the child (each row is individually restorable).
+    for (id, agent_id) in [(10, &parent_id), (11, &child_id)] {
+        let restore_frame = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.restore","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}"}}}}"#
+        );
+        let restored = wss_call(srv.port, srv.cfg.clone(), &restore_frame).await;
+        assert_eq!(
+            restored["result"]["restored"],
+            serde_json::json!(true),
+            "restore {agent_id}: {restored}"
+        );
+    }
+    let hooks = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"hook.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let hook_row = hooks["result"]["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["hookId"] == serde_json::json!(hook_id))
+        .expect("seeded hook listed");
+    assert_eq!(
+        hook_row["state"],
+        serde_json::json!("cancelled"),
+        "restore does not resurrect the cancelled hook: {hook_row}"
+    );
+    let subs = wss_call(srv.port, srv.cfg.clone(), &subs_frame).await;
+    assert!(
+        subs["result"]["subscriptions"]
+            .as_array()
+            .expect("subscriptions array")
+            .is_empty(),
+        "restore does not resurrect the consumed watch: {subs}"
     );
 
     srv.ws.stop().await;
@@ -4893,18 +5319,118 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
 
 #[cfg(unix)]
 #[tokio::test]
-async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
+async fn wss_models_list_legacy_fresh_entry_served_and_forced_failure_stale() {
     // models.list legacy path contract (§5.30) over the real WSS transport:
-    // cached entries are served indefinitely — a NON-forced read whose
-    // persisted entry is arbitrarily old (fetchedAtMs: 0) serves it plainly
-    // (`{ models, source }`, no `stale`, no `warning`, no probe). A FORCED
-    // read whose probe fails serves the same last-good list labeled
-    // `stale: true` + `warning` — exactly `{ models, source, stale, warning }`
-    // with `source: "auggie"`, never a silent static fallback. The fake
-    // auggie appends to a counter file per invocation and always fails,
-    // making CLI spawns observable.
+    // a NON-forced read whose persisted entry is fresh (younger than the 24h
+    // staleness threshold) serves it plainly (`{ models, source }`, no
+    // `stale`, no `warning`, no probe). A FORCED read whose probe fails
+    // serves the same last-good list labeled `stale: true` + `warning` —
+    // exactly `{ models, source, stale, warning }` with `source: "auggie"`,
+    // never a silent static fallback. The fake auggie appends to a counter
+    // file per invocation and always fails, making CLI spawns observable.
     use std::os::unix::fs::PermissionsExt;
     let dir = test_tempdir("intentd-wss-models-stale-");
+    let count = dir.path().join("count");
+    let bin = dir.path().join("auggie");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\necho x >> {}\nexit 1\n", count.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let calls = || std::fs::read_to_string(&count).map_or(0, |s| s.lines().count());
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis(),
+    )
+    .expect("unix ms fits in u64");
+    let last_good = serde_json::json!({
+        "version": 2,
+        "entries": {
+            "auggie": {
+                "versionKey": AUGGIE_CATALOG_VERSION,
+                "fetchedAtMs": now_ms,
+                "models": [ { "id": "lg", "name": "LG", "provider": "auggie" } ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&last_good).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        Some(bin),
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+
+    // Non-forced: the fresh persisted entry is a plain cache hit.
+    let frame = r#"{"jsonrpc":"2.0","id":45,"method":"models.list"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 45);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["source"], "auggie");
+    assert_eq!(
+        resp["result"]["models"],
+        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
+    );
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["models", "source"], "{resp}");
+    assert_eq!(
+        calls(),
+        0,
+        "non-forced fresh cache hit must not spawn the CLI"
+    );
+
+    // Forced: the probe runs, fails, and the last-good list is served stale.
+    let frame =
+        r#"{"jsonrpc":"2.0","id":46,"method":"models.list","params":{"forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 46);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["source"], "auggie");
+    assert_eq!(resp["result"]["stale"], true, "{resp}");
+    assert!(resp["result"]["warning"].is_string(), "{resp}");
+    assert_eq!(
+        resp["result"]["models"],
+        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
+    );
+    // Legacy shape plus the documented degradation labels — no providerId.
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
+    assert!(calls() > 0, "forced read must spawn the CLI");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
+    // models.list legacy path staleness contract (§5.30) over the real WSS
+    // transport: a NON-forced read whose persisted entry is past the 24h
+    // staleness threshold (fetchedAtMs: 0) re-probes; when the probe fails,
+    // the last-good list keeps being served labeled `stale: true` +
+    // `warning` — exactly `{ models, source, stale, warning }` with
+    // `source: "auggie"`, never a silent static fallback. The fake auggie
+    // appends to a counter file per invocation and always fails, making CLI
+    // spawns observable.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = test_tempdir("intentd-wss-models-aged-");
     let count = dir.path().join("count");
     let bin = dir.path().join("auggie");
     std::fs::write(
@@ -4936,31 +5462,11 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
     )
     .await;
 
-    // Non-forced: the arbitrarily old persisted entry is a plain cache hit.
-    let frame = r#"{"jsonrpc":"2.0","id":45,"method":"models.list"}"#;
+    // Non-forced: the aged entry triggers a re-probe; the probe fails, so
+    // the last-good list is served with the degradation labels.
+    let frame = r#"{"jsonrpc":"2.0","id":47,"method":"models.list"}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
-    assert_eq!(resp["id"], 45);
-    assert!(resp.get("error").is_none(), "{resp}");
-    assert_eq!(resp["result"]["source"], "auggie");
-    assert_eq!(
-        resp["result"]["models"],
-        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
-    );
-    let mut keys: Vec<_> = resp["result"]
-        .as_object()
-        .expect("result object")
-        .keys()
-        .cloned()
-        .collect();
-    keys.sort();
-    assert_eq!(keys, ["models", "source"], "{resp}");
-    assert_eq!(calls(), 0, "non-forced cache hit must not spawn the CLI");
-
-    // Forced: the probe runs, fails, and the last-good list is served stale.
-    let frame =
-        r#"{"jsonrpc":"2.0","id":46,"method":"models.list","params":{"forceRefresh":true}}"#;
-    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
-    assert_eq!(resp["id"], 46);
+    assert_eq!(resp["id"], 47);
     assert!(resp.get("error").is_none(), "{resp}");
     assert_eq!(resp["result"]["source"], "auggie");
     assert_eq!(resp["result"]["stale"], true, "{resp}");
@@ -4969,7 +5475,6 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
         resp["result"]["models"],
         serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
     );
-    // Legacy shape plus the documented degradation labels — no providerId.
     let mut keys: Vec<_> = resp["result"]
         .as_object()
         .expect("result object")
@@ -4978,7 +5483,22 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
-    assert!(calls() > 0, "forced read must spawn the CLI");
+    assert!(calls() > 0, "aged non-forced read must spawn the CLI");
+    let after_probe = calls();
+
+    // Within the negative window: the stale last-good list keeps being
+    // served without re-spawning the CLI.
+    let frame = r#"{"jsonrpc":"2.0","id":48,"method":"models.list"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 48);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["source"], "auggie");
+    assert_eq!(resp["result"]["stale"], true, "{resp}");
+    assert_eq!(
+        calls(),
+        after_probe,
+        "negative window must suppress the re-probe"
+    );
     srv.ws.stop().await;
 }
 
@@ -6026,6 +6546,42 @@ async fn heartbeat_terminates_silent_client() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(terminated, "silent client must be terminated by heartbeat");
+    srv.ws.stop().await;
+}
+
+/// Companion to [`heartbeat_terminates_silent_client`] and regression guard
+/// for intent-hq/intent#3712: a client that keeps polling its stream (and so
+/// auto-pongs every server ping) must SURVIVE many heartbeat interval+timeout
+/// cycles. This would catch a mixed-clock regression in the pong bookkeeping —
+/// e.g. storing wall-clock ms on pong receipt while the reaper compares
+/// against monotonic ms (or vice versa) — which makes even responsive clients
+/// look stale and get reaped within one timeout window.
+#[tokio::test]
+async fn heartbeat_keeps_responsive_client_alive() {
+    let srv = start(WsOptions {
+        heartbeat_interval: Duration::from_millis(100),
+        heartbeat_timeout: Duration::from_millis(200),
+        ..WsOptions::default()
+    })
+    .await;
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    // Keep the stream polled so tungstenite answers each Ping with a Pong.
+    let poller = tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+    for _ in 0..50 {
+        if srv.ws.client_count() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(srv.ws.client_count(), 1, "client should register");
+    // Outlive many timeout windows (2s >> 200ms timeout, >= 20 ping cycles).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        srv.ws.client_count(),
+        1,
+        "responsive client must survive heartbeat cycles"
+    );
+    poller.abort();
     srv.ws.stop().await;
 }
 
@@ -9385,6 +9941,40 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
     .await;
     assert_eq!(bad_sub["error"]["code"], -32602);
 
+    // `includeInProgress` (§5.5, monorepo#3647): boolean values are
+    // accepted — with no turn in flight both shapes match the opted-out
+    // read — and a non-boolean is `-32602`.
+    let opted_in = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","includeInProgress":true}}}}"#
+        ),
+    )
+    .await;
+    let opted_out = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","includeInProgress":false}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        opted_in["result"], opted_out["result"],
+        "idle agent: includeInProgress adds nothing"
+    );
+    assert!(opted_in["result"]["messages"][0]["inProgress"].is_null());
+    let bad_flag = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","includeInProgress":"yes"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_flag["error"]["code"], -32602);
+
     srv.ws.stop().await;
 }
 
@@ -11920,4 +12510,166 @@ async fn wss_unacceptable_extension_offer_declines_to_plain_connection() {
     );
     let _ = ws.close(None).await;
     srv.ws.stop().await;
+}
+
+/// Minimal [`SystemControl`] whose `fileWatch` comes from a real
+/// [`WatchHealth`] handle — the same mapping the composition root (main.rs)
+/// performs — so the WSS e2e below exercises the real
+/// registry → hub → snapshot → render path. Every other field is a fixed
+/// plausible value; only `fileWatch` is under test.
+struct WatchHealthControl {
+    health: WatchHealth,
+}
+
+impl SystemControl for WatchHealthControl {
+    fn status(&self) -> SystemStatus {
+        SystemStatus {
+            listen_mode: "both".to_string(),
+            uds: true,
+            tcp: true,
+            port: None,
+            clients: 1,
+            agents: 0,
+            fingerprint: None,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            has_display: false,
+            max_agents: 1,
+            version: "0.0.0-test".to_string(),
+            build_commit: None,
+            uptime_seconds: 0,
+            local_ips: Vec::new(),
+            hostname: "test".to_string(),
+            pretty_hostname: "test".to_string(),
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+            child_processes: None,
+            child_memory_bytes: None,
+            child_memory_peak_bytes: None,
+            agent_memory_budget_bytes: None,
+            agent_memory_charged_bytes: None,
+            queued_spawns: None,
+            workspaces_disk_available_bytes: None,
+            workspaces_disk_total_bytes: None,
+            file_watch: self.health.snapshot().map(|s| FileWatchStatus {
+                active_streams: s.active_streams,
+                total_roots: s.total_roots,
+                failed_roots: s.failed_roots,
+            }),
+        }
+    }
+    fn request_shutdown(&self) {}
+    fn request_update(&self) -> std::result::Result<(), String> {
+        Err("not supported in this test".to_string())
+    }
+    fn import_legacy(
+        &self,
+        _force: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
+    > {
+        Box::pin(async { Err("not supported in this test".to_string()) })
+    }
+    fn git_credential(
+        &self,
+        _client_pid: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
+    {
+        Box::pin(async { None })
+    }
+}
+
+/// Watch-coverage health over the real WSS transport (intent-hq/intent#3708):
+/// `fileWatch` is absent from `system.status` until the watcher registry
+/// attaches the [`WatchHealth`] handle, then present — including when healthy
+/// (`failedRoots: 0`) — through the same TLS + bearer-auth upgrade path
+/// production clients use. The degraded (watcher-creation-failure) shape is
+/// covered end-to-end over UDS in `uds_control.rs`; both transports share one
+/// render path (`status_json`), so this presence/shape proof carries over.
+#[tokio::test]
+async fn system_status_surfaces_file_watch_coverage_over_wss() {
+    let dir = test_tempdir("intentd-wss-fw-");
+    let store = Store::open(&dir.path().join("intentd.db"))
+        .await
+        .expect("open store");
+    let bus = EventBus::new(store.clone());
+    let workspaces_root = dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir workspaces root");
+    let registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("load settings registry"),
+    );
+    let services = Services::new(store.clone())
+        .with_assets_root(dir.path().join("assets"))
+        .with_workspaces_root(workspaces_root)
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    let status_cache = services.git_status_cache();
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+
+    // Health handle created BEFORE the registry, as in the composition root:
+    // registry init is backgrounded in production, so `fileWatch` must read as
+    // absent until attachment.
+    let health = WatchHealth::default();
+    let control: Arc<dyn SystemControl> = Arc::new(WatchHealthControl {
+        health: health.clone(),
+    });
+
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let opts = WsOptions {
+        base_port: 0,
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
+        ..WsOptions::default()
+    };
+    let ws = WsApiServer::new(
+        api.clone(),
+        bus.clone(),
+        &tls,
+        &token_store,
+        opts,
+        Some(control),
+    )
+    .expect("server");
+    let cfg = client_config(&tls.fingerprint256);
+    let port = ws.start().await.expect("start");
+
+    // Before the registry starts: the whole `fileWatch` object is absent, not
+    // null — presence-detected on the wire.
+    let frame = r#"{"jsonrpc":"2.0","id":1,"method":"system.status"}"#;
+    let resp = wss_call(port, cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 1, "id echoed: {resp}");
+    assert!(
+        resp["result"].is_object(),
+        "system.status over WSS returns a result: {resp}"
+    );
+    assert!(
+        resp["result"].get("fileWatch").is_none(),
+        "fileWatch must be absent before the registry attaches: {resp}"
+    );
+
+    // Start the real watcher registry (attaches `health` to the hub). No
+    // workspaces exist, so the healthy snapshot is present with zero counts —
+    // present-when-healthy is the contract, letting clients distinguish
+    // "healthy" from "not yet measurable".
+    let refresher = Arc::new(GitStatusRefresher::start(
+        bus.clone(),
+        api.clone(),
+        status_cache,
+    ));
+    let _watcher_registry =
+        WatcherRegistry::start_with_health(bus.clone(), api.clone(), refresher, &health).await;
+
+    let resp = wss_call(port, cfg, frame).await;
+    let fw = &resp["result"]["fileWatch"];
+    assert!(
+        fw.is_object(),
+        "fileWatch must appear once the registry attaches: {resp}"
+    );
+    assert_eq!(fw["failedRoots"], 0, "healthy daemon: {resp}");
+    assert!(fw["activeStreams"].is_u64(), "activeStreams: {resp}");
+    assert!(fw["totalRoots"].is_u64(), "totalRoots: {resp}");
+    ws.stop().await;
 }

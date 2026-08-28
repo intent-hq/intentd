@@ -417,16 +417,32 @@ mod build_args_tests {
     }
 
     #[test]
+    fn build_args_propagates_tools_to_remove_for_droid() {
+        // droid takes a single comma-joined denylist flag.
+        let droid = intent_providers::find_provider("droid").unwrap();
+        let mut opts = SpawnOptions::new(droid);
+        opts.tools_to_remove = vec!["Edit", "Create", "ApplyPatch", "Task"];
+        let args = build_args(&opts);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--disabled-tools", "Edit,Create,ApplyPatch,Task"]),
+            "droid spawn args missing comma-joined denylist: {args:?}"
+        );
+    }
+
+    #[test]
     fn build_args_omits_remove_tool_flags_for_non_supporting_providers() {
-        // claude-code / codex etc. don't advertise --remove-tool support; the
-        // spawn layer must not leak an unknown flag to them.
+        // claude-code / codex etc. don't advertise a spawn-time tool-removal
+        // flag; the spawn layer must not leak an unknown flag to them. grok
+        // is in this set: its `--disallowed-tools` flag is headless-only and
+        // clap-rejected on `agent stdio`, so the registry leaves it unset.
         for id in [
             "claude-code",
             "codex",
             "cortex",
-            "opencode",
-            "droid",
             "grok",
+            "opencode",
+            "pi",
             "mock",
         ] {
             let provider = intent_providers::find_provider(id).unwrap();
@@ -434,8 +450,10 @@ mod build_args_tests {
             opts.tools_to_remove = vec!["str-replace-editor"];
             let args = build_args(&opts);
             assert!(
-                !args.iter().any(|a| a == "--remove-tool"),
-                "{id} spawn args unexpectedly include --remove-tool: {args:?}"
+                !args.iter().any(|a| a == "--remove-tool"
+                    || a == "--disallowed-tools"
+                    || a == "--disabled-tools"),
+                "{id} spawn args unexpectedly include a tool-removal flag: {args:?}"
             );
         }
     }

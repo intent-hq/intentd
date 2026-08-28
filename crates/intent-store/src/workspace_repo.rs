@@ -401,6 +401,53 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Scoped, conditional unarchive flip: set `status`/`archived`/
+    /// `archived_at` (plus `updated_at`) back to Active ONLY when the row is
+    /// currently archived, so the write and the "did this call flip it"
+    /// decision are a single atomic statement — two concurrent unarchivers
+    /// (or an unarchive racing a turn-start auto-unarchive) can both read
+    /// `archived: true`, but exactly one write affects a row. Same
+    /// scoped-update discipline as [`Self::set_workspace_attention`]. Returns
+    /// whether a row was written (`true` ⇒ this call performed the flip);
+    /// `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn unarchive_workspace_if_archived(
+        &self,
+        id: &WorkspaceId,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE workspace SET status=?, archived=0, archived_at=NULL, updated_at=? \
+             WHERE id=? AND archived=1",
+        )
+        .bind(enum_to_db(&WorkspaceStatus::Active)?)
+        .bind(updated_at)
+        .bind(&id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("conditional unarchive failed: {e}")))?;
+        if res.rows_affected() > 0 {
+            return Ok(true);
+        }
+        // Zero rows: either the row is already active (no flip) or the
+        // workspace is missing — distinguish so callers keep NotFound
+        // semantics.
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?) AS present")
+            .bind(&id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("conditional unarchive presence check failed: {e}"))
+            })?;
+        if col::<i64>(&row, "present")? == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(false)
+    }
+
     /// Scoped, monotonic `last_activity` write (monorepo#1580): set ONLY the
     /// `last_activity` column — never `updated_at`, never a full-row replace —
     /// and only when the supplied timestamp is strictly newer than the stored

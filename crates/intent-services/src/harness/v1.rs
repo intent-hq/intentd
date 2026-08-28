@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::TaskStatus;
 
 use super::{ChildSettlementParams, Doctrine, Harness, HarnessEntry, TurnEnvelopeParams};
@@ -98,6 +98,7 @@ fn settlement_kind(event_type: &str) -> &str {
         AGENT_IDLE => "completed",
         AGENT_FAILED => "failed",
         AGENT_DELETED => "was deleted",
+        AGENT_RETIRED => "retired",
         other => other,
     }
 }
@@ -511,11 +512,18 @@ impl Harness for V1 {
             // A deleted agent fails closed in `agent.watch` (rejected as
             // unknown) and has no next completion, so the deleted-kind wake
             // must not carry the re-arm pointer — say the agent cannot be
-            // re-watched instead.
+            // re-watched instead. A retired agent is inert the same way
+            // (`agent.watch` rejects it), so its wake drops the re-arm
+            // pointer too.
             if params.event_type == AGENT_DELETED {
                 msg.push_str(
                     " NOTE: this wake consumed your one-shot watch on this agent — the watch is \
                      now retired. The agent was deleted, so it cannot be re-watched.",
+                );
+            } else if params.event_type == AGENT_RETIRED {
+                msg.push_str(
+                    " NOTE: this wake consumed your one-shot watch on this agent — the watch is \
+                     now retired. The agent retired and cannot be re-watched or woken again.",
                 );
             } else {
                 let _ = write!(msg, " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
@@ -994,6 +1002,23 @@ impl Harness for V1 {
             } else {
                 "left the merge queue".to_string()
             });
+        }
+        // Keyed on the event identity (`at`), not the queued flag: an
+        // enter→eject pair that nets out on `isInMergeQueue` still yields
+        // this reportable line.
+        let ejection_at = |r: &crate::pr_ops::MergeRequirements| {
+            r.merge_queue_ejection.as_ref().map(|e| e.at.clone())
+        };
+        if ejection_at(o) != ejection_at(n) {
+            if let Some(e) = &n.merge_queue_ejection {
+                changes.push(match &e.reason {
+                    Some(reason) => format!(
+                        "removed from the merge queue ({})",
+                        reason.replace('_', " ")
+                    ),
+                    None => "removed from the merge queue".to_string(),
+                });
+            }
         }
         if o.mergeable != n.mergeable {
             changes.push(format!(

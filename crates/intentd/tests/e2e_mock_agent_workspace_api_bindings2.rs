@@ -705,6 +705,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("get conversation");
@@ -1037,6 +1038,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("get conversation");

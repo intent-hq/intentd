@@ -215,6 +215,7 @@ async fn agent_conversation_and_summary() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("get conversation");

@@ -27,6 +27,8 @@ pub struct PersistedCompletionWatch {
     /// Explicit `agent.watch` watches also wake on the child's attention
     /// requests (blocker/discussion); auto-registered watches default false.
     pub wake_on_attention: bool,
+    /// Ask-only watches wait for terminal completion and ignore attention.
+    pub completion_only: bool,
     pub created_at: String,
 }
 
@@ -179,14 +181,15 @@ impl Store {
             "INSERT INTO completion_watch (
                 id, parent_workspace_id, child_workspace_id, parent_agent_id,
                 parent_agent_name, child_agent_id, group_id,
-                report_delivered, wake_on_attention, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                report_delivered, wake_on_attention, completion_only, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 parent_workspace_id = excluded.parent_workspace_id,
                 parent_agent_name = excluded.parent_agent_name,
                 group_id = excluded.group_id,
                 report_delivered = excluded.report_delivered,
-                wake_on_attention = excluded.wake_on_attention",
+                wake_on_attention = excluded.wake_on_attention,
+                completion_only = excluded.completion_only",
         )
         .bind(&w.id)
         .bind(&w.parent_workspace_id.0)
@@ -197,6 +200,7 @@ impl Store {
         .bind(&w.group_id)
         .bind(i64::from(w.report_delivered))
         .bind(i64::from(w.wake_on_attention))
+        .bind(i64::from(w.completion_only))
         .bind(&w.created_at)
         .execute(self.write_pool())
         .await
@@ -214,7 +218,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT id, parent_workspace_id, child_workspace_id, parent_agent_id,
                     parent_agent_name, child_agent_id, group_id,
-                    report_delivered, wake_on_attention, created_at
+                    report_delivered, wake_on_attention, completion_only, created_at
              FROM completion_watch
              ORDER BY created_at ASC",
         )
@@ -375,6 +379,10 @@ fn decode_watch_row(row: &sqlx::sqlite::SqliteRow) -> Result<PersistedCompletion
         wake_on_attention: row
             .try_get::<i64, _>("wake_on_attention")
             .map_err(|e| Error::Internal(format!("decode wake_on_attention: {e}")))?
+            != 0,
+        completion_only: row
+            .try_get::<i64, _>("completion_only")
+            .map_err(|e| Error::Internal(format!("decode completion_only: {e}")))?
             != 0,
         created_at: row
             .try_get("created_at")

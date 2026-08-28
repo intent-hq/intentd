@@ -12,15 +12,16 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine as _;
 use intent_core::events::{
-    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
-    COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
-    GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED, LINE_ATTRIBUTION_UPDATED,
-    NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE,
-    SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED, TASK_AGENT_UNLINKED,
-    TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED, WORKSPACE_SETUP_COMPLETED,
-    WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED, CHANGES_GIT_STATUS,
+    CHANGES_METRICS_CHANGED, COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL,
+    GIT_PUSH, GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED,
+    LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
+    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
+    TASK_AGENT_UNLINKED, TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
+    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED,
+    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED,
+    WORKSPACE_SETUP_COMPLETED, WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED,
+    WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -132,6 +133,8 @@ mod workspace_status;
 pub mod workspace_vocabulary;
 
 #[cfg(test)]
+mod test_tracing;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod v1_1_goldens;
@@ -175,7 +178,8 @@ pub use agent_session::SuspendOverlapQuery;
 // (they now take the crate-private shared-stream hub), so only the registry and
 // the bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry,
+    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatchHealth,
+    WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -272,8 +276,10 @@ pub struct Services {
     /// `agent:session-stats-changed` only when the rollup actually moved (§6.5).
     session_stats_cache: Arc<Mutex<HashMap<AgentId, SessionStats>>>,
     /// The one `models.list` model cache (PROTOCOL §5.30): entries keyed by
-    /// provider id + registry-derived version key, served indefinitely (a
-    /// probe runs only on a cache miss or `forceRefresh`), persisted in
+    /// provider id + registry-derived version key, re-probed once aged (a
+    /// probe runs on a cache miss, on an entry at or past the 24h staleness
+    /// threshold, or on `forceRefresh`; a failed re-probe serves the
+    /// last-good list labeled stale), persisted in
     /// the daemon data dir when configured via
     /// [`Services::with_models_cache_dir`]; also holds the per-provider
     /// single-flight and negative-cache state. Both the per-provider path
@@ -314,6 +320,9 @@ pub struct Services {
     /// the `after_all` group fan-in (AS-4) consume it later. Shared across
     /// clones like the other in-memory registries.
     agent_subscriptions: Arc<Mutex<agent_subscriptions::SubscriptionRegistry>>,
+    /// Serializes strict completion-only ask registration so a watch is
+    /// durably persisted before it becomes visible to completion delivery.
+    completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
     /// `agent_id → (last error text, consecutive count)`. Incremented by the
     /// terminal-failure handler when the same error text repeats back-to-back,
@@ -893,6 +902,7 @@ impl Services {
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
+            completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
@@ -1242,6 +1252,43 @@ impl Services {
             .with_embedded(entry.doctrine.specialists)
             .resolve_display_name(specialist_id, workspace_path)
             .is_some()
+    }
+
+    /// Whether a session's specialist resolves to the `orchestrator` role —
+    /// the spawn-time gate for the orchestrator tool denylist (§18.4,
+    /// [`intent_acp::get_native_tools_to_remove`]). The frozen
+    /// creation-time snapshot (`metadata.specialistIsOrchestrator`, written
+    /// by `agent_create_op` and refreshed by `agent_update_op` on a
+    /// specialist change) wins when present — like the identity snapshot
+    /// keys, so later edits/deletes of specialist files never hand an
+    /// orchestrator its file-editing tools back mid-life. Gated on
+    /// `session.specialist` (mirroring `agent_specialist_injection`'s
+    /// write-side invariant), so a caller-supplied key on a non-specialist
+    /// session stays inert. Legacy sessions (no snapshot) fall through to
+    /// live resolution against the session's harness-pinned embedded floor
+    /// (H2), like the other session-scoped specialist reads; the name-based
+    /// fallback for the historical `spec-writer`/`coordinator` ids lives in
+    /// [`specialists::SpecialistsService::resolve_is_orchestrator`].
+    pub(crate) fn session_specialist_is_orchestrator(
+        &self,
+        session: &AgentSession,
+        workspace_path: Option<&Path>,
+    ) -> bool {
+        let Some(specialist_id) = session.specialist.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        if let Some(frozen) = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("specialistIsOrchestrator"))
+            .and_then(serde_json::Value::as_bool)
+        {
+            return frozen;
+        }
+        let entry = crate::harness::resolve_entry(&session.harness_version);
+        self.specialists_service()
+            .with_embedded(entry.doctrine.specialists)
+            .resolve_is_orchestrator(specialist_id, workspace_path)
     }
 
     /// Resolve every non-hidden specialist's delegation `modelOptions`
@@ -1881,55 +1928,85 @@ impl Services {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
 
-            // Get the current workspace and capture its old lastActivity.
-            let mut ws = match this.store.get_workspace(&ws_id).await {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!(workspace = %ws_id.as_str(), error = %e, "schedule_last_activity_event: get_workspace failed");
-                    return;
-                }
-            };
-            let old_activity = ws.last_activity.clone();
-
-            // Recompute lastActivity via the existing aggregation.
-            this.derive_last_activity(&mut ws).await;
-            let new_activity = ws.last_activity.clone();
-
-            // Emit only when the derived value changed.
-            if old_activity != new_activity {
-                if let Some(new_val) = &new_activity {
-                    // Persist the derived value (monorepo#1580). Without this
-                    // the column keeps whatever the last full-row write left
-                    // behind, so cheap read paths that do not derive
-                    // (`list_workspaces_lite`, the `workspace.subscribe` seq-0
-                    // snapshot) serve a stale `lastActivity` after a restart.
-                    // Scoped + monotonic: only this column moves, and an
-                    // out-of-order late timer can never walk the value back.
-                    // A declined bump (a concurrent writer already persisted
-                    // something newer) still emits below — the event is a
-                    // change signal, and the concurrent task's own event
-                    // carries the newer value.
-                    if let Err(e) = this
-                        .store
-                        .bump_workspace_last_activity(&ws_id, new_val)
-                        .await
-                    {
-                        tracing::warn!(
-                            workspace = %ws_id.as_str(),
-                            error = %e,
-                            "schedule_last_activity_event: persist lastActivity failed"
-                        );
+            // Inner block so the gen-guarded self-removal below runs on every
+            // exit path — an early return here must not strand this task's
+            // `(gen, AbortHandle)` entry in the map (monorepo#3623: a timer
+            // re-armed by a bump racing the delete would otherwise leak its
+            // entry for the daemon's lifetime, since ids are never recycled
+            // and the delete's own cancel has already run).
+            async {
+                // Get the current workspace and capture its old lastActivity.
+                let mut ws = match this.store.get_workspace(&ws_id).await {
+                    Ok(w) => w,
+                    Err(Error::NotFound(_)) => {
+                        // Expected shape, not a failure (monorepo#3623): the
+                        // workspace was deleted while the timer was pending —
+                        // `workspace.delete` cancels the schedule, but a bump
+                        // racing the delete can still re-arm one after the
+                        // cancel. Ids are never recycled, so not-found here
+                        // always means "deleted mid-window"; there is nothing
+                        // left to derive against.
+                        tracing::debug!(workspace = %ws_id.as_str(), "schedule_last_activity_event: workspace deleted before the debounce fired; skipping");
+                        return;
                     }
-                    publish_event(
-                        this.event_bus.as_ref(),
-                        workspace_updated_event(
-                            &ws_id,
-                            &serde_json::json!({ "lastActivity": new_val }),
-                        ),
-                    )
-                    .await;
+                    Err(e) => {
+                        tracing::warn!(workspace = %ws_id.as_str(), error = %e, "schedule_last_activity_event: get_workspace failed");
+                        return;
+                    }
+                };
+                let old_activity = ws.last_activity.clone();
+
+                // Recompute lastActivity via the existing aggregation.
+                this.derive_last_activity(&mut ws).await;
+                let new_activity = ws.last_activity.clone();
+
+                // Emit only when the derived value changed.
+                if old_activity != new_activity {
+                    if let Some(new_val) = &new_activity {
+                        // Persist the derived value (monorepo#1580). Without this
+                        // the column keeps whatever the last full-row write left
+                        // behind, so cheap read paths that do not derive
+                        // (`list_workspaces_lite`, the `workspace.subscribe` seq-0
+                        // snapshot) serve a stale `lastActivity` after a restart.
+                        // Scoped + monotonic: only this column moves, and an
+                        // out-of-order late timer can never walk the value back.
+                        // A declined bump (a concurrent writer already persisted
+                        // something newer) still emits below — the event is a
+                        // change signal, and the concurrent task's own event
+                        // carries the newer value.
+                        match this
+                            .store
+                            .bump_workspace_last_activity(&ws_id, new_val)
+                            .await
+                        {
+                            // Same deleted-mid-window shape as above, through
+                            // the narrower window between the successful
+                            // `get_workspace` and this persist (monorepo#3623).
+                            Err(Error::NotFound(_)) => {
+                                tracing::debug!(workspace = %ws_id.as_str(), "schedule_last_activity_event: workspace deleted before lastActivity persisted; skipping");
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    workspace = %ws_id.as_str(),
+                                    error = %e,
+                                    "schedule_last_activity_event: persist lastActivity failed"
+                                );
+                            }
+                            Ok(_) => {}
+                        }
+                        publish_event(
+                            this.event_bus.as_ref(),
+                            workspace_updated_event(
+                                &ws_id,
+                                &serde_json::json!({ "lastActivity": new_val }),
+                            ),
+                        )
+                        .await;
+                    }
                 }
             }
+            .await;
 
             // Remove ourselves from the debouncers map only if we're still the current task.
             if let Ok(mut map) = debouncers.lock() {
@@ -1956,6 +2033,31 @@ impl Services {
                 }
             } else {
                 // Our generation is older; abort this task immediately.
+                handle.abort();
+            }
+        }
+    }
+
+    /// Cancel the pending debounced lastActivity derivation for a workspace,
+    /// if any (monorepo#3623): called from `workspace.delete` so the timer
+    /// does not outlive the workspace, fire against the deleted row, and log
+    /// a spurious not-found WARN.
+    pub(crate) fn cancel_last_activity_schedule(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut debouncers) = self.last_activity_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(workspace_id) {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Cancel the pending debounced idle flip for a workspace, if any
+    /// (monorepo#3632): called from `workspace.delete` so the timer does not
+    /// outlive the workspace and emit a spurious
+    /// `workspace:activity-changed { idle }` for the deleted id ~3s after
+    /// the delete.
+    pub(crate) fn cancel_idle_debounce(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut debouncers) = self.idle_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(workspace_id) {
                 handle.abort();
             }
         }
@@ -2559,24 +2661,52 @@ impl Services {
                 gen_valid && count_zero
             };
 
-            if should_emit {
-                // Remove debouncer entry before emitting so reads stop reporting grace.
-                // Race note: an `agent_activity_begin` that lands after the
-                // should_emit check finds no handle to abort, so the client
-                // can observe `agent_running` followed by this stale `idle`
-                // activity event (pre-existing inversion). The displayStatus
-                // recompute below is safe against it: it re-reads
-                // `workspace_activity()` at emit time (count already 1 →
-                // `in_progress`) and the dedup cache suppresses a bogus
-                // demotion.
-                if let Ok(mut map) = debouncers.lock() {
-                    if let Some((current_gen, _)) = map.get(&ws_id) {
-                        if *current_gen == gen {
-                            map.remove(&ws_id);
-                        }
+            // Remove ourselves from the debouncers map (gen-guarded) on EVERY
+            // exit path, not just the emitting one (monorepo#3632): a
+            // suppressed fire — agents back in flight at fire time — must not
+            // strand this task's `(gen, AbortHandle)` entry for the daemon's
+            // lifetime (ids are never recycled, and nothing later removes an
+            // entry whose timer has already finished). On the emitting path
+            // the removal runs before the publish so reads stop reporting
+            // grace first.
+            // Race note: an `agent_activity_begin` that lands after the
+            // should_emit check finds no handle to abort, so the client
+            // can observe `agent_running` followed by this stale `idle`
+            // activity event (pre-existing inversion). The displayStatus
+            // recompute below is safe against it: it re-reads
+            // `workspace_activity()` at emit time (count already 1 →
+            // `in_progress`) and the dedup cache suppresses a bogus
+            // demotion.
+            if let Ok(mut map) = debouncers.lock() {
+                if let Some((current_gen, _)) = map.get(&ws_id) {
+                    if *current_gen == gen {
+                        map.remove(&ws_id);
                     }
                 }
+            }
 
+            if should_emit {
+                // Existence guard (monorepo#3632): a fire racing
+                // `workspace.delete` can pass the gen/count checks and remove
+                // its own entry while the delete is mid-flight — the delete's
+                // sweep then finds no handle to abort, and this task would
+                // publish a durable `{ idle }` for the deleted id. Ids are
+                // never recycled, so not-found always means "deleted
+                // mid-window"; skip the emit (same shape as
+                // `schedule_last_activity_event`'s NotFound handling,
+                // monorepo#3623). Any other probe error fails open — the row
+                // almost certainly exists and a missed idle flip would strand
+                // clients on `agent_running`.
+                if matches!(
+                    this.store.get_workspace(&ws_id).await,
+                    Err(Error::NotFound(_))
+                ) {
+                    tracing::debug!(
+                        workspace = %ws_id.as_str(),
+                        "schedule_idle_debounce: workspace deleted before the debounce fired; skipping"
+                    );
+                    return;
+                }
                 publish_event(
                     this.event_bus.as_ref(),
                     activity_changed_event(&ws_id, WorkspaceActivity::Idle),
@@ -4240,7 +4370,8 @@ impl Services {
     }
 
     /// Spawn the AS-3 completion-delivery worker: subscribe to the AGENT
-    /// completion event set (agent:idle / agent:failed / agent:deleted) across
+    /// completion event set (agent:idle / agent:failed / agent:deleted /
+    /// agent:retired) across
     /// every workspace and, on each child completion, wake every parent holding
     /// a completion watch for that child (the same `agent_send_message_op`
     /// path reportToParent uses), removing the watch after delivery.
@@ -4261,6 +4392,7 @@ impl Services {
                     AGENT_IDLE.to_string(),
                     AGENT_FAILED.to_string(),
                     AGENT_DELETED.to_string(),
+                    AGENT_RETIRED.to_string(),
                 ],
                 ..Default::default()
             };
@@ -4767,6 +4899,20 @@ impl Services {
             return;
         }
         if self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()) {
+            return;
+        }
+        // Soft-retire inertness: a retired session's watches settle via its
+        // own terminal `agent:retired` emit, never a synthesized
+        // `agent:idle`. The retire sweep cancels the owner's hooks and PR
+        // monitors, and each cancellation re-enters here through the
+        // terminal-transition backstop BEFORE the retired event publishes —
+        // without this guard, a hook-deferred watcher would be settled with
+        // a stale completed notice instead of the retired one. Consume the
+        // marker (nothing may redeliver it later; a restored agent's next
+        // real idle emits fresh) and let the retire emit resolve the
+        // watches. Lookup failures fall through (conservative: not retired).
+        if let Ok(Some(_)) = self.store.get_agent_session_retired_at(child_id).await {
+            self.take_interim_skipped_idle(child_id);
             return;
         }
         // Idle-visibility deferral: an idle agent still owning active
@@ -5360,7 +5506,11 @@ impl Services {
                 // Route the child's completion into the parent's after_all
                 // delegation group instead of waking immediately. The group's own
                 // fire path removes these watches once it settles (AS-4).
-                let deleted = event.event_type == AGENT_DELETED;
+                // A retired child records in the deleted bucket: like a
+                // deletion it is a terminal, non-completing settlement (the
+                // session is inert), so the group must not hang on it.
+                let deleted =
+                    event.event_type == AGENT_DELETED || event.event_type == AGENT_RETIRED;
                 // Prefer the child's persisted completionReport (set by
                 // `agent.reportToParent`, whose immediate send is suppressed for
                 // grouped children) over the event's lastResponseSummary,
@@ -15096,7 +15246,9 @@ impl WorkspaceApi for Services {
                     // starts when a prompt exists). The agent is parentless,
                     // non-background (delegate parity: `agent_create_op`). When
                     // the prompt is non-empty it is stored as
-                    // `metadata.initialMessage` and delivered exactly once — all
+                    // `AgentSession.initial_message` (harvested from the
+                    // `metadata.initialMessage` create param; served by
+                    // `agent.getSession` only) and delivered exactly once — all
                     // inside the idempotency scope, so a client retry replays
                     // the stored result instead of re-sending. An empty/missing
                     // prompt persists the row without a message; the FE first
@@ -15110,8 +15262,10 @@ impl WorkspaceApi for Services {
                             .filter(|s| !s.is_empty())
                             .map(str::to_string);
                         // Persist the prompt (when present) as
-                        // `metadata.initialMessage` (delegate parity: a wake-up
-                        // can resume from it) and stamp the reference-parity
+                        // `AgentSession.initial_message` via the
+                        // `metadata.initialMessage` harvest key (delegate
+                        // parity: a wake-up can resume from it) and stamp the
+                        // reference-parity
                         // `isInitialAgent`/`isFirstWorkspaceAgent` flags the
                         // FE surface (`agent-backend-handler.service.ts`,
                         // `instruction-service.ts` prompt-cache `':initial'`
@@ -15134,7 +15288,8 @@ impl WorkspaceApi for Services {
                             "isFirstWorkspaceAgent".to_string(),
                             serde_json::json!(true),
                         );
-                        // Own the `metadata.initialMessage` invariant: when
+                        // Own the initial-message invariant on the
+                        // `metadata.initialMessage` harvest key: when
                         // the daemon has a non-empty prompt, stamp it (delegate
                         // parity — a wake-up can resume from it); otherwise
                         // drop any caller-supplied `initialMessage` so
@@ -15215,8 +15370,8 @@ impl WorkspaceApi for Services {
                         // messages should start a turn, consistent with
                         // agent.sendMessage semantics). The runtime `AgentManager` when
                         // attached, else the store-only persist. Best-effort like the
-                        // delegate path — the agent holds `metadata.initialMessage` for
-                        // resume.
+                        // delegate path — the agent holds
+                        // `AgentSession.initial_message` for resume.
                         let has_content = prompt.is_some()
                             || created_image_blocks.is_some()
                             || created_file_blocks.is_some();
@@ -16024,6 +16179,22 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             }
+            // Cancel any pending debounced lastActivity derivation
+            // (monorepo#3623): the timer must not outlive the workspace —
+            // it would fire against the deleted row and log a spurious
+            // not-found WARN. After the row delete, so a schedule placed
+            // by the teardown above is swept too.
+            services.cancel_last_activity_schedule(&id);
+            // Sweep the pending idle debouncer the same way (monorepo#3632):
+            // an `agent_activity_end` during the agent teardown above
+            // schedules an idle flip whose timer would otherwise outlive the
+            // workspace and emit a spurious
+            // `workspace:activity-changed { idle }` ~3s after deletion.
+            // Residual race: an `agent_activity_end` landing after this sweep
+            // can still re-arm a flip for the deleted id — the timer's
+            // every-exit-path removal self-heals the map entry, and its
+            // emit-time existence guard skips the spurious event.
+            services.cancel_idle_debounce(&id);
             // Evict the deleted workspace's last-observed displayStatus
             // baseline so the in-memory map does not leak for the daemon's
             // lifetime (and a same-id recreate seeds fresh).
@@ -16530,8 +16701,12 @@ impl WorkspaceApi for Services {
         let this = self.clone();
         // Manual unarchive (`workspace.unarchive` / `workspace.restore`):
         // no `autoUnarchive` stamp on the emitted delta (absent ≠
-        // present-false, PROTOCOL §6.5).
-        Box::pin(async move { this.unarchive_workspace_inner(id, None).await })
+        // present-false, PROTOCOL §6.5). The flip bool is auto-path-only.
+        Box::pin(async move {
+            this.unarchive_workspace_inner(id, None)
+                .await
+                .map(|(ws, _)| ws)
+        })
     }
 
     fn duplicate_workspace(
@@ -20551,7 +20726,14 @@ impl WorkspaceApi for Services {
                     "git.status: working-tree status scan"
                 );
             }
-            status.map(|s| (*s).clone())
+            // The wire response is capped (monorepo#3635): the cached status
+            // keeps the full-fidelity file list for internal consumers
+            // (auto-commit selection, accept-changes, `git.changes`), and only
+            // this `git.status` projection truncates — tracked changes
+            // preferred over untracked, additive `filesTruncated`/`totalFiles`
+            // markers set — so a ~100k-untracked-file worktree can no longer
+            // produce a multi-megabyte outbound frame.
+            status.map(|s| intent_git::status::cap_status_files(&s))
         })
     }
 
@@ -22368,6 +22550,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_list_including_retired_op(workspace_id).await })
     }
 
+    fn agent_list_retired_only(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        Box::pin(async move { self.agent_list_retired_only_op(workspace_id).await })
+    }
+
+    fn agent_retired_count(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move { self.agent_retired_count_op(workspace_id).await })
+    }
+
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_list_active_op().await })
     }
@@ -22389,6 +22582,7 @@ impl WorkspaceApi for Services {
         around_message_id: Option<String>,
         around_index: Option<i64>,
         projection: Option<intent_core::ConversationProjection>,
+        include_in_progress: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.agent_get_conversation_op(
@@ -22399,6 +22593,7 @@ impl WorkspaceApi for Services {
                 around_message_id,
                 around_index,
                 projection,
+                include_in_progress,
             )
             .await
         })
@@ -23260,6 +23455,46 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn app_agents_send(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.app_agents_send_op(
+                workspace_id,
+                caller_agent_id,
+                target_agent_id,
+                message,
+                priority,
+            )
+            .await
+        })
+    }
+
+    fn app_agents_ask(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.app_agents_ask_op(
+                workspace_id,
+                caller_agent_id,
+                target_agent_id,
+                message,
+                priority,
+            )
+            .await
+        })
+    }
+
     fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             let rows = self.store.list_interrupted_agents().await?;
@@ -23667,7 +23902,7 @@ impl WorkspaceApi for Services {
             // `prMonitor.list` summaries all describe a PR with the same
             // object — this registers nothing and triggers no monitoring.
             // Every forge sub-read inside degrades on its own.
-            let (requirements, review_comment_count) =
+            let (requirements, review_comment_count, _ejection_known) =
                 pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await;
             let unresolved_thread_count = requirements.threads.unresolved;
             // The conversation-comment count is not part of the checklist; a
@@ -25606,23 +25841,45 @@ impl Services {
     /// on the turn-start trigger — is embedded additively in the delta's
     /// `changes` as `autoUnarchive: { reason, agentId, agentName }`; manual
     /// callers pass `None` and the field is absent (PROTOCOL §6.5).
+    ///
+    /// Returns the workspace plus whether THIS call performed the
+    /// Archived → Active flip: the row write is conditional
+    /// (`unarchive_workspace_if_archived`, `WHERE archived = 1`), so
+    /// concurrent unarchivers serialize at the statement and exactly one
+    /// caller reports `true`. A declined flip (already Active) still
+    /// succeeds for the manual RPCs (idempotent unarchive, delta still
+    /// emitted) but skips the emit entirely on the auto path — the losing
+    /// racer must not re-announce a flip it did not perform (the winner's
+    /// stamped delta already went out).
     async fn unarchive_workspace_inner(
         &self,
         id: WorkspaceId,
         auto_unarchive: Option<serde_json::Value>,
-    ) -> Result<Workspace> {
+    ) -> Result<(Workspace, bool)> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let manager = self.agent_manager();
         if id.is_chief() {
-            return Ok(chief_workspace());
+            return Ok((chief_workspace(), false));
         }
+        // Conditional flip: writes only when the row is currently archived,
+        // so two racing unarchivers (concurrent turn starts, or a manual
+        // unarchive racing the turn-start auto-unarchive) resolve to
+        // exactly one `flipped = true`.
+        let flipped = store
+            .unarchive_workspace_if_archived(&id, &now_iso())
+            .await?;
         let mut ws = store.get_workspace(&id).await?;
-        ws.status = WorkspaceStatus::Active;
-        ws.archived = false;
-        ws.archived_at = None;
-        ws.updated_at = now_iso();
-        store.update_workspace(&ws).await?;
+        // The losing racer on the auto path stops here: the winner (a
+        // concurrent turn start or a manual unarchive) already kicked the
+        // parked drains and emitted its delta, so re-running the tail would
+        // only duplicate the announcement for a flip this call never made.
+        // Manual callers fall through — the manual RPC stays idempotent
+        // (unarchiving an Active workspace still re-derives and re-emits).
+        if auto_unarchive.is_some() && !flipped {
+            ws.activity = self.workspace_activity(&ws.id);
+            return Ok((ws, false));
+        }
         // Re-engage queues parked by the archived gates
         // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
         // background agent's drain organically, so without this a queue
@@ -25676,7 +25933,7 @@ impl Services {
             changes["autoUnarchive"] = stamp;
         }
         publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
-        Ok(ws)
+        Ok((ws, flipped))
     }
 
     /// Best-effort auto-unarchive at the turn-start choke point
@@ -25686,11 +25943,12 @@ impl Services {
     /// stamped `autoUnarchive: { reason: "agent_activity", agentId,
     /// agentName }`.
     ///
-    /// Not serialized across concurrent turn starts: two agents winning
-    /// `try_begin` near-simultaneously in the same archived workspace can
-    /// each observe `archived: true` and both emit a stamped delta. The
-    /// row writes are idempotent; consumers keying UI (e.g. a toast) on
-    /// the stamp should dedup per workspace.
+    /// Concurrent turn starts serialize at the store's conditional flip
+    /// (`unarchive_workspace_if_archived`, `WHERE archived = 1`): two agents
+    /// winning `try_begin` near-simultaneously in the same archived
+    /// workspace can each read `archived: true`, but exactly one write
+    /// affects the row — only that winner emits the stamped delta and
+    /// reports `true` here; the loser skips the emit and reports `false`.
     ///
     /// Non-archived workspaces cost one point read (`archived` is part of
     /// the workspace row already fetched by callers of the send path, but
@@ -25701,6 +25959,13 @@ impl Services {
     /// better than a lost turn, and the archived drain gates keep parking
     /// follow-on wakes until a later trigger succeeds.
     ///
+    /// Returns `true` only when THIS call actually flipped the workspace
+    /// from Archived to Active (the conditional write affected the row);
+    /// `false` on the chief skip, a non-archived workspace, a read failure,
+    /// a lost flip race, or an unarchive failure — the caller uses the flip
+    /// to persist the `auto_unarchived` transcript notice and inject the
+    /// triggering turn's prompt block.
+    ///
     /// Returns a [`BoxFuture`] (rather than `async fn`) to break the async
     /// type cycle: this helper is awaited inside `try_begin`, and the
     /// unarchive's drain kick re-enters `try_begin` (bounded at runtime —
@@ -25710,14 +25975,14 @@ impl Services {
         &'a self,
         workspace_id: &'a WorkspaceId,
         agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, bool> {
         Box::pin(async move {
             if workspace_id.is_chief() {
-                return;
+                return false;
             }
             match self.store.get_workspace(workspace_id).await {
                 Ok(ws) if ws.archived => {}
-                Ok(_) => return,
+                Ok(_) => return false,
                 Err(e) => {
                     tracing::warn!(
                         workspace = %workspace_id.as_str(),
@@ -25725,7 +25990,7 @@ impl Services {
                         error = %e,
                         "auto-unarchive: workspace read failed; turn proceeds in archived workspace"
                     );
-                    return;
+                    return false;
                 }
             }
             // Name lookup is display-only: a lookup failure (or a session
@@ -25746,17 +26011,25 @@ impl Services {
                 .unarchive_workspace_inner(workspace_id.clone(), Some(stamp))
                 .await
             {
-                Ok(_) => tracing::info!(
-                    workspace = %workspace_id.as_str(),
-                    agent = %agent_id,
-                    "auto-unarchived workspace on agent turn start"
-                ),
-                Err(e) => tracing::warn!(
-                    workspace = %workspace_id.as_str(),
-                    agent = %agent_id,
-                    error = %e,
-                    "auto-unarchive failed; turn proceeds in archived workspace"
-                ),
+                Ok((_, flipped)) => {
+                    if flipped {
+                        tracing::info!(
+                            workspace = %workspace_id.as_str(),
+                            agent = %agent_id,
+                            "auto-unarchived workspace on agent turn start"
+                        );
+                    }
+                    flipped
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        agent = %agent_id,
+                        error = %e,
+                        "auto-unarchive failed; turn proceeds in archived workspace"
+                    );
+                    false
+                }
             }
         })
     }

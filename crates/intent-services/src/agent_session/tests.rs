@@ -32,6 +32,14 @@ impl LifecycleCapture {
     fn lines(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
     }
+
+    /// Install `self` as the thread-local default via
+    /// [`crate::test_tracing::set_capture_default`], which anchors the
+    /// callsite interest cache first (regression: monorepo#3580 — see the
+    /// `test_tracing` module docs for the race).
+    fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
+        crate::test_tracing::set_capture_default(self.clone())
+    }
 }
 
 impl tracing::Subscriber for LifecycleCapture {
@@ -3250,7 +3258,7 @@ async fn post_output_transport_death_keeps_terminal_events() {
     let (conn, mut note_rx, _agent) = connect_dying(vec![chunk]);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let capture = LifecycleCapture::default();
-    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let _capture_guard = capture.set_as_default();
 
     let err = services
         .run_prompt_turn(
@@ -3381,7 +3389,7 @@ async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
         connect_with_prompt_result(Vec::new(), json!({ "stopReason": "end_turn" }));
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let capture = LifecycleCapture::default();
-    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let _capture_guard = capture.set_as_default();
     services
         .run_prompt_turn(
             &conn,
@@ -3436,7 +3444,7 @@ async fn harness_wake_logs_persist_end_and_idle_with_one_private_correlation() {
     let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
     let (_tx, mut notifications) = mpsc::unbounded_channel();
     let capture = LifecycleCapture::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let _guard = capture.set_as_default();
 
     let outcome = services
         .run_harness_wake_turn(
@@ -3480,7 +3488,7 @@ async fn harness_wake_logs_persist_end_and_idle_with_one_private_correlation() {
 #[test]
 fn turn_mapping_joins_idle_timeout_cap_records_without_raw_ids() {
     let capture = LifecycleCapture::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let _guard = capture.set_as_default();
     crate::agent_session::trace_stream_correlation_mapping(
         "assistant-message-fixture",
         Some("wire-turn-fixture"),
@@ -4256,7 +4264,7 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
         connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let capture = LifecycleCapture::default();
-    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let _capture_guard = capture.set_as_default();
 
     let err = services
         .run_prompt_turn(
@@ -7825,4 +7833,70 @@ fn assert_result_ids_match_transcript(events: &[Event], blocks: &[Value]) {
             "resultBlockId {result_id} names THIS call's result"
         );
     }
+}
+
+/// The session-open orchestrator resolution is gated on the provider: only
+/// the claude-code `_meta` branch consumes the decision, so every other
+/// provider short-circuits to `false` — even for a specialist whose role
+/// resolves (or snapshots) as orchestrator.
+#[tokio::test]
+async fn resolve_session_is_orchestrator_gated_on_provider() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let mut stored = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    // Historical orchestrator id with no snapshot: the name fallback decides.
+    stored.specialist = Some("spec-writer".to_string());
+    assert!(
+        services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await
+    );
+    for provider in ["auggie", "droid", "grok", "codex", "mock"] {
+        assert!(
+            !services
+                .resolve_session_is_orchestrator(provider, &stored)
+                .await,
+            "{provider} must skip orchestrator resolution"
+        );
+    }
+    // Plain agents resolve false even on claude-code.
+    stored.specialist = None;
+    assert!(
+        !services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await
+    );
+}
+
+/// The frozen creation-time snapshot (`metadata.specialistIsOrchestrator`)
+/// decides the session-open resolution without live specialist resolution:
+/// a `false` snapshot overrides the historical-name fallback and a `true`
+/// snapshot holds without any resolvable specialist file.
+#[tokio::test]
+async fn resolve_session_is_orchestrator_prefers_frozen_snapshot() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let mut stored = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    stored.specialist = Some("spec-writer".to_string());
+    stored.metadata = Some(json!({ "specialistIsOrchestrator": false }));
+    assert!(
+        !services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await,
+        "a false snapshot beats the historical-name fallback"
+    );
+    stored.specialist = Some("custom-orch".to_string());
+    stored.metadata = Some(json!({ "specialistIsOrchestrator": true }));
+    assert!(
+        services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await,
+        "a true snapshot holds without a resolvable specialist file"
+    );
 }

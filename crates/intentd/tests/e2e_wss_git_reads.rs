@@ -1,6 +1,7 @@
 //! WSS end-to-end for the read-side `git.*` extensions added in
 //! docs/protocol/methods/git.md §5.6: `git.numstat`, `git.branchDiff`, `git.getRemoteUrl`,
-//! and `git.getConfig` (STAB-10a).
+//! and `git.getConfig` (STAB-10a), plus the `git.status` file-list cap
+//! (monorepo#3635).
 //! Drives a real pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via
 //! config) and asserts the response envelope shape from docs/protocol/methods/git.md §5.6 plus the
 //! `-32602` error envelope for the validation paths.
@@ -588,6 +589,59 @@ async fn git_get_config_over_wss() {
     }
     let nonrepo_resp = wss_rpc(&mut ws, 8, "git.getConfig", json!({ "workspaceId": ws_id })).await;
     assert_eq!(nonrepo_resp["result"]["config"], json!(""));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// `git.status` file-list cap (monorepo#3635): a worktree with more entries
+/// than the 5000-entry cap serves a truncated `files` list with the additive
+/// `filesTruncated: true` + `totalFiles` markers, tracked changes surviving
+/// ahead of untracked noise and the aggregate flags reflecting the full
+/// scan; an under-cap status omits both markers (the pre-8.4 wire shape).
+#[tokio::test]
+async fn git_status_files_capped_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("root-status-cap");
+    let (daemon, port, cfg) = boot(&root).await;
+    let repo = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Read E2E — status cap").await;
+
+    // Under the cap: no truncation markers on the wire (additive shape).
+    let resp = wss_rpc(&mut ws, 3, "git.status", json!({ "workspaceId": ws_id })).await;
+    assert!(resp.get("error").is_none(), "status under cap: {resp}");
+    assert!(resp["result"].get("filesTruncated").is_none(), "{resp}");
+    assert!(resp["result"].get("totalFiles").is_none(), "{resp}");
+
+    // One tracked change plus 5100 untracked files → over the cap.
+    std::fs::write(wt.join("tracked.txt"), "seed\nCHANGED\n").unwrap();
+    let noise = wt.join("noise");
+    std::fs::create_dir_all(&noise).unwrap();
+    for i in 0..5100 {
+        std::fs::write(noise.join(format!("f{i}.txt")), "x").unwrap();
+    }
+
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "git.status",
+        json!({ "workspaceId": ws_id, "forceRefresh": true }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "status over cap: {resp}");
+    let result = &resp["result"];
+    let files = result["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 5000, "capped at 5000: got {}", files.len());
+    assert_eq!(result["filesTruncated"], json!(true), "{result:?}");
+    assert_eq!(result["totalFiles"], json!(5101));
+    assert_eq!(result["hasUncommittedChanges"], json!(true));
+    assert_eq!(result["hasUntrackedFiles"], json!(true));
+    // The tracked change leads the list — never pushed out by untracked noise.
+    assert_eq!(files[0]["path"], json!("tracked.txt"));
+    assert_eq!(files[0]["status"], json!("M"));
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);

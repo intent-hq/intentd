@@ -71,6 +71,36 @@ use uuid::Uuid;
 
 use crate::Services;
 
+/// Row scope selecting which sessions an `agent.list` read serves (§5.5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentListScope {
+    /// Default read: active (not soft-retired) sessions only.
+    Active,
+    /// `includeRetired: true`: every session, retired rows carrying `retiredAt`.
+    All,
+    /// `retiredOnly: true`: soft-retired sessions only.
+    RetiredOnly,
+}
+
+/// "Running a turn" statuses for the retire guard (§5.5, confirmed
+/// decision): a descendant in `pending`/`active`/`Processing` blocks
+/// `ws.agent.retire`; idle/waiting/settled children are cascade-retired.
+fn is_running_turn(status: AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing
+    )
+}
+
+/// Terminal statuses the retire cascade never touches (the same set
+/// `count_child_agents` treats as terminal).
+fn is_terminal_status(status: AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
+    )
+}
+
 /// Per-agent ordering gate for pending-question marker writes and their
 /// matching `agent:updated` events. Different agents never contend.
 #[derive(Clone, Default)]
@@ -2105,9 +2135,13 @@ impl Services {
     ///
     /// List-payload cost contract (monorepo#2932): `metadata.initialMessage`
     /// — the full spawn-time first message, the single largest per-session
-    /// field on real workspaces — is detail-only (no list-context consumer)
-    /// and is OMITTED from every row here; `agent.get` / `agent.getSession`
-    /// still serve it. The remaining preview fields (`lastAgentResponse`,
+    /// field on real workspaces — is stripped from the whole [`AgentLite`]
+    /// projection (`agent.list` AND `agent.get`; no client reads it off
+    /// agent rows) and is served by `agent.getSession` only. The strip is
+    /// SQL-deep: the summary SELECT behind these reads omits the
+    /// `initial_message` column entirely (like `system_prompt` /
+    /// `image_blocks`), so the bytes are never fetched or decoded.
+    /// The remaining preview fields (`lastAgentResponse`,
     /// `lastUserMessage`, `lastToolUse`, `digest`,
     /// `metadata.completionReport` — read by list consumers like the HUD, so
     /// capped rather than omitted) are bounded per row to the render-sized
@@ -2116,18 +2150,19 @@ impl Services {
     /// Together these keep a ~250-session response well under the 1 MiB
     /// outbound frame warn threshold.
     ///
-    /// Deliberate asymmetry (same shape as the #2932 `initialMessage`
-    /// omission): the agent channel's seq-0 snapshot goes through this op
-    /// (capped rows), while per-agent deltas re-read via `agent.get` (full
-    /// values) — the bound is a property of list-shaped reads, not a channel
-    /// invariant. Delta frames are single-agent, so the size goal holds.
+    /// Deliberate asymmetry: the agent channel's seq-0 snapshot goes through
+    /// this op (capped rows), while per-agent deltas re-read via `agent.get`
+    /// (full values) — the bound is a property of list-shaped reads, not a
+    /// channel invariant. Delta frames are single-agent, so the size goal
+    /// holds.
     ///
     /// Soft retire: the default read excludes retired sessions (SQL-side
     /// `retired_at IS NULL` filter — cost stays O(rows returned)); the wire
     /// `includeRetired: true` variant is
     /// [`Self::agent_list_including_retired_op`].
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
-        self.agent_list_impl(workspace_id, false).await
+        self.agent_list_impl(workspace_id, AgentListScope::Active)
+            .await
     }
 
     /// `agent.list` with `includeRetired: true` (PROTOCOL §5.5): every
@@ -2136,47 +2171,100 @@ impl Services {
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<AgentLite>> {
-        self.agent_list_impl(workspace_id, true).await
+        self.agent_list_impl(workspace_id, AgentListScope::All)
+            .await
+    }
+
+    /// `agent.list` with `retiredOnly: true` (PROTOCOL §5.5): ONLY
+    /// soft-retired sessions, whose rows carry `retiredAt`. SQL-side
+    /// `retired_at IS NOT NULL` filter on both the summary read AND the
+    /// message-projection aggregate (served from the partial covering index
+    /// `idx_agent_workspace_retired`), and the hook/PR-monitor overlays are
+    /// skipped (retire cancels them, so retired rows always read empty) —
+    /// cost stays O(retired rows returned), never touching the workspace's
+    /// active sessions.
+    pub(crate) async fn agent_list_retired_only_op(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<AgentLite>> {
+        self.agent_list_impl(workspace_id, AgentListScope::RetiredOnly)
+            .await
+    }
+
+    /// `retiredCount` (PROTOCOL §5.5): number of soft-retired sessions in
+    /// the workspace — one SQL COUNT answered from the partial covering
+    /// index `idx_agent_workspace_retired` (O(retired rows), O(1) when the
+    /// bin is empty), attached to every `agent.list` response variant by
+    /// the router.
+    pub(crate) async fn agent_retired_count_op(&self, workspace_id: WorkspaceId) -> Result<u64> {
+        self.store.count_retired_agent_sessions(&workspace_id).await
     }
 
     async fn agent_list_impl(
         &self,
         workspace_id: WorkspaceId,
-        include_retired: bool,
+        scope: AgentListScope,
     ) -> Result<Vec<AgentLite>> {
-        let sessions = if include_retired {
-            self.store
-                .list_agent_session_summaries(&workspace_id)
-                .await?
-        } else {
-            self.store
-                .list_active_agent_session_summaries(&workspace_id)
-                .await?
+        let sessions = match scope {
+            AgentListScope::All => {
+                self.store
+                    .list_agent_session_summaries(&workspace_id)
+                    .await?
+            }
+            AgentListScope::Active => {
+                self.store
+                    .list_active_agent_session_summaries(&workspace_id)
+                    .await?
+            }
+            AgentListScope::RetiredOnly => {
+                self.store
+                    .list_retired_agent_session_summaries(&workspace_id)
+                    .await?
+            }
         };
         // Message projections are the expensive half (full-workspace COUNT
-        // aggregate + preview columns). The default read serves them from the
-        // per-workspace cache (active sessions only, matching the row set
-        // above — cost stays O(rows returned)); invalidated on transcript
-        // writes and session create/delete. `includeRetired` needs retired
-        // rows' projections too, so it loads directly, bypassing the cache
-        // in both directions.
-        let mut projections = if include_retired {
-            self.store
-                .get_agent_session_message_projections(&workspace_id)
-                .await?
-        } else {
-            self.agent_list_cache
-                .get_or_load(&self.store, &workspace_id)
-                .await?
+        // aggregate + preview columns). Each scope loads a projection set
+        // matching exactly its row set (RPC cost contract — O(rows
+        // returned)): the default read serves the active-only set from the
+        // per-workspace cache (invalidated on transcript writes and session
+        // create/delete); `retiredOnly` loads the retired-only SQL variant
+        // directly (never the full-workspace superset); `includeRetired`
+        // loads the full set directly, bypassing the cache in both
+        // directions.
+        let mut projections = match scope {
+            AgentListScope::Active => {
+                self.agent_list_cache
+                    .get_or_load(&self.store, &workspace_id)
+                    .await?
+            }
+            AgentListScope::RetiredOnly => {
+                self.store
+                    .get_retired_agent_session_message_projections(&workspace_id)
+                    .await?
+            }
+            AgentListScope::All => {
+                self.store
+                    .get_agent_session_message_projections(&workspace_id)
+                    .await?
+            }
         };
         // Idle-visibility: overlay each agent's active-hook metadata
-        // (`waitingOnHooks`, omitted when empty) from one workspace-wide
-        // hook query.
-        let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
-        // Idle-visibility (unified external-wait): same overlay for active
-        // PR monitors (`waitingOnPrMonitors`, omitted when empty) from one
-        // workspace-wide monitor query.
-        let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
+        // (`waitingOnHooks`) and active PR monitors (`waitingOnPrMonitors`),
+        // each omitted when empty, from one workspace-wide query apiece.
+        // Retire cancels the owner's hooks and PR monitors
+        // (`retire_one_session`), so retired rows always read empty — the
+        // `retiredOnly` scope skips both workspace-wide queries entirely
+        // rather than hydrating every active agent's hook history for rows
+        // that cannot carry any (RPC cost contract).
+        let (mut hooks_by_agent, mut pr_monitors_by_agent) = if scope == AgentListScope::RetiredOnly
+        {
+            (HashMap::new(), HashMap::new())
+        } else {
+            (
+                self.active_hooks_by_agent(&workspace_id).await,
+                self.active_pr_monitors_by_agent(&workspace_id).await,
+            )
+        };
         Ok(sessions
             .into_iter()
             .map(|s| {
@@ -2187,9 +2275,6 @@ impl Services {
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
                 lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
-                // monorepo#2932: detail-only — omitted from list rows (see
-                // the doc comment above); `agent.get` still serves it.
-                lite.metadata.initial_message = None;
                 // List-payload cost contract: bound the render-preview
                 // fields per row (see the doc comment above); the detail
                 // reads keep full values. Applied AFTER the runtime overlay
@@ -2395,6 +2480,27 @@ impl Services {
         lite.waiting_for_agent_ids = waiting_for_agent_ids;
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
+        // Liveness overlay on `lastActivity` (monorepo#3647): the persisted
+        // `updated_at` freezes at turn start (nothing persists until the turn
+        // ends), so mid-turn the live-turn slot's stream stamp is the newer
+        // truth. Serve the max of the two so pollers watching `lastActivity`
+        // see a long-but-alive turn advance instead of reading as stalled.
+        // Compare parsed instants — RFC-3339 strings carry variable
+        // sub-second precision, so lexicographic order is not chronological.
+        // An exact-instant tie prefers the live stamp (refreshed on every
+        // stream event, so at least as fresh), matching the diagnostics path.
+        if let Some(live) = lite.last_stream_activity_at.as_ref() {
+            let newer = match lite.last_activity.as_deref() {
+                None => true,
+                Some(persisted) => match (parse_iso(live), parse_iso(persisted)) {
+                    (Some(l), Some(p)) => l >= p,
+                    _ => false,
+                },
+            };
+            if newer {
+                lite.last_activity = Some(live.clone());
+            }
+        }
         lite.session_corrupted = session_corrupted;
         lite.pending_delete_at = pending_delete_at;
         if let Some((live_response, live_digest)) = live_overlay {
@@ -2565,6 +2671,20 @@ impl Services {
     /// / `truncated` semantics are unchanged (transcript-wide, not
     /// page-length). Slim is the wire default since v8.0; an unbudgeted full
     /// read (`projection: None`) survives only as an internal test seam.
+    ///
+    /// In-progress tail (monorepo#3647): with `include_in_progress` set and
+    /// an in-flight turn (`turnInFlight` true), a page that ends at the live
+    /// tail additionally carries the in-flight turn's partial assistant
+    /// message — the live-turn slot's streamed blocks so far — appended as a
+    /// trailing row marked `inProgress: true`. The row is serve-time only
+    /// (nothing persists until the turn ends), runs through the same slim
+    /// bounding as persisted rows, and is excluded from `totalMessages` /
+    /// pagination (`truncated`, tokens). Non-tail pages (older continuations
+    /// and seeks that do not reach the tail) never carry it. Absent the
+    /// param, responses are byte-identical to before. Its `created_at` is
+    /// the slot's stream stamp, so unlike persisted rows it advances across
+    /// successive reads of the same turn — deliberate: the row IS the
+    /// liveness signal, and the id is the stable reconciliation key.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
@@ -2575,6 +2695,7 @@ impl Services {
         around_message_id: Option<String>,
         around_index: Option<i64>,
         projection: Option<ConversationProjection>,
+        include_in_progress: bool,
     ) -> Result<Value> {
         // Metadata-only scope check — the transcript is never hydrated here.
         let session = self.store.get_agent_session_summary(&agent_id).await?;
@@ -2641,6 +2762,13 @@ impl Services {
             let w = crate::pagination::page_window(total, limit, page_token.as_deref());
             (w.start, w.end, w.next_token, None)
         };
+        // Global indices of the served page — updated by a budget trim
+        // below; `page_end == total` means the page ends at the live tail
+        // (where the in-progress row may be appended), and `page_start`
+        // anchors token re-minting after the in-progress append's own
+        // re-budget pass.
+        let mut page_start = start;
+        let mut page_end = end;
         let mut page: Vec<AgentMessage> = self
             .store
             .get_agent_messages_page(
@@ -2694,15 +2822,96 @@ impl Services {
             if (lo, hi) != (0, page.len()) {
                 page.truncate(hi);
                 page.drain(..lo);
+                page_start = start + lo;
+                page_end = start + hi;
                 next_token = crate::pagination::remint_backward_token(start + lo);
                 if prev_token.is_some() {
                     prev_token = Some(crate::pagination::remint_forward_token(start + hi, total));
                 }
             }
         }
+        let mut messages = serde_json::to_value(&page).expect("messages serialize");
+        // In-progress tail (monorepo#3647): append the in-flight turn's
+        // partial assistant message when the caller opted in and this page
+        // ends at the live tail, so a mid-turn read shows the tool calls and
+        // text streamed so far instead of only persisted completed messages.
+        // `turn_in_flight` already gates on a busy worker + open slot and
+        // terminal statuses; the row is serve-time only and deliberately
+        // outside `totalMessages`/pagination. Idempotent against the
+        // persist/slot-clear race: if the turn's message already persisted
+        // (id present in the served page) the append is skipped, mirroring
+        // the seq-0 snapshot merge (`merge_live_turn`), so a read in that
+        // window never duplicates the row.
+        if include_in_progress && turn_in_flight && page_end == total {
+            if let Some(live) = self.live_turn(&agent_id) {
+                let arr = messages.as_array_mut().expect("messages is an array");
+                let already_persisted = arr
+                    .iter()
+                    .any(|m| m.get("id").and_then(Value::as_str) == Some(live.message_id.as_str()));
+                if !already_persisted {
+                    let row = AgentMessage {
+                        id: live.message_id.clone(),
+                        agent_id: agent_id.clone(),
+                        seq: i64::try_from(total).unwrap_or(i64::MAX),
+                        role: "assistant".to_string(),
+                        content: Value::Array(live.blocks),
+                        metadata: None,
+                        app_message_id: None,
+                        created_at: live.last_activity_at.clone(),
+                    };
+                    let mut row = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(row));
+                    if projection == Some(ConversationProjection::Slim) {
+                        row = apply_slim_projection(row, None);
+                    }
+                    let mut row = serde_json::to_value(row).expect("in-progress row serialize");
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert("inProgress".to_string(), json!(true));
+                    }
+                    arr.push(row);
+                    // Re-apply the slim page budget after the append (§5.5),
+                    // mirroring the seq-0 snapshot's `rebudget_merged_page`:
+                    // `apply_slim_projection` caps block bodies but not block
+                    // count, and the motivating scenario — a long tool-heavy
+                    // turn — is exactly one that accumulates hundreds of
+                    // capped blocks in the live slot, so appended beside an
+                    // at-budget persisted page the response could blow the
+                    // budget the read path just enforced. The live row is the
+                    // newest and always serves; oldest persisted rows are
+                    // evicted until the page fits, with `nextToken` re-minted
+                    // at the first evicted row. The page's own anchor (a
+                    // forward page's oldest row, a seek's target) is never
+                    // evicted — dropping it would re-mint a cursor at the
+                    // anchor itself and loop the client — so those pages
+                    // bound at their already-budgeted anchor..tail suffix
+                    // plus the live row. Full (absent-projection) reads are
+                    // never budgeted, as above.
+                    if projection == Some(ConversationProjection::Slim) {
+                        let protect_rel = match slim_anchor {
+                            crate::pagination::BudgetAnchor::Newest => None,
+                            crate::pagination::BudgetAnchor::Oldest => Some(0),
+                            crate::pagination::BudgetAnchor::Target(global) => {
+                                Some(global.saturating_sub(page_start))
+                            }
+                        };
+                        let sizes: Vec<usize> =
+                            arr.iter().map(crate::pagination::serialized_size).collect();
+                        let (lo, _hi) = crate::pagination::budget_page(
+                            &sizes,
+                            crate::pagination::BudgetAnchor::Newest,
+                            SLIM_PAGE_BUDGET_BYTES,
+                        );
+                        let lo = protect_rel.map_or(lo, |p| lo.min(p));
+                        if lo > 0 {
+                            arr.drain(..lo);
+                            next_token = crate::pagination::remint_backward_token(page_start + lo);
+                        }
+                    }
+                }
+            }
+        }
         let mut result = json!({
             "agentId": agent_id,
-            "messages": page,
+            "messages": messages,
             "truncated": next_token.is_some(),
             "totalMessages": total,
             "nextToken": next_token,
@@ -2728,6 +2937,14 @@ impl Services {
     /// the returned block is always the full, unprojected body. Bounded cost
     /// (RPC cost contract): a metadata-only session read plus ONE primary-key
     /// message row read; the transcript is never hydrated.
+    ///
+    /// In-progress rows (monorepo#3647): when the message id is not persisted
+    /// but matches the live-turn slot's in-flight message, the block resolves
+    /// from the slot's streamed blocks (O(1) in-memory read) — so a
+    /// slim-truncated block served on the `includeInProgress` tail row is
+    /// hydratable mid-turn, same contract as persisted rows. The persisted
+    /// row wins once the turn ends (checked first), and an unknown id stays
+    /// `InvalidParams` exactly as before.
     ///
     /// Frame-size note: a block whose serialized response exceeds the
     /// transport's 40 MiB outbound frame cap (`MAX_OUTBOUND_MESSAGE_BYTES`)
@@ -2755,11 +2972,37 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let message = self
+        let message = match self
             .store
             .get_agent_message_by_id(&agent_id, &message_id)
             .await?
-            .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {message_id}")))?;
+        {
+            Some(m) => m,
+            // In-progress fallback (monorepo#3647): an unpersisted id that
+            // matches the live-turn slot's in-flight message resolves from
+            // the slot's streamed blocks, so blocks slim-truncated on the
+            // `includeInProgress` tail row hydrate mid-turn too.
+            None => match self
+                .live_turn(&agent_id)
+                .filter(|l| l.message_id == message_id)
+            {
+                Some(live) => AgentMessage {
+                    id: live.message_id,
+                    agent_id: agent_id.clone(),
+                    seq: i64::MAX,
+                    role: "assistant".to_string(),
+                    content: Value::Array(live.blocks),
+                    metadata: None,
+                    app_message_id: None,
+                    created_at: live.last_activity_at,
+                },
+                None => {
+                    return Err(Error::InvalidParams(format!(
+                        "unknown message id: {message_id}"
+                    )))
+                }
+            },
+        };
         let message = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
         let block = message
             .content
@@ -2995,7 +3238,7 @@ impl Services {
         // `-32602` naming the id and the known catalog ids (monorepo#3497)
         // — BEFORE any side effect, so no session row is persisted. Every
         // spawn seam funnels through here (`agent.create`, the MCP
-        // `create_agent`/`ws.agent.spawnPeer` tools, `agent.delegate`,
+        // `create_agent`/`ws.agent.create` tools, `agent.delegate`,
         // `agent.wakeOrCreate`'s create branch, `workspace.create`'s
         // `initialAgent`), so the validation covers them all.
         // SECURITY: the project tier resolves against the stored workspace
@@ -3344,6 +3587,25 @@ impl Services {
                         }
                     }
                 }
+            }
+            // Orchestrator-role snapshot: freeze the creation-time role
+            // decision alongside the identity snapshot so later edits or
+            // deletes of specialist files never flip this agent's tool
+            // denylist on respawn/session-open
+            // (`session_specialist_is_orchestrator` prefers this key).
+            // Written for EVERY specialist session — including one whose id
+            // did not resolve above (the fail-closed name fallback decides)
+            // — and always overwrites any caller-supplied value, so the
+            // frozen readers never consume caller input as a trusted role.
+            let frozen_is_orchestrator = self
+                .specialists_service()
+                .resolve_is_orchestrator(spec_id, spec_wp.as_deref());
+            let meta_value = metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(obj) = meta_value.as_object_mut() {
+                obj.insert(
+                    "specialistIsOrchestrator".to_string(),
+                    json!(frozen_is_orchestrator),
+                );
             }
         }
         // Harness stamp (intent-hq/monorepo#2459): every new session gets the
@@ -3854,6 +4116,12 @@ impl Services {
     /// an already-retired session (the existing timestamp is preserved, no
     /// event re-emitted). Emits `agent:retired` with
     /// `{ agentId, agentName, retiredAt, reason? }`.
+    ///
+    /// GUARDED on active children: the call FAILS (`InvalidParams`, nothing
+    /// mutated) while any descendant — transitive over `parent_agent_id` —
+    /// is still running a turn. On success the whole descendant subtree is
+    /// cascade-retired (see the inline comments), and restoring the parent
+    /// does NOT restore the cascaded children.
     pub(crate) async fn agent_retire_op(
         &self,
         agent_id: AgentId,
@@ -3869,31 +4137,141 @@ impl Services {
         if let Some(existing) = session.retired_at {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
+        // Guard (confirmed decision): retire fails while any descendant —
+        // grandchildren included — is still running a turn
+        // (pending/active/Processing). NOTHING is mutated on rejection (no
+        // partial cascade). Retired descendants are inert and never count;
+        // idle/waiting children pass the guard and are cascade-retired
+        // below.
+        let descendants = self.collect_retire_descendants(&agent_id).await?;
+        let active: Vec<String> = descendants
+            .iter()
+            .filter(|c| c.retired_at.is_none() && is_running_turn(c.status))
+            .map(|c| format!("{} ({})", c.name, c.id.0))
+            .collect();
+        if !active.is_empty() {
+            return Err(Error::InvalidParams(format!(
+                "cannot retire: {} active child agent(s) still running a turn: {}. \
+                 Stop them or wait for them to finish, then retire again.",
+                active.len(),
+                active.join(", ")
+            )));
+        }
+        let mut session = session;
+        let now = loop {
+            if let Some(now) = self.retire_one_session(&session, reason.as_deref()).await? {
+                break now;
+            }
+            // Lost the CAS to a concurrent retire: re-read. While the
+            // winner's mark is set, report `alreadyRetired` with its real
+            // timestamp; if a concurrent restore already cleared it again,
+            // retry the retire instead of fabricating a timestamp for an
+            // agent that is not actually retired.
+            session = self.store.get_agent_session_summary(&agent_id).await?;
+            if let Some(existing) = session.retired_at.clone() {
+                return Ok(
+                    json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }),
+                );
+            }
+        };
+        // Cascade (confirmed decision): every non-terminal,
+        // not-already-retired descendant retires with the parent, each
+        // through the same full cleanup — hooks/PR monitors cancelled,
+        // subscriptions dropped, watches resolved via its own
+        // `agent:retired` emit. Restoring the parent does NOT restore them;
+        // each is individually restorable via `agent.restore`.
+        // Guard-vs-cascade race: a child that started a turn after the
+        // guard passed is SKIPPED (left running, un-retired) rather than
+        // stopped or failed late — the parent's own retire already landed,
+        // and the racing child can retire itself later. Best-effort: a
+        // per-child failure logs and moves on.
+        let cascade_reason = format!("parent {} retired", session.name);
+        for child in &descendants {
+            // Row gone since the snapshot → skip.
+            let Ok(fresh) = self.store.get_agent_session_summary(&child.id).await else {
+                continue;
+            };
+            if fresh.retired_at.is_some()
+                || is_terminal_status(fresh.status)
+                || is_running_turn(fresh.status)
+            {
+                continue;
+            }
+            if let Err(e) = self.retire_one_session(&fresh, Some(&cascade_reason)).await {
+                tracing::warn!(
+                    parent = %agent_id,
+                    child = %fresh.id,
+                    error = %e,
+                    "retire cascade: child retire failed; continuing"
+                );
+            }
+        }
+        Ok(json!({ "success": true, "retiredAt": now }))
+    }
+
+    /// Snapshot the retiring agent's descendant tree, transitive over
+    /// `parent_agent_id` (cross-workspace, like
+    /// [`intent_store::Store::count_child_agents`]). Deleted rows are
+    /// excluded from the returned set (the cascade never touches them) but
+    /// still traversed, so grandchildren under a deleted intermediary are
+    /// found. Cycle-safe via a visited set (parent links cannot cycle in
+    /// practice, but a corrupt row must not hang the retire).
+    async fn collect_retire_descendants(&self, root: &AgentId) -> Result<Vec<AgentSession>> {
+        let mut seen: HashSet<String> = HashSet::from([root.0.clone()]);
+        let mut frontier = vec![root.clone()];
+        let mut out = Vec::new();
+        while let Some(id) = frontier.pop() {
+            for child in self.store.list_child_agent_summaries(&id).await? {
+                if !seen.insert(child.id.0.clone()) {
+                    continue;
+                }
+                frontier.push(child.id.clone());
+                if !matches!(child.status, AgentStatus::Deleted) {
+                    out.push(child);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One session's retire transition + cleanup, shared by the caller path
+    /// and the child cascade of [`Services::agent_retire_op`]. Returns
+    /// `Ok(Some(retiredAt))` when this call performed the transition,
+    /// `Ok(None)` when a concurrent retire won the CAS (nothing re-emitted).
+    async fn retire_one_session(
+        &self,
+        session: &AgentSession,
+        reason: Option<&str>,
+    ) -> Result<Option<String>> {
         let now = now_iso();
         // CAS write: only the request that actually flips NULL → set emits
-        // the event; a concurrent retire that lost the race re-reads the
-        // winner's timestamp and reports `alreadyRetired`.
+        // the event.
         let transitioned = self
             .store
-            .set_agent_session_retired_at(&session.workspace_id, &agent_id, Some(&now), &now)
+            .set_agent_session_retired_at(&session.workspace_id, &session.id, Some(&now), &now)
             .await?;
         if !transitioned {
-            let session = self.store.get_agent_session_summary(&agent_id).await?;
-            let existing = session.retired_at.unwrap_or(now);
-            return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
+            return Ok(None);
         }
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Drop the retired agent's event subscriptions: the wake target is
         // inert, so matching/batching for it is pure leak (same rationale
         // as the delete cascade — monorepo#937). The queue entry is kept:
         // restore may drain it later.
-        self.remove_event_subscriptions_for_agent(&agent_id).await;
+        self.remove_event_subscriptions_for_agent(&session.id).await;
+        // Cancel the retiring agent's active hooks and PR monitors (mirrors
+        // the workspace-archive sweeps): the owner is inert and retired
+        // itself, so NO wake notice is queued. `agent.restore` does NOT
+        // resurrect them (unarchive precedent) — the agent re-registers if
+        // the condition still matters.
+        self.cancel_agent_hooks(&session.id).await;
+        self.cancel_agent_pr_monitors(&session.id).await;
         let mut data = json!({
-            "agentId": agent_id.0,
+            "agentId": session.id.0,
             "agentName": session.name,
             "retiredAt": now,
         });
-        if let Some(r) = reason.as_ref() {
+        if let Some(r) = reason {
             data["reason"] = json!(r);
         }
         crate::publish_event(
@@ -3903,7 +4281,7 @@ impl Services {
                 timestamp: now.clone(),
                 event_type: intent_core::events::AGENT_RETIRED.to_string(),
                 actor: crate::system_actor(),
-                session_id: Some(agent_id.0.clone()),
+                session_id: Some(session.id.0.clone()),
                 correlation_id: None,
                 parent_event_id: None,
                 metadata: None,
@@ -3916,7 +4294,7 @@ impl Services {
         // the row): recompute-and-compare (§6.5 step 0).
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
-        Ok(json!({ "success": true, "retiredAt": now }))
+        Ok(Some(now))
     }
 
     /// `agent.restore` (wire-only; PROTOCOL §5.5): clear `retired_at`,
@@ -4116,20 +4494,45 @@ impl Services {
                     // UNKNOWN id is rejected with `-32602` naming the id and
                     // the known catalog ids (monorepo#3497) — the session is
                     // left untouched. Null still clears the field.
-                    session.specialist = match update_optional_string(value, "specialist")? {
-                        Some(spec_id) => {
-                            let wp = self
-                                .store
-                                .get_workspace(&session.workspace_id)
-                                .await
-                                .ok()
-                                .and_then(|w| crate::git_ops::worktree_path(&w));
-                            Some(
-                                self.specialists_service()
-                                    .canonical_id_or_err(&spec_id, wp.as_deref())?,
-                            )
+                    session.specialist = if let Some(spec_id) =
+                        update_optional_string(value, "specialist")?
+                    {
+                        let wp = self
+                            .store
+                            .get_workspace(&session.workspace_id)
+                            .await
+                            .ok()
+                            .and_then(|w| crate::git_ops::worktree_path(&w));
+                        let canonical = self
+                            .specialists_service()
+                            .canonical_id_or_err(&spec_id, wp.as_deref())?;
+                        // Refresh the frozen orchestrator-role snapshot
+                        // (`specialistIsOrchestrator`, written at create)
+                        // for the NEW specialist so the session-open
+                        // denylist decision tracks the identity change
+                        // instead of the stale creation-time role.
+                        let is_orchestrator = self
+                            .specialists_service()
+                            .resolve_is_orchestrator(&canonical, wp.as_deref());
+                        let meta = session
+                            .metadata
+                            .get_or_insert_with(|| json!(serde_json::Map::new()));
+                        if let Some(obj) = meta.as_object_mut() {
+                            obj.insert(
+                                "specialistIsOrchestrator".to_string(),
+                                json!(is_orchestrator),
+                            );
                         }
-                        None => None,
+                        Some(canonical)
+                    } else {
+                        // A cleared specialist retires the snapshot: a
+                        // plain agent has no role and the stale key must
+                        // not survive a later re-assignment.
+                        if let Some(obj) = session.metadata.as_mut().and_then(Value::as_object_mut)
+                        {
+                            obj.remove("specialistIsOrchestrator");
+                        }
+                        None
                     };
                 }
                 "taskNoteId" => {
@@ -4547,8 +4950,9 @@ impl Services {
 
     /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
     /// §5.30). With no `providerId` this is the backward-compatible auggie
-    /// path — auggie CLI (JSON → plain-text fallback) with an indefinitely
-    /// served success cache (probe only on miss or `forceRefresh`), degrading
+    /// path — auggie CLI (JSON → plain-text fallback) with a success cache
+    /// served fresh for [`crate::model_catalog::MODELS_STALE_AFTER`] (probe
+    /// on miss, aged entry, or `forceRefresh`), degrading
     /// to an empty list (`source: "static"`) when the CLI is unavailable;
     /// `forceRefresh` skips the cache read. With a `providerId` the request
     /// goes through the generic per-provider cache
@@ -4608,7 +5012,8 @@ impl Services {
     /// The legacy no-`providerId` `models.list` path, routed through the same
     /// generic per-provider cache as `providerId: "auggie"` — same provider
     /// id and same registry-derived version key — so the two can never
-    /// diverge: one cache, one single-flight, one negative window. Only the
+    /// diverge: one cache, one single-flight, one negative window, one
+    /// staleness threshold. Only the
     /// wire shape differs: the response omits the `providerId` field,
     /// `source` is `"auggie"` or `"static"`, and an empty list is the
     /// fallback when the probe fails with no last-good list. A failed probe
@@ -4639,7 +5044,8 @@ impl Services {
     }
 
     /// [`Self::models_list_auggie_op`] with an injectable fetch and clock
-    /// (the unit-test seam). Delegates all cache policy — indefinite serving,
+    /// (the unit-test seam). Delegates all cache policy — fresh-window
+    /// serving, age-based re-probe,
     /// negative window, single-flight, last-good fallback — to
     /// [`crate::model_catalog::resolve_with_cache`] and only maps the
     /// resolved rows onto the shared internal shape. The caller removes the
@@ -6655,17 +7061,18 @@ impl Services {
             }
         }
         // 6. monorepo#1229: attention fan-out to the caller's watchers. Every
-        // active completion watch is woken — auto-registered
+        // ordinary active completion watch is woken — auto-registered
         // (wakeOrCreate/delegate SUB-1) watches included, not just explicit
         // `agent.watch` registrations (monorepo#3443 widened the fan-out past
-        // the old `wake_on_attention` filter). The caller's parent is
+        // the old `wake_on_attention` filter). Completion-only Chief asks wait
+        // for terminal completion. The caller's parent is
         // excluded — step 5 already woke it directly — so a parent that ALSO
         // watches its child never receives a duplicate attention wake.
         // Watches are left in place (attention is not a completion).
         for watch in self
             .find_watches_for_child(&caller)
             .into_iter()
-            .filter(|w| Some(&w.parent_agent_id) != parent.as_ref())
+            .filter(|w| !w.completion_only && Some(&w.parent_agent_id) != parent.as_ref())
         {
             // Attention is not a completion, so the watch is left in place —
             // say so explicitly (issue monorepo#2051) to avoid reading as
@@ -6737,7 +7144,9 @@ impl Services {
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         // Resolve the child's first message up front so it can be persisted as
-        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
+        // `AgentSession.initial_message` on the created session (harvested from
+        // the `metadata.initialMessage` create param; served by
+        // `agent.getSession` only — P3-1.2b; the FE
         // stored it so a wake-up can resume). Source priority mirrors the TS
         // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
         // then the linked task note's content (falling back to its title).
@@ -7242,7 +7651,7 @@ impl Services {
             }
         }
         // Deliver the child's first message (resolved above, persisted as
-        // `metadata.initialMessage`) and start its turn (PROTOCOL §5.5).
+        // `AgentSession.initial_message`) and start its turn (PROTOCOL §5.5).
         // Without this the child stays `Pending` and never runs. `wait_mode` is
         // already honored by the completion-watch registration above; the child
         // turn itself starts unconditionally.
@@ -8132,7 +8541,7 @@ impl Services {
             );
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
-        // SUB-1 independent-peer suppression (spawnPeer): a top-level
+        // SUB-1 independent-peer suppression: a top-level
         // FOREGROUND target is a co-equal peer, not a worker — messaging it
         // must not passively subscribe the sender to its completion (peers
         // are watched explicitly with `agent.watch`). The auto-watch is
@@ -8489,6 +8898,174 @@ impl Services {
     /// an event that fired long ago. This also closes the TOCTOU window where
     /// a target settles between the validation loop above and the watch
     /// registration (its live event would dispatch before the watch exists).
+    /// Chief-only cross-workspace send behind the MCP `ws.app.agents.send`
+    /// binding. The source anchor always comes from the caller's newest
+    /// persisted conversation row. A model cannot supply or replace it.
+    pub(crate) async fn app_agents_send_op(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> Result<Value> {
+        if !workspace_id.is_chief() {
+            return Err(Error::InvalidParams(
+                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+            ));
+        }
+        if caller_agent_id == target_agent_id {
+            return Err(Error::InvalidParams(
+                "Chief of Staff cannot send a message to itself".to_string(),
+            ));
+        }
+
+        let caller = self
+            .agent_get_op(caller_agent_id.clone(), Some(workspace_id.clone()))
+            .await?;
+        if caller.status == AgentStatus::Deleted
+            || caller.retired_at.is_some()
+            || !caller.workspace_id.is_chief()
+        {
+            return Err(Error::InvalidParams(format!(
+                "caller agent {} is not an active Chief of Staff agent",
+                caller_agent_id.0
+            )));
+        }
+        let source_message_id = caller.last_message_id.ok_or_else(|| {
+            Error::InvalidParams(
+                "Chief conversation has no persisted source message to link".to_string(),
+            )
+        })?;
+
+        let target = self.require_agent_session(&target_agent_id).await?;
+        if target.status == AgentStatus::Deleted {
+            return Err(Error::InvalidParams(format!(
+                "agent {} is deleted",
+                target_agent_id.0
+            )));
+        }
+        if target.workspace_id.is_chief() {
+            return Err(Error::InvalidParams(
+                "Chief messages can only target agents outside the Chief workspace".to_string(),
+            ));
+        }
+
+        let source_url = format!(
+            "intent://local/{}/agent/{}/message/{}",
+            workspace_id.0, caller_agent_id.0, source_message_id
+        );
+        let metadata = json!({
+            "type": "chief_message",
+            "fromAgentId": caller_agent_id.0,
+            "fromAgentName": "Chief of Staff",
+            "fromWorkspaceId": workspace_id.0,
+            "sourceMessageId": source_message_id,
+            "sourceUrl": source_url,
+        });
+        let outcome = WorkspaceApi::agent_send_message(
+            self,
+            target.workspace_id.clone(),
+            target_agent_id.clone(),
+            message,
+            None,
+            None,
+            None,
+            priority,
+            None,
+            None,
+            None,
+            Some(metadata),
+            intent_core::MessageOrigin::Automatic,
+        )
+        .await?;
+
+        let mut result = json!({
+            "ok": true,
+            "agentId": target_agent_id.0,
+            "agentName": target.name,
+            "workspaceId": target.workspace_id.0,
+            "sourceMessageId": source_message_id,
+            "sourceUrl": source_url,
+        });
+        if let (Some(result), Some(outcome)) = (result.as_object_mut(), outcome.as_object()) {
+            result.extend(outcome.clone());
+        }
+        Ok(result)
+    }
+
+    /// Chief-only completion-bound ask. The message is an ordinary Chief send;
+    /// after delivery, one durable ungrouped completion watch is armed and the
+    /// target is reconciled against its post-send state. The explicit
+    /// idle-target rejection is intentionally not used: this operation pairs
+    /// the watch with a send that wakes a previously settled target.
+    pub(crate) async fn app_agents_ask_op(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> Result<Value> {
+        if !workspace_id.is_chief() {
+            return Err(Error::InvalidParams(
+                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+            ));
+        }
+        let caller = self.require_agent_session(&caller_agent_id).await?;
+        let sent = self
+            .app_agents_send_op(
+                workspace_id.clone(),
+                caller_agent_id.clone(),
+                target_agent_id.clone(),
+                message,
+                priority,
+            )
+            .await?;
+        let target_workspace = sent
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map(WorkspaceId::from)
+            .ok_or_else(|| Error::Internal("Chief send omitted target workspace".to_string()))?;
+        let subscription_id = self
+            .register_completion_watch_strict_durable(
+                &workspace_id,
+                &target_workspace,
+                caller_agent_id.clone(),
+                caller.name,
+                target_agent_id.clone(),
+            )
+            .await?;
+        self.publish_subscriptions_changed(&workspace_id, &caller_agent_id)
+            .await;
+        self.reconcile_watch_child_on_rehydration(
+            &target_agent_id,
+            &target_workspace,
+            crate::agent_subscriptions::WatchReconcileCallSite::Registration,
+        )
+        .await;
+        let target_name = sent
+            .get("agentName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Internal("Chief send omitted target name".to_string()))?
+            .to_string();
+        Ok(json!({
+            "ok": true,
+            "send": sent,
+            "watch": {
+                "ok": true,
+                "waitMode": "immediate",
+                "results": [{
+                    "agentId": target_agent_id.0,
+                    "agentName": target_name,
+                    "workspaceId": target_workspace.0,
+                    "subscriptionId": subscription_id,
+                    "groupId": Value::Null,
+                }],
+            },
+        }))
+    }
+
     pub(crate) async fn app_agents_wait_op(
         &self,
         workspace_id: WorkspaceId,
@@ -9331,7 +9908,25 @@ impl Services {
             } else {
                 None
             };
-            let last_activity = session.map(|s| s.updated_at.clone());
+            // Liveness-aware activity stamp (monorepo#3647): the persisted
+            // `updated_at` freezes at turn start, so a long healthy turn
+            // would read stale off it alone. Overlay the live-turn slot's
+            // stream stamp (refreshed on every chunk/tool call) and key the
+            // stale-responding heuristic on the max of the two — an agent
+            // actively streaming through the harness is never flagged stale.
+            // Compare parsed instants (`iso_ms`) — RFC-3339 strings carry
+            // variable sub-second precision, so lexicographic order is not
+            // chronological. `iso_ms` truncates to milliseconds, so a
+            // same-millisecond tie prefers the live stamp — it is refreshed
+            // on every stream event and thus at least as fresh.
+            let live_stream_activity = self.live_turn_activity_at(&AgentId(id.clone()));
+            let last_activity = match (
+                session.map(|s| s.updated_at.clone()),
+                live_stream_activity.clone(),
+            ) {
+                (Some(p), Some(l)) => Some(if iso_ms(&l) >= iso_ms(&p) { l } else { p }),
+                (p, l) => p.or(l),
+            };
             let last_activity_age = last_activity.as_deref().map(|t| age_ms(now_ms, t));
             let stale_responding = status == "responding"
                 && match last_activity_age {
@@ -9384,6 +9979,12 @@ impl Services {
             );
             if let Some(la) = &last_activity {
                 row.insert("lastActivity".into(), json!(la));
+            }
+            // Additive (monorepo#3647): the raw live-turn stream stamp, so
+            // diagnostics consumers can distinguish harness liveness from
+            // persisted-row churn. Omitted when no turn is streaming.
+            if let Some(ls) = &live_stream_activity {
+                row.insert("lastStreamActivityAt".into(), json!(ls));
             }
             if let Some(hooks) = hooks_by_agent.remove(id.as_str()) {
                 if !hooks.is_empty() {
@@ -9529,9 +10130,15 @@ impl Services {
         let mut workspace_archived: Option<bool> = None;
         for q in &queues {
             let aid = q["agentId"].as_str().unwrap_or_default();
+            // Liveness-aware, like `staleResponding` above (monorepo#3647):
+            // a mid-turn agent's `updated_at` is frozen, so also accept the
+            // live-turn stream stamp as proof of active draining.
             let actively_responding = session_by_id.get(aid).is_some_and(|s| {
                 agent_status_wire(s.status) == Some("responding")
-                    && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                    && (age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                        || self
+                            .live_turn_activity_at(&AgentId(aid.to_string()))
+                            .is_some_and(|t| age_ms(now_ms, &t) <= stale_after_ms))
             });
             if actively_responding {
                 continue;
@@ -9664,7 +10271,10 @@ impl Services {
                     && pending_ids.iter().all(|id| {
                         session_by_id.get(*id).is_some_and(|s| {
                             agent_status_wire(s.status) == Some("responding")
-                                && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                                && (age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                                    || self
+                                        .live_turn_activity_at(&AgentId((*id).to_string()))
+                                        .is_some_and(|t| age_ms(now_ms, &t) <= stale_after_ms))
                         })
                     });
                 let severity = if g["subscriptionMissing"].as_bool() == Some(true) {

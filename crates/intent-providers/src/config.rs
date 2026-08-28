@@ -93,6 +93,17 @@ pub enum InjectionMechanism {
     None,
 }
 
+/// How a provider's tool-removal flag consumes the tool-name list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRemovalStyle {
+    /// Flag repeated once per tool name (auggie: `--remove-tool X --remove-tool Y`).
+    Repeated,
+    /// Single flag with a comma-joined value (droid: `--disabled-tools X,Y`
+    /// — droid's list flags accept comma or space separation, comma is used
+    /// for a single argv entry).
+    CommaJoined,
+}
+
 /// Configuration for an ACP provider (port of `ACPProviderConfig`).
 ///
 /// UI-only fields from the TS interface (`ipcChannelPrefix`, `iconPath`) are
@@ -163,11 +174,18 @@ pub struct ProviderConfig {
     pub mcp_config_flag: Option<&'static str>,
     /// Flag for quiet mode (e.g., `--quiet`).
     pub quiet_flag: Option<&'static str>,
-    /// Flag for removing a provider-native tool at spawn time (e.g.
-    /// `--remove-tool`). Repeated once per tool name. `None` when the provider
-    /// exposes no equivalent knob — spawn-time tool restrictions are dropped
-    /// for that provider (MCP-side filtering, §6.8, still applies).
+    /// Flag for removing provider-native tools at spawn time (auggie
+    /// `--remove-tool`, droid `--disabled-tools`).
+    /// Emission shape is governed by [`Self::remove_tool_style`]. `None` when
+    /// the provider exposes no equivalent knob — spawn-time tool restrictions
+    /// are dropped for that provider (MCP-side filtering, §6.8, still
+    /// applies). Tool names are provider-native (each provider names its
+    /// built-in tools differently); the per-provider mapping lives in
+    /// `intent-acp`'s `tool_restrictions` module.
     pub remove_tool_flag: Option<&'static str>,
+    /// How [`Self::remove_tool_flag`] consumes the tool list (repeated flag
+    /// vs single comma-joined value). Only meaningful when the flag is set.
+    pub remove_tool_style: ToolRemovalStyle,
     /// Optional provider-specific mode-map overrides (`logical -> provider`).
     pub mode_map: Option<&'static [(&'static str, &'static str)]>,
     /// Optional filter of available models for this provider.
@@ -257,6 +275,7 @@ impl ProviderConfig {
             mcp_config_flag: None,
             quiet_flag: None,
             remove_tool_flag: None,
+            remove_tool_style: ToolRemovalStyle::Repeated,
             mode_map: None,
             supported_models: None,
             can_be_disabled: false,
@@ -500,6 +519,11 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // carry the full ws.* reference in the system prompt
         // (`--append-system-prompt-file`).
         truncates_tool_descriptions: true,
+        // Spawn-time tool stripping (§18.4): droid's `--disabled-tools` takes
+        // a comma-or-space-separated list of tool IDs; comma-joined here so
+        // it stays one argv entry (docs.factory.ai CLI reference).
+        remove_tool_flag: Some("--disabled-tools"),
+        remove_tool_style: ToolRemovalStyle::CommaJoined,
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
     ProviderConfig {
@@ -534,6 +558,14 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // with empty `args` (Node shell:true style). intentd argv-only spawn
         // would ENOENT that string; shell-wrap on terminal/create instead.
         terminal_requires_shell: true,
+        // No spawn-time tool stripping: grok's `--disallowed-tools` is a
+        // top-level headless-mode (`grok -p …`) flag only — it is not defined
+        // on the `agent` subcommand's args and is consumed solely by the
+        // headless single-turn path, so `agent stdio --disallowed-tools X,Y`
+        // would be rejected by clap as an unknown flag (verified against the
+        // xai-org/grok-build source: `PagerArgs.cli_disallowed_tools` vs
+        // `AgentArgs`). Orchestrator restrictions on grok are prompt-only;
+        // MCP-side filtering (§6.8) still covers workspace tools.
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {

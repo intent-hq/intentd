@@ -212,10 +212,10 @@ API:
   ws.primitive.addPatch(noteId, filePath, diff, description) → { ok, primitiveId, noteId }  // Stores a patch block that can be applied in a note.
   ws.primitive.addAgentAction(noteId, agentId, goal, description) → { ok, primitiveId, noteId }  // Adds a triggerable agent action block.
 
-  ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
+  ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create a sub-agent, or with `topLevel: true` an INDEPENDENT top-level agent. Sub-agent creation starts immediately and auto-subscribes you to its completion events — you are woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
-  ws.agent.spawnPeer(name, message, opts?) → { ok, id, agentId, name, sponsorAgentId }  // Spawn an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only) and a sponsor preamble telling it of its independent standing is prepended to your message. Peers are FOREGROUND by default (`isBackground: false`); `opts` also takes `specialist`, `model`, `provider`, `reasoningEffort`, `behaviorPrompt`. Top-level agents only, and refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Use `create` instead when you want a child you are woken for; watch a peer explicitly with `watch` if you care about its completion.
+    With `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) the created agent is a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
   ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
@@ -228,14 +228,14 @@ API:
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
-  ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
+  ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars).
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries. Check it for an entry with your `fromAgentId` before sending again — the single-pending-message rule on `ws.agent.send` refuses a second send while one is pending.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected. This is the remediation when `ws.agent.send` / `ws.agent.sendToTask` refuse a second send under the single-pending-message rule: remove the pending entry, then re-send ONE combined message.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
   ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
-  ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history. Served under the slim projection: oversized tool/image block bodies arrive truncated (`inputTruncated`/`outputTruncated`) with stable block ids — hydrate one in full with `ws.agent.getMessageBlock`.
+  ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history. Served under the slim projection: oversized tool/image block bodies arrive truncated (`inputTruncated`/`outputTruncated`) with stable block ids — hydrate one in full with `ws.agent.getMessageBlock`. A mid-turn read includes the in-flight turn's partial assistant message (tool calls/blocks streamed so far) as a trailing `inProgress: true` row, so a busy agent's latest activity is visible without waiting for the turn to end.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — the on-demand hydration counterpart to the slim `readConversation` truncation markers.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
@@ -250,7 +250,7 @@ API:
   ws.git.unregisterRoot(path) → { ok, gitRootId, path }  // Remove a registered secondary git root by path (relative paths resolve against the workspace worktree). Errors when no root is registered for the path.
   ws.git.listRoots() → [{ id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }]  // List the workspace's registered secondary git roots; `branch` is read live per call.
 
-  ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
+  ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, ALL that agent's events in the window; otherwise recent activity window. Default window is 30 min, and tool-call events land mid-turn, so a busy agent shows advancing activity here while its turn runs.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
   ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters. `eventType` accepts the same glob syntax as subscribe: a category wildcard like `note:*`, an exact type like `note:updated`, or bare `*` for no type filter.
     Responses are size-bounded: oversized rows get their `data`/`metadata` replaced by bounded previews plus `truncated: true` + `originalBytes` markers, and `limit` is clamped (default 50, max 500).
@@ -305,11 +305,12 @@ API:
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
   ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
-  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist right now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (with `failingRequired` / `pendingRequired` named, `requiredKnown` false when the host did not report which checks are required), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true only while queued) and `rulesKnown`.
+  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
+    `mergeQueueEjection?` is `{ at, reason? }` — the latest merge-queue removal event (e.g. reason `failed_checks`); absent when the PR was never ejected or the host did not report it.
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop monitoring a PR you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
   ws.pr.monitors() → [monitors]  // YOUR active and completed monitors: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (the last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (the net changes since the last report, awaiting the debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`.
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, mergeable?, checks: { total, passed, failed, pending, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, rulesKnown } }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, mergeable?, checks: { total, passed, failed, pending, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueueEjection?, rulesKnown } }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     `requirements` is the full merge-requirements checklist — what is still needed to merge — with `failingRequired` / `pendingRequired` naming the required checks, `requiredKnown` false when the host did not report which checks are required, and `rulesKnown` false when the base branch's rules were unreadable (`approvals.needed` / `threads.resolutionRequired` then omitted). The top-level `checks` / `reviews` / `comments` blocks are the compact projection of the same read.
     This is the SAME enriched object `ws.pr.monitor` returns and monitor wakes / `ws.pr.monitors` rows carry — one canonical shape across all three surfaces — except that a snapshot registers nothing and triggers no monitoring. For PR monitoring prefer `ws.pr.monitor` — it runs the polling, debouncing and merge detection in the daemon, so you do not have to author a hook that diffs snapshots and expires while the PR sits blocked. Use `ws.pr.snapshot` when you just want the current state once.
     These are the only `ws.pr.*` methods. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
@@ -391,6 +392,8 @@ API:
   ws.app.agents.readConversation(workspaceId, agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }?) → { workspaceId, workspaceTitle, agentId, agentName, totalMessages, returnedMessages, startTurn, endTurn, includeToolCalls, taskNoteId?, messages }  // Chief workspace only. Reads a bounded cross-workspace agent conversation. Defaults to last 20 messages, max 100, and excludes tool-call blocks unless `includeToolCalls=true`.
     Safe usage: list first, then read only the relevant thread slices with `lastN` or `startTurn`/`endTurn`; keep `includeToolCalls` false unless the user explicitly needs raw tool-call details. Served under the slim projection: oversized tool/image block bodies arrive truncated (`inputTruncated`/`outputTruncated`) with stable block ids — hydrate one in full with `ws.app.agents.getMessageBlock`.
   ws.app.agents.getMessageBlock(workspaceId, agentId, messageId, blockId) → { block }  // Chief workspace only. Fetch ONE full content block of a persisted message in the target workspace — the on-demand hydration counterpart to the slim `readConversation` truncation markers.
+  ws.app.agents.send(agentId, message, priority?) → { ok, agentId, agentName, workspaceId, sourceMessageId, sourceUrl, ...sendOutcome }  // Chief workspace only. Message an agent in any non-Chief workspace without knowing its workspace ID. Omitted priority interrupts by default; pass `priority="queue"` to queue instead. The daemon derives the exact Chief source-message link and persists Chief attribution; do not put a source id or URL in the message.
+  ws.app.agents.ask(agentId, message, priority?) → { ok, send, watch }  // Chief workspace only. Send an attributed message and receive one wake only when the target completes. `send` is the ordinary send result; `watch` is the immediate completion-watch result. Direct target messages are progress only and never consume the ask. Omitted priority interrupts by default; pass `priority="queue"` to queue instead.
   ws.app.agents.waitFor({ agentIds, waitMode? }) → { ok, waitMode, results }  // Chief workspace only. Register to be woken when existing agents (in any workspace) complete — the subscription side of `agent.delegate` without creating agents. `waitMode`: `"immediate"` (default) wakes you as each agent completes; `"after_all"` delivers one aggregated wake once all of them settle. Each result is { agentId, agentName, workspaceId, subscriptionId, groupId }.
   ws.app.proposal.show(proposal) → ProposalCard  // Chief workspace only. Render an app-level proposal card in chat.
   ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
@@ -454,10 +457,10 @@ API:
   ws.primitive.addPatch(noteId, filePath, diff, description) → { ok, primitiveId, noteId }  // Stores a patch block that can be applied in a note.
   ws.primitive.addAgentAction(noteId, agentId, goal, description) → { ok, primitiveId, noteId }  // Adds a triggerable agent action block.
 
-  ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
+  ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create a sub-agent, or with `topLevel: true` an INDEPENDENT top-level agent. Sub-agent creation starts immediately and auto-subscribes you to its completion events — you are woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
-  ws.agent.spawnPeer(name, message, opts?) → { ok, id, agentId, name, sponsorAgentId }  // Spawn an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only) and a sponsor preamble telling it of its independent standing is prepended to your message. Peers are FOREGROUND by default (`isBackground: false`); `opts` also takes `specialist`, `model`, `provider`, `reasoningEffort`, `behaviorPrompt`. Top-level agents only, and refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Use `create` instead when you want a child you are woken for; watch a peer explicitly with `watch` if you care about its completion.
+    With `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) the created agent is a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
   ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
@@ -470,12 +473,12 @@ API:
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
-  ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
+  ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
   ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
-  ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history. Slim projection: oversized tool/image block bodies arrive truncated with stable block ids.
+  ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history. Slim projection: oversized tool/image block bodies arrive truncated with stable block ids. Mid-turn reads append the in-flight turn's partial message as a trailing `inProgress: true` row.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — hydrates the truncated slim blocks from `readConversation`.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
@@ -490,7 +493,7 @@ API:
   ws.git.unregisterRoot(path) → { ok, gitRootId, path }  // Remove a registered secondary git root by path (relative paths resolve against the workspace worktree). Errors when no root is registered for the path.
   ws.git.listRoots() → [{ id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }]  // List the workspace's registered secondary git roots; `branch` is read live per call.
 
-  ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
+  ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, ALL that agent's events in the window (default 30 min; tool-call events land mid-turn); otherwise recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
   ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters. `eventType` accepts the same glob syntax as subscribe: a category wildcard like `note:*`, an exact type like `note:updated`, or bare `*` for no type filter.
     Responses are size-bounded: oversized rows get their `data`/`metadata` replaced by bounded previews plus `truncated: true` + `originalBytes` markers, and `limit` is clamped (default 50, max 500).
@@ -543,11 +546,12 @@ API:
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
   ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
-  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist right now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (with `failingRequired` / `pendingRequired` named, `requiredKnown` false when the host did not report which checks are required), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true only while queued) and `rulesKnown`.
+  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
+    `mergeQueueEjection?` is `{ at, reason? }` — the latest merge-queue removal event (e.g. reason `failed_checks`); absent when the PR was never ejected or the host did not report it.
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop monitoring a PR you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
   ws.pr.monitors() → [monitors]  // YOUR active and completed monitors: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (the last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (the net changes since the last report, awaiting the debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`.
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, mergeable?, checks: { total, passed, failed, pending, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, rulesKnown } }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, mergeable?, checks: { total, passed, failed, pending, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueueEjection?, rulesKnown } }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     `requirements` is the full merge-requirements checklist — what is still needed to merge — with `failingRequired` / `pendingRequired` naming the required checks, `requiredKnown` false when the host did not report which checks are required, and `rulesKnown` false when the base branch's rules were unreadable (`approvals.needed` / `threads.resolutionRequired` then omitted). The top-level `checks` / `reviews` / `comments` blocks are the compact projection of the same read.
     This is the SAME enriched object `ws.pr.monitor` returns and monitor wakes / `ws.pr.monitors` rows carry — one canonical shape across all three surfaces — except that a snapshot registers nothing and triggers no monitoring. For PR monitoring prefer `ws.pr.monitor` — it runs the polling, debouncing and merge detection in the daemon, so you do not have to author a hook that diffs snapshots and expires while the PR sits blocked. Use `ws.pr.snapshot` when you just want the current state once.
     These are the only `ws.pr.*` methods. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
@@ -594,8 +598,8 @@ static ALL_TOOLS_CHIEF: &[ToolDef] = &[ToolDef {
 
 /// The `ws.` path prefixes gated by each disabled `[agentFeatures]` toggle.
 /// Namespace-level prefixes end with `.`; method-level prefixes (the
-/// `attentionRequests` pair, the `peerAgents` retire/spawnPeer entries) name
-/// one full method each. Shared by the description assembler below, the prelude
+/// `attentionRequests` pair, the `peerAgents` retire entry) name one full
+/// method each. Shared by the description assembler below, the prelude
 /// assembler in [`super::bindings`], and the dispatch deny in
 /// [`super::bindings`] (via [`denied_feature`]), so the three layers cannot
 /// drift.
@@ -635,12 +639,12 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
         out.push(("ws.pr.unmonitor", "agentFeatures.prMonitor"));
     }
     if !features.peer_agents {
-        // Method-level: `ws.agent.retire` and `ws.agent.spawnPeer` are the
-        // only `ws.agent.*` surfaces gated by the opt-in peerAgents toggle
-        // (default off). `spawnPeer` is additionally top-level-only — that
-        // rule lives in the bridge/dispatch layers, not here.
+        // Method-level: `ws.agent.retire` is the only whole `ws.agent.*`
+        // surface gated by the opt-in peerAgents toggle (default off).
+        // `ws.agent.create({ topLevel: true })` is also peerAgents-gated,
+        // but arg-conditionally — that gate lives in the dispatch layer,
+        // not here (plain `create` is never feature-gated).
         out.push(("ws.agent.retire", "agentFeatures.peerAgents"));
-        out.push(("ws.agent.spawnPeer", "agentFeatures.peerAgents"));
     }
     if !features.mcp_tools {
         out.push(("ws.mcp.", "agentFeatures.mcpTools"));
@@ -694,22 +698,6 @@ const TASK_GRAPH_SETCONTENT_XREF: &str = "; the fence line takes optional `key=`
 const TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR: &str = " The fence line takes optional attributes — `@@@task key=api dependsOn=a,b conflictsWith=c effort=2h` — bare tokens, comma-separated lists, whitespace-tolerant; `dependsOn`/`conflictsWith` values resolve against sibling block `key=`s, then exact sibling titles, then existing task-note ids, and `effort` seeds the estimated effort.\n    Conversion never fails on bad attributes: blocks always convert, and unresolvable/ambiguous references or rejected edges (cycle, tree ancestor/descendant) are skipped with a warning naming the block and reference. `createdTasks` is `[{ key?, title, noteId }]` in block order; check `warnings` after converting.";
 const TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR_OFF: &str =
     " `createdTasks` is `[{ key?, title, noteId }]` in block order; `warnings` names skipped relation references.";
-
-/// The `ws.agent.spawnPeer` doc line (one line, no continuations, identical
-/// in both static variants — a drift test pins it). Pruned from the
-/// assembled description via [`gated_prefixes`] when `peerAgents` is off;
-/// scrubbed by [`scrub_spawn_peer_doc`] on sub-agent bridges when the toggle
-/// is ON, because spawning peers is top-level-only (like `ws.app.question.*`)
-/// while the co-gated `ws.agent.retire` stays available to sub-agents.
-pub(crate) const SPAWN_PEER_DOC_LINE: &str = "  ws.agent.spawnPeer(name, message, opts?) → { ok, id, agentId, name, sponsorAgentId }  // Spawn an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only) and a sponsor preamble telling it of its independent standing is prepended to your message. Peers are FOREGROUND by default (`isBackground: false`); `opts` also takes `specialist`, `model`, `provider`, `reasoningEffort`, `behaviorPrompt`. Top-level agents only, and refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Use `create` instead when you want a child you are woken for; watch a peer explicitly with `watch` if you care about its completion.\n";
-
-/// Drop the `ws.agent.spawnPeer` doc line from an assembled description for
-/// a sub-agent bridge (top-level-only rule; the dispatch layer denies the
-/// frame with `SUB_AGENT_SPAWN_PEER_DENIED` as defense in depth). No-op when
-/// the line is already pruned by the `peerAgents` gate.
-pub(crate) fn scrub_spawn_peer_doc(desc: &str) -> String {
-    desc.replacen(SPAWN_PEER_DOC_LINE, "", 1)
-}
 
 /// The `[agentFeatures]` settings path whose toggle is off and gates `method`
 /// (the `host({ method })` frame name, e.g. `hook.list`), or `None` when the
@@ -1051,12 +1039,7 @@ pub(super) fn help_namespace(
             let trimmed = line.trim_start();
             let indent = line.len() - trimmed.len();
             if indent == 2 && trimmed.starts_with("ws.") {
-                in_segment = (trimmed.starts_with(&dot_prefix)
-                    || trimmed.starts_with(&call_prefix))
-                    // Top-level-only rule: a sub-agent bridge's help output
-                    // must not advertise `spawnPeer` (dispatch denies it
-                    // with the redirect error).
-                    && !(is_sub_agent && trimmed.starts_with("ws.agent.spawnPeer("));
+                in_segment = trimmed.starts_with(&dot_prefix) || trimmed.starts_with(&call_prefix);
             } else if indent < 4 || trimmed.is_empty() {
                 in_segment = false;
             }
@@ -1222,16 +1205,15 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
 mod tests {
     use super::{
         compact_workspace_api_description, condensed_workspace_api_description, denied_feature,
-        first_sentence_end, help_index, help_namespace, scrub_spawn_peer_doc,
-        workspace_api_description, workspace_api_description_with_model_options,
-        AgentFeaturesSettings, Cow, SpecialistModelOption, SpecialistModelOptions,
-        HOOK_HOST_EXEC_DOC_XREF, HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER,
-        NAMESPACE_INDEX_HEADER_COMPACT, PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL,
-        PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE,
-        REPORT_TO_PARENT_ATTENTION_XREF, SPAWN_PEER_DOC_LINE, TASK_GRAPH_BATCH_FORM_LINE,
-        TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF,
-        TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
-        WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+        first_sentence_end, help_index, help_namespace, workspace_api_description,
+        workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
+        SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
+        HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT,
+        PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF,
+        PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
+        TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS,
+        TASK_GRAPH_SETCONTENT_XREF, TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION,
+        WORKSPACE_API_DESCRIPTION_CHIEF, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
     };
     use std::collections::HashSet;
 
@@ -1635,53 +1617,60 @@ mod tests {
         }
     }
 
-    // The spawnPeer doc-line const the sub-agent scrub anchors on must appear
-    // verbatim in both static variants — a reworded doc line would silently
-    // turn `scrub_spawn_peer_doc` into a no-op.
+    // The merged create API: `spawnPeer` no longer exists — the static
+    // variants document `topLevel` on the `ws.agent.create` entry instead
+    // (the option stays visible in sub-agent docs; the runtime error is the
+    // enforcement).
     #[test]
-    fn spawn_peer_doc_line_present_in_both_variants() {
+    fn spawn_peer_absent_and_top_level_documented_in_both_variants() {
         for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
-            assert!(desc.contains(SPAWN_PEER_DOC_LINE));
+            assert!(!desc.contains("spawnPeer"));
+            assert!(desc.contains("`topLevel: true`"));
         }
     }
 
-    // The sub-agent scrub removes exactly the spawnPeer doc line (retire and
-    // the rest of `ws.agent` survive), and composes with the peerAgents gate
-    // (already-pruned input is a no-op).
+    // Discoverability under truncation: `topLevel` must sit in the FIRST
+    // sentence of the primary `ws.agent.create` doc line, because
+    // `condensed_workspace_api_description` drops continuation lines and
+    // cuts each method summary at its first sentence end — an option
+    // documented only on a continuation line would be invisible to agents
+    // on truncating providers.
     #[test]
-    fn scrub_spawn_peer_doc_removes_only_spawn_peer() {
+    fn condensed_create_line_mentions_top_level() {
         let features = AgentFeaturesSettings {
             peer_agents: true,
             ..AgentFeaturesSettings::default()
         };
-        let full = workspace_api_description(false, &features);
-        let scrubbed = scrub_spawn_peer_doc(&full);
-        assert!(!scrubbed.contains("ws.agent.spawnPeer("));
-        assert!(scrubbed.contains("ws.agent.retire("));
-        assert!(scrubbed.contains("ws.agent.create("));
-        assert_eq!(scrubbed.len(), full.len() - SPAWN_PEER_DOC_LINE.len());
-
-        // peerAgents off (the default): the gate already pruned the line,
-        // so the sub-agent scrub composes as a no-op.
-        let gated = workspace_api_description(false, &AgentFeaturesSettings::default());
-        assert!(!gated.contains("ws.agent.spawnPeer("));
-        assert_eq!(scrub_spawn_peer_doc(&gated), gated.as_ref());
+        for is_chief in [false, true] {
+            let condensed = condensed_workspace_api_description(is_chief, &features, &[]);
+            let create_line = condensed
+                .lines()
+                .find(|l| l.trim_start().starts_with("ws.agent.create("))
+                .unwrap_or_else(|| panic!("chief={is_chief}: no condensed create line"));
+            assert!(
+                create_line.contains("`topLevel: true`"),
+                "chief={is_chief}: condensed create line must mention topLevel: {create_line}"
+            );
+        }
     }
 
-    // ws.help("agent") on a sub-agent bridge omits the spawnPeer doc line
-    // (top-level-only rule) while a top-level bridge with peerAgents on
-    // serves it.
+    // ws.help("agent") serves the `create` entry — `topLevel` continuation
+    // included — identically on top-level and sub-agent bridges; no
+    // spawnPeer entry exists on either.
     #[test]
-    fn help_namespace_agent_omits_spawn_peer_for_sub_agents() {
+    fn help_namespace_agent_documents_top_level_for_all_bridges() {
         let features = AgentFeaturesSettings {
             peer_agents: true,
             ..AgentFeaturesSettings::default()
         };
         let top = help_namespace(false, &features, false, "agent").unwrap();
-        assert!(top.contains("ws.agent.spawnPeer("));
         let sub = help_namespace(false, &features, true, "agent").unwrap();
-        assert!(!sub.contains("ws.agent.spawnPeer("));
-        assert!(sub.contains("ws.agent.retire("));
+        for out in [&top, &sub] {
+            assert!(!out.contains("spawnPeer"));
+            assert!(out.contains("ws.agent.create("));
+            assert!(out.contains("`topLevel: true`"));
+            assert!(out.contains("ws.agent.retire("));
+        }
     }
 
     // The compact description is a pure derivation of the full assembly: the
@@ -2233,7 +2222,7 @@ mod tests {
                 &["ws.pr.monitors", "ws.pr.monitor", "ws.pr.unmonitor"],
                 |f| f.pr_monitor = false,
             ),
-            (&["ws.agent.retire", "ws.agent.spawnPeer"], |f| {
+            (&["ws.agent.retire"], |f| {
                 f.peer_agents = false;
             }),
             (&["ws.mcp."], |f| f.mcp_tools = false),
@@ -2719,8 +2708,11 @@ mod tests {
         // Sibling `ws.agent.*` methods pass even with attentionRequests off.
         assert_eq!(denied_feature(&all_off, "agent.reportToParent"), None);
         assert_eq!(denied_feature(&all_off, "agent.list"), None);
-        // `peerAgents` gates exactly `agent.retire` + `agent.spawnPeer` —
-        // off by DEFAULT (the one opt-in toggle), so the defaults deny both.
+        // `peerAgents` gates exactly `agent.retire` at the method level —
+        // off by DEFAULT (the one opt-in toggle), so the defaults deny it.
+        // The `agent.create` + `topLevel: true` gate is arg-conditional and
+        // lives in the dispatch layer, so plain `agent.create` never appears
+        // here.
         assert_eq!(
             denied_feature(&all_off, "agent.retire"),
             Some("agentFeatures.peerAgents")
@@ -2730,15 +2722,7 @@ mod tests {
             Some("agentFeatures.peerAgents")
         );
         assert_eq!(denied_feature(&all_gates_open(), "agent.retire"), None);
-        assert_eq!(
-            denied_feature(&all_off, "agent.spawnPeer"),
-            Some("agentFeatures.peerAgents")
-        );
-        assert_eq!(
-            denied_feature(&AgentFeaturesSettings::default(), "agent.spawnPeer"),
-            Some("agentFeatures.peerAgents")
-        );
-        assert_eq!(denied_feature(&all_gates_open(), "agent.spawnPeer"), None);
+        assert_eq!(denied_feature(&all_off, "agent.create"), None);
         // Method-level entries match exactly: a longer method sharing the
         // gated method as a prefix is not over-denied.
         assert_eq!(

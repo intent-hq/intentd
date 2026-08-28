@@ -2,6 +2,107 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.11] - 2026-08-28
+
+### 🚀 Features
+
+- *(transport)* Time subscribe fast-path snapshot emission, WARN above threshold ([#1545](https://github.com/intent-hq/intentd/pull/1545))
+- *(transport)* System.requestUpdate RPC to trigger a sitter update check ([#1546](https://github.com/intent-hq/intentd/pull/1546))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Use monotonic clock for WSS heartbeat pong bookkeeping ([#1547](https://github.com/intent-hq/intentd/pull/1547))
+
+### 🧪 Testing
+
+- *(intentd)* Scale repro for concurrent cold-start chat.subscribe seq-0 latency ([#1549](https://github.com/intent-hq/intentd/pull/1549))
+
+
+## [0.8.10] - 2026-08-27
+
+### 🐛 Bug Fixes
+
+- *(transport)* Release RPC limiter permit before awaiting the outbound send ([#1541](https://github.com/intent-hq/intentd/pull/1541))
+
+### ⚡ Performance
+
+- Strip metadata.initialMessage from the AgentLite projection ([#1542](https://github.com/intent-hq/intentd/pull/1542))
+
+
+## [0.8.9] - 2026-08-27
+
+### 🚀 Features
+
+- *(settings)* PeerAgents tokenImpact annotation + label rename ([#1539](https://github.com/intent-hq/intentd/pull/1539))
+
+
+## [0.8.8] - 2026-08-27
+
+### 🚀 Features
+
+- Enforce orchestrator tool restrictions across providers via specialist role ([#1532](https://github.com/intent-hq/intentd/pull/1532))
+
+### 🐛 Bug Fixes
+
+- *(models)* Re-probe provider model catalogs older than 24h on models.list ([#1538](https://github.com/intent-hq/intentd/pull/1538))
+
+
+## [0.8.7] - 2026-08-27
+
+### 🚀 Features
+
+- *(services)* Agent liveness observability for long tool-heavy turns ([#1535](https://github.com/intent-hq/intentd/pull/1535))
+
+
+## [0.8.6] - 2026-08-27
+
+### 🚀 Features
+
+- *(intentd)* Log version, build commit, and protocol at serve startup ([#1531](https://github.com/intent-hq/intentd/pull/1531))
+
+### 🐛 Bug Fixes
+
+- *(services)* Sweep pending idle debouncer on workspace delete ([#1528](https://github.com/intent-hq/intentd/pull/1528))
+- *(git)* Cap git.status files list at 5000 entries with additive truncation markers ([#1530](https://github.com/intent-hq/intentd/pull/1530))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update monorepo references for the intent-hq/intent rename ([#1534](https://github.com/intent-hq/intentd/pull/1534))
+
+
+## [0.8.5] - 2026-08-27
+
+### 🚀 Features
+
+- *(acp)* Merge spawnPeer into agent.create with topLevel option ([#1520](https://github.com/intent-hq/intentd/pull/1520))
+- *(transport)* Slim projection for note.subscribe snapshot and deltas ([#1526](https://github.com/intent-hq/intentd/pull/1526))
+- *(services)* Persist auto-unarchive notice and inject it into the triggering turn prompt ([#1521](https://github.com/intent-hq/intentd/pull/1521))
+- *(transport)* Agent.list retiredOnly param and retiredCount field ([#1523](https://github.com/intent-hq/intentd/pull/1523))
+
+### 🐛 Bug Fixes
+
+- *(services)* Cancel pending last-activity schedule on workspace delete ([#1522](https://github.com/intent-hq/intentd/pull/1522))
+- *(services)* Deflake harness_wake lifecycle capture under parallel tests ([#1525](https://github.com/intent-hq/intentd/pull/1525))
+
+### ⚡ Performance
+
+- *(store)* Trigger-maintained per-session message stats counters ([#1524](https://github.com/intent-hq/intentd/pull/1524))
+
+
+## [0.8.4] - 2026-08-27
+
+### 🚀 Features
+
+- *(services)* Retire cancels hooks and PR monitors, resolves watches, and cascades to settled descendants ([#1517](https://github.com/intent-hq/intentd/pull/1517))
+
+
+## [0.8.3] - 2026-08-26
+
+### 🚀 Features
+
+- *(acp)* Scope filters on ws.agent.list and honor includeCompleted ([#1513](https://github.com/intent-hq/intentd/pull/1513))
+
+
 ## [0.8.2] - 2026-08-26
 
 ### 🚀 Features

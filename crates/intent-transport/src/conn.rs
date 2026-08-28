@@ -14,8 +14,9 @@ use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 
 use crate::browser;
@@ -80,6 +81,17 @@ impl OutboundSender {
     /// means the connection's writer is gone.
     pub(crate) async fn send_bulk(&self, frame: String) -> Result<(), ()> {
         self.bulk.send(frame).await.map_err(|_| ())
+    }
+
+    /// Reserve one slot on the priority lane, waiting for space when the
+    /// lane is full. The returned permit makes the eventual send
+    /// non-blocking, so a spawned slow-path task can enqueue its response
+    /// without parking outside the bounded lane — the reservation is the
+    /// backpressure point, applied on the read loop BEFORE a limiter slot is
+    /// claimed (see [`finish_slow_path_rpc`]). `Err` means the connection's
+    /// writer is gone.
+    pub(crate) async fn reserve_priority(&self) -> Result<mpsc::OwnedPermit<String>, ()> {
+        self.priority.clone().reserve_owned().await.map_err(|_| ())
     }
 
     /// Whether the writer has stopped draining (both lanes closed together;
@@ -226,8 +238,9 @@ impl ConnSubs {
 }
 
 /// Route one frame: deliver replies to daemon-initiated reverse RPCs (§12.4),
-/// then intercept the `system.*` control methods (`system.status` on both
-/// transports; `system.shutdown`/`system.importLegacy` UDS-only via the
+/// then intercept the `system.*` control methods (`system.status` and
+/// `system.requestUpdate` on both transports;
+/// `system.shutdown`/`system.importLegacy` UDS-only via the
 /// `is_uds` guard inside `control::handle`), the `host.status` capability
 /// probe (both transports), the `forward.*` port-forwarding methods, and the
 /// `events.` fast-path, else hand to the JSON-RPC dispatcher. `control` is
@@ -251,11 +264,16 @@ impl ConnSubs {
 /// Every frame sent here is a response/error frame and travels on the
 /// priority lane; only the forwarder tasks push on the bulk lane.
 ///
-/// Every detached spawn claims a slot from the daemon-wide `limiter`
-/// (`server.maxOutstandingRpcs`) first; when the cap is reached the request is
+/// Every detached spawn first reserves a priority-lane slot for its response
+/// (parking the read loop when the lane is full — a slow client throttles
+/// only itself), then claims a slot from the daemon-wide `limiter`
+/// (`server.maxOutstandingRpcs`); when the cap is reached the request is
 /// rejected immediately with `-32011 "Server overloaded"` (notifications are
 /// dropped silently) rather than queued. The permit is moved into the spawned
-/// task, so the slot is released when the task ends — panic unwinds included.
+/// task and released as soon as the handler completes — the response then
+/// delivers into the pre-reserved slot without blocking (see
+/// [`finish_slow_path_rpc`]) — and a panic unwind through the task still
+/// drops both.
 /// Frames that fail parse/envelope validation are exempt: they are answered
 /// inline with the router's `-32700`/`-32600`, so the error matrix does not
 /// change under load.
@@ -357,34 +375,36 @@ pub(crate) async fn process_frame(
             // loop (UDS HOL fix). `openInEditor` in particular awaits an
             // FE-served reverse RPC on this same connection (§5.14) — running
             // it inline would deadlock frame reads until the reverse timeout.
-            // Response is delivered through the cloned outbound sender; if the
-            // connection has since closed the send is dropped silently.
+            // The response slot is reserved up front (see
+            // [`finish_slow_path_rpc`]); if the connection has since closed
+            // the send is dropped silently.
+            let Ok(slot) = out_tx.reserve_priority().await else {
+                return false;
+            };
             let permit = match limiter.try_acquire() {
                 Ok(permit) => permit,
                 Err(overloaded) => {
-                    return reject_overloaded(&method, rpc_id, out_tx, overloaded).await
+                    drop(slot);
+                    return reject_overloaded(&method, rpc_id, out_tx, overloaded).await;
                 }
             };
             let api = Arc::clone(api);
             let bus = bus.clone();
-            let out = out_tx.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                // Held for the whole task, so the slot is released when it
-                // ends — including a panic unwind through `guard_frame`.
-                let _permit = permit;
                 crate::context::with_connection_context(is_tcp, async {
-                    if let Some(frame) = panic_guard::guard_frame(
-                        &method,
-                        rpc_id,
-                        host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse),
+                    finish_slow_path_rpc(
+                        permit,
+                        panic_guard::guard_frame(
+                            &method,
+                            rpc_id,
+                            host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse),
+                        ),
+                        slot,
                     )
-                    .await
-                    {
-                        let _ = out.send_priority(frame).await;
-                    }
+                    .await;
                 })
                 .await;
             });
@@ -395,25 +415,27 @@ pub(crate) async fn process_frame(
             // same connection (§12.4), so run it off the read loop for the same
             // reason as `host::classify` — inline would block frame reads until
             // the reverse timeout.
+            let Ok(slot) = out_tx.reserve_priority().await else {
+                return false;
+            };
             let permit = match limiter.try_acquire() {
                 Ok(permit) => permit,
                 Err(overloaded) => {
-                    return reject_overloaded(&method, rpc_id, out_tx, overloaded).await
+                    drop(slot);
+                    return reject_overloaded(&method, rpc_id, out_tx, overloaded).await;
                 }
             };
-            let out = out_tx.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                let _permit = permit;
                 crate::context::with_connection_context(is_tcp, async {
-                    if let Some(frame) =
-                        panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse))
-                            .await
-                    {
-                        let _ = out.send_priority(frame).await;
-                    }
+                    finish_slow_path_rpc(
+                        permit,
+                        panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse)),
+                        slot,
+                    )
+                    .await;
                 })
                 .await;
             });
@@ -506,26 +528,70 @@ pub(crate) async fn process_frame(
             None => true,
         };
     }
+    let Ok(slot) = out_tx.reserve_priority().await else {
+        return false;
+    };
     let permit = match limiter.try_acquire() {
         Ok(permit) => permit,
-        Err(overloaded) => return reject_overloaded(&method, rpc_id, out_tx, overloaded).await,
+        Err(overloaded) => {
+            drop(slot);
+            return reject_overloaded(&method, rpc_id, out_tx, overloaded).await;
+        }
     };
     let api = api.clone();
-    let out_tx = out_tx.clone();
     let raw = raw.to_string();
     let is_tcp = crate::context::is_tcp_connection();
     tokio::spawn(async move {
-        let _permit = permit;
         crate::context::with_connection_context(is_tcp, async {
-            if let Some(response) =
-                panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)).await
-            {
-                let _ = out_tx.send_priority(response).await;
-            }
+            finish_slow_path_rpc(
+                permit,
+                panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)),
+                slot,
+            )
+            .await;
         })
         .await;
     });
     true
+}
+
+/// Finish one detached slow-path RPC: await the guarded `handler`, release
+/// the limiter slot, then deliver the response frame (if any) into the
+/// priority-lane `slot` the read loop reserved before spawning the task.
+///
+/// The split of responsibilities is the point:
+///
+/// - **Backpressure** is applied by the read loop's `reserve_priority().await`
+///   BEFORE a limiter slot is claimed. When a connection's writer stalls and
+///   its priority lane fills, that connection's own read loop parks on the
+///   reservation — it stops reading frames and holds no limiter permit while
+///   waiting, so a slow client throttles only itself.
+/// - **The limiter permit covers handler execution only.** Delivering the
+///   response into the pre-reserved slot is non-blocking, so the permit is
+///   released the moment the handler completes and outbound-lane wait time is
+///   never charged against `maxOutstandingRpcs` — one slow connection cannot
+///   pin every slot and reject all other clients with `-32011`.
+/// - **Responses stay inside the bounded lane.** Each in-flight task holds a
+///   reserved slot, not a parked send outside the channel, so the number of
+///   response frames buffered per connection can never exceed
+///   [`PRIORITY_CAPACITY`] — a client that sends without reading cannot grow
+///   an unbounded backlog of completed responses.
+///
+/// Panic safety is unchanged: `guard_frame` already catches handler panics,
+/// and both the permit and the slot are owned by this future, so an unwind
+/// that does escape still releases them when the spawned task dies. A
+/// handler that yields no frame (notification) drops the unused slot,
+/// returning the capacity.
+async fn finish_slow_path_rpc(
+    permit: Option<OwnedSemaphorePermit>,
+    handler: impl Future<Output = Option<String>>,
+    slot: mpsc::OwnedPermit<String>,
+) {
+    let frame = handler.await;
+    drop(permit);
+    if let Some(frame) = frame {
+        slot.send(frame);
+    }
 }
 
 /// Whether a generic frame can actually reach a service handler, i.e. it
@@ -756,12 +822,19 @@ async fn handle_sub_fast_path(
             id,
             channel: Channel::Note,
             params,
-        } => match subscriptions::parse_subscribe_params(&params) {
+        } => match subscriptions::parse_note_subscribe_params(&params) {
             Ok(p) => {
                 let subscriptions::NoteSubscribeParams {
                     workspace_id,
                     replace_group,
+                    projection,
                 } = p;
+                // Time the request-to-snapshot interval (intent-hq/intent#3707):
+                // the fast-path never enters the `rpc_dispatch` span, so this
+                // timer is its duration guardrail. Started before the
+                // replace-group cleanup so a costly removal scan is included
+                // in the measured interval.
+                let timer = subscriptions::SnapshotTimer::start(Channel::Note, &workspace_id);
                 if let Some(group) = replace_group.as_deref() {
                     subs.remove_group(group);
                 }
@@ -795,9 +868,11 @@ async fn handle_sub_fast_path(
                 let handle = tokio::spawn(forward_note_subscription(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
+                    projection,
                     subscription,
                     subscription_id.clone(),
                     out_tx.clone(),
+                    timer,
                 ));
                 subs.insert(subscription_id, handle, replace_group);
                 true
@@ -824,6 +899,10 @@ async fn handle_sub_fast_path(
                     projection,
                     replace_group,
                 } = p;
+                // Time the request-to-snapshot interval (intent-hq/intent#3707),
+                // started before the replace-group cleanup so a costly removal
+                // scan is included in the measured interval.
+                let timer = subscriptions::SnapshotTimer::start(Channel::Chat, &agent_id);
                 if let Some(group) = replace_group.as_deref() {
                     subs.remove_group(group);
                 }
@@ -855,6 +934,7 @@ async fn handle_sub_fast_path(
                     subscription,
                     subscription_id.clone(),
                     out_tx.clone(),
+                    timer,
                 ));
                 subs.insert(subscription_id, handle, replace_group);
                 true
@@ -876,6 +956,13 @@ async fn handle_sub_fast_path(
                     note_id,
                     replace_group,
                 }) => {
+                    // Time the request-to-snapshot interval (intent-hq/intent#3707),
+                    // started before the replace-group cleanup so a costly
+                    // removal scan is included in the measured interval.
+                    let timer = subscriptions::SnapshotTimer::start(
+                        channel,
+                        workspace_id.as_deref().unwrap_or("global"),
+                    );
                     if let Some(group) = replace_group.as_deref() {
                         subs.remove_group(group);
                     }
@@ -909,6 +996,7 @@ async fn handle_sub_fast_path(
                         subscription,
                         subscription_id.clone(),
                         out_tx.clone(),
+                        timer,
                     ));
                     subs.insert(subscription_id, handle, replace_group);
                     true
@@ -934,27 +1022,42 @@ async fn handle_sub_fast_path(
 /// the snapshot (seq 0) from `list_notes`, then maps each `note:*` change event
 /// to a `{ added, updated, removedIds }` delta (re-reading the entity, §2.2) at
 /// the next seq. Owns `seq`, so strict monotonicity holds without shared state.
-/// Aborted by [`ConnSub`] on unsubscribe / disconnect.
+/// Aborted by [`ConnSub`] on unsubscribe / disconnect. The subscription's
+/// `projection` (v8.2, monorepo#3586 — mirroring `note.list`, §5.2) is fixed
+/// at subscribe time: slim serves bounded `note_list_slim_row`s on the seq-0
+/// snapshot AND every `added`/`updated` delta, so no note-channel frame class
+/// escapes the bound; full (`None`) keeps the rows byte-identical to before.
 async fn forward_note_subscription(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
+    projection: Option<intent_core::NoteListProjection>,
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: OutboundSender,
+    timer: subscriptions::SnapshotTimer,
 ) {
     let snapshot = match api.list_notes(&workspace_id).await {
-        Ok(notes) => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+        Ok(notes) => match projection {
+            Some(intent_core::NoteListProjection::Slim) => Value::Array(
+                notes
+                    .into_iter()
+                    .map(intent_core::note_list_slim_row)
+                    .collect(),
+            ),
+            None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+        },
         Err(_) => Value::Array(Vec::new()),
     };
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
     if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
+    timer.snapshot_emitted();
     let mut seq: u64 = 1;
     while let Some(batch) = subscription.recv().await {
         for event in batch {
             if let Some(delta) =
-                subscriptions::note_delta(api.as_ref(), &workspace_id, &event).await
+                subscriptions::note_delta(api.as_ref(), &workspace_id, &event, projection).await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 if out_tx.send_bulk(frame).await.is_err() {
@@ -1025,6 +1128,7 @@ async fn forward_chat_subscription(
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: OutboundSender,
+    timer: subscriptions::SnapshotTimer,
 ) {
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
@@ -1041,6 +1145,7 @@ async fn forward_chat_subscription(
     if out_tx.send(frame).await.is_err() {
         return;
     }
+    timer.snapshot_emitted();
     let mut state = subscriptions::ChatDeltaState::new(&agent_id, delta_encoding, projection);
     // Mid-turn resume (CS-0 D5): if the snapshot carried an in-flight message,
     // seed the delta state from it so the next chunk continues the streamed text
@@ -1307,6 +1412,7 @@ fn parse_channel_params(
 /// [`subscriptions::task_delta`] pair so spec-body edits refresh flipped
 /// `specLinked` flags (monorepo#2407). Owns `seq` for strict monotonicity;
 /// aborted by [`ConnSub`] on unsubscribe / disconnect.
+#[allow(clippy::too_many_arguments)]
 async fn forward_channel_subscription(
     api: Arc<dyn WorkspaceApi>,
     channel: Channel,
@@ -1315,6 +1421,7 @@ async fn forward_channel_subscription(
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: OutboundSender,
+    timer: subscriptions::SnapshotTimer,
 ) {
     // The task channel's delta mapper is stateful: it tracks the spec's
     // task-link set so a spec-body edit can re-emit the rows whose
@@ -1333,6 +1440,7 @@ async fn forward_channel_subscription(
     if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
+    timer.snapshot_emitted();
     let mut seq: u64 = 1;
     while let Some(batch) = subscription.recv().await {
         for event in batch {
@@ -1407,6 +1515,100 @@ mod tests {
             rx.priority.try_recv().is_err() && rx.bulk.try_recv().is_err(),
             "notifications get no response"
         );
+    }
+
+    /// Regression: a completed RPC releases its limiter slot without waiting
+    /// on the stalled writer. The response delivers into the slot reserved
+    /// before the spawn, so [`finish_slow_path_rpc`] never blocks after the
+    /// handler — permits come free even though the lane is otherwise full and
+    /// nothing drains it, and a subsequent RPC still acquires a slot instead
+    /// of being rejected with `-32011`. Charging the enqueue against the
+    /// permit again (awaiting a lane send inside the helper) makes this test
+    /// fail.
+    #[tokio::test]
+    async fn permits_are_released_before_the_outbound_send() {
+        let limiter = RpcLimiter::new(2);
+        let (tx, mut rx) = outbound_channel();
+        // Stall the writer: fill the priority lane except the two slots the
+        // read loop reserves for the responses below.
+        for _ in 0..PRIORITY_CAPACITY - 2 {
+            tx.send_priority("stall".to_string()).await.unwrap();
+        }
+        // Two RPCs reserve their response slots, claim both limiter slots,
+        // and complete their handlers; nothing ever drains the lane.
+        let mut tasks = Vec::new();
+        for i in 0..2 {
+            let slot = tx.reserve_priority().await.expect("reserved slot");
+            let permit = limiter.try_acquire().expect("slot");
+            tasks.push(tokio::spawn(async move {
+                finish_slow_path_rpc(permit, async move { Some(format!("resp-{i}")) }, slot).await;
+            }));
+        }
+        // Both permits come free while the writer is still stalled.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while limiter.available_permits() != Some(2) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "permits must be released while the writer is stalled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // A subsequent RPC acquires a freed slot instead of `-32011`.
+        let regained = limiter.try_acquire().expect("freed slot").expect("permit");
+        drop(regained);
+        // Once the writer drains, the responses deliver intact.
+        for _ in 0..PRIORITY_CAPACITY - 2 {
+            assert_eq!(rx.recv().await.as_deref(), Some("stall"));
+        }
+        let mut got = vec![
+            rx.recv().await.expect("first response"),
+            rx.recv().await.expect("second response"),
+        ];
+        got.sort();
+        assert_eq!(got, ["resp-0", "resp-1"]);
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    /// A full priority lane parks the read loop's reservation WITHOUT a
+    /// limiter permit being held: the slow connection stops reading frames
+    /// (throttling only itself) while every `maxOutstandingRpcs` slot stays
+    /// available to other connections, and no completed response is ever
+    /// buffered outside the bounded lane. Draining one frame unparks the
+    /// reservation.
+    #[tokio::test]
+    async fn full_lane_parks_the_reservation_without_pinning_a_permit() {
+        let limiter = RpcLimiter::new(1);
+        let (tx, mut rx) = outbound_channel();
+        for _ in 0..PRIORITY_CAPACITY {
+            tx.send_priority("stall".to_string()).await.unwrap();
+        }
+        // The slow connection's read loop parks on the reservation, holding
+        // no permit while it waits.
+        let parked = tokio::spawn(async move {
+            let slot = tx.reserve_priority().await.expect("slot after drain");
+            slot.send("late-resp".to_string());
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !parked.is_finished(),
+            "reservation must park on a full lane"
+        );
+        assert_eq!(
+            limiter.available_permits(),
+            Some(1),
+            "a parked reservation must not pin a limiter slot"
+        );
+        // Other connections keep acquiring permits the whole time.
+        drop(limiter.try_acquire().expect("slot").expect("permit"));
+        // Draining one frame hands the freed capacity to the reservation.
+        assert_eq!(rx.recv().await.as_deref(), Some("stall"));
+        parked.await.unwrap();
+        for _ in 0..PRIORITY_CAPACITY - 1 {
+            assert_eq!(rx.recv().await.as_deref(), Some("stall"));
+        }
+        assert_eq!(rx.recv().await.as_deref(), Some("late-resp"));
     }
 
     /// Only frames that survive envelope validation are gated by the limiter;

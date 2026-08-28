@@ -244,13 +244,64 @@
 //! listing rows with `content` omitted, replaced by `contentPreview` (first
 //! 500 chars) plus `contentLength` (total chars, the `note.listVersions`
 //! unit), every other Note field unchanged; any other value is `-32602`.
-//! No method-catalog change — 297 router methods, 336 total.
+//! No method-catalog change — 297 router methods, 336 total. Version 8.2
+//! extends the same optional `projection` param to `note.subscribe`
+//! (additive; §6.9, monorepo#3586 — the subscription half of the note.list
+//! slim story): absent / `null` / `"full"` keep the full rows byte-identical
+//! to before (full stays the default, matching `note.list`); `"slim"`,
+//! fixed for the subscription's lifetime, serves the same bounded slim rows
+//! (`content` → `contentPreview` + `contentLength`) on the seq-0 snapshot
+//! AND every `added`/`updated` delta re-read, so a slim-adopting client has
+//! no unbounded note-channel frame class left; any other value is `-32602`.
+//! The `task`/`agent` channels are untouched (the param stays an ignored
+//! unknown key there). No method-catalog change — 297 router methods,
+//! 336 total. Version 8.3 adds the `agent.list` retired-bin read
+//! (additive; §5.5): the optional `retiredOnly` param serves ONLY
+//! soft-retired rows (each carrying `retiredAt`, via an SQL-side
+//! `retired_at IS NOT NULL` filter; `includeRetired` + `retiredOnly`
+//! together is `-32602`), and every response variant gains the
+//! always-present `retiredCount` field (one SQL COUNT of the workspace's
+//! soft-retired sessions). No method-catalog change — 297 router methods,
+//! 336 total. Version 8.4 caps the `git.status` wire response (additive;
+//! §5.6, monorepo#3635): `files` is truncated to at most 5000 entries per
+//! response — tracked changes preferred over untracked, relative order
+//! preserved — and a truncated result carries the additive
+//! `filesTruncated: true` + `totalFiles` (full pre-cap count) markers, both
+//! omitted on an untruncated result so the pre-8.4 shape is preserved
+//! byte-for-byte; aggregate flags (`hasUncommittedChanges`,
+//! `hasUntrackedFiles`) still reflect the full scan, and `git.changes` is
+//! deliberately uncapped. No method-catalog change — 297 router methods,
+//! 336 total. Version 8.5 adds agent liveness observability
+//! (additive; §5.5, monorepo#3647): the optional `includeInProgress`
+//! boolean param on `agent.getConversation` (absent / `null` / `false`
+//! byte-identical; non-boolean `-32602`) — when `true` and the served page
+//! ends at the live tail, the in-flight turn's partial assistant message
+//! (streamed blocks so far, slim-bounded like persisted rows, excluded
+//! from `totalMessages`/pagination) is appended as a trailing
+//! `inProgress: true` row (its blocks hydrate via `agent.getMessageBlock`
+//! mid-turn: an unpersisted message id matching the live turn resolves
+//! from the slot's streamed blocks); `AgentLite.lastActivity` is overlaid
+//! mid-turn with the live-turn stream stamp (max of persisted `updatedAt`
+//! and `lastStreamActivityAt`) so it advances on tool-call/stream
+//! activity; and `agent.diagnostics` rows key `staleResponding` on that
+//! same liveness-aware max, additionally serving the raw
+//! `lastStreamActivityAt?` (presence-detected, omitted when no turn is
+//! streaming). No method-catalog change — 297 router methods, 336 total.
+//! Version 8.6 adds the `system.requestUpdate` fast-path method (additive;
+//! §5.7): no params, served on BOTH transports (unlike `system.shutdown` —
+//! a remote client is exactly who needs to trigger an update); the daemon
+//! locates the supervising sitter's pidfile (`<data_dir>/sitter/sitter.pid`),
+//! verifies the pid is live, and sends it SIGUSR1 (the sitter's "check for
+//! updates now" signal), returning `{ ok: true }`; a daemon that is not
+//! sitter-supervised (missing/stale pidfile, or a platform without unix
+//! signals) gets `-32603` with the reason. Method catalog grows by one
+//! fast-path method — 297 router methods, 337 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "8.1";
+pub const PROTOCOL_VERSION: &str = "8.6";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

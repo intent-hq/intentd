@@ -73,6 +73,10 @@ pub(crate) struct CompletionWatch {
     /// it already wakes directly. The field is kept as the persisted record
     /// of an explicit registration.
     pub wake_on_attention: bool,
+    /// Ask-only watches wait strictly for terminal completion. Attention
+    /// requests do not consume or wake this watch, and it may coexist with an
+    /// unrelated grouped watch for the same parent/child pair.
+    pub completion_only: bool,
 }
 
 /// Fan-in table for `waitMode: "after_all"` delegation groups. All children a
@@ -222,6 +226,60 @@ impl Services {
         Ok(id)
     }
 
+    /// Ask-only durable registration. A new completion-only watch is persisted
+    /// before it becomes visible to completion delivery, so a concurrent
+    /// delivery cannot delete it before a late upsert resurrects an orphan.
+    /// An existing ungrouped watch already provides an immediate completion
+    /// path and is reused without another durable write.
+    pub(crate) async fn register_completion_watch_strict_durable(
+        &self,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        parent_agent_name: String,
+        child_agent_id: AgentId,
+    ) -> Result<String> {
+        check_watch_scope(parent_workspace_id, child_workspace_id)?;
+        let _registration = self.completion_watch_registration_gate.lock().await;
+        if let Some(existing) = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .find(|watch| {
+                watch.parent_agent_id == parent_agent_id
+                    && watch.child_agent_id == child_agent_id
+                    && watch.group_id.is_none()
+            })
+        {
+            return Ok(existing.id.clone());
+        }
+        let watch = CompletionWatch {
+            id: Uuid::new_v4().to_string(),
+            parent_workspace_id: parent_workspace_id.clone(),
+            child_workspace_id: child_workspace_id.clone(),
+            parent_agent_id,
+            parent_agent_name,
+            child_agent_id,
+            group_id: None,
+            created_at: now_iso(),
+            report_delivered: false,
+            wake_on_attention: false,
+            completion_only: true,
+        };
+        let id = watch.id.clone();
+        self.store
+            .upsert_completion_watch(&completion_watch_to_persisted(&watch))
+            .await?;
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .push(watch);
+        Ok(id)
+    }
+
     /// Explicit `agent.watch` registration (monorepo#1229): an ungrouped
     /// watch with an AWAITED persist (the registration is the caller's
     /// durable contract). Attention wakes reach every active watch
@@ -327,6 +385,7 @@ impl Services {
                     created_at: now_iso(),
                     report_delivered: false,
                     wake_on_attention,
+                    completion_only: false,
                 };
                 guard.subscriptions.push(watch.clone());
                 watch
@@ -1318,7 +1377,8 @@ impl Services {
                     LoadOutcome::AlreadyInMemory
                 } else if guard.subscriptions.iter().any(|s| {
                     s.parent_agent_id == p.parent_agent_id && s.child_agent_id == p.child_agent_id
-                }) {
+                }) && !p.completion_only
+                {
                     // Pair uniqueness: a stronger (grouped) watch for the
                     // same (parent, child) already loaded — this row is a
                     // pre-invariant duplicate.
@@ -1385,8 +1445,9 @@ impl Services {
 
     /// Reconcile one watch's child against current agent state (mirrors the
     /// STAB-108 group reconciliation): if the child already completed /
-    /// failed / was deleted, synthesize the matching completion event and
-    /// route it through [`Services::deliver_completion_to_watches`] so the
+    /// failed / was deleted / retired, synthesize the matching completion
+    /// event and route it through
+    /// [`Services::deliver_completion_to_watches`] so the
     /// parent wakes now instead of waiting for an event that already fired.
     /// Used both at startup rehydration (child settled while the daemon was
     /// down) and at `agent.watch` / `app.agents.waitFor` registration time
@@ -1404,12 +1465,24 @@ impl Services {
             match self.store.get_agent_session(child_id).await {
                 Ok(session) => {
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
+                    // A retired session (`retired_at` set) is inert — no
+                    // future completion can fire, so the watch resolves NOW
+                    // with a synthetic `agent:retired` (a child that retired
+                    // while the daemon was down, or a watch racing a
+                    // concurrent retire). Deletion still wins: a deleted row
+                    // stays deleted regardless of the retire mark.
+                    let is_retired = !is_deleted && session.retired_at.is_some();
                     let is_completed = matches!(session.status, AgentStatus::Completed);
                     let is_failed = matches!(session.status, AgentStatus::Error);
                     // RuntimeIdle: genuinely complete only with a completion
                     // report and no interrupted row (same conservative
-                    // predicate as reconcile_group_on_rehydration).
-                    let is_idle_complete = if matches!(session.status, AgentStatus::RuntimeIdle) {
+                    // predicate as reconcile_group_on_rehydration). A retired
+                    // child skips this block entirely — its idle-deferral
+                    // early-returns (agent-waiting / hooks / monitors) must
+                    // not leave a watch armed on an inert session.
+                    let is_idle_complete = if !is_retired
+                        && matches!(session.status, AgentStatus::RuntimeIdle)
+                    {
                         let has_report = session.completion_report.is_some();
                         let settled = match self.store.get_interrupted_agent(child_id).await {
                             Ok(opt) => has_report && opt.is_none(),
@@ -1471,6 +1544,11 @@ impl Services {
                     };
                     let event_type = if is_deleted {
                         intent_core::events::AGENT_DELETED
+                    } else if is_retired {
+                        // Retired outranks failed/completed: whatever the
+                        // status was when the mark landed, the session is
+                        // inert now and "retired" is the accurate settlement.
+                        intent_core::events::AGENT_RETIRED
                     } else if is_failed {
                         intent_core::events::AGENT_FAILED
                     } else if is_completed || is_idle_complete {
@@ -1670,13 +1748,17 @@ impl Services {
                     // - Otherwise, skip (child may be interrupted/healing)
 
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
+                    // A retired child (`retired_at` set) settles like a
+                    // deleted one: the session is inert, no future completion
+                    // can fire, so the group must not hang on it. Deletion
+                    // still wins for the event kind.
+                    let is_retired = !is_deleted && session.retired_at.is_some();
                     let is_explicitly_completed = matches!(session.status, AgentStatus::Completed);
                     let is_failed = matches!(session.status, AgentStatus::Error);
 
-                    let is_idle_and_genuinely_complete = if matches!(
-                        session.status,
-                        AgentStatus::RuntimeIdle
-                    ) {
+                    let is_idle_and_genuinely_complete = if !is_retired
+                        && matches!(session.status, AgentStatus::RuntimeIdle)
+                    {
                         // Check if there's a completion report and no interrupted row
                         let has_completion_report = session.completion_report.is_some();
                         let interrupted_check = self.store.get_interrupted_agent(&child_id).await;
@@ -1697,15 +1779,19 @@ impl Services {
                     };
 
                     let should_record = is_deleted
+                        || is_retired
                         || is_explicitly_completed
                         || is_failed
                         || is_idle_and_genuinely_complete;
 
                     if should_record {
-                        // Build a synthetic agent:idle, agent:failed, or agent:deleted event
+                        // Build a synthetic agent:idle, agent:failed,
+                        // agent:deleted, or agent:retired event.
                         // Prefer the child's persisted completion_report when present
                         let event_type = if is_deleted {
                             intent_core::events::AGENT_DELETED
+                        } else if is_retired {
+                            intent_core::events::AGENT_RETIRED
                         } else if is_failed {
                             intent_core::events::AGENT_FAILED
                         } else {
@@ -1861,9 +1947,15 @@ impl Services {
                             stall.as_ref(),
                         );
 
-                        // Record the completion
+                        // Record the completion. Retired records in the
+                        // deleted bucket (terminal, non-completing — same as
+                        // the live delivery path).
                         self.record_group_child_completion(
-                            group_id, &child_id, is_deleted, summary, event,
+                            group_id,
+                            &child_id,
+                            is_deleted || is_retired,
+                            summary,
+                            event,
                         )
                         .await;
                     }
@@ -2108,6 +2200,7 @@ fn completion_watch_to_persisted(watch: &CompletionWatch) -> PersistedCompletion
         group_id: watch.group_id.clone(),
         report_delivered: watch.report_delivered,
         wake_on_attention: watch.wake_on_attention,
+        completion_only: watch.completion_only,
         created_at: watch.created_at.clone(),
     }
 }
@@ -2129,6 +2222,7 @@ fn persisted_to_completion_watch(p: &PersistedCompletionWatch) -> CompletionWatc
         // those legacy rows.
         report_delivered: false,
         wake_on_attention: p.wake_on_attention,
+        completion_only: p.completion_only,
     }
 }
 

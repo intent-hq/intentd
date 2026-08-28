@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
-    now_iso, AgentDelegateInput, AgentId, Error, NoteCreate, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, NoteCreate, Workspace,
+    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use std::time::Duration;
 
@@ -301,6 +301,24 @@ async fn retired_agents_are_inert_until_restored() {
         .expect("list all");
     let row = all.iter().find(|a| a.id == id).expect("retired row");
     assert!(row.retired_at.is_some(), "retiredAt missing on wire row");
+    // …the retiredOnly variant serves ONLY the retired row…
+    let retired = svc
+        .agent_list_retired_only_op(ws.clone())
+        .await
+        .expect("list retired");
+    assert_eq!(retired.len(), 1, "retiredOnly serves only retired rows");
+    assert_eq!(retired[0].id, id);
+    assert!(
+        retired[0].retired_at.is_some(),
+        "retiredOnly rows carry retiredAt"
+    );
+    // …the retired count reflects the mark…
+    assert_eq!(
+        svc.agent_retired_count_op(ws.clone())
+            .await
+            .expect("retired count"),
+        1
+    );
     // …and interaction paths fail closed with the retired error.
     let err = svc
         .agent_send_message_op(id.clone(), "hi".into(), None, None, None, None)
@@ -333,6 +351,20 @@ async fn retired_agents_are_inert_until_restored() {
 
     let rows = svc.agent_list_op(ws.clone()).await.expect("list");
     assert!(rows.iter().any(|a| a.id == id), "restored row missing");
+    let retired = svc
+        .agent_list_retired_only_op(ws.clone())
+        .await
+        .expect("list retired");
+    assert!(
+        retired.is_empty(),
+        "restored row must leave the retiredOnly list"
+    );
+    assert_eq!(
+        svc.agent_retired_count_op(ws.clone())
+            .await
+            .expect("retired count"),
+        0
+    );
     svc.agent_send_message_op(id.clone(), "hi again".into(), None, None, None, None)
         .await
         .expect("send after restore");
@@ -376,6 +408,23 @@ async fn retired_sessions_are_excluded_from_default_projection_load() {
         "retired session must not be loaded by the default projection read"
     );
 
+    // …and the retired-only store read is the exact mirror: it omits the
+    // active session entirely (PR review: the retiredOnly path must never
+    // pay the full-workspace projection cost).
+    let retired_projections = svc
+        .store()
+        .get_retired_agent_session_message_projections(&ws)
+        .await
+        .expect("retired projections");
+    assert!(
+        retired_projections.contains_key(&old.0),
+        "retired session projected"
+    );
+    assert!(
+        !retired_projections.contains_key(&live.0),
+        "active session must not be loaded by the retired-only projection read"
+    );
+
     // includeRetired still serves the retired row WITH its projections
     // (message_count from the direct, cache-bypassing load).
     let all = svc
@@ -386,6 +435,18 @@ async fn retired_sessions_are_excluded_from_default_projection_load() {
     assert_eq!(
         row.message_count, 1,
         "retired row keeps its message projection in the includeRetired read"
+    );
+
+    // The retiredOnly read serves the retired-only projection variant, so
+    // its rows keep full message projections too.
+    let retired = svc
+        .agent_list_retired_only_op(ws.clone())
+        .await
+        .expect("list retired");
+    let row = retired.iter().find(|a| a.id == old).expect("retired row");
+    assert_eq!(
+        row.message_count, 1,
+        "retired row keeps its message projection in the retiredOnly read"
     );
 }
 
@@ -408,6 +469,273 @@ async fn retire_and_restore_reject_cross_workspace_targets() {
     // The mark was never set.
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert!(session.retired_at.is_none());
+}
+
+/// Link `child` under `parent` and pin its persisted status — the fixture
+/// for the retire guard/cascade tests below.
+async fn link_child(
+    svc: &Services,
+    ws: &WorkspaceId,
+    child: &AgentId,
+    parent: &AgentId,
+    status: intent_core::AgentStatus,
+) {
+    let mut s = svc
+        .store()
+        .get_agent_session(child)
+        .await
+        .expect("child session");
+    s.parent_agent_id = Some(parent.clone());
+    s.status = status;
+    svc.store()
+        .update_agent_session(ws, &s)
+        .await
+        .expect("link child");
+}
+
+/// Guard: `ws.agent.retire` FAILS (`InvalidParams`, nothing mutated) while a
+/// descendant is still running a turn — transitively: an active grandchild
+/// under an idle child blocks the retire just like a direct child would.
+#[tokio::test]
+async fn retire_rejects_while_a_descendant_is_running_a_turn() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Busy").await;
+    link_child(&svc, &ws, &child, &parent, intent_core::AgentStatus::Active).await;
+
+    let err = svc
+        .agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect_err("retire with an active child must fail");
+    let msg = err.to_string();
+    assert!(msg.contains("Busy"), "error names the active child: {msg}");
+    assert!(msg.contains("running a turn"), "got: {msg}");
+    // Nothing mutated: neither the parent nor the child is retired.
+    for id in [&parent, &child] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_none(), "no partial retire for {id}");
+    }
+
+    // Transitive: settle the child, hang an active grandchild under it —
+    // the guard still rejects and names the grandchild.
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    let grandchild = create_agent(&svc, &ws, "DeepWorker").await;
+    link_child(
+        &svc,
+        &ws,
+        &grandchild,
+        &child,
+        intent_core::AgentStatus::Processing,
+    )
+    .await;
+    let err = svc
+        .agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect_err("retire with an active grandchild must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("DeepWorker"),
+        "error names the grandchild: {msg}"
+    );
+    for id in [&parent, &child, &grandchild] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_none(), "no partial retire for {id}");
+    }
+
+    // A `pending` descendant (queued turn) blocks too.
+    link_child(
+        &svc,
+        &ws,
+        &grandchild,
+        &child,
+        intent_core::AgentStatus::Pending,
+    )
+    .await;
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect_err("retire with a pending descendant must fail");
+}
+
+/// Cascade: retiring the parent retires every settled/idle descendant with
+/// it — each with its own `agent:retired` emit carrying the cascade reason —
+/// while terminal children, already-retired children (timestamp preserved),
+/// and unrelated bystanders are untouched. A second retire of the parent is
+/// the documented idempotent no-op (no re-cascade, no re-emit).
+#[tokio::test]
+async fn retire_cascades_to_settled_descendants() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "IdleChild").await;
+    let grandchild = create_agent(&svc, &ws, "WaitingGrandchild").await;
+    let done = create_agent(&svc, &ws, "DoneChild").await;
+    let veteran = create_agent(&svc, &ws, "VeteranChild").await;
+    let bystander = create_agent(&svc, &ws, "Bystander").await;
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    link_child(
+        &svc,
+        &ws,
+        &grandchild,
+        &child,
+        intent_core::AgentStatus::Waiting,
+    )
+    .await;
+    link_child(
+        &svc,
+        &ws,
+        &done,
+        &parent,
+        intent_core::AgentStatus::Completed,
+    )
+    .await;
+    link_child(
+        &svc,
+        &ws,
+        &veteran,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    // Pre-retire the veteran: its timestamp must survive the cascade.
+    let r = svc
+        .agent_retire_op(veteran.clone(), Some(ws.clone()), None)
+        .await
+        .expect("pre-retire veteran");
+    let veteran_retired_at = r["retiredAt"].as_str().expect("retiredAt").to_string();
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RETIRED.to_string()],
+        ..Default::default()
+    });
+    let r = svc
+        .agent_retire_op(parent.clone(), Some(ws.clone()), Some("wrapping up".into()))
+        .await
+        .expect("retire parent");
+    assert_eq!(r["success"], json!(true));
+    assert!(r.get("alreadyRetired").is_none());
+
+    // Three emits: the parent (caller's reason) + the two cascaded
+    // descendants (cascade reason naming the parent).
+    let mut events = Vec::new();
+    while events.len() < 3 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription closed");
+        events.extend(batch);
+    }
+    let reason_of = |id: &AgentId| {
+        events
+            .iter()
+            .find(|e| e.data["agentId"].as_str() == Some(id.0.as_str()))
+            .unwrap_or_else(|| panic!("no agent:retired for {id}"))
+            .data["reason"]
+            .as_str()
+            .map(str::to_string)
+    };
+    assert_eq!(reason_of(&parent).as_deref(), Some("wrapping up"));
+    assert_eq!(reason_of(&child).as_deref(), Some("parent Parent retired"));
+    assert_eq!(
+        reason_of(&grandchild).as_deref(),
+        Some("parent Parent retired")
+    );
+
+    // Rows: parent + cascaded descendants retired; terminal child and
+    // bystander untouched; the veteran keeps its original timestamp.
+    for id in [&parent, &child, &grandchild] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_some(), "{id} retired by the cascade");
+    }
+    for id in [&done, &bystander] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_none(), "{id} must not be cascade-retired");
+    }
+    let s = svc
+        .store()
+        .get_agent_session(&veteran)
+        .await
+        .expect("veteran");
+    assert_eq!(
+        s.retired_at.as_deref(),
+        Some(veteran_retired_at.as_str()),
+        "pre-retired child keeps its original timestamp"
+    );
+
+    // Idempotent short-circuit: re-retiring the already-retired parent
+    // reports alreadyRetired without re-walking the tree or re-emitting.
+    let r2 = svc
+        .agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect("re-retire");
+    assert_eq!(r2["alreadyRetired"], json!(true));
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "no re-emit on the idempotent retire"
+    );
+}
+
+/// Restore does NOT resurrect the cascade: restoring the parent clears only
+/// the parent's mark — cascaded children stay retired until each is
+/// individually restored via its own `agent.restore`.
+#[tokio::test]
+async fn restoring_the_parent_does_not_restore_cascaded_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Kid").await;
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire parent");
+    let s = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(s.retired_at.is_some(), "child cascade-retired");
+
+    let r = svc
+        .agent_restore_op(parent.clone(), Some(ws.clone()))
+        .await
+        .expect("restore parent");
+    assert_eq!(r["restored"], json!(true));
+    let s = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent");
+    assert!(s.retired_at.is_none(), "parent restored");
+    let s = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(
+        s.retired_at.is_some(),
+        "cascaded child stays retired after the parent's restore"
+    );
+
+    // The child is individually restorable.
+    let r = svc
+        .agent_restore_op(child.clone(), Some(ws.clone()))
+        .await
+        .expect("restore child");
+    assert_eq!(r["restored"], json!(true));
+    let s = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(s.retired_at.is_none());
 }
 
 #[tokio::test]
@@ -3400,6 +3728,905 @@ async fn app_agents_wait_validation_failures() {
     assert!(svc.delegation_group_for_parent(&caller).is_none());
 }
 
+#[tokio::test]
+async fn app_agents_send_persists_chief_attribution_and_source_link() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    let source = svc
+        .agent_send_message_op(
+            chief.clone(),
+            "Ask the remote agent for an update".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("persist Chief source message");
+    let source_id = source["messageId"].as_str().expect("source id");
+
+    let result = svc
+        .app_agents_send_op(
+            chief_ws.clone(),
+            chief.clone(),
+            target.clone(),
+            "Please send a status update".into(),
+            Some("interrupt".into()),
+        )
+        .await
+        .expect("Chief send");
+
+    let source_url = format!(
+        "intent://local/{}/agent/{}/message/{source_id}",
+        chief_ws.0, chief.0
+    );
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["success"], true);
+    assert_eq!(result["queued"], false);
+    assert_eq!(result["agentId"], target.0);
+    assert_eq!(result["workspaceId"], target_ws.0);
+    assert_eq!(result["sourceMessageId"], source_id);
+    assert_eq!(result["sourceUrl"], source_url);
+
+    let target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    let delivered = target_session.messages.last().expect("delivered message");
+    assert_eq!(delivered.role, "user");
+    assert_eq!(
+        delivered.metadata,
+        Some(json!({
+            "type": "chief_message",
+            "fromAgentId": chief.0,
+            "fromAgentName": "Chief of Staff",
+            "fromWorkspaceId": chief_ws.0,
+            "sourceMessageId": source_id,
+            "sourceUrl": source_url,
+        }))
+    );
+}
+
+#[tokio::test]
+async fn app_agents_send_preserves_chief_attribution_through_queue_drain() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Held target").await;
+    let source = svc
+        .agent_send_message_op(
+            chief.clone(),
+            "Queue a request for the held target".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("persist Chief source message");
+    let source_id = source["messageId"].as_str().expect("source id").to_string();
+    let question = svc
+        .store()
+        .append_agent_message(&target, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append held question");
+    assert!(
+        svc.record_pending_questions_marker(&target_ws, &target, &question.id)
+            .await,
+        "real question row must arm the hold"
+    );
+
+    let result = svc
+        .app_agents_send_op(
+            chief_ws.clone(),
+            chief.clone(),
+            target.clone(),
+            "Wait until the questions are resolved".into(),
+            Some("normal".into()),
+        )
+        .await
+        .expect("queued Chief send");
+    assert_eq!(result["queued"], true);
+    assert_eq!(result["heldForQuestions"], true);
+    let queued_id = result["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued id")
+        .to_string();
+    let source_url = format!(
+        "intent://local/{}/agent/{}/message/{source_id}",
+        chief_ws.0, chief.0
+    );
+    let expected_metadata = json!({
+        "type": "chief_message",
+        "fromAgentId": chief.0,
+        "fromAgentName": "Chief of Staff",
+        "fromWorkspaceId": chief_ws.0,
+        "sourceMessageId": source_id,
+        "sourceUrl": source_url,
+    });
+    assert_eq!(
+        result["queuedMessage"]["messageMetadata"],
+        expected_metadata
+    );
+
+    svc.agent_send_queued_message_now_op(target.clone(), queued_id)
+        .await
+        .expect("drain queued Chief message");
+    let target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    assert_eq!(
+        target_session
+            .messages
+            .last()
+            .expect("drained row")
+            .metadata,
+        Some(expected_metadata)
+    );
+}
+
+#[tokio::test]
+async fn app_agents_send_fails_closed_for_invalid_callers_and_targets() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+
+    let missing_source = svc
+        .app_agents_send_op(
+            chief_ws.clone(),
+            chief.clone(),
+            target.clone(),
+            "hello".into(),
+            None,
+        )
+        .await;
+    assert!(matches!(missing_source, Err(Error::InvalidParams(_))));
+
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+    for outcome in [
+        svc.app_agents_send_op(
+            target_ws.clone(),
+            chief.clone(),
+            target.clone(),
+            "hello".into(),
+            None,
+        )
+        .await,
+        svc.app_agents_send_op(
+            chief_ws.clone(),
+            chief.clone(),
+            chief.clone(),
+            "hello".into(),
+            None,
+        )
+        .await,
+        svc.app_agents_send_op(
+            chief_ws.clone(),
+            chief.clone(),
+            AgentId::from_string("agent-missing"),
+            "hello".into(),
+            None,
+        )
+        .await,
+    ] {
+        assert!(matches!(outcome, Err(Error::InvalidParams(_))));
+    }
+
+    svc.agent_update_op(target.clone(), json!({ "status": "deleted" }))
+        .await
+        .expect("mark target deleted");
+    let deleted = svc
+        .app_agents_send_op(chief_ws, chief, target, "hello".into(), None)
+        .await;
+    assert!(matches!(deleted, Err(Error::InvalidParams(_))));
+}
+
+#[tokio::test]
+async fn app_agents_send_remains_an_ordinary_send_without_a_completion_watch() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+
+    svc.app_agents_send_op(
+        chief_ws,
+        chief.clone(),
+        target,
+        "ordinary send".into(),
+        None,
+    )
+    .await
+    .expect("Chief send");
+
+    assert!(
+        svc.list_watches_for_parent(&chief).is_empty(),
+        "ordinary send must not arm or claim a completion watch"
+    );
+}
+
+#[tokio::test]
+async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completion() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    let unrelated = create_agent(&svc, &target_ws, "Unrelated target").await;
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+
+    let mut target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    target_session.status = AgentStatus::RuntimeIdle;
+    target_session.completion_report = Some("previous completion".into());
+    target_session.completion_report_timestamp = Some("2026-08-25T00:00:00Z".into());
+    svc.store()
+        .update_agent_session(&target_ws, &target_session)
+        .await
+        .expect("mark previously completed");
+    svc.set_test_busy(&target, true);
+
+    let asked = svc
+        .app_agents_ask_op(
+            chief_ws.clone(),
+            chief.clone(),
+            target.clone(),
+            "finish the work".into(),
+            Some("interrupt".into()),
+        )
+        .await
+        .expect("Chief ask");
+    let subscription_id = asked["watch"]["results"][0]["subscriptionId"]
+        .as_str()
+        .expect("subscription id")
+        .to_string();
+    assert_eq!(svc.list_watches_for_parent(&chief).len(), 1);
+
+    svc.agent_send_message_op(
+        chief.clone(),
+        "progress only".into(),
+        None,
+        None,
+        None,
+        Some(json!({
+            "type": "agent_message",
+            "fromAgentId": target.0,
+            "fromAgentName": "Remote target",
+        })),
+    )
+    .await
+    .expect("ordinary progress send");
+    let sender_watch = svc
+        .agent_watch_completion_for_sender_op(target_ws.clone(), target.clone(), chief.clone())
+        .await
+        .expect("ordinary sender-watch decision");
+    assert_eq!(sender_watch["ok"], false);
+    let watches = svc.list_watches_for_parent(&chief);
+    assert_eq!(watches.len(), 1, "progress must not consume the ask");
+    assert_eq!(watches[0].id, subscription_id);
+
+    svc.agent_send_message_op(
+        chief.clone(),
+        "unrelated update".into(),
+        None,
+        None,
+        None,
+        Some(json!({
+            "type": "agent_message",
+            "fromAgentId": unrelated.0,
+            "fromAgentName": "Unrelated target",
+        })),
+    )
+    .await
+    .expect("unrelated ordinary send");
+    let unrelated_sender_watch = svc
+        .agent_watch_completion_for_sender_op(target_ws.clone(), unrelated, chief.clone())
+        .await
+        .expect("unrelated sender-watch decision");
+    assert_eq!(unrelated_sender_watch["ok"], false);
+    assert_eq!(
+        svc.list_watches_for_parent(&chief).len(),
+        1,
+        "unrelated message must not consume or duplicate the ask"
+    );
+
+    svc.set_test_busy(&target, false);
+    let mut target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    target_session.status = AgentStatus::RuntimeIdle;
+    target_session.completion_report = Some("new completion".into());
+    target_session.completion_report_timestamp = Some("2026-08-26T00:00:00Z".into());
+    svc.store()
+        .update_agent_session(&target_ws, &target_session)
+        .await
+        .expect("mark newly completed");
+    let event = completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({
+            "agentId": target.0,
+            "completionReport": "new completion",
+        }),
+    );
+    svc.handle_completion_event(&event).await;
+    svc.handle_completion_event(&event).await;
+
+    assert!(svc.list_watches_for_parent(&chief).is_empty());
+    let chief_session = svc
+        .store()
+        .get_agent_session(&chief)
+        .await
+        .expect("Chief session");
+    let wakes = chief_session
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .content
+                .to_string()
+                .contains("[WORKSPACE EVENTS] Child agent")
+        })
+        .count();
+    assert_eq!(wakes, 1, "one ask must produce exactly one completion wake");
+}
+
+#[tokio::test]
+async fn app_agents_ask_keeps_a_queued_delivery_armed_until_completion() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Held target").await;
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+    let question = svc
+        .store()
+        .append_agent_message(&target, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append held question");
+    assert!(
+        svc.record_pending_questions_marker(&target_ws, &target, &question.id)
+            .await
+    );
+
+    let asked = svc
+        .app_agents_ask_op(
+            chief_ws,
+            chief.clone(),
+            target.clone(),
+            "answer after the hold".into(),
+            Some("normal".into()),
+        )
+        .await
+        .expect("queued ask");
+    assert_eq!(asked["send"]["queued"], true);
+    assert_eq!(asked["send"]["heldForQuestions"], true);
+    let queued_message_id = asked["send"]["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued message id")
+        .to_string();
+    assert_eq!(svc.list_watches_for_parent(&chief).len(), 1);
+
+    svc.handle_completion_event(&completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0 }),
+    ))
+    .await;
+    assert_eq!(
+        svc.list_watches_for_parent(&chief).len(),
+        1,
+        "queued work makes the idle event interim"
+    );
+
+    svc.agent_dismiss_questions_op(target_ws.clone(), target.clone(), question.id)
+        .await
+        .expect("release question hold and drain queued ask");
+    svc.agent_send_queued_message_now_op(target.clone(), queued_message_id)
+        .await
+        .expect("drain queued ask on store-only test path");
+    let queue = svc
+        .agent_get_queue_op(target.clone(), Some(target_ws.clone()))
+        .await
+        .expect("queue after hold release");
+    assert_eq!(queue["queue"], json!([]), "queued ask must drain");
+    svc.handle_completion_event(&completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({
+            "agentId": target.0,
+            "completionReport": "queued ask complete",
+        }),
+    ))
+    .await;
+    assert!(
+        svc.list_watches_for_parent(&chief).is_empty(),
+        "queued ask must wake and retire on final completion"
+    );
+}
+
+#[tokio::test]
+async fn app_agents_ask_adopts_generic_watch_without_weakening_or_duplication() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+    let generic = svc
+        .agent_watch_op(chief_ws.clone(), chief.clone(), target.clone())
+        .await
+        .expect("generic watch");
+    let generic_id = generic["subscriptionId"].as_str().expect("watch id");
+
+    let asked = svc
+        .app_agents_ask_op(
+            chief_ws,
+            chief.clone(),
+            target,
+            "finish the work".into(),
+            None,
+        )
+        .await
+        .expect("Chief ask");
+
+    assert_eq!(asked["watch"]["results"][0]["subscriptionId"], generic_id);
+    let watches = svc.list_watches_for_parent(&chief);
+    assert_eq!(watches.len(), 1);
+    assert!(
+        watches[0].wake_on_attention,
+        "ask adoption must preserve explicit generic-watch strength"
+    );
+}
+
+#[tokio::test]
+async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+
+    svc.app_agents_ask_op(
+        chief_ws,
+        chief.clone(),
+        target.clone(),
+        "finish the audit".into(),
+        None,
+    )
+    .await
+    .expect("Chief ask");
+    let watch = svc
+        .list_watches_for_parent(&chief)
+        .pop()
+        .expect("ask watch");
+    assert!(watch.completion_only, "ask watch is completion-only");
+    let chief_before = svc
+        .store()
+        .get_agent_session(&chief)
+        .await
+        .expect("Chief session")
+        .messages
+        .len();
+
+    svc.agent_request_attention_op(
+        target_ws.clone(),
+        "discussion".into(),
+        "Need a decision".into(),
+        Some(target.clone()),
+    )
+    .await
+    .expect("attention request");
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&chief)
+            .await
+            .expect("Chief after attention")
+            .messages
+            .len(),
+        chief_before
+    );
+    assert_eq!(svc.list_watches_for_parent(&chief).len(), 1);
+
+    let mut target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    target_session.status = AgentStatus::RuntimeIdle;
+    target_session.completion_report = Some("audit complete".into());
+    target_session.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&target_ws, &target_session)
+        .await
+        .expect("mark target complete");
+    svc.handle_completion_event(&completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0, "completionReport": "audit complete" }),
+    ))
+    .await;
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&chief)
+            .await
+            .expect("Chief after completion")
+            .messages
+            .len(),
+        chief_before + 1
+    );
+    assert!(svc.list_watches_for_parent(&chief).is_empty());
+}
+
+#[tokio::test]
+async fn app_agents_ask_does_not_adopt_an_unrelated_after_all_group() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+    let group_id = svc.get_or_create_delegation_group(&chief_ws, &chief);
+    svc.enroll_child_in_group(&group_id, &target);
+    let grouped_id = svc
+        .register_completion_watch(
+            &chief_ws,
+            &target_ws,
+            chief.clone(),
+            "Chief thread".into(),
+            target.clone(),
+            Some(group_id.clone()),
+        )
+        .expect("grouped watch");
+
+    let asked = svc
+        .app_agents_ask_op(
+            chief_ws,
+            chief.clone(),
+            target.clone(),
+            "finish now".into(),
+            None,
+        )
+        .await
+        .expect("Chief ask");
+    let ask_id = asked["watch"]["results"][0]["subscriptionId"]
+        .as_str()
+        .expect("ask watch id");
+    assert_ne!(ask_id, grouped_id);
+    let watches = svc.list_watches_for_parent(&chief);
+    assert_eq!(watches.len(), 2);
+    assert!(watches
+        .iter()
+        .any(|watch| { watch.id == ask_id && watch.group_id.is_none() && watch.completion_only }));
+    assert!(watches.iter().any(|watch| {
+        watch.id == grouped_id
+            && watch.group_id.as_deref() == Some(group_id.as_str())
+            && !watch.completion_only
+    }));
+
+    let chief_before = svc
+        .store()
+        .get_agent_session(&chief)
+        .await
+        .expect("Chief session")
+        .messages
+        .len();
+    let mut target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    target_session.status = AgentStatus::RuntimeIdle;
+    target_session.completion_report = Some("finished now".into());
+    target_session.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&target_ws, &target_session)
+        .await
+        .expect("mark target complete");
+    svc.handle_completion_event(&completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0, "completionReport": "finished now" }),
+    ))
+    .await;
+
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&chief)
+            .await
+            .expect("Chief after completion")
+            .messages
+            .len(),
+        chief_before + 1,
+        "the ask wake does not wait for the unsealed after_all group"
+    );
+    let group = svc
+        .delegation_group_for_parent(&chief)
+        .expect("unrelated group remains");
+    assert!(!group.sealed);
+    assert!(!group.delivered);
+    assert!(group.completed_agent_ids.contains(&target));
+}
+
+#[tokio::test]
+async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
+    let tmp = TempDb::new();
+    let target_ws = WorkspaceId::new();
+    let (chief, target) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store
+            .insert_workspace(&workspace(&target_ws))
+            .await
+            .expect("workspace");
+        let svc = Services::new(store);
+        let chief = create_agent(&svc, &WorkspaceId::chief(), "Chief thread").await;
+        let target = create_agent(&svc, &target_ws, "Remote target").await;
+        svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+            .await
+            .expect("persist source");
+        let mut session = svc
+            .store()
+            .get_agent_session(&target)
+            .await
+            .expect("target session");
+        session.status = AgentStatus::Active;
+        svc.store()
+            .update_agent_session(&target_ws, &session)
+            .await
+            .expect("mark active");
+
+        svc.app_agents_ask_op(
+            WorkspaceId::chief(),
+            chief.clone(),
+            target.clone(),
+            "finish after restart".into(),
+            None,
+        )
+        .await
+        .expect("Chief ask");
+        let persisted = svc
+            .store()
+            .list_completion_watches()
+            .await
+            .expect("persisted watches");
+        assert_eq!(persisted.len(), 1, "ask returns after durable registration");
+        assert!(
+            persisted[0].completion_only,
+            "ask semantics survive restart"
+        );
+        (chief, target)
+    };
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    assert_eq!(
+        restarted
+            .heal_completion_watches_on_startup()
+            .await
+            .expect("rehydrate ask watch"),
+        1
+    );
+    let before = restarted
+        .store()
+        .get_agent_session(&chief)
+        .await
+        .expect("Chief session")
+        .messages
+        .len();
+    let mut target_session = restarted
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    target_session.status = AgentStatus::RuntimeIdle;
+    target_session.completion_report = Some("completed after restart".into());
+    target_session.completion_report_timestamp = Some("2026-08-26T00:00:00Z".into());
+    restarted
+        .store()
+        .update_agent_session(&target_ws, &target_session)
+        .await
+        .expect("mark completed");
+    let completion = completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({
+            "agentId": target.0,
+            "completionReport": "completed after restart",
+        }),
+    );
+    restarted.handle_completion_event(&completion).await;
+    restarted.handle_completion_event(&completion).await;
+
+    let after = restarted
+        .store()
+        .get_agent_session(&chief)
+        .await
+        .expect("Chief session")
+        .messages
+        .len();
+    assert_eq!(after, before + 1, "rehydrated ask delivers one wake");
+    assert!(restarted.list_watches_for_parent(&chief).is_empty());
+    wait_for_persisted_watches(&restarted, 0).await;
+}
+
+#[tokio::test]
+async fn app_agents_ask_fails_closed_when_completion_watch_persistence_fails() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
+        .await
+        .expect("persist source");
+    sqlx::query(
+        "CREATE TRIGGER fail_ask_completion_watch_upsert
+         BEFORE INSERT ON completion_watch
+         BEGIN
+             SELECT RAISE(FAIL, 'injected ask completion-watch failure');
+         END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install completion-watch failure trigger");
+
+    let error = svc
+        .app_agents_ask_op(
+            chief_ws,
+            chief.clone(),
+            target.clone(),
+            "send succeeds but watch persistence fails".into(),
+            None,
+        )
+        .await
+        .expect_err("ask must fail closed");
+
+    assert!(
+        error.to_string().contains("upsert completion_watch failed"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        svc.list_watches_for_parent(&chief).is_empty(),
+        "failed durable registration must remove the in-memory ask watch"
+    );
+    assert!(
+        svc.store()
+            .list_completion_watches()
+            .await
+            .expect("persisted watches")
+            .is_empty(),
+        "failed durable registration must not leave a persisted ask watch"
+    );
+    let target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    assert!(
+        target_session.messages.iter().any(|message| {
+            message
+                .content
+                .to_string()
+                .contains("send succeeds but watch persistence fails")
+        }),
+        "the documented send-before-registration side effect remains"
+    );
+}
+
+#[tokio::test]
+async fn strict_ask_registration_is_durable_before_in_memory_visibility() {
+    let (_t, svc, target_ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
+    let target = create_agent(&svc, &target_ws, "Remote target").await;
+    let mut blocker = svc
+        .store()
+        .write_pool()
+        .acquire()
+        .await
+        .expect("writer connection");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *blocker)
+        .await
+        .expect("hold writer lock");
+
+    let registration_svc = svc.clone();
+    let registration_chief = chief.clone();
+    let registration_target = target.clone();
+    let registration_target_ws = target_ws.clone();
+    let registration = tokio::spawn(async move {
+        registration_svc
+            .register_completion_watch_strict_durable(
+                &chief_ws,
+                &registration_target_ws,
+                registration_chief,
+                "Chief thread".into(),
+                registration_target,
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !registration.is_finished(),
+        "registration waits for durability"
+    );
+    assert!(
+        svc.list_watches_for_parent(&chief).is_empty(),
+        "a blocked insert is never visible to completion delivery"
+    );
+
+    sqlx::query("COMMIT")
+        .execute(&mut *blocker)
+        .await
+        .expect("release writer lock");
+    drop(blocker);
+    timeout(Duration::from_secs(10), registration)
+        .await
+        .expect("registration unblocked")
+        .expect("registration task")
+        .expect("registration succeeds");
+    assert_eq!(svc.list_watches_for_parent(&chief).len(), 1);
+    assert_eq!(
+        svc.store()
+            .list_completion_watches()
+            .await
+            .expect("persisted watches")
+            .len(),
+        1
+    );
+
+    let mut target_session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    target_session.status = AgentStatus::RuntimeIdle;
+    target_session.completion_report = Some("complete after registration".into());
+    target_session.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&target_ws, &target_session)
+        .await
+        .expect("mark target complete");
+    svc.handle_completion_event(&completion_event(
+        &target_ws,
+        AGENT_IDLE,
+        &target,
+        json!({
+            "agentId": target.0,
+            "completionReport": "complete after registration",
+        }),
+    ))
+    .await;
+    assert!(svc.list_watches_for_parent(&chief).is_empty());
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
 async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
     let created = svc
         .agent_create_op(
@@ -4126,7 +5353,7 @@ async fn get_conversation_surfaces_turn_liveness() {
 
     // Idle: turnInFlight false, lastStreamActivityAt null (always present).
     let res = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(res["turnInFlight"], false);
@@ -4140,7 +5367,7 @@ async fn get_conversation_surfaces_turn_liveness() {
         vec![json!({ "type": "text", "id": "msg-1:0", "text": "streaming…" })],
     );
     let res = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(res["turnInFlight"], true);
@@ -4153,11 +5380,353 @@ async fn get_conversation_surfaces_turn_liveness() {
     svc.clear_live_turn(&id);
     svc.set_test_busy(&id, false);
     let res = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(res["turnInFlight"], false);
     assert!(res["lastStreamActivityAt"].is_null());
+}
+
+/// monorepo#3647: with `includeInProgress`, a tail-page conversation read
+/// mid-turn appends the in-flight turn's partial assistant message as a
+/// trailing `inProgress: true` row — outside `totalMessages`/pagination —
+/// while opted-out reads and non-tail pages stay byte-identical.
+#[tokio::test]
+async fn get_conversation_appends_in_progress_tail_when_opted_in() {
+    use intent_core::ConversationProjection;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Streamer").await;
+    for i in 0..3 {
+        let c = json!([{ "type": "text", "text": format!("m{i}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![
+            json!({ "type": "text", "id": "msg-live:0", "text": "streaming…" }),
+            json!({ "type": "tool_use", "id": "msg-live:1", "name": "bash", "input": {"cmd": "ls"} }),
+        ],
+    );
+
+    // Opted in, tail page: persisted rows + one trailing inProgress row.
+    let res = svc
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, true)
+        .await
+        .expect("conv");
+    assert_eq!(res["totalMessages"], 3, "synthetic row not counted");
+    assert_eq!(res["truncated"], false);
+    let messages = res["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4, "3 persisted + in-progress tail");
+    let tail = &messages[3];
+    assert_eq!(tail["inProgress"], true);
+    assert_eq!(tail["id"], "msg-live");
+    assert_eq!(tail["role"], "assistant");
+    assert_eq!(tail["contentBlocks"][0]["text"], "streaming…");
+    assert_eq!(tail["contentBlocks"][1]["name"], "bash");
+    assert!(
+        messages[..3].iter().all(|m| m.get("inProgress").is_none()),
+        "persisted rows never carry the flag"
+    );
+
+    // Opted out: byte-identical to before — no synthetic row.
+    let res = svc
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
+        .await
+        .expect("conv");
+    assert_eq!(res["messages"].as_array().unwrap().len(), 3);
+
+    // Non-tail page (older continuation): never carries the row even when
+    // opted in — only the page that ends at the live tail does.
+    let tail_page = svc
+        .agent_get_conversation_op(id.clone(), Some(1), None, None, None, None, None, true)
+        .await
+        .expect("tail page");
+    assert_eq!(tail_page["messages"].as_array().unwrap().len(), 2);
+    let older_token = tail_page["nextToken"].as_str().expect("token").to_string();
+    let older = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(1),
+            None,
+            Some(older_token),
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("older page");
+    let older_msgs = older["messages"].as_array().unwrap();
+    assert!(
+        older_msgs.iter().all(|m| m.get("inProgress").is_none()),
+        "older page has no in-progress row: {older_msgs:?}"
+    );
+
+    // The row runs through the slim projection like persisted rows: an
+    // oversized tool input arrives truncated with a stable block id.
+    let big = "x".repeat(64 * 1024);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({ "type": "tool_use", "id": "msg-live:0", "name": "bash", "input": {"cmd": big} })],
+    );
+    let res = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ConversationProjection::Slim),
+            true,
+        )
+        .await
+        .expect("slim conv");
+    let messages = res["messages"].as_array().unwrap();
+    let tail = messages.last().unwrap();
+    assert_eq!(tail["inProgress"], true);
+    assert_eq!(tail["contentBlocks"][0]["inputTruncated"], true);
+
+    // Turn end: the tail row disappears even with the param set.
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+    let res = svc
+        .agent_get_conversation_op(id, None, None, None, None, None, None, true)
+        .await
+        .expect("conv");
+    assert_eq!(res["messages"].as_array().unwrap().len(), 3);
+}
+
+/// monorepo#3647 persist/slot-clear race: when the live turn's message has
+/// already persisted (its id is in the served page) but the slot has not yet
+/// cleared, the in-progress append is skipped — never a duplicate row
+/// (mirrors the seq-0 snapshot merge's idempotency guard).
+#[tokio::test]
+async fn get_conversation_in_progress_tail_skips_already_persisted_message() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Racer").await;
+    let content = json!([{ "type": "text", "id": "msg-live:0", "text": "done" }]);
+    svc.store()
+        .append_agent_message_with_id(&id, "msg-live", "assistant", &content, None, &now_iso())
+        .await
+        .expect("append");
+    // The persist happened but the slot is still published (the race window).
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({ "type": "text", "id": "msg-live:0", "text": "done" })],
+    );
+    let res = svc
+        .agent_get_conversation_op(id, None, None, None, None, None, None, true)
+        .await
+        .expect("conv");
+    let messages = res["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "no duplicate of the persisted row");
+    assert_eq!(messages[0]["id"], "msg-live");
+    assert!(
+        messages[0].get("inProgress").is_none(),
+        "the persisted row is served, not the synthetic one"
+    );
+}
+
+/// monorepo#3647 slim budget after the in-progress append: a block-heavy live
+/// row appended beside an at-budget persisted page re-budgets the merged page
+/// (live row anchored, oldest persisted rows evicted, `nextToken` re-minted at
+/// the first evicted row) so an opted-in tail read never exceeds the §5.5
+/// budget the read path just enforced (mirrors `rebudget_merged_page` on the
+/// seq-0 snapshot path).
+#[tokio::test]
+async fn get_conversation_in_progress_tail_rebudgets_slim_page() {
+    use intent_core::{ConversationProjection, SLIM_PAGE_BUDGET_BYTES};
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "HeavyStreamer").await;
+    // 6 persisted messages of ~100KB: the slim page-budget pass serves an
+    // at-budget newest suffix of these.
+    let chunk = "y".repeat(100 * 1024);
+    for i in 0..6 {
+        let c = json!([{ "type": "text", "id": format!("b{i}"), "text": format!("{i}:{chunk}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+    // A live turn with hundreds of individually-capped blocks — the
+    // motivating long tool-heavy turn; heavy in aggregate, not per block.
+    let live_blocks: Vec<serde_json::Value> = (0..300)
+        .map(|i| json!({ "type": "text", "id": format!("msg-live:{i}"), "text": "z".repeat(1024) }))
+        .collect();
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(&id, "msg-live", live_blocks);
+
+    let res = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ConversationProjection::Slim),
+            true,
+        )
+        .await
+        .expect("slim conv");
+    let messages = res["messages"].as_array().unwrap();
+    let tail = messages.last().unwrap();
+    assert_eq!(tail["inProgress"], true, "live row always serves (anchor)");
+    let page_bytes = serde_json::to_string(&res["messages"]).unwrap().len();
+    assert!(
+        page_bytes <= SLIM_PAGE_BUDGET_BYTES + 110 * 1024,
+        "merged page bounded by budget + one message: {page_bytes}"
+    );
+    // Rows evicted by the re-budget stay reachable: the re-minted token
+    // resumes at the first evicted row and a token walk reconstructs all 6
+    // persisted messages with no gaps or duplicates.
+    let evicted = 6 + 1 - messages.len();
+    assert!(evicted > 0, "the live row forced evictions");
+    assert_eq!(res["truncated"], true);
+    let mut walked: Vec<String> = messages[..messages.len() - 1]
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    let mut token = res["nextToken"].as_str().map(str::to_string);
+    while let Some(t) = token {
+        let page = svc
+            .agent_get_conversation_op(
+                id.clone(),
+                None,
+                None,
+                Some(t),
+                None,
+                None,
+                Some(ConversationProjection::Slim),
+                true,
+            )
+            .await
+            .expect("older slim page");
+        let msgs = page["messages"].as_array().unwrap();
+        assert!(
+            msgs.iter().all(|m| m.get("inProgress").is_none()),
+            "older pages never carry the in-progress row"
+        );
+        let ids: Vec<String> = msgs
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        walked.splice(0..0, ids);
+        token = page["nextToken"].as_str().map(str::to_string);
+    }
+    assert_eq!(walked.len(), 6, "token walk reaches every persisted row");
+}
+
+/// monorepo#3647: `AgentLite.lastActivity` is overlaid with the live-turn
+/// stream stamp mid-turn, so pollers watching it see a long-but-alive turn
+/// advance instead of a value frozen at turn start.
+#[tokio::test]
+async fn agent_lite_last_activity_overlays_live_stream_stamp() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Streamer").await;
+
+    // Freeze the persisted stamp in the past — a long turn's updated_at.
+    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    s.updated_at = "2000-01-01T00:00:00Z".to_string();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("backdate");
+    let v = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(v["lastActivity"], "2000-01-01T00:00:00Z");
+
+    // Mid-turn: the newer stream stamp wins.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-1",
+        vec![json!({ "type": "text", "id": "msg-1:0", "text": "thinking…" })],
+    );
+    let v = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    let stream = v["lastStreamActivityAt"].as_str().expect("stream stamp");
+    assert_eq!(
+        v["lastActivity"].as_str().unwrap(),
+        stream,
+        "lastActivity overlaid with the live stream stamp: {v}"
+    );
+
+    // Turn end: back to the persisted stamp.
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+    let v = serde_json::to_value(svc.agent_get_op(id, None).await.expect("get")).unwrap();
+    assert_eq!(v["lastActivity"], "2000-01-01T00:00:00Z");
+}
+
+/// monorepo#3647: `agent.diagnostics` keys `staleResponding` on the
+/// liveness-aware activity (max of persisted `updatedAt` and the live-turn
+/// stream stamp) and serves the raw `lastStreamActivityAt` — an agent
+/// actively streaming a long turn is never flagged stale.
+#[tokio::test]
+async fn diagnostics_stale_responding_respects_live_stream_activity() {
+    use serde_json::Value;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "LongTurn").await;
+
+    // Responding status with a long-stale persisted stamp.
+    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    s.status = intent_core::AgentStatus::Active;
+    s.updated_at = "2000-01-01T00:00:00Z".to_string();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark responding stale");
+
+    let find_row = |result: &Value| -> Value {
+        result["diagnostics"]["agents"]
+            .as_array()
+            .expect("agents")
+            .iter()
+            .find(|a| a["id"] == id.0.as_str())
+            .expect("row")
+            .clone()
+    };
+
+    // No live turn: persisted staleness stands.
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let row = find_row(&result);
+    assert_eq!(row["staleResponding"], true);
+    assert!(row.get("lastStreamActivityAt").is_none());
+
+    // Mid-turn stream activity: fresh liveness overrides the frozen
+    // persisted stamp — not stale, and the raw stream stamp is served.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-1",
+        vec![json!({ "type": "text", "id": "msg-1:0", "text": "still working…" })],
+    );
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics live");
+    let row = find_row(&result);
+    assert_eq!(
+        row["staleResponding"], false,
+        "streaming agent is not stale: {row}"
+    );
+    let stream = row["lastStreamActivityAt"].as_str().expect("stream stamp");
+    assert_eq!(
+        row["lastActivity"].as_str().unwrap(),
+        stream,
+        "lastActivity keyed on the liveness-aware max"
+    );
 }
 
 #[tokio::test]
@@ -4298,7 +5867,7 @@ async fn get_conversation_truncates_to_limit() {
             .expect("append");
     }
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(res["totalMessages"], 5);
@@ -4329,7 +5898,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 1: newest two, oldest→newest within the page, nextToken present.
     let p1 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("p1");
     assert_eq!(p1["totalMessages"], 5);
@@ -4344,7 +5913,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 2 follows the token to the next-older window.
     let p2 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t1), None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t1), None, None, None, false)
         .await
         .expect("p2");
     let m2 = p2["messages"].as_array().unwrap();
@@ -4354,7 +5923,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 3 is the final page: oldest message, no further token.
     let p3 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t2), None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t2), None, None, None, false)
         .await
         .expect("p3");
     let m3 = p3["messages"].as_array().unwrap();
@@ -4366,13 +5935,13 @@ async fn get_conversation_paginates_with_opaque_next_token() {
     // No limit → default page returns all five with no token; an over-max limit
     // clamps to 200 and likewise fits all five in one page.
     let all = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("all");
     assert_eq!(all["messages"].as_array().unwrap().len(), 5);
     assert!(all["nextToken"].is_null());
     let clamped = svc
-        .agent_get_conversation_op(id, Some(10_000), None, None, None, None, None)
+        .agent_get_conversation_op(id, Some(10_000), None, None, None, None, None, false)
         .await
         .expect("clamped");
     assert_eq!(clamped["messages"].as_array().unwrap().len(), 5);
@@ -4409,6 +5978,7 @@ async fn get_conversation_seeks_around_message_id() {
             Some(ids[5].clone()),
             None,
             None,
+            false,
         )
         .await
         .expect("seek");
@@ -4429,7 +5999,16 @@ async fn get_conversation_seeks_around_message_id() {
 
     // nextToken continues into strictly older rows (ordinary backward paging).
     let older = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(next), None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(next),
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect("older");
     let mo = older["messages"].as_array().unwrap();
@@ -4442,7 +6021,16 @@ async fn get_conversation_seeks_around_message_id() {
 
     // prevToken walks newer to the live tail; the tail page has no prev.
     let newer = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(prev), None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(prev),
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect("newer");
     let mn = newer["messages"].as_array().unwrap();
@@ -4484,6 +6072,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
             Some(ids[0].clone()),
             None,
             None,
+            false,
         )
         .await
         .expect("oldest seek");
@@ -4504,6 +6093,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
             Some(ids[5].clone()),
             None,
             None,
+            false,
         )
         .await
         .expect("newest seek");
@@ -4514,7 +6104,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
 
     // Precedence: aroundMessageId wins when a token is also supplied.
     let token = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("mint token")["nextToken"]
         .as_str()
@@ -4529,6 +6119,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
             Some(ids[0].clone()),
             None,
             None,
+            false,
         )
         .await
         .expect("seek beats token");
@@ -4566,6 +6157,7 @@ async fn get_conversation_seek_unknown_message_id_is_invalid_params() {
             Some("msg-nope".into()),
             None,
             None,
+            false,
         )
         .await
         .expect_err("unknown id");
@@ -4574,13 +6166,22 @@ async fn get_conversation_seek_unknown_message_id_is_invalid_params() {
         "error names the unknown id: {err:?}"
     );
     // A message id from another agent's log is equally unknown here.
-    svc.agent_get_conversation_op(id.clone(), None, None, None, Some(foreign.id), None, None)
-        .await
-        .expect_err("foreign message id");
+    svc.agent_get_conversation_op(
+        id.clone(),
+        None,
+        None,
+        None,
+        Some(foreign.id),
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect_err("foreign message id");
 
     // Seek-free reads stay byte-compatible: no prevToken key is added.
     let plain = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("plain");
     assert!(plain.get("prevToken").is_none());
@@ -4605,7 +6206,7 @@ async fn get_conversation_seeks_around_index() {
     // Seek to ordinal 5 with limit 4: page is [m3..m7), both cursors minted
     // — identical to the aroundMessageId seek targeting the same row.
     let seek = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(5), None)
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(5), None, false)
         .await
         .expect("seek");
     let m = seek["messages"].as_array().unwrap();
@@ -4624,7 +6225,16 @@ async fn get_conversation_seeks_around_index() {
 
     // nextToken continues into strictly older rows (ordinary backward paging).
     let older = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(next), None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(next),
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect("older");
     let mo = older["messages"].as_array().unwrap();
@@ -4633,7 +6243,16 @@ async fn get_conversation_seeks_around_index() {
 
     // prevToken walks newer to the live tail; the tail page has no prev.
     let newer = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(prev), None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(prev),
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect("newer");
     let mn = newer["messages"].as_array().unwrap();
@@ -4660,7 +6279,7 @@ async fn get_conversation_around_index_clamps_out_of_range() {
 
     // Oldest edge: index 0 pins to the start of history.
     let oldest = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(0), None)
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(0), None, false)
         .await
         .expect("oldest seek");
     let m = oldest["messages"].as_array().unwrap();
@@ -4671,7 +6290,16 @@ async fn get_conversation_around_index_clamps_out_of_range() {
 
     // Overshoot: index far past the end clamps to the newest window.
     let newest = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(1_000_000), None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            None,
+            None,
+            Some(1_000_000),
+            None,
+            false,
+        )
         .await
         .expect("overshoot clamps");
     let m = newest["messages"].as_array().unwrap();
@@ -4681,14 +6309,23 @@ async fn get_conversation_around_index_clamps_out_of_range() {
 
     // Ordinal seek wins over a simultaneously supplied token.
     let token = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("mint token")["nextToken"]
         .as_str()
         .expect("token")
         .to_string();
     let both = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(token), None, Some(0), None)
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(token),
+            None,
+            Some(0),
+            None,
+            false,
+        )
         .await
         .expect("seek beats token");
     assert_eq!(
@@ -4706,7 +6343,7 @@ async fn get_conversation_around_index_clamps_out_of_range() {
             .expect("append");
     }
     let small = svc
-        .agent_get_conversation_op(small_id, Some(10), None, None, None, Some(1), None)
+        .agent_get_conversation_op(small_id, Some(10), None, None, None, Some(1), None, false)
         .await
         .expect("small seek");
     assert_eq!(small["messages"].as_array().unwrap().len(), 3);
@@ -4739,7 +6376,7 @@ async fn get_conversation_reads_only_the_requested_page_from_store() {
         .expect("corrupt older rows");
 
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None, None, false)
         .await
         .expect("newest page must not decode rows outside its window");
     assert_eq!(res["totalMessages"], 5);
@@ -4751,7 +6388,7 @@ async fn get_conversation_reads_only_the_requested_page_from_store() {
     // Following the token into the corrupted region decodes those rows and
     // fails — confirming the corruption is real and only page rows decode.
     let t = res["nextToken"].as_str().expect("token").to_string();
-    svc.agent_get_conversation_op(id, Some(2), None, Some(t), None, None, None)
+    svc.agent_get_conversation_op(id, Some(2), None, Some(t), None, None, None, false)
         .await
         .expect_err("older page decodes the corrupted rows");
 }
@@ -4785,7 +6422,7 @@ async fn get_conversation_strips_anonymous_tool_use_pairs() {
         .expect("append");
 
     let res = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let blocks = res["messages"][0]["contentBlocks"].as_array().unwrap();
@@ -4829,7 +6466,7 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
 
     // Absent param: byte-identical full fidelity, no flags anywhere.
     let full = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("full conv");
     let full_blocks = full["messages"][0]["contentBlocks"].as_array().unwrap();
@@ -4848,6 +6485,7 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
             None,
             None,
             Some(ConversationProjection::Slim),
+            false,
         )
         .await
         .expect("slim conv");
@@ -4941,6 +6579,7 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
             None,
             None,
             Some(ConversationProjection::Slim),
+            false,
         )
         .await
         .expect("slim conv");
@@ -5012,7 +6651,7 @@ async fn get_conversation_slim_pages_are_byte_budgeted() {
 
     // Full projection: never budgeted — all 12 in one default page.
     let full = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("full conv");
     let all: Vec<String> = full["messages"]
@@ -5039,6 +6678,7 @@ async fn get_conversation_slim_pages_are_byte_budgeted() {
                 None,
                 None,
                 Some(ConversationProjection::Slim),
+                false,
             )
             .await
             .expect("slim page");
@@ -5108,6 +6748,7 @@ async fn get_conversation_slim_single_overbudget_message_still_serves() {
             None,
             None,
             Some(ConversationProjection::Slim),
+            false,
         )
         .await
         .expect("page 1");
@@ -5124,6 +6765,7 @@ async fn get_conversation_slim_single_overbudget_message_still_serves() {
             None,
             None,
             Some(ConversationProjection::Slim),
+            false,
         )
         .await
         .expect("page 2");
@@ -5166,6 +6808,7 @@ async fn get_conversation_slim_seek_budget_keeps_target_and_reminted_cursors() {
             Some(target.clone()),
             None,
             slim,
+            false,
         )
         .await
         .expect("seek page");
@@ -5190,7 +6833,7 @@ async fn get_conversation_slim_seek_budget_keeps_target_and_reminted_cursors() {
     let mut token = seek["nextToken"].as_str().map(str::to_string);
     while let Some(t) = token {
         let page = svc
-            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim)
+            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim, false)
             .await
             .expect("older page");
         let ids: Vec<String> = page["messages"]
@@ -5206,7 +6849,7 @@ async fn get_conversation_slim_seek_budget_keeps_target_and_reminted_cursors() {
     let mut fwd = seek["prevToken"].as_str().map(str::to_string);
     while let Some(t) = fwd {
         let page = svc
-            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim)
+            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim, false)
             .await
             .expect("newer page");
         let ids: Vec<String> = page["messages"]
@@ -5344,6 +6987,67 @@ async fn get_message_block_rejects_unknown_ids_and_workspace_mismatch() {
         .await
         .expect_err("unknown agent");
     assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
+/// monorepo#3647: a block id served on the `includeInProgress` tail row
+/// hydrates mid-turn — the unpersisted message id resolves from the live-turn
+/// slot's streamed blocks, returning the FULL unprojected body (the slim tail
+/// row truncated it). The persisted row wins once the turn ends, and a
+/// non-matching id stays `InvalidParams`.
+#[tokio::test]
+async fn get_message_block_resolves_live_turn_blocks_mid_turn() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "LiveBlocks").await;
+    let big = "x".repeat(64 * 1024);
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![
+            json!({ "type": "text", "id": "msg-live:0", "text": "streaming…" }),
+            json!({ "type": "tool_use", "id": "msg-live:1", "name": "bash", "input": {"cmd": big} }),
+        ],
+    );
+
+    // The oversized live block hydrates in full mid-turn.
+    let res = svc
+        .agent_get_message_block_op(id.clone(), "msg-live".into(), "msg-live:1".into(), None)
+        .await
+        .expect("live block hydrates");
+    assert_eq!(
+        res["block"]["input"]["cmd"].as_str().unwrap().len(),
+        big.len()
+    );
+    assert!(res["block"].get("inputTruncated").is_none());
+
+    // A block id outside the live slot is still InvalidParams.
+    let err = svc
+        .agent_get_message_block_op(id.clone(), "msg-live".into(), "msg-live:9".into(), None)
+        .await
+        .expect_err("unknown live block id");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+
+    // A message id that matches neither a persisted row nor the live slot
+    // stays InvalidParams.
+    let err = svc
+        .agent_get_message_block_op(id.clone(), "msg-other".into(), "msg-other:0".into(), None)
+        .await
+        .expect_err("unknown message id");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+
+    // Turn end: slot cleared, the same id resolves from the persisted row.
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+    let content = json!([{ "type": "text", "id": "msg-live:0", "text": "persisted" }]);
+    svc.store()
+        .append_agent_message_with_id(&id, "msg-live", "assistant", &content, None, &now_iso())
+        .await
+        .expect("append");
+    let res = svc
+        .agent_get_message_block_op(id, "msg-live".into(), "msg-live:0".into(), None)
+        .await
+        .expect("persisted block");
+    assert_eq!(res["block"]["text"], "persisted");
 }
 
 /// monorepo#1114 helper: only id-less object blocks are stamped with the
@@ -5515,7 +7219,7 @@ async fn get_conversation_stamps_synthetic_block_ids() {
         .expect("append assistant");
 
     let res = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let messages = res["messages"].as_array().unwrap();
@@ -5535,7 +7239,7 @@ async fn get_conversation_stamps_synthetic_block_ids() {
     // Serve-time only: a second read re-derives the same ids from unmutated
     // stored rows.
     let again = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv again");
     assert_eq!(again["messages"], res["messages"]);
@@ -6654,9 +8358,10 @@ async fn create_with_name_explicitly_set_false_stays_renameable() {
 /// session-level `contextReferences`, and `metadata.isBackground`
 /// (G-A1/P3-1.2c). Session-level `imageBlocks` persist but stay OFF the lite
 /// projection (list-payload cost contract) — they are served by
-/// `agent.getSession` only. `metadata.initialMessage` is detail-only and
-/// likewise stays OFF `agent.list` rows (monorepo#2932) while `agent.get`
-/// still serves it.
+/// `agent.getSession` only. `metadata.initialMessage` likewise stays OFF the
+/// whole lite projection — `agent.get` AND `agent.list` rows (extending
+/// monorepo#2932) — while `agent.getSession` still serves the persisted
+/// value.
 #[tokio::test]
 async fn create_persists_and_reserves_gap_fields() {
     let (_t, svc, ws) = setup().await;
@@ -6689,7 +8394,10 @@ async fn create_persists_and_reserves_gap_fields() {
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     let v = serde_json::to_value(&got).expect("lite json");
     assert_eq!(v["metadata"]["delegationDepth"], json!(2));
-    assert_eq!(v["metadata"]["initialMessage"], "start here");
+    assert!(
+        v["metadata"].get("initialMessage").is_none(),
+        "initialMessage must stay off the lite projection entirely"
+    );
     assert_eq!(
         v["contextReferences"],
         json!([{ "type": "file", "path": "src/a.rs" }])
@@ -6700,7 +8408,7 @@ async fn create_persists_and_reserves_gap_fields() {
     );
     assert_eq!(v["metadata"]["isBackground"], json!(true));
 
-    // The persisted blocks are still served by the detail read.
+    // The persisted values are still served by the detail read.
     let session = svc
         .agent_get_session_op(id.clone())
         .await
@@ -6709,16 +8417,22 @@ async fn create_persists_and_reserves_gap_fields() {
         session.image_blocks,
         Some(json!([{ "type": "image", "data": "abc" }]))
     );
+    assert_eq!(
+        session.initial_message.as_deref(),
+        Some("start here"),
+        "agent.getSession keeps serving the persisted initialMessage"
+    );
 
-    // And on `agent.list` — except `metadata.initialMessage`, which is
-    // detail-only and omitted from list rows (monorepo#2932).
+    // And on `agent.list` — same projection, so `metadata.initialMessage`
+    // is absent there too.
     let agents = svc.agent_list_op(ws).await.expect("list");
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0].metadata.delegation_depth, Some(2));
     assert!(agents[0].metadata.is_background);
-    assert_eq!(
-        agents[0].metadata.initial_message, None,
-        "initialMessage must stay off agent.list rows (monorepo#2932)"
+    let row = serde_json::to_value(&agents[0]).expect("row json");
+    assert!(
+        row["metadata"].get("initialMessage").is_none(),
+        "initialMessage must stay off agent.list rows"
     );
 }
 
@@ -8077,9 +9791,11 @@ async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
 }
 
 /// `agent.delegate` persists the resolved first message as
-/// `metadata.initialMessage` and the child's `metadata.delegationDepth`
+/// `AgentSession.initial_message` and the child's `metadata.delegationDepth`
 /// (parent depth + 1) so a wake-up can resume (P3-1.2b). Delegated children
-/// are background agents (G-A1/P3-1.2c).
+/// are background agents (G-A1/P3-1.2c). The persisted `initialMessage` is
+/// served by `agent.getSession` only — it stays off the lite projection
+/// (extending monorepo#2932).
 #[tokio::test]
 async fn delegate_persists_initial_message_and_delegation_depth() {
     let (_t, svc, ws) = setup().await;
@@ -8096,9 +9812,17 @@ async fn delegate_persists_initial_message_and_delegation_depth() {
         .await
         .expect("delegate");
     let child = AgentId::from(out["agentId"].as_str().unwrap());
+    let session = svc
+        .agent_get_session_op(child.clone())
+        .await
+        .expect("get child session");
+    assert_eq!(session.initial_message.as_deref(), Some("Do the thing"));
     let got = svc.agent_get_op(child, None).await.expect("get child");
     let v = serde_json::to_value(&got).expect("lite json");
-    assert_eq!(v["metadata"]["initialMessage"], "Do the thing");
+    assert!(
+        v["metadata"].get("initialMessage").is_none(),
+        "initialMessage stays off the lite projection"
+    );
     assert_eq!(v["metadata"]["delegationDepth"], json!(1));
     assert_eq!(v["metadata"]["isBackground"], json!(true));
 }
@@ -8715,7 +10439,7 @@ async fn send_message_delivers_when_agent_exists() {
     assert_eq!(r["queued"], false);
     assert_eq!(r["messageId"], "m1");
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -9074,7 +10798,7 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
         .expect("send");
     assert_eq!(r["queued"], false);
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let content = &conv["messages"][0]["contentBlocks"];
@@ -9122,7 +10846,7 @@ async fn send_queued_message_now_op_persists_attachment_blocks_in_transcript() {
         "the dequeued entry left the queue"
     );
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let content = &conv["messages"][0]["contentBlocks"];
@@ -9157,7 +10881,7 @@ async fn send_queued_message_now_op_not_found_has_no_side_effects() {
     let queue = svc.queue_snapshot(&id);
     assert_eq!(queue.len(), 1, "queue untouched: {queue:?}");
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(
@@ -10274,6 +11998,102 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
         .await
         .expect("heal after delete");
     assert_eq!(loaded, 0, "orphaned rows must be pruned, not rehydrated");
+}
+
+/// Soft-retire inertness on the event-subscription surface: subscribing AS
+/// a retired agent is rejected fail-closed, and a persisted row whose
+/// subscriber retired while the daemon was down (crash window after the
+/// retire mark but before the teardown's row delete) is pruned at startup
+/// instead of rehydrated.
+#[tokio::test]
+async fn event_subscriptions_reject_and_prune_retired_subscribers() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let subscriber = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store).with_event_bus(bus);
+        let subscriber = create_agent(&svc, &ws, "Watcher").await;
+        svc.agent_subscribe(
+            ws.clone(),
+            Some(subscriber.clone()),
+            vec!["file:*".into()],
+            None,
+            Some(50),
+        )
+        .await
+        .expect("subscribe while live");
+        // The write-through persist is async; wait for the row.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let rows = svc
+                .store()
+                .list_event_subscriptions()
+                .await
+                .expect("list rows");
+            if rows.len() == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "subscription row never persisted"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Simulate the crash window: mark retired directly at the store —
+        // the retire op's live teardown never runs.
+        let now = now_iso();
+        svc.store()
+            .set_agent_session_retired_at(&ws, &subscriber, Some(&now), &now)
+            .await
+            .expect("mark retired");
+        subscriber
+    }; // Services dropped — simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let svc = Services::new(store).with_event_bus(bus);
+    let loaded = svc
+        .heal_event_subscriptions_on_startup()
+        .await
+        .expect("heal");
+    assert_eq!(loaded, 0, "retired subscriber's row pruned, not rehydrated");
+    assert!(
+        svc.store()
+            .list_event_subscriptions()
+            .await
+            .expect("list rows")
+            .is_empty(),
+        "persisted row deleted by the prune"
+    );
+
+    // Registering a NEW subscription against the retired agent fails closed.
+    let err = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(subscriber.clone()),
+            vec!["file:*".into()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("subscribe as a retired agent must fail");
+    assert!(err.to_string().contains("retired"), "got: {err}");
+
+    // Restore lifts the rejection.
+    svc.agent_restore_op(subscriber.clone(), Some(ws.clone()))
+        .await
+        .expect("restore");
+    svc.agent_subscribe(
+        ws.clone(),
+        Some(subscriber),
+        vec!["file:*".into()],
+        None,
+        None,
+    )
+    .await
+    .expect("subscribe after restore");
 }
 
 /// monorepo#947: `agent.getSubscriptions` lists the caller's live event
@@ -12147,6 +13967,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
                 group_id: None,
                 report_delivered: false,
                 wake_on_attention: false,
+                completion_only: false,
                 created_at: created_at.to_string(),
             })
             .await
@@ -13460,7 +15281,7 @@ async fn delegate_delivers_agent_instructions_as_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1, "child got exactly one message");
@@ -13489,7 +15310,7 @@ async fn delegate_falls_back_to_task_text_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -13549,7 +15370,7 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -13906,7 +15727,7 @@ async fn delegate_without_message_source_delivers_nothing() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child, None, None, None, None, None, None)
+        .agent_get_conversation_op(child, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 0, "no message delivered");
@@ -15420,6 +17241,7 @@ async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
         group_id: None,
         report_delivered,
         wake_on_attention: false,
+        completion_only: false,
         created_at: now_iso(),
     };
     restarted
@@ -20681,7 +22503,7 @@ async fn wake_or_create_delivers_message_metadata_on_block() {
         .expect("wake");
     let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(new_id, None, None, None, None, None, None)
+        .agent_get_conversation_op(new_id, None, None, None, None, None, None, false)
         .await
         .expect("conv");
     // The delivered message is the first user message; its content block
@@ -20716,7 +22538,7 @@ async fn wake_or_create_store_only_persists_row_level_metadata() {
         .expect("wake");
     let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(new_id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(new_id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let msg = &conv["messages"][0];
@@ -20944,7 +22766,7 @@ async fn deliv1_wake_or_create_persists_block_metadata_alongside_runtime_drive()
         .expect("wake");
     let agent_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let msg = &conv["messages"][0];
@@ -20979,7 +22801,7 @@ async fn deliv1_wake_runtime_idle_branch_persists_row_level_metadata() {
     assert_eq!(resp["ok"], true);
     let agent_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None, None)
+        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None, None, false)
         .await
         .expect("conv");
     let msg = &conv["messages"][0];
@@ -21213,7 +23035,16 @@ async fn agent_ops_reject_cross_workspace_bare_id_probes() {
     assert!(matches!(err, Error::NotFound(_)), "get: {err:?}");
 
     let err = svc
-        .agent_get_conversation_op(id.clone(), None, Some(ws_b.clone()), None, None, None, None)
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            Some(ws_b.clone()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
         .await
         .expect_err("cross-ws conversation must not observe");
     assert!(matches!(err, Error::NotFound(_)), "conversation: {err:?}");
@@ -27676,6 +29507,492 @@ async fn agent_watch_removed_after_target_deleted() {
         metadata["watchStillArmed"],
         json!(false),
         "deleted wake carries watchStillArmed: false: {metadata}"
+    );
+}
+
+/// `agent:retired` is terminal like `agent:deleted`: the live retire emit
+/// (through the real bus + delivery worker, proving the subscription filter
+/// covers it) wakes the watcher exactly once with the retired wording and no
+/// re-arm pointer, and the watch is removed. A later `agent.restore` does
+/// NOT re-create the resolved watch.
+#[tokio::test]
+async fn agent_watch_resolved_when_target_retires() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("watch");
+
+    svc.agent_retire_op(target.clone(), Some(ws.clone()), Some("handing off".into()))
+        .await
+        .expect("retire");
+    wait_for_message_count(&svc, &watcher, 1).await;
+    wait_for_child_watch_cleanup(&svc, &target).await;
+
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("Target (agent-") || text.contains(&target.0),
+        "retired wake names the agent: {text}"
+    );
+    assert!(
+        text.contains("retired."),
+        "retired wake uses the retired settlement verb: {text}"
+    );
+    assert!(
+        text.contains("the watch is now retired"),
+        "retired wake states the retirement: {text}"
+    );
+    assert!(
+        text.contains("The agent retired and cannot be re-watched or woken again"),
+        "retired wake states the target cannot be re-watched: {text}"
+    );
+    assert!(
+        !text.contains("ws.agent.watch("),
+        "retired wake carries no dead-end re-arm pointer: {text}"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&watcher)
+        .await
+        .expect("watcher session");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata["watchStillArmed"],
+        json!(false),
+        "retired wake carries watchStillArmed: false: {metadata}"
+    );
+    // The persisted row is retired with the in-memory watch.
+    wait_for_persisted_watches(&svc, 0).await;
+
+    // agent:restored does NOT re-create the resolved watch.
+    svc.agent_restore_op(target.clone(), Some(ws.clone()))
+        .await
+        .expect("restore");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        svc.find_watches_for_child(&target).is_empty(),
+        "restore must not resurrect the resolved watch"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        1,
+        "restore delivers no extra wake"
+    );
+}
+
+/// A CASCADED retire resolves the child's watchers too: the parent's retire
+/// cascade emits the child's own `agent:retired` (cascade reason) through
+/// the real bus + delivery worker, so a watcher on the settled child gets
+/// exactly one retired-notice wake and its watch is removed — the full
+/// per-child cleanup, not just the parent's.
+#[tokio::test]
+async fn agent_watch_resolved_when_target_is_cascade_retired() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Kid").await;
+
+    // Watch while the child is still watchable, THEN park it settled under
+    // the parent (a bare idle target with nothing pending rejects new
+    // watches, but an existing watch stays armed).
+    svc.agent_watch_op(ws.clone(), watcher.clone(), child.clone())
+        .await
+        .expect("watch the child");
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+
+    // Retire the PARENT: the cascade retires the child, whose own
+    // agent:retired emit resolves the watch.
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), Some("wrapping up".into()))
+        .await
+        .expect("retire parent");
+    wait_for_message_count(&svc, &watcher, 1).await;
+    wait_for_child_watch_cleanup(&svc, &child).await;
+
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains(&child.0),
+        "retired wake names the cascaded child: {text}"
+    );
+    assert!(
+        text.contains("retired."),
+        "retired wake uses the retired settlement verb: {text}"
+    );
+    assert!(
+        text.contains("the watch is now retired"),
+        "retired wake states the retirement: {text}"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "cascaded retire removes the child's watch"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        1,
+        "exactly one wake for the cascaded retire"
+    );
+}
+
+/// Retiring an agent whose watcher was hook-deferred settles the watch with
+/// the RETIRED notice, not a stale synthesized `agent:idle`: the retire
+/// sweep cancels the owner's last hook, whose terminal-transition backstop
+/// (`redeliver_completion_after_queue_mutation`) must defer to the
+/// `agent:retired` emit instead of consuming the watch with a completed
+/// wake first.
+#[tokio::test]
+async fn retire_settles_hook_deferred_watch_with_retired_notice() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let _hook = seed_active_hook(&svc, &ws, &target, "pr-watch").await;
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("watch");
+    // The target idles while its hook is active: deferred — interim-skip
+    // marker recorded, no wake, watch armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "idle deferred while the hook is active"
+    );
+    assert_eq!(svc.find_watches_for_child(&target).len(), 1);
+
+    // Retire: the sweep cancels the hook — whose terminal backstop re-runs
+    // the deferred redelivery — and the agent:retired emit resolves the
+    // watch. Exactly one wake, carrying the retired wording.
+    svc.agent_retire_op(target.clone(), Some(ws.clone()), Some("handing off".into()))
+        .await
+        .expect("retire");
+    wait_for_message_count(&svc, &watcher, 1).await;
+    wait_for_child_watch_cleanup(&svc, &target).await;
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("retired."),
+        "retired notice, not a stale completion: {text}"
+    );
+    assert!(
+        !text.contains("completed"),
+        "no synthesized completed wake before the retire emit: {text}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        1,
+        "exactly one wake for the retire"
+    );
+}
+
+/// Cross-workspace cascade at the services level: a settled descendant
+/// living in a DIFFERENT workspace retires with the parent — its active
+/// hook and PR monitor are cancelled, its watcher resolves with the retired
+/// notice, and its `agent:retired` event lands in the child's own
+/// workspace.
+#[tokio::test]
+async fn retire_cascade_reaches_cross_workspace_descendants() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other workspace");
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let watcher = create_agent(&svc, &other_ws, "Watcher").await;
+    let child = create_agent(&svc, &other_ws, "RemoteChild").await;
+
+    // Watch (same-workspace watcher next to the child) while the child is
+    // still watchable, THEN park it settled under the cross-workspace
+    // parent with an active hook + PR monitor.
+    svc.register_completion_watch(
+        &other_ws,
+        &other_ws,
+        watcher.clone(),
+        "Watcher".into(),
+        child.clone(),
+        None,
+    )
+    .expect("watch the remote child");
+    link_child(
+        &svc,
+        &other_ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    let hook = seed_active_hook(&svc, &other_ws, &child, "remote-watch").await;
+    let monitor = seed_active_pr_monitor(&svc, &other_ws, &child, 41).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RETIRED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), Some("wrapping up".into()))
+        .await
+        .expect("retire parent");
+
+    // Two emits: the parent's in its workspace, the cascaded child's in the
+    // CHILD's own workspace.
+    let mut events = Vec::new();
+    while events.len() < 2 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription closed");
+        events.extend(batch);
+    }
+    let child_event = events
+        .iter()
+        .find(|e| e.data["agentId"].as_str() == Some(child.0.as_str()))
+        .expect("child agent:retired emit");
+    assert_eq!(
+        child_event.workspace_id, other_ws,
+        "child's agent:retired lands in its own workspace"
+    );
+    assert_eq!(
+        child_event.data["reason"].as_str(),
+        Some("parent Parent retired")
+    );
+
+    // Rows retired on both sides of the workspace boundary.
+    for id in [&parent, &child] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_some(), "{id} retired by the cascade");
+    }
+    // The remote child's hook and PR monitor are cancelled by its cleanup.
+    let stored = svc.store().get_hook(&hook.hook_id).await.expect("hook");
+    assert_eq!(stored.state, intent_core::HookState::Cancelled);
+    assert!(stored.next_run_at.is_none());
+    let stored = svc
+        .store()
+        .get_pr_monitor(&monitor.monitor_id)
+        .await
+        .expect("monitor");
+    assert_eq!(stored.state, intent_core::PrMonitorState::Cancelled);
+
+    // The watcher resolves with the retired notice.
+    wait_for_message_count(&svc, &watcher, 1).await;
+    wait_for_child_watch_cleanup(&svc, &child).await;
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("retired."),
+        "cross-workspace cascade wake carries the retired verb: {text}"
+    );
+}
+
+/// A retired member of an `after_all` delegation group records as settled
+/// (deleted bucket), so the group fires its aggregated wake instead of
+/// hanging on the inert child.
+#[tokio::test]
+async fn after_all_group_settles_retired_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+
+    // The child retires (live event path, direct dispatch).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_RETIRED,
+        &child,
+        json!({ "agentId": child.0, "agentName": "Child", "retiredAt": now_iso() }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group still open");
+    assert!(
+        group.deleted_agent_ids.contains(&child),
+        "retired child recorded as settled (deleted bucket)"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // The parent idles: group seals, is complete, and fires.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "aggregated wake fired instead of hanging on the retired member"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("retired."),
+        "aggregated wake's child line says the member retired: {text}"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// Rehydration reconciliation: a child that RETIRED while the daemon was
+/// down resolves its rehydrated watch immediately at startup with the
+/// retired notice instead of leaving the parent waiting forever.
+#[tokio::test]
+async fn completion_watch_rehydration_resolves_retired_child() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        (parent, child)
+    }; // old Services dropped — simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    // The child retired during the downtime.
+    let now = now_iso();
+    store
+        .set_agent_session_retired_at(&ws, &child, Some(&now), &now)
+        .await
+        .expect("mark child retired");
+    let restarted = Services::new(store);
+
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "watch rehydrated before reconciliation");
+
+    let session = restarted
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "reconciliation delivered the retired wake"
+    );
+    let text = parent_messages_text(&restarted, &parent).await;
+    assert!(
+        text.contains("The agent retired and cannot be re-watched or woken again"),
+        "rehydration wake carries the retired notice: {text}"
+    );
+    assert!(restarted.find_watches_for_child(&child).is_empty());
+    wait_for_persisted_watches(&restarted, 0).await;
+}
+
+/// Group rehydration reconciliation: an `after_all` member that RETIRED
+/// while the daemon was down records as settled at startup, so the
+/// rehydrated group fires instead of hanging.
+#[tokio::test]
+async fn group_rehydration_settles_retired_child() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        let gid = svc.get_or_create_delegation_group(&ws, &parent);
+        svc.enroll_child_in_group(&gid, &child);
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            Some(gid.clone()),
+        )
+        .expect("grouped watch");
+        // Persist the open group before the "crash".
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let rows = svc
+                .store()
+                .list_undelivered_groups(&ws)
+                .await
+                .expect("list groups");
+            if rows.iter().any(|r| r.group_id == gid) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "group row persisted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (parent, child)
+    };
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let now = now_iso();
+    store
+        .set_agent_session_retired_at(&ws, &child, Some(&now), &now)
+        .await
+        .expect("mark child retired");
+    let restarted = Services::new(store);
+
+    let loaded = restarted
+        .rehydrate_delegation_groups(&ws)
+        .await
+        .expect("rehydrate groups");
+    assert_eq!(loaded, 1, "group rehydrated");
+
+    // The retired member reconciled as settled and the sealed group fired.
+    let session = restarted
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "rehydrated group fired instead of hanging on the retired member"
+    );
+    let text = parent_messages_text(&restarted, &parent).await;
+    assert!(
+        text.contains("retired."),
+        "aggregated wake's child line says the member retired: {text}"
     );
 }
 

@@ -1359,6 +1359,31 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.list` with `retiredOnly: true` (PROTOCOL §5.5): ONLY
+    /// soft-retired sessions, whose rows carry `retiredAt`.
+    fn agent_list_retired_only(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_retired_only not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Number of soft-retired sessions in a workspace — the `retiredCount`
+    /// field attached to every `agent.list` response variant (PROTOCOL §5.5).
+    fn agent_retired_count(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<u64>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_retired_count not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.listActive`: daemon-global mid-turn agent streams (PROTOCOL
     /// §5.5). No workspace id is required because the result spans workspaces.
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -1392,8 +1417,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// `[0, totalMessages - 1]`. The two seek params are mutually exclusive
     /// (enforced at the transport boundary). The optional `projection`
     /// requests bounded tool/image block bodies
-    /// ([`crate::ConversationProjection`]); absent all optional params,
-    /// behavior is byte-identical to before.
+    /// ([`crate::ConversationProjection`]). When `include_in_progress` is
+    /// `true` and the served page ends at the live tail, the in-flight
+    /// turn's partial assistant message (streamed blocks so far) is appended
+    /// as a trailing `inProgress: true` row (monorepo#3647); absent all
+    /// optional params, behavior is byte-identical to before.
     #[allow(clippy::too_many_arguments)]
     fn agent_get_conversation(
         &self,
@@ -1404,6 +1432,7 @@ pub trait WorkspaceApi: Send + Sync {
         around_message_id: Option<String>,
         around_index: Option<i64>,
         projection: Option<crate::ConversationProjection>,
+        include_in_progress: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             agent_id,
@@ -1413,6 +1442,7 @@ pub trait WorkspaceApi: Send + Sync {
             around_message_id,
             around_index,
             projection,
+            include_in_progress,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -1990,8 +2020,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// a failed probe may serve the last-good cached list with `stale`/
     /// `warning` fields added. With a `provider_id` the catalog comes from
     /// that provider's registered source through the generic per-provider
-    /// cache (version-keyed, served indefinitely; a probe runs only on a
-    /// miss or forced read), returning
+    /// cache (version-keyed; a probe runs on a miss, on an entry at or past
+    /// the 24h staleness threshold, or on a forced read — a failed re-probe
+    /// serves the last-good list labeled `stale` + `warning`), returning
     /// `{ providerId, models, source, stale?, warning? }`. `force_refresh`
     /// skips the cache read and awaits a fresh probe.
     fn models_list(
@@ -2557,6 +2588,57 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::app_agents_wait not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `app.agents.send` (the Chief-only `ws.app.agents.send` MCP binding):
+    /// resolve a target agent across workspaces and deliver an automatically
+    /// attributed message through the ordinary agent message path.
+    fn app_agents_send(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            caller_agent_id,
+            target_agent_id,
+            message,
+            priority,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_agents_send not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `app.agents.ask` (the Chief-only `ws.app.agents.ask` MCP binding):
+    /// deliver an attributed message through the ordinary send path and arm
+    /// one durable completion watch. Direct replies remain ordinary messages;
+    /// only target settlement consumes the watch and wakes the Chief.
+    fn app_agents_ask(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            caller_agent_id,
+            target_agent_id,
+            message,
+            priority,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_agents_ask not implemented".to_string(),
             ))
         })
     }

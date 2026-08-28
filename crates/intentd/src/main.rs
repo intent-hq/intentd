@@ -1233,7 +1233,23 @@ fn resolve_config() -> anyhow::Result<Config> {
     Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
+/// Build-commit value for the serve startup banner (monorepo#3649): the
+/// embedded commit when present, "unknown" for builds without one — the same
+/// `Option` `system.info` maps into its `build_commit` field.
+fn banner_build_commit(build_commit: Option<&str>) -> &str {
+    build_commit.unwrap_or("unknown")
+}
+
 async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyhow::Result<()> {
+    // Build-identity banner as the first serve log line so every log file
+    // opens with which build produced it (monorepo#3649). Same identity
+    // values `system.info` and the hello handshake expose.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build_commit = banner_build_commit(intent_transport::BUILD_COMMIT),
+        protocol = intent_transport::PROTOCOL_VERSION,
+        "intentd starting"
+    );
     // Insecure dev mode: `--insecure` OR `INTENTD_INSECURE=1` disables TLS and
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
     // provisioning entirely. Dev-only; loudly warned at startup.
@@ -1814,8 +1830,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         let services = services.clone();
         tokio::spawn(async move { services.start_enabled_mcp_servers().await })
     };
-    let watcher_init_task =
-        spawn_watcher_registry_init(bus.clone(), api.clone(), Arc::clone(&git_status_refresher));
+    // Watch-health handle created BEFORE the backgrounded registry start so
+    // DaemonControl can hold it now; it snapshots `None` (fileWatch absent
+    // from system.status) until the registry attaches the shared hub.
+    let watch_health = intent_services::WatchHealth::default();
+    let watcher_init_task = spawn_watcher_registry_init(
+        bus.clone(),
+        api.clone(),
+        Arc::clone(&git_status_refresher),
+        watch_health.clone(),
+    );
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
@@ -1958,11 +1982,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         child_usage,
         route_info,
         workspaces_disk,
+        watch_health,
         legacy_import_store,
         legacy_import_assets_root: assets_root,
         legacy_import_lock: legacy_import_lock.clone(),
         legacy_import_bus: bus.clone(),
         settings_registry: settings_registry.clone(),
+        sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -2277,6 +2303,9 @@ struct DaemonControl {
     /// Latest workspaces-root disk sample (available/total bytes) from the
     /// background sampler, so `status()` never calls `statfs(2)` inline.
     workspaces_disk: Arc<WorkspacesDiskUsage>,
+    /// Watch-coverage handle for `system.status` (intent-hq/intent#3708);
+    /// snapshots `None` until the backgrounded watcher registry attaches.
+    watch_health: intent_services::WatchHealth,
     /// Live store and asset destination shared with Services for legacy import.
     legacy_import_store: Store,
     legacy_import_assets_root: PathBuf,
@@ -2290,6 +2319,9 @@ struct DaemonControl {
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
+    /// `<data_dir>/sitter/sitter.pid` — the supervising sitter's pidfile,
+    /// read by `system.requestUpdate` to find the process to SIGUSR1.
+    sitter_pid_path: PathBuf,
 }
 
 /// Latest own-process resource sample for `system.status`, written by the
@@ -3008,6 +3040,17 @@ impl SystemControl for DaemonControl {
             queued_spawns: budget.map(|(_, _, queued)| queued),
             workspaces_disk_available_bytes: workspaces_disk.map(|(avail, _)| avail),
             workspaces_disk_total_bytes: workspaces_disk.map(|(_, total)| total),
+            // Snapshot cost is O(watched roots) under one in-process mutex —
+            // no filesystem or OS calls — and `None` (field absent) until the
+            // backgrounded watcher registry has attached the hub.
+            file_watch: self
+                .watch_health
+                .snapshot()
+                .map(|s| intent_transport::FileWatchStatus {
+                    active_streams: s.active_streams,
+                    total_roots: s.total_roots,
+                    failed_roots: s.failed_roots,
+                }),
         }
     }
 
@@ -3015,6 +3058,10 @@ impl SystemControl for DaemonControl {
         // `notify_one` stores a permit if the serve loop is not yet awaiting, so
         // the shutdown is never lost to a race with a freshly-arrived RPC.
         self.shutdown.notify_one();
+    }
+
+    fn request_update(&self) -> Result<(), String> {
+        signal_sitter_update(&self.sitter_pid_path)
     }
 
     fn import_legacy(
@@ -3563,6 +3610,61 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
+/// Whether the live process at `pid` is an `intentd-sitter`. SIGUSR1's
+/// default disposition terminates, so a stale pidfile whose pid the OS
+/// recycled to an unrelated process must read as "not supervised" — never
+/// as a signal target. Name-checked via the process table, like the
+/// liveness probe a signal-0 alone cannot provide.
+#[cfg(unix)]
+fn pid_is_sitter(pid: u32) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(pid)
+        .is_some_and(|p| p.name() == std::ffi::OsStr::new("intentd-sitter"))
+}
+
+/// `system.requestUpdate` (§5.7): find the supervising sitter via its pidfile
+/// (`<data_dir>/sitter/sitter.pid`), verify the recorded pid is a live
+/// `intentd-sitter`, and send it SIGUSR1 — the sitter's "check for updates
+/// now" signal. `Err` carries the reason when the daemon is not
+/// sitter-supervised (missing/unparsable/stale/recycled pidfile) or the
+/// signal cannot be delivered. The pid range is clamped to `1..=i32::MAX`
+/// like `lock_holder_detail`: 0 probes our own process group and larger
+/// values go negative in the `i32` cast (`4294967295` → `-1`, the
+/// signal-every-process-we-can broadcast target).
+#[cfg(unix)]
+fn signal_sitter_update(pid_path: &Path) -> Result<(), String> {
+    let pid = read_pid(pid_path)
+        .filter(|pid| (1..=i32::MAX as u32).contains(pid) && pid_is_sitter(*pid))
+        .ok_or_else(|| {
+            format!(
+                "daemon is not supervised by intentd-sitter (no live intentd-sitter pid in {})",
+                pid_path.display()
+            )
+        })?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid.cast_signed()),
+        nix::sys::signal::Signal::SIGUSR1,
+    )
+    .map_err(|e| format!("failed to signal intentd-sitter (pid {pid}): {e}"))?;
+    tracing::info!(
+        sitter_pid = pid,
+        "sent SIGUSR1 to intentd-sitter (update check requested)"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn signal_sitter_update(_pid_path: &Path) -> Result<(), String> {
+    Err("system.requestUpdate is not supported on this platform (no unix signals)".to_string())
+}
+
 /// Local-transport liveness probe: a successful connect means a daemon is
 /// listening. Probes the UDS on Unix and the derived named pipe on Windows.
 #[cfg(unix)]
@@ -4063,6 +4165,7 @@ fn spawn_watcher_registry_init(
     bus: EventBus,
     api: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
+    watch_health: intent_services::WatchHealth,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // `block_in_place`, not a bare `spawn`: the registrations inside are
@@ -4087,7 +4190,7 @@ fn spawn_watcher_registry_init(
                     // exercise worker starvation at all.
                     std::thread::sleep(delay);
                 }
-                WatcherRegistry::start(bus, api, refresher).await
+                WatcherRegistry::start_with_health(bus, api, refresher, &watch_health).await
             })
         });
         tracing::info!("watcher registry ready");
@@ -5531,6 +5634,91 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banner_build_commit_passes_through_embedded_commit() {
+        assert_eq!(banner_build_commit(Some("abc1234")), "abc1234");
+    }
+
+    #[test]
+    fn banner_build_commit_falls_back_to_unknown() {
+        assert_eq!(banner_build_commit(None), "unknown");
+    }
+
+    /// A stand-in "sitter" the `pid_is_sitter` name check accepts: `sleep`
+    /// symlinked as `intentd-sitter` (the process name follows the executed
+    /// path's basename). SIGUSR1's default disposition is terminate, so the
+    /// child exiting on signal 10/30 proves delivery.
+    #[cfg(unix)]
+    fn spawn_stand_in_sitter(dir: &Path) -> std::process::Child {
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .expect("sleep binary");
+        let link = dir.join("intentd-sitter");
+        std::os::unix::fs::symlink(sleep, &link).unwrap();
+        std::process::Command::new(&link).arg("30").spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_sitter_update_errors_when_not_supervised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+
+        // Missing pidfile ⇒ not supervised.
+        let err = signal_sitter_update(&path).unwrap_err();
+        assert!(err.contains("not supervised"), "missing pidfile: {err}");
+
+        // Garbage / out-of-range contents ⇒ not supervised. u32::MAX would
+        // cast to pid -1 — the signal-everything broadcast target — so the
+        // range clamp must reject it before any kill().
+        for garbage in ["", "not a pid", "-4", "0", "2147483648", "4294967295"] {
+            std::fs::write(&path, garbage).unwrap();
+            let err = signal_sitter_update(&path).unwrap_err();
+            assert!(err.contains("not supervised"), "garbage {garbage:?}: {err}");
+        }
+
+        // A stale pid (spawned and already reaped) ⇒ not supervised.
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        std::fs::write(&path, dead_pid.to_string()).unwrap();
+        let err = signal_sitter_update(&path).unwrap_err();
+        assert!(err.contains("not supervised"), "stale pid: {err}");
+
+        // A live pid that is NOT an intentd-sitter (a recycled stale pid) ⇒
+        // not supervised — never a signal target.
+        let mut not_sitter = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&path, not_sitter.id().to_string()).unwrap();
+        let err = signal_sitter_update(&path).unwrap_err();
+        assert!(err.contains("not supervised"), "live non-sitter pid: {err}");
+        not_sitter.kill().unwrap();
+        not_sitter.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_sitter_update_signals_the_live_pidfile_process() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let mut child = spawn_stand_in_sitter(dir.path());
+        std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+
+        signal_sitter_update(&path).expect("live sitter pid is signaled");
+
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGUSR1 as i32),
+            "child must be terminated by SIGUSR1"
+        );
+    }
 
     #[test]
     fn bind_choices_list_interfaces_then_all_interfaces_option() {

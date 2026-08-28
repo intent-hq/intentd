@@ -2565,10 +2565,11 @@ pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 
 /// Sponsor attribution key in `agent_session.metadata` JSON: stamped by
-/// `ws.agent.spawnPeer` with the spawning agent's id so `agent.list` /
-/// `agent.get` can serve `metadata.sponsorAgentId` on peer rows. Rides the
-/// existing free-form `metadata` column (no schema migration), like
-/// [`IS_INITIAL_AGENT_KEY`]. Read back by [`AgentSession::sponsor_agent_id`].
+/// `ws.agent.create({ topLevel: true })` with the creating agent's id so
+/// `agent.list` / `agent.get` can serve `metadata.sponsorAgentId` on
+/// sponsored top-level rows. Rides the existing free-form `metadata` column
+/// (no schema migration), like [`IS_INITIAL_AGENT_KEY`]. Read back by
+/// [`AgentSession::sponsor_agent_id`].
 pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
 
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
@@ -2706,8 +2707,10 @@ pub struct AgentSession {
     /// runaway delegation loops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
-    /// The first message a delegated agent was started with (FE
-    /// `metadata.initialMessage`), persisted so a wake-up can resume.
+    /// The first message a delegated agent was started with (harvested from
+    /// the `metadata.initialMessage` create param), persisted so a wake-up can
+    /// resume. Served by `agent.getSession` only — deliberately absent from
+    /// the `AgentLite` projection (see `AgentMetadata`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_message: Option<String>,
     /// Session-level context references captured at spawn (FE top-level
@@ -2887,9 +2890,10 @@ impl AgentSession {
     }
 
     /// The sponsor attribution persisted under [`SPONSOR_AGENT_ID_KEY`] in
-    /// the session's free-form `metadata`: the agent that spawned this
-    /// independent peer via `ws.agent.spawnPeer`. `None` for non-peer
-    /// sessions (absent, empty, or non-string values all read as `None`).
+    /// the session's free-form `metadata`: the agent that created this
+    /// independent top-level agent via `ws.agent.create({ topLevel: true })`.
+    /// `None` for non-sponsored sessions (absent, empty, or non-string
+    /// values all read as `None`).
     pub fn sponsor_agent_id(&self) -> Option<&str> {
         self.metadata
             .as_ref()
@@ -2904,9 +2908,15 @@ impl AgentSession {
 /// `isBackground`, `specialist`, `createdByAgentId` (the parent/spawning agent),
 /// and `taskNoteId` — plus the persistence-gap fields the FE writer stored
 /// under `metadata` (`completionReport`, `completionReportTimestamp`,
-/// `delegationDepth`, `initialMessage`; P3-1.2b). `isBackground` is always
+/// `delegationDepth`; P3-1.2b). `isBackground` is always
 /// emitted (iOS reads it with a `false` default) and carries the persisted
 /// session value (G-A1/P3-1.2c); the rest are omitted when absent.
+///
+/// The persisted spawn-time `initialMessage` is deliberately ABSENT from this
+/// projection (extending the monorepo#2932 list carve-out to `agent.get`):
+/// it is the last unbounded `AgentLite` field, no client reads it off agent
+/// rows (the FE is write-only at creation; iOS never references it), and the
+/// detail read `agent.getSession` still serves the full persisted value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMetadata {
@@ -2931,8 +2941,6 @@ pub struct AgentMetadata {
     pub attention_request_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_message: Option<String>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<String>,
@@ -2967,8 +2975,9 @@ pub struct AgentMetadata {
     /// initial-agent orchestration). Omitted otherwise — never `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_initial_agent: Option<bool>,
-    /// Sponsor attribution for `ws.agent.spawnPeer`-created peers: the agent
-    /// that spawned this INDEPENDENT top-level agent. Attribution only —
+    /// Sponsor attribution for `ws.agent.create({ topLevel: true })`-created
+    /// agents: the agent that created this INDEPENDENT top-level agent.
+    /// Attribution only —
     /// unlike `createdByAgentId` it implies no parent linkage, no reporting
     /// obligation, and no delegation depth. Rides the free-form session
     /// `metadata` under [`SPONSOR_AGENT_ID_KEY`] (like
@@ -3086,7 +3095,9 @@ pub struct AgentLite {
     pub created_at: String,
     pub updated_at: String,
     /// Most-recent activity timestamp; derived from `updated_at` (iOS falls back
-    /// to this after `updatedAt`).
+    /// to this after `updatedAt`). Mid-turn the service projection overlays the
+    /// live-turn stream stamp when newer (monorepo#3647), so it advances on
+    /// tool-call/stream activity while nothing has persisted yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
     pub message_count: u64,
@@ -3207,7 +3218,6 @@ impl AgentLite {
             attention_request_reason: session.attention_request_reason,
             attention_request_timestamp: session.attention_request_timestamp,
             delegation_depth: session.delegation_depth,
-            initial_message: session.initial_message,
             sandbox_id: session.sandbox_id.clone(),
             sandbox_path: session.sandbox_path.clone(),
             sandbox_branch: session.sandbox_branch.clone(),
@@ -3600,6 +3610,20 @@ pub struct FileStatus {
 
 /// `git.status` result (`GitStatus` in `src/shared/types.ts`). `diverged` is true
 /// only when the branch is both ahead and behind its upstream.
+///
+/// `files` served over the wire is capped (monorepo#3635): when the working
+/// tree carries more entries than the per-response cap, the list is truncated
+/// (tracked changes preferred over untracked) and the additive truncation
+/// markers are set — `filesTruncated: true` plus `totalFiles` carrying the
+/// full pre-cap count. Both are omitted from the wire on an untruncated
+/// result, so the pre-#3635 shape is preserved byte-for-byte. Aggregate flags
+/// (`hasUncommittedChanges`, `hasUntrackedFiles`) always reflect the full
+/// scan, never the truncated list.
+///
+/// The bools mirror the wire contract 1:1 (each an independent flag on the
+/// `git.status` result), so folding them into enums would diverge the model
+/// from the protocol shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatus {
@@ -3610,6 +3634,14 @@ pub struct GitStatus {
     pub files: Vec<FileStatus>,
     pub has_uncommitted_changes: bool,
     pub has_untracked_files: bool,
+    /// `true` when `files` was truncated to the per-response cap
+    /// (monorepo#3635). Omitted from the wire when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub files_truncated: bool,
+    /// Full working-tree entry count before the cap was applied. Present only
+    /// alongside `filesTruncated: true`; omitted on an untruncated result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_files: Option<usize>,
 }
 
 /// `git.getBranches` result (`{ branches, remoteBranches, currentBranch,

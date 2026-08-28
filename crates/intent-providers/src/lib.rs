@@ -37,7 +37,7 @@ pub use args::{
 pub use config::{
     all_provider_ids, auth_error_message, find_provider, first_provider_id,
     is_provider_authentication_error, provider_config, InjectionMechanism, ProviderConfig,
-    ACP_PROVIDERS, AUGGIE_CLI_MIN_VERSION, AUGGIE_CLI_REQUIREMENT,
+    ToolRemovalStyle, ACP_PROVIDERS, AUGGIE_CLI_MIN_VERSION, AUGGIE_CLI_REQUIREMENT,
     CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
     PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
 };

@@ -1207,19 +1207,45 @@ async fn dispatch(
         "agent.list" => {
             let ws = require_ws_note(params)?;
             // Soft retire (§5.5): retired rows are excluded by default;
-            // `includeRetired: true` serves them too (carrying `retiredAt`).
+            // `includeRetired: true` serves them too, `retiredOnly: true`
+            // serves ONLY them (retired rows carrying `retiredAt`). The two
+            // flags together are contradictory → `-32602`. Both flags are
+            // deliberately lenient — a non-bool value coerces to `false`
+            // (documented `includeRetired` precedent), it is NOT `-32602`
+            // like v8.1 `note.list` `projection`. Every variant additionally
+            // carries `retiredCount` (one covering-index SQL COUNT of the
+            // workspace's soft-retired sessions, v8.2). The count is a
+            // second statement after the rows read, with no snapshot
+            // isolation across the two: a retire/restore landing between
+            // them can skew `retiredCount` off the returned rows by one —
+            // tolerated by design, since the paired `agent:retired` /
+            // `agent:restored` events let clients reconcile.
             let include_retired = params
                 .get("includeRetired")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let agents = if include_retired {
-                api.agent_list_including_retired(ws)
+            let retired_only = params
+                .get("retiredOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if include_retired && retired_only {
+                return Err(invalid_params(
+                    "includeRetired and retiredOnly are mutually exclusive",
+                ));
+            }
+            let agents = if retired_only {
+                api.agent_list_retired_only(ws.clone())
+                    .await
+                    .map_err(domain_to_rpc)?
+            } else if include_retired {
+                api.agent_list_including_retired(ws.clone())
                     .await
                     .map_err(domain_to_rpc)?
             } else {
-                api.agent_list(ws).await.map_err(domain_to_rpc)?
+                api.agent_list(ws.clone()).await.map_err(domain_to_rpc)?
             };
-            Ok(json!({ "agents": agents }))
+            let retired_count = api.agent_retired_count(ws).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "agents": agents, "retiredCount": retired_count }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
         "agent.get" => {
@@ -1264,6 +1290,18 @@ async fn dispatch(
             // v8.0 — absent / null and the explicit `"slim"` all serve
             // bounded tool/image block bodies; any other value is `-32602`.
             let projection = parse_projection(params)?;
+            // Additive `includeInProgress` param (§5.5, monorepo#3647):
+            // opt-in to the in-flight turn's partial assistant message as a
+            // trailing `inProgress: true` row on tail pages. Absent / null /
+            // false keep responses byte-identical; any non-boolean is
+            // `-32602`.
+            let include_in_progress = match params.get("includeInProgress") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(invalid_params("includeInProgress must be a boolean"));
+                }
+            };
             match api
                 .agent_get_conversation(
                     agent_id,
@@ -1273,6 +1311,7 @@ async fn dispatch(
                     around_message_id,
                     around_index,
                     projection,
+                    include_in_progress,
                 )
                 .await
             {
