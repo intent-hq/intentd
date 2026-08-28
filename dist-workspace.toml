@@ -50,9 +50,9 @@ github-custom-job-permissions = { "publish-channel-manifest" = { contents = "wri
 # check is relaxed here. Re-apply the customization after any `dist init` /
 # `dist generate`; it is marked LOCAL CUSTOMIZATION in v-release.yml.
 allow-dirty = ["ci"]
-# Injected into build-local-artifacts: provisions rustup/toolchain/targets on
-# the self-hosted runners, which don't have the hosted images' preinstalled
-# toolchains (see the file header for details).
+# Injected into build-local-artifacts: provisions the pinned
+# rust-toolchain.toml channel and the matrix's cross targets, which no
+# runner image guarantees (see the file header for details).
 github-build-setup = "../dist-build-setup.yml"
 
 # Every job runs on GitHub-hosted runners: the self-hosted fleet (tinybox)
