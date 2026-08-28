@@ -5214,7 +5214,7 @@ impl AgentManager {
         // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
         // below (quarantine/archived/hold parks, busy enqueue, direct
         // persist) so immediate deliveries and queued entries alike carry it
-        // and drain/flush/redrive never re-annotate (prefix guard).
+        // and drain/flush/redrive never re-annotate (exact-header guard).
         crate::agent_ops::annotate_sender_attribution(
             &mut content,
             options.message_metadata.as_ref(),

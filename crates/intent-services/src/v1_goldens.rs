@@ -172,9 +172,11 @@ fn golden_dequeue_wait_note() {
 }
 
 /// The A2A sender-attribution header MUST stay single-line and start with
-/// `A2A_SENDER_NOTE_PREFIX`: the delivery path's idempotency guard matches
-/// the prefix, and the FE strips the header line with a single-line regex
-/// (same pattern as `hook-wake-attribution.ts`).
+/// `A2A_SENDER_NOTE_PREFIX`: the FE strips the header line with a
+/// single-line regex keyed on that prefix (same pattern as
+/// `hook-wake-attribution.ts`). The delivery path's idempotency guard is
+/// stricter — it rebuilds and exact-matches the full header — but the
+/// prefix is still the FE-visible contract.
 #[test]
 fn golden_a2a_sender_note() {
     let harness = crate::harness::latest();

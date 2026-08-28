@@ -79,10 +79,13 @@ pub(crate) const STALE_REDRIVE_NOTE_PREFIX: &str =
 /// before you completed"), so the two checks never shadow each other.
 pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
 
-/// Stable prefix of [`Harness::a2a_sender_note`], used by the agent-origin
-/// send paths as an idempotency guard (an entry whose content already
-/// carries a sender header is never re-annotated — same contract as the
-/// dequeue-wait note).
+/// Stable prefix of [`Harness::a2a_sender_note`], asserted by the goldens
+/// as the contract the FE's header-strip regex keys on. NOT the annotation
+/// skip condition: the idempotency guard rebuilds the exact header from the
+/// entry's stamped attribution and compares byte-for-byte, so a
+/// caller-authored lookalike prefix cannot suppress the genuine header
+/// (spoof resistance).
+#[cfg(test)]
 pub(crate) const A2A_SENDER_NOTE_PREFIX: &str = "[MESSAGE FROM AGENT";
 
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
@@ -427,6 +430,21 @@ impl Harness for V1 {
     }
 
     fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String {
+        // The header MUST stay single-line (the FE strips it with a
+        // single-line regex, and the exact-match idempotency guard keys on
+        // it): collapse newlines/control chars in the display name to
+        // single spaces so a hostile agent name cannot inject header-like
+        // lines, and drop a name that sanitizes to empty.
+        let name = name
+            .map(|n| {
+                n.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|n| !n.is_empty());
         match name {
             Some(name) => format!("[MESSAGE FROM AGENT {name} ({agent_id})]"),
             None => format!("[MESSAGE FROM AGENT ({agent_id})]"),

@@ -1563,15 +1563,22 @@ pub(crate) fn is_interrupt_priority(priority: Option<&str>) -> bool {
 /// [`crate::harness::Harness::a2a_sender_note`] (+ blank line) to an
 /// agent-origin send's content when `message_metadata` is an object carrying
 /// a string `fromAgentId` — daemon-stamped by the MCP bindings, never
-/// caller-controlled — using `fromAgentName` when present. No-op otherwise,
-/// so user/FE sends stay byte-identical. Applied at the send front doors
-/// (BEFORE persist/enqueue), so immediate deliveries, auto-queue fallbacks
-/// and queued entries all inherit the header and drain/flush/redrive never
-/// need to re-annotate; content already starting with
-/// [`A2A_SENDER_NOTE_PREFIX`] is never re-annotated (idempotent across the
-/// layered front doors and requeues — same contract as the dequeue-wait
-/// note), and `persisted: true` requeues are untouched by construction (the
-/// annotation never runs at drain time). Metadata is not modified: the
+/// caller-controlled (the wire front doors strip caller-supplied attribution
+/// at the router ingress) — using `fromAgentName` when present. No-op
+/// otherwise, so user/FE sends stay byte-identical. Applied at the send
+/// front doors (BEFORE persist/enqueue), so immediate deliveries, auto-queue
+/// fallbacks and queued entries all inherit the header and
+/// drain/flush/redrive never need to re-annotate. Idempotency is
+/// **exact-match**: the daemon rebuilds the header it would emit from THIS
+/// entry's stamped attribution and skips only when the content already
+/// starts with exactly that header + blank line — byte-stable across the
+/// layered front doors and requeues because the name is read from the same
+/// stamped metadata, never a live lookup (same contract as the dequeue-wait
+/// note). A caller-authored lookalike first line (any other `[MESSAGE FROM
+/// AGENT…`) does NOT suppress annotation: the genuine header is prepended
+/// ABOVE it, so the spoof visibly appears below the real attribution.
+/// `persisted: true` requeues are untouched by construction (the annotation
+/// never runs at drain time). Metadata is not modified: the
 /// single-pending-message guard, `removeQueuedMessage` ownership and
 /// `question_answers` intake all key on metadata and are unaffected.
 pub(crate) fn annotate_sender_attribution(content: &mut String, message_metadata: Option<&Value>) {
@@ -1581,14 +1588,15 @@ pub(crate) fn annotate_sender_attribution(content: &mut String, message_metadata
     else {
         return;
     };
-    if content.starts_with(crate::harness::v1::A2A_SENDER_NOTE_PREFIX) {
-        return;
-    }
     let name = message_metadata
         .and_then(|md| md.get("fromAgentName"))
         .and_then(Value::as_str);
     let note = crate::harness::latest().a2a_sender_note(name, from_agent_id);
-    *content = format!("{note}\n\n{content}");
+    let annotated_head = format!("{note}\n\n");
+    if content.starts_with(&annotated_head) {
+        return;
+    }
+    *content = format!("{annotated_head}{content}");
 }
 
 /// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5): every entry
@@ -5527,7 +5535,7 @@ impl Services {
         // mirrors the runtime `AgentManager::send_message` prepend so both
         // wirings persist identical agent-origin content. Idempotent: the
         // runtime path may already have annotated (delegate kickoff), and
-        // the prefix guard makes the second application a no-op.
+        // the exact-header guard makes the second application a no-op.
         annotate_sender_attribution(&mut content, message_metadata.as_ref());
         // Attachment-reference validation (PROTOCOL §5.5): every file and
         // image block must carry exactly one of `data` / `attachmentId`,
