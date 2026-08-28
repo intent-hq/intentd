@@ -14,6 +14,8 @@ struct FakeControl {
     import_force: std::sync::Mutex<Option<bool>>,
     credential: Option<(String, String)>,
     credential_pid: std::sync::Mutex<Option<Option<u64>>>,
+    update_error: Option<String>,
+    update_called: AtomicBool,
 }
 
 impl FakeControl {
@@ -52,12 +54,21 @@ impl FakeControl {
             import_force: std::sync::Mutex::new(None),
             credential: None,
             credential_pid: std::sync::Mutex::new(None),
+            update_error: None,
+            update_called: AtomicBool::new(false),
         }
     }
 
     fn with_credential(username: &str, password: &str) -> Self {
         Self {
             credential: Some((username.to_string(), password.to_string())),
+            ..Self::new()
+        }
+    }
+
+    fn with_update_error(message: &str) -> Self {
+        Self {
+            update_error: Some(message.to_string()),
             ..Self::new()
         }
     }
@@ -69,6 +80,13 @@ impl SystemControl for FakeControl {
     }
     fn request_shutdown(&self) {
         self.shutdown_called.store(true, Ordering::SeqCst);
+    }
+    fn request_update(&self) -> Result<(), String> {
+        self.update_called.store(true, Ordering::SeqCst);
+        match &self.update_error {
+            Some(message) => Err(message.clone()),
+            None => Ok(()),
+        }
     }
     fn import_legacy(
         &self,
@@ -104,6 +122,9 @@ fn classify_only_matches_system_methods() {
     );
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.gitCredential" })).is_some()
+    );
+    assert!(
+        classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.requestUpdate" })).is_some()
     );
     // Non-system methods fall through.
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "workspace.list" })).is_none());
@@ -319,6 +340,56 @@ async fn handle_shutdown_remote_notification_is_ignored() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "system.shutdown" })).unwrap();
     assert!(handle(req, &control, false, false).await.is_none());
     assert!(!control.shutdown_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn request_update_supervised_returns_ok() {
+    let control = FakeControl::new();
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 31, "method": "system.requestUpdate" })).unwrap();
+    let frame = handle(req, &control, true, true)
+        .await
+        .expect("requestUpdate has a response");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 31);
+    assert_eq!(parsed["result"], json!({ "ok": true }));
+    assert!(control.update_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn request_update_unsupervised_maps_to_internal_error() {
+    let control = FakeControl::with_update_error("daemon is not supervised by intentd-sitter");
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 32, "method": "system.requestUpdate" })).unwrap();
+    let parsed: Value =
+        serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+    assert_eq!(parsed["id"], 32);
+    assert_eq!(parsed["error"]["code"], -32603);
+    assert_eq!(
+        parsed["error"]["message"],
+        "daemon is not supervised by intentd-sitter"
+    );
+}
+
+#[tokio::test]
+async fn request_update_is_served_to_remote_callers() {
+    // Unlike system.shutdown, remote (TCP/WSS) callers may trigger an update
+    // check — that is the point of the method (a remote FE's update button).
+    let control = FakeControl::new();
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 33, "method": "system.requestUpdate" })).unwrap();
+    let parsed: Value =
+        serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+    assert_eq!(parsed["result"], json!({ "ok": true }));
+    assert!(control.update_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn request_update_notification_fires_without_response() {
+    let control = FakeControl::new();
+    let req = classify(&json!({ "jsonrpc": "2.0", "method": "system.requestUpdate" })).unwrap();
+    assert!(handle(req, &control, true, true).await.is_none());
+    assert!(control.update_called.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

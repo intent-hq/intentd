@@ -1979,6 +1979,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         legacy_import_lock: legacy_import_lock.clone(),
         legacy_import_bus: bus.clone(),
         settings_registry: settings_registry.clone(),
+        sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -2306,6 +2307,9 @@ struct DaemonControl {
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
+    /// `<data_dir>/sitter/sitter.pid` — the supervising sitter's pidfile,
+    /// read by `system.requestUpdate` to find the process to SIGUSR1.
+    sitter_pid_path: PathBuf,
 }
 
 /// Latest own-process resource sample for `system.status`, written by the
@@ -3033,6 +3037,10 @@ impl SystemControl for DaemonControl {
         self.shutdown.notify_one();
     }
 
+    fn request_update(&self) -> Result<(), String> {
+        signal_sitter_update(&self.sitter_pid_path)
+    }
+
     fn import_legacy(
         &self,
         force: bool,
@@ -3577,6 +3585,38 @@ fn pid_is_alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn pid_is_alive(_pid: u32) -> bool {
     true
+}
+
+/// `system.requestUpdate` (§5.7): find the supervising sitter via its pidfile
+/// (`<data_dir>/sitter/sitter.pid`), verify the recorded pid is live, and send
+/// it SIGUSR1 — the sitter's "check for updates now" signal. `Err` carries the
+/// reason when the daemon is not sitter-supervised (missing/unparsable/stale
+/// pidfile) or the signal cannot be delivered.
+#[cfg(unix)]
+fn signal_sitter_update(pid_path: &Path) -> Result<(), String> {
+    let pid = read_pid(pid_path)
+        .filter(|pid| *pid > 0 && pid_is_alive(*pid))
+        .ok_or_else(|| {
+            format!(
+                "daemon is not supervised by intentd-sitter (no live pid in {})",
+                pid_path.display()
+            )
+        })?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid.cast_signed()),
+        nix::sys::signal::Signal::SIGUSR1,
+    )
+    .map_err(|e| format!("failed to signal intentd-sitter (pid {pid}): {e}"))?;
+    tracing::info!(
+        sitter_pid = pid,
+        "sent SIGUSR1 to intentd-sitter (update check requested)"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn signal_sitter_update(_pid_path: &Path) -> Result<(), String> {
+    Err("system.requestUpdate is not supported on this platform (no unix signals)".to_string())
 }
 
 /// Local-transport liveness probe: a successful connect means a daemon is
@@ -5556,6 +5596,57 @@ mod tests {
     #[test]
     fn banner_build_commit_falls_back_to_unknown() {
         assert_eq!(banner_build_commit(None), "unknown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_sitter_update_errors_when_not_supervised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+
+        // Missing pidfile ⇒ not supervised.
+        let err = signal_sitter_update(&path).unwrap_err();
+        assert!(err.contains("not supervised"), "missing pidfile: {err}");
+
+        // Garbage contents ⇒ not supervised.
+        for garbage in ["", "not a pid", "-4", "0"] {
+            std::fs::write(&path, garbage).unwrap();
+            let err = signal_sitter_update(&path).unwrap_err();
+            assert!(err.contains("not supervised"), "garbage {garbage:?}: {err}");
+        }
+
+        // A stale pid (spawned and already reaped) ⇒ not supervised.
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        std::fs::write(&path, dead_pid.to_string()).unwrap();
+        let err = signal_sitter_update(&path).unwrap_err();
+        assert!(err.contains("not supervised"), "stale pid: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_sitter_update_signals_the_live_pidfile_process() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        // A stand-in "sitter": SIGUSR1's default disposition is terminate, so
+        // the child exiting on signal 10/30 proves delivery.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+
+        signal_sitter_update(&path).expect("live sitter pid is signaled");
+
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGUSR1 as i32),
+            "child must be terminated by SIGUSR1"
+        );
     }
 
     #[test]
