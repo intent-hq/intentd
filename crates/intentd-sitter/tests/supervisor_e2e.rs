@@ -129,6 +129,36 @@ fn dead_url() -> String {
     url
 }
 
+/// [`serve`] with a stall switch: while the returned flag is false requests
+/// are served normally (so the sitter's startup check succeeds); once a test
+/// sets it, each accepted socket is parked in a detached thread that sleeps
+/// forever — a stalled update endpoint whose checks hang until the updater's
+/// own (minutes-long) timeout instead of failing fast.
+fn serve_stallable(routes: Routes) -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_stalled = Arc::clone(&stalled);
+    thread::spawn(move || {
+        let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let routes = Arc::clone(&routes);
+            let log = Arc::clone(&log);
+            let stalled = Arc::clone(&server_stalled);
+            thread::spawn(move || {
+                if stalled.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _hold = stream;
+                    thread::sleep(Duration::from_secs(3600));
+                } else {
+                    handle(stream, &routes, &log);
+                }
+            });
+        }
+    });
+    (url, stalled)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -1707,6 +1737,60 @@ fn sigusr1_when_already_current_leaves_daemon_running() {
         .filter(|line| line.starts_with("start "))
         .count();
     assert_eq!(starts, 1, "an already-current SIGUSR1 must not restart");
+}
+
+/// A SIGUSR1 check against a stalled update endpoint (accepts connections,
+/// never responds) must not deafen the sitter: a SIGTERM arriving while that
+/// check hangs shuts the sitter down promptly — the updater's own download
+/// timeout is minutes long, so waiting the check out is not an option for
+/// service management.
+#[test]
+fn sigterm_during_a_stalled_sigusr1_check_still_shuts_down() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, stall) = serve_stallable(routes);
+
+    // Hour-long check interval: only the SIGUSR1 may trigger a check.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Stall the endpoint, then trigger the on-demand check; it hangs.
+    stall.store(true, std::sync::atomic::Ordering::SeqCst);
+    let stderr = stderr_path(dir.path());
+    send_signal(&sitter, "USR1");
+    wait_until(
+        "the SIGUSR1 check to be in flight",
+        Duration::from_secs(15),
+        || read_or_empty(&stderr).contains("SIGUSR1 received; checking for updates now"),
+    );
+
+    // SIGTERM while the check hangs: the sitter must shut down promptly
+    // (well under the stalled check's own timeout), forwarding the signal
+    // to the daemon and exiting with its status as usual.
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM during a stalled check must shut down promptly"
+    );
 }
 
 /// A SIGUSR1 that lands during a crash-backoff sleep cuts the wait short:

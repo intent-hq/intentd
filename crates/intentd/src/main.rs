@@ -3587,18 +3587,41 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
+/// Whether the live process at `pid` is an `intentd-sitter`. SIGUSR1's
+/// default disposition terminates, so a stale pidfile whose pid the OS
+/// recycled to an unrelated process must read as "not supervised" — never
+/// as a signal target. Name-checked via the process table, like the
+/// liveness probe a signal-0 alone cannot provide.
+#[cfg(unix)]
+fn pid_is_sitter(pid: u32) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(pid)
+        .is_some_and(|p| p.name() == std::ffi::OsStr::new("intentd-sitter"))
+}
+
 /// `system.requestUpdate` (§5.7): find the supervising sitter via its pidfile
-/// (`<data_dir>/sitter/sitter.pid`), verify the recorded pid is live, and send
-/// it SIGUSR1 — the sitter's "check for updates now" signal. `Err` carries the
-/// reason when the daemon is not sitter-supervised (missing/unparsable/stale
-/// pidfile) or the signal cannot be delivered.
+/// (`<data_dir>/sitter/sitter.pid`), verify the recorded pid is a live
+/// `intentd-sitter`, and send it SIGUSR1 — the sitter's "check for updates
+/// now" signal. `Err` carries the reason when the daemon is not
+/// sitter-supervised (missing/unparsable/stale/recycled pidfile) or the
+/// signal cannot be delivered. The pid range is clamped to `1..=i32::MAX`
+/// like `lock_holder_detail`: 0 probes our own process group and larger
+/// values go negative in the `i32` cast (`4294967295` → `-1`, the
+/// signal-every-process-we-can broadcast target).
 #[cfg(unix)]
 fn signal_sitter_update(pid_path: &Path) -> Result<(), String> {
     let pid = read_pid(pid_path)
-        .filter(|pid| *pid > 0 && pid_is_alive(*pid))
+        .filter(|pid| (1..=i32::MAX as u32).contains(pid) && pid_is_sitter(*pid))
         .ok_or_else(|| {
             format!(
-                "daemon is not supervised by intentd-sitter (no live pid in {})",
+                "daemon is not supervised by intentd-sitter (no live intentd-sitter pid in {})",
                 pid_path.display()
             )
         })?;
@@ -5598,6 +5621,21 @@ mod tests {
         assert_eq!(banner_build_commit(None), "unknown");
     }
 
+    /// A stand-in "sitter" the `pid_is_sitter` name check accepts: `sleep`
+    /// symlinked as `intentd-sitter` (the process name follows the executed
+    /// path's basename). SIGUSR1's default disposition is terminate, so the
+    /// child exiting on signal 10/30 proves delivery.
+    #[cfg(unix)]
+    fn spawn_stand_in_sitter(dir: &Path) -> std::process::Child {
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .expect("sleep binary");
+        let link = dir.join("intentd-sitter");
+        std::os::unix::fs::symlink(sleep, &link).unwrap();
+        std::process::Command::new(&link).arg("30").spawn().unwrap()
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_sitter_update_errors_when_not_supervised() {
@@ -5608,8 +5646,10 @@ mod tests {
         let err = signal_sitter_update(&path).unwrap_err();
         assert!(err.contains("not supervised"), "missing pidfile: {err}");
 
-        // Garbage contents ⇒ not supervised.
-        for garbage in ["", "not a pid", "-4", "0"] {
+        // Garbage / out-of-range contents ⇒ not supervised. u32::MAX would
+        // cast to pid -1 — the signal-everything broadcast target — so the
+        // range clamp must reject it before any kill().
+        for garbage in ["", "not a pid", "-4", "0", "2147483648", "4294967295"] {
             std::fs::write(&path, garbage).unwrap();
             let err = signal_sitter_update(&path).unwrap_err();
             assert!(err.contains("not supervised"), "garbage {garbage:?}: {err}");
@@ -5622,6 +5662,18 @@ mod tests {
         std::fs::write(&path, dead_pid.to_string()).unwrap();
         let err = signal_sitter_update(&path).unwrap_err();
         assert!(err.contains("not supervised"), "stale pid: {err}");
+
+        // A live pid that is NOT an intentd-sitter (a recycled stale pid) ⇒
+        // not supervised — never a signal target.
+        let mut not_sitter = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&path, not_sitter.id().to_string()).unwrap();
+        let err = signal_sitter_update(&path).unwrap_err();
+        assert!(err.contains("not supervised"), "live non-sitter pid: {err}");
+        not_sitter.kill().unwrap();
+        not_sitter.wait().unwrap();
     }
 
     #[cfg(unix)]
@@ -5631,12 +5683,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sitter.pid");
-        // A stand-in "sitter": SIGUSR1's default disposition is terminate, so
-        // the child exiting on signal 10/30 proves delivery.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut child = spawn_stand_in_sitter(dir.path());
         std::fs::write(&path, format!("{}\n", child.id())).unwrap();
 
         signal_sitter_update(&path).expect("live sitter pid is signaled");

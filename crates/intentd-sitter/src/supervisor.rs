@@ -352,7 +352,14 @@ pub fn run(
         config,
         updater,
     };
-    runtime.block_on(supervisor.supervise())
+    let code = runtime.block_on(supervisor.supervise());
+    // Dropping the runtime waits for in-flight `spawn_blocking` tasks — and
+    // an update check abandoned mid-shutdown (its blocking HTTP client has a
+    // minutes-long timeout against a stalled endpoint) must not wedge the
+    // exit. Shut down in the background instead: the task is detached and
+    // dies with the process.
+    runtime.shutdown_background();
+    code
 }
 
 struct Supervisor {
@@ -545,10 +552,16 @@ impl Supervisor {
                         }
                         #[cfg(unix)]
                         BackoffOutcome::CheckNowRequested => {
-                            if let Some(version) =
-                                self.check_now(&current_version, &mut next_check_at).await
+                            match self
+                                .check_now(&current_version, &mut signals, &mut next_check_at)
+                                .await
                             {
-                                current_version = version;
+                                CheckNowOutcome::Shutdown(signal) => return 128 + signal,
+                                CheckNowOutcome::RestartRequested => {
+                                    self.refresh_version_from_state(&mut current_version);
+                                }
+                                CheckNowOutcome::Respawn(version) => current_version = version,
+                                CheckNowOutcome::Unchanged => {}
                             }
                             backoff = self.config.backoff_initial;
                             failures = 0;
@@ -639,10 +652,16 @@ impl Supervisor {
                             }
                             #[cfg(unix)]
                             BackoffOutcome::CheckNowRequested => {
-                                if let Some(version) =
-                                    self.check_now(&current_version, &mut next_check_at).await
+                                match self
+                                    .check_now(&current_version, &mut signals, &mut next_check_at)
+                                    .await
                                 {
-                                    current_version = version;
+                                    CheckNowOutcome::Shutdown(signal) => return 128 + signal,
+                                    CheckNowOutcome::RestartRequested => {
+                                        self.refresh_version_from_state(&mut current_version);
+                                    }
+                                    CheckNowOutcome::Respawn(version) => current_version = version,
+                                    CheckNowOutcome::Unchanged => {}
                                 }
                                 backoff = self.config.backoff_initial;
                                 failures = 0;
@@ -709,15 +728,29 @@ impl Supervisor {
                                     continue;
                                 }
                                 eprintln!("intentd-sitter: SIGUSR1 received; checking for updates now");
-                                match self.check_now(&current_version, &mut next_check_at).await {
-                                    Some(version) => {
+                                match self
+                                    .check_now(&current_version, &mut signals, &mut next_check_at)
+                                    .await
+                                {
+                                    CheckNowOutcome::Respawn(version) => {
                                         self.graceful_stop(&mut child).await;
                                         current_version = version;
                                         backoff = self.config.backoff_initial;
                                         failures = 0;
                                         break; // respawn the new version
                                     }
-                                    None => continue, // daemon untouched
+                                    CheckNowOutcome::Unchanged => continue, // daemon untouched
+                                    CheckNowOutcome::RestartRequested => {
+                                        self.graceful_stop(&mut child).await;
+                                        self.refresh_version_from_state(&mut current_version);
+                                        backoff = self.config.backoff_initial;
+                                        failures = 0;
+                                        break; // respawn (possibly a new version)
+                                    }
+                                    // Fall through to the shutdown handling
+                                    // below, exactly as if the signal had
+                                    // arrived outside the check.
+                                    CheckNowOutcome::Shutdown(signal) => signal,
                                 }
                             }
                             SignalEvent::Shutdown(signal) => signal,
@@ -868,18 +901,43 @@ impl Supervisor {
 
     /// The SIGUSR1 ("update now") check: one immediate on-demand check on
     /// top of the periodic schedule (which it re-arms, persisting
-    /// `state.json` exactly like a periodic check). Returns the version to
-    /// respawn when the check installed a newer one — or found a version a
-    /// concurrent updater (e.g. `sitter channel --redownload`) installed —
-    /// and `None` when the channel is already current or the check failed,
-    /// both of which are non-fatal: the caller leaves the daemon alone.
+    /// `state.json` exactly like a periodic check). Selects on
+    /// `signals.recv()` while the check runs (like
+    /// [`Supervisor::check_after_failed_start`]) so a stalled update
+    /// endpoint — the updater's download timeout is minutes long — can never
+    /// make SIGTERM/SIGHUP service management hang behind an in-flight
+    /// check; a signal cutting the check short leaves the schedule
+    /// untouched (the abandoned check re-arms nothing).
     #[cfg(unix)]
     async fn check_now(
         &self,
         current_version: &str,
+        signals: &mut Signals,
         next_check_at: &mut Instant,
-    ) -> Option<String> {
-        let outcome = self.check().await;
+    ) -> CheckNowOutcome {
+        let check = self.check();
+        tokio::pin!(check);
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut check => break outcome,
+                event = signals.recv() => match event {
+                    SignalEvent::Shutdown(signal) => {
+                        return CheckNowOutcome::Shutdown(signal);
+                    }
+                    SignalEvent::Restart => {
+                        eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
+                        return CheckNowOutcome::RestartRequested;
+                    }
+                    // A check is already in flight, which is exactly what
+                    // SIGUSR1 asks for: let it finish.
+                    SignalEvent::CheckNow => {
+                        eprintln!(
+                            "intentd-sitter: SIGUSR1 received; an update check is already running"
+                        );
+                    }
+                },
+            }
+        };
         *next_check_at = self.schedule_next_check();
         match outcome {
             Ok(UpdateOutcome::Installed { version, previous }) => {
@@ -887,7 +945,7 @@ impl Supervisor {
                     "intentd-sitter: installed intentd {version} (was {}); restarting daemon",
                     previous.as_deref().unwrap_or("none")
                 );
-                Some(version)
+                CheckNowOutcome::Respawn(version)
             }
             Ok(UpdateOutcome::AlreadyCurrent { version })
                 if version != current_version && self.paths.daemon_binary(&version).exists() =>
@@ -896,15 +954,15 @@ impl Supervisor {
                     "intentd-sitter: found concurrently installed intentd {version} \
                      (was {current_version}); restarting daemon"
                 );
-                Some(version)
+                CheckNowOutcome::Respawn(version)
             }
             Ok(UpdateOutcome::AlreadyCurrent { version }) => {
                 eprintln!("intentd-sitter: intentd {version} is already current");
-                None
+                CheckNowOutcome::Unchanged
             }
             Err(e) => {
                 eprintln!("intentd-sitter: update check failed: {e}");
-                None
+                CheckNowOutcome::Unchanged
             }
         }
     }
@@ -1013,6 +1071,24 @@ enum FailedStartCheck {
     #[cfg(unix)]
     RestartRequested,
     /// A shutdown signal arrived during the check; exit with this code.
+    Shutdown(i32),
+}
+
+/// How the SIGUSR1 on-demand update check ([`Supervisor::check_now`]) ended.
+#[cfg(unix)]
+enum CheckNowOutcome {
+    /// The check installed (or found concurrently installed) a different
+    /// version; respawn it with the backoff and failure counter reset.
+    Respawn(String),
+    /// Already current or the check failed; both non-fatal — the caller
+    /// leaves the daemon alone.
+    Unchanged,
+    /// A restart request (SIGHUP) cut the check short; the caller must
+    /// re-resolve the version from `state.json` before respawning.
+    RestartRequested,
+    /// A shutdown signal cut the check short; the caller shuts down with
+    /// this raw signal number, exactly as if it had arrived outside the
+    /// check.
     Shutdown(i32),
 }
 
