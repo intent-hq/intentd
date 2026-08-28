@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.13] - 2026-08-28
+
+### 🐛 Bug Fixes
+
+- Retry durable wakes and bound reverse requests ([#1514](https://github.com/intent-hq/intentd/pull/1514))
+
+
 ## [0.8.12] - 2026-08-28
 
 ### 🚀 Features
