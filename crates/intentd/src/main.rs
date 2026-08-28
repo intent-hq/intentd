@@ -1830,8 +1830,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         let services = services.clone();
         tokio::spawn(async move { services.start_enabled_mcp_servers().await })
     };
-    let watcher_init_task =
-        spawn_watcher_registry_init(bus.clone(), api.clone(), Arc::clone(&git_status_refresher));
+    // Watch-health handle created BEFORE the backgrounded registry start so
+    // DaemonControl can hold it now; it snapshots `None` (fileWatch absent
+    // from system.status) until the registry attaches the shared hub.
+    let watch_health = intent_services::WatchHealth::default();
+    let watcher_init_task = spawn_watcher_registry_init(
+        bus.clone(),
+        api.clone(),
+        Arc::clone(&git_status_refresher),
+        watch_health.clone(),
+    );
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
@@ -1974,6 +1982,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         child_usage,
         route_info,
         workspaces_disk,
+        watch_health,
         legacy_import_store,
         legacy_import_assets_root: assets_root,
         legacy_import_lock: legacy_import_lock.clone(),
@@ -2293,6 +2302,9 @@ struct DaemonControl {
     /// Latest workspaces-root disk sample (available/total bytes) from the
     /// background sampler, so `status()` never calls `statfs(2)` inline.
     workspaces_disk: Arc<WorkspacesDiskUsage>,
+    /// Watch-coverage handle for `system.status` (intent-hq/intent#3708);
+    /// snapshots `None` until the backgrounded watcher registry attaches.
+    watch_health: intent_services::WatchHealth,
     /// Live store and asset destination shared with Services for legacy import.
     legacy_import_store: Store,
     legacy_import_assets_root: PathBuf,
@@ -3024,6 +3036,17 @@ impl SystemControl for DaemonControl {
             queued_spawns: budget.map(|(_, _, queued)| queued),
             workspaces_disk_available_bytes: workspaces_disk.map(|(avail, _)| avail),
             workspaces_disk_total_bytes: workspaces_disk.map(|(_, total)| total),
+            // Snapshot cost is O(watched roots) under one in-process mutex —
+            // no filesystem or OS calls — and `None` (field absent) until the
+            // backgrounded watcher registry has attached the hub.
+            file_watch: self
+                .watch_health
+                .snapshot()
+                .map(|s| intent_transport::FileWatchStatus {
+                    active_streams: s.active_streams,
+                    total_roots: s.total_roots,
+                    failed_roots: s.failed_roots,
+                }),
         }
     }
 
@@ -4079,6 +4102,7 @@ fn spawn_watcher_registry_init(
     bus: EventBus,
     api: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
+    watch_health: intent_services::WatchHealth,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // `block_in_place`, not a bare `spawn`: the registrations inside are
@@ -4103,7 +4127,7 @@ fn spawn_watcher_registry_init(
                     // exercise worker starvation at all.
                     std::thread::sleep(delay);
                 }
-                WatcherRegistry::start(bus, api, refresher).await
+                WatcherRegistry::start_with_health(bus, api, refresher, &watch_health).await
             })
         });
         tracing::info!("watcher registry ready");

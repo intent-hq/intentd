@@ -176,7 +176,8 @@ pub use agent_session::SuspendOverlapQuery;
 // (they now take the crate-private shared-stream hub), so only the registry and
 // the bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry,
+    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatchHealth,
+    WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;

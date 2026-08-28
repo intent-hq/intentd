@@ -22,6 +22,7 @@ pub(crate) use filter::{
 };
 pub use git_status_refresher::GitStatusRefresher;
 pub use registry::WatcherRegistry;
+pub use shared_watch::{WatchHealth, WatchHealthSnapshot};
 
 /// Serializes every test that starts a real filesystem watcher (the
 /// `notify`-backed `RootWatch` / `FileWatcher` / `ConfigWatcher` probes across

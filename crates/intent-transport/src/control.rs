@@ -122,6 +122,26 @@ pub struct SystemStatus {
     /// Total bytes of the volume containing the workspaces root. `None`
     /// alongside `workspaces_disk_available_bytes`.
     pub workspaces_disk_total_bytes: Option<u64>,
+    /// File-watch coverage snapshot (intent-hq/intent#3708): `None` until the
+    /// backgrounded watcher registry has started (and again after it is torn
+    /// down), so the whole `fileWatch` object is presence-detected on the
+    /// wire — absent when `None`, never null.
+    pub file_watch: Option<FileWatchStatus>,
+}
+
+/// Live file-watch coverage for `system.status` (intent-hq/intent#3708):
+/// whether the roots the daemon *wants* watched are actually registered with
+/// the OS. `failed_roots > 0` means lost coverage — file events under those
+/// roots are silently missed until a retry recovers them (e.g. inotify
+/// instance exhaustion, `fseventsd` load).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileWatchStatus {
+    /// Live shared OS watch streams (one `notify` watcher each).
+    pub active_streams: usize,
+    /// Watch roots currently requested, whatever their registration state.
+    pub total_roots: usize,
+    /// Roots whose OS registration failed; 0 when coverage is healthy.
+    pub failed_roots: usize,
 }
 
 /// A `(username, password)` pair resolved for `system.gitCredential`.
@@ -292,6 +312,16 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     }
     if let Some(total) = status.workspaces_disk_total_bytes {
         obj.insert("workspacesDiskTotalBytes".into(), total.into());
+    }
+    if let Some(fw) = &status.file_watch {
+        obj.insert(
+            "fileWatch".into(),
+            json!({
+                "activeStreams": fw.active_streams,
+                "totalRoots": fw.total_roots,
+                "failedRoots": fw.failed_roots,
+            }),
+        );
     }
     v
 }

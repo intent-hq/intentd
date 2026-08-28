@@ -49,7 +49,7 @@ use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
 use super::git_metadata_watcher::{GitCommonDirWatches, GitMetadataWatcher};
 use super::git_status_refresher::GitStatusRefresher;
-use super::shared_watch::SharedWatchHub;
+use super::shared_watch::{SharedWatchHub, WatchHealth};
 use super::skills_watcher::SkillsWatcher;
 use super::specialists_watcher::SpecialistsWatcher;
 use super::watcher::FileWatcher;
@@ -100,7 +100,21 @@ impl WatcherRegistry {
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
     ) -> Self {
-        Self::start_with_backstop(bus, services, refresher, SETUP_COMPLETION_BACKSTOP).await
+        Self::start_with_health(bus, services, refresher, &WatchHealth::default()).await
+    }
+
+    /// [`Self::start`] that additionally attaches `health` to the shared hub,
+    /// so `system.status` can render live watch coverage
+    /// (intent-hq/intent#3708). The composition root creates the handle before
+    /// this backgrounded start runs; until attachment the handle snapshots
+    /// `None` (rendered as an absent field).
+    pub async fn start_with_health(
+        bus: EventBus,
+        services: Arc<dyn WorkspaceApi>,
+        refresher: Arc<GitStatusRefresher>,
+        health: &WatchHealth,
+    ) -> Self {
+        Self::start_with_backstop(bus, services, refresher, health, SETUP_COMPLETION_BACKSTOP).await
     }
 
     /// [`Self::start`] with an explicit setup-completion backstop, so tests
@@ -109,6 +123,7 @@ impl WatcherRegistry {
         bus: EventBus,
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
+        health: &WatchHealth,
         setup_backstop: Duration,
     ) -> Self {
         // Subscribe BEFORE taking the workspace snapshot: subscription
@@ -148,6 +163,11 @@ impl WatcherRegistry {
         // directories the workspace roots live under, not the workspace count
         // times the number of watch roots each one used to register.
         let hub = SharedWatchHub::new();
+        health.attach(&hub);
+        tracing::info!(
+            os_watch_limits = %super::shared_watch::os_watch_limits(),
+            "watcher registry starting"
+        );
         // Shared common-dir watches for linked-worktree workspaces: one watch
         // per repo, fanned out to every worktree workspace (monorepo#1663).
         let git_common = GitCommonDirWatches::new();
@@ -747,7 +767,14 @@ mod tests {
             api.clone(),
             Arc::new(crate::git_status_cache::GitStatusCache::new()),
         ));
-        WatcherRegistry::start_with_backstop(bus.clone(), api, refresher, backstop).await
+        WatcherRegistry::start_with_backstop(
+            bus.clone(),
+            api,
+            refresher,
+            &WatchHealth::default(),
+            backstop,
+        )
+        .await
     }
 
     /// Wait until `root` is watched-and-established (`want = true`) or absent

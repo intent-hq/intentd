@@ -164,6 +164,80 @@ pub(super) struct SharedWatchHub {
     factory: Arc<WatcherFactory>,
 }
 
+/// Point-in-time aggregate of the hub's watch coverage, rendered into
+/// `system.status` (intent-hq/intent#3708). `failed_roots > 0` means lost
+/// coverage: those roots emit no file events until a retry succeeds — the
+/// rejoin retry in [`SharedWatchHub::subscribe`] or the registrar's
+/// creation-retry backoff — so surfacing the count is what turns the WARN-only
+/// degradation into something a client can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchHealthSnapshot {
+    /// Live shared streams (groups) — one OS watcher each.
+    pub active_streams: usize,
+    /// Roots currently requested across every group, whatever their state.
+    pub total_roots: usize,
+    /// Roots whose registration settled as FAILED (watcher creation failure,
+    /// `ENOSPC`, a vanished directory). A still-pending registration is not a
+    /// failure.
+    pub failed_roots: usize,
+}
+
+/// Cloneable handle the composition root polls for [`WatchHealthSnapshot`]s.
+///
+/// Created before the watcher registry exists — registry init is backgrounded
+/// so it cannot delay the UDS bind (monorepo#1581) — and attached to the hub
+/// when the registry starts. `snapshot()` is therefore `None` (rendered as an
+/// absent `fileWatch` field) until then, and again once the registry — and
+/// with it the hub — is dropped at shutdown. Holds only a `Weak`, so the
+/// handle never extends the hub's lifetime.
+#[derive(Clone, Default)]
+pub struct WatchHealth {
+    hub: Arc<Mutex<std::sync::Weak<SharedWatchHub>>>,
+}
+
+impl WatchHealth {
+    /// Point this handle at `hub`; called once by the registry at start.
+    pub(super) fn attach(&self, hub: &Arc<SharedWatchHub>) {
+        let mut slot = match self.hub.lock() {
+            Ok(slot) => slot,
+            Err(e) => e.into_inner(),
+        };
+        *slot = Arc::downgrade(hub);
+    }
+
+    /// Aggregate the hub's current coverage; `None` while unattached (the
+    /// registry has not started yet) or after the hub is gone.
+    #[must_use]
+    pub fn snapshot(&self) -> Option<WatchHealthSnapshot> {
+        let hub = {
+            let slot = match self.hub.lock() {
+                Ok(slot) => slot,
+                Err(e) => e.into_inner(),
+            };
+            slot.upgrade()?
+        };
+        let state = match hub.state.lock() {
+            Ok(state) => state,
+            Err(e) => e.into_inner(),
+        };
+        let mut total_roots = 0;
+        let mut failed_roots = 0;
+        for group in state.groups.values() {
+            for root in group.roots.values() {
+                total_roots += 1;
+                if root.registration.failed() {
+                    failed_roots += 1;
+                }
+            }
+        }
+        Some(WatchHealthSnapshot {
+            active_streams: state.groups.len(),
+            total_roots,
+            failed_roots,
+        })
+    }
+}
+
 /// A live subscription. Dropping it removes the sink and, when the root has no
 /// subscribers left, unwatches it (and retires the group once it is empty).
 pub(super) struct SubHandle {
@@ -274,9 +348,20 @@ fn group_key(root: &Path) -> PathBuf {
     }
 }
 
+/// E2E seam: when set (to anything but `0`), every watcher creation fails, so
+/// an out-of-process test can drive the daemon into the degraded state that
+/// `system.status` must surface. Read per creation attempt, not once at
+/// startup, purely for simplicity — production never sets it.
+pub(super) const TEST_FAIL_WATCHER_CREATION_ENV: &str = "INTENTD_TEST_FAIL_WATCHER_CREATION";
+
 impl SharedWatchHub {
     pub(super) fn new() -> Arc<Self> {
         Self::with_factory(Arc::new(|callback: EventCallback| {
+            if std::env::var(TEST_FAIL_WATCHER_CREATION_ENV).is_ok_and(|v| v != "0") {
+                return Err(notify::Error::generic(
+                    "watcher creation failed by test seam",
+                ));
+            }
             notify::recommended_watcher(callback).map(|w| Box::new(w) as Box<dyn Watcher + Send>)
         }))
     }
@@ -536,6 +621,7 @@ fn build_watcher_serving(
                     group = %group.display(),
                     error = %e,
                     retry_in = ?backoff,
+                    os_watch_limits = %os_watch_limits(),
                     "shared watcher creation failed; roots in this group are unwatched until a retry succeeds"
                 );
             }
@@ -568,9 +654,38 @@ fn register(watcher: &mut dyn Watcher, root: &Path, registration: &Registration)
     match watcher.watch(root, RecursiveMode::Recursive) {
         Ok(()) => registration.settle(true),
         Err(e) => {
-            tracing::warn!(root = %root.display(), error = %e, "shared watch registration failed");
+            tracing::warn!(
+                root = %root.display(),
+                error = %e,
+                os_watch_limits = %os_watch_limits(),
+                "shared watch registration failed"
+            );
             registration.settle(false);
         }
+    }
+}
+
+/// Human-readable OS watch limits for the failure WARNs, so an operator can
+/// judge at a glance whether a failure is cap exhaustion. On Linux the live
+/// inotify sysctls (`max_user_instances` / `max_user_watches`); elsewhere
+/// there is no equivalent user-tunable cap to read, and unreadable procfs
+/// values degrade to `?`.
+pub(super) fn os_watch_limits() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let read = |name: &str| {
+            std::fs::read_to_string(format!("/proc/sys/fs/inotify/{name}"))
+                .map_or_else(|_| "?".to_string(), |v| v.trim().to_string())
+        };
+        format!(
+            "inotify max_user_instances={} max_user_watches={}",
+            read("max_user_instances"),
+            read("max_user_watches")
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "n/a".to_string()
     }
 }
 
@@ -1182,5 +1297,111 @@ mod tests {
             }
         }
         panic!("recovered watch never delivered events");
+    }
+
+    /// The health handle tracks the hub through its lifecycle: `None` before
+    /// attachment, healthy counts while watches are live, failed-root counts
+    /// when a registration settles as failed, and `None` again once the hub
+    /// is dropped (the `Weak` must not extend the hub's lifetime).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn watch_health_snapshot_tracks_roots_failures_and_hub_lifetime() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parent = TempDir::new("health");
+        let a = parent.path.join("ws-a");
+        let b = parent.path.join("ws-b");
+        std::fs::create_dir_all(&a).expect("mk ws-a");
+        std::fs::create_dir_all(&b).expect("mk ws-b");
+
+        let health = WatchHealth::default();
+        assert!(
+            health.snapshot().is_none(),
+            "unattached handle must report None, not a fake healthy zero"
+        );
+
+        let hub = SharedWatchHub::new();
+        health.attach(&hub);
+        let (sub_a, _rx_a, canonical_a) = hub.subscribe(&a);
+        let (sub_b, _rx_b, _) = hub.subscribe(&b);
+        hub.wait_all_established(2, LIVENESS).await;
+
+        let snap = health.snapshot().expect("attached handle must snapshot");
+        assert_eq!(snap.total_roots, 2);
+        assert_eq!(snap.failed_roots, 0, "established roots are not failures");
+        assert_eq!(snap.active_streams, hub.stream_count());
+
+        // A settled failure surfaces as a failed root; the other root's
+        // health is unaffected.
+        {
+            let state = hub.state.lock().unwrap();
+            let entry = state
+                .groups
+                .values()
+                .find_map(|g| g.roots.get(&canonical_a))
+                .expect("root a must be tracked");
+            entry.registration.settle(false);
+        }
+        let snap = health.snapshot().expect("snapshot after failure");
+        assert_eq!(snap.total_roots, 2);
+        assert_eq!(snap.failed_roots, 1);
+
+        drop((sub_a, sub_b));
+        drop(hub);
+        assert!(
+            health.snapshot().is_none(),
+            "a dropped hub must read as None, not a stale snapshot"
+        );
+    }
+
+    /// Watcher-creation failure shows up in the snapshot as failed roots (the
+    /// registrar settles incoming registrations as failed while no watcher
+    /// exists), and recovery drains the count back to zero.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn watch_health_reflects_creation_failure_and_recovery() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parent = TempDir::new("health-create-fail");
+        let root = parent.path.join("ws");
+        std::fs::create_dir_all(&root).expect("mk ws");
+
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail_in_factory = Arc::clone(&fail);
+        let hub = SharedWatchHub::with_factory(Arc::new(move |callback: EventCallback| {
+            if fail_in_factory.load(Ordering::SeqCst) {
+                Err(notify::Error::generic("injected creation failure"))
+            } else {
+                notify::recommended_watcher(callback)
+                    .map(|w| Box::new(w) as Box<dyn Watcher + Send>)
+            }
+        }));
+        let health = WatchHealth::default();
+        health.attach(&hub);
+
+        let (sub, _rx, _) = hub.subscribe(&root);
+        sub.wait_established(LIVENESS).await;
+        let snap = health.snapshot().expect("snapshot while degraded");
+        assert_eq!(snap.total_roots, 1);
+        assert_eq!(
+            snap.failed_roots, 1,
+            "creation failure must surface as a failed root"
+        );
+
+        fail.store(false, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            let snap = health.snapshot().expect("snapshot during recovery");
+            if snap.failed_roots == 0 && snap.total_roots == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "failed-root count must drain once the factory recovers, still {snap:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }
