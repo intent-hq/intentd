@@ -14566,6 +14566,137 @@ mod dequeue_wait_tests {
     }
 }
 
+/// A2A sender header on the delivery paths (monorepo#1015): the runtime
+/// `send_message` front door prepends the header for agent-origin sends
+/// (daemon-stamped `fromAgentId` in the metadata), user sends stay
+/// byte-identical, and a queued agent-origin entry drains with the header on
+/// top and the dequeue-wait note appended BELOW (the header rides the entry
+/// content from enqueue time; the wait note is appended at drain).
+mod sender_header_tests {
+    use super::dequeue_wait_tests::{iso_secs_ago, queued_msg};
+    use super::*;
+    use crate::harness::v1::A2A_SENDER_NOTE_PREFIX;
+
+    #[tokio::test]
+    async fn agent_origin_send_persists_header() {
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-a2a-a"), AgentId::from("a-a2a-a"));
+        seed_agent(&mgr, &ws, &id).await;
+        let _agent = track_mock_agent(&mgr, &id, false);
+
+        let options = super::super::TurnOptions {
+            message_metadata: Some(json!({
+                "fromAgentId": "agent-sender",
+                "fromAgentName": "Coordinator",
+            })),
+            ..super::super::TurnOptions::default()
+        };
+        let result = mgr
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "do the thing".to_string(),
+                None,
+                options,
+            )
+            .await
+            .expect("send");
+        assert_eq!(result["queued"], json!(false), "delivered immediately");
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let row = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("user row persisted");
+        let text = row.content[0]["text"].as_str().unwrap();
+        assert_eq!(
+            text, "[MESSAGE FROM AGENT Coordinator (agent-sender)]\n\ndo the thing",
+            "agent-origin content carries the sender header"
+        );
+        // Metadata is unchanged — the attribution fields stay authoritative.
+        let md = row.metadata.as_ref().expect("row metadata");
+        assert_eq!(md["fromAgentId"], json!("agent-sender"));
+    }
+
+    #[tokio::test]
+    async fn user_send_stays_byte_identical() {
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-a2a-b"), AgentId::from("a-a2a-b"));
+        seed_agent(&mgr, &ws, &id).await;
+        let _agent = track_mock_agent(&mgr, &id, false);
+
+        let result = mgr
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "plain user message".to_string(),
+                None,
+                super::super::TurnOptions::default(),
+            )
+            .await
+            .expect("send");
+        assert_eq!(result["queued"], json!(false));
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let row = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("user row persisted");
+        assert_eq!(
+            row.content[0]["text"].as_str().unwrap(),
+            "plain user message",
+            "no fromAgentId → no header"
+        );
+    }
+
+    /// A queued agent-origin entry: the header is already on the content
+    /// (prepended at the send front door before the enqueue) and the
+    /// drain-time dequeue-wait note appends BELOW it — header first, wait
+    /// note last.
+    #[test]
+    fn queued_entry_drains_with_header_above_wait_note() {
+        let mut content = "queued work".to_string();
+        crate::agent_ops::annotate_sender_attribution(
+            &mut content,
+            Some(&json!({ "fromAgentId": "agent-sender", "fromAgentName": "Coordinator" })),
+        );
+        let mut msg = queued_msg(&content, &iso_secs_ago(10), false);
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert!(
+            msg.content.starts_with(A2A_SENDER_NOTE_PREFIX),
+            "sender header stays on top: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("queued work"),
+            "original content preserved: {}",
+            msg.content
+        );
+        let header_pos = msg.content.find(A2A_SENDER_NOTE_PREFIX).unwrap();
+        let wait_pos = msg
+            .content
+            .find(super::super::DEQUEUE_WAIT_NOTE_PREFIX)
+            .expect("dequeue-wait note appended");
+        assert!(
+            header_pos < wait_pos,
+            "wait note appends below the header: {}",
+            msg.content
+        );
+    }
+}
+
 /// Batch-flush grouping stamp: [`super::stamp_flush_batch_id`] mints ONE
 /// fresh `queueInfo.batchId` per multi-entry flush and stamps it on every
 /// drained entry — including sub-threshold-wait entries that carry no other

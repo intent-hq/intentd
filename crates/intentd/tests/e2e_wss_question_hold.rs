@@ -664,9 +664,9 @@ where
     panic!("agent {agent_id} never reached idle status");
 }
 
-/// 0-based index of the user row whose first text block starts with `text`
+/// 0-based index of the user row whose first text block contains `text`
 /// (held messages drain from the queue, so their rows may carry the appended
-/// dequeue-wait system note).
+/// dequeue-wait system note — and A2A entries the prepended sender header).
 fn user_row_index(messages: &[Value], text: &str) -> Option<usize> {
     messages.iter().position(|m| {
         m["role"] == "user"
@@ -675,9 +675,20 @@ fn user_row_index(messages: &[Value], text: &str) -> Option<usize> {
                 .into_iter()
                 .flatten()
                 .any(|b| {
-                    b["type"] == "text" && b["text"].as_str().is_some_and(|t| t.starts_with(text))
+                    b["type"] == "text" && b["text"].as_str().is_some_and(|t| t.contains(text))
                 })
     })
+}
+
+/// The queue-entry/wire `content` of a held A2A send: the sender header
+/// (monorepo#1015) is prepended at the send front door, above the caller's
+/// text.
+fn assert_a2a_content(actual: &Value, expected_body: &str, ctx: &str) {
+    let text = actual.as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("[MESSAGE FROM AGENT") && text.ends_with(&format!("\n\n{expected_body}")),
+        "{ctx}: expected sender header + `{expected_body}`, got: {text}"
+    );
 }
 
 /// 0-based index of the assistant row whose text contains `text`.
@@ -868,17 +879,19 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     }
     assert!(sender_done, "urgent sender turn completed");
     let snapshot = held_snapshot.expect("agent:queue:updated carried the 2-entry held snapshot");
-    assert_eq!(
-        snapshot[0]["content"], HELD_URGENT,
-        "interrupt entry ordered FIRST: {snapshot:?}"
+    assert_a2a_content(
+        &snapshot[0]["content"],
+        HELD_URGENT,
+        "interrupt entry ordered FIRST",
     );
     assert_eq!(
         snapshot[0]["interruptPriority"], true,
         "interrupt marker on the wire: {snapshot:?}"
     );
-    assert_eq!(
-        snapshot[1]["content"], HELD_NORMAL,
-        "normal entry behind the interrupt: {snapshot:?}"
+    assert_a2a_content(
+        &snapshot[1]["content"],
+        HELD_NORMAL,
+        "normal entry behind the interrupt",
     );
     assert!(
         snapshot[1].get("interruptPriority").is_none(),
@@ -909,8 +922,8 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
     let queue = q["queue"].as_array().expect("queue array");
     assert_eq!(queue.len(), 2, "both held entries parked: {queue:?}");
-    assert_eq!(queue[0]["content"], HELD_URGENT);
-    assert_eq!(queue[1]["content"], HELD_NORMAL);
+    assert_a2a_content(&queue[0]["content"], HELD_URGENT, "getQueue[0]");
+    assert_a2a_content(&queue[1]["content"], HELD_NORMAL, "getQueue[1]");
     let conv = wss_rpc(
         &mut rpc,
         "agent.getConversation",
@@ -1232,7 +1245,7 @@ async fn question_hold_released_by_dismiss_questions_over_wss() {
     assert!(
         user_rows[2]["contentBlocks"][0]["text"]
             .as_str()
-            .is_some_and(|t| t.starts_with(HELD_DISMISS)),
+            .is_some_and(|t| t.contains(HELD_DISMISS)),
         "third user row is the drained held message: {user_rows:?}"
     );
 

@@ -5194,7 +5194,7 @@ impl AgentManager {
         self: &Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
-        content: String,
+        mut content: String,
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
@@ -5210,6 +5210,15 @@ impl AgentManager {
                 )));
             }
         }
+        // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
+        // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
+        // below (quarantine/archived/hold parks, busy enqueue, direct
+        // persist) so immediate deliveries and queued entries alike carry it
+        // and drain/flush/redrive never re-annotate (exact-header guard).
+        crate::agent_ops::annotate_sender_attribution(
+            &mut content,
+            options.message_metadata.as_ref(),
+        );
         // Resolve the id before any queue gate so every delivery path carries
         // the same durable identity. Internal completion wakes supply a stable
         // id; restart retries then adopt the existing queue entry or transcript

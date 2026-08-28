@@ -1489,7 +1489,9 @@ async fn dispatch(
             let priority = opt_str(params, "priority");
             // Same opaque per-message payload as `agent.sendMessage` below
             // (PROTOCOL §5.5) — persisted on the assignee's user row.
-            let message_metadata = opt_value(params, "messageMetadata");
+            // Attribution fields are reserved (daemon-stamped, agent callers
+            // only) and stripped at this user-origin front door.
+            let message_metadata = strip_sender_attribution(opt_value(params, "messageMetadata"));
             let result = api
                 .agent_send_to_task(ws, task_note_id, message, priority, message_metadata)
                 .await
@@ -1514,9 +1516,11 @@ async fn dispatch(
             let context_references = opt_value(params, "contextReferences");
             // Opaque per-message payload (PROTOCOL §5.5): the FE attaches
             // arbitrary JSON to distinguish daemon-initiated turns (e.g.
-            // `{ source: "system" }`). Passed through unmodified and persisted
-            // on the user message row via the store's metadata-aware append.
-            let message_metadata = opt_value(params, "messageMetadata");
+            // `{ source: "system" }`). Persisted on the user message row via
+            // the store's metadata-aware append — passed through unmodified
+            // except the reserved attribution fields, which are stripped at
+            // this user-origin front door.
+            let message_metadata = strip_sender_attribution(opt_value(params, "messageMetadata"));
             // `userAppMessageId` (PROTOCOL §5.5): the FE's client-minted
             // logical identity for its optimistic user message. Folded into
             // the row `metadata` here so it persists without a schema change,
@@ -1914,7 +1918,9 @@ async fn dispatch(
                 caller_agent_id: opt_nonempty_str(params, "callerAgentId")
                     .map(|s| AgentId::from(s.as_str())),
                 delegation_depth: params.get("delegationDepth").and_then(Value::as_i64),
-                message_metadata: opt_value(params, "messageMetadata"),
+                // Reserved attribution fields stripped: same user-origin
+                // front door rule as `agent.sendMessage` / `agent.sendToTask`.
+                message_metadata: strip_sender_attribution(opt_value(params, "messageMetadata")),
                 create,
             };
             let result = api
@@ -3798,6 +3804,26 @@ fn opt_value(params: &Map<String, Value>, name: &str) -> Option<Value> {
     match params.get(name) {
         None | Some(Value::Null) => None,
         Some(v) => Some(v.clone()),
+    }
+}
+
+/// Strip the reserved sender-attribution fields (`fromAgentId` /
+/// `fromAgentName`, PROTOCOL §5.5) from a caller-supplied `messageMetadata`
+/// object. The RPC router is the user/FE front door: attribution is
+/// daemon-stamped by the MCP bindings for agent callers only, so a wire
+/// caller must not be able to forge an agent-origin send (the attribution
+/// gates the A2A sender header, the single-pending-message guard and
+/// `removeQueuedMessage` ownership). All other fields pass through
+/// untouched; non-object metadata cannot carry attribution and is returned
+/// as-is.
+fn strip_sender_attribution(message_metadata: Option<Value>) -> Option<Value> {
+    match message_metadata {
+        Some(Value::Object(mut obj)) => {
+            obj.remove("fromAgentId");
+            obj.remove("fromAgentName");
+            Some(Value::Object(obj))
+        }
+        other => other,
     }
 }
 

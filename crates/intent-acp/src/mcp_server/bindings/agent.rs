@@ -1070,7 +1070,7 @@ async fn wake_or_create(
             caller_name = Some(caller_lite.name);
         }
     }
-    // Sender attribution on the delivered context message (monorepo#1015):
+    // Sender attribution on the delivered context message (intent-hq/intent#3721, monorepo#1015):
     // same daemon-stamped attribution semantics as `send`, reusing the
     // depth-guard lookup's name (no second `agent_get` round-trip).
     let message_metadata =

@@ -153,6 +153,10 @@ pub(crate) trait Harness: Send + Sync {
     fn stale_redrive_note(&self, report_timestamp: &str) -> String;
     /// `[SYSTEM NOTE]` appended to a drained queue entry (monorepo#2353).
     fn dequeue_wait_note(&self, queued_at: &str, waited: &str) -> String;
+    /// `[MESSAGE FROM AGENT {name} ({agent_id})]` sender-attribution header
+    /// prepended to agent-origin (A2A) sends; an absent `name` renders
+    /// `[MESSAGE FROM AGENT ({agent_id})]`.
+    fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String;
     /// Human-readable wait for [`Harness::dequeue_wait_note`]: `Ns` under a
     /// minute, then `Nm Ss`, then `Nh Mm`; negative waits clamp to `0s`.
     fn wait_duration(&self, secs: i64) -> String;

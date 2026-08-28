@@ -11314,8 +11314,10 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
 /// messages agent B through the `ws.agent.send` host binding, the delivered
 /// user row on B's transcript must carry
 /// `metadata == { type: "agent_message", fromAgentId, fromAgentName }` so
-/// clients can render who sent it. A human `agent.sendMessage` (FE/RPC front
-/// door, no caller agent) must stay untagged.
+/// clients can render who sent it, and its content must start with the
+/// daemon-prepended A2A sender header (monorepo#3721). A human
+/// `agent.sendMessage` (FE/RPC front door, no caller agent) must stay
+/// untagged AND header-free (byte-identical content).
 #[tokio::test]
 async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
     let Some(script) = gate("WSS agent-to-agent sender metadata E2E") else {
@@ -11445,9 +11447,17 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
             m["role"] == "user"
                 && m["contentBlocks"][0]["text"]
                     .as_str()
-                    .is_some_and(|t| t.starts_with("cross-agent hello"))
+                    .is_some_and(|t| t.contains("cross-agent hello"))
         })
         .expect("cross-agent user row present");
+    // The delivered content carries the A2A sender header (monorepo#1015)
+    // prepended at the send front door, above the caller's text.
+    let text = tagged["contentBlocks"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        text,
+        format!("[MESSAGE FROM AGENT SenderA ({sender_id})]\n\ncross-agent hello"),
+        "agent-origin content carries the sender header"
+    );
     assert_eq!(
         tagged["metadata"],
         json!({
@@ -11501,6 +11511,14 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         })
         .expect("human user row present")
         .clone();
+    // FE-origin content is byte-identical to what the user sent — the A2A
+    // sender header (monorepo#3721) is gated on the daemon-stamped
+    // `fromAgentId` attribution, which human front-door sends never carry.
+    assert_eq!(
+        human_row["contentBlocks"][0]["text"],
+        json!("human follow-up"),
+        "FE-origin content must carry NO sender header: {human_row}"
+    );
     assert_ne!(
         human_row["metadata"]["type"],
         json!("agent_message"),
@@ -11708,6 +11726,8 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         "fromAgentId": sender_id,
         "fromAgentName": "SenderA",
     });
+    // Agent-origin rows carry the A2A sender header (monorepo#1015) above
+    // the caller's text, so match on `contains` rather than `starts_with`.
     let user_row = |conv: &Value, text: &str| -> Value {
         conv["messages"]
             .as_array()
@@ -11717,7 +11737,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
                 m["role"] == "user"
                     && m["contentBlocks"][0]["text"]
                         .as_str()
-                        .is_some_and(|t| t.starts_with(text))
+                        .is_some_and(|t| t.contains(text))
             })
             .unwrap_or_else(|| panic!("user row `{text}` present: {conv}"))
             .clone()
