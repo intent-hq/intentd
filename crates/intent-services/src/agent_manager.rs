@@ -5210,7 +5210,7 @@ impl AgentManager {
                 )));
             }
         }
-        // A2A sender header (monorepo#1015): the runtime front door — gated
+        // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
         // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
         // below (quarantine/archived/hold parks, busy enqueue, direct
         // persist) so immediate deliveries and queued entries alike carry it

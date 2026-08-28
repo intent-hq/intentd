@@ -1559,7 +1559,7 @@ pub(crate) fn is_interrupt_priority(priority: Option<&str>) -> bool {
     priority == Some("interrupt")
 }
 
-/// A2A sender-attribution header (monorepo#1015): prepends
+/// A2A sender-attribution header (intent-hq/intent#3721, monorepo#1015): prepends
 /// [`crate::harness::Harness::a2a_sender_note`] (+ blank line) to an
 /// agent-origin send's content when `message_metadata` is an object carrying
 /// a string `fromAgentId` — daemon-stamped by the MCP bindings, never
@@ -5531,7 +5531,7 @@ impl Services {
                 )));
             }
         }
-        // A2A sender header (monorepo#1015): the store-only front door —
+        // A2A sender header (intent-hq/intent#3721, monorepo#1015): the store-only front door —
         // mirrors the runtime `AgentManager::send_message` prepend so both
         // wirings persist identical agent-origin content. Idempotent: the
         // runtime path may already have annotated (delegate kickoff), and
@@ -10325,7 +10325,7 @@ impl Services {
                 // definition, so an active hold parks the message instead
                 // of persisting a user row that buries the pending Q&A.
                 if self.question_hold_active(&agent).await {
-                    // A2A sender header (monorepo#1015): this hold-park
+                    // A2A sender header (intent-hq/intent#3721, monorepo#1015): this hold-park
                     // bypasses `agent_send_message_op`'s prepend, so the
                     // queued entry is annotated here — the drain persist
                     // then inherits it.
@@ -11056,7 +11056,7 @@ impl Services {
                 agent_id.0
             )));
         }
-        // A2A sender header (monorepo#1015): the wake front door — the
+        // A2A sender header (intent-hq/intent#3721, monorepo#1015): the wake front door — the
         // `agent.wakeOrCreate` context message carries the daemon-stamped
         // attribution, and this path persists/enqueues directly (it never
         // routes through `send_message`/`agent_send_message_op`), so the
