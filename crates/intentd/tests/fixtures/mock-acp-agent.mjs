@@ -672,7 +672,25 @@ async function handlePrompt(id, params) {
       }
     }
   }
-  const base = active.response || behavior.response || 'Mock agent completed.';
+  let base = active.response || behavior.response || 'Mock agent completed.';
+  // Opt-in dynamic response for E2E cases where the agent-side JS must derive
+  // its final prose from the real MCP result (for example, an exact message
+  // link returned after reading a conversation).
+  if (typeof active.responseFromToolResultField === 'string') {
+    const lastResult = toolResults.at(-1)?.result;
+    const textItem = lastResult?.content?.find((item) => item?.type === 'text');
+    try {
+      const parsed = JSON.parse(textItem?.text || '');
+      const derived = parsed?.[active.responseFromToolResultField];
+      if (typeof derived !== 'string' || derived.length === 0) {
+        throw new Error(`missing string field ${active.responseFromToolResultField}`);
+      }
+      base = derived;
+    } catch (err) {
+      log(`tool-result response derivation failed: ${err.message}`);
+      return result(id, { stopReason: 'refusal' });
+    }
+  }
   // In keep-alive mode, stamp the turn count so a resumed follow-up turn is
   // distinguishable from a fresh spawn (which would report `turn=1`).
   // With echoCwd, stamp the child's working directory so e2e tests can assert

@@ -73,6 +73,10 @@ pub(crate) struct CompletionWatch {
     /// it already wakes directly. The field is kept as the persisted record
     /// of an explicit registration.
     pub wake_on_attention: bool,
+    /// Ask-only watches wait strictly for terminal completion. Attention
+    /// requests do not consume or wake this watch, and it may coexist with an
+    /// unrelated grouped watch for the same parent/child pair.
+    pub completion_only: bool,
 }
 
 /// Fan-in table for `waitMode: "after_all"` delegation groups. All children a
@@ -222,6 +226,60 @@ impl Services {
         Ok(id)
     }
 
+    /// Ask-only durable registration. A new completion-only watch is persisted
+    /// before it becomes visible to completion delivery, so a concurrent
+    /// delivery cannot delete it before a late upsert resurrects an orphan.
+    /// An existing ungrouped watch already provides an immediate completion
+    /// path and is reused without another durable write.
+    pub(crate) async fn register_completion_watch_strict_durable(
+        &self,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        parent_agent_name: String,
+        child_agent_id: AgentId,
+    ) -> Result<String> {
+        check_watch_scope(parent_workspace_id, child_workspace_id)?;
+        let _registration = self.completion_watch_registration_gate.lock().await;
+        if let Some(existing) = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .find(|watch| {
+                watch.parent_agent_id == parent_agent_id
+                    && watch.child_agent_id == child_agent_id
+                    && watch.group_id.is_none()
+            })
+        {
+            return Ok(existing.id.clone());
+        }
+        let watch = CompletionWatch {
+            id: Uuid::new_v4().to_string(),
+            parent_workspace_id: parent_workspace_id.clone(),
+            child_workspace_id: child_workspace_id.clone(),
+            parent_agent_id,
+            parent_agent_name,
+            child_agent_id,
+            group_id: None,
+            created_at: now_iso(),
+            report_delivered: false,
+            wake_on_attention: false,
+            completion_only: true,
+        };
+        let id = watch.id.clone();
+        self.store
+            .upsert_completion_watch(&completion_watch_to_persisted(&watch))
+            .await?;
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .push(watch);
+        Ok(id)
+    }
+
     /// Explicit `agent.watch` registration (monorepo#1229): an ungrouped
     /// watch with an AWAITED persist (the registration is the caller's
     /// durable contract). Attention wakes reach every active watch
@@ -327,6 +385,7 @@ impl Services {
                     created_at: now_iso(),
                     report_delivered: false,
                     wake_on_attention,
+                    completion_only: false,
                 };
                 guard.subscriptions.push(watch.clone());
                 watch
@@ -1318,7 +1377,8 @@ impl Services {
                     LoadOutcome::AlreadyInMemory
                 } else if guard.subscriptions.iter().any(|s| {
                     s.parent_agent_id == p.parent_agent_id && s.child_agent_id == p.child_agent_id
-                }) {
+                }) && !p.completion_only
+                {
                     // Pair uniqueness: a stronger (grouped) watch for the
                     // same (parent, child) already loaded — this row is a
                     // pre-invariant duplicate.
@@ -2140,6 +2200,7 @@ fn completion_watch_to_persisted(watch: &CompletionWatch) -> PersistedCompletion
         group_id: watch.group_id.clone(),
         report_delivered: watch.report_delivered,
         wake_on_attention: watch.wake_on_attention,
+        completion_only: watch.completion_only,
         created_at: watch.created_at.clone(),
     }
 }
@@ -2161,6 +2222,7 @@ fn persisted_to_completion_watch(p: &PersistedCompletionWatch) -> CompletionWatc
         // those legacy rows.
         report_delivered: false,
         wake_on_attention: p.wake_on_attention,
+        completion_only: p.completion_only,
     }
 }
 
