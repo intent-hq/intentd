@@ -140,6 +140,15 @@ async fn start() -> Server {
 /// Build + start a WSS listener with custom `/tunnel` limits (tests shrink
 /// the timeouts to make idle/connect/forward teardown observable).
 async fn start_with(limits: TunnelLimits) -> Server {
+    start_with_heartbeat(limits, None).await
+}
+
+/// [`start_with`] plus an optional `(heartbeat_interval, heartbeat_timeout)`
+/// override for heartbeat-focused tests.
+async fn start_with_heartbeat(
+    limits: TunnelLimits,
+    heartbeat: Option<(Duration, Duration)>,
+) -> Server {
     let dir = common::test_tempdir("intentd-wss-tunnel-");
     let store = Store::open(&dir.path().join("intentd.db"))
         .await
@@ -155,12 +164,16 @@ async fn start_with(limits: TunnelLimits) -> Server {
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
-    let opts = WsOptions {
+    let mut opts = WsOptions {
         base_port: 0,
         bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         tunnel_limits: limits,
         ..WsOptions::default()
     };
+    if let Some((interval, timeout)) = heartbeat {
+        opts.heartbeat_interval = interval;
+        opts.heartbeat_timeout = timeout;
+    }
     let ws =
         WsApiServer::new(api.clone(), bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
@@ -905,4 +918,38 @@ async fn tunnel_connections_counted_in_health_and_stopped() {
     .await;
     deadline.expect("tunnel connection closed by stop()");
     assert_eq!(srv.ws.client_count(), 0);
+}
+
+/// Regression guard for intent-hq/intent#3712 on the `/tunnel` path
+/// (companion to `heartbeat_keeps_responsive_client_alive` in
+/// `wss_integration.rs`, which covers `/ws`): a tunnel client that keeps
+/// polling its stream (auto-ponging every server ping) must SURVIVE many
+/// heartbeat interval+timeout cycles. `run_tunnel_connection` has its own
+/// pong-bookkeeping arm, so a mixed-clock regression there (wall-clock stamp
+/// vs monotonic reaper, or vice versa) would reap this responsive client
+/// within one timeout window without ever failing the `/ws` test.
+#[tokio::test]
+async fn heartbeat_keeps_responsive_tunnel_client_alive() {
+    let srv = start_with_heartbeat(
+        TunnelLimits::default(),
+        Some((Duration::from_millis(100), Duration::from_millis(200))),
+    )
+    .await;
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    // Keep the stream polled so tungstenite answers each Ping with a Pong.
+    let poller = tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+    let deadline = Instant::now() + common::test_timeout(Duration::from_secs(10));
+    while srv.ws.client_count() != 1 {
+        assert!(Instant::now() < deadline, "tunnel client never registered");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Outlive many timeout windows (2s >> 200ms timeout, >= 20 ping cycles).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        srv.ws.client_count(),
+        1,
+        "responsive tunnel client must survive heartbeat cycles"
+    );
+    poller.abort();
+    srv.ws.stop().await;
 }

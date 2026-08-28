@@ -176,7 +176,8 @@ pub use agent_session::SuspendOverlapQuery;
 // (they now take the crate-private shared-stream hub), so only the registry and
 // the bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry,
+    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatchHealth,
+    WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -317,6 +318,9 @@ pub struct Services {
     /// the `after_all` group fan-in (AS-4) consume it later. Shared across
     /// clones like the other in-memory registries.
     agent_subscriptions: Arc<Mutex<agent_subscriptions::SubscriptionRegistry>>,
+    /// Serializes strict completion-only ask registration so a watch is
+    /// durably persisted before it becomes visible to completion delivery.
+    completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
     /// `agent_id → (last error text, consecutive count)`. Incremented by the
     /// terminal-failure handler when the same error text repeats back-to-back,
@@ -896,6 +900,7 @@ impl Services {
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
+            completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
@@ -23454,6 +23459,46 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.app_agents_wait_op(workspace_id, caller_agent_id, agent_ids, wait_mode)
                 .await
+        })
+    }
+
+    fn app_agents_send(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.app_agents_send_op(
+                workspace_id,
+                caller_agent_id,
+                target_agent_id,
+                message,
+                priority,
+            )
+            .await
+        })
+    }
+
+    fn app_agents_ask(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.app_agents_ask_op(
+                workspace_id,
+                caller_agent_id,
+                target_agent_id,
+                message,
+                priority,
+            )
+            .await
         })
     }
 

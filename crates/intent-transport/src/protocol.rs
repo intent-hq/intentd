@@ -287,12 +287,21 @@
 //! same liveness-aware max, additionally serving the raw
 //! `lastStreamActivityAt?` (presence-detected, omitted when no turn is
 //! streaming). No method-catalog change — 297 router methods, 336 total.
+//! Version 8.6 adds the `system.requestUpdate` fast-path method (additive;
+//! §5.7): no params, served on BOTH transports (unlike `system.shutdown` —
+//! a remote client is exactly who needs to trigger an update); the daemon
+//! locates the supervising sitter's pidfile (`<data_dir>/sitter/sitter.pid`),
+//! verifies the pid is live, and sends it SIGUSR1 (the sitter's "check for
+//! updates now" signal), returning `{ ok: true }`; a daemon that is not
+//! sitter-supervised (missing/stale pidfile, or a platform without unix
+//! signals) gets `-32603` with the reason. Method catalog grows by one
+//! fast-path method — 297 router methods, 337 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "8.5";
+pub const PROTOCOL_VERSION: &str = "8.6";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

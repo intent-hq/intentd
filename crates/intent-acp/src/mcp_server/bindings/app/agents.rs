@@ -1,7 +1,8 @@
 //! `ws.app.agents.*` bindings (chief-gated).
 //!
-//! Exposes cross-workspace agent audit methods (`list`, `readConversation`)
-//! and the completion-watch registration method (`waitFor`) exclusively to
+//! Exposes cross-workspace agent audit methods (`list`, `readConversation`),
+//! messaging (`send` / completion-bound `ask`) and completion watches
+//! (`waitFor`) exclusively to
 //! Chief-of-Staff workspace agents. Non-chief agents receive a clear gating
 //! error. Shape parity with the TS reference
 //! `packages/cloudlands-fe/src/features/mcp/main/mcp/ws-app-agents-api.ts`.
@@ -22,6 +23,10 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'app.agents.readConversation', args: { workspaceId, agentId, ...(opts || {}) } }),
         getMessageBlock: (workspaceId, agentId, messageId, blockId) =>
             host({ method: 'app.agents.getMessageBlock', args: { workspaceId, agentId, messageId, blockId } }),
+        send: (agentId, message, priority) =>
+            host({ method: 'app.agents.send', args: { agentId, message, priority } }),
+        ask: (agentId, message, priority) =>
+            host({ method: 'app.agents.ask', args: { agentId, message, priority } }),
         waitFor: (options) => host({ method: 'app.agents.waitFor', args: options || {} }),
     };
 ";
@@ -52,9 +57,73 @@ pub(crate) async fn dispatch(
         "list" => list(api, args).await,
         "readConversation" => read_conversation(api, args).await,
         "getMessageBlock" => get_message_block(api, args).await,
+        "send" => send(api, workspace_id, caller, args).await,
+        "ask" => ask(api, workspace_id, caller, args).await,
         "waitFor" => wait_for(api, workspace_id, caller, args).await,
         other => Err(format!("host: unknown method `app.agents.{other}`")),
     }
+}
+
+async fn send(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller_agent_id = caller.cloned().ok_or_else(|| {
+        "No agent context available. This tool must be called by an agent.".to_string()
+    })?;
+    let agent_id = opt_str(args, "agentId").ok_or_else(|| "agentId is required".to_string())?;
+    let message = opt_str(args, "message").ok_or_else(|| "message is required".to_string())?;
+    if message.trim().is_empty() {
+        return Err("message must not be empty".to_string());
+    }
+    let priority = match args.get("priority") {
+        None | Some(Value::Null) => Some("interrupt".to_string()),
+        Some(Value::String(value)) if value == "interrupt" => Some(value.clone()),
+        Some(Value::String(value)) if value == "queue" => Some("normal".to_string()),
+        Some(_) => return Err("priority must be \"interrupt\" or \"queue\"".to_string()),
+    };
+    api.app_agents_send(
+        workspace_id.clone(),
+        caller_agent_id,
+        AgentId::from(agent_id.as_str()),
+        message,
+        priority,
+    )
+    .await
+    .map_err(map_err)
+}
+
+async fn ask(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller_agent_id = caller.cloned().ok_or_else(|| {
+        "No agent context available. This tool must be called by an agent.".to_string()
+    })?;
+    let agent_id = opt_str(args, "agentId").ok_or_else(|| "agentId is required".to_string())?;
+    let message = opt_str(args, "message").ok_or_else(|| "message is required".to_string())?;
+    if message.trim().is_empty() {
+        return Err("message must not be empty".to_string());
+    }
+    let priority = match args.get("priority") {
+        None | Some(Value::Null) => Some("interrupt".to_string()),
+        Some(Value::String(value)) if value == "interrupt" => Some(value.clone()),
+        Some(Value::String(value)) if value == "queue" => Some("normal".to_string()),
+        Some(_) => return Err("priority must be \"interrupt\" or \"queue\"".to_string()),
+    };
+    api.app_agents_ask(
+        workspace_id.clone(),
+        caller_agent_id,
+        AgentId::from(agent_id.as_str()),
+        message,
+        priority,
+    )
+    .await
+    .map_err(map_err)
 }
 
 async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
@@ -487,12 +556,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     type WaitCall = (WorkspaceId, AgentId, Vec<String>, Option<String>);
+    type SendCall = (WorkspaceId, AgentId, AgentId, String, Option<String>);
 
     #[derive(Default)]
     struct FakeApi {
         workspaces: Mutex<Vec<Workspace>>,
         agents: Mutex<Vec<AgentLite>>,
         conversation_messages: Mutex<Vec<Value>>,
+        send_calls: Mutex<Vec<SendCall>>,
+        ask_calls: Mutex<Vec<SendCall>>,
+        send_error: Mutex<Option<String>>,
         wait_calls: Mutex<Vec<WaitCall>>,
         wait_error: Mutex<Option<String>>,
     }
@@ -584,6 +657,76 @@ mod tests {
                     })
                     .collect();
                 Ok(json!({ "ok": true, "waitMode": mode, "results": results }))
+            })
+        }
+
+        fn app_agents_send(
+            &self,
+            workspace_id: WorkspaceId,
+            caller_agent_id: AgentId,
+            target_agent_id: AgentId,
+            message: String,
+            priority: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let error = self.send_error.lock().unwrap().clone();
+            self.send_calls.lock().unwrap().push((
+                workspace_id,
+                caller_agent_id,
+                target_agent_id.clone(),
+                message,
+                priority,
+            ));
+            Box::pin(async move {
+                if let Some(msg) = error {
+                    return Err(Error::InvalidParams(msg));
+                }
+                Ok(json!({
+                    "ok": true,
+                    "agentId": target_agent_id.0,
+                    "workspaceId": "ws-target",
+                    "sourceUrl": "intent://local/__chief__/agent/agent-caller/message/msg-source",
+                    "success": true,
+                    "queued": false,
+                }))
+            })
+        }
+
+        fn app_agents_ask(
+            &self,
+            workspace_id: WorkspaceId,
+            caller_agent_id: AgentId,
+            target_agent_id: AgentId,
+            message: String,
+            priority: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let error = self.send_error.lock().unwrap().clone();
+            self.ask_calls.lock().unwrap().push((
+                workspace_id,
+                caller_agent_id,
+                target_agent_id.clone(),
+                message,
+                priority,
+            ));
+            Box::pin(async move {
+                if let Some(msg) = error {
+                    return Err(Error::InvalidParams(msg));
+                }
+                Ok(json!({
+                    "ok": true,
+                    "send": {
+                        "ok": true,
+                        "agentId": target_agent_id.0,
+                        "workspaceId": "ws-target",
+                        "sourceUrl": "intent://local/__chief__/agent/agent-caller/message/msg-source",
+                        "success": true,
+                        "queued": false,
+                    },
+                    "watch": {
+                        "ok": true,
+                        "waitMode": "immediate",
+                        "results": [{ "subscriptionId": "watch-1" }],
+                    },
+                }))
             })
         }
     }
@@ -1356,6 +1499,158 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("unknown agent id: agent-ghost"));
+    }
+
+    #[tokio::test]
+    async fn test_send_requires_agent_context_and_valid_args() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        let no_caller = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "send",
+            &json!({ "agentId": "agent-target", "message": "hello" }),
+        )
+        .await;
+        assert_eq!(
+            no_caller.unwrap_err(),
+            "No agent context available. This tool must be called by an agent."
+        );
+
+        for (args, expected) in [
+            (json!({ "message": "hello" }), "agentId is required"),
+            (json!({ "agentId": "agent-target" }), "message is required"),
+            (
+                json!({ "agentId": "agent-target", "message": "  " }),
+                "message must not be empty",
+            ),
+            (
+                json!({ "agentId": "agent-target", "message": "hello", "priority": "later" }),
+                "priority must be \"interrupt\" or \"queue\"",
+            ),
+        ] {
+            let result = dispatch(&api, &chief_id, Some(&caller), "send", &args).await;
+            assert_eq!(result.unwrap_err(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_maps_priority_and_forwards_to_service() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        for (args, expected_priority) in [
+            (
+                json!({ "agentId": "agent-target", "message": "urgent" }),
+                "interrupt",
+            ),
+            (
+                json!({ "agentId": "agent-target", "message": "later", "priority": "queue" }),
+                "normal",
+            ),
+        ] {
+            let result = dispatch(&api, &chief_id, Some(&caller), "send", &args)
+                .await
+                .unwrap();
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["agentId"], "agent-target");
+            assert!(result["sourceUrl"]
+                .as_str()
+                .unwrap()
+                .starts_with("intent://"));
+            assert_eq!(
+                fake.send_calls.lock().unwrap().last().unwrap().4.as_deref(),
+                Some(expected_priority)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ask_maps_priority_and_returns_completion_subscription() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        let result = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "ask",
+            &json!({
+                "agentId": "agent-target",
+                "message": "finish this",
+                "priority": "queue",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["send"]["agentId"], "agent-target");
+        assert_eq!(result["watch"]["results"][0]["subscriptionId"], "watch-1");
+        assert!(fake.send_calls.lock().unwrap().is_empty());
+        let calls = fake.ask_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, chief_id);
+        assert_eq!(calls[0].1, caller);
+        assert_eq!(calls[0].2, AgentId::from_string("agent-target"));
+        assert_eq!(calls[0].3, "finish this");
+        assert_eq!(calls[0].4.as_deref(), Some("normal"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_requires_agent_context_and_valid_args() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+        let no_caller = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "ask",
+            &json!({ "agentId": "agent-target", "message": "hello" }),
+        )
+        .await;
+        assert_eq!(
+            no_caller.unwrap_err(),
+            "No agent context available. This tool must be called by an agent."
+        );
+        let invalid = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "ask",
+            &json!({ "agentId": "agent-target", "message": "hello", "priority": "later" }),
+        )
+        .await;
+        assert_eq!(
+            invalid.unwrap_err(),
+            "priority must be \"interrupt\" or \"queue\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_surfaces_service_errors() {
+        let fake = Arc::new(FakeApi::default());
+        *fake.send_error.lock().unwrap() = Some("unknown agent id: agent-ghost".to_string());
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let result = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            Some(&AgentId::from_string("agent-caller")),
+            "send",
+            &json!({ "agentId": "agent-ghost", "message": "hello" }),
+        )
+        .await;
         assert!(result
             .unwrap_err()
             .contains("unknown agent id: agent-ghost"));

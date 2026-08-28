@@ -7107,17 +7107,18 @@ impl Services {
             }
         }
         // 6. monorepo#1229: attention fan-out to the caller's watchers. Every
-        // active completion watch is woken — auto-registered
+        // ordinary active completion watch is woken — auto-registered
         // (wakeOrCreate/delegate SUB-1) watches included, not just explicit
         // `agent.watch` registrations (monorepo#3443 widened the fan-out past
-        // the old `wake_on_attention` filter). The caller's parent is
+        // the old `wake_on_attention` filter). Completion-only Chief asks wait
+        // for terminal completion. The caller's parent is
         // excluded — step 5 already woke it directly — so a parent that ALSO
         // watches its child never receives a duplicate attention wake.
         // Watches are left in place (attention is not a completion).
         for watch in self
             .find_watches_for_child(&caller)
             .into_iter()
-            .filter(|w| Some(&w.parent_agent_id) != parent.as_ref())
+            .filter(|w| !w.completion_only && Some(&w.parent_agent_id) != parent.as_ref())
         {
             // Attention is not a completion, so the watch is left in place —
             // say so explicitly (issue monorepo#2051) to avoid reading as
@@ -8943,6 +8944,174 @@ impl Services {
     /// an event that fired long ago. This also closes the TOCTOU window where
     /// a target settles between the validation loop above and the watch
     /// registration (its live event would dispatch before the watch exists).
+    /// Chief-only cross-workspace send behind the MCP `ws.app.agents.send`
+    /// binding. The source anchor always comes from the caller's newest
+    /// persisted conversation row. A model cannot supply or replace it.
+    pub(crate) async fn app_agents_send_op(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> Result<Value> {
+        if !workspace_id.is_chief() {
+            return Err(Error::InvalidParams(
+                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+            ));
+        }
+        if caller_agent_id == target_agent_id {
+            return Err(Error::InvalidParams(
+                "Chief of Staff cannot send a message to itself".to_string(),
+            ));
+        }
+
+        let caller = self
+            .agent_get_op(caller_agent_id.clone(), Some(workspace_id.clone()))
+            .await?;
+        if caller.status == AgentStatus::Deleted
+            || caller.retired_at.is_some()
+            || !caller.workspace_id.is_chief()
+        {
+            return Err(Error::InvalidParams(format!(
+                "caller agent {} is not an active Chief of Staff agent",
+                caller_agent_id.0
+            )));
+        }
+        let source_message_id = caller.last_message_id.ok_or_else(|| {
+            Error::InvalidParams(
+                "Chief conversation has no persisted source message to link".to_string(),
+            )
+        })?;
+
+        let target = self.require_agent_session(&target_agent_id).await?;
+        if target.status == AgentStatus::Deleted {
+            return Err(Error::InvalidParams(format!(
+                "agent {} is deleted",
+                target_agent_id.0
+            )));
+        }
+        if target.workspace_id.is_chief() {
+            return Err(Error::InvalidParams(
+                "Chief messages can only target agents outside the Chief workspace".to_string(),
+            ));
+        }
+
+        let source_url = format!(
+            "intent://local/{}/agent/{}/message/{}",
+            workspace_id.0, caller_agent_id.0, source_message_id
+        );
+        let metadata = json!({
+            "type": "chief_message",
+            "fromAgentId": caller_agent_id.0,
+            "fromAgentName": "Chief of Staff",
+            "fromWorkspaceId": workspace_id.0,
+            "sourceMessageId": source_message_id,
+            "sourceUrl": source_url,
+        });
+        let outcome = WorkspaceApi::agent_send_message(
+            self,
+            target.workspace_id.clone(),
+            target_agent_id.clone(),
+            message,
+            None,
+            None,
+            None,
+            priority,
+            None,
+            None,
+            None,
+            Some(metadata),
+            intent_core::MessageOrigin::Automatic,
+        )
+        .await?;
+
+        let mut result = json!({
+            "ok": true,
+            "agentId": target_agent_id.0,
+            "agentName": target.name,
+            "workspaceId": target.workspace_id.0,
+            "sourceMessageId": source_message_id,
+            "sourceUrl": source_url,
+        });
+        if let (Some(result), Some(outcome)) = (result.as_object_mut(), outcome.as_object()) {
+            result.extend(outcome.clone());
+        }
+        Ok(result)
+    }
+
+    /// Chief-only completion-bound ask. The message is an ordinary Chief send;
+    /// after delivery, one durable ungrouped completion watch is armed and the
+    /// target is reconciled against its post-send state. The explicit
+    /// idle-target rejection is intentionally not used: this operation pairs
+    /// the watch with a send that wakes a previously settled target.
+    pub(crate) async fn app_agents_ask_op(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> Result<Value> {
+        if !workspace_id.is_chief() {
+            return Err(Error::InvalidParams(
+                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+            ));
+        }
+        let caller = self.require_agent_session(&caller_agent_id).await?;
+        let sent = self
+            .app_agents_send_op(
+                workspace_id.clone(),
+                caller_agent_id.clone(),
+                target_agent_id.clone(),
+                message,
+                priority,
+            )
+            .await?;
+        let target_workspace = sent
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map(WorkspaceId::from)
+            .ok_or_else(|| Error::Internal("Chief send omitted target workspace".to_string()))?;
+        let subscription_id = self
+            .register_completion_watch_strict_durable(
+                &workspace_id,
+                &target_workspace,
+                caller_agent_id.clone(),
+                caller.name,
+                target_agent_id.clone(),
+            )
+            .await?;
+        self.publish_subscriptions_changed(&workspace_id, &caller_agent_id)
+            .await;
+        self.reconcile_watch_child_on_rehydration(
+            &target_agent_id,
+            &target_workspace,
+            crate::agent_subscriptions::WatchReconcileCallSite::Registration,
+        )
+        .await;
+        let target_name = sent
+            .get("agentName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Internal("Chief send omitted target name".to_string()))?
+            .to_string();
+        Ok(json!({
+            "ok": true,
+            "send": sent,
+            "watch": {
+                "ok": true,
+                "waitMode": "immediate",
+                "results": [{
+                    "agentId": target_agent_id.0,
+                    "agentName": target_name,
+                    "workspaceId": target_workspace.0,
+                    "subscriptionId": subscription_id,
+                    "groupId": Value::Null,
+                }],
+            },
+        }))
+    }
+
     pub(crate) async fn app_agents_wait_op(
         &self,
         workspace_id: WorkspaceId,
