@@ -12559,6 +12559,9 @@ impl SystemControl for WatchHealthControl {
         }
     }
     fn request_shutdown(&self) {}
+    fn request_update(&self) -> std::result::Result<(), String> {
+        Err("not supported in this test".to_string())
+    }
     fn import_legacy(
         &self,
         _force: bool,
