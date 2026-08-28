@@ -828,13 +828,15 @@ async fn handle_sub_fast_path(
                     replace_group,
                     projection,
                 } = p;
+                // Time the request-to-snapshot interval (intent-hq/intent#3707):
+                // the fast-path never enters the `rpc_dispatch` span, so this
+                // timer is its duration guardrail. Started before the
+                // replace-group cleanup so a costly removal scan is included
+                // in the measured interval.
+                let timer = subscriptions::SnapshotTimer::start(Channel::Note, &workspace_id);
                 if let Some(group) = replace_group.as_deref() {
                     subs.remove_group(group);
                 }
-                // Time the request-to-snapshot interval (intent-hq/intent#3707):
-                // the fast-path never enters the `rpc_dispatch` span, so this
-                // timer is its duration guardrail.
-                let timer = subscriptions::SnapshotTimer::start(Channel::Note, &workspace_id);
                 // Subscribe before the snapshot so a mutation racing the read is
                 // captured and re-emitted as a delta (idempotent over-delivery,
                 // §1.3). Each matched event is delivered individually (no
@@ -896,11 +898,13 @@ async fn handle_sub_fast_path(
                     projection,
                     replace_group,
                 } = p;
+                // Time the request-to-snapshot interval (intent-hq/intent#3707),
+                // started before the replace-group cleanup so a costly removal
+                // scan is included in the measured interval.
+                let timer = subscriptions::SnapshotTimer::start(Channel::Chat, &agent_id);
                 if let Some(group) = replace_group.as_deref() {
                     subs.remove_group(group);
                 }
-                // Time the request-to-snapshot interval (intent-hq/intent#3707).
-                let timer = subscriptions::SnapshotTimer::start(Channel::Chat, &agent_id);
                 // The chat channel is per-agent, not workspace-scoped, so the
                 // bus filter carries no `workspaceId`; the forwarder narrows the
                 // stream family to this agent (cross-agent isolation).
@@ -951,14 +955,16 @@ async fn handle_sub_fast_path(
                     note_id,
                     replace_group,
                 }) => {
-                    if let Some(group) = replace_group.as_deref() {
-                        subs.remove_group(group);
-                    }
-                    // Time the request-to-snapshot interval (intent-hq/intent#3707).
+                    // Time the request-to-snapshot interval (intent-hq/intent#3707),
+                    // started before the replace-group cleanup so a costly
+                    // removal scan is included in the measured interval.
                     let timer = subscriptions::SnapshotTimer::start(
                         channel,
                         workspace_id.as_deref().unwrap_or("global"),
                     );
+                    if let Some(group) = replace_group.as_deref() {
+                        subs.remove_group(group);
+                    }
                     let filter_ws = if subscriptions::channel_is_global(channel) {
                         None
                     } else {

@@ -486,14 +486,16 @@ fn maybe_warn_slow_snapshot(
     if elapsed <= threshold {
         return false;
     }
-    let as_ms =
-        |d: Duration| u64::try_from(d.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+    // `elapsed_ms` is fractional: `as_millis()` truncation would render a
+    // marginal breach (e.g. 200.5ms over a 200ms budget) as equal to the
+    // threshold, hiding it from threshold-based log queries.
     tracing::warn!(
         target: SNAPSHOT_WARN_TARGET,
         channel,
         scope,
-        elapsed_ms = as_ms(elapsed),
-        threshold_ms = as_ms(threshold),
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        threshold_ms =
+            u64::try_from(threshold.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
         in_flight,
         "subscribe fast-path snapshot exceeded duration budget"
     );

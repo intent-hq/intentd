@@ -289,7 +289,7 @@ fn slow_snapshot_warn_carries_channel_scope_and_counts() {
     for needle in [
         "channel=\"chat\"",
         "scope=\"agent-1\"",
-        "elapsed_ms=950",
+        "elapsed_ms=950.0",
         "threshold_ms=200",
         "in_flight=3",
         "exceeded duration budget",
@@ -299,6 +299,32 @@ fn slow_snapshot_warn_carries_channel_scope_and_counts() {
             "missing `{needle}` in {rendered}"
         );
     }
+}
+
+#[test]
+fn slow_snapshot_warn_logs_fractional_millis_for_marginal_breach() {
+    // A 200.5ms breach of a 200ms budget must not truncate to
+    // elapsed_ms=200 == threshold_ms=200 (indistinguishable from a
+    // non-breach in threshold-based log queries).
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        maybe_warn_slow_snapshot(
+            "note",
+            "ws-1",
+            Duration::from_micros(200_500),
+            Duration::from_millis(200),
+            1,
+        );
+    });
+    assert_eq!(lines.len(), 1, "exactly one WARN event: {lines:?}");
+    let rendered = &lines[0].1;
+    assert!(
+        rendered.contains("elapsed_ms=200.5"),
+        "fractional elapsed_ms preserved in {rendered}"
+    );
+    assert!(
+        rendered.contains("threshold_ms=200"),
+        "threshold_ms present in {rendered}"
+    );
 }
 
 #[test]
