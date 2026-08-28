@@ -131,10 +131,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
-      - uses: swatinem/rust-cache@v2
-        with:
-          shared-key: build-${{ matrix.target }}
-          save-if: false
+      # No rust-cache step: nothing saves under a key this tag-push-only
+      # workflow could restore (ci.yml's build job uses gh-build-<target>),
+      # so a restore-only cache here was dead weight — and enabling saves
+      # would pressure the repo's 10 GiB Actions cache budget (now
+      # load-bearing for ci.yml's burst caches and release-plz's sccache
+      # dir) for a blob likely LRU-evicted between infrequent sitter
+      # releases anyway. Release builds are accepted as cold.
       # Mirror the dist pipeline's musl approach: cross-compile with
       # cargo-zigbuild (the PyPI package bundles the zig toolchain). The
       # user-site install can land in ~/.local/bin, which is not guaranteed
