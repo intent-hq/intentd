@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.14] - 2026-08-28
+
+### 🚀 Features
+
+- *(agent)* Prepend A2A sender header on agent-origin sends ([#1553](https://github.com/intent-hq/intentd/pull/1553))
+- Add bundled vulnerability scanner ([#1529](https://github.com/intent-hq/intentd/pull/1529))
+
+
 ## [0.8.13] - 2026-08-28
 
 ### 🐛 Bug Fixes
