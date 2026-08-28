@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.11] - 2026-08-28
+
+### 🚀 Features
+
+- *(transport)* Time subscribe fast-path snapshot emission, WARN above threshold ([#1545](https://github.com/intent-hq/intentd/pull/1545))
+- *(transport)* System.requestUpdate RPC to trigger a sitter update check ([#1546](https://github.com/intent-hq/intentd/pull/1546))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Use monotonic clock for WSS heartbeat pong bookkeeping ([#1547](https://github.com/intent-hq/intentd/pull/1547))
+
+### 🧪 Testing
+
+- *(intentd)* Scale repro for concurrent cold-start chat.subscribe seq-0 latency ([#1549](https://github.com/intent-hq/intentd/pull/1549))
+
+
 ## [0.8.10] - 2026-08-27
 
 ### 🐛 Bug Fixes
