@@ -112,11 +112,55 @@ pub(crate) const EMBEDDED_BUNDLED_V1_1: &[(&str, &str)] = &[
     ),
 ];
 
+/// The v2.1 embedded specialist bundle: the frozen v1.1 definitions plus the
+/// bundled Vulnerability Scanner. Unchanged specialist bytes keep reusing the
+/// v1.1 resources; the new definition lives under `resources/specialists/v2.1/`.
+/// Harness 2.0 remains pinned to [`EMBEDDED_BUNDLED_V1_1`], while 2.1 sessions
+/// resolve this extended set.
+pub(crate) const EMBEDDED_BUNDLED_V2_1: &[(&str, &str)] = &[
+    (
+        "chief-of-staff",
+        include_str!("../resources/specialists/v1.1/chief-of-staff.md"),
+    ),
+    (
+        "developer",
+        include_str!("../resources/specialists/v1.1/developer.md"),
+    ),
+    (
+        "implementor",
+        include_str!("../resources/specialists/v1.1/implementor.md"),
+    ),
+    (
+        "pr-reviewer",
+        include_str!("../resources/specialists/v1.1/pr-reviewer.md"),
+    ),
+    (
+        "ralph",
+        include_str!("../resources/specialists/v1.1/ralph.md"),
+    ),
+    (
+        "spec-writer",
+        include_str!("../resources/specialists/v1.1/spec-writer.md"),
+    ),
+    (
+        "ui-designer",
+        include_str!("../resources/specialists/v1.1/ui-designer.md"),
+    ),
+    (
+        "verifier",
+        include_str!("../resources/specialists/v1.1/verifier.md"),
+    ),
+    (
+        "vulnerability-scanner",
+        include_str!("../resources/specialists/v2.1/vulnerability-scanner.md"),
+    ),
+];
+
 /// The embedded bundled floor the specialist 3-tier resolution uses by
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V1_1;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V2_1;
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
 /// base tier: no shipped specialist survives the replacement.
@@ -2367,8 +2411,8 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    /// The eight reference specialist ids embedded via `include_str!` (PP-2).
-    const EMBEDDED_IDS: [&str; 8] = [
+    /// The nine latest specialist ids embedded via `include_str!` (PP-2).
+    const LATEST_EMBEDDED_IDS: [&str; 9] = [
         "spec-writer",
         "implementor",
         "verifier",
@@ -2377,16 +2421,17 @@ mod tests {
         "ralph",
         "ui-designer",
         "pr-reviewer",
+        "vulnerability-scanner",
     ];
 
     #[test]
-    fn embedded_bundled_resolves_all_eight_with_zero_local_files() {
+    fn embedded_bundled_resolves_all_nine_with_zero_local_files() {
         // Empty user + bundled dirs: every embedded id still resolves through
         // get()/resolve_agent_type()/resolve_role_reminder(). Ralph is the one
         // retired id intentionally omitted from list().
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
-        for id in EMBEDDED_IDS {
+        for id in LATEST_EMBEDDED_IDS {
             let got = svc.get(id, None).expect("embedded specialist resolves");
             let def = &got["specialist"];
             assert_eq!(def["source"], "bundled", "{id}");
@@ -2399,8 +2444,8 @@ mod tests {
         }
         let list = svc.list(None).unwrap();
         let specs = list["specialists"].as_array().unwrap();
-        assert_eq!(specs.len(), 7, "Ralph is excluded from the catalog");
-        for id in EMBEDDED_IDS.into_iter().filter(|id| *id != "ralph") {
+        assert_eq!(specs.len(), 8, "Ralph is excluded from the catalog");
+        for id in LATEST_EMBEDDED_IDS.into_iter().filter(|id| *id != "ralph") {
             assert!(specs.iter().any(|s| s["id"] == id), "{id} listed");
         }
         assert!(!specs.iter().any(|s| s["id"] == "ralph"));
@@ -2429,6 +2474,30 @@ mod tests {
         let (name, reminder) = svc.resolve_role_reminder("implementor", None).unwrap();
         assert_eq!(name, "Implementor");
         assert!(reminder.starts_with("Stay within task scope."));
+    }
+
+    #[test]
+    fn bundled_vulnerability_scanner_resolves_supplied_definition() {
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        let got = svc
+            .get("vulnerability-scanner", None)
+            .expect("embedded vulnerability scanner resolves");
+        let def = &got["specialist"];
+        assert_eq!(def["id"], "vulnerability-scanner");
+        assert_eq!(def["name"], "Vulnerability Scanner");
+        assert_eq!(
+            def["description"],
+            "Finds real, exploitable security vulnerabilities in code"
+        );
+        assert!(def.get("codingAgent").is_none());
+        assert!(def.get("model").is_none());
+        assert_eq!(def["icon"], "pr-reviewer");
+        assert!(def["prompt"]
+            .as_str()
+            .is_some_and(|body| body.starts_with("## Vulnerability Scanner\n")));
+        assert_eq!(def["source"], "bundled");
+        assert_eq!(def["isCustomized"], false);
     }
 
     #[test]
@@ -3581,7 +3650,7 @@ mod tests {
 
     #[test]
     fn embedded_bundle_carries_picker_metadata() {
-        // The v1.1 embedded bundle resolves the new picker-metadata fields:
+        // The latest embedded bundle resolves the picker-metadata fields:
         // spec-writer is the orchestrator with its advisory roster,
         // implementor/verifier are internal, and every def carries an icon.
         let dir = TempSpecialistsDir::new();
@@ -3598,7 +3667,7 @@ mod tests {
             assert_eq!(got["specialist"]["role"], "internal", "{id}");
             assert_eq!(got["specialist"]["icon"], id, "{id}");
         }
-        for id in EMBEDDED_IDS {
+        for id in LATEST_EMBEDDED_IDS {
             let got = svc.get(id, None).unwrap();
             assert!(
                 got["specialist"]["icon"]

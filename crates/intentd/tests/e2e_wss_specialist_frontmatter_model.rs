@@ -476,7 +476,7 @@ async fn specialist_hidden_round_trips_over_wss() {
 }
 
 /// WSS e2e for the embedded bundled catalog: with an empty user tier and no
-/// bundled-dir override, `specialist.list` over WSS returns exactly the seven
+/// bundled-dir override, `specialist.list` over WSS returns exactly the eight
 /// catalog-visible embedded reference specialists. Retired Ralph stays directly
 /// resolvable for pinned v1 sessions, while `pr-shepherd` remains gone.
 #[tokio::test]
@@ -524,15 +524,36 @@ async fn embedded_bundled_catalog_over_wss() {
             "spec-writer",
             "ui-designer",
             "verifier",
+            "vulnerability-scanner",
         ],
-        "bundled catalog over WSS is exactly the seven catalog-visible embedded ids"
+        "bundled catalog over WSS is exactly the eight catalog-visible embedded ids"
     );
     assert!(!ids.contains(&"ralph"), "retired Ralph is not cataloged");
     for spec in specs {
         assert_eq!(spec["source"], "bundled", "{}: embedded tier", spec["id"]);
     }
 
-    let ralph = wss_rpc(&mut ws, 3, "specialist.get", json!({ "id": "ralph" })).await;
+    let scanner = wss_rpc(
+        &mut ws,
+        3,
+        "specialist.get",
+        json!({ "id": "vulnerability-scanner" }),
+    )
+    .await;
+    let scanner = &scanner["specialist"];
+    assert_eq!(scanner["name"], "Vulnerability Scanner");
+    assert_eq!(
+        scanner["description"],
+        "Finds real, exploitable security vulnerabilities in code"
+    );
+    assert!(scanner.get("codingAgent").is_none());
+    assert!(scanner.get("model").is_none());
+    assert_eq!(scanner["icon"], "pr-reviewer");
+    assert!(scanner["prompt"]
+        .as_str()
+        .is_some_and(|body| body.starts_with("## Vulnerability Scanner\n")));
+
+    let ralph = wss_rpc(&mut ws, 4, "specialist.get", json!({ "id": "ralph" })).await;
     assert_eq!(ralph["specialist"]["source"], "bundled");
     assert_eq!(ralph["specialist"]["hidden"], true);
     assert_eq!(ralph["specialist"]["agentType"], "ralph-loop");
@@ -547,7 +568,7 @@ async fn embedded_bundled_catalog_over_wss() {
 /// WSS e2e for the base-tier replacement (`INTENTD_SPECIALISTS_DIR`): with the
 /// startup pin set, `specialist.list` over the real WSS transport returns only
 /// the replacement directory's specialists (as `bundled`) plus user-tier
-/// folds — none of the eight embedded ids survive — and the pin surfaces as
+/// folds — none of the nine embedded ids survive — and the pin surfaces as
 /// the read-only `specialists.dir` setting.
 #[tokio::test]
 async fn specialists_replacement_dir_over_wss() {
