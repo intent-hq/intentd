@@ -50,6 +50,6 @@ fn golden_vulnerability_scanner_definition_hash() {
         .expect("vulnerability scanner is bundled");
     assert_eq!(
         sha256_hex(content),
-        "4c1f0c12afe005b012b237edc06958796c98bde8ee3cfb81f54da917050ec4df"
+        "d682949a05d728d1a484667d8285c1cb21d63281e25f0bcb0dc8d7aa6dc85c1c"
     );
 }
