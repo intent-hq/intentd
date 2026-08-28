@@ -321,6 +321,12 @@ pub struct Services {
     /// Serializes strict completion-only ask registration so a watch is
     /// durably persisted before it becomes visible to completion delivery.
     completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Completion-watch ids with an active terminal-delivery retry task. A
+    /// transient wake or retirement failure keeps the durable watch armed and
+    /// retries under its stable message id without waiting for another event.
+    completion_delivery_retries: Arc<Mutex<HashSet<String>>>,
+    /// Delegation-group ids with an active aggregated-wake retry task.
+    completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
     /// `agent_id → (last error text, consecutive count)`. Incremented by the
     /// terminal-failure handler when the same error text repeats back-to-back,
@@ -901,6 +907,8 @@ impl Services {
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
             completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            completion_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
+            completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
@@ -5085,6 +5093,91 @@ impl Services {
         }
     }
 
+    /// Retry one failed durable terminal wake until its watch retires or is
+    /// removed. The shared id set keeps one task per watch; the delivery path's
+    /// stable message id makes every attempt idempotent.
+    fn schedule_completion_delivery_retry(
+        &self,
+        watch_id: String,
+        child_id: AgentId,
+        event: Event,
+    ) {
+        if !self
+            .completion_delivery_retries
+            .lock()
+            .expect("completion delivery retries poisoned")
+            .insert(watch_id.clone())
+        {
+            return;
+        }
+
+        let services = self.clone();
+        tokio::spawn(async move {
+            let mut backoff = std::time::Duration::from_millis(100);
+            let max_backoff = std::time::Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(backoff).await;
+                let still_armed = services
+                    .find_watches_for_child(&child_id)
+                    .iter()
+                    .any(|watch| watch.id == watch_id);
+                if !still_armed {
+                    break;
+                }
+
+                Box::pin(services.deliver_completion_to_watches(&child_id, &event)).await;
+                if !services
+                    .find_watches_for_child(&child_id)
+                    .iter()
+                    .any(|watch| watch.id == watch_id)
+                {
+                    break;
+                }
+                backoff = backoff.saturating_mul(2).min(max_backoff);
+            }
+            services
+                .completion_delivery_retries
+                .lock()
+                .expect("completion delivery retries poisoned")
+                .remove(&watch_id);
+        });
+    }
+
+    /// Retry one failed durable aggregated wake until its group settles or is
+    /// removed. The stable group message id makes every attempt idempotent.
+    fn schedule_completion_group_delivery_retry(&self, group_id: String) {
+        if !self
+            .completion_group_delivery_retries
+            .lock()
+            .expect("completion group delivery retries poisoned")
+            .insert(group_id.clone())
+        {
+            return;
+        }
+
+        let services = self.clone();
+        tokio::spawn(async move {
+            let mut backoff = std::time::Duration::from_millis(100);
+            let max_backoff = std::time::Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(backoff).await;
+                if !services.has_delegation_group(&group_id) {
+                    break;
+                }
+                Box::pin(services.try_fire_group(&group_id)).await;
+                if !services.has_delegation_group(&group_id) {
+                    break;
+                }
+                backoff = backoff.saturating_mul(2).min(max_backoff);
+            }
+            services
+                .completion_group_delivery_retries
+                .lock()
+                .expect("completion group delivery retries poisoned")
+                .remove(&group_id);
+        });
+    }
+
     /// Wake every parent whose watch matches `child_id`, then drop that watch:
     /// every ungrouped watch is deliver-once-and-retire. `group_id` = Some
     /// watches defer to the AS-4 delegation-group fan-in and are left
@@ -5716,6 +5809,11 @@ impl Services {
             // linked task — a genuine `agent:idle` completion only; failure
             // and deletion wakes never attribute triggers.
             let mut stamped_triggers = trigger_tasks.clone();
+            for pair in crate::agent_ops::ready_delta::event_trigger_tasks(&event.data) {
+                if !stamped_triggers.contains(&pair) {
+                    stamped_triggers.push(pair);
+                }
+            }
             if event.event_type == AGENT_IDLE && !interim_idle {
                 let flips = if let Some(f) = &taken_flip_triggers {
                     f.clone()
@@ -5731,6 +5829,11 @@ impl Services {
                 }
             }
             crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &stamped_triggers);
+            let mut retry_event = event.clone();
+            crate::agent_ops::ready_delta::stamp_event_trigger_tasks(
+                &mut retry_event.data,
+                &stamped_triggers,
+            );
             if let Err(e) = self
                 .deliver_parent_wake_durable(
                     &parent_ws,
@@ -5744,7 +5847,13 @@ impl Services {
                 tracing::warn!(
                     error = %e,
                     parent = %watch.parent_agent_id.0,
-                    "failed to deliver completion wake to parent"
+                    watch = %watch.id,
+                    "failed to deliver completion wake to parent; retry scheduled"
+                );
+                self.schedule_completion_delivery_retry(
+                    watch.id.clone(),
+                    child_id.clone(),
+                    retry_event.clone(),
                 );
                 continue;
             }
@@ -5765,6 +5874,11 @@ impl Services {
                     parent = %watch.parent_agent_id.0,
                     watch = %watch.id,
                     "terminal wake is durable but watch retirement failed; stable-id retry remains armed"
+                );
+                self.schedule_completion_delivery_retry(
+                    watch.id.clone(),
+                    child_id.clone(),
+                    retry_event,
                 );
                 continue;
             }
@@ -5892,9 +6006,10 @@ impl Services {
                 error = %e,
                 parent = %group.parent_agent_id.0,
                 group = %group_id,
-                "failed to deliver aggregated after_all wake to parent"
+                "failed to deliver aggregated after_all wake to parent; retry scheduled"
             );
             self.release_group_delivery(group_id);
+            self.schedule_completion_group_delivery_retry(group_id.to_string());
             return;
         }
         if let Err(e) = self
@@ -5906,9 +6021,10 @@ impl Services {
                 error = %e,
                 parent = %group.parent_agent_id.0,
                 group = %group_id,
-                "aggregated wake is durable but group settlement failed; stable-id retry remains armed"
+                "aggregated wake is durable but group settlement failed; stable-id retry scheduled"
             );
             self.release_group_delivery(group_id);
+            self.schedule_completion_group_delivery_retry(group_id.to_string());
             return;
         }
         let retained = self.finalize_group_delivery(group_id, &failed_children);

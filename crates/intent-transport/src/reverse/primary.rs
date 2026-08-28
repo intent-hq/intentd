@@ -151,12 +151,19 @@ pub struct PrimaryReverseGuard {
 impl Drop for PrimaryReverseGuard {
     fn drop(&mut self) {
         if let Some(inner) = self.registry.take() {
-            let mut entries = inner
-                .entries
-                .lock()
-                .expect("primary reverse entries poisoned");
-            if let Some(pos) = entries.iter().position(|e| e.id == self.id) {
-                entries.remove(pos);
+            let channel = {
+                let mut entries = inner
+                    .entries
+                    .lock()
+                    .expect("primary reverse entries poisoned");
+                entries
+                    .iter()
+                    .position(|e| e.id == self.id)
+                    .and_then(|pos| entries.remove(pos))
+                    .map(|entry| entry.channel)
+            };
+            if let Some(channel) = channel {
+                channel.close();
             }
         }
     }
