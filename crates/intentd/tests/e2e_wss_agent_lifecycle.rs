@@ -11257,8 +11257,10 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
 /// messages agent B through the `ws.agent.send` host binding, the delivered
 /// user row on B's transcript must carry
 /// `metadata == { type: "agent_message", fromAgentId, fromAgentName }` so
-/// clients can render who sent it. A human `agent.sendMessage` (FE/RPC front
-/// door, no caller agent) must stay untagged.
+/// clients can render who sent it, and its content must start with the
+/// daemon-prepended A2A sender header (monorepo#3721). A human
+/// `agent.sendMessage` (FE/RPC front door, no caller agent) must stay
+/// untagged AND header-free (byte-identical content).
 #[tokio::test]
 async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
     let Some(script) = gate("WSS agent-to-agent sender metadata E2E") else {
@@ -11452,6 +11454,14 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         })
         .expect("human user row present")
         .clone();
+    // FE-origin content is byte-identical to what the user sent — the A2A
+    // sender header (monorepo#3721) is gated on the daemon-stamped
+    // `fromAgentId` attribution, which human front-door sends never carry.
+    assert_eq!(
+        human_row["contentBlocks"][0]["text"],
+        json!("human follow-up"),
+        "FE-origin content must carry NO sender header: {human_row}"
+    );
     assert_ne!(
         human_row["metadata"]["type"],
         json!("agent_message"),
