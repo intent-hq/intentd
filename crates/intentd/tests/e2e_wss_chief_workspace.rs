@@ -2496,7 +2496,9 @@ async fn chief_agent_send_cross_workspace_over_wss() {
     assert_eq!(delivered["role"], json!("user"));
     assert_eq!(
         delivered["contentBlocks"][0]["text"],
-        json!("Please report your status")
+        json!(format!(
+            "[MESSAGE FROM AGENT Chief of Staff ({chief_id})]\n\nPlease report your status"
+        ))
     );
     assert_eq!(
         delivered["metadata"],
