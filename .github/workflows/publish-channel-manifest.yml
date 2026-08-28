@@ -45,7 +45,7 @@ on:
 
 jobs:
   publish-channel-manifest:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
@@ -120,12 +120,12 @@ jobs:
           # with the job's GH_TOKEN via a one-shot credential helper — the
           # token is read from the environment at runtime and never appears
           # in argv or gets persisted (intent-hq/monorepo#1279). --force lets
-          # the fetch update tags left stale by earlier runs on this
-          # non-ephemeral runner — without it a rejected tag update ("would
-          # clobber existing tag") makes the fetch exit 1 with no output at
-          # all under --quiet, so the fallback fetch drops --quiet to keep
-          # git's own diagnostics visible; log loudly if it still fails
-          # (intent-hq/monorepo#1921).
+          # the fetch update stale tags (kept as a harmless guard now that
+          # the runner is ephemeral) — without it a rejected tag update
+          # ("would clobber existing tag") makes the fetch exit 1 with no
+          # output at all under --quiet, so the fallback fetch drops --quiet
+          # to keep git's own diagnostics visible; log loudly if it still
+          # fails (intent-hq/monorepo#1921).
           auth_helper='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
           git -c credential.helper= -c credential.helper="$auth_helper" \
             fetch --quiet --force --tags --unshallow 2>/dev/null \
