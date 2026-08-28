@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{Error, Result, WorkspaceApi};
@@ -109,6 +109,7 @@ pub(crate) enum ConnCmd {
 /// Registry record for one live WebSocket client.
 pub(crate) struct ClientHandle {
     pub cmd_tx: mpsc::Sender<ConnCmd>,
+    /// Last pong receipt on the monotonic clock ([`mono_ms`]), NOT wall time.
     pub last_pong: Arc<AtomicI64>,
     pub abort: AbortHandle,
 }
@@ -412,13 +413,17 @@ impl WsInner {
 
     /// Ping every client each interval; terminate any that has not ponged within
     /// the timeout, cleaning up its subscriptions (port of `startHeartbeat`).
+    ///
+    /// Staleness is measured on the monotonic clock ([`mono_ms`]), so time the
+    /// host spends suspended (or wall-clock skew) never counts against a
+    /// client's pong deadline (intent-hq/intent#3712).
     pub(crate) async fn heartbeat_loop(self: Arc<Self>) {
         let mut tick = tokio::time::interval(self.heartbeat_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let timeout_ms = i64::try_from(self.heartbeat_timeout.as_millis()).unwrap_or(i64::MAX);
         loop {
             tick.tick().await;
-            let now = now_ms();
+            let now = mono_ms();
             let snapshot: Vec<(u64, i64, mpsc::Sender<ConnCmd>, AbortHandle)> = {
                 let map = self.clients.lock().expect("ws clients poisoned");
                 map.iter()
@@ -587,7 +592,7 @@ impl WsInner {
     {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
-        let last_pong = Arc::new(AtomicI64::new(now_ms()));
+        let last_pong = Arc::new(AtomicI64::new(mono_ms()));
         let handle = tokio::spawn(
             self.clone()
                 .connection_loop(id, ws, cmd_rx, last_pong.clone()),
@@ -613,7 +618,7 @@ impl WsInner {
     {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
-        let last_pong = Arc::new(AtomicI64::new(now_ms()));
+        let last_pong = Arc::new(AtomicI64::new(mono_ms()));
         let this = self.clone();
         let limits = self.tunnel_limits;
         let handle = tokio::spawn({
@@ -709,7 +714,7 @@ impl WsInner {
                             break;
                         }
                     }
-                    Some(Ok(Message::Pong(_))) => last_pong.store(now_ms(), Ordering::Relaxed),
+                    Some(Ok(Message::Pong(_))) => last_pong.store(mono_ms(), Ordering::Relaxed),
                     None | Some(Ok(Message::Close(_))) => break,
                     Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
                 },
@@ -870,16 +875,45 @@ fn header_str(value: &[u8]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Current wall-clock time in milliseconds since the Unix epoch.
-pub(crate) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+/// Milliseconds elapsed on the **monotonic** clock since this process first
+/// called it. Used for heartbeat pong bookkeeping instead of wall-clock time:
+/// `Instant` never jumps on wall-clock skew and (on the platforms we ship —
+/// `CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` / `mach_absolute_time` on
+/// Darwin) does not advance while the host is suspended, so a sleep/resume
+/// cannot make every client look 60s+ stale and get reaped on the first
+/// post-resume tick (intent-hq/intent#3712).
+pub(crate) fn mono_ms() -> i64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    i64::try_from(epoch.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::negotiate_extensions;
+    use super::{mono_ms, negotiate_extensions};
+
+    /// Tripwire for intent-hq/intent#3712: heartbeat bookkeeping must stay on
+    /// the monotonic clock. A wall-clock regression would make `mono_ms()`
+    /// return epoch-scale values (~1.7e12 ms and rising); the monotonic
+    /// process-relative clock stays far below that for any realistic daemon
+    /// uptime (the bound below is ~31 years).
+    #[test]
+    fn mono_ms_is_process_relative_not_wall_clock() {
+        let ms = mono_ms();
+        assert!(ms >= 0, "monotonic ms must be non-negative: {ms}");
+        assert!(
+            ms < 1_000_000_000_000,
+            "mono_ms() looks like a wall-clock epoch timestamp: {ms}"
+        );
+    }
+
+    /// `mono_ms()` never goes backwards across successive calls.
+    #[test]
+    fn mono_ms_is_non_decreasing() {
+        let a = mono_ms();
+        let b = mono_ms();
+        assert!(b >= a, "monotonic clock went backwards: {a} -> {b}");
+    }
 
     /// No `Sec-WebSocket-Extensions` header ⇒ no response header, plain
     /// uncompressed connection (the pre-deflate behavior).

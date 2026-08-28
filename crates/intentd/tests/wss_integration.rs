@@ -6549,6 +6549,42 @@ async fn heartbeat_terminates_silent_client() {
     srv.ws.stop().await;
 }
 
+/// Companion to [`heartbeat_terminates_silent_client`] and regression guard
+/// for intent-hq/intent#3712: a client that keeps polling its stream (and so
+/// auto-pongs every server ping) must SURVIVE many heartbeat interval+timeout
+/// cycles. This would catch a mixed-clock regression in the pong bookkeeping —
+/// e.g. storing wall-clock ms on pong receipt while the reaper compares
+/// against monotonic ms (or vice versa) — which makes even responsive clients
+/// look stale and get reaped within one timeout window.
+#[tokio::test]
+async fn heartbeat_keeps_responsive_client_alive() {
+    let srv = start(WsOptions {
+        heartbeat_interval: Duration::from_millis(100),
+        heartbeat_timeout: Duration::from_millis(200),
+        ..WsOptions::default()
+    })
+    .await;
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    // Keep the stream polled so tungstenite answers each Ping with a Pong.
+    let poller = tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+    for _ in 0..50 {
+        if srv.ws.client_count() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(srv.ws.client_count(), 1, "client should register");
+    // Outlive many timeout windows (2s >> 200ms timeout, >= 20 ping cycles).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        srv.ws.client_count(),
+        1,
+        "responsive client must survive heartbeat cycles"
+    );
+    poller.abort();
+    srv.ws.stop().await;
+}
+
 /// Minimal `Workspace` fixture used by `task.list` seeding below.
 fn fixture_workspace(id: &WorkspaceId) -> Workspace {
     let ts = now_iso();

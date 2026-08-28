@@ -55,7 +55,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::ws::{now_ms, ConnCmd};
+use crate::ws::{mono_ms, ConnCmd};
 
 /// `OPEN` — client asks the daemon to connect `127.0.0.1:<port>` (payload:
 /// port `u16` big-endian).
@@ -338,7 +338,7 @@ pub(crate) async fn run_tunnel_connection<S>(
                         break;
                     }
                 }
-                Some(Ok(Message::Pong(_))) => last_pong.store(now_ms(), Ordering::Relaxed),
+                Some(Ok(Message::Pong(_))) => last_pong.store(mono_ms(), Ordering::Relaxed),
                 None | Some(Ok(Message::Close(_))) => break,
                 Some(Ok(Message::Text(_))) => {
                     protocol_close(&mut sink, "text frames not allowed on /tunnel").await;
