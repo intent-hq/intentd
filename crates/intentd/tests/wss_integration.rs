@@ -17,15 +17,15 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, Result as CoreResult,
-    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    now_iso, AgentReverseDispatch, ContentType, Note, NoteId, NoteMetadata, NoteVisibility,
+    Result as CoreResult, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
 use intent_transport::{
-    ensure_tls_certificate, serve_uds, AsyncTokenStore, FileWatchStatus, SystemControl,
-    SystemStatus, TokenStore, WsApiServer, WsOptions, MAX_INBOUND_MESSAGE_BYTES,
+    ensure_tls_certificate, serve_uds, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
+    SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions, MAX_INBOUND_MESSAGE_BYTES,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -221,6 +221,7 @@ struct Server {
     bus: EventBus,
     store: Store,
     registry: Arc<intent_services::SettingsRegistry>,
+    reverse_registry: Arc<PrimaryReverseRegistry>,
     dir: tempfile::TempDir,
 }
 
@@ -261,8 +262,17 @@ async fn start_with_auggie_and_models_cache(
         opts.base_port = 0;
     }
     opts.bind_addresses = vec![Ipv4Addr::LOCALHOST.into()];
-    let ws =
-        WsApiServer::new(api.clone(), bus.clone(), &tls, &token_store, opts, None).expect("server");
+    let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
+    let ws = WsApiServer::new_with_reverse(
+        api.clone(),
+        bus.clone(),
+        &tls,
+        &token_store,
+        opts,
+        reverse_registry.clone(),
+        None,
+    )
+    .expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Server {
@@ -273,6 +283,7 @@ async fn start_with_auggie_and_models_cache(
         bus,
         store,
         registry,
+        reverse_registry,
         dir,
     }
 }
@@ -8813,6 +8824,158 @@ async fn wss_note_save_asset_round_trip() {
     assert_eq!(resp["error"]["code"], -32602);
     assert_eq!(resp["error"]["message"], "Missing required parameter: data");
 
+    srv.ws.stop().await;
+}
+
+/// An authenticated, fingerprint-pinned WSS client can serve the selected
+/// screenshot reverse request and return its result over the same connection.
+#[tokio::test]
+async fn wss_browser_screenshot_reverse_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    ws.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"browser.exec","params":{"actions":[{"action":"screenshot"}]}}"#
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send browser.exec");
+
+    let mut final_response = None;
+    while final_response.is_none() {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).expect("json frame");
+                if frame["method"] == "browser.exec" {
+                    assert_eq!(frame["params"]["actions"][0]["action"], "screenshot");
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": frame["id"],
+                        "result": { "success": true, "results": [{ "success": true }] }
+                    });
+                    ws.send(Message::Text(reply.to_string().into()))
+                        .await
+                        .expect("send reverse reply");
+                } else if frame["id"] == 1 {
+                    final_response = Some(frame);
+                }
+            }
+            Some(Ok(Message::Ping(payload))) => {
+                ws.send(Message::Pong(payload)).await.expect("pong");
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let response = final_response.expect("browser.exec response");
+    assert!(response.get("error").is_none(), "unexpected: {response}");
+    assert_eq!(response["result"]["success"], true);
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_disconnect_wakes_accepted_screenshot_request() {
+    let srv = start(WsOptions::default()).await;
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while srv.reverse_registry.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reverse registration");
+
+    let reverse_registry = srv.reverse_registry.clone();
+    let request = tokio::spawn(async move {
+        reverse_registry
+            .dispatch(
+                "browser.exec",
+                serde_json::json!({ "actions": [{ "action": "screenshot" }] }),
+            )
+            .await
+    });
+    let frame = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).expect("json frame");
+                    if frame["method"] == "browser.exec" {
+                        break frame;
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    ws.send(Message::Pong(payload)).await.expect("pong");
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected reverse frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("accepted reverse frame");
+    assert_eq!(frame["params"]["actions"][0]["action"], "screenshot");
+    ws.send(Message::Close(None)).await.expect("close WSS");
+
+    let err = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .expect("disconnect wakes request")
+        .expect("join")
+        .expect_err("request fails on disconnect");
+    assert!(err.to_string().contains("closed"), "unexpected: {err}");
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
+    let srv = start(WsOptions {
+        heartbeat_interval: Duration::from_millis(100),
+        heartbeat_timeout: Duration::from_millis(300),
+        ..WsOptions::default()
+    })
+    .await;
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while srv.reverse_registry.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reverse registration");
+
+    let reverse_registry = srv.reverse_registry.clone();
+    let request = tokio::spawn(async move {
+        reverse_registry
+            .dispatch(
+                "browser.exec",
+                serde_json::json!({ "actions": [{ "action": "screenshot" }] }),
+            )
+            .await
+    });
+    let frame = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).expect("json frame");
+                    if frame["method"] == "browser.exec" {
+                        break frame;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected reverse frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("accepted reverse frame");
+    assert_eq!(frame["params"]["actions"][0]["action"], "screenshot");
+
+    let err = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("heartbeat abort wakes request")
+        .expect("join")
+        .expect_err("request fails on heartbeat abort");
+    assert!(err.to_string().contains("closed"), "unexpected: {err}");
+    assert!(srv.reverse_registry.is_empty());
     srv.ws.stop().await;
 }
 

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
-    now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, NoteCreate, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, NoteCreate, NoteUpdateInput,
+    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use std::time::Duration;
 
@@ -8761,6 +8761,174 @@ async fn legacy_checkbox_delegate_can_report_and_request_attention() {
     );
 }
 
+async fn delegate_task_then_edit_note(
+    svc: &Services,
+    ws: &WorkspaceId,
+    parent: &AgentId,
+) -> (NoteId, AgentId) {
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Incident task".into(),
+                content: Some("Implement the narrow fix.".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create task note")
+        .note;
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "in_progress".into(),
+        vec!["Regression is covered".into()],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("mark task in progress");
+    let delegated = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(note.id.clone()),
+                agent_instructions: Some("Cover the incident".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate task note");
+    let child = AgentId::from(delegated["agentId"].as_str().expect("agentId"));
+
+    svc.update_note(
+        ws.clone(),
+        note.id.clone(),
+        NoteUpdateInput {
+            title: Some("Incident task, clarified".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("edit task title after delegation");
+    svc.update_note(
+        ws.clone(),
+        note.id.clone(),
+        NoteUpdateInput {
+            content: Some(
+                "Implement the narrow fix.\n\n## Verification\nFocused tests pass.\n\n## Notes\nReady for review."
+                    .into(),
+            ),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("edit task body after delegation");
+
+    (note.id, child)
+}
+
+#[tokio::test]
+async fn delegated_task_note_edits_do_not_suppress_report_to_parent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let (note_id, child) = delegate_task_then_edit_note(&svc, &ws, &parent).await;
+
+    let result = svc
+        .agent_report_to_parent_op(
+            ws.clone(),
+            json!("incident regression covered"),
+            Some(child.clone()),
+        )
+        .await
+        .expect("report after ordinary task note edits");
+    assert_eq!(result["ok"], json!(true));
+    assert!(result.get("quarantined").is_none());
+
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert_eq!(
+        session.completion_report.as_deref(),
+        Some("incident regression covered")
+    );
+    let note = svc
+        .store()
+        .get_note(&ws, &note_id)
+        .await
+        .expect("task note");
+    assert_eq!(note.title, "Incident task, clarified");
+    assert!(note.content.contains("## Verification"));
+    assert_eq!(
+        note.metadata.task.expect("task metadata").status,
+        intent_core::TaskStatus::ReviewRequired
+    );
+}
+
+#[tokio::test]
+async fn delegated_task_note_edits_do_not_suppress_attention_requests() {
+    for (kind, expected_status) in [
+        ("discussion", intent_core::TaskStatus::DiscussionNeeded),
+        ("blocker", intent_core::TaskStatus::Blocked),
+    ] {
+        let (_t, svc, ws) = setup().await;
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let (note_id, child) = delegate_task_then_edit_note(&svc, &ws, &parent).await;
+
+        let result = svc
+            .agent_request_attention_op(
+                ws.clone(),
+                kind.into(),
+                format!("{kind} after task edit"),
+                Some(child.clone()),
+            )
+            .await
+            .expect("attention request after ordinary task note edits");
+        assert_eq!(result["ok"], json!(true));
+        assert!(result.get("quarantined").is_none());
+
+        let session = svc.store().get_agent_session(&child).await.expect("child");
+        assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
+        let note = svc
+            .store()
+            .get_note(&ws, &note_id)
+            .await
+            .expect("task note");
+        assert!(note.content.contains("## Notes"));
+        assert_eq!(
+            note.metadata.task.expect("task metadata").status,
+            expected_status,
+            "{kind} request persists after the task note edit"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delegated_task_note_edits_do_not_suppress_valid_status_updates() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let (note_id, child) = delegate_task_then_edit_note(&svc, &ws, &parent).await;
+
+    let result = WorkspaceApi::task_update_note_status(
+        &svc,
+        ws.clone(),
+        note_id.clone(),
+        "waiting".into(),
+        None,
+        Some(child),
+    )
+    .await
+    .expect("valid task status update after ordinary task note edits");
+    assert!(result.ok);
+    assert_eq!(result.status, intent_core::TaskStatus::Waiting);
+    assert_eq!(result.note.title, "Incident task, clarified");
+    assert!(result.note.content.contains("## Verification"));
+}
+
 /// TASK-B: on `agent.reportToParent`, the caller's linked task note
 /// transitions from a non-terminal status (`in_progress`) to
 /// `review_required`, mirroring the reference reportToParent writer.
@@ -9430,6 +9598,168 @@ async fn durable_completion_queue_retry_adopts_existing_message_id() {
     assert_eq!(retry.id, first.id);
     assert_eq!(retry_position, first_position);
     assert_eq!(svc.queue_snapshot(&parent).len(), 1);
+}
+
+#[tokio::test]
+async fn failed_terminal_wake_retries_without_another_event() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let flipped = seed_task(&svc, &ws, "Flipped task").await;
+    svc.task_update_note_status(
+        ws.clone(),
+        flipped.clone(),
+        "complete".into(),
+        None,
+        Some(child.clone()),
+    )
+    .await
+    .expect("record flipped completion");
+    let watch_id = svc
+        .register_completion_watch_durable(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .await
+        .expect("register watch");
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER fail_completion_wake BEFORE INSERT ON agent_message BEGIN
+         SELECT RAISE(FAIL, 'injected completion wake failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install failure trigger");
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    sqlx::query("DROP TRIGGER fail_completion_wake")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove failure trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if parent_message_count(&svc, &parent).await == 1
+                && svc.find_watches_for_child(&child).is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry delivers and retires without another event");
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(
+        session.messages[0].id,
+        format!("completion-wake:{watch_id}"),
+        "retry keeps the stable delivery id"
+    );
+    let metadata = session.messages[0]
+        .metadata
+        .as_ref()
+        .expect("wake metadata");
+    assert_eq!(
+        metadata[crate::agent_ops::ready_delta::UNBLOCKED_TRIGGER_TASKS_KEY],
+        json!([{ "workspaceId": ws.0, "taskNoteId": flipped.0 }]),
+        "retry preserves consumed flipped-completion triggers"
+    );
+    assert!(svc
+        .store()
+        .list_agent_flipped_completions(&child)
+        .await
+        .expect("list flips")
+        .is_empty());
+    svc.handle_completion_event(&event).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "retired watch cannot produce a duplicate wake"
+    );
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+#[tokio::test]
+async fn failed_aggregated_wake_retries_without_another_event() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+    let group_id = svc
+        .delegation_group_for_parent(&parent)
+        .expect("delegation group")
+        .group_id;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+
+    sqlx::query(
+        "CREATE TRIGGER fail_group_wake BEFORE INSERT ON agent_message BEGIN
+         SELECT RAISE(FAIL, 'injected group wake failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install failure trigger");
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert!(svc.delegation_group_for_parent(&parent).is_some());
+
+    sqlx::query("DROP TRIGGER fail_group_wake")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove failure trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if parent_message_count(&svc, &parent).await == 1
+                && svc.delegation_group_for_parent(&parent).is_none()
+                && svc.list_watches_for_parent(&parent).is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("group retry delivers and settles without another event");
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(
+        session.messages[0].id,
+        format!("completion-group-wake:{group_id}")
+    );
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
 }
 
 /// A report is a progress wake: it says "reported", omits terminal retirement,

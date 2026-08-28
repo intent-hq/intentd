@@ -3869,12 +3869,18 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     };
 
     let data_dir = temp_data_dir();
-    let ws_id = seed_workspace_only(&data_dir).await;
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     // The child reports via the unified `workspace_api` tool + `ws.*` binding
-    // (post-WSAPI-8: discrete `report_to_parent` MCP tool is gone).
-    let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    // after an ordinary linked task-note append, reproducing monorepo#3577.
+    let report_js = format!(
+        "await ws.note.add({}, {{ content: {} }}); return await ws.agent.reportToParent({});",
+        json!(note_id),
+        json!("\n## Verification\nWSS incident regression covered."),
+        json!(REPORT),
+    );
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
+        json!(note_id),
         json!(CHILD_TAG),
     );
     // One behavior, prompt-matched rules:
@@ -3944,9 +3950,17 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     );
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    let parent = wss_rpc(
+    let marked = wss_rpc(
         &mut rpc,
         10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+    let parent = wss_rpc(
+        &mut rpc,
+        11,
         "agent.create",
         json!({ "workspaceId": ws_id, "name": "SUB2 Parent", "model": "mock:default" }),
     )
@@ -3957,7 +3971,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         .to_string();
     let sent = wss_rpc(
         &mut rpc,
-        11,
+        12,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
     )
@@ -4050,7 +4064,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     // `Report:` branch — the `Summary:` fallback MUST NOT appear.
     let conv = wss_rpc(
         &mut rpc,
-        12,
+        13,
         "agent.getConversation",
         json!({ "agentId": parent_id }),
     )
@@ -4088,7 +4102,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     let cid = child_id.expect("child id captured");
     let child_got = wss_rpc(
         &mut rpc,
-        13,
+        14,
         "agent.get",
         json!({ "workspaceId": ws_id, "agentId": cid }),
     )
@@ -4097,6 +4111,31 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         child_got["agent"]["metadata"]["completionReport"].as_str(),
         Some(REPORT),
         "child's persisted completionReport matches: {child_got}"
+    );
+    let task = wss_rpc(
+        &mut rpc,
+        15,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        task["task"]["status"], "review_required",
+        "report persists after the note edit and transitions the task: {task}"
+    );
+    let note = wss_rpc(
+        &mut rpc,
+        16,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert!(
+        note["note"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("WSS incident regression covered"),
+        "ordinary task-note append persisted before reportToParent: {note}"
     );
 }
 
@@ -4136,8 +4175,11 @@ async fn attention_request_discussion_over_wss() {
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let request_js = format!(
-        "return await ws.agent.requestDiscussion({});",
-        json!(REASON)
+        "await ws.note.add({}, {{ content: {} }}); await ws.task.updateNoteStatus({}, 'waiting'); return await ws.agent.requestDiscussion({});",
+        json!(note_id),
+        json!("\n## Notes\nNeed a coordinator decision."),
+        json!(note_id),
+        json!(REASON),
     );
     let behavior = json!({
         "rules": [{
@@ -4220,21 +4262,24 @@ async fn attention_request_discussion_over_wss() {
     let mut attention: Option<Value> = None;
     let mut raise_updated = false;
     let mut system_message = false;
-    let mut task_changed: Option<Value> = None;
+    let mut direct_task_changed = false;
+    let mut attention_task_changed: Option<Value> = None;
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(attention.is_some()
         && raise_updated
         && system_message
-        && task_changed.is_some()
+        && direct_task_changed
+        && attention_task_changed.is_some()
         && idle)
     {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!(
                 "timed out: attention={a} raise_updated={raise_updated} \
-                 system_message={system_message} task_changed={t} idle={idle}",
+                 system_message={system_message} direct_task_changed={direct_task_changed} \
+                 attention_task_changed={t} idle={idle}",
                 a = attention.is_some(),
-                t = task_changed.is_some(),
+                t = attention_task_changed.is_some(),
             )
         };
         let ev = &frame["params"]["event"];
@@ -4265,7 +4310,17 @@ async fn attention_request_discussion_over_wss() {
                 system_message = true;
             }
             "task:status-changed" if data["noteId"] == json!(note_id) => {
-                task_changed = Some(data.clone());
+                match data["newStatus"].as_str() {
+                    Some("waiting") => {
+                        assert_eq!(
+                            data["previousStatus"], "in_progress",
+                            "direct task update: {data}"
+                        );
+                        direct_task_changed = true;
+                    }
+                    Some("discussion_needed") => attention_task_changed = Some(data.clone()),
+                    _ => {}
+                }
             }
             "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
             _ => {}
@@ -4296,9 +4351,9 @@ async fn attention_request_discussion_over_wss() {
         attention["reason"], REASON,
         "attention event reason: {attention}"
     );
-    let task_changed = task_changed.expect("task:status-changed captured");
+    let task_changed = attention_task_changed.expect("attention task:status-changed captured");
     assert_eq!(
-        task_changed["previousStatus"], "in_progress",
+        task_changed["previousStatus"], "waiting",
         "task transition source: {task_changed}"
     );
     assert_eq!(
@@ -4735,8 +4790,10 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let blocker_js = format!(
-        "return await ws.agent.reportBlocker({});",
-        json!(BLOCK_REASON)
+        "await ws.note.add({}, {{ content: {} }}); return await ws.agent.reportBlocker({});",
+        json!(note_id),
+        json!("\n## Notes\nBlocked after reproducing the incident."),
+        json!(BLOCK_REASON),
     );
     let taskless_js = format!(
         "return await ws.agent.requestDiscussion({});",

@@ -756,6 +756,7 @@ impl WsInner {
         }
         drop(subs);
         drop(forwards);
+        reverse.close();
         let _ = sink.close().await;
         self.deregister(id);
     }
