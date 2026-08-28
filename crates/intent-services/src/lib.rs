@@ -321,10 +321,16 @@ pub struct Services {
     /// Serializes strict completion-only ask registration so a watch is
     /// durably persisted before it becomes visible to completion delivery.
     completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Completion-watch ids with an active terminal-delivery retry task. A
-    /// transient wake or retirement failure keeps the durable watch armed and
-    /// retries under its stable message id without waiting for another event.
-    completion_delivery_retries: Arc<Mutex<HashSet<String>>>,
+    /// Child agent ids with an active terminal-delivery retry task, mapped
+    /// to a schedule generation. Ownership is coalesced per CHILD, not per
+    /// watch (intent-hq/intent#3728): one delivery pass processes ALL of the
+    /// child's watches, so per-watch tasks would each repeat the same full
+    /// pass (quadratic attempts, synchronized bursts). A transient wake or
+    /// retirement failure keeps the durable watch armed and retries under
+    /// its stable message id without waiting for another event; scheduling
+    /// while a task is live bumps the generation, which the task re-checks
+    /// before exiting so a racing failure never loses its retry owner.
+    completion_delivery_retries: Arc<Mutex<HashMap<String, u64>>>,
     /// Delegation-group ids with an active aggregated-wake retry task.
     completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
@@ -907,7 +913,7 @@ impl Services {
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
             completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
-            completion_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
+            completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
@@ -5093,22 +5099,30 @@ impl Services {
         }
     }
 
-    /// Retry one failed durable terminal wake until its watch retires or is
-    /// removed. The shared id set keeps one task per watch; the delivery path's
-    /// stable message id makes every attempt idempotent.
-    fn schedule_completion_delivery_retry(
-        &self,
-        watch_id: String,
-        child_id: AgentId,
-        event: Event,
-    ) {
-        if !self
-            .completion_delivery_retries
-            .lock()
-            .expect("completion delivery retries poisoned")
-            .insert(watch_id.clone())
+    /// Retry failed durable terminal wakes for `child_id` until its
+    /// ungrouped watches retire or a pass completes without a delivery
+    /// failure. Retry ownership is coalesced per child
+    /// (intent-hq/intent#3728): each delivery pass processes ALL of the
+    /// child's watches, so one task owns the child and a second failure
+    /// while it runs only bumps the registry generation — the task
+    /// re-checks the generation before exiting, so a failure racing its
+    /// clean pass keeps the task alive for another pass instead of being
+    /// stranded without an owner. A pass that reports no ungrouped
+    /// delivery failure stops the polling: watches it left armed are
+    /// armed on purpose (interim deferral, dedup suppression) and the
+    /// normal event paths own their settlement. The delivery path's
+    /// stable message ids make every attempt idempotent.
+    fn schedule_completion_delivery_retry(&self, child_id: AgentId, event: Event) {
         {
-            return;
+            let mut retries = self
+                .completion_delivery_retries
+                .lock()
+                .expect("completion delivery retries poisoned");
+            if let Some(generation) = retries.get_mut(&child_id.0) {
+                *generation = generation.wrapping_add(1);
+                return;
+            }
+            retries.insert(child_id.0.clone(), 0);
         }
 
         let services = self.clone();
@@ -5117,29 +5131,39 @@ impl Services {
             let max_backoff = std::time::Duration::from_secs(5);
             loop {
                 tokio::time::sleep(backoff).await;
-                let still_armed = services
+                let seen_generation = services
+                    .completion_delivery_retries
+                    .lock()
+                    .expect("completion delivery retries poisoned")
+                    .get(&child_id.0)
+                    .copied()
+                    .unwrap_or(0);
+                let ungrouped_armed = services
                     .find_watches_for_child(&child_id)
                     .iter()
-                    .any(|watch| watch.id == watch_id);
-                if !still_armed {
+                    .any(|watch| watch.group_id.is_none());
+                let clean = if ungrouped_armed {
+                    !Box::pin(services.deliver_completion_to_watches(&child_id, &event))
+                        .await
+                        .ungrouped_delivery_failed
+                } else {
+                    true
+                };
+                if !clean {
+                    backoff = backoff.saturating_mul(2).min(max_backoff);
+                    continue;
+                }
+                let mut retries = services
+                    .completion_delivery_retries
+                    .lock()
+                    .expect("completion delivery retries poisoned");
+                if retries.get(&child_id.0).copied().unwrap_or(seen_generation) == seen_generation {
+                    retries.remove(&child_id.0);
                     break;
                 }
-
-                Box::pin(services.deliver_completion_to_watches(&child_id, &event)).await;
-                if !services
-                    .find_watches_for_child(&child_id)
-                    .iter()
-                    .any(|watch| watch.id == watch_id)
-                {
-                    break;
-                }
-                backoff = backoff.saturating_mul(2).min(max_backoff);
+                // A racing failure bumped the generation mid-pass; run
+                // another pass so it keeps a retry owner.
             }
-            services
-                .completion_delivery_retries
-                .lock()
-                .expect("completion delivery retries poisoned")
-                .remove(&watch_id);
         });
     }
 
@@ -5564,6 +5588,10 @@ impl Services {
         // rows for the wake that actually stamps them; one take is shared by
         // every watch in this pass so multiple watchers stamp the same set.
         let mut taken_flip_triggers: Option<Vec<(String, String)>> = None;
+        // intent-hq/intent#3728: set on any ungrouped wake/retirement
+        // failure below so the returned classification tells the per-child
+        // retry task whether this pass genuinely needs another attempt.
+        let mut ungrouped_delivery_failed = false;
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -5850,11 +5878,8 @@ impl Services {
                     watch = %watch.id,
                     "failed to deliver completion wake to parent; retry scheduled"
                 );
-                self.schedule_completion_delivery_retry(
-                    watch.id.clone(),
-                    child_id.clone(),
-                    retry_event.clone(),
-                );
+                ungrouped_delivery_failed = true;
+                self.schedule_completion_delivery_retry(child_id.clone(), retry_event.clone());
                 continue;
             }
             let delivered_at = now_iso();
@@ -5875,11 +5900,8 @@ impl Services {
                     watch = %watch.id,
                     "terminal wake is durable but watch retirement failed; stable-id retry remains armed"
                 );
-                self.schedule_completion_delivery_retry(
-                    watch.id.clone(),
-                    child_id.clone(),
-                    retry_event,
-                );
+                ungrouped_delivery_failed = true;
+                self.schedule_completion_delivery_retry(child_id.clone(), retry_event);
                 continue;
             }
             self.remove_watch_after_delivery_commit(&watch.id);
@@ -5943,6 +5965,7 @@ impl Services {
             queue_interim,
             hook_waiting,
             pr_monitor_waiting,
+            ungrouped_delivery_failed,
         }
     }
 
@@ -10592,6 +10615,7 @@ pub(crate) fn event_completion_report(data: &serde_json::Value) -> Option<&str> 
 /// `agent:failed` / `agent:deleted`). Returned so the seal callers share the
 /// delivery pass's probes instead of re-probing (monorepo#1281).
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct CompletionIdleClassification {
     /// Queue/busy interim (monorepo#1281/#1297): ready-to-send entries remain
     /// or a worker turn is in flight — the agent's delegating turn is not
@@ -10609,6 +10633,13 @@ pub(crate) struct CompletionIdleClassification {
     /// eventually wakes the agent, so this alone must NOT gate the
     /// parent-side `after_all` seal either.
     pub(crate) pr_monitor_waiting: bool,
+    /// intent-hq/intent#3728: at least one ungrouped watch's terminal wake
+    /// (or its retirement) FAILED during this pass, so the per-child retry
+    /// task must keep polling. When `false`, any watches the pass left armed
+    /// were left armed on purpose (interim deferral, dedup suppression) and
+    /// the normal event paths own their settlement — the retry task stops
+    /// instead of re-running the pass every backoff tick until retirement.
+    pub(crate) ungrouped_delivery_failed: bool,
 }
 
 /// STAB-129: the group members whose recorded terminal event was

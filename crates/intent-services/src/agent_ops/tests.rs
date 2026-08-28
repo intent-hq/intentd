@@ -9762,6 +9762,215 @@ async fn failed_aggregated_wake_retries_without_another_event() {
     assert_eq!(parent_message_count(&svc, &parent).await, 1);
 }
 
+/// intent-hq/intent#3728 defect 1: retry ownership is coalesced per CHILD.
+/// Each retry pass processes ALL of the child's watches, so several watches
+/// failing together must arm exactly one retry task (keyed by the child),
+/// not one per watch — per-watch tasks would each repeat the same full pass
+/// (quadratic attempts, synchronized bursts). The coalesced task still
+/// delivers every watch once the failure clears, under stable message ids.
+#[tokio::test]
+async fn multi_watch_wake_failure_coalesces_one_retry_per_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent_a = create_agent(&svc, &ws, "ParentA").await;
+    let parent_b = create_agent(&svc, &ws, "ParentB").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let watch_a = svc
+        .register_completion_watch_durable(
+            &ws,
+            &ws,
+            parent_a.clone(),
+            "ParentA".into(),
+            child.clone(),
+            None,
+        )
+        .await
+        .expect("register watch a");
+    let watch_b = svc
+        .register_completion_watch_durable(
+            &ws,
+            &ws,
+            parent_b.clone(),
+            "ParentB".into(),
+            child.clone(),
+            None,
+        )
+        .await
+        .expect("register watch b");
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER fail_completion_wake BEFORE INSERT ON agent_message BEGIN
+         SELECT RAISE(FAIL, 'injected completion wake failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install failure trigger");
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent_a).await, 0);
+    assert_eq!(parent_message_count(&svc, &parent_b).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 2);
+    {
+        let retries = svc
+            .completion_delivery_retries
+            .lock()
+            .expect("retries registry");
+        assert_eq!(
+            retries.len(),
+            1,
+            "both failed watches must coalesce into ONE per-child retry entry: {retries:?}"
+        );
+        assert!(
+            retries.contains_key(&child.0),
+            "retry ownership is keyed by the child agent id: {retries:?}"
+        );
+    }
+
+    sqlx::query("DROP TRIGGER fail_completion_wake")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove failure trigger");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if parent_message_count(&svc, &parent_a).await == 1
+                && parent_message_count(&svc, &parent_b).await == 1
+                && svc.find_watches_for_child(&child).is_empty()
+                && svc
+                    .completion_delivery_retries
+                    .lock()
+                    .expect("retries registry")
+                    .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("coalesced retry delivers every watch and clears its registry entry");
+
+    for (parent, watch_id) in [(&parent_a, &watch_a), (&parent_b, &watch_b)] {
+        let session = svc
+            .store()
+            .get_agent_session(parent)
+            .await
+            .expect("parent session");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(
+            session.messages[0].id,
+            format!("completion-wake:{watch_id}"),
+            "coalesced retry keeps each watch's stable delivery id"
+        );
+    }
+    svc.handle_completion_event(&event).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent_a).await,
+        1,
+        "retired watches cannot produce duplicate wakes"
+    );
+    assert_eq!(parent_message_count(&svc, &parent_b).await, 1);
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+/// intent-hq/intent#3728 defect 2: a retry pass that classifies the child as
+/// interim WITHOUT a delivery failure stops the retry polling — the watch
+/// stays armed on purpose and the normal event paths (queue drain,
+/// retraction redelivery, hook/monitor resolution) own its settlement, so
+/// the task must not keep re-running the pass every 5s until retirement.
+/// Real delivery failures still retry (covered by
+/// `failed_terminal_wake_retries_without_another_event`).
+#[tokio::test]
+async fn clean_interim_retry_pass_stops_polling() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    svc.register_completion_watch_durable(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .await
+    .expect("register watch");
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER fail_completion_wake BEFORE INSERT ON agent_message BEGIN
+         SELECT RAISE(FAIL, 'injected completion wake failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install failure trigger");
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert!(
+        svc.completion_delivery_retries
+            .lock()
+            .expect("retries registry")
+            .contains_key(&child.0),
+        "failed delivery arms the per-child retry task"
+    );
+
+    // Make the child queue-interim BEFORE clearing the failure, so the next
+    // retry pass observes a clean interim classification (no delivery error).
+    let (queued, _) =
+        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    sqlx::query("DROP TRIGGER fail_completion_wake")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove failure trigger");
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if svc
+                .completion_delivery_retries
+                .lock()
+                .expect("retries registry")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("clean interim pass retires the retry task instead of polling until retirement");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "interim pass delivers nothing"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch stays armed for the real settlement"
+    );
+
+    // The normal retraction path still settles the deferred watch: exactly
+    // one wake, one-shot retirement.
+    svc.agent_remove_queued_message_op(child.clone(), queued.id)
+        .await
+        .expect("remove queued message");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "retraction redelivery fires the stranded watch"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
 /// A report is a progress wake: it says "reported", omits terminal retirement,
 /// and exposes that the completion watch is still armed.
 #[tokio::test]
