@@ -323,19 +323,28 @@ struct SubscribeLatency {
     snapshot: Duration,
 }
 
-/// On an already-open connection, send `chat.subscribe {agentId}` and time
-/// the ack response and the seq-0 snapshot frame (order-independent).
-async fn timed_subscribe(
-    write: &mut (impl AsyncWriteExt + Unpin),
-    reader: &mut BufReader<OwnedReadHalf>,
-    agent_id: &str,
-) -> SubscribeLatency {
+/// Send `chat.subscribe {agentId}` on an already-open connection and return
+/// the send timestamp. Kept separate from the read loop so both requests can
+/// be written before either response is read — `tokio::join!` polls futures
+/// in order on one task, so a combined write+read future for connection 1
+/// could otherwise complete before connection 2 sends anything, making the
+/// "concurrent" measurement serial.
+async fn send_subscribe(write: &mut (impl AsyncWriteExt + Unpin), agent_id: &str) -> Instant {
     let frame = json!({
         "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
         "params": { "agentId": agent_id },
     });
     let start = Instant::now();
     send(write, &serde_json::to_string(&frame).unwrap()).await;
+    start
+}
+
+/// Read a connection until both the subscribe ack and the seq-0 snapshot
+/// frame have arrived (order-independent), timing each against `start`.
+async fn read_subscribe_latency(
+    reader: &mut BufReader<OwnedReadHalf>,
+    start: Instant,
+) -> SubscribeLatency {
     let mut ack = None;
     let mut snapshot = None;
     while ack.is_none() || snapshot.is_none() {
@@ -419,17 +428,20 @@ async fn run_scenario(
         .await;
     }
 
-    // Open both subscription connections first, then send the two subscribe
-    // frames back-to-back and read each connection concurrently.
+    // Open both subscription connections first, write BOTH subscribe frames
+    // before reading either response (so the daemon truly sees the two opens
+    // back-to-back), then read both connections concurrently.
     let (r1, mut w1) = connect_retry(&socket).await.into_split();
     let mut reader1 = BufReader::new(r1);
     let (r2, mut w2) = connect_retry(&socket).await.into_split();
     let mut reader2 = BufReader::new(r2);
     let a1 = subscribers[0].clone();
     let a2 = subscribers[1].clone();
+    let start1 = send_subscribe(&mut w1, &a1).await;
+    let start2 = send_subscribe(&mut w2, &a2).await;
     let (l1, l2) = tokio::join!(
-        timed_subscribe(&mut w1, &mut reader1, &a1),
-        timed_subscribe(&mut w2, &mut reader2, &a2),
+        read_subscribe_latency(&mut reader1, start1),
+        read_subscribe_latency(&mut reader2, start2),
     );
 
     println!(
