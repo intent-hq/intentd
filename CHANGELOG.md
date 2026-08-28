@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.12] - 2026-08-28
+
+### 🚀 Features
+
+- Add Chief cross-workspace agent messaging ([#1543](https://github.com/intent-hq/intentd/pull/1543))
+
+### 🐛 Bug Fixes
+
+- *(services)* Survive watch exhaustion — registrar retry, Linux single inotify group, system.status coverage ([#1550](https://github.com/intent-hq/intentd/pull/1550))
+
+
 ## [0.8.11] - 2026-08-28
 
 ### 🚀 Features
