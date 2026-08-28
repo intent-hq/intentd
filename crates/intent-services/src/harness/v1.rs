@@ -79,6 +79,14 @@ pub(crate) const STALE_REDRIVE_NOTE_PREFIX: &str =
 /// before you completed"), so the two checks never shadow each other.
 pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
 
+/// Stable prefix of [`Harness::a2a_sender_note`], used by the agent-origin
+/// send paths as an idempotency guard (an entry whose content already
+/// carries a sender header is never re-annotated — same contract as the
+/// dequeue-wait note). Consumed by the goldens until the delivery-path
+/// prepend lands.
+#[allow(dead_code)]
+pub(crate) const A2A_SENDER_NOTE_PREFIX: &str = "[MESSAGE FROM AGENT";
+
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wakes.
 pub(crate) const HOOK_WAKE_LOGS_CAP: usize = 2048;
@@ -418,6 +426,13 @@ impl Harness for V1 {
         format!(
             "[SYSTEM NOTE] This message was queued at {queued_at} and waited {waited} before delivery."
         )
+    }
+
+    fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String {
+        match name {
+            Some(name) => format!("[MESSAGE FROM AGENT {name} ({agent_id})]"),
+            None => format!("[MESSAGE FROM AGENT ({agent_id})]"),
+        }
     }
 
     fn wait_duration(&self, secs: i64) -> String {

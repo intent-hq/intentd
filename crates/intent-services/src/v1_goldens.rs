@@ -171,6 +171,33 @@ fn golden_dequeue_wait_note() {
     );
 }
 
+/// The A2A sender-attribution header MUST stay single-line and start with
+/// `A2A_SENDER_NOTE_PREFIX`: the delivery path's idempotency guard matches
+/// the prefix, and the FE strips the header line with a single-line regex
+/// (same pattern as `hook-wake-attribution.ts`).
+#[test]
+fn golden_a2a_sender_note() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.a2a_sender_note(Some("Research Agent"), "agent-1234"),
+        "[MESSAGE FROM AGENT Research Agent (agent-1234)]"
+    );
+    assert_eq!(
+        harness.a2a_sender_note(None, "agent-1234"),
+        "[MESSAGE FROM AGENT (agent-1234)]"
+    );
+    for note in [
+        harness.a2a_sender_note(Some("Research Agent"), "agent-1234"),
+        harness.a2a_sender_note(None, "agent-1234"),
+    ] {
+        assert!(
+            note.starts_with(crate::harness::v1::A2A_SENDER_NOTE_PREFIX),
+            "header must start with the idempotency-guard prefix: {note}"
+        );
+        assert!(!note.contains('\n'), "header must be single-line: {note}");
+    }
+}
+
 // Deliberately redundant with the byte-exact table in
 // `agent_manager::tests` (queue-note context there); kept here so the
 // H0 baseline is self-contained. Update both together.
