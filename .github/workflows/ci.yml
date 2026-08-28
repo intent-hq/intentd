@@ -48,15 +48,18 @@ concurrency:
 
 jobs:
   # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all)
-  # run: the local tinybox runner normally, or GitHub-hosted larger runners
-  # when the tinybox queue is backed up. Runs on a GitHub-hosted runner so
+  # run: the local tinybox runner when it is confirmed healthy, or
+  # GitHub-hosted larger runners otherwise. Runs on a GitHub-hosted runner so
   # the burst decision is independent of the tinybox queue: when the probe
   # ran on tinybox it queued behind the very backlog it measures (and
-  # deadlocked entirely with tinybox offline). The probe fails open to
-  # tinybox on API errors; if the job itself fails (runner outage, timeout),
-  # the routed jobs are skipped and need a re-run — a deliberate trade-off.
-  # The mac build is intentionally not routed — it runs on a GitHub-hosted
-  # macOS runner (see the build job's matrix).
+  # deadlocked entirely with tinybox offline). The probe FAILS OPEN TO BURST:
+  # tinybox is only selected when the probe positively confirms an online
+  # self-hosted Linux runner AND an acceptable queue depth — any API error,
+  # missing permission, or an offline fleet routes to the burst runners, so
+  # CI cannot queue-deadlock when the fleet is down. If the job itself fails
+  # (timeout), the routed jobs are skipped and need a re-run — a deliberate
+  # trade-off. The mac build is intentionally not routed — it runs on a
+  # GitHub-hosted macOS runner (see the build job's matrix).
   route:
     # Skipped on push to main: its only consumers (check / coverage-e2e /
     # coverage-all) are push-skipped as redundant (see the `on: push`
@@ -91,7 +94,13 @@ jobs:
           # GITHUB_TOKEN is repo-scoped and can only see intentd. Set the
           # CI_QUEUE_READ_TOKEN secret (fine-grained PAT with actions:read
           # on the sibling repos) to enable cross-repo counting; without
-          # it those repos are skipped and contribute 0.
+          # it those repos are skipped and contribute 0. Routing to tinybox
+          # additionally requires the token to list this repo's self-hosted
+          # runners (fine-grained "Administration" repository permission,
+          # read) — the default GITHUB_TOKEN cannot carry that permission,
+          # so without a suitably-scoped CI_QUEUE_READ_TOKEN the runner
+          # check fails and every run bursts (safe: burst is the fail-open
+          # default; it just never uses tinybox).
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
             const tinybox = ["self-hosted", "Linux", "X64"];
@@ -103,30 +112,63 @@ jobs:
             const burst = ["gh-linux-16x"];
             const checkBurst = ["gh-linux-8x"];
             const threshold = parseInt(process.env.THRESHOLD || "8", 10);
-            // Count self-hosted Linux jobs that are queued or running in
-            // queued/in-progress runs: a running job occupies a tinybox
-            // slot just as much as a queued one. GitHub-hosted jobs
-            // — including this route job and bursted heavy jobs — don't
-            // match the self-hosted+Linux label filter, so they never
-            // inflate the depth.
-            const owner = context.repo.owner;
-            const repos = ["intentd", "cloudlands-fe", "monorepo"];
-            let depth = 0;
-            for (const repo of repos) {
-              try {
-                for (const status of ["queued", "in_progress"]) {
-                  const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
-                  for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
-                    const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
-                    depth += jobs.data.jobs.filter(j => (j.status === "queued" || j.status === "in_progress") && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
+            // FAIL OPEN TO BURST: tinybox is only selected when the probe
+            // positively confirms (a) an online self-hosted Linux runner
+            // registered on this repo and (b) a queue depth within the
+            // threshold. Any probe error — including a token that cannot
+            // list runners — routes to burst, so CI cannot queue-deadlock
+            // when the fleet is offline or unreadable.
+            let useBurst = true;
+            let reason = "fail-open default";
+            try {
+              // Repo-registered runners only: org-level runner groups are
+              // not visible here, and an empty/unreadable list routes to
+              // burst by design (never deadlock on an invisible fleet).
+              const runners = await github.paginate(
+                github.rest.actions.listSelfHostedRunnersForRepo,
+                { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+              );
+              const online = runners.filter(r =>
+                r.status === "online" &&
+                tinybox.every(l => (r.labels || []).some(x => x.name === l))
+              );
+              if (online.length === 0) {
+                reason = "no online self-hosted Linux runner";
+              } else {
+                // Count self-hosted Linux jobs that are queued or running in
+                // queued/in-progress runs: a running job occupies a tinybox
+                // slot just as much as a queued one. GitHub-hosted jobs
+                // — including this route job and bursted heavy jobs — don't
+                // match the self-hosted+Linux label filter, so they never
+                // inflate the depth. Sibling-repo probe failures are the
+                // documented degraded mode (skip, contribute 0); a failure
+                // on this repo's own probe means the depth is unknowable,
+                // so it rethrows into the fail-open burst path.
+                const owner = context.repo.owner;
+                const repos = ["intentd", "cloudlands-fe", "monorepo"];
+                let depth = 0;
+                for (const repo of repos) {
+                  try {
+                    for (const status of ["queued", "in_progress"]) {
+                      const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
+                      for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
+                        const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
+                        depth += jobs.data.jobs.filter(j => (j.status === "queued" || j.status === "in_progress") && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
+                      }
+                    }
+                  } catch (e) {
+                    if (repo === context.repo.repo) throw e;
+                    core.info(`queue probe skipped ${repo}: ${e.message}`);
                   }
                 }
-              } catch (e) {
-                core.info(`queue probe skipped ${repo}: ${e.message}`);
+                useBurst = depth > threshold;
+                reason = `queue depth=${depth} threshold=${threshold} online=${online.length}`;
               }
+            } catch (e) {
+              useBurst = true;
+              reason = `probe failed (${e.message})`;
             }
-            const useBurst = depth > threshold;
-            core.info(`linux queue depth=${depth} threshold=${threshold} burst=${useBurst}`);
+            core.info(`linux routing: burst=${useBurst} (${reason})`);
             core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
             core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
             core.setOutput("linux_burst", String(useBurst));

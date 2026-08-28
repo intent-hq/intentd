@@ -48,7 +48,7 @@ concurrency:
 
 jobs:
   promote-to-beta:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
