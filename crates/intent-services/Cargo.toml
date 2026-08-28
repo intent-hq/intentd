@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.8.11"
+version = "0.8.12"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,19 +8,19 @@ license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.8.11" }
-intent-store = { path = "../intent-store", version = "0.8.11" }
-intent-git = { path = "../intent-git", version = "0.8.11" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.8.11" }
-intent-linear = { path = "../intent-linear", version = "0.8.11" }
-intent-sentry = { path = "../intent-sentry", version = "0.8.11" }
+intent-core = { path = "../intent-core", version = "0.8.12" }
+intent-store = { path = "../intent-store", version = "0.8.12" }
+intent-git = { path = "../intent-git", version = "0.8.12" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.8.12" }
+intent-linear = { path = "../intent-linear", version = "0.8.12" }
+intent-sentry = { path = "../intent-sentry", version = "0.8.12" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.8.11" }
-intent-js = { path = "../intent-js", version = "0.8.11" }
-intent-context = { path = "../intent-context", version = "0.8.11" }
-intent-providers = { path = "../intent-providers", version = "0.8.11" }
-intent-pty = { path = "../intent-pty", version = "0.8.11" }
-intent-search = { path = "../intent-search", version = "0.8.11" }
+intent-acp = { path = "../intent-acp", version = "0.8.12" }
+intent-js = { path = "../intent-js", version = "0.8.12" }
+intent-context = { path = "../intent-context", version = "0.8.12" }
+intent-providers = { path = "../intent-providers", version = "0.8.12" }
+intent-pty = { path = "../intent-pty", version = "0.8.12" }
+intent-search = { path = "../intent-search", version = "0.8.12" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
