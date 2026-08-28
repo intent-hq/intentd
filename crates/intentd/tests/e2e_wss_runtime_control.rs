@@ -772,6 +772,99 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     );
 }
 
+/// `system.requestUpdate` over the real WSS transport (PROTOCOL §5.7, v8.6):
+/// remote callers ARE allowed (unlike `system.shutdown` — a remote client is
+/// exactly who needs to trigger an update). Unsupervised (no sitter pidfile,
+/// or a pidfile naming a live process that is NOT an `intentd-sitter`) the
+/// daemon answers `-32603` with the reason; with a live `intentd-sitter` pid
+/// recorded in `<data_dir>/sitter/sitter.pid` it answers `{ ok: true }` and
+/// delivers SIGUSR1 to that process (proven by the stand-in child's exit
+/// signal).
+#[tokio::test]
+async fn wss_system_request_update_signals_the_sitter() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let _daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // No sitter pidfile ⇒ the daemon is not supervised: -32603 with the reason.
+    let resp = wss_rpc(&mut ws, 41, "system.requestUpdate", json!({})).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 41);
+    assert_eq!(resp["error"]["code"], -32603, "response: {resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .expect("message is string")
+            .contains("not supervised"),
+        "message names the cause: {resp}"
+    );
+
+    let sitter_dir = data_dir.join("sitter");
+    std::fs::create_dir_all(&sitter_dir).expect("mkdir sitter dir");
+
+    // A pidfile naming a live process that is NOT an intentd-sitter (a stale
+    // pid the OS recycled) ⇒ still not supervised — never a signal target.
+    let mut not_sitter = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn non-sitter process");
+    std::fs::write(
+        sitter_dir.join("sitter.pid"),
+        format!("{}\n", not_sitter.id()),
+    )
+    .expect("write sitter pidfile");
+    let resp = wss_rpc(&mut ws, 42, "system.requestUpdate", json!({})).await;
+    assert_eq!(resp["error"]["code"], -32603, "response: {resp}");
+    not_sitter.kill().expect("kill non-sitter");
+    not_sitter.wait().expect("wait non-sitter");
+
+    // Stand-in "sitter" that passes the identity check: sleep symlinked as
+    // intentd-sitter (the process name follows the executed path's basename).
+    // SIGUSR1's default disposition terminates the child, so its exit signal
+    // proves the daemon delivered the signal.
+    let sleep_bin = ["/bin/sleep", "/usr/bin/sleep"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .expect("sleep binary");
+    let sitter_bin = sitter_dir.join("intentd-sitter");
+    std::os::unix::fs::symlink(sleep_bin, &sitter_bin).expect("symlink stand-in sitter");
+    let mut sitter = std::process::Command::new(&sitter_bin)
+        .arg("30")
+        .spawn()
+        .expect("spawn stand-in sitter");
+    std::fs::write(sitter_dir.join("sitter.pid"), format!("{}\n", sitter.id()))
+        .expect("write sitter pidfile");
+
+    let resp = wss_rpc(&mut ws, 43, "system.requestUpdate", json!({})).await;
+    assert_eq!(resp["id"], 43);
+    assert_eq!(resp["result"], json!({ "ok": true }), "response: {resp}");
+
+    let status = sitter.wait().expect("wait stand-in sitter");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGUSR1),
+        "stand-in sitter must be terminated by SIGUSR1"
+    );
+}
+
 #[tokio::test]
 async fn wss_system_status_reports_budget_fields_when_installed() {
     // With `agents.memoryBudgetMb` set, system.status carries the aggregate

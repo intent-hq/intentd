@@ -238,8 +238,9 @@ impl ConnSubs {
 }
 
 /// Route one frame: deliver replies to daemon-initiated reverse RPCs (§12.4),
-/// then intercept the `system.*` control methods (`system.status` on both
-/// transports; `system.shutdown`/`system.importLegacy` UDS-only via the
+/// then intercept the `system.*` control methods (`system.status` and
+/// `system.requestUpdate` on both transports;
+/// `system.shutdown`/`system.importLegacy` UDS-only via the
 /// `is_uds` guard inside `control::handle`), the `host.status` capability
 /// probe (both transports), the `forward.*` port-forwarding methods, and the
 /// `events.` fast-path, else hand to the JSON-RPC dispatcher. `control` is
