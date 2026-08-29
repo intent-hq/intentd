@@ -158,10 +158,21 @@ pub(crate) fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
 /// ([`intent_core::token_usage_reported`]) —
 /// silently losing real consumption from the session tally and the hourly
 /// stats delta. The total is preserved as degraded INPUT-attributed usage:
-/// the synthesized figure is the context fill after the last request,
-/// which is input-dominated, and attributing it to one existing counter
-/// keeps the wire/store shape unchanged while the standard all-counter
-/// sum still equals the reported total exactly.
+/// the synthesized figure is the context fill-up DELTA —
+/// `fill_to_context_window()` sets the forwarded `last_token_usage.
+/// total_tokens` to `max(0, context_window − previous_total)`; the full
+/// window arrives only via `full_context_window()` on fresh info — which
+/// is unaccounted context growth and thus input-dominated, and attributing
+/// it to one existing counter keeps the wire/store shape unchanged while
+/// the standard all-counter sum still equals the reported total exactly.
+/// A delta also composes safely with codex's `LastRequest` SUM semantics
+/// (no over-count on repeated context-limit turns; a zero delta stays
+/// all-zero, i.e. still "no report"). Should a Cumulative-semantics
+/// provider ever emit this shape, the preserved total would REPLACE the
+/// snapshot input-attributed and the next report's per-counter clamped
+/// delta could misattribute between counters for that one turn — accepted
+/// degraded behavior; no known Cumulative provider emits totals-only
+/// reports.
 ///
 /// **Recreate baseline** (monorepo#737): the stored snapshot is cumulative
 /// per *ACP* session (in every semantics mode), so when the
