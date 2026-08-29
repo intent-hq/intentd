@@ -101,8 +101,8 @@ const USD_TICKS_PER_USD: f64 = 1e10;
 /// `PromptResponse._meta.usage` (`PromptUsage` with its `PromptUsageModel`
 /// totals flattened in; camelCase; every counter `#[serde(default)]`).
 /// Audited @ xai-org/grok-build `bc7f02e` (v1.0.12) — audit §8.2. Unknown
-/// siblings (`modelUsage`, `numTurns`, `usageIsIncomplete`, `modelCalls`,
-/// `apiDurationMs`, …) are ignored.
+/// siblings (`modelUsage`, `numTurns`, `modelCalls`, `apiDurationMs`, …) are
+/// ignored.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct GrokPromptUsage {
@@ -120,6 +120,10 @@ struct GrokPromptUsage {
     /// Belt-and-braces: grok stamps this when any shown cost is a partial
     /// sum; a partial figure is untrustworthy, drop it like an absent one.
     cost_is_partial: bool,
+    /// Stamped when any model-usage entry in the bill is incomplete; the
+    /// wire contract treats the cost as untrustworthy whenever this is set,
+    /// independently of `costIsPartial` — same drop-the-cost handling.
+    usage_is_incomplete: bool,
 }
 
 /// Parse grok's `_meta.usage` whole-prompt bill into a standard end-of-turn
@@ -141,11 +145,11 @@ struct GrokPromptUsage {
 pub(crate) fn prompt_meta_usage_bill(meta: &Meta) -> Option<(Usage, Option<UsageCost>)> {
     let bill: GrokPromptUsage = serde_json::from_value(meta.get("usage")?.clone()).ok()?;
     // Trustworthy cost only: grok scrubs untrustworthy ticks to absent and
-    // "absent when scrubbed, missing, or zero on the wire" — so non-positive
-    // or partial figures count as no cost at all, never as $0.
+    // "absent when scrubbed, missing, or zero on the wire" — so non-positive,
+    // partial, or incomplete-bill figures count as no cost at all, never $0.
     let cost_ticks = bill
         .cost_usd_ticks
-        .filter(|&ticks| ticks > 0 && !bill.cost_is_partial);
+        .filter(|&ticks| ticks > 0 && !bill.cost_is_partial && !bill.usage_is_incomplete);
     let empty = bill.input_tokens == 0
         && bill.output_tokens == 0
         && bill.cached_read_tokens == 0
@@ -333,6 +337,22 @@ mod tests {
         }));
         let (_, cost) = prompt_meta_usage_bill(&meta).expect("tokens parsed");
         assert!(cost.is_none(), "partial cost is untrustworthy → dropped");
+    }
+
+    #[test]
+    fn grok_incomplete_bill_cost_is_dropped() {
+        // `usageIsIncomplete` marks the whole bill's cost untrustworthy
+        // independently of `costIsPartial`: tokens still record, cost is
+        // absent — never persisted as an authoritative charge.
+        let meta = grok_meta(serde_json::json!({
+            "inputTokens": 100,
+            "outputTokens": 50,
+            "costUsdTicks": 100_000_000i64,
+            "usageIsIncomplete": true
+        }));
+        let (usage, cost) = prompt_meta_usage_bill(&meta).expect("tokens parsed");
+        assert_eq!(usage.input_tokens, 100);
+        assert!(cost.is_none(), "incomplete bill cost dropped, not $0.01");
     }
 
     #[test]

@@ -13679,6 +13679,200 @@ async fn usage_update_cost_captured_over_wss() {
     assert_eq!(usage["totals"]["inputTokens"], 100);
 }
 
+/// Pin the `grok` provider binary to a wrapper around the mock ACP fixture
+/// via the highest-precedence `providers.paths` config tier, so the test is
+/// hermetic even when a real grok install exists. Mirrors the cross-provider
+/// history e2e's setup.
+fn seed_grok_path_override(data_dir: &Path, script: &str) {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
+    let wrapper = data_dir.join("fake-grok");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nexec \"{}\" \"{script}\"\n", node.display()),
+    )
+    .expect("write wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod wrapper");
+    let path = data_dir.join("config.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let _ = writeln!(
+        text,
+        "\n[providers.paths]\ngrok = \"{}\"",
+        wrapper.display()
+    );
+    std::fs::write(&path, text).expect("write config.toml");
+}
+
+/// grok's `_meta.usage` whole-prompt bill over the real WSS transport
+/// (intent-hq/intent#3803): the provider never sends the standard
+/// `PromptResponse.usage` field — its bill rides `_meta.usage` (inputTokens
+/// INCLUDING cache reads, costUsdTicks at 1e10/$). The daemon must
+/// synthesize the per-turn report at the turn-end seam, normalize to the
+/// disjoint buckets, and emit `workspace:tokenUsage-changed` with tokens AND
+/// cost; a second turn's bill SUMS (tokens and cost) — never REPLACEs — and
+/// `workspace.getTokenUsage` returns the same tally over the wire.
+#[tokio::test]
+async fn grok_meta_usage_bill_captured_over_wss() {
+    let Some(script) = gate("WSS grok _meta.usage E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    seed_grok_path_override(&data_dir, &script);
+    // No standard `usage` field on either turn — only the `_meta` bill, in
+    // grok's captured shape (sibling last-call fields + context-occupancy
+    // totalTokens that must NOT be read). Turn 1: 5000 input incl. 3000
+    // cache reads, $0.025. Turn 2 (rule): a SMALLER bill, $0.005.
+    let behavior = json!({
+        "response": "grok turn one",
+        "promptMeta": {
+            "sessionId": "sess-1",
+            "totalTokens": 999_999,
+            "modelId": "grok-code-1",
+            "inputTokens": 11,
+            "outputTokens": 7,
+            "usage": {
+                "inputTokens": 5000,
+                "outputTokens": 1200,
+                "totalTokens": 6200,
+                "cachedReadTokens": 3000,
+                "reasoningTokens": 0,
+                "costUsdTicks": 250_000_000i64,
+                "numTurns": 1,
+            },
+        },
+        "rules": [{
+            "ifPromptContains": "SECOND_TURN",
+            "response": "grok turn two",
+            "promptMeta": {
+                "usage": {
+                    "inputTokens": 1000,
+                    "outputTokens": 300,
+                    "totalTokens": 1300,
+                    "costUsdTicks": 50_000_000i64,
+                },
+            },
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so no event is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:tokenUsage-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "GrokBill", "model": "grok:grok-code-1" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Turn 1 — tokens synthesized from the _meta bill land on the event,
+    // normalized to disjoint buckets (input MINUS cache reads), with the
+    // ticks converted to USD.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage 1 ok: {sent}");
+    let ev1 = wss_event(&mut sub, 30).await;
+    let ev1 = &ev1["params"]["event"];
+    assert_eq!(ev1["type"], "workspace:tokenUsage-changed");
+    let totals1 = &ev1["data"]["tokenUsage"]["totals"];
+    assert_eq!(
+        totals1["inputTokens"], 2000,
+        "5000 minus 3000 cache reads (disjoint buckets): {ev1}"
+    );
+    assert_eq!(totals1["outputTokens"], 1200);
+    assert_eq!(totals1["cacheReadTokens"], 3000);
+    assert_eq!(totals1["cost"]["amount"], 0.025, "ticks / 1e10: {ev1}");
+    assert_eq!(totals1["cost"]["currency"], "USD");
+
+    // Turn 2 — the smaller whole-prompt bill SUMS on top: tokens AND cost.
+    let sent2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SECOND_TURN please" }),
+    )
+    .await;
+    assert_eq!(sent2["success"], true, "sendMessage 2 ok: {sent2}");
+    let ev2 = wss_event(&mut sub, 30).await;
+    let totals2 = &ev2["params"]["event"]["data"]["tokenUsage"]["totals"];
+    assert_eq!(
+        totals2["inputTokens"], 3000,
+        "whole-prompt bills SUM (2000 + 1000), never REPLACE: {ev2}"
+    );
+    assert_eq!(totals2["outputTokens"], 1500);
+    let cost2 = totals2["cost"]["amount"].as_f64().expect("cost amount");
+    assert!(
+        (cost2 - 0.03).abs() < 1e-12,
+        "per-prompt costs SUM ($0.025 + $0.005), got {cost2}: {ev2}"
+    );
+
+    // workspace.getTokenUsage over WSS returns the same durable tally (§5.23).
+    let read = wss_rpc(
+        &mut rpc,
+        13,
+        "workspace.getTokenUsage",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let usage = &read["tokenUsage"];
+    assert_eq!(usage["totals"]["inputTokens"], 3000, "read: {read}");
+    let read_cost = usage["totals"]["cost"]["amount"]
+        .as_f64()
+        .expect("cost amount");
+    assert!((read_cost - 0.03).abs() < 1e-12, "read cost: {read}");
+    assert_eq!(usage["byAgentId"][&agent_id]["inputTokens"], 3000);
+}
+
 /// Title-preserving tool updates (the claude-code "Run" collapse): ACP
 /// `tool_call_update`s carry **only changed fields** — a richer title/input
 /// arrives on one update, later status-only updates carry no title at all.
