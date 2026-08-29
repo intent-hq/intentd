@@ -147,7 +147,7 @@ impl WatcherRegistry {
             Ok(ws) => ws
                 .into_iter()
                 .filter_map(|ws| {
-                    let root = ws.path.clone().or_else(|| ws.worktree_path.clone())?;
+                    let root = ws.effective_path()?.to_string();
                     let path = PathBuf::from(&root);
                     path.is_dir().then_some((ws.id, path))
                 })
@@ -896,6 +896,36 @@ mod tests {
 
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
         assert!(ev.is_some(), "boot-time workspace must emit file events");
+    }
+
+    /// The startup snapshot resolves `repositoryPath` as the final fallback
+    /// (monorepo#3778): a direct-checkout workspace persisting only
+    /// `repositoryPath` that exists at daemon start must be watched, not
+    /// silently skipped on every restart.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn boot_time_repository_only_workspace_is_watched() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let root = TempDir::new("boot-repo");
+        let mut ws = chief_workspace();
+        ws.id = WorkspaceId::from("ws-boot-repo");
+        ws.title = "ws-boot-repo".to_string();
+        ws.repository_path = Some(root.path.to_string_lossy().into_owned());
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
+
+        std::fs::write(root.path.join("hello.txt"), "hi").expect("write file");
+
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
+        assert!(
+            ev.is_some(),
+            "boot-time repository-only workspace must emit file events"
+        );
     }
 
     #[tokio::test]

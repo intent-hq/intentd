@@ -8350,7 +8350,7 @@ fn derive_agent_type(
 ) -> String {
     if let Some(specialist) = session.specialist.as_deref().filter(|s| !s.is_empty()) {
         let workspace_path = workspace
-            .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+            .and_then(intent_core::Workspace::effective_path)
             .map(PathBuf::from);
         if let Some(agent_type) =
             services.specialist_agent_type(specialist, workspace_path.as_deref())
@@ -8374,7 +8374,7 @@ fn derive_is_orchestrator(
     workspace: Option<&intent_core::Workspace>,
 ) -> bool {
     let workspace_path = workspace
-        .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+        .and_then(intent_core::Workspace::effective_path)
         .map(PathBuf::from);
     services.session_specialist_is_orchestrator(session, workspace_path.as_deref())
 }

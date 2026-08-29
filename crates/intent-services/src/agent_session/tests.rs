@@ -7900,3 +7900,45 @@ async fn resolve_session_is_orchestrator_prefers_frozen_snapshot() {
         "a true snapshot holds without a resolvable specialist file"
     );
 }
+
+/// Legacy live resolution (no frozen snapshot) resolves the project tier via
+/// the workspace's `repositoryPath` fallback (monorepo#3778): a
+/// direct-checkout workspace persisting only `repositoryPath` still finds an
+/// orchestrator-role specialist under `<repo>/.intent/specialists/`.
+#[tokio::test]
+async fn resolve_session_is_orchestrator_project_tier_via_repository_path() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+
+    let repo = crate::tests::test_tempdir("intentd-orch-repo-");
+    let project_dir = repo.path().join(".intent").join("specialists");
+    std::fs::create_dir_all(&project_dir).expect("project specialists dir");
+    std::fs::write(
+        project_dir.join("custom-orch.md"),
+        "---\nname: \"Custom Orch\"\ndescription: \"d\"\nrole: \"orchestrator\"\n---\n\nbody",
+    )
+    .expect("write specialist");
+
+    let ws2 = WorkspaceId::from("ws-repo-only-orch");
+    let mut row = workspace(&ws2);
+    row.repository_path = Some(repo.path().to_string_lossy().into_owned());
+    services
+        .store
+        .insert_workspace(&row)
+        .await
+        .expect("insert ws2");
+
+    let mut stored = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    stored.workspace_id = ws2;
+    stored.specialist = Some("custom-orch".to_string());
+    stored.metadata = None;
+    assert!(
+        services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await,
+        "project-tier orchestrator must resolve via repositoryPath fallback"
+    );
+}
