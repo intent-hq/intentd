@@ -66,7 +66,9 @@ fn temp_data_dir() -> PathBuf {
     dir
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+/// Shared `serve` setup: hermetic dirs, log redirection, env. Used by the
+/// direct spawn and the stand-in-sitter wrapper spawn below.
+fn configure_serve(cmd: &mut Command, data_dir: &Path, listen: &str, env: &[(&str, &str)]) {
     use std::fs::OpenOptions;
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     // Append to daemon.log instead of truncating, so multi-boot tests preserve all logs
@@ -80,9 +82,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -90,7 +90,48 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
+}
+
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve");
+    configure_serve(&mut cmd, data_dir, listen, env);
     cmd.spawn().expect("spawn intentd serve")
+}
+
+/// Spawn `intentd serve` as the CHILD of a stand-in sitter: `sitter_bin` (a
+/// shell symlinked as `intentd-sitter`, so the process name follows the
+/// executed path's basename) backgrounds the daemon, records the daemon's pid
+/// in `daemon_pid_path`, and waits. The returned child (the wrapper) is thus
+/// both sitter-named AND the daemon's parent — the conjunction
+/// `signal_sitter_update` requires.
+fn spawn_serve_under_stand_in_sitter(
+    data_dir: &Path,
+    listen: &str,
+    env: &[(&str, &str)],
+    sitter_bin: &Path,
+    daemon_pid_path: &Path,
+) -> Child {
+    let mut cmd = Command::new(sitter_bin);
+    cmd.arg("-c")
+        .arg(r#""$1" serve & echo "$!" > "$2"; wait"#)
+        .arg("intentd-sitter")
+        .arg(env!("CARGO_BIN_EXE_intentd"))
+        .arg(daemon_pid_path);
+    configure_serve(&mut cmd, data_dir, listen, env);
+    cmd.spawn().expect("spawn stand-in sitter wrapper")
+}
+
+/// SIGKILLs a raw pid on drop — cleanup for the daemon grandchild, which
+/// survives its wrapper parent's death and is not reachable via `Child`.
+struct KillPidOnDrop(i32);
+
+impl Drop for KillPidOnDrop {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+        }
+    }
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -774,25 +815,50 @@ async fn wss_system_status_includes_capacity_version_uptime() {
 
 /// `system.requestUpdate` over the real WSS transport (PROTOCOL §5.7, v8.6):
 /// remote callers ARE allowed (unlike `system.shutdown` — a remote client is
-/// exactly who needs to trigger an update). Unsupervised (no sitter pidfile,
-/// or a pidfile naming a live process that is NOT an `intentd-sitter`) the
-/// daemon answers `-32603` with the reason; with a live `intentd-sitter` pid
-/// recorded in `<data_dir>/sitter/sitter.pid` it answers `{ ok: true }` and
-/// delivers SIGUSR1 to that process (proven by the stand-in child's exit
-/// signal).
+/// exactly who needs to trigger an update). Supervision requires BOTH signals
+/// — the pidfile pid must be the daemon's direct parent AND a sitter-named
+/// process (`intentd-sitter` in dev, `intentd` after the packaged rename) —
+/// so the daemon here runs as the child of a shell symlinked as
+/// `intentd-sitter` (the process name follows the executed path's basename).
+/// Unsupervised (no sitter pidfile, a live non-sitter pid, or a sitter-named
+/// pid that is not the parent) the daemon answers `-32603` with the reason;
+/// with the wrapper's pid recorded in `<data_dir>/sitter/sitter.pid` it
+/// answers `{ ok: true }` and delivers SIGUSR1 to it (proven by the
+/// wrapper's exit signal — SIGUSR1's default disposition terminates).
 #[tokio::test]
 async fn wss_system_request_update_signals_the_sitter() {
     use std::os::unix::process::ExitStatusExt;
 
     let data_dir = temp_data_dir();
+    let sitter_dir = data_dir.join("sitter");
+    std::fs::create_dir_all(&sitter_dir).expect("mkdir sitter dir");
+    let sitter_bin = sitter_dir.join("intentd-sitter");
+    std::os::unix::fs::symlink("/bin/sh", &sitter_bin).expect("symlink stand-in sitter shell");
+    let daemon_pid_path = sitter_dir.join("daemon.pid");
+
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
-    let _daemon = Daemon {
-        child: spawn_serve(&data_dir, "both", &env),
+    let mut daemon = Daemon {
+        child: spawn_serve_under_stand_in_sitter(
+            &data_dir,
+            "both",
+            &env,
+            &sitter_bin,
+            &daemon_pid_path,
+        ),
         data_dir: data_dir.clone(),
         cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
+    // The wrapper wrote the daemon's pid before the daemon could bind the UDS
+    // socket; the guard SIGKILLs the daemon grandchild on drop — it outlives
+    // its wrapper parent and is not reachable via the wrapper's `Child`.
+    let daemon_pid: i32 = std::fs::read_to_string(&daemon_pid_path)
+        .expect("read daemon pid file")
+        .trim()
+        .parse()
+        .expect("daemon pid is an integer");
+    let _kill_daemon = KillPidOnDrop(daemon_pid);
 
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
     let port =
@@ -817,11 +883,9 @@ async fn wss_system_request_update_signals_the_sitter() {
         "message names the cause: {resp}"
     );
 
-    let sitter_dir = data_dir.join("sitter");
-    std::fs::create_dir_all(&sitter_dir).expect("mkdir sitter dir");
-
-    // A pidfile naming a live process that is NOT an intentd-sitter (a stale
-    // pid the OS recycled) ⇒ still not supervised — never a signal target.
+    // A pidfile naming a live process that is neither sitter-named nor the
+    // daemon's parent (a stale pid the OS recycled) ⇒ still not supervised —
+    // never a signal target.
     let mut not_sitter = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
@@ -836,32 +900,43 @@ async fn wss_system_request_update_signals_the_sitter() {
     not_sitter.kill().expect("kill non-sitter");
     not_sitter.wait().expect("wait non-sitter");
 
-    // Stand-in "sitter" that passes the identity check: sleep symlinked as
-    // intentd-sitter (the process name follows the executed path's basename).
-    // SIGUSR1's default disposition terminates the child, so its exit signal
-    // proves the daemon delivered the signal.
+    // A live process that IS sitter-named but is NOT the daemon's parent (a
+    // recycled pid landing on an unrelated sitter-named process) ⇒ rejected:
+    // the name alone is not proof of supervision.
     let sleep_bin = ["/bin/sleep", "/usr/bin/sleep"]
         .iter()
         .find(|p| Path::new(p).exists())
         .expect("sleep binary");
-    let sitter_bin = sitter_dir.join("intentd-sitter");
-    std::os::unix::fs::symlink(sleep_bin, &sitter_bin).expect("symlink stand-in sitter");
-    let mut sitter = std::process::Command::new(&sitter_bin)
+    let decoy_dir = sitter_dir.join("decoy");
+    std::fs::create_dir_all(&decoy_dir).expect("mkdir decoy dir");
+    let decoy_bin = decoy_dir.join("intentd-sitter");
+    std::os::unix::fs::symlink(sleep_bin, &decoy_bin).expect("symlink decoy sitter");
+    let mut decoy = std::process::Command::new(&decoy_bin)
         .arg("30")
         .spawn()
-        .expect("spawn stand-in sitter");
-    std::fs::write(sitter_dir.join("sitter.pid"), format!("{}\n", sitter.id()))
+        .expect("spawn decoy sitter");
+    std::fs::write(sitter_dir.join("sitter.pid"), format!("{}\n", decoy.id()))
         .expect("write sitter pidfile");
-
     let resp = wss_rpc(&mut ws, 43, "system.requestUpdate", json!({})).await;
-    assert_eq!(resp["id"], 43);
+    assert_eq!(resp["error"]["code"], -32603, "response: {resp}");
+    decoy.kill().expect("kill decoy sitter");
+    decoy.wait().expect("wait decoy sitter");
+
+    // The wrapper's pid — sitter-named AND the daemon's parent ⇒ signaled.
+    std::fs::write(
+        sitter_dir.join("sitter.pid"),
+        format!("{}\n", daemon.child.id()),
+    )
+    .expect("write sitter pidfile");
+    let resp = wss_rpc(&mut ws, 44, "system.requestUpdate", json!({})).await;
+    assert_eq!(resp["id"], 44);
     assert_eq!(resp["result"], json!({ "ok": true }), "response: {resp}");
 
-    let status = sitter.wait().expect("wait stand-in sitter");
+    let status = daemon.child.wait().expect("wait stand-in sitter wrapper");
     assert_eq!(
         status.signal(),
         Some(libc::SIGUSR1),
-        "stand-in sitter must be terminated by SIGUSR1"
+        "stand-in sitter wrapper must be terminated by SIGUSR1"
     );
 }
 

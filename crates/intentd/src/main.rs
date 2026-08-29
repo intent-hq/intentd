@@ -3610,29 +3610,29 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
-/// Whether the live process at `pid` is the supervising sitter. SIGUSR1's
-/// default disposition terminates, so a stale pidfile whose pid the OS
-/// recycled to an unrelated process must read as "not supervised" — never
-/// as a signal target. Two guards, strongest first:
+/// Whether the process at `pid` is the supervising sitter: true exactly when
+/// BOTH signals hold — `pid` equals the daemon's parent pid AND the process
+/// at that pid carries a sitter binary name. SIGUSR1's default disposition
+/// terminates, so an unrelated process must never be a signal target, and
+/// neither signal is safe alone:
 ///
-/// 1. `pid == expected_parent` (the daemon's own parent pid): the serve-mode
-///    sitter spawns the daemon directly (see intentd-sitter's supervisor),
-///    so the supervising sitter is our parent, and `getppid` always names a
-///    live process — a recycled pid cannot pass this check.
-/// 2. Process-table name fallback, like the liveness probe a signal-0 alone
-///    cannot provide: `intentd-sitter` is the dev-build binary name, and
-///    packaging renames the sitter to `intentd` at release time (it is the
-///    binary users install — see intentd-sitter's crate docs and
-///    packaging/homebrew, scripts/install.sh, scripts/build-deb.sh). Our own
-///    pid is excluded: the daemon binary shares the `intentd` name, and a
-///    stale pidfile must never make the daemon SIGUSR1 itself.
+/// - Parent equality alone proves direction, not identity: a daemon launched
+///   without a sitter (shell, service manager) next to a stale pidfile whose
+///   recycled pid happens to equal that parent would signal the unrelated
+///   parent. The serve-mode sitter always spawns the daemon directly (see
+///   intentd-sitter's supervisor), so requiring parenthood is still the
+///   pid-recycling guard — `getppid` always names a live process.
+/// - The name alone identifies nothing: `intentd-sitter` is only the
+///   dev-build name — packaging renames the sitter binary to `intentd` at
+///   release time (see intentd-sitter's crate docs, packaging/homebrew,
+///   scripts/install.sh, scripts/build-deb.sh), the exact basename the
+///   daemon and one-shot sitter commands also run under, so a recycled
+///   pidfile pid pointing at another `intentd` process would pass a pure
+///   name check.
 #[cfg(unix)]
 fn pid_is_sitter(pid: u32, expected_parent: u32) -> bool {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-    if pid == expected_parent {
-        return true;
-    }
-    if pid == std::process::id() {
+    if pid != expected_parent {
         return false;
     }
     let pid = sysinfo::Pid::from_u32(pid);
@@ -3649,15 +3649,15 @@ fn pid_is_sitter(pid: u32, expected_parent: u32) -> bool {
 }
 
 /// `system.requestUpdate` (§5.7): find the supervising sitter via its pidfile
-/// (`<data_dir>/sitter/sitter.pid`), verify the recorded pid is a live
-/// sitter — the daemon's direct parent, or a process named `intentd-sitter`
-/// (dev build) / `intentd` (packaged rename; see `pid_is_sitter`) — and send
-/// it SIGUSR1, the sitter's "check for updates now" signal. `Err` carries
-/// the reason when the daemon is not sitter-supervised
-/// (missing/unparsable/stale/recycled pidfile) or the signal cannot be
-/// delivered. The pid range is clamped to `1..=i32::MAX` like
-/// `lock_holder_detail`: 0 probes our own process group and larger values go
-/// negative in the `i32` cast (`4294967295` → `-1`, the
+/// (`<data_dir>/sitter/sitter.pid`), verify the recorded pid is the
+/// supervising sitter — the daemon's direct parent AND named
+/// `intentd-sitter` (dev build) or `intentd` (packaged rename; see
+/// `pid_is_sitter`) — and send it SIGUSR1, the sitter's "check for updates
+/// now" signal. `Err` carries the reason when the daemon is not
+/// sitter-supervised (missing/unparsable/stale/recycled pidfile) or the
+/// signal cannot be delivered. The pid range is clamped to `1..=i32::MAX`
+/// like `lock_holder_detail`: 0 probes our own process group and larger
+/// values go negative in the `i32` cast (`4294967295` → `-1`, the
 /// signal-every-process-we-can broadcast target).
 #[cfg(unix)]
 fn signal_sitter_update(pid_path: &Path) -> Result<(), String> {
@@ -3673,7 +3673,7 @@ fn signal_sitter_update_with_parent(pid_path: &Path, expected_parent: u32) -> Re
         .filter(|pid| (1..=i32::MAX as u32).contains(pid) && pid_is_sitter(*pid, expected_parent))
         .ok_or_else(|| {
             format!(
-                "daemon is not supervised by intentd-sitter (no live intentd-sitter pid in {})",
+                "daemon is not supervised by intentd-sitter (pid in {} is not the daemon's parent)",
                 pid_path.display()
             )
         })?;
@@ -5674,11 +5674,11 @@ mod tests {
         assert_eq!(banner_build_commit(None), "unknown");
     }
 
-    /// A stand-in "sitter" the `pid_is_sitter` name check accepts: `sleep`
-    /// symlinked as `name` (the process name follows the executed path's
-    /// basename) — `intentd-sitter` for the dev build, `intentd` for the
-    /// packaged rename. SIGUSR1's default disposition is terminate, so the
-    /// child exiting on signal 10/30 proves delivery.
+    /// A stand-in "sitter": `sleep` symlinked as `name` (the process name
+    /// follows the executed path's basename) — `intentd-sitter` for the dev
+    /// build, `intentd` for the packaged rename. SIGUSR1's default
+    /// disposition is terminate, so the child exiting on signal 10/30
+    /// proves delivery.
     #[cfg(unix)]
     fn spawn_stand_in_sitter(dir: &Path, name: &str) -> std::process::Child {
         let sleep = ["/bin/sleep", "/usr/bin/sleep"]
@@ -5717,73 +5717,60 @@ mod tests {
         let err = signal_sitter_update(&path).unwrap_err();
         assert!(err.contains("not supervised"), "stale pid: {err}");
 
-        // A live pid that is NOT an intentd-sitter (a recycled stale pid) ⇒
-        // not supervised — never a signal target.
+        // A live pid that is not the daemon's parent (a recycled stale pid)
+        // ⇒ not supervised — never a signal target.
         let mut not_sitter = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
         std::fs::write(&path, not_sitter.id().to_string()).unwrap();
         let err = signal_sitter_update(&path).unwrap_err();
-        assert!(err.contains("not supervised"), "live non-sitter pid: {err}");
+        assert!(err.contains("not supervised"), "live non-parent pid: {err}");
         not_sitter.kill().unwrap();
         not_sitter.wait().unwrap();
     }
 
+    /// Acceptance requires BOTH signals: a live process named
+    /// `intentd-sitter` (dev) or `intentd` (packaged rename) is rejected
+    /// when it is not the daemon's parent — the daemon and one-shot sitter
+    /// commands run under the same `intentd` basename, so a recycled pid
+    /// could too — and signaled once it is also injected as the expected
+    /// parent.
     #[cfg(unix)]
     #[test]
-    fn signal_sitter_update_signals_the_live_pidfile_process() {
+    fn signal_sitter_update_requires_both_parenthood_and_sitter_name() {
         use std::os::unix::process::ExitStatusExt;
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sitter.pid");
-        let mut child = spawn_stand_in_sitter(dir.path(), "intentd-sitter");
-        std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+        for name in ["intentd-sitter", "intentd"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sitter.pid");
+            let mut child = spawn_stand_in_sitter(dir.path(), name);
+            std::fs::write(&path, format!("{}\n", child.id())).unwrap();
 
-        signal_sitter_update(&path).expect("live sitter pid is signaled");
+            // Sitter name but not the daemon's parent ⇒ rejected.
+            let err = signal_sitter_update(&path).unwrap_err();
+            assert!(err.contains("not supervised"), "{name}: {err}");
 
-        let status = child.wait().unwrap();
-        assert_eq!(
-            status.signal(),
-            Some(nix::sys::signal::Signal::SIGUSR1 as i32),
-            "child must be terminated by SIGUSR1"
-        );
+            // Sitter name AND expected parent ⇒ signaled.
+            signal_sitter_update_with_parent(&path, child.id())
+                .unwrap_or_else(|e| panic!("{name} as parent is signaled: {e}"));
+
+            let status = child.wait().unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(nix::sys::signal::Signal::SIGUSR1 as i32),
+                "{name} child must be terminated by SIGUSR1"
+            );
+        }
     }
 
-    /// Regression: packaging renames the sitter binary to `intentd` (the
-    /// binary users install — see intentd-sitter's crate docs), so on a
-    /// packaged install the pidfile pid's process name is `intentd`, not
-    /// `intentd-sitter`. `system.requestUpdate` must still signal it.
+    /// Parent equality alone is not enough: a pidfile pid that matches the
+    /// daemon's parent but is not a sitter-named process (here a plain
+    /// `sleep`, standing in for a shell/service-manager parent next to a
+    /// stale recycled pidfile) must be rejected, never signaled.
     #[cfg(unix)]
     #[test]
-    fn signal_sitter_update_signals_the_renamed_production_sitter() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sitter.pid");
-        let mut child = spawn_stand_in_sitter(dir.path(), "intentd");
-        std::fs::write(&path, format!("{}\n", child.id())).unwrap();
-
-        signal_sitter_update(&path).expect("renamed production sitter pid is signaled");
-
-        let status = child.wait().unwrap();
-        assert_eq!(
-            status.signal(),
-            Some(nix::sys::signal::Signal::SIGUSR1 as i32),
-            "child must be terminated by SIGUSR1"
-        );
-    }
-
-    /// The serve-mode sitter spawns the daemon directly, so a pidfile pid
-    /// equal to the daemon's parent pid is accepted regardless of process
-    /// name — the strongest supervision proof. Stand-in "parent": a plain
-    /// `sleep` whose name matches no allowlist entry, injected as the
-    /// expected parent.
-    #[cfg(unix)]
-    #[test]
-    fn signal_sitter_update_accepts_the_daemons_parent_pid() {
-        use std::os::unix::process::ExitStatusExt;
-
+    fn signal_sitter_update_rejects_a_parent_that_is_not_a_sitter() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sitter.pid");
         let mut child = std::process::Command::new("sleep")
@@ -5792,15 +5779,11 @@ mod tests {
             .unwrap();
         std::fs::write(&path, format!("{}\n", child.id())).unwrap();
 
-        signal_sitter_update_with_parent(&path, child.id())
-            .expect("pid matching the daemon's parent is signaled");
+        let err = signal_sitter_update_with_parent(&path, child.id()).unwrap_err();
+        assert!(err.contains("not supervised"), "non-sitter parent: {err}");
 
-        let status = child.wait().unwrap();
-        assert_eq!(
-            status.signal(),
-            Some(nix::sys::signal::Signal::SIGUSR1 as i32),
-            "child must be terminated by SIGUSR1"
-        );
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
