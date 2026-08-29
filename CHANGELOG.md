@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.19] - 2026-08-29
+
+### 🐛 Bug Fixes
+
+- *(services)* Fail closed on empty containment root in file.* ops ([#1571](https://github.com/intent-hq/intentd/pull/1571))
+
+
 ## [0.8.18] - 2026-08-29
 
 ### 🐛 Bug Fixes
