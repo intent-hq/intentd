@@ -2797,6 +2797,102 @@ mod tests {
             .any(|c| c == "merge is no longer blocked"));
     }
 
+    /// `unknown` is a transient GitHub state ("still recomputing"), never an
+    /// actionable signal: `mergeable`/`mergeStateStatus` transitions TO
+    /// unknown are suppressed unconditionally — queued or not — so the
+    /// merge-queue processing blip (mergeable → null, mergeStateStatus →
+    /// UNKNOWN) never wakes the agent. Transitions FROM unknown to a known
+    /// value still report.
+    #[test]
+    fn diff_suppresses_mergeable_and_merge_state_transitions_to_unknown() {
+        // While queued: the recomputation blip produces no lines at all,
+        // whether the merge state reads as the literal UNKNOWN enum…
+        let queued = snapshot(|s| s.requirements.is_in_merge_queue = Some(true));
+        let queued_blip = snapshot(|s| {
+            s.requirements.is_in_merge_queue = Some(true);
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = Some("UNKNOWN".into());
+        });
+        assert!(diff_snapshots(&queued, &queued_blip).is_empty());
+        // …or as absent entirely.
+        let queued_none = snapshot(|s| {
+            s.requirements.is_in_merge_queue = Some(true);
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = None;
+        });
+        assert!(diff_snapshots(&queued, &queued_none).is_empty());
+
+        // Not queued: suppression is unconditional — the same blip stays
+        // quiet.
+        let base = snapshot(|_| {});
+        let blip = snapshot(|s| {
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = Some("UNKNOWN".into());
+        });
+        assert!(diff_snapshots(&base, &blip).is_empty());
+
+        // Settling FROM unknown at a known value still reports.
+        let known = snapshot(|s| s.requirements.mergeable = Some(false));
+        let changes = diff_snapshots(&blip, &known);
+        assert!(changes.iter().any(|c| c == "mergeable: unknown → false"));
+        assert!(changes
+            .iter()
+            .any(|c| c == "merge state: UNKNOWN → BLOCKED"));
+    }
+
+    /// The same transient recomputation also clears the DERIVED fields
+    /// (`hasConflicts` / `isBehind` / `mergeBlockedReason`): while the NEW
+    /// snapshot's mergeability is unknown, the clearing direction of those
+    /// lines is suppressed too — a DIRTY/BEHIND/blocked PR blipping to
+    /// UNKNOWN stays fully silent. A real clear to a known state still
+    /// reports, and the appearing direction reports even while unknown.
+    #[test]
+    fn diff_suppresses_derived_clears_while_mergeability_is_unknown() {
+        let dirty = snapshot(|s| {
+            s.requirements.has_conflicts = true;
+            s.requirements.is_behind = true;
+            s.requirements.mergeable = Some(false);
+            s.requirements.merge_state_status = Some("DIRTY".into());
+            s.requirements.merge_blocked_reason = Some("merge conflicts".into());
+        });
+        // DIRTY → UNKNOWN blip: the recomputation resets the derived fields
+        // alongside the raw ones; nothing reports.
+        let blip = snapshot(|s| {
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = Some("UNKNOWN".into());
+        });
+        assert!(diff_snapshots(&dirty, &blip).is_empty());
+        // Same with the merge state absent entirely.
+        let blip_none = snapshot(|s| {
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = None;
+        });
+        assert!(diff_snapshots(&dirty, &blip_none).is_empty());
+
+        // A real clear to a known state still reports all three.
+        let cleared = snapshot(|s| s.requirements.merge_state_status = Some("CLEAN".into()));
+        let changes = diff_snapshots(&dirty, &cleared);
+        assert!(changes.iter().any(|c| c == "merge conflicts resolved"));
+        assert!(changes
+            .iter()
+            .any(|c| c == "branch is no longer behind its base"));
+        assert!(changes.iter().any(|c| c == "merge is no longer blocked"));
+
+        // The appearing direction keeps reporting even while unknown.
+        let base = snapshot(|_| {});
+        let appearing = snapshot(|s| {
+            s.requirements.has_conflicts = true;
+            s.requirements.is_behind = true;
+            s.requirements.merge_blocked_reason = Some("blocked".into());
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = None;
+        });
+        let changes = diff_snapshots(&base, &appearing);
+        assert!(changes.iter().any(|c| c == "merge conflicts appeared"));
+        assert!(changes.iter().any(|c| c == "branch is now behind its base"));
+        assert!(changes.iter().any(|c| c == "merge blocked: blocked"));
+    }
+
     /// The ejection diff is keyed on the event identity (`at`): a new event
     /// fires (with the reason humanized, underscores → spaces), an unchanged
     /// event stays quiet, and an enter→eject pair that nets out on
