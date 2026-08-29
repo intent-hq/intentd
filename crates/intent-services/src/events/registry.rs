@@ -552,11 +552,17 @@ async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf
         .data
         .get("workspace")
         .and_then(|ws| {
-            ws.get("path")
-                .and_then(|v| v.as_str())
-                .or_else(|| ws.get("worktreePath").and_then(|v| v.as_str()))
-                .or_else(|| ws.get("repositoryPath").and_then(|v| v.as_str()))
-                .filter(|p| !p.is_empty())
+            // Per-step empty-string filtering, matching `effective_path()`:
+            // an empty candidate falls through to the next one rather than
+            // masking it.
+            let candidate = |key: &str| {
+                ws.get(key)
+                    .and_then(|v| v.as_str())
+                    .filter(|p| !p.is_empty())
+            };
+            candidate("path")
+                .or_else(|| candidate("worktreePath"))
+                .or_else(|| candidate("repositoryPath"))
         })
         .map(PathBuf::from);
 
@@ -756,6 +762,16 @@ mod tests {
 
         // Lookup arm (`workspace:opened` carries only the id).
         let ev = stored_event(lifecycle_event(WORKSPACE_OPENED, &ws, false));
+        assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
+
+        // Payload arm with an empty `path`: each candidate is filtered
+        // per-step, so an empty string falls through to `repositoryPath`
+        // instead of resolving the whole chain to `None`. The API is left
+        // empty so the lookup arm cannot compensate — the payload arm alone
+        // must resolve.
+        ws.path = Some(String::new());
+        let api = FakeApi::new(vec![]);
+        let ev = stored_event(lifecycle_event(WORKSPACE_CREATED, &ws, true));
         assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
     }
 
