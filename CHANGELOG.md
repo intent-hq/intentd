@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.20] - 2026-08-29
+
+### 🚀 Features
+
+- *(services)* Ingest usage_update used/size as context-occupancy signal ([#1574](https://github.com/intent-hq/intentd/pull/1574))
+
+### 🐛 Bug Fixes
+
+- *(services)* Normalize codex thoughtTokens to disjoint storage at ingestion ([#1572](https://github.com/intent-hq/intentd/pull/1572))
+
+
 ## [0.8.19] - 2026-08-29
 
 ### 🐛 Bug Fixes
