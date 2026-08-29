@@ -3946,6 +3946,14 @@ impl Services {
             // Per-turn `_meta.usage` bill (#3803): the fresh figure covers
             // one prompt — SUM with the stored session cost. `merge` also
             // covers the either-half-absent fallbacks.
+            //
+            // INVARIANT: SUM is safe only because a `reads_prompt_meta_usage`
+            // provider's costs all originate from per-turn meta bills — grok
+            // never emits `usage_update` costs (audit §8.1), so the cumulative
+            // figures `persist_cost_only_ordered` routes through here (and the
+            // seam's `turn_cost.or(cost)` preference) can never reach this
+            // branch. If grok ever grows `usage_update` costs, key this on the
+            // cost's SOURCE (meta bill vs usage_update), not the provider.
             UsageCost::merge(stored_cost.as_ref(), cost.as_ref())
         } else {
             // Cumulative `usage_update` cost: latest wins, stored fallback.
