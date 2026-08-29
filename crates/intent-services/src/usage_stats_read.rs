@@ -112,7 +112,9 @@ fn local_parts(row: &UsageStatsRow, utc: OffsetDateTime, tz: time::UtcOffset) ->
 /// The separate token counters (D6) for one aggregation cell: the four
 /// always-present counters plus reasoning ("thought") tokens, which follow
 /// the §5.23 `TokenUsageTotals` convention — omitted from the wire when zero,
-/// never `0`, never `null`.
+/// never `0`, never `null`. All five buckets are DISJOINT: providers whose
+/// wire `thoughtTokens` is a subset of `outputTokens` (codex, grok) have the
+/// subset carved out at ingestion (intent-hq/intent#3796).
 #[derive(Debug, Default, Clone, Copy)]
 struct TokenCell {
     input: u64,
@@ -131,6 +133,9 @@ impl TokenCell {
         self.thought += r.thought_tokens;
     }
 
+    /// The "total tokens" ranking sum (§5.36): all five counters. Safe to
+    /// sum because the stored buckets are disjoint — subset-reporting
+    /// providers are normalized at ingestion (intent-hq/intent#3796).
     fn total(&self) -> u64 {
         self.input + self.output + self.cache_read + self.cache_creation + self.thought
     }
@@ -761,9 +766,10 @@ mod tests {
     #[test]
     fn thought_tokens_count_toward_by_model_and_by_provider_ranking() {
         let now = parse("2026-07-25T10:00:00Z");
-        // thinker: 40 input + 30 thought = 70; plain: 60 input. The thought
-        // counter must count toward the "total tokens" ranking, putting
-        // thinker first.
+        // thinker: 40 input + 30 thought; plain: 60 input. Stored thought is
+        // DISJOINT from output (carved out at ingestion —
+        // intent-hq/intent#3796), so it counts toward the "total tokens"
+        // ranking — thinker (40 + 30 = 70) outranks plain (60).
         let mut thinker = prow("2026-07-10T14:00:00Z", "Opus 4.8", "claude-code", 40, 0);
         thinker.thought_tokens = 30;
         let plain = prow("2026-07-11T14:00:00Z", "GPT-6", "codex", 60, 0);
@@ -782,6 +788,20 @@ mod tests {
         assert_eq!(v["byModel"][1]["model"], "GPT-6");
         assert_eq!(v["byProvider"][0]["provider"], "claude-code");
         assert_eq!(v["byProvider"][1]["provider"], "codex");
+    }
+
+    /// The ranking sum convention itself: total = all five counters — safe
+    /// because the stored buckets are disjoint (intent-hq/intent#3796).
+    #[test]
+    fn total_sums_all_five_disjoint_counters() {
+        let cell = TokenCell {
+            input: 1,
+            output: 2,
+            cache_read: 4,
+            cache_creation: 8,
+            thought: 16,
+        };
+        assert_eq!(cell.total(), 31);
     }
 
     #[test]

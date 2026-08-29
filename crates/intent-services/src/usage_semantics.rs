@@ -93,6 +93,27 @@ pub(crate) fn reads_prompt_meta_usage(provider_id: Option<&str>) -> bool {
     provider_id.is_some_and(|p| p.trim().eq_ignore_ascii_case("grok"))
 }
 
+/// Whether the provider's end-of-turn `thoughtTokens` counter is a SUBSET of
+/// its `outputTokens` — codex only (codex-rs `output_tokens` includes
+/// reasoning; intent-hq/intent#3796). Gates [`carve_thought_from_output`] at
+/// the accounting seams so the STORED buckets are always disjoint: grok's
+/// subset is already carved out by [`prompt_meta_usage_bill`], and
+/// claude-agent-acp never sends `thoughtTokens`. Matching is trimmed and
+/// case-insensitive like [`usage_report_semantics`].
+pub(crate) fn reports_thought_subset_of_output(provider_id: Option<&str>) -> bool {
+    provider_id.is_some_and(|p| p.trim().eq_ignore_ascii_case("codex"))
+}
+
+/// Normalize a mapped report from subset semantics to intentd's disjoint
+/// storage convention: reasoning moves out of `outputTokens` into the
+/// disjoint `thoughtTokens` bucket (`output − thought`, saturating — a
+/// malformed `thought > output` report clamps output to zero rather than
+/// wrapping). Mirrors the normalization [`prompt_meta_usage_bill`] applies
+/// to grok at parse time (intent-hq/intent#3796).
+pub(crate) fn carve_thought_from_output(totals: &mut intent_core::TokenUsageTotals) {
+    totals.output_tokens = totals.output_tokens.saturating_sub(totals.thought_tokens);
+}
+
 /// grok's cost unit: `USD_TICKS_PER_USD` = 1e10 ticks per $1 (audit §8.2,
 /// xai-grok-shell `extensions/notification.rs`).
 const USD_TICKS_PER_USD: f64 = 1e10;
@@ -237,6 +258,54 @@ mod tests {
             assert!(!reads_prompt_meta_usage(Some(id)), "{id}");
         }
         assert!(!reads_prompt_meta_usage(None));
+    }
+
+    #[test]
+    fn only_codex_reports_thought_subset_of_output() {
+        assert!(reports_thought_subset_of_output(Some("codex")));
+        assert!(reports_thought_subset_of_output(Some("  CoDeX ")));
+        for id in [
+            "claude-code",
+            "grok",
+            "opencode",
+            "unsloth",
+            "pi",
+            "auggie",
+            "droid",
+            "cortex",
+            "mock",
+        ] {
+            assert!(!reports_thought_subset_of_output(Some(id)), "{id}");
+        }
+        assert!(!reports_thought_subset_of_output(None));
+    }
+
+    #[test]
+    fn carve_moves_thought_out_of_output() {
+        let mut totals = intent_core::TokenUsageTotals {
+            input_tokens: 100,
+            output_tokens: 50,
+            thought_tokens: 20,
+            ..Default::default()
+        };
+        carve_thought_from_output(&mut totals);
+        assert_eq!(totals.output_tokens, 30);
+        assert_eq!(totals.thought_tokens, 20);
+        assert_eq!(totals.input_tokens, 100);
+    }
+
+    #[test]
+    fn carve_saturates_when_thought_exceeds_output() {
+        // Defensive: a malformed report with thought > output clamps output
+        // to zero instead of wrapping.
+        let mut totals = intent_core::TokenUsageTotals {
+            output_tokens: 5,
+            thought_tokens: 9,
+            ..Default::default()
+        };
+        carve_thought_from_output(&mut totals);
+        assert_eq!(totals.output_tokens, 0);
+        assert_eq!(totals.thought_tokens, 9);
     }
 
     #[test]
