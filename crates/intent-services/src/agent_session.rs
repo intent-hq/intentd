@@ -3817,14 +3817,23 @@ impl Services {
     ) {
         // The session row is read unconditionally: the stored snapshot backs
         // both the missing-half fallback and the SUM accumulation, and the
-        // model/provider columns key the report semantics.
+        // model/provider columns key the report semantics. The configured
+        // default is passed through so the resolution mirrors the spawn
+        // precedence exactly: a bare-model session with `provider = NULL`
+        // actually runs on `providers.active`, and classifying it as the
+        // Cumulative default would reintroduce the undercount for a SUM
+        // default provider (#3794/#3795).
         let (stored, semantics) = match self
             .store
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
             Ok((model, _, provider, stored)) => {
-                let provider_id = resolve_provider_id(model.as_deref(), provider.as_deref(), None);
+                let provider_id = resolve_provider_id(
+                    model.as_deref(),
+                    provider.as_deref(),
+                    derived_default_provider(&self.effective_settings()).as_deref(),
+                );
                 (
                     stored,
                     crate::usage_semantics::usage_report_semantics(provider_id.as_deref()),
@@ -3923,13 +3932,21 @@ impl Services {
                 (None, None, None, None, false)
             }
         };
-        // Stats attribution only: no configured-default upgrade (unlike the
-        // spawn-adjacent call sites), matching the pre-existing
-        // `usage_stats.rs` helpers — out of scope for D2. An unresolvable
-        // provider falls to the `"unknown"` stats tail (and the cumulative
-        // semantics default below).
+        // Resolution mirrors the spawn precedence (compound model prefix →
+        // provider field → configured default) so a bare-model session with
+        // `provider = NULL` — which actually runs on `providers.active` —
+        // keys the correct report semantics instead of falling to the
+        // Cumulative default (#3794/#3795). A still-unresolvable provider
+        // falls to the `"unknown"` stats tail (and the cumulative semantics
+        // default below).
         let provider_id = prev_readable
-            .then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None))
+            .then(|| {
+                resolve_provider_id(
+                    model.as_deref(),
+                    provider.as_deref(),
+                    derived_default_provider(&self.effective_settings()).as_deref(),
+                )
+            })
             .flatten();
         let semantics = crate::usage_semantics::usage_report_semantics(provider_id.as_deref());
         let tokens = match usage {

@@ -31203,6 +31203,83 @@ mod turn_token_usage {
         let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
         assert_eq!(input, 100, "saturating-sub delta unchanged");
     }
+
+    /// A session row with `provider = NULL` and a bare (non-compound) model
+    /// actually runs on the configured default (`providers.active`), so the
+    /// accounting seam must resolve through the settings-derived default —
+    /// mirroring the spawn precedence — instead of falling to the Cumulative
+    /// REPLACE default and reintroducing the undercount for a SUM default
+    /// provider (#3794/#3795).
+    #[tokio::test]
+    async fn bare_model_null_provider_resolves_via_configured_default() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("seed workspace");
+        let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+        let registry =
+            std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+        registry
+            .apply(&[(
+                "providers.active".to_string(),
+                serde_json::json!("claude-code"),
+            )])
+            .expect("seed default provider");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &ws, "sonnet");
+        session.provider = None;
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        // Two per-turn reports: with the default resolved to claude-code the
+        // snapshot SUMS (100/70); the Cumulative misclassification would have
+        // REPLACED down to 30/20.
+        for report in [(70u64, 50u64), (30, 20)] {
+            services
+                .record_turn_usage_stats(
+                    &agent,
+                    &ws,
+                    Some(&acp_usage(report.0, report.1, 0, 0)),
+                    Duration::from_secs(1),
+                    now,
+                    true,
+                )
+                .await;
+            services
+                .persist_turn_token_usage(
+                    &agent,
+                    &ws,
+                    Some(&acp_usage(report.0, report.1, 0, 0)),
+                    None,
+                )
+                .await;
+        }
+
+        let ws_row = store.get_workspace(&ws).await.expect("reload");
+        let usage = ws_row.token_usage.expect("usage persisted");
+        assert_eq!(
+            usage.totals.input_tokens, 100,
+            "summed via default provider"
+        );
+        assert_eq!(usage.totals.output_tokens, 70);
+
+        // Hourly stats: each report is the delta (70 + 30), not clamped-to-0
+        // saturating subtraction for the second, smaller report.
+        let rows = store.list_usage_stats_hourly().await.expect("stats rows");
+        let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+        assert_eq!(input, 100, "each report recorded in full");
+    }
 }
 
 /// Wire-payload tests for `discover_providers_with_npx` (host.providerDiscovery):
