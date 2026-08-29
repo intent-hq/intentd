@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.15] - 2026-08-29
+
+### 🐛 Bug Fixes
+
+- Accept renamed production sitter in system.requestUpdate ([#1559](https://github.com/intent-hq/intentd/pull/1559))
+
+
 ## [0.8.14] - 2026-08-28
 
 ### 🚀 Features
