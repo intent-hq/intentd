@@ -804,6 +804,7 @@ mod tests {
             waiting_on_pr_monitors: vec![],
             turn_in_flight: false,
             last_stream_activity_at: None,
+            context_usage: None,
             stats: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

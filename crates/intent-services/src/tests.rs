@@ -33661,6 +33661,98 @@ mod harness_versioning {
     }
 }
 
+/// Context-window occupancy (intent-hq/intent#3797): the latest ACP
+/// `usage_update` `used`/`size` is recorded latest-wins in the in-memory
+/// registry and overlaid on the `AgentLite` projection as `contextUsage` —
+/// never persisted, never folded into token tallies.
+mod context_usage_projection {
+    use super::*;
+
+    async fn setup() -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let registry = test_registry_with_default_provider(&tmp);
+        let services = Services::new(store).with_settings_registry(registry);
+        (tmp, services, ws)
+    }
+
+    async fn create_agent(svc: &Services, ws: &WorkspaceId) -> AgentId {
+        let created = svc
+            .agent_create_op(
+                ws.clone(),
+                Some("Occupancy".into()),
+                None,
+                None,
+                None,
+                None,
+                false,
+                intent_core::AgentCreateExtra::default(),
+            )
+            .await
+            .expect("create agent");
+        AgentId::from(created["agent"]["id"].as_str().unwrap())
+    }
+
+    /// A recorded report surfaces on the projection (`used`/`size` +
+    /// `updatedAt` stamp), a second report replaces it wholesale
+    /// (latest-wins), and the serialized wire form carries camelCase
+    /// `contextUsage`.
+    #[tokio::test]
+    async fn latest_report_overlays_projection() {
+        let (_tmp, svc, ws) = setup().await;
+        let id = create_agent(&svc, &ws).await;
+
+        // No report yet: field absent (fresh session / post-restart shape).
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let lite = svc.project_lite_with_flags(session);
+        assert_eq!(lite.context_usage, None, "no report → omitted");
+
+        svc.record_context_usage(&id, 53_000, 200_000);
+        svc.record_context_usage(&id, 61_500, 200_000);
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let lite = svc.project_lite_with_flags(session);
+        let usage = lite.context_usage.as_ref().expect("latest report overlaid");
+        assert_eq!((usage.used, usage.size), (61_500, 200_000), "latest wins");
+        assert!(!usage.updated_at.is_empty(), "report carries a timestamp");
+
+        let wire = serde_json::to_value(&lite).expect("serialize");
+        assert_eq!(wire["contextUsage"]["used"], 61_500);
+        assert_eq!(wire["contextUsage"]["size"], 200_000);
+        assert!(
+            wire["contextUsage"]["updatedAt"].is_string(),
+            "camelCase wire field"
+        );
+    }
+
+    /// The registry is in-memory only and keyed by agent: deleting the
+    /// session drops its entry (no leak, and a projection built for a
+    /// same-id row would start clean), and other agents are unaffected.
+    #[tokio::test]
+    async fn delete_drops_registry_entry() {
+        let (_tmp, svc, ws) = setup().await;
+        let id = create_agent(&svc, &ws).await;
+        let other = create_agent(&svc, &ws).await;
+        svc.record_context_usage(&id, 10_000, 200_000);
+        svc.record_context_usage(&other, 20_000, 200_000);
+
+        svc.agent_delete_op(id.clone(), None).await.expect("delete");
+        assert_eq!(
+            svc.context_usage_for(&id),
+            None,
+            "deleted agent's entry dropped"
+        );
+        let session = svc.store().get_agent_session(&other).await.expect("get");
+        let lite = svc.project_lite_with_flags(session);
+        assert_eq!(
+            lite.context_usage.map(|u| u.used),
+            Some(20_000),
+            "other agent's entry survives"
+        );
+    }
+}
+
 /// Regression tests for the `agentSummary` soft-delete filter: sessions with
 /// `AgentStatus::Deleted` must be excluded from the card aggregate's
 /// `count`/`agents`/`agentIds` (all three consistent, §5.1) so clients never

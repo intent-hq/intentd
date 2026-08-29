@@ -25,8 +25,8 @@ use intent_core::events::{
     AGENT_STREAM_STATUS, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA,
 };
 use intent_core::{
-    now_epoch_ms, now_iso, ActorType, AgentId, AgentSession, Error, EventActor, Result, UsageCost,
-    WorkspaceId, WorkspaceStatus,
+    now_epoch_ms, now_iso, ActorType, AgentId, AgentSession, ContextUsage, Error, EventActor,
+    Result, UsageCost, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -804,6 +804,14 @@ pub(crate) const ACTIVITY_THROTTLE: std::time::Duration = std::time::Duration::f
 /// writer observe the same state.
 pub(crate) type LiveTurns = Arc<Mutex<HashMap<AgentId, LiveTurn>>>;
 
+/// Per-agent latest context-window occupancy from ACP `usage_update`
+/// (intent-hq/intent#3797): latest-wins per live session, in-memory only —
+/// never a token-tally input, dropped with the session on delete and on
+/// daemon restart. Shared across [`Services`] clones so the notification
+/// writer and the `agent.get`/`agent.list` projection overlay observe the
+/// same state.
+pub(crate) type ContextUsages = Arc<Mutex<HashMap<AgentId, ContextUsage>>>;
+
 /// Per-agent silent tail (ms of `session/update` silence before the prompt
 /// resolved) of the most recently ended turn (intent-hq/monorepo#2669):
 /// recorded at turn end by [`run_prompt_turn`](Services::run_prompt_turn) and
@@ -1427,6 +1435,42 @@ impl Services {
     pub fn clear_live_turn(&self, agent_id: &AgentId) {
         if let Ok(mut slots) = self.live_turns.lock() {
             slots.remove(agent_id);
+        }
+    }
+
+    /// Record the latest context-window occupancy reported by an ACP
+    /// `usage_update` for `agent_id` (intent-hq/intent#3797): latest-wins,
+    /// in-memory only — never folded into token tallies. `pub(crate)` so
+    /// in-crate tests can seed the registry without driving a stream.
+    pub(crate) fn record_context_usage(&self, agent_id: &AgentId, used: u64, size: u64) {
+        if let Ok(mut usages) = self.context_usages.lock() {
+            usages.insert(
+                agent_id.clone(),
+                ContextUsage {
+                    used,
+                    size,
+                    updated_at: now_iso(),
+                },
+            );
+        }
+    }
+
+    /// The latest recorded context-window occupancy for `agent_id`, or `None`
+    /// when no live `usage_update` has reported one (fresh session, daemon
+    /// restart). Read by the `AgentLite` service projection overlay.
+    pub(crate) fn context_usage_for(&self, agent_id: &AgentId) -> Option<ContextUsage> {
+        self.context_usages
+            .lock()
+            .ok()
+            .and_then(|usages| usages.get(agent_id).cloned())
+    }
+
+    /// Drop an agent's recorded context occupancy (registry hygiene, mirrors
+    /// the other per-agent in-memory maps): called when the session is
+    /// deleted so the map never leaks entries for deleted agents.
+    pub(crate) fn clear_context_usage(&self, agent_id: &AgentId) {
+        if let Ok(mut usages) = self.context_usages.lock() {
+            usages.remove(agent_id);
         }
     }
 
@@ -4189,16 +4233,23 @@ impl Services {
                     .await;
                 }
             }
-            MappedUpdate::UsageCost(cost) => {
+            MappedUpdate::Usage(usage) => {
+                // Context-window occupancy (intent-hq/intent#3797): recorded
+                // latest-wins in the in-memory per-agent registry — a signal
+                // for the `contextUsage` read overlay, NEVER folded into the
+                // token tallies.
+                self.record_context_usage(agent_id, usage.used, usage.size);
                 // §5.23: cumulative per ACP session, so the latest report
                 // wins. Recorded on the transcript and persisted with the
                 // turn's token snapshot; it materializes no transcript
                 // content and publishes no event, so this is NOT a turn
                 // update (the redrive eligibility must stay unaffected).
-                transcript.usage_cost = Some(UsageCost {
-                    amount: cost.amount,
-                    currency: cost.currency,
-                });
+                if let Some(cost) = usage.cost {
+                    transcript.usage_cost = Some(UsageCost {
+                        amount: cost.amount,
+                        currency: cost.currency,
+                    });
+                }
                 return false;
             }
             MappedUpdate::ToolCall(tc) => {

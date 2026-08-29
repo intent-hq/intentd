@@ -550,6 +550,11 @@ pub struct Services {
     /// clones so the [`AgentManager`]'s turn writer and the `WorkspaceApi` chat
     /// read door observe the same state; populated only while a turn streams.
     live_turns: agent_session::LiveTurns,
+    /// Per-agent latest context-window occupancy from ACP `usage_update`
+    /// (intent-hq/intent#3797): see [`agent_session::ContextUsages`]. Shared
+    /// across clones so the notification writer and the `agent.get`/
+    /// `agent.list` projection overlay observe the same state.
+    context_usages: agent_session::ContextUsages,
     /// Per-agent chain of detached turn-end usage-bookkeeping tasks
     /// (monorepo#738): see [`agent_session::TurnBookkeeping`]. Shared across
     /// clones so consecutive turns of one agent chain onto the same handle.
@@ -952,6 +957,7 @@ impl Services {
             mcp_hub: Arc::new(McpHub::new()),
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
+            context_usages: Arc::new(Mutex::new(HashMap::new())),
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
