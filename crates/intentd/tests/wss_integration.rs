@@ -12903,3 +12903,82 @@ async fn system_status_surfaces_file_watch_coverage_over_wss() {
     assert!(fw["totalRoots"].is_u64(), "totalRoots: {resp}");
     ws.stop().await;
 }
+
+/// Symlink-aware workspace containment over the real WSS wire
+/// (intent-hq/intent#3847): a symlink planted inside a rooted workspace that
+/// points outside the root passes the lexical prefix guard, but the OS
+/// follows it — `file.read` / `file.write` through such a link must be
+/// rejected with the containment `-32603` ("Access denied" rides in
+/// `error.data`, not `error.message`), and the outside target must be
+/// neither read out nor modified. A control read through an IN-workspace
+/// symlink still succeeds, proving the gate rejects only escaping links.
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_file_ops_symlink_escape_rejected() {
+    let srv = start(WsOptions::default()).await;
+
+    let dir = test_tempdir("intentd-wss-symlink-ws-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let outside = test_tempdir("intentd-wss-symlink-outside-");
+    let outside_root = std::fs::canonicalize(outside.path()).expect("canonicalize outside");
+    std::fs::write(outside_root.join("secret.txt"), "top secret").expect("write outside fixture");
+    std::os::unix::fs::symlink(&outside_root, root.join("escape")).expect("plant escape symlink");
+
+    let ws_id = WorkspaceId::new();
+    let mut w = fixture_workspace(&ws_id);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    // Read THROUGH the escaping symlink → containment -32603, no content out.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.read","params":{{"workspaceId":"{}","path":"escape/secret.txt"}}}}"#,
+        ws_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32603), "{resp}");
+    assert!(
+        resp["error"]["data"]
+            .as_str()
+            .is_some_and(|m| m.contains("Access denied")),
+        "{resp}"
+    );
+
+    // Write a NEW file through the link → -32603, nothing lands outside.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.write","params":{{"workspaceId":"{}","path":"escape/planted.txt","content":"x"}}}}"#,
+        ws_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32603), "{resp}");
+    assert!(
+        !outside_root.join("planted.txt").exists(),
+        "escape write must not land outside the workspace"
+    );
+
+    // Overwrite the EXISTING outside file through the link → -32603, bytes intact.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.write","params":{{"workspaceId":"{}","path":"escape/secret.txt","content":"clobbered"}}}}"#,
+        ws_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32603), "{resp}");
+    assert_eq!(
+        std::fs::read_to_string(outside_root.join("secret.txt")).expect("outside file readable"),
+        "top secret",
+        "outside target must not be modified"
+    );
+
+    // Control: an in-workspace symlink to an in-workspace target still works,
+    // so the rejections above are the symlink gate, not a broken file path.
+    std::fs::create_dir_all(root.join("data")).expect("mkdir data");
+    std::fs::write(root.join("data/real.txt"), "ok").expect("write in-ws fixture");
+    std::os::unix::fs::symlink(root.join("data"), root.join("alias")).expect("in-ws symlink");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.read","params":{{"workspaceId":"{}","path":"alias/real.txt"}}}}"#,
+        ws_id.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"], serde_json::json!("ok"), "{resp}");
+
+    srv.ws.stop().await;
+}

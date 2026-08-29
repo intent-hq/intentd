@@ -949,22 +949,26 @@ async fn materialize_imported_attachments(
                      root — import rejected"
                 ))
             };
+            // The root may not exist yet on repo-less imports; the import
+            // owns creating it, and `resolve_attachment_source`'s
+            // symlink-aware gate needs it on disk to canonicalize — ensure
+            // it before resolving.
+            tokio::fs::create_dir_all(root)
+                .await
+                .map_err(|e| Error::Internal(format!("create workspace root failed: {e}")))?;
             let dest = crate::file_ops::resolve_attachment_source(root, stored_path)
                 .map_err(|_| escape_err())?;
             let file_name = dest.file_name().map(PathBuf::from).ok_or_else(escape_err)?;
             let parent = dest.parent().ok_or_else(escape_err)?;
-            // The lexical guard above is not enough on its own: the git
-            // bundle just materialized tracked content, which can include a
+            // `resolve_attachment_source` already re-checks containment
+            // through symlinks, but the checks below stay: the git bundle
+            // just materialized tracked content, which can include a
             // symlinked ancestor (e.g. a tracked `.intent` symlink) pointing
             // outside the checkout, and both `create_dir_all` and `copy`
             // would follow it. Canonicalize the deepest EXISTING ancestor
             // and require it inside the canonical root BEFORE creating
-            // anything — a symlinked escape fails the commit. (The root may
-            // not exist yet on repo-less imports; the import owns creating
-            // it, so ensure it first.)
-            tokio::fs::create_dir_all(root)
-                .await
-                .map_err(|e| Error::Internal(format!("create workspace root failed: {e}")))?;
+            // anything — a symlinked escape fails the commit — and re-verify
+            // the created parent afterwards (TOCTOU belt-and-braces).
             let canon_root = tokio::fs::canonicalize(root)
                 .await
                 .map_err(|e| Error::Internal(format!("canonicalize workspace root failed: {e}")))?;

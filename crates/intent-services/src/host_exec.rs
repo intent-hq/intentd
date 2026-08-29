@@ -283,7 +283,27 @@ pub(crate) async fn resolve_cwd_within_workspace(
             "Access denied: cwd outside workspace",
         ));
     }
+    enforce_cwd_symlink_containment(&root, &full)?;
     Ok(full)
+}
+
+/// Symlink-aware second gate on the exec `cwd` (intent-hq/intent#3847),
+/// applied AFTER the lexical [`cwd_within_root`] check passes: the lexical
+/// guard cannot see a symlink inside the root pointing outside it — the
+/// spawned child would chdir through it and run outside the workspace. The
+/// cwd must exist for the spawn to succeed anyway, so canonicalize it
+/// directly (no deepest-ancestor handling needed, unlike the `file.*` write
+/// path) and re-check against the canonicalized root with the same
+/// component-aware boundary; any canonicalize failure (missing cwd, broken
+/// symlink) fails closed with the existing containment message.
+fn enforce_cwd_symlink_containment(root: &str, full: &Path) -> Result<(), HostExecError> {
+    let denied = || HostExecError::internal("Access denied: cwd outside workspace");
+    let canon_root = std::fs::canonicalize(root).map_err(|_| denied())?;
+    let canon_full = std::fs::canonicalize(full).map_err(|_| denied())?;
+    if !cwd_within_root(&canon_root, &canon_full) {
+        return Err(denied());
+    }
+    Ok(())
 }
 
 /// Component-aware containment check for the `cwd` guard: a raw-string
@@ -749,5 +769,55 @@ mod tests {
             Some("/captured/only"),
             "captured PATH must not clobber the enhanced PATH"
         );
+    }
+
+    /// Canonicalized tempdir root for the symlink-gate tests (the OS temp
+    /// dir may itself be a symlink, e.g. macOS `/var` → `/private/var`).
+    #[cfg(unix)]
+    fn canon_tempdir(prefix: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::canonicalize(&path).unwrap()
+    }
+
+    /// HIGH-severity regression (intent-hq/intent#3847, Finding 3): a symlink
+    /// inside the workspace pointing outside it passes the lexical
+    /// `cwd_within_root` guard, but the spawned child chdir's through it and
+    /// runs OUTSIDE the root — the symlink-aware gate must reject it with the
+    /// existing containment message. In-root symlinks and plain subdirs keep
+    /// resolving, and a missing cwd fails closed.
+    #[cfg(unix)]
+    #[test]
+    fn cwd_symlink_escape_rejected_in_root_links_allowed() {
+        use std::os::unix::fs::symlink;
+        let outside = canon_tempdir("intentd-hostexec-outside-");
+        let root_path = canon_tempdir("intentd-hostexec-root-");
+        let root = root_path.to_string_lossy().into_owned();
+
+        symlink(&outside, root_path.join("escape")).unwrap();
+        std::fs::create_dir_all(root_path.join("sub")).unwrap();
+        symlink(root_path.join("sub"), root_path.join("alias")).unwrap();
+
+        // Lexical guard passes for the escaping link…
+        let full = node_resolve(&root, "escape").unwrap();
+        assert!(cwd_within_root(Path::new(&root), &full));
+        // …but the symlink-aware gate rejects it.
+        let err = enforce_cwd_symlink_containment(&root, &full).unwrap_err();
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(err.message.contains("cwd outside workspace"), "{err:?}");
+
+        // In-root symlink and plain subdir still pass.
+        let alias = node_resolve(&root, "alias").unwrap();
+        assert!(enforce_cwd_symlink_containment(&root, &alias).is_ok());
+        let sub = node_resolve(&root, "sub").unwrap();
+        assert!(enforce_cwd_symlink_containment(&root, &sub).is_ok());
+
+        // Non-existent cwd fails closed (canonicalize error path).
+        let missing = node_resolve(&root, "missing").unwrap();
+        let err = enforce_cwd_symlink_containment(&root, &missing).unwrap_err();
+        assert!(err.message.contains("cwd outside workspace"), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&root_path);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
