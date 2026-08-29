@@ -166,6 +166,17 @@ pub(crate) fn workspace_relative(root: &str, path: &str) -> Option<String> {
 /// - An empty (or `/`, which trims to empty) root enforces nothing here,
 ///   mirroring [`is_within`]'s empty-root TS parity — the fail-closed guards
 ///   for empty roots live with the callers (see `read_chunk`).
+///
+/// Residual TOCTOU window (accepted, NOT a guarantee): this is a
+/// check-then-use gate — between the `canonicalize` here and the IO in the
+/// caller (`fs::write`, `create_dir_all`, `fs::rename`, …), a concurrently
+/// running local process could swap a verified in-root directory for an
+/// out-of-root symlink and the IO would follow it. Winning that race
+/// requires already having concurrent code execution on the daemon host,
+/// which is outside this guard's threat model (intent-hq/intent#3847 covers
+/// planted static symlinks, which this gate fully closes). Closing the race
+/// needs descriptor-anchored IO (`openat2(RESOLVE_BENEATH)` / `O_NOFOLLOW`
+/// per component), not more path checks.
 fn enforce_symlink_containment(root: &str, full: &Path) -> Result<()> {
     let denied = || Error::Internal(ACCESS_DENIED.to_string());
     if root.trim_end_matches(['/', '\\']).is_empty() {

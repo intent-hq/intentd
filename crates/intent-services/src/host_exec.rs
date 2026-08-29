@@ -2,11 +2,12 @@
 //!
 //! Spawns `command` with `args` on the daemon host (no shell interpolation —
 //! `argv` only), captures stdout/stderr/exit code, and enforces a
-//! workspace-containment guard on `cwd` in the same spirit as `file_ops`
-//! (lexical resolve against the workspace root). The guard here uses the
-//! component-aware `Path::starts_with` instead of a raw-string prefix so
-//! sibling paths like `/tmp/ws2` cannot escape a `/tmp/ws` root; `file_ops`
-//! is not (yet) bit-for-bit identical.
+//! workspace-containment guard on `cwd` in the same spirit as `file_ops`:
+//! a lexical resolve against the workspace root (component-aware
+//! `Path::starts_with`, so sibling paths like `/tmp/ws2` cannot escape a
+//! `/tmp/ws` root) followed by a symlink-aware canonicalize re-check
+//! ([`enforce_cwd_symlink_containment`], intent-hq/intent#3847) so a symlink
+//! inside the root cannot point the spawn outside it.
 //! Reuses the process-group leader + `kill_on_drop` discipline (`mcp_servers` /
 //! `intent-acp::spawn`) so a `timeoutMs` reaps the whole tree (no orphaned
 //! grandchildren). The child env is assembled with a strict precedence:
@@ -296,6 +297,15 @@ pub(crate) async fn resolve_cwd_within_workspace(
 /// path) and re-check against the canonicalized root with the same
 /// component-aware boundary; any canonicalize failure (missing cwd, broken
 /// symlink) fails closed with the existing containment message.
+///
+/// Residual TOCTOU window (accepted, NOT a guarantee): between this check
+/// and `Command::spawn`, a concurrently running local process could swap the
+/// verified cwd for an out-of-root symlink and the child would chdir through
+/// it. Winning that race requires already having concurrent code execution
+/// on the daemon host, which is outside this guard's threat model
+/// (intent-hq/intent#3847 covers planted static symlinks, which this gate
+/// fully closes); see `file_ops::enforce_symlink_containment` for the same
+/// accepted residual on the `file.*` path.
 fn enforce_cwd_symlink_containment(root: &str, full: &Path) -> Result<(), HostExecError> {
     let denied = || HostExecError::internal("Access denied: cwd outside workspace");
     let canon_root = std::fs::canonicalize(root).map_err(|_| denied())?;
