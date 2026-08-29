@@ -16947,6 +16947,127 @@ async fn failed_advisory_wake_retries_without_another_event() {
     );
 }
 
+/// PR #1578 review: the ungrouped advisory's watch retirement and episode
+/// marker must commit ATOMICALLY. If retirement committed first and the
+/// process crashed before the marker write, the parent's re-armed watch
+/// would carry a NEW id — a new stable message id — so neither dedup nor
+/// marker covers the next monitoring idle and a second advisory fires in
+/// the same episode. Injecting a failure on the watch DELETE must roll the
+/// marker back with it: never marker-without-retirement or
+/// retirement-without-marker.
+#[tokio::test]
+async fn advisory_watch_retirement_and_marker_commit_atomically() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+    svc.register_completion_watch_durable(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .await
+    .expect("register watch");
+    let event = completion_event(&ws, AGENT_IDLE, &child, json!({ "agentId": child.0 }));
+
+    // Direction 1 — marker INSERT fails: under the pre-fix ordering the
+    // watch DELETE had already committed, leaving retirement-without-marker
+    // (the double-advisory window). The transaction must roll the DELETE
+    // back instead.
+    sqlx::query(
+        "CREATE TRIGGER fail_marker_write BEFORE INSERT ON advisory_wake_delivery BEGIN
+         SELECT RAISE(FAIL, 'injected marker write failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install marker failure trigger");
+    svc.handle_completion_event(&event).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "the advisory wake itself is durable before the retirement transaction"
+    );
+    assert_eq!(
+        svc.store()
+            .list_completion_watches()
+            .await
+            .expect("list watches")
+            .len(),
+        1,
+        "failed marker write rolls the watch retirement back with it (atomic)"
+    );
+    // Direction 2 — watch DELETE fails: the marker write must roll back
+    // with it (never marker-without-retirement), and the armed watch stays
+    // as the recovery record for the stable-id retry. Install this trigger
+    // BEFORE dropping the first so direction 1's scheduled background retry
+    // never finds a window where the transaction can fully succeed.
+    sqlx::query(
+        "CREATE TRIGGER fail_watch_retire BEFORE DELETE ON completion_watch BEGIN
+         SELECT RAISE(FAIL, 'injected watch retirement failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install failure trigger");
+    sqlx::query("DROP TRIGGER fail_marker_write")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove marker failure trigger");
+    svc.handle_completion_event(&event).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "stable-id dedup holds across failed passes"
+    );
+    assert!(
+        !svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "failed retirement rolls the episode marker back with it (atomic)"
+    );
+    let persisted = svc
+        .store()
+        .list_completion_watches()
+        .await
+        .expect("list watches");
+    assert_eq!(
+        persisted.len(),
+        1,
+        "the watch survives as the recovery record"
+    );
+
+    // With the failure gone, the scheduled retry replays the pass: the
+    // stable-id send dedups and the retirement + marker land together.
+    sqlx::query("DROP TRIGGER fail_watch_retire")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove failure trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if svc.find_watches_for_child(&child).is_empty()
+                && svc
+                    .store()
+                    .has_advisory_wake_delivery(&parent, &child)
+                    .await
+                    .expect("marker read")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry retires the watch and persists the marker together");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "stable-id dedup: the healed retirement re-sends nothing"
+    );
+}
+
 /// PR #1578 review: the once-per-episode advisory marker must clear at the
 /// child's GENUINE settlement even when the parent never re-armed a watch
 /// after the advisory consumed it — the per-watch clear alone would leak
@@ -17032,6 +17153,67 @@ async fn advisory_marker_clears_at_settlement_without_rearmed_watch() {
     );
     let text = parent_messages_text(&svc, &parent).await;
     assert!(text.contains("second-watch"), "names the new hook: {text}");
+
+    // Settlement flavors beyond idle-completion also end the episode: an
+    // agent:failed wake clears the marker (again with no watch armed — the
+    // episode-2 advisory consumed it) ...
+    assert!(svc
+        .store()
+        .has_advisory_wake_delivery(&parent, &child)
+        .await
+        .expect("marker read"));
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "boom" }),
+    ))
+    .await;
+    assert!(
+        !svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "agent:failed settlement clears the episode marker"
+    );
+
+    // ... and so does an agent:deleted wake for a later episode.
+    seed_active_hook(&svc, &ws, &child, "third-watch").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-arm watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert!(svc
+        .store()
+        .has_advisory_wake_delivery(&parent, &child)
+        .await
+        .expect("marker read"));
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_DELETED,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert!(
+        !svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "agent:deleted settlement clears the episode marker"
+    );
 }
 
 /// The advisory is scoped to PURE hook-/monitor-waiting deferral: an idle

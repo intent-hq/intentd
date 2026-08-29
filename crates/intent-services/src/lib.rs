@@ -5399,9 +5399,12 @@ impl Services {
 
     /// [`Services::deliver_completion_to_watches`] with the advisory wake
     /// suppressed: used by the registration-time / boot reconciliation
-    /// (`agent_subscriptions.rs`) and the synthetic mutation-path redelivery,
-    /// whose deferred idles must keep today's silent-skip behavior — only a
-    /// LIVE `agent:idle` may fire the hook-/PR-monitor-waiting advisory.
+    /// (`agent_subscriptions.rs`) and the synthetic mutation-path redelivery
+    /// (except its advisory-pending heal branch — monorepo#1297 — which runs
+    /// the advisory-allowed variant to stand in for a busy-suppressed LIVE
+    /// idle), whose deferred idles must keep today's silent-skip behavior —
+    /// only a LIVE `agent:idle` may fire the hook-/PR-monitor-waiting
+    /// advisory.
     pub(crate) async fn deliver_completion_to_watches_no_advisory(
         &self,
         child_id: &AgentId,
@@ -5980,7 +5983,10 @@ impl Services {
             // before — cleared when a genuine completion/failure/deletion
             // wake delivers below. Only a LIVE `agent:idle` may fire it
             // (`advisory_allowed`): registration-time reconciliation and the
-            // synthetic mutation-path redelivery keep today's silent skip.
+            // synthetic mutation-path redelivery keep today's silent skip —
+            // except the redelivery's advisory-pending heal (monorepo#1297),
+            // which passes `advisory_allowed` to stand in for a LIVE idle
+            // suppressed solely by the busy-slot race.
             if interim_idle {
                 if advisory_allowed
                     && (hook_waiting || pr_monitor_waiting)
@@ -6256,13 +6262,22 @@ impl Services {
     /// to break the parent's unbounded silent wait (a PR monitor has no
     /// TTL), so waiting for the child's next idle could park the parent
     /// indefinitely. The retry replays the advisory-allowed delivery pass;
-    /// the stable message id keeps every attempt idempotent. For a grouped
-    /// `after_all` watch (`grouped: true`, STAB-160 shape) the watch stays
-    /// armed and the group stays open (`watchStillArmed: true`, no re-arm
-    /// instruction, no retirement, no `ungrouped_delivery_failed`); only
-    /// the shared episode marker is recorded. Both shapes persist the
-    /// marker last, so a crash or failure before it means at worst one
-    /// repeated advisory next idle.
+    /// the stable message id keeps every attempt idempotent. The ungrouped
+    /// marker write and watch retirement commit in ONE transaction
+    /// (`retire_advisory_watch_after_delivery`, PR #1578 review): a crash
+    /// between them could otherwise retire the watch without its marker,
+    /// and the parent's re-armed watch — carrying a NEW id, hence a new
+    /// stable message id — would fire a second advisory in the same
+    /// episode. A crash or failure BEFORE the transaction leaves the old
+    /// watch (same id) as the recovery record, so the replayed send is
+    /// deduped, never lost. For a grouped `after_all` watch
+    /// (`grouped: true`, STAB-160 shape) the watch stays armed and the
+    /// group stays open (`watchStillArmed: true`, no re-arm instruction,
+    /// no retirement, no `ungrouped_delivery_failed`); only the shared
+    /// episode marker is recorded, and since the armed watch keeps its id,
+    /// a crash or failure before that write means a stable-id-deduped
+    /// replay next idle — at worst a repeated marker attempt, never a
+    /// duplicate advisory.
     #[allow(clippy::too_many_arguments)]
     async fn deliver_monitoring_idle_advisory(
         &self,
@@ -6341,18 +6356,40 @@ impl Services {
             return false;
         }
         let delivered_at = now_iso();
-        if !grouped {
-            // Retire with NO completion identity: the advisory is not the
-            // child's completion, so nothing may be recorded as "delivered"
-            // for the genuine completion a re-armed watch waits for. Grouped
-            // watches never retire here — group settlement owns them.
+        if grouped {
+            // Grouped watches never retire here — group settlement owns
+            // them. Only the shared episode marker is recorded; the armed
+            // watch keeps its id, so a crash or failure before this write
+            // means a stable-id-deduped replay next idle, never a duplicate
+            // advisory.
             if let Err(e) = self
                 .store
-                .retire_completion_watch_after_delivery(
+                .record_advisory_wake_delivery(&watch.parent_agent_id, child_id, &delivered_at)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %watch.parent_agent_id.0,
+                    child = %child_id.0,
+                    "failed to record advisory-wake episode marker"
+                );
+            }
+        } else {
+            // Retire the watch and write the episode marker in ONE
+            // transaction (with NO completion identity: the advisory is not
+            // the child's completion, so nothing may be recorded as
+            // "delivered" for the genuine completion a re-armed watch waits
+            // for). Atomicity closes the crash window where the watch is
+            // retired without its marker — the re-armed watch's NEW id
+            // would defeat the stable-id dedup and a second advisory would
+            // fire this episode. A failed transaction leaves the old watch
+            // (same id) armed for the deduped retry.
+            if let Err(e) = self
+                .store
+                .retire_advisory_watch_after_delivery(
                     &watch.id,
                     &watch.parent_agent_id,
                     child_id,
-                    None,
                     &delivered_at,
                 )
                 .await
@@ -6368,23 +6405,6 @@ impl Services {
                 return false;
             }
             self.remove_watch_after_delivery_commit(&watch.id);
-        }
-        // Marker last: a crash before this write re-sends the (deduped)
-        // advisory on the next monitoring idle and re-attempts the marker; a
-        // write failure means at worst one repeated advisory next idle.
-        if let Err(e) = self
-            .store
-            .record_advisory_wake_delivery(&watch.parent_agent_id, child_id, &delivered_at)
-            .await
-        {
-            tracing::warn!(
-                error = %e,
-                parent = %watch.parent_agent_id.0,
-                child = %child_id.0,
-                "failed to record advisory-wake episode marker"
-            );
-        }
-        if !grouped {
             self.publish_subscriptions_changed(parent_ws, &watch.parent_agent_id)
                 .await;
         }

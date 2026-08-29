@@ -37,6 +37,63 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically record the advisory-delivered marker AND retire the
+    /// ungrouped watch the advisory consumed — one transaction, so a crash
+    /// can never leave the watch retired without its episode marker (the
+    /// re-armed watch would carry a NEW id, so neither the old stable
+    /// message id nor a marker would cover the next monitoring idle and a
+    /// second advisory would fire in the same episode — PR #1578 review).
+    /// The caller invokes this only after the advisory wake is durable: a
+    /// failed transaction leaves the watch as the retry/restart-recovery
+    /// record, and the stable message id keeps the replayed send idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the transaction cannot begin, write the
+    /// marker, retire the watch, or commit.
+    pub async fn retire_advisory_watch_after_delivery(
+        &self,
+        watch_id: &str,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+        delivered_at: &str,
+    ) -> Result<()> {
+        let pool = self.write_pool().clone();
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| Error::Internal(format!("retire advisory watch begin failed: {e}")))?;
+            sqlx::query(
+                "INSERT INTO advisory_wake_delivery (
+                    parent_agent_id, child_agent_id, delivered_at
+                ) VALUES (?,?,?)
+                ON CONFLICT(parent_agent_id, child_agent_id) DO UPDATE SET
+                    delivered_at = excluded.delivered_at",
+            )
+            .bind(&parent_agent_id.0)
+            .bind(&child_agent_id.0)
+            .bind(delivered_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("retire advisory watch marker write failed: {e}"))
+            })?;
+            sqlx::query("DELETE FROM completion_watch WHERE id = ?")
+                .bind(watch_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("retire advisory watch delete failed: {e}"))
+                })?;
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!("retire advisory watch commit failed: {e}"))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Whether an advisory-delivered marker stands for the pair.
     ///
     /// # Errors
