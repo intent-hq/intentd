@@ -11219,6 +11219,38 @@ mod workspace_api_output_limit_tests {
     }
 
     #[tokio::test]
+    async fn over_limit_output_resolves_relative_repository_path() {
+        let srv = server_with_paths(None, None, Some("."), 50);
+
+        let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
+        let text = tool_text(&resp);
+        let path = text
+            .split_once("The full output was written to:\n")
+            .expect("relative repository path should redirect oversized output")
+            .1
+            .lines()
+            .next()
+            .map(PathBuf::from)
+            .unwrap();
+
+        assert!(
+            path.is_absolute(),
+            "redirect path must be absolute: {path:?}"
+        );
+        let cwd = std::fs::canonicalize(".").unwrap();
+        assert_eq!(
+            path.parent().unwrap(),
+            cwd.parent().unwrap().join("tool-outputs")
+        );
+        let full = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&full).unwrap();
+        assert_eq!(value["data"].as_str().unwrap().len(), 200);
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn toon_encodes_object_results_when_enabled() {
         let (_folder, checkout) = temp_workspace_layout();
         let srv = server(Some(&checkout), true, 0);

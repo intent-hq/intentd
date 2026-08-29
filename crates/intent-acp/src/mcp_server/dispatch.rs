@@ -439,10 +439,23 @@ impl WorkspaceMcpServer {
             .or(ws.path.as_deref().filter(|p| !p.is_empty()))
             .or(ws.repository_path.as_deref().filter(|p| !p.is_empty()))
             .ok_or_else(|| "workspace has no on-disk checkout path".to_string())?;
-        let folder = std::path::Path::new(checkout)
+        let checkout = std::path::Path::new(checkout);
+        let resolved_checkout = if checkout.is_absolute() {
+            checkout.to_path_buf()
+        } else {
+            tokio::fs::canonicalize(checkout)
+                .await
+                .map_err(|e| format!("resolve checkout path `{}`: {e}", checkout.display()))?
+        };
+        let folder = resolved_checkout
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .ok_or_else(|| format!("checkout path `{checkout}` has no parent directory"))?;
+            .ok_or_else(|| {
+                format!(
+                    "checkout path `{}` has no parent directory",
+                    resolved_checkout.display()
+                )
+            })?;
         let dir = folder.join("tool-outputs");
         tokio::fs::create_dir_all(&dir)
             .await
