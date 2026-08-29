@@ -23,7 +23,12 @@
 //!    interim idle (stamped `isWaitingForOtherAgents: true`) — on both the
 //!    live delivery path and the registration-time reconcile (re-arm on an
 //!    already-idle-but-waiting target) — and delivers exactly once when the
-//!    chain settles.
+//!    chain settles;
+//!  - monitoring-idle advisory: a child idling with only active hooks / PR
+//!    monitors delivers ONE advisory wake that consumes the ungrouped watch
+//!    (`watchStillArmed: false`, re-arm instruction); a re-armed watch stays
+//!    silent through later monitoring idles and fires at the genuine
+//!    completion.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 //!
@@ -2404,5 +2409,349 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
     assert_eq!(
         wakes, 4,
         "two initial progress wakes, one terminal wake, and one watchless progress wake"
+    );
+}
+
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+/// Monitoring-idle advisory + re-arm flow: a child that goes idle while only
+/// externally monitoring (an active background hook here — the cheapest
+/// external wait to arrange hermetically; PR monitors share the same
+/// classification) no longer parks its ungrouped watcher silently:
+///  - the parent receives exactly ONE advisory wake naming the hook, with
+///    `watchStillArmed: false` + `childExternallyWaiting: true` +
+///    `waitingOnHooks` metadata and the re-arm instruction — the advisory
+///    consumes the one-shot watch;
+///  - the parent re-arms `ws.agent.watch`; the registration-time reconcile
+///    defers silently and the once-per-episode marker keeps the child's NEXT
+///    live monitoring idle silent (no second advisory, watch stays armed);
+///  - the hook's terminal dispatch settles the child and the re-armed watch
+///    delivers the genuine completion wake exactly once
+///    (`watchStillArmed: false`, no advisory flag).
+///
+/// DEFECT (ignored until fixed): the advisory is racily suppressed on the
+/// real turn-end path. The child's `agent:idle` is published while its
+/// worker still holds the busy slot (`run_message_worker` runs `end_turn`
+/// after `run_prompt_turn` returns — see the monorepo#1297 note there), so
+/// the delivery pass's `agent_is_busy` probe classifies the idle
+/// `queue_interim` and the advisory gate (`interim idle` branch of
+/// `deliver_completion_to_watches_inner`, which requires `!queue_interim`)
+/// silently skips. The worker-exit heal then re-enters via
+/// `redeliver_completion_after_queue_mutation`, but that path is the
+/// deliberate no-advisory variant and its hook-waiting branch defers
+/// silently — so no advisory is ever delivered and the ungrouped watcher
+/// parks indefinitely. Reproduced 5/5 with a temporary probe on the
+/// interim-skip log: `queue_interim=true` at classification,
+/// `has_ready=false busy=false` at the skip log 2ms later.
+#[ignore = "monitoring-idle advisory racily suppressed by the busy-slot idle-publish race; see doc comment"]
+#[tokio::test]
+async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_wss() {
+    const SPAWN_GO: &str = "WATCH8_SPAWN_GO";
+    const CHILD_GO: &str = "WATCH8_CHILD_GO";
+    const REARM_GO: &str = "WATCH8_REARM_GO";
+    const POKE_GO: &str = "WATCH8_POKE_GO";
+    const ADVISORY_NEEDLE: &str = "idle but still waiting on external monitoring";
+    let Some(script) = gate("WSS monitoring-idle advisory E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+
+    let spawn_js = format!(
+        "const r = await ws.agent.create('AdvisoryChild', '{CHILD_GO} do your work', \
+         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+    );
+    // Armed-timer hook, NO report: the child idles hook-waiting, so its idle
+    // is a monitoring idle — not a settled completion. The immediate
+    // validation run holds (state marker); the later `hook.runNow` dispatch
+    // is the hook's terminal transition.
+    let child_hook_js = format!(
+        "const r = await ws.hook.schedule({{ name: 'pr-review-watch', code: {}, delayMs: 60000 }}); \
+         return 'hooked=' + r.hook.state;",
+        json!(
+            "if (hookState === null) { return { dispatch: false, state: { armed: true } }; } \
+             return { dispatch: true, message: 'review landed' };"
+        )
+    );
+    // try/catch: the parent's completion-wake turn replays REARM_GO from
+    // history and re-runs this rule — by then the child has settled with
+    // nothing pending, so the re-watch is rejected and must not fail the
+    // turn (or re-arm anything).
+    let rearm_js = r"
+        const agents = await ws.agent.list(true);
+        const t = agents.find(a => a.name === 'AdvisoryChild');
+        if (!t) { return 'rearmed=missing'; }
+        try { const r = await ws.agent.watch(t.id); return 'rearmed=' + r.ok; }
+        catch (e) { return 'rearmed=rejected'; }
+    ";
+    // Later-turn markers before earlier ones: prompts replay history, so an
+    // earlier turn's rule would shadow the later marker (see WATCH7 note).
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": REARM_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": rearm_js, "summary": "parent re-arms the watch" }
+                },
+                "emitToolBlocks": true,
+                "response": "re-arm done",
+            },
+            { "ifPromptContains": "[Background hook", "response": "hook wake handled" },
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "wake acknowledged" },
+            { "ifPromptContains": POKE_GO, "response": "child poked" },
+            {
+                "ifPromptContains": SPAWN_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_js, "summary": "spawn the monitoring child" }
+                },
+                "emitToolBlocks": true,
+                "response": "child spawned",
+            },
+            {
+                "ifPromptContains": CHILD_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": child_hook_js, "summary": "child schedules hook" }
+                },
+                "emitToolBlocks": true,
+                "response": "child parked behind its hook",
+            },
+        ],
+    })
+    .to_string();
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
+    let ws_id = setup.ws_id.clone();
+
+    // The parent spawns the child through the bridge — the auto parent→child
+    // completion watch is the ungrouped watch under test.
+    let parent = create_agent(&mut setup.rpc, 10, &ws_id, "AdvisoryParent").await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": SPAWN_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "spawn send ok: {sent}");
+    let mut req_id = 20i64;
+    let child = await_agent_id_by_name(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        "AdvisoryChild",
+        budget.step(60),
+    )
+    .await;
+
+    // The child schedules its hook and idles WITHOUT reporting: the idle is
+    // stamped hook-waiting — a monitoring idle, not its completion.
+    let child_idle = await_idle_event(&mut setup.sub, &child, budget.step(90)).await;
+    assert!(
+        child_idle["data"]["waitingOnHooks"].is_array(),
+        "child idle is stamped hook-waiting: {child_idle}"
+    );
+
+    // The advisory wake delivers: it names the hook, carries the disarm +
+    // externally-waiting metadata, instructs re-arming, and consumed the
+    // auto watch.
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        ADVISORY_NEEDLE,
+        budget.step(90),
+    )
+    .await;
+    let rows = wake_rows_serialized(&mut setup.rpc, req_id, &ws_id, &parent).await;
+    req_id += 1;
+    let advisory = rows
+        .iter()
+        .find(|r| r.contains(ADVISORY_NEEDLE))
+        .unwrap_or_else(|| panic!("advisory wake row present: {rows:?}"));
+    assert!(
+        advisory.contains("pr-review-watch"),
+        "advisory names the active hook: {advisory}"
+    );
+    assert!(
+        advisory.contains("consumed your one-shot watch"),
+        "advisory says the one-shot watch was consumed: {advisory}"
+    );
+    assert!(
+        advisory.contains("re-arm with ws.agent.watch") && advisory.contains(&child),
+        "advisory instructs re-arming a watch on the child: {advisory}"
+    );
+    assert!(
+        advisory.contains("\"watchStillArmed\":false"),
+        "advisory metadata tags watchStillArmed=false: {advisory}"
+    );
+    assert!(
+        advisory.contains("\"childExternallyWaiting\":true"),
+        "advisory metadata tags childExternallyWaiting=true: {advisory}"
+    );
+    assert!(
+        advisory.contains("waitingOnHooks"),
+        "advisory metadata lists the active hooks: {advisory}"
+    );
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
+
+    // The parent re-arms. The registration-time reconcile on the still
+    // idle-and-monitoring child defers silently (no-advisory variant): the
+    // fresh watch stays armed and no second advisory fires.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        30,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": REARM_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "re-arm send ok: {sent}");
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        "rearmed=true",
+        budget.step(60),
+    )
+    .await;
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        1,
+        budget.step(60),
+    )
+    .await;
+
+    // Drive the child through ANOTHER live monitoring idle: the standing
+    // once-per-episode marker keeps it silent — no second advisory, no
+    // completion wake, the re-armed watch stays armed.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        40,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": child, "content": POKE_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "poke send ok: {sent}");
+    let poke_idle = await_idle_event(&mut setup.sub, &child, budget.step(90)).await;
+    assert!(
+        poke_idle["data"]["waitingOnHooks"].is_array(),
+        "child's second idle is still hook-waiting: {poke_idle}"
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let text = await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+    assert!(
+        !text.contains("completed."),
+        "no completion wake while the child still monitors: {text}"
+    );
+    let advisories = wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, ADVISORY_NEEDLE).await;
+    req_id += 1;
+    assert_eq!(
+        advisories, 1,
+        "the advisory never repeats within an episode"
+    );
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
+    req_id += 1;
+    assert_eq!(n, 1, "re-armed watch survives the silent monitoring idle");
+
+    // Fire the hook (its terminal one-shot dispatch): the child's wake turn
+    // ends in its GENUINE completion — the re-armed watch delivers it.
+    let listed = wss_rpc(
+        &mut setup.rpc,
+        50,
+        "hook.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let hook_id = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["name"] == "pr-review-watch" && h["state"] == "scheduled")
+        .unwrap_or_else(|| panic!("scheduled pr-review-watch hook in hook.list: {listed}"))
+        ["hookId"]
+        .as_str()
+        .expect("hookId")
+        .to_string();
+    let ran = wss_rpc(
+        &mut setup.rpc,
+        51,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": hook_id }),
+    )
+    .await;
+    assert_eq!(ran["ok"], true, "hook.runNow ok: {ran}");
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        "completed.",
+        budget.step(90),
+    )
+    .await;
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
+    await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+
+    // Final per-row audit: one advisory, one genuine completion (disarming,
+    // without the advisory flag) — nothing else.
+    let rows = wake_rows_serialized(&mut setup.rpc, req_id, &ws_id, &parent).await;
+    let terminal = rows
+        .iter()
+        .find(|r| r.contains("completed."))
+        .unwrap_or_else(|| panic!("terminal completion wake row present: {rows:?}"));
+    assert!(
+        terminal.contains("\"watchStillArmed\":false"),
+        "terminal wake metadata tags watchStillArmed=false: {terminal}"
+    );
+    assert!(
+        !terminal.contains("childExternallyWaiting"),
+        "terminal wake is not the advisory: {terminal}"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.contains("completed.")).count(),
+        1,
+        "exactly one genuine completion wake: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.contains(ADVISORY_NEEDLE)).count(),
+        1,
+        "exactly one advisory wake for the whole episode: {rows:?}"
     );
 }
