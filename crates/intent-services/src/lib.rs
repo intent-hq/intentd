@@ -388,6 +388,22 @@ pub struct Services {
     /// a live interim idle (the child ran a new turn, so the session report
     /// is current again). In-memory only, like the parent set.
     stale_report_interim_skips: Arc<Mutex<HashSet<AgentId>>>,
+    /// Subset of [`Self::interim_skipped_idles`] whose LIVE `agent:idle` was
+    /// hook-/PR-monitor-waiting and would have fired the monitoring-idle
+    /// advisory, but was classified interim solely by the BUSY probe — the
+    /// worker publishes the terminal idle before releasing the busy slot
+    /// (monorepo#1297), so the advisory gate's `!queue_interim` requirement
+    /// misfired. The advisory is OWED, not cancelled: the queue-mutation
+    /// redelivery consults this provenance and runs the advisory-ALLOWED
+    /// delivery variant, so the worker-exit heal (or the delivery pass's own
+    /// post-skip re-check) delivers the suppressed advisory instead of
+    /// deferring silently forever. Only the live delivery pass ever sets it
+    /// (`advisory_allowed` is required), so the no-advisory passes
+    /// (registration-time / boot reconciliation, workspace delete) still
+    /// never advise. Cleared with the marker (any take) and superseded by
+    /// any re-mark that does not re-qualify. In-memory only, like the
+    /// parent set.
+    advisory_pending_interim_skips: Arc<Mutex<HashSet<AgentId>>>,
     /// Message ids whose questions-dismissed notice has already been claimed
     /// per agent (`agent.dismissQuestions`, PROTOCOL §5.5). The persisted
     /// dismissal marker is single-slot (most recent id only), so this set is
@@ -922,6 +938,7 @@ impl Services {
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
             stale_report_interim_skips: Arc::new(Mutex::new(HashSet::new())),
+            advisory_pending_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -4712,6 +4729,13 @@ impl Services {
             .lock()
             .expect("stale-report interim skip registry poisoned")
             .remove(child_id);
+        // A re-mark that does not itself qualify for advisory-pending
+        // provenance supersedes it: the classification that owed the
+        // advisory has been replaced by a fresh one.
+        self.advisory_pending_interim_skips
+            .lock()
+            .expect("advisory-pending interim skip registry poisoned")
+            .remove(child_id);
     }
 
     /// [`Self::mark_interim_skipped_idle`] variant for the REGISTRATION-TIME
@@ -4728,6 +4752,32 @@ impl Services {
         self.stale_report_interim_skips
             .lock()
             .expect("stale-report interim skip registry poisoned")
+            .insert(child_id.clone());
+        self.advisory_pending_interim_skips
+            .lock()
+            .expect("advisory-pending interim skip registry poisoned")
+            .remove(child_id);
+    }
+
+    /// [`Self::mark_interim_skipped_idle`] variant for a LIVE monitoring
+    /// idle whose advisory was suppressed solely by the busy probe (the
+    /// worker publishes the terminal `agent:idle` before releasing the busy
+    /// slot — monorepo#1297): also records advisory-pending provenance, so
+    /// the queue-mutation redelivery runs the advisory-ALLOWED delivery
+    /// variant and the worker-exit heal delivers the owed advisory instead
+    /// of deferring silently forever.
+    fn mark_interim_skipped_idle_advisory_pending(&self, child_id: &AgentId) {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .insert(child_id.clone());
+        self.stale_report_interim_skips
+            .lock()
+            .expect("stale-report interim skip registry poisoned")
+            .remove(child_id);
+        self.advisory_pending_interim_skips
+            .lock()
+            .expect("advisory-pending interim skip registry poisoned")
             .insert(child_id.clone());
     }
 
@@ -4748,14 +4798,29 @@ impl Services {
             .contains(child_id)
     }
 
+    /// Whether the recorded interim-skip marker for `child_id` carries
+    /// advisory-pending provenance (a live monitoring idle's advisory was
+    /// suppressed solely by the busy probe).
+    fn has_advisory_pending_interim_skip(&self, child_id: &AgentId) -> bool {
+        self.advisory_pending_interim_skips
+            .lock()
+            .expect("advisory-pending interim skip registry poisoned")
+            .contains(child_id)
+    }
+
     /// Take (check-and-clear) the interim-skip marker for `child_id`,
     /// returning whether it was set. Clearing on read makes the retraction
-    /// redelivery at-most-once per skipped idle. The stale-report provenance
-    /// travels with the marker (cleared on any take).
+    /// redelivery at-most-once per skipped idle. The stale-report and
+    /// advisory-pending provenances travel with the marker (cleared on any
+    /// take).
     fn take_interim_skipped_idle(&self, child_id: &AgentId) -> bool {
         self.stale_report_interim_skips
             .lock()
             .expect("stale-report interim skip registry poisoned")
+            .remove(child_id);
+        self.advisory_pending_interim_skips
+            .lock()
+            .expect("advisory-pending interim skip registry poisoned")
             .remove(child_id);
         self.interim_skipped_idles
             .lock()
@@ -4949,8 +5014,16 @@ impl Services {
         // than starving the seal until the hooks/monitors resolve. Box::pin
         // mirrors the seal below (try_fire_group → deliver_parent_wake →
         // send_message → try_drain_queue → this function).
-        if !self.active_hooks_for_agent(child_id).await.is_empty()
-            || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+        // monorepo#1297 busy-slot advisory race: the marker carries
+        // advisory-pending provenance when the LIVE idle was a monitoring
+        // idle whose advisory was suppressed solely by the busy probe. The
+        // hook/monitor guard below must NOT defer silently in that case —
+        // the owed advisory is exactly what the deferral would starve; fall
+        // through and run the advisory-ALLOWED delivery variant instead.
+        let advisory_pending = self.has_advisory_pending_interim_skip(child_id);
+        if !advisory_pending
+            && (!self.active_hooks_for_agent(child_id).await.is_empty()
+                || !self.active_pr_monitors_for_agent(child_id).await.is_empty())
         {
             // monorepo#2532 Gap B provenance gate: when the marker was
             // recorded by a REGISTRATION-TIME deferral, the persisted report
@@ -4997,6 +5070,8 @@ impl Services {
                 // forever (the retried redelivery seals it below).
                 if had_stale_report {
                     self.mark_interim_skipped_idle_stale_report(child_id);
+                } else if advisory_pending {
+                    self.mark_interim_skipped_idle_advisory_pending(child_id);
                 } else {
                     self.mark_interim_skipped_idle(child_id);
                 }
@@ -5057,12 +5132,22 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        // No-advisory variant: this synthetic pass is non-interim by
-        // construction, but a hook/monitor registered in the guard→delivery
-        // window could re-classify it as monitoring-idle — that deferral
-        // keeps today's silent skip; only a LIVE idle fires the advisory.
-        let classification =
-            Box::pin(self.deliver_completion_to_watches_no_advisory(child_id, &event)).await;
+        // No-advisory variant by default: this synthetic pass is non-interim
+        // by construction, but a hook/monitor registered in the
+        // guard→delivery window could re-classify it as monitoring-idle —
+        // that deferral keeps today's silent skip; only a LIVE idle fires
+        // the advisory. EXCEPT when the consumed marker carried
+        // advisory-pending provenance (monorepo#1297 busy-slot race): the
+        // LIVE idle already qualified for the advisory and was suppressed
+        // solely by the busy probe, so this heal pass stands in for it and
+        // runs the advisory-ALLOWED variant — the still-active hooks/monitors
+        // re-classify the synthesized idle as monitoring-idle and the owed
+        // advisory delivers (once per episode, via the persisted marker).
+        let classification = if advisory_pending {
+            Box::pin(self.deliver_completion_to_watches(child_id, &event)).await
+        } else {
+            Box::pin(self.deliver_completion_to_watches_no_advisory(child_id, &event)).await
+        };
         // Real completion: seal the agent's open after_all group and try to
         // fire it, mirroring `handle_completion_event`'s non-queue-interim
         // idle path (monorepo#1281). Gated on the delivery pass's own
@@ -5347,8 +5432,14 @@ impl Services {
         // running turn is caught by the busy probe. (A snapshot, not a lock:
         // an enqueue landing after both probes can still race a premature
         // wake, but the window shrinks from emit→delivery to check→wake.)
-        let queue_interim = event.event_type == AGENT_IDLE
-            && (self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()));
+        // The two probes are split (queue first, busy only when the queue is
+        // empty, preserving the combined probe's short-circuit order) because
+        // the advisory-pending marker below needs to know when the interim
+        // classification came SOLELY from the busy probe (monorepo#1297).
+        let queue_ready = event.event_type == AGENT_IDLE && self.has_ready_to_send(child_id);
+        let busy_interim =
+            event.event_type == AGENT_IDLE && !queue_ready && self.agent_is_busy(child_id.clone());
+        let queue_interim = queue_ready || busy_interim;
         // monorepo#1945: an `agent:idle` carrying a non-empty
         // completionReport (stamped by every idle emit site from the
         // session's persisted report, set exclusively by
@@ -5439,7 +5530,23 @@ impl Services {
         // gates the seal), so the redelivery's seal is a no-op backstop
         // for it.
         if interim_idle {
-            self.mark_interim_skipped_idle(child_id);
+            // monorepo#1297 busy-slot advisory race: the worker publishes the
+            // terminal `agent:idle` BEFORE releasing the busy slot, so a LIVE
+            // monitoring idle (hook-/PR-monitor-waiting, queue empty, not
+            // agent-waiting) that would have fired the advisory below can be
+            // classified interim solely by the busy probe. That advisory is
+            // OWED, not cancelled — record the advisory-pending provenance so
+            // the worker-exit heal (`redeliver_completion_after_queue_mutation`)
+            // runs the advisory-ALLOWED variant and delivers it.
+            if advisory_allowed
+                && busy_interim
+                && (hook_waiting || pr_monitor_waiting)
+                && !agent_waiting
+            {
+                self.mark_interim_skipped_idle_advisory_pending(child_id);
+            } else {
+                self.mark_interim_skipped_idle(child_id);
+            }
         }
         // The dedup clear is completion-scoped: an interim idle is not a
         // completion, so it must not clear failure-dedup state (a poisoned

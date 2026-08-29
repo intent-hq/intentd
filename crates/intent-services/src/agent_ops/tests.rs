@@ -16776,6 +16776,86 @@ async fn queue_interim_monitoring_idle_gets_no_advisory() {
     );
 }
 
+/// monorepo#1297 busy-slot advisory race: the child's terminal `agent:idle`
+/// is published while the worker still holds the busy slot, so the LIVE
+/// delivery pass classifies the monitoring idle (active hook, empty queue)
+/// interim and suppresses the advisory. The suppression records
+/// advisory-pending provenance, and the worker-exit heal
+/// (`redeliver_completion_after_queue_mutation` once the slot is released)
+/// runs the advisory-ALLOWED variant: exactly ONE advisory wake delivers
+/// (naming the hook, consuming the one-shot watch, persisting the
+/// once-per-episode marker) instead of deferring silently forever.
+#[tokio::test]
+async fn busy_suppressed_monitoring_idle_advisory_heals_on_worker_exit() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // The monitoring idle is delivered while the slot is still held: the
+    // busy probe classifies it interim, the advisory gate skips.
+    svc.set_test_busy(&child, true);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "advisory suppressed while the busy slot is held"
+    );
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // Slot released, no further completion event: the worker-exit hook runs
+    // the mutation-path redelivery, which must deliver the owed advisory.
+    svc.set_test_busy(&child, false);
+    svc.redeliver_completion_after_queue_mutation(&child).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "worker-exit heal delivers exactly one advisory wake"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("still waiting on external monitoring"),
+        "advisory wording: {text}"
+    );
+    assert!(text.contains("pr-watch"), "names the hook: {text}");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "advisory consumed the one-shot watch"
+    );
+    assert!(
+        svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "once-per-episode marker persisted"
+    );
+
+    // The heal is at-most-once: a second redelivery pass (e.g. the hook
+    // cancel backstop) finds no marker and delivers nothing more.
+    svc.redeliver_completion_after_queue_mutation(&child).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "no second wake from a repeated redelivery"
+    );
+}
+
 /// The advisory is scoped to PURE hook-/monitor-waiting deferral: an idle
 /// that is ALSO agent-waiting (child holds outgoing watches on unsettled
 /// agents) defers silently with the watch armed.

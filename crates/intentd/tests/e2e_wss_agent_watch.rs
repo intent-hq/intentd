@@ -2428,21 +2428,15 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
 ///    delivers the genuine completion wake exactly once
 ///    (`watchStillArmed: false`, no advisory flag).
 ///
-/// DEFECT (ignored until fixed): the advisory is racily suppressed on the
-/// real turn-end path. The child's `agent:idle` is published while its
-/// worker still holds the busy slot (`run_message_worker` runs `end_turn`
-/// after `run_prompt_turn` returns — see the monorepo#1297 note there), so
-/// the delivery pass's `agent_is_busy` probe classifies the idle
-/// `queue_interim` and the advisory gate (`interim idle` branch of
-/// `deliver_completion_to_watches_inner`, which requires `!queue_interim`)
-/// silently skips. The worker-exit heal then re-enters via
-/// `redeliver_completion_after_queue_mutation`, but that path is the
-/// deliberate no-advisory variant and its hook-waiting branch defers
-/// silently — so no advisory is ever delivered and the ungrouped watcher
-/// parks indefinitely. Reproduced 5/5 with a temporary probe on the
-/// interim-skip log: `queue_interim=true` at classification,
-/// `has_ready=false busy=false` at the skip log 2ms later.
-#[ignore = "monitoring-idle advisory racily suppressed by the busy-slot idle-publish race; see doc comment"]
+/// Exercises the monorepo#1297 busy-slot advisory race end-to-end: the
+/// child's `agent:idle` is published while its worker still holds the busy
+/// slot (`run_message_worker` runs `end_turn` after `run_prompt_turn`
+/// returns), so the delivery pass's `agent_is_busy` probe classifies the
+/// idle `queue_interim` and the advisory gate skips — recording
+/// advisory-pending provenance on the interim-skip marker. The worker-exit
+/// heal (`redeliver_completion_after_queue_mutation`) consults that
+/// provenance and runs the advisory-ALLOWED delivery variant, so the owed
+/// advisory still arrives exactly once per waiting episode.
 #[tokio::test]
 async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_wss() {
     const SPAWN_GO: &str = "WATCH8_SPAWN_GO";
