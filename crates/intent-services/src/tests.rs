@@ -31018,6 +31018,73 @@ mod turn_token_usage {
         assert_eq!(ws.token_usage.unwrap().totals.output_tokens, 30);
     }
 
+    /// #3795: a codex totals-only report (`totalTokens > 0`, every breakdown
+    /// zero — the `fill_to_context_window()` synthesized shape) is NOT
+    /// silently zero: the total lands as degraded input-attributed usage in
+    /// both the session tally and the hourly stats delta.
+    #[tokio::test]
+    async fn totals_only_report_preserved_in_tally_and_stats() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "gpt-5.3-codex");
+        session.provider = Some("codex".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        // `Usage` is #[non_exhaustive]; construct via its camelCase wire form.
+        let totals_only: Usage = serde_json::from_value(serde_json::json!({
+            "totalTokens": 258_000,
+            "inputTokens": 0,
+            "outputTokens": 0,
+        }))
+        .expect("totals-only usage deserializes");
+
+        // Turn 1: a normal last-request report of 40/10.
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(40, 10, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(40, 10, 0, 0)), None)
+            .await;
+        // Turn 2: the totals-only report — dropping totalTokens would make
+        // this turn read as all-zero / "no report".
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&totals_only),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&totals_only), None)
+            .await;
+
+        // Session tally: 40 + 258_000 input-attributed, not 40.
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 258_040, "total preserved");
+        assert_eq!(usage.totals.output_tokens, 10);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 258_040);
+
+        // Hourly delta: turn 2's report records in full, not as zero.
+        let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+        let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+        assert_eq!(input, 258_040, "hourly delta reflects the total");
+    }
+
     /// SUM providers still get REPLACE cost semantics: ACP `usage_update`
     /// cost is cumulative per session regardless of counter semantics, so
     /// the latest cost wins and a token-only turn keeps it.

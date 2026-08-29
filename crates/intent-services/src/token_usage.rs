@@ -150,7 +150,29 @@ pub(crate) fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
 /// Field mapping: `cachedReadTokens` → `cacheReadTokens`,
 /// `cachedWriteTokens` → `cacheCreationTokens` and `thoughtTokens` →
 /// `thoughtTokens`; absent optional counters map to zero. `totalTokens` is
-/// dropped (it is derivable).
+/// dropped (it is derivable) — EXCEPT for a totals-only report
+/// (`totalTokens > 0` with every breakdown zero), which codex-rs
+/// synthesizes on context-limit conditions (`fill_to_context_window()`,
+/// intent-hq/intent#3795). Dropping the total there would make the report
+/// read as all-zero — i.e. as "no report"
+/// ([`intent_core::token_usage_reported`]) —
+/// silently losing real consumption from the session tally and the hourly
+/// stats delta. The total is preserved as degraded INPUT-attributed usage:
+/// the synthesized figure is the context fill-up DELTA —
+/// `fill_to_context_window()` sets the forwarded `last_token_usage.
+/// total_tokens` to `max(0, context_window − previous_total)`; the full
+/// window arrives only via `full_context_window()` on fresh info — which
+/// is unaccounted context growth and thus input-dominated, and attributing
+/// it to one existing counter keeps the wire/store shape unchanged while
+/// the standard all-counter sum still equals the reported total exactly.
+/// A delta also composes safely with codex's `LastRequest` SUM semantics
+/// (no over-count on repeated context-limit turns; a zero delta stays
+/// all-zero, i.e. still "no report"). Should a Cumulative-semantics
+/// provider ever emit this shape, the preserved total would REPLACE the
+/// snapshot input-attributed and the next report's per-counter clamped
+/// delta could misattribute between counters for that one turn — accepted
+/// degraded behavior; no known Cumulative provider emits totals-only
+/// reports.
 ///
 /// **Recreate baseline** (monorepo#737): the stored snapshot is cumulative
 /// per *ACP* session (in every semantics mode), so when the
@@ -162,7 +184,7 @@ pub(crate) fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
 /// mode-independent because it operates on the stored snapshot, never on
 /// raw reports.
 pub(crate) fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
-    TokenUsageTotals {
+    let mut totals = TokenUsageTotals {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cached_read_tokens.unwrap_or(0),
@@ -171,7 +193,18 @@ pub(crate) fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
         // Cost rides on a separate ACP `usage_update` notification, not the
         // end-of-turn report; the caller stamps it onto the snapshot.
         cost: None,
+    };
+    let breakdowns_zero = totals.input_tokens == 0
+        && totals.output_tokens == 0
+        && totals.cache_read_tokens == 0
+        && totals.cache_creation_tokens == 0
+        && totals.thought_tokens == 0;
+    if breakdowns_zero && usage.total_tokens > 0 {
+        // Totals-only report (#3795): preserve the total as degraded
+        // input-attributed usage instead of an all-zero "no report".
+        totals.input_tokens = usage.total_tokens;
     }
+    totals
 }
 
 /// One agent's tally for the workspace roll-up (§5.23): the effective total
@@ -502,6 +535,49 @@ mod tests {
         }))
         .expect("sparse usage deserializes");
         assert_eq!(snapshot_from_turn_usage(&sparse), totals(2, 1, 0, 0));
+    }
+
+    /// #3795: a totals-only report (`totalTokens > 0`, every breakdown zero —
+    /// codex-rs `fill_to_context_window()`) preserves the total as degraded
+    /// input-attributed usage instead of mapping to an all-zero "no report".
+    #[test]
+    fn snapshot_from_turn_usage_preserves_totals_only_report() {
+        let totals_only: Usage = serde_json::from_value(serde_json::json!({
+            "totalTokens": 258_000,
+            "inputTokens": 0,
+            "outputTokens": 0
+        }))
+        .expect("totals-only usage deserializes");
+        assert_eq!(
+            snapshot_from_turn_usage(&totals_only),
+            totals(258_000, 0, 0, 0)
+        );
+        assert!(intent_core::token_usage_reported(
+            None,
+            Some(&snapshot_from_turn_usage(&totals_only))
+        ));
+
+        // A genuinely all-zero report stays all-zero — still "no report".
+        let all_zero: Usage = serde_json::from_value(serde_json::json!({
+            "totalTokens": 0,
+            "inputTokens": 0,
+            "outputTokens": 0
+        }))
+        .expect("all-zero usage deserializes");
+        assert_eq!(snapshot_from_turn_usage(&all_zero), totals(0, 0, 0, 0));
+
+        // Any non-zero breakdown keeps the standard mapping: the total is
+        // derivable and never overrides reported counters.
+        let with_breakdown: Usage = serde_json::from_value(serde_json::json!({
+            "totalTokens": 999,
+            "inputTokens": 0,
+            "outputTokens": 5
+        }))
+        .expect("breakdown usage deserializes");
+        assert_eq!(
+            snapshot_from_turn_usage(&with_breakdown),
+            totals(0, 5, 0, 0)
+        );
     }
 
     /// `thoughtTokens` folds through the same baseline+snapshot combine and
