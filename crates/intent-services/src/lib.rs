@@ -27962,6 +27962,7 @@ pub mod metrics;
 // Integrations & Ops modules (§19).
 pub mod token_usage;
 pub(crate) mod usage_rate;
+pub(crate) mod usage_semantics;
 pub(crate) mod usage_stats;
 pub(crate) mod usage_stats_read;
 pub(crate) mod session_stats {}

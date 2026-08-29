@@ -30941,6 +30941,268 @@ mod turn_token_usage {
         }
         assert!(seen >= 1, "at least one tokenUsage-changed event fired");
     }
+
+    /// Provider-keyed accumulation (intent-hq/intent#3794): a per-turn
+    /// provider's session with a provider-prefixed compound model id, e.g.
+    /// `claude-code:sonnet`.
+    fn per_turn_session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+        let mut session = agent_session(agent_id, ws, "claude-code:sonnet");
+        session.provider = Some("claude-code".into());
+        session
+    }
+
+    /// #3794: claude-agent-acp reports PER-TURN counters, so each report
+    /// SUMS into the stored snapshot — persisted totals equal the sum of
+    /// all turns, never just the last report (the old REPLACE undercount).
+    #[tokio::test]
+    async fn per_turn_provider_sums_reports_into_snapshot() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&per_turn_session(&agent, &h.ws))
+            .await
+            .expect("insert session");
+
+        // Turn 1 reports 70/50 (+30 cached read, +4 cached write).
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 30, 4)), None)
+            .await;
+        // Turn 2 reports 30/20 (+10, +2) — a SMALLER report than turn 1's,
+        // which REPLACE would have dropped turn 1 for.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(30, 20, 10, 2)), None)
+            .await;
+
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 100, "sum of turns, not latest");
+        assert_eq!(usage.totals.output_tokens, 70);
+        assert_eq!(usage.totals.cache_read_tokens, 40);
+        assert_eq!(usage.totals.cache_creation_tokens, 6);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
+    }
+
+    /// #3795: codex-acp (and opencode/unsloth) report LAST-REQUEST counters
+    /// — also summed, so totals accumulate monotonically per turn instead
+    /// of bouncing to whatever the final request happened to cost.
+    #[tokio::test]
+    async fn last_request_provider_accumulates_monotonically() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "gpt-5.3-codex");
+        session.provider = Some("codex".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        let mut expected_input = 0;
+        for report in [(40, 10), (25, 5), (60, 15)] {
+            h.services
+                .persist_turn_token_usage(
+                    &agent,
+                    &h.ws,
+                    Some(&acp_usage(report.0, report.1, 0, 0)),
+                    None,
+                )
+                .await;
+            expected_input += report.0;
+            let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+            let usage = ws.token_usage.expect("usage persisted");
+            assert_eq!(
+                usage.totals.input_tokens, expected_input,
+                "totals accumulate monotonically"
+            );
+        }
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(ws.token_usage.unwrap().totals.output_tokens, 30);
+    }
+
+    /// SUM providers still get REPLACE cost semantics: ACP `usage_update`
+    /// cost is cumulative per session regardless of counter semantics, so
+    /// the latest cost wins and a token-only turn keeps it.
+    #[tokio::test]
+    async fn per_turn_provider_cost_still_replaces() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&per_turn_session(&agent, &h.ws))
+            .await
+            .expect("insert session");
+        let cost = |amount: f64| {
+            Some(intent_core::UsageCost {
+                amount,
+                currency: "USD".to_string(),
+            })
+        };
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), cost(0.5))
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(30, 20, 0, 0)), cost(1.25))
+            .await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 100, "counters summed");
+        assert_eq!(usage.totals.cost, cost(1.25), "cost replaced, not summed");
+
+        // Token-only turn: the summed counters grow, the cost is kept.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 5, 0, 0)), None)
+            .await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 110);
+        assert_eq!(usage.totals.cost, cost(1.25), "cost not dropped");
+    }
+
+    /// The recreate-baseline fold (monorepo#737) keeps working for SUM
+    /// providers: the stored snapshot is cumulative in every mode, so the
+    /// CAS swap banks it into the baseline and post-recreate reports keep
+    /// summing on top — the tally never regresses.
+    #[tokio::test]
+    async fn per_turn_provider_recreate_fold_keeps_totals() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&per_turn_session(&agent, &h.ws))
+            .await
+            .expect("insert session");
+        h.store
+            .set_acp_session_id(&h.ws, &agent, "acp-1")
+            .await
+            .expect("set acp id");
+
+        // Two per-turn reports sum to a 100/80 snapshot.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(30, 30, 0, 0)), None)
+            .await;
+
+        // Recreate: the swap folds the 100/80 snapshot into the baseline.
+        h.store
+            .replace_acp_session_id(&h.ws, &agent, "acp-1", "acp-2")
+            .await
+            .expect("CAS swap");
+
+        // First post-recreate turn reports 5/3: baseline 100/80 + fresh
+        // summed snapshot 5/3 = 105/83, never just 5/3.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(5, 3, 0, 0)), None)
+            .await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 105);
+        assert_eq!(usage.totals.output_tokens, 83);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 105);
+    }
+
+    /// Hourly stats (#3794): for a per-turn provider the report itself IS
+    /// the delta — no snapshot subtraction, so a report smaller than the
+    /// stored snapshot records in full instead of clamping to zero.
+    #[tokio::test]
+    async fn per_turn_provider_stats_delta_is_the_report() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&per_turn_session(&agent, &h.ws))
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        // Turn 1 reports 70/50; bookkeeping order: stats first, then persist.
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(70, 50, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
+            .await;
+        // Turn 2 reports 30/20 — smaller than the stored 70/50 snapshot;
+        // cumulative subtraction would clamp this turn to 0.
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(30, 20, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(30, 20, 0, 0)), None)
+            .await;
+
+        let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+        let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+        let output: u64 = rows.iter().map(|r| r.output_tokens).sum();
+        assert_eq!(input, 100, "each report recorded in full");
+        assert_eq!(output, 70);
+    }
+
+    /// Cumulative providers (the default, e.g. mock or an unknown future
+    /// adapter) keep the pre-quirk behavior byte-identical: snapshots
+    /// REPLACE and the hourly delta is the saturating subtraction.
+    #[tokio::test]
+    async fn cumulative_provider_behavior_unchanged() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "opus-4.8");
+        session.provider = Some("mock".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(70, 50, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
+            .await;
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(100, 80, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), None)
+            .await;
+
+        // Snapshot replaced: the tally equals the latest cumulative report.
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 100, "latest snapshot, not sum");
+        assert_eq!(usage.totals.output_tokens, 80);
+
+        // Hourly delta: 70 (first report) + 30 (100 - 70), never 170.
+        let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+        let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+        assert_eq!(input, 100, "saturating-sub delta unchanged");
+    }
 }
 
 /// Wire-payload tests for `discover_providers_with_npx` (host.providerDiscovery):

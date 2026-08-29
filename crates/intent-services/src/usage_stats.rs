@@ -59,6 +59,10 @@ pub(crate) fn recording_local_offset() -> Option<UtcOffset> {
 /// per counter. The clamp absorbs snapshot regressions — e.g. the first
 /// report of a recreated ACP session restarting from zero — at the cost of
 /// under-counting that one turn, which is preferable to a huge bogus delta.
+/// Applies to CUMULATIVE-reporting providers only: for per-turn /
+/// last-request providers the report itself is the delta and callers bypass
+/// this subtraction entirely (see [`crate::usage_semantics`],
+/// intent-hq/intent#3794/#3795).
 pub(crate) fn turn_token_delta(
     prev: Option<&TokenUsageTotals>,
     next: &TokenUsageTotals,
