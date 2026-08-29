@@ -1466,8 +1466,10 @@ impl Services {
     }
 
     /// Drop an agent's recorded context occupancy (registry hygiene, mirrors
-    /// the other per-agent in-memory maps): called when the session is
-    /// deleted so the map never leaks entries for deleted agents.
+    /// the other per-agent in-memory maps): called on agent delete, session
+    /// recreate (CAS winner only — the old session's report is stale), and
+    /// the vanished-session cleanup sweep, so the map never leaks entries or
+    /// serves a snapshot for a session that no longer exists.
     pub(crate) fn clear_context_usage(&self, agent_id: &AgentId) {
         if let Ok(mut usages) = self.context_usages.lock() {
             usages.remove(agent_id);
