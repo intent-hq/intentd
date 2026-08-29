@@ -3891,7 +3891,7 @@ impl Services {
         // actually runs on `providers.active`, and classifying it as the
         // Cumulative default would reintroduce the undercount for a SUM
         // default provider (#3794/#3795).
-        let (stored, semantics, per_turn_cost) = match self
+        let (stored, semantics, per_turn_cost, thought_subset) = match self
             .store
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
@@ -3906,6 +3906,9 @@ impl Services {
                     stored,
                     crate::usage_semantics::usage_report_semantics(provider_id.as_deref()),
                     crate::usage_semantics::reads_prompt_meta_usage(provider_id.as_deref()),
+                    crate::usage_semantics::reports_thought_subset_of_output(
+                        provider_id.as_deref(),
+                    ),
                 )
             }
             // Degrade, never drop: with no readable prior snapshot the report
@@ -3918,12 +3921,18 @@ impl Services {
                     None,
                     crate::usage_semantics::UsageReportSemantics::Cumulative,
                     false,
+                    false,
                 )
             }
         };
         let mut snapshot = match usage {
             Some(usage) => {
-                let report = token_usage::snapshot_from_turn_usage(usage);
+                let mut report = token_usage::snapshot_from_turn_usage(usage);
+                if thought_subset {
+                    // codex reports thoughtTokens ⊂ outputTokens; normalize
+                    // to the disjoint storage convention (#3796).
+                    crate::usage_semantics::carve_thought_from_output(&mut report);
+                }
                 if semantics.sums_reports() {
                     // Per-turn / last-request report: SUM into the stored
                     // cumulative snapshot (#3794/#3795).
@@ -4036,14 +4045,24 @@ impl Services {
             })
             .flatten();
         let semantics = crate::usage_semantics::usage_report_semantics(provider_id.as_deref());
+        // codex reports thoughtTokens ⊂ outputTokens; normalize each mapped
+        // report to the disjoint storage convention (#3796) — same carve as
+        // the session-snapshot seam so the stats delta matches what
+        // `persist_turn_token_usage` banks.
+        let map_report = |u: &session::Usage| {
+            let mut report = token_usage::snapshot_from_turn_usage(u);
+            if crate::usage_semantics::reports_thought_subset_of_output(provider_id.as_deref()) {
+                crate::usage_semantics::carve_thought_from_output(&mut report);
+            }
+            report
+        };
         let tokens = match usage {
             // Per-turn / last-request report: the report IS the turn's delta
             // (no snapshot subtraction — #3794/#3795).
-            Some(u) if semantics.sums_reports() => token_usage::snapshot_from_turn_usage(u),
-            Some(u) if prev_readable => usage_stats::turn_token_delta(
-                prev.as_ref(),
-                &token_usage::snapshot_from_turn_usage(u),
-            ),
+            Some(u) if semantics.sums_reports() => map_report(u),
+            Some(u) if prev_readable => {
+                usage_stats::turn_token_delta(prev.as_ref(), &map_report(u))
+            }
             _ => intent_core::TokenUsageTotals::default(),
         };
         let delta = intent_store::UsageStatsDelta {

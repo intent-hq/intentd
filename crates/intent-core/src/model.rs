@@ -457,10 +457,14 @@ pub struct TokenUsageTotals {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
-    /// Cumulative reasoning ("thought") tokens, reported by providers that
-    /// break them out of `outputTokens` via ACP `usage_update.thoughtTokens`.
-    /// Omitted (not `0`) when nothing reported any, so clients that predate
-    /// the field see the previous shape byte-for-byte.
+    /// Cumulative reasoning ("thought") tokens, sourced from the end-of-turn
+    /// ACP `PromptResponse.usage.thoughtTokens` field (not the `usage_update`
+    /// notification, which carries only `used`/`size`/`cost`). DISJOINT from
+    /// `outputTokens`: providers whose wire report is a subset (codex, grok)
+    /// have it carved out of `outputTokens` at ingestion, so summing all five
+    /// counters yields the correct total (intent-hq/intent#3796). Omitted
+    /// (not `0`) when nothing reported any, so clients that predate the field
+    /// see the previous shape byte-for-byte.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub thought_tokens: u64,
     /// Cumulative cost, present only when at least one contributing session

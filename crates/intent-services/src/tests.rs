@@ -31085,6 +31085,60 @@ mod turn_token_usage {
         assert_eq!(input, 258_040, "hourly delta reflects the total");
     }
 
+    /// #3796: codex reports `thoughtTokens` as a SUBSET of `outputTokens`;
+    /// both accounting seams carve it out so the STORED buckets are disjoint
+    /// (matching grok's `_meta.usage` normalization) and the five-counter
+    /// total is correct.
+    #[tokio::test]
+    async fn codex_thought_subset_carved_out_at_both_seams() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "gpt-5.3-codex");
+        session.provider = Some("codex".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        // 100 input, 50 output of which 20 are reasoning (codex subset shape).
+        let with_thought: Usage = serde_json::from_value(serde_json::json!({
+            "totalTokens": 150,
+            "inputTokens": 100,
+            "outputTokens": 50,
+            "thoughtTokens": 20,
+        }))
+        .expect("usage deserializes");
+
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&with_thought),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&with_thought), None)
+            .await;
+
+        // Session snapshot: output carved to 30, thought disjoint at 20.
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let totals = ws.token_usage.expect("usage persisted").totals;
+        assert_eq!(totals.input_tokens, 100);
+        assert_eq!(totals.output_tokens, 30, "thought carved out of output");
+        assert_eq!(totals.thought_tokens, 20);
+
+        // Hourly stats: the same disjoint carve lands in the delta.
+        let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+        let output: u64 = rows.iter().map(|r| r.output_tokens).sum();
+        let thought: u64 = rows.iter().map(|r| r.thought_tokens).sum();
+        assert_eq!(output, 30, "stats delta carved identically");
+        assert_eq!(thought, 20);
+    }
+
     /// SUM providers still get REPLACE cost semantics: ACP `usage_update`
     /// cost is cumulative per session regardless of counter semantics, so
     /// the latest cost wins and a token-only turn keeps it.
