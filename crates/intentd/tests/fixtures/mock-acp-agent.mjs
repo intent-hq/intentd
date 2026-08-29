@@ -809,6 +809,13 @@ async function handlePrompt(id, params) {
   if (active.usage && typeof active.usage === 'object') {
     payload.usage = active.usage;
   }
+  // Optional `_meta` extension payload on the PromptResponse: when the active
+  // behavior/rule carries a `promptMeta` object it is echoed verbatim as
+  // `_meta`, letting e2e tests drive provider extension paths — e.g. grok's
+  // whole-prompt `_meta.usage` bill (intent-hq/intent#3803).
+  if (active.promptMeta && typeof active.promptMeta === 'object') {
+    payload._meta = active.promptMeta;
+  }
   result(id, payload);
 }
 

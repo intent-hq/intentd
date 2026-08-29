@@ -2641,12 +2641,16 @@ impl Services {
         for attachment in drained_attachments {
             transcript.push_block(attachment.resource_item());
         }
-        // Split the PromptOutcome into its stop reason and the optional
+        // Split the PromptOutcome into its stop reason, the optional
         // end-of-turn usage snapshot (persisted below once the turn's message
-        // is durable).
+        // is durable), and the raw `_meta` payload — the fallback usage
+        // source for providers that bill only there (grok's `_meta.usage`
+        // whole-prompt bill, intent-hq/intent#3803).
         let mut turn_usage = None;
+        let mut turn_meta = None;
         let result = result.map(|outcome| {
             turn_usage = outcome.usage;
+            turn_meta = outcome.meta;
             outcome.stop_reason
         });
         // Latest ACP `usage_update` cost of the turn (§5.23), accumulated by
@@ -2936,6 +2940,7 @@ impl Services {
             // real turn end.
             let turn_end = time::OffsetDateTime::now_utc();
             let turn_usage = turn_usage.take();
+            let turn_meta = turn_meta.take();
             let prev = self
                 .turn_bookkeeping
                 .lock()
@@ -2945,6 +2950,28 @@ impl Services {
                 if let Some(prev) = prev {
                     let _ = prev.await;
                 }
+                // grok fallback (intent-hq/intent#3803): no standard report,
+                // but the turn's `_meta` may carry the whole-prompt bill —
+                // synthesize the standard per-turn report from it so the
+                // ordinary seam below ingests it (SUM, grok is PerTurn). A
+                // present standard report always wins; runs after the
+                // predecessor await so its provider read cannot race turn
+                // N-1's bookkeeping.
+                let (turn_usage, turn_cost) = if turn_usage.is_none() {
+                    match services
+                        .prompt_meta_turn_usage(
+                            &agent_id_task,
+                            &workspace_id_task,
+                            turn_meta.as_ref(),
+                        )
+                        .await
+                    {
+                        Some((usage, cost)) => (Some(usage), turn_cost.or(cost)),
+                        None => (turn_usage, turn_cost),
+                    }
+                } else {
+                    (turn_usage, turn_cost)
+                };
                 services
                     .record_turn_usage_stats(
                         &agent_id_task,
@@ -3784,6 +3811,45 @@ impl Services {
             .await;
     }
 
+    /// Synthesize the standard per-turn usage report from the
+    /// `PromptResponse._meta.usage` whole-prompt bill for providers that
+    /// report usage only there (grok, intent-hq/intent#3803; audit §8.4).
+    /// Called by the turn-end bookkeeping task when the standard `usage`
+    /// field was absent: parses the bill first (cheap, no I/O — most
+    /// providers have no such `_meta` shape) and only then resolves the
+    /// session's provider to gate on
+    /// [`reads_prompt_meta_usage`](crate::usage_semantics::reads_prompt_meta_usage),
+    /// so a non-grok provider that happens to attach a similar `_meta` never
+    /// gets misread. `None` when there is no bill, it is empty, or the
+    /// provider does not report via `_meta` — the caller then proceeds
+    /// exactly as before (report-less turn).
+    pub(crate) async fn prompt_meta_turn_usage(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        meta: Option<&Meta>,
+    ) -> Option<(session::Usage, Option<UsageCost>)> {
+        let bill = crate::usage_semantics::prompt_meta_usage_bill(meta?)?;
+        let provider_id = match self
+            .store
+            .get_agent_session_token_usage(workspace_id, agent_id)
+            .await
+        {
+            Ok((model, _, provider, _)) => resolve_provider_id(
+                model.as_deref(),
+                provider.as_deref(),
+                derived_default_provider(&self.effective_settings()).as_deref(),
+            ),
+            // Fail closed: without the provider column the gate cannot
+            // confirm a `_meta`-billing provider — skip rather than misread.
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "read provider for _meta usage failed");
+                return None;
+            }
+        };
+        crate::usage_semantics::reads_prompt_meta_usage(provider_id.as_deref()).then_some(bill)
+    }
+
     /// Persist one turn's end-of-turn usage report and refresh the workspace
     /// tally (§5.23). How the report folds into the stored cumulative
     /// snapshot is provider-keyed (see `usage_semantics`,
@@ -3804,6 +3870,12 @@ impl Services {
     /// turn carried no fresh report for it: a cost-only turn never zeroes the
     /// counters, and a counters-only turn never drops a cost already
     /// reported for the session.
+    ///
+    /// Exception: for a provider whose cost arrives on the per-turn
+    /// `_meta.usage` bill (grok, #3803 — `reads_prompt_meta_usage`), `cost`
+    /// covers the just-finished prompt only, so it SUMS into the stored cost
+    /// (`UsageCost::merge`) instead of replacing it — mirroring the counters'
+    /// `PerTurn` fold.
     pub(crate) async fn persist_turn_token_usage(
         &self,
         agent_id: &AgentId,
@@ -3819,7 +3891,7 @@ impl Services {
         // actually runs on `providers.active`, and classifying it as the
         // Cumulative default would reintroduce the undercount for a SUM
         // default provider (#3794/#3795).
-        let (stored, semantics) = match self
+        let (stored, semantics, per_turn_cost) = match self
             .store
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
@@ -3833,6 +3905,7 @@ impl Services {
                 (
                     stored,
                     crate::usage_semantics::usage_report_semantics(provider_id.as_deref()),
+                    crate::usage_semantics::reads_prompt_meta_usage(provider_id.as_deref()),
                 )
             }
             // Degrade, never drop: with no readable prior snapshot the report
@@ -3844,6 +3917,7 @@ impl Services {
                 (
                     None,
                     crate::usage_semantics::UsageReportSemantics::Cumulative,
+                    false,
                 )
             }
         };
@@ -3863,7 +3937,24 @@ impl Services {
             }
             None => stored.clone().unwrap_or_default(),
         };
-        snapshot.cost = cost.or_else(|| stored.and_then(|s| s.cost));
+        let stored_cost = stored.and_then(|s| s.cost);
+        snapshot.cost = if per_turn_cost {
+            // Per-turn `_meta.usage` bill (#3803): the fresh figure covers
+            // one prompt — SUM with the stored session cost. `merge` also
+            // covers the either-half-absent fallbacks.
+            //
+            // INVARIANT: SUM is safe only because a `reads_prompt_meta_usage`
+            // provider's costs all originate from per-turn meta bills — grok
+            // never emits `usage_update` costs (audit §8.1), so the cumulative
+            // figures `persist_cost_only_ordered` routes through here (and the
+            // seam's `turn_cost.or(cost)` preference) can never reach this
+            // branch. If grok ever grows `usage_update` costs, key this on the
+            // cost's SOURCE (meta bill vs usage_update), not the provider.
+            UsageCost::merge(stored_cost.as_ref(), cost.as_ref())
+        } else {
+            // Cumulative `usage_update` cost: latest wins, stored fallback.
+            cost.or(stored_cost)
+        };
         if let Err(e) = self
             .store
             .set_agent_session_token_usage(workspace_id, agent_id, &snapshot)

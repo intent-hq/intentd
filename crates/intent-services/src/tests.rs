@@ -31347,6 +31347,113 @@ mod turn_token_usage {
         let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
         assert_eq!(input, 100, "each report recorded in full");
     }
+
+    /// A `PromptResponse._meta` in the shape grok serializes (#3803, audit
+    /// §8.2): the whole-prompt `usage` bill plus the sibling last-call token
+    /// fields and context-occupancy `totalTokens` that must NOT be read.
+    fn grok_meta(input: u64, output: u64, cached: u64, ticks: i64) -> intent_acp::session::Meta {
+        serde_json::json!({
+            "sessionId": "sess-1",
+            "promptId": "req-1",
+            "totalTokens": 999_999,
+            "modelId": "grok-code-1",
+            "inputTokens": 11,
+            "outputTokens": 7,
+            "usage": {
+                "inputTokens": input,
+                "outputTokens": output,
+                "totalTokens": input + output,
+                "cachedReadTokens": cached,
+                "reasoningTokens": 0,
+                "costUsdTicks": ticks,
+                "numTurns": 1
+            }
+        })
+        .as_object()
+        .expect("object")
+        .clone()
+    }
+
+    /// grok's `_meta.usage` bill (#3803): synthesized into a standard
+    /// per-turn report at the seam and SUMMED across turns — tokens AND
+    /// cost, since the bill covers one prompt.
+    #[tokio::test]
+    async fn grok_meta_bill_ingested_and_sums_across_turns() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "grok-code-1");
+        session.provider = Some("grok".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        // Turn 1: 5000 input incl. 3000 cache reads, $0.025.
+        let meta = grok_meta(5000, 1200, 3000, 250_000_000);
+        let (usage, cost) = h
+            .services
+            .prompt_meta_turn_usage(&agent, &h.ws, Some(&meta))
+            .await
+            .expect("grok bill synthesized");
+        assert_eq!(usage.input_tokens, 2000, "cache reads subtracted");
+        assert_eq!(usage.cached_read_tokens, Some(3000));
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&usage), cost)
+            .await;
+        // Turn 2: a smaller bill — REPLACE would drop turn 1.
+        let meta = grok_meta(1000, 300, 0, 50_000_000);
+        let (usage, cost) = h
+            .services
+            .prompt_meta_turn_usage(&agent, &h.ws, Some(&meta))
+            .await
+            .expect("grok bill synthesized");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&usage), cost)
+            .await;
+
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 3000, "2000 + 1000 summed");
+        assert_eq!(usage.totals.output_tokens, 1500);
+        assert_eq!(usage.totals.cache_read_tokens, 3000);
+        let cost = usage.totals.cost.expect("cost persisted");
+        assert!(
+            (cost.amount - 0.03).abs() < 1e-12,
+            "$0.025 + $0.005 summed, got {}",
+            cost.amount
+        );
+        assert_eq!(cost.currency, "USD");
+    }
+
+    /// The `_meta` synthesis is gated on the provider: an identical payload
+    /// from a non-grok session is never misread as a usage report.
+    #[tokio::test]
+    async fn meta_bill_ignored_for_non_grok_providers() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "opus-4.8");
+        session.provider = Some("mock".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        let meta = grok_meta(5000, 1200, 3000, 250_000_000);
+        assert!(
+            h.services
+                .prompt_meta_turn_usage(&agent, &h.ws, Some(&meta))
+                .await
+                .is_none(),
+            "non-grok provider skips the _meta bill"
+        );
+        assert!(
+            h.services
+                .prompt_meta_turn_usage(&agent, &h.ws, None)
+                .await
+                .is_none(),
+            "no _meta at all"
+        );
+    }
 }
 
 /// Wire-payload tests for `discover_providers_with_npx` (host.providerDiscovery):
