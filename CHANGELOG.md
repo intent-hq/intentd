@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.17] - 2026-08-29
+
+### 🐛 Bug Fixes
+
+- Fall back to repositoryPath when resolving workspace on-disk paths ([#1563](https://github.com/intent-hq/intentd/pull/1563))
+
+
 ## [0.8.16] - 2026-08-29
 
 ### 🐛 Bug Fixes
