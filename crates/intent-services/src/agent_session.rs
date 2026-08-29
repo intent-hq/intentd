@@ -3789,15 +3789,20 @@ impl Services {
     }
 
     /// Persist one turn's end-of-turn usage report and refresh the workspace
-    /// tally (§5.23). The report is interpreted as the session's cumulative
-    /// snapshot (see `token_usage::snapshot_from_turn_usage`), so it REPLACES
-    /// the previously stored snapshot; the workspace `TokenUsage` is then
-    /// re-aggregated, persisted, and `workspace:tokenUsage-changed` emitted
-    /// when it changed. Best-effort: errors are logged, never propagated —
-    /// usage bookkeeping must not fail an otherwise-successful turn.
+    /// tally (§5.23). How the report folds into the stored cumulative
+    /// snapshot is provider-keyed (see `usage_semantics`,
+    /// intent-hq/intent#3794/#3795): for spec-compliant cumulative providers
+    /// the mapped report REPLACES the previously stored snapshot; for
+    /// per-turn / last-request providers it SUMS into it. Either way the
+    /// STORED snapshot remains cumulative per ACP session — the recreate
+    /// baseline fold (monorepo#737) is unaffected. The workspace
+    /// `TokenUsage` is then re-aggregated, persisted, and
+    /// `workspace:tokenUsage-changed` emitted when it changed. Best-effort:
+    /// errors are logged, never propagated — usage bookkeeping must not fail
+    /// an otherwise-successful turn.
     ///
     /// `cost` is the latest ACP `usage_update` cost observed during the turn,
-    /// also cumulative per ACP session (latest wins). The two reports are
+    /// cumulative per ACP session (latest wins). The two reports are
     /// independent — a provider may send either alone — so each part of the
     /// stored snapshot falls back to its previously persisted value when this
     /// turn carried no fresh report for it: a cost-only turn never zeroes the
@@ -3810,28 +3815,56 @@ impl Services {
         usage: Option<&session::Usage>,
         cost: Option<UsageCost>,
     ) {
-        let stored = if usage.is_none() || cost.is_none() {
-            match self
-                .store
-                .get_agent_session_token_usage(workspace_id, agent_id)
-                .await
-            {
-                Ok((_, _, _, stored)) => stored,
-                // Degrade, never drop: the read only recovers the half of the
-                // snapshot this turn carries no fresh report for, so a failure
-                // must not discard the half we do have. The lost fallback is
-                // self-healing — both reports are cumulative, so the next one
-                // restores it.
-                Err(e) => {
-                    tracing::warn!(agent = %agent_id, error = %e, "read prior token usage failed");
-                    None
-                }
+        // The session row is read unconditionally: the stored snapshot backs
+        // both the missing-half fallback and the SUM accumulation, and the
+        // model/provider columns key the report semantics. The configured
+        // default is passed through so the resolution mirrors the spawn
+        // precedence exactly: a bare-model session with `provider = NULL`
+        // actually runs on `providers.active`, and classifying it as the
+        // Cumulative default would reintroduce the undercount for a SUM
+        // default provider (#3794/#3795).
+        let (stored, semantics) = match self
+            .store
+            .get_agent_session_token_usage(workspace_id, agent_id)
+            .await
+        {
+            Ok((model, _, provider, stored)) => {
+                let provider_id = resolve_provider_id(
+                    model.as_deref(),
+                    provider.as_deref(),
+                    derived_default_provider(&self.effective_settings()).as_deref(),
+                );
+                (
+                    stored,
+                    crate::usage_semantics::usage_report_semantics(provider_id.as_deref()),
+                )
             }
-        } else {
-            None
+            // Degrade, never drop: with no readable prior snapshot the report
+            // is persisted as-is (the semantics fall to the REPLACE default —
+            // a SUM provider under-counts this one turn rather than
+            // re-counting or dropping history).
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "read prior token usage failed");
+                (
+                    None,
+                    crate::usage_semantics::UsageReportSemantics::Cumulative,
+                )
+            }
         };
         let mut snapshot = match usage {
-            Some(usage) => token_usage::snapshot_from_turn_usage(usage),
+            Some(usage) => {
+                let report = token_usage::snapshot_from_turn_usage(usage);
+                if semantics.sums_reports() {
+                    // Per-turn / last-request report: SUM into the stored
+                    // cumulative snapshot (#3794/#3795).
+                    let mut acc = stored.clone().unwrap_or_default();
+                    token_usage::add_totals(&mut acc, &report);
+                    acc
+                } else {
+                    // Cumulative report: the mapped report IS the snapshot.
+                    report
+                }
+            }
             None => stored.clone().unwrap_or_default(),
         };
         snapshot.cost = cost.or_else(|| stored.and_then(|s| s.cost));
@@ -3856,18 +3889,21 @@ impl Services {
     }
 
     /// Record one finished prompt turn into the global `usage_stats_hourly`
-    /// store (usage-stats cards): the per-turn token delta — the new
-    /// cumulative snapshot minus the previously persisted one, clamped ≥ 0
-    /// per counter — plus, for completed turns only (agent runs = completed
-    /// prompt turns), a `runs` increment and the turn's wall-clock duration
-    /// folded into the bucket's `longest_run_ms` MAX. Counters land in the
-    /// current UTC hour bucket keyed by the session's stats model key —
-    /// normalized model name, falling back to the provider id for
-    /// placeholder/absent models, `"unknown"` only when the provider is
-    /// unknowable too (D13) — with no workspace dimension, stamped with the
-    /// daemon's local wall-clock (D12). MUST run BEFORE
-    /// `persist_turn_token_usage` replaces the session snapshot the delta is
-    /// computed against — the per-agent chained bookkeeping task spawned in
+    /// store (usage-stats cards): the per-turn token delta — provider-keyed
+    /// (see `usage_semantics`, intent-hq/intent#3794/#3795): for cumulative
+    /// providers the new snapshot minus the previously persisted one,
+    /// clamped ≥ 0 per counter; for per-turn / last-request providers the
+    /// report itself IS the delta (no subtraction) — plus, for completed
+    /// turns only (agent runs = completed prompt turns), a `runs` increment
+    /// and the turn's wall-clock duration folded into the bucket's
+    /// `longest_run_ms` MAX. Counters land in the current UTC hour bucket
+    /// keyed by the session's stats model key — normalized model name,
+    /// falling back to the provider id for placeholder/absent models,
+    /// `"unknown"` only when the provider is unknowable too (D13) — with no
+    /// workspace dimension, stamped with the daemon's local wall-clock
+    /// (D12). MUST run BEFORE `persist_turn_token_usage` updates the session
+    /// snapshot the cumulative delta is computed against — the per-agent
+    /// chained bookkeeping task spawned in
     /// [`run_prompt_turn`](Self::run_prompt_turn) calls the two in that
     /// order. Best-effort: errors are logged, never propagated — stats
     /// bookkeeping must not fail a turn.
@@ -3896,7 +3932,27 @@ impl Services {
                 (None, None, None, None, false)
             }
         };
+        // Resolution mirrors the spawn precedence (compound model prefix →
+        // provider field → configured default) so a bare-model session with
+        // `provider = NULL` — which actually runs on `providers.active` —
+        // keys the correct report semantics instead of falling to the
+        // Cumulative default (#3794/#3795). A still-unresolvable provider
+        // falls to the `"unknown"` stats tail (and the cumulative semantics
+        // default below).
+        let provider_id = prev_readable
+            .then(|| {
+                resolve_provider_id(
+                    model.as_deref(),
+                    provider.as_deref(),
+                    derived_default_provider(&self.effective_settings()).as_deref(),
+                )
+            })
+            .flatten();
+        let semantics = crate::usage_semantics::usage_report_semantics(provider_id.as_deref());
         let tokens = match usage {
+            // Per-turn / last-request report: the report IS the turn's delta
+            // (no snapshot subtraction — #3794/#3795).
+            Some(u) if semantics.sums_reports() => token_usage::snapshot_from_turn_usage(u),
             Some(u) if prev_readable => usage_stats::turn_token_delta(
                 prev.as_ref(),
                 &token_usage::snapshot_from_turn_usage(u),
@@ -3924,13 +3980,6 @@ impl Services {
         let now = turn_end;
         let bucket = usage_stats::hour_bucket_utc(now);
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
-        // Stats attribution only: no configured-default upgrade here (unlike
-        // the spawn-adjacent call sites above), matching the pre-existing
-        // `usage_stats.rs` helpers this mirrors — out of scope for D2. An
-        // unresolvable provider falls to the `"unknown"` stats tail.
-        let provider_id = prev_readable
-            .then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None))
-            .flatten();
         let model = usage_stats::stats_model_key(
             model.as_deref(),
             resolved_model.as_deref(),

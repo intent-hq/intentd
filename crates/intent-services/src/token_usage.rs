@@ -42,8 +42,10 @@ pub struct AgentTokenTally {
 /// can never panic on overflow). The optional `cost` is NOT folded here:
 /// bucket-level cost accumulation is currency-aware and lives in
 /// [`CostBucket`] (the roll-up) / [`UsageCost::merge`] (the pairwise
-/// baseline+snapshot fold).
-fn add_totals(lhs: &mut TokenUsageTotals, rhs: &TokenUsageTotals) {
+/// baseline+snapshot fold). Also the SUM operation for providers whose
+/// end-of-turn reports are per-turn/last-request rather than cumulative
+/// (see [`crate::usage_semantics`]).
+pub(crate) fn add_totals(lhs: &mut TokenUsageTotals, rhs: &TokenUsageTotals) {
     lhs.input_tokens = lhs.input_tokens.saturating_add(rhs.input_tokens);
     lhs.output_tokens = lhs.output_tokens.saturating_add(rhs.output_tokens);
     lhs.cache_read_tokens = lhs.cache_read_tokens.saturating_add(rhs.cache_read_tokens);
@@ -132,28 +134,33 @@ pub(crate) fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
     usage
 }
 
-/// Interpret one end-of-turn ACP `Usage` report as the session's cumulative
-/// [`TokenUsageTotals`] snapshot.
+/// Map one end-of-turn ACP `Usage` report into [`TokenUsageTotals`].
 ///
-/// **Cumulative-replace interpretation** (isolated here on purpose): the ACP
-/// `unstable_end_turn_token_usage` extension documents its counters as totals
-/// "across all turns" of the ACP session, so each report REPLACES the
-/// session's previous snapshot — reports are never summed. The ACP RFD is
-/// still Draft; if the semantics flip to per-turn deltas later, this function
-/// (and its callers' replace-vs-add choice) is the single place to change.
+/// **Report semantics are provider-keyed** (intent-hq/intent#3794, #3795):
+/// the ACP `unstable_end_turn_token_usage` extension documents its counters
+/// as totals "across all turns" of the ACP session — for compliant providers
+/// each mapped report REPLACES the session's previous snapshot — but some
+/// adapters send per-turn or last-request counters instead, whose reports
+/// SUM into the snapshot. The classification lives in
+/// [`crate::usage_semantics`]; the replace-vs-sum choice is applied by the
+/// callers at the accounting seam (`persist_turn_token_usage` /
+/// `record_turn_usage_stats`). Either way the STORED snapshot stays
+/// cumulative-per-ACP-session.
 ///
 /// Field mapping: `cachedReadTokens` → `cacheReadTokens`,
 /// `cachedWriteTokens` → `cacheCreationTokens` and `thoughtTokens` →
 /// `thoughtTokens`; absent optional counters map to zero. `totalTokens` is
 /// dropped (it is derivable).
 ///
-/// **Recreate baseline** (monorepo#737): counters are cumulative per *ACP*
-/// session, so when the resume-impossible fallback recreates the ACP session,
-/// the fresh session restarts from zero. The store banks the outgoing
-/// session's snapshot into `token_usage_baseline` atomically with the id swap
+/// **Recreate baseline** (monorepo#737): the stored snapshot is cumulative
+/// per *ACP* session (in every semantics mode), so when the
+/// resume-impossible fallback recreates the ACP session, the fresh session
+/// restarts from zero. The store banks the outgoing session's snapshot into
+/// `token_usage_baseline` atomically with the id swap
 /// (`Store::replace_acp_session_id`); the agent's effective total is then
-/// `baseline + snapshot` (see [`agent_token_tally`]). The snapshot itself
-/// stays replace-only — the baseline lives outside it.
+/// `baseline + snapshot` (see [`agent_token_tally`]) — this fold is
+/// mode-independent because it operates on the stored snapshot, never on
+/// raw reports.
 pub(crate) fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
     TokenUsageTotals {
         input_tokens: usage.input_tokens,
