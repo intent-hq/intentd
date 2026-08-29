@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.18] - 2026-08-29
+
+### 🐛 Bug Fixes
+
+- *(services)* Preserve totals-only usage reports as degraded input-attributed usage ([#1566](https://github.com/intent-hq/intentd/pull/1566))
+- *(services)* Ingest grok's _meta.usage whole-prompt bill ([#1567](https://github.com/intent-hq/intentd/pull/1567))
+
+
 ## [0.8.17] - 2026-08-29
 
 ### 🐛 Bug Fixes
