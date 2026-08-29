@@ -2797,6 +2797,49 @@ mod tests {
             .any(|c| c == "merge is no longer blocked"));
     }
 
+    /// `unknown` is a transient GitHub state ("still recomputing"), never an
+    /// actionable signal: `mergeable`/`mergeStateStatus` transitions TO
+    /// unknown are suppressed unconditionally — queued or not — so the
+    /// merge-queue processing blip (mergeable → null, mergeStateStatus →
+    /// UNKNOWN) never wakes the agent. Transitions FROM unknown to a known
+    /// value still report.
+    #[test]
+    fn diff_suppresses_mergeable_and_merge_state_transitions_to_unknown() {
+        // While queued: the recomputation blip produces no lines at all,
+        // whether the merge state reads as the literal UNKNOWN enum…
+        let queued = snapshot(|s| s.requirements.is_in_merge_queue = Some(true));
+        let queued_blip = snapshot(|s| {
+            s.requirements.is_in_merge_queue = Some(true);
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = Some("UNKNOWN".into());
+        });
+        assert!(diff_snapshots(&queued, &queued_blip).is_empty());
+        // …or as absent entirely.
+        let queued_none = snapshot(|s| {
+            s.requirements.is_in_merge_queue = Some(true);
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = None;
+        });
+        assert!(diff_snapshots(&queued, &queued_none).is_empty());
+
+        // Not queued: suppression is unconditional — the same blip stays
+        // quiet.
+        let base = snapshot(|_| {});
+        let blip = snapshot(|s| {
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = Some("UNKNOWN".into());
+        });
+        assert!(diff_snapshots(&base, &blip).is_empty());
+
+        // Settling FROM unknown at a known value still reports.
+        let known = snapshot(|s| s.requirements.mergeable = Some(false));
+        let changes = diff_snapshots(&blip, &known);
+        assert!(changes.iter().any(|c| c == "mergeable: unknown → false"));
+        assert!(changes
+            .iter()
+            .any(|c| c == "merge state: UNKNOWN → BLOCKED"));
+    }
+
     /// The ejection diff is keyed on the event identity (`at`): a new event
     /// fires (with the reason humanized, underscores → spaces), an unchanged
     /// event stays quiet, and an enter→eject pair that nets out on

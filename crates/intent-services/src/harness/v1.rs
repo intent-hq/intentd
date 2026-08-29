@@ -1051,14 +1051,23 @@ impl Harness for V1 {
                 });
             }
         }
-        if o.mergeable != n.mergeable {
+        // Transitions TO unknown are suppressed: `unknown` is a transient
+        // GitHub state ("still recomputing", e.g. while a merge-queue group
+        // is processed), never an actionable signal. A blip either reverts
+        // (net silent against the emit baseline) or settles at a known
+        // value, which then reports as a single old → new line.
+        if o.mergeable != n.mergeable && n.mergeable.is_some() {
             changes.push(format!(
                 "mergeable: {} → {}",
                 describe_opt(o.mergeable),
                 describe_opt(n.mergeable)
             ));
         }
-        if o.merge_state_status != n.merge_state_status {
+        if o.merge_state_status != n.merge_state_status
+            && n.merge_state_status
+                .as_deref()
+                .is_some_and(|s| s != "UNKNOWN")
+        {
             changes.push(format!(
                 "merge state: {} → {}",
                 o.merge_state_status.as_deref().unwrap_or("unknown"),
