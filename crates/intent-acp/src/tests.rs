@@ -5698,6 +5698,21 @@ mod workspace_api_tool_tests {
         WorkspaceMcpServer::new(api, WorkspaceId::from_string(id))
     }
 
+    fn server_with_paths(
+        id: &str,
+        path: Option<&str>,
+        worktree_path: Option<&str>,
+        repository_path: Option<&str>,
+    ) -> WorkspaceMcpServer {
+        let api = WorkspaceInfoMockApi::new(id, path);
+        {
+            let mut workspace = api.ws.lock().unwrap();
+            workspace.worktree_path = worktree_path.map(str::to_string);
+            workspace.repository_path = repository_path.map(str::to_string);
+        }
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string(id))
+    }
+
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
@@ -5975,15 +5990,46 @@ mod workspace_api_tool_tests {
     }
 
     #[tokio::test]
-    async fn workspace_api_info_binding_returns_null_path_when_workspace_has_none() {
-        // `Workspace.path` is optional (§9.1); a workspace without a
-        // resolved on-disk path returns `path: null` rather than erroring.
+    async fn workspace_api_info_binding_preserves_path_then_worktree_precedence() {
+        let srv = server_with_paths(
+            "amber-forest",
+            Some("/tmp/path"),
+            Some("/tmp/worktree"),
+            Some("/tmp/repository"),
+        );
+        let body = tool_json(&call_workspace_api(&srv, "return await ws.workspace.info();").await);
+        assert_eq!(body["path"], json!("/tmp/path"));
+
+        let srv = server_with_paths(
+            "amber-forest",
+            None,
+            Some("/tmp/worktree"),
+            Some("/tmp/repository"),
+        );
+        let body = tool_json(&call_workspace_api(&srv, "return await ws.workspace.info();").await);
+        assert_eq!(body["path"], json!("/tmp/worktree"));
+    }
+
+    #[tokio::test]
+    async fn workspace_api_info_binding_falls_back_to_repository_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let srv = server_with_paths(
+            "amber-forest",
+            None,
+            None,
+            Some(repo.path().to_str().unwrap()),
+        );
+        let body = tool_json(&call_workspace_api(&srv, "return await ws.workspace.info();").await);
+        assert_eq!(body["id"], json!("amber-forest"));
+        assert_eq!(body["path"], repo.path().to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn workspace_api_info_binding_rejects_genuinely_pathless_workspace() {
         let srv = server("amber-forest", None);
         let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
-        assert_eq!(body["id"], json!("amber-forest"));
-        assert_eq!(body["path"], Value::Null);
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(tool_text(&resp).contains("workspace has no on-disk checkout path"));
     }
 
     #[tokio::test]
@@ -10946,7 +10992,9 @@ mod workspace_api_output_limit_tests {
     /// Mock whose `settings_get` serves configurable `workspaceApi.*` knobs
     /// and whose `get_workspace` reports an optional on-disk checkout path.
     struct OutputLimitMockApi {
-        checkout: Mutex<Option<String>>,
+        path: Mutex<Option<String>>,
+        worktree_path: Mutex<Option<String>>,
+        repository_path: Mutex<Option<String>>,
         toon_output: Mutex<Value>,
         max_output_chars: Mutex<Value>,
     }
@@ -10954,8 +11002,25 @@ mod workspace_api_output_limit_tests {
     impl OutputLimitMockApi {
         fn new(checkout: Option<&str>, toon_output: bool, max_output_chars: u64) -> Arc<Self> {
             Arc::new(Self {
-                checkout: Mutex::new(checkout.map(str::to_string)),
+                path: Mutex::new(None),
+                worktree_path: Mutex::new(checkout.map(str::to_string)),
+                repository_path: Mutex::new(None),
                 toon_output: Mutex::new(json!(toon_output)),
+                max_output_chars: Mutex::new(json!(max_output_chars)),
+            })
+        }
+
+        fn with_paths(
+            path: Option<&str>,
+            worktree_path: Option<&str>,
+            repository_path: Option<&str>,
+            max_output_chars: u64,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                path: Mutex::new(path.map(str::to_string)),
+                worktree_path: Mutex::new(worktree_path.map(str::to_string)),
+                repository_path: Mutex::new(repository_path.map(str::to_string)),
+                toon_output: Mutex::new(json!(false)),
                 max_output_chars: Mutex::new(json!(max_output_chars)),
             })
         }
@@ -10963,7 +11028,9 @@ mod workspace_api_output_limit_tests {
 
     impl WorkspaceApi for OutputLimitMockApi {
         fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
-            let checkout = self.checkout.lock().unwrap().clone();
+            let path = self.path.lock().unwrap().clone();
+            let worktree_path = self.worktree_path.lock().unwrap().clone();
+            let repository_path = self.repository_path.lock().unwrap().clone();
             Box::pin(async move {
                 let now = "2026-01-01T00:00:00Z".to_string();
                 Ok(Workspace {
@@ -10981,11 +11048,11 @@ mod workspace_api_output_limit_tests {
                     updated_at: now,
                     last_activity: None,
                     tags: Vec::new(),
-                    path: None,
-                    repository_path: None,
+                    path,
+                    repository_path,
                     repository_owner: None,
                     repository_name: None,
-                    worktree_path: checkout,
+                    worktree_path,
                     scope: None,
                     skip_worktree: false,
                     setup_script: None,
@@ -11043,6 +11110,17 @@ mod workspace_api_output_limit_tests {
         max_output_chars: u64,
     ) -> WorkspaceMcpServer {
         let api = OutputLimitMockApi::new(checkout, toon_output, max_output_chars);
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
+    }
+
+    fn server_with_paths(
+        path: Option<&str>,
+        worktree_path: Option<&str>,
+        repository_path: Option<&str>,
+        max_output_chars: u64,
+    ) -> WorkspaceMcpServer {
+        let api =
+            OutputLimitMockApi::with_paths(path, worktree_path, repository_path, max_output_chars);
         WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
     }
 
@@ -11111,6 +11189,33 @@ mod workspace_api_output_limit_tests {
         let head: String = full.chars().take(50).collect();
         assert!(text.contains(&head));
         assert!(text.contains("`ws.file.read` cannot reach it"));
+    }
+
+    #[tokio::test]
+    async fn over_limit_output_preserves_worktree_then_path_precedence() {
+        let (worktree_folder, worktree) = temp_workspace_layout();
+        let (path_folder, path) = temp_workspace_layout();
+        let (repository_folder, repository) = temp_workspace_layout();
+        let srv = server_with_paths(Some(&path), Some(&worktree), Some(&repository), 50);
+
+        let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
+        let text = tool_text(&resp);
+        let output = only_tool_output(worktree_folder.path());
+        assert!(text.contains(output.to_str().unwrap()));
+        assert!(!path_folder.path().join("tool-outputs").exists());
+        assert!(!repository_folder.path().join("tool-outputs").exists());
+    }
+
+    #[tokio::test]
+    async fn over_limit_output_falls_back_to_repository_path() {
+        let (folder, repository) = temp_workspace_layout();
+        let srv = server_with_paths(None, None, Some(&repository), 50);
+
+        let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
+        let text = tool_text(&resp);
+        let output = only_tool_output(folder.path());
+        assert!(text.contains(output.to_str().unwrap()));
+        assert!(!text.contains("workspace has no on-disk checkout path"));
     }
 
     #[tokio::test]

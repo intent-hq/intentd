@@ -261,7 +261,23 @@ async fn propose_sibling(
 
 async fn info(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
     let workspace = api.get_workspace(ws.clone()).await.map_err(map_err)?;
-    let path = workspace.path.clone().or(workspace.worktree_path.clone());
+    let path = workspace
+        .path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .or_else(|| {
+            workspace
+                .worktree_path
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+        })
+        .or_else(|| {
+            workspace
+                .repository_path
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+        })
+        .ok_or_else(|| "workspace has no on-disk checkout path".to_string())?;
     Ok(json!({
         "id": ws.as_str(),
         "path": path,
