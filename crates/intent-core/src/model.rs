@@ -473,8 +473,9 @@ pub struct TokenUsageTotals {
 /// latest `usage_update` notification's required `used`/`size` fields
 /// (intent-hq/intent#3797). Point-in-time occupancy (input + cache tokens vs.
 /// the model's context window) — a UI signal, never a token-tally input.
-/// Latest-wins per live session, held in-memory only: a daemon restart (or
-/// agent respawn) drops it and the field disappears until the next report.
+/// Latest-wins per live session, held in-memory only: a daemon restart or an
+/// ACP session recreate drops it and the field disappears until the next
+/// report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextUsage {

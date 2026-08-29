@@ -2270,6 +2270,12 @@ impl Services {
         // unknown", not "the provider advertised no selector", and writing it
         // would clobber what the winner just persisted.
         let (modes, thought_level) = if canonical == new_acp_session_id {
+            // The old ACP session is gone: its last context-occupancy report
+            // no longer describes anything live, so drop it rather than serve
+            // a stale snapshot until the new session's first `usage_update`
+            // (intent-hq/intent#3797). Skipped on CAS loss — the winner owns
+            // the canonical session and this cleanup with it.
+            self.clear_context_usage(agent_id);
             self.persist_effective_model(
                 &workspace_id,
                 agent_id,

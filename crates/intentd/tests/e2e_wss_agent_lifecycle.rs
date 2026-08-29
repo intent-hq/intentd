@@ -13677,6 +13677,27 @@ async fn usage_update_cost_captured_over_wss() {
     assert_eq!(usage["totals"]["cost"]["amount"], 1.25, "read: {read}");
     assert_eq!(usage["totals"]["cost"]["currency"], "USD");
     assert_eq!(usage["totals"]["inputTokens"], 100);
+
+    // The same usage_update's required used/size fields surface as the
+    // additive AgentLite.contextUsage occupancy overlay (§5.5,
+    // intent-hq/intent#3797): latest-wins — turn two's 61_000 replaced turn
+    // one's 53_000 — and never fed into the token tallies asserted above.
+    let got = wss_rpc(&mut rpc, 14, "agent.get", json!({ "agentId": agent_id })).await;
+    let ctx = &got["agent"]["contextUsage"];
+    assert_eq!(ctx["used"], 61_000, "agent.get contextUsage: {got}");
+    assert_eq!(ctx["size"], 200_000);
+    assert!(ctx["updatedAt"].is_string(), "RFC-3339 timestamp: {got}");
+    let listed = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let row = listed["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == agent_id.as_str())
+        .expect("created agent listed");
+    assert_eq!(
+        row["contextUsage"]["used"], 61_000,
+        "agent.list carries the same overlay: {listed}"
+    );
 }
 
 /// Pin the `grok` provider binary to a wrapper around the mock ACP fixture

@@ -10803,6 +10803,7 @@ async fn discard_failure_for_vanished_session(
     mgr.services.clear_failure_streak(agent_id);
     mgr.services.discard_pending_terminal_error(agent_id);
     mgr.services.clear_turn_silent_tail(agent_id);
+    mgr.services.clear_context_usage(agent_id);
     mgr.services.clear_truncation_redrives(agent_id);
     mgr.services.take_truncation_redrive(agent_id);
     true
