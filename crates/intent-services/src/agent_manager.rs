@@ -6641,9 +6641,10 @@ impl AgentManager {
         // emit a phantom `stream:start`/`stream:end` pair with no content
         // and pin the busy slot for the settle window.
         //
-        // A `usage_update` cost is the one exception: providers commonly emit
-        // the final cost report after the response, so it can lead a buffered
-        // burst. It materializes no transcript content, so it is persisted
+        // A `usage_update` is the one exception: providers commonly emit
+        // the final usage report after the response, so it can lead a
+        // buffered burst. It materializes no transcript content, so its
+        // context occupancy is recorded in-memory and any cost is persisted
         // cost-only (§5.23) — no turn, no busy slot, no phantom stream events
         // — instead of being dropped.
         match intent_acp::session::map_notification(&first) {
@@ -6653,18 +6654,24 @@ impl AgentManager {
             Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
             Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
                 if !tc.tool_name.trim().is_empty() => {}
-            Some(intent_acp::session::MappedUpdate::UsageCost(cost)) => {
+            Some(intent_acp::session::MappedUpdate::Usage(usage)) => {
                 drop(guard);
+                // Context occupancy (intent-hq/intent#3797): latest-wins
+                // in-memory record, never a token-tally input.
                 self.services
-                    .persist_cost_only_ordered(
-                        agent_id,
-                        workspace_id,
-                        UsageCost {
-                            amount: cost.amount,
-                            currency: cost.currency,
-                        },
-                    )
-                    .await;
+                    .record_context_usage(agent_id, usage.used, usage.size);
+                if let Some(cost) = usage.cost {
+                    self.services
+                        .persist_cost_only_ordered(
+                            agent_id,
+                            workspace_id,
+                            UsageCost {
+                                amount: cost.amount,
+                                currency: cost.currency,
+                            },
+                        )
+                        .await;
+                }
                 return true;
             }
             _ => return true,
@@ -10796,6 +10803,7 @@ async fn discard_failure_for_vanished_session(
     mgr.services.clear_failure_streak(agent_id);
     mgr.services.discard_pending_terminal_error(agent_id);
     mgr.services.clear_turn_silent_tail(agent_id);
+    mgr.services.clear_context_usage(agent_id);
     mgr.services.clear_truncation_redrives(agent_id);
     mgr.services.take_truncation_redrive(agent_id);
     true

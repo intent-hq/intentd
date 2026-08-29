@@ -473,6 +473,24 @@ pub struct TokenUsageTotals {
     pub cost: Option<UsageCost>,
 }
 
+/// Context-window occupancy of a live ACP session (PROTOCOL §5.5), from the
+/// latest `usage_update` notification's required `used`/`size` fields
+/// (intent-hq/intent#3797). Point-in-time occupancy (input + cache tokens vs.
+/// the model's context window) — a UI signal, never a token-tally input.
+/// Latest-wins per live session, held in-memory only: a daemon restart or an
+/// ACP session recreate drops it and the field disappears until the next
+/// report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    /// Tokens currently in the session's context window.
+    pub used: u64,
+    /// Total context window size in tokens.
+    pub size: u64,
+    /// RFC-3339 timestamp of the report this snapshot came from.
+    pub updated_at: String,
+}
+
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &u64) -> bool {
@@ -3112,6 +3130,14 @@ pub struct AgentLite {
     pub turn_in_flight: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_stream_activity_at: Option<String>,
+    /// Context-window occupancy from the latest ACP `usage_update`
+    /// (intent-hq/intent#3797, additive): `{ used, size, updatedAt }` —
+    /// latest-wins per live session, in-memory only (a daemon restart drops
+    /// it). Omitted when no live report exists. Stays `None` in
+    /// [`AgentLite::from_session`] (no runtime context) and is overlaid by
+    /// the service projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<SessionStats>,
     pub created_at: String,
@@ -3273,6 +3299,7 @@ impl AgentLite {
             waiting_on_pr_monitors: Vec::new(),
             turn_in_flight: false,
             last_stream_activity_at: None,
+            context_usage: None,
             stats: session.stats,
             last_activity: Some(session.updated_at.clone()),
             created_at: session.created_at,

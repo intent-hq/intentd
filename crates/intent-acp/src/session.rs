@@ -9,8 +9,10 @@
 //! without a canonical `WorkspaceEvent` in `events/types.ts`
 //! (plan/mode/commands/…) map to `None`: emitting invented event
 //! strings would break wire parity with the live iOS client. `usage_update`
-//! emits no event either, but its cumulative `cost` is mapped so the service
-//! layer can fold it into the workspace `TokenUsage` tally (§5.23).
+//! emits no event either, but it maps: `used`/`size` carry the live session's
+//! context-window occupancy (a latest-wins signal, never a token-tally input)
+//! and the cumulative `cost`, when reported, is folded into the workspace
+//! `TokenUsage` tally by the service layer (§5.23).
 //!
 //! ## Session lifetime semantics
 //!
@@ -353,11 +355,26 @@ pub enum MappedUpdate {
     },
     /// `tool_call` / `tool_call_update` → `agent:tool:call`.
     ToolCall(MappedToolCall),
-    /// `usage_update` → no canonical `WorkspaceEvent`, but its cumulative
-    /// per-ACP-session `cost` feeds the workspace `TokenUsage` tally (§5.23).
-    /// Mapped only when the notification actually carries a cost object; the
-    /// context-window fields (`used`/`size`) are not consumed here.
-    UsageCost(MappedUsageCost),
+    /// `usage_update` → no canonical `WorkspaceEvent`. The context-window
+    /// occupancy (`used`/`size`) is recorded latest-wins per live session
+    /// (never folded into token tallies), and the cumulative per-ACP-session
+    /// `cost`, when reported, feeds the workspace `TokenUsage` tally (§5.23).
+    Usage(MappedUsage),
+}
+
+/// The context-window occupancy and optional cumulative cost carried by an
+/// ACP `usage_update` (§5.23). `used`/`size` are point-in-time context
+/// occupancy (input + cache vs. the model's window) — a signal, not a
+/// billing counter; only `cost` ever contributes to the token tally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MappedUsage {
+    /// Tokens currently in the session's context window.
+    pub used: u64,
+    /// Total context window size in tokens.
+    pub size: u64,
+    /// Cumulative session cost, when the provider reports one — absence is
+    /// never coerced to a zero figure.
+    pub cost: Option<MappedUsageCost>,
 }
 
 /// The cumulative session cost carried by an ACP `usage_update` (§5.23).
@@ -391,8 +408,9 @@ pub struct MappedToolCall {
 
 /// Map a `session/update` to a [`MappedUpdate`], or `None` when the variant has
 /// no canonical `WorkspaceEvent` and nothing else to accumulate
-/// (plan/mode/commands/…) (§6.6). `usage_update` maps only when it
-/// carries a `cost` object (§5.23).
+/// (plan/mode/commands/…) (§6.6). `usage_update` always maps: `used`/`size`
+/// are required schema fields (the context-occupancy signal), and `cost`
+/// rides along when reported (§5.23).
 pub(crate) fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
@@ -417,12 +435,14 @@ pub(crate) fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate>
         SessionUpdate::ToolCallUpdate(update) => {
             Some(MappedUpdate::ToolCall(map_tool_call_update(update)))
         }
-        SessionUpdate::UsageUpdate(usage) => usage.cost.as_ref().map(|cost| {
-            MappedUpdate::UsageCost(MappedUsageCost {
+        SessionUpdate::UsageUpdate(usage) => Some(MappedUpdate::Usage(MappedUsage {
+            used: usage.used,
+            size: usage.size,
+            cost: usage.cost.as_ref().map(|cost| MappedUsageCost {
                 amount: cost.amount,
                 currency: cost.currency.clone(),
-            })
-        }),
+            }),
+        })),
         _ => None,
     }
 }

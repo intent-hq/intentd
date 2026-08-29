@@ -1704,11 +1704,12 @@ mod session_tests {
         assert_eq!(session::map_notification(&other), None);
     }
 
-    /// `usage_update` maps to [`MappedUpdate::UsageCost`] when it carries a
-    /// `cost` object (§5.23) and to `None` when it reports only the context
-    /// window — a cost-less provider must never fabricate a zero figure.
+    /// `usage_update` maps to [`MappedUpdate::Usage`] carrying the required
+    /// context-occupancy fields (`used`/`size`, intent-hq/intent#3797) plus
+    /// the `cost` object when reported (§5.23) — a cost-less provider must
+    /// never fabricate a zero cost figure.
     #[test]
-    fn usage_update_maps_only_when_cost_is_reported() {
+    fn usage_update_maps_used_size_and_optional_cost() {
         let with_cost: SessionUpdate = serde_json::from_value(json!({
             "sessionUpdate": "usage_update",
             "used": 53_000,
@@ -1718,9 +1719,13 @@ mod session_tests {
         .expect("usage_update with cost deserializes");
         assert_eq!(
             session::map_session_update(&with_cost),
-            Some(MappedUpdate::UsageCost(session::MappedUsageCost {
-                amount: 1.25,
-                currency: "USD".to_string(),
+            Some(MappedUpdate::Usage(session::MappedUsage {
+                used: 53_000,
+                size: 200_000,
+                cost: Some(session::MappedUsageCost {
+                    amount: 1.25,
+                    currency: "USD".to_string(),
+                }),
             }))
         );
 
@@ -1730,7 +1735,14 @@ mod session_tests {
             "size": 200_000
         }))
         .expect("usage_update without cost deserializes");
-        assert_eq!(session::map_session_update(&without_cost), None);
+        assert_eq!(
+            session::map_session_update(&without_cost),
+            Some(MappedUpdate::Usage(session::MappedUsage {
+                used: 53_000,
+                size: 200_000,
+                cost: None,
+            }))
+        );
     }
 }
 
@@ -8770,6 +8782,7 @@ mod wsapi4_bindings_tests {
             waiting_on_pr_monitors: vec![],
             turn_in_flight: false,
             last_stream_activity_at: None,
+            context_usage: None,
             stats: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

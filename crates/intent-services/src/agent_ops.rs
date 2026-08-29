@@ -2520,6 +2520,11 @@ impl Services {
         lite.waiting_for_agent_ids = waiting_for_agent_ids;
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
+        // Context-occupancy overlay (intent-hq/intent#3797): the latest ACP
+        // `usage_update` `used`/`size` for this agent, from the in-memory
+        // registry (O(1) map lookup, never persisted). Omitted when no live
+        // report exists (fresh session, daemon restart).
+        lite.context_usage = self.context_usage_for(&lite.id);
         // Liveness overlay on `lastActivity` (monorepo#3647): the persisted
         // `updated_at` freezes at turn start (nothing persists until the turn
         // ends), so mid-turn the live-turn slot's stream stamp is the newer
@@ -3976,6 +3981,9 @@ impl Services {
         self.clear_turn_silent_tail(&agent_id);
         self.clear_truncation_redrives(&agent_id);
         self.take_truncation_redrive(&agent_id);
+        // Context-occupancy registry (intent-hq/intent#3797): in-memory,
+        // keyed by agent — dropped on the same terms.
+        self.clear_context_usage(&agent_id);
         // Registry hygiene (monorepo#840): drop the failure streak and any
         // failure-wake dedup records naming the deleted agent as parent OR
         // child — delegation churns short-lived agents in both roles, so a
