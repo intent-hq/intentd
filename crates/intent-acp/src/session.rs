@@ -203,6 +203,12 @@ pub struct PromptOutcome {
     pub stop_reason: StopReason,
     /// Cumulative-per-session token usage reported at end of turn, if any.
     pub usage: Option<Usage>,
+    /// The response's raw `_meta` extension payload, if any. Some providers
+    /// report usage only here instead of the standard `usage` field (grok's
+    /// `_meta.usage` whole-prompt bill, intent-hq/intent#3803); the service
+    /// layer owns interpreting it. Best-effort like `usage`: a malformed
+    /// `_meta` deserializes to `None`.
+    pub meta: Option<Meta>,
 }
 
 /// `session/prompt` with the user content blocks → drives a turn; the agent
@@ -246,6 +252,7 @@ pub async fn prompt(
                 return Ok(PromptOutcome {
                     stop_reason: response.stop_reason,
                     usage: response.usage,
+                    meta: response.meta,
                 });
             }
             () = tokio::time::sleep(poll_interval) => {

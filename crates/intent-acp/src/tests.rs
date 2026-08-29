@@ -857,6 +857,29 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn prompt_captures_response_meta() {
+        // Providers may attach extension payloads at `_meta` (grok reports
+        // its whole-prompt usage bill only there, intent-hq/intent#3803);
+        // the outcome carries the raw map for the service layer.
+        let (conn, _responder) = connect_session_with_prompt_result(json!({
+            "stopReason": "end_turn",
+            "_meta": {
+                "modelId": "grok-code-1",
+                "usage": { "inputTokens": 5000, "outputTokens": 1200 }
+            }
+        }));
+        let block = ContentBlock::Text(TextContent::new("hello"));
+        let activity = session::ActivityTracker::new();
+        let outcome = session::prompt(&conn, "acp-session-1", vec![block], &activity)
+            .await
+            .expect("session/prompt resolves");
+        assert!(outcome.usage.is_none(), "no standard usage field");
+        let meta = outcome.meta.expect("_meta captured");
+        assert_eq!(meta["modelId"], json!("grok-code-1"));
+        assert_eq!(meta["usage"]["inputTokens"], json!(5000));
+    }
+
+    #[tokio::test]
     async fn prompt_with_malformed_usage_yields_none() {
         // The schema deserializes `usage` best-effort (`DefaultOnError`), so a
         // malformed payload degrades to None instead of failing the turn.
