@@ -1012,15 +1012,29 @@ impl Harness for V1 {
             });
         }
 
-        // Mergeability + residual signals.
-        if o.has_conflicts != n.has_conflicts {
+        // Mergeability + residual signals. `unknown` is a transient GitHub
+        // state ("still recomputing", e.g. while a merge-queue group is
+        // processed), never an actionable signal — and the recomputation
+        // also resets the derived conflict/behind/blocked signals, so while
+        // the NEW snapshot's mergeability is unknown their clearing
+        // direction is suppressed alongside the raw `mergeable`/`merge
+        // state` transitions (the appearing direction always reports). A
+        // blip either reverts (net silent against the emit baseline) or
+        // settles at a known value, which then reports as a single
+        // old → new line.
+        let merge_state_known = n
+            .merge_state_status
+            .as_deref()
+            .is_some_and(|s| s != "UNKNOWN");
+        let recomputing = n.mergeable.is_none() || !merge_state_known;
+        if o.has_conflicts != n.has_conflicts && (n.has_conflicts || !recomputing) {
             changes.push(if n.has_conflicts {
                 "merge conflicts appeared".to_string()
             } else {
                 "merge conflicts resolved".to_string()
             });
         }
-        if o.is_behind != n.is_behind {
+        if o.is_behind != n.is_behind && (n.is_behind || !recomputing) {
             changes.push(if n.is_behind {
                 "branch is now behind its base".to_string()
             } else {
@@ -1051,11 +1065,6 @@ impl Harness for V1 {
                 });
             }
         }
-        // Transitions TO unknown are suppressed: `unknown` is a transient
-        // GitHub state ("still recomputing", e.g. while a merge-queue group
-        // is processed), never an actionable signal. A blip either reverts
-        // (net silent against the emit baseline) or settles at a known
-        // value, which then reports as a single old → new line.
         if o.mergeable != n.mergeable && n.mergeable.is_some() {
             changes.push(format!(
                 "mergeable: {} → {}",
@@ -1063,18 +1072,16 @@ impl Harness for V1 {
                 describe_opt(n.mergeable)
             ));
         }
-        if o.merge_state_status != n.merge_state_status
-            && n.merge_state_status
-                .as_deref()
-                .is_some_and(|s| s != "UNKNOWN")
-        {
+        if o.merge_state_status != n.merge_state_status && merge_state_known {
             changes.push(format!(
                 "merge state: {} → {}",
                 o.merge_state_status.as_deref().unwrap_or("unknown"),
                 n.merge_state_status.as_deref().unwrap_or("unknown")
             ));
         }
-        if o.merge_blocked_reason != n.merge_blocked_reason {
+        if o.merge_blocked_reason != n.merge_blocked_reason
+            && (n.merge_blocked_reason.is_some() || !recomputing)
+        {
             changes.push(match &n.merge_blocked_reason {
                 Some(reason) => format!("merge blocked: {reason}"),
                 None => "merge is no longer blocked".to_string(),
