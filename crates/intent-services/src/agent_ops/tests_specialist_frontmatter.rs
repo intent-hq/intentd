@@ -1157,6 +1157,54 @@ async fn legacy_session_without_snapshot_picks_up_file_edit() {
     assert_eq!(inj.role_reminder.as_deref(), Some("Edited reminder"));
 }
 
+/// Legacy live resolution (no frozen snapshot) must resolve the workspace
+/// path for the project tier via the `repositoryPath` fallback
+/// (monorepo#3778): a direct-checkout workspace persisting only
+/// `repositoryPath` picks up its project-tier reminder instead of silently
+/// falling back to the user tier.
+#[tokio::test]
+async fn legacy_role_reminder_resolves_project_tier_via_repository_path() {
+    let (_t, svc, _ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "tiered",
+        "User Name",
+        "User reminder",
+        "User body.",
+    );
+
+    // Project tier lives under `<repositoryPath>/.intent/specialists/`.
+    let repo = TempDir::new().expect("repo dir");
+    let project_dir = repo.path().join(".intent").join("specialists");
+    std::fs::create_dir_all(&project_dir).expect("project specialists dir");
+    create_specialist_with_body(
+        &project_dir,
+        "tiered",
+        "Project Name",
+        "Project reminder",
+        "Project body.",
+    );
+
+    // A direct-checkout workspace: only `repositoryPath` is persisted.
+    let ws2 = WorkspaceId::new();
+    let mut row = workspace(&ws2);
+    row.repository_path = Some(repo.path().to_string_lossy().into_owned());
+    svc.store().insert_workspace(&row).await.expect("ws2");
+
+    let id = create_agent(&svc, &ws2, "TestAgent", None, Some("tiered".into())).await;
+    // Strip the frozen creation-time snapshot to force legacy live resolution.
+    svc.store()
+        .update_agent_session_metadata(&ws2, &id, None, &intent_core::now_iso())
+        .await
+        .expect("strip snapshot");
+
+    let reminder = svc.agent_role_reminder(&id).await.expect("reminder");
+    assert!(
+        reminder.contains("Project Name") && reminder.contains("Project reminder"),
+        "expected project-tier reminder via repositoryPath fallback, got: {reminder}"
+    );
+}
+
 /// Create a specialist file with an explicit `role` frontmatter value.
 fn create_specialist_with_role(dir: &Path, id: &str, role: &str) {
     let content = format!(

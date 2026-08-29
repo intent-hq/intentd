@@ -1429,8 +1429,7 @@ impl Services {
             .get_workspace(&session.workspace_id)
             .await
             .ok()
-            .and_then(|w| w.path.or(w.worktree_path))
-            .map(PathBuf::from);
+            .and_then(|w| w.effective_path().map(PathBuf::from));
         // Embedded floor pinned to the session's stamped harness version
         // (H2); the wrapper wording stays latest-owned (turn envelope, H6).
         let entry = crate::harness::resolve_entry(&session.harness_version);

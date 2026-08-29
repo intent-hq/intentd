@@ -543,7 +543,9 @@ async fn lifecycle_loop(
 
 /// Resolve the on-disk root for a lifecycle event: prefer the self-sufficient
 /// `data.workspace` payload (`workspace:created`, §6.7), fall back to a
-/// `get_workspace` lookup (`workspace:opened` carries only the id). Returns
+/// `get_workspace` lookup (`workspace:opened` carries only the id). Both arms
+/// resolve `path`, else `worktreePath`, else `repositoryPath` — direct
+/// checkouts may persist only `repositoryPath` (monorepo#3778). Returns
 /// `None` when the workspace has no existing directory.
 async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf> {
     let from_payload = ev
@@ -553,6 +555,8 @@ async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf
             ws.get("path")
                 .and_then(|v| v.as_str())
                 .or_else(|| ws.get("worktreePath").and_then(|v| v.as_str()))
+                .or_else(|| ws.get("repositoryPath").and_then(|v| v.as_str()))
+                .filter(|p| !p.is_empty())
         })
         .map(PathBuf::from);
 
@@ -560,7 +564,7 @@ async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf
         Some(p)
     } else {
         let ws = services.get_workspace(ev.workspace_id.clone()).await.ok()?;
-        ws.path.or(ws.worktree_path).map(PathBuf::from)
+        ws.effective_path().map(PathBuf::from)
     }?;
 
     path.is_dir().then_some(path)
@@ -714,6 +718,45 @@ mod tests {
             "ranScript": ran_script,
         });
         ev
+    }
+
+    /// Materialize a [`NewEvent`] as a stored [`Event`] so the private
+    /// `resolve_path` helper can be exercised directly.
+    fn stored_event(ev: NewEvent) -> Event {
+        Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ev.workspace_id,
+            timestamp: ev.timestamp,
+            event_type: ev.event_type,
+            actor: ev.actor,
+            session_id: ev.session_id,
+            correlation_id: ev.correlation_id,
+            parent_event_id: ev.parent_event_id,
+            metadata: ev.metadata,
+            data: ev.data,
+        }
+    }
+
+    /// `resolve_path` resolves `repositoryPath` as the final fallback in BOTH
+    /// arms (monorepo#3778): the self-sufficient `data.workspace` payload arm
+    /// and the `get_workspace` lookup arm — direct checkouts may persist only
+    /// `repositoryPath`.
+    #[tokio::test]
+    async fn resolve_path_falls_back_to_repository_path() {
+        let dir = TempDir::new("repo-fallback");
+        let mut ws = chief_workspace();
+        ws.id = WorkspaceId::from("ws-repo-only");
+        ws.title = "ws-repo-only".to_string();
+        ws.repository_path = Some(dir.path.to_string_lossy().into_owned());
+        let api = FakeApi::new(vec![ws.clone()]);
+
+        // Payload arm (`workspace:created` carries the row).
+        let ev = stored_event(lifecycle_event(WORKSPACE_CREATED, &ws, true));
+        assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
+
+        // Lookup arm (`workspace:opened` carries only the id).
+        let ev = stored_event(lifecycle_event(WORKSPACE_OPENED, &ws, false));
+        assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
     }
 
     async fn bus_and_sub() -> (TempDb, EventBus, super::super::bus::Subscription) {

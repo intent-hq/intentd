@@ -281,6 +281,24 @@ pub struct Workspace {
     pub pending_delete_at: Option<String>,
 }
 
+impl Workspace {
+    /// The workspace's on-disk root: `path`, else `worktreePath`, else
+    /// `repositoryPath` — direct-checkout workspaces (`skipIsolation`) may
+    /// persist only `repositoryPath` (monorepo#3778). Empty strings are
+    /// filtered at every step; `None` when no non-empty candidate exists.
+    #[must_use]
+    pub fn effective_path(&self) -> Option<&str> {
+        [
+            self.path.as_deref(),
+            self.worktree_path.as_deref(),
+            self.repository_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|p| !p.is_empty())
+    }
+}
+
 /// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -4078,6 +4096,35 @@ mod tests {
     use super::*;
 
     use serde_json::json;
+
+    /// [`Workspace::effective_path`] precedence (monorepo#3778): `path`, else
+    /// `worktreePath`, else `repositoryPath`; empty strings are skipped at
+    /// every step and `None` is returned only when no non-empty candidate
+    /// remains — direct-checkout workspaces persisting only `repositoryPath`
+    /// must still resolve.
+    #[test]
+    fn workspace_effective_path_precedence_and_empty_filtering() {
+        let mut ws = chief_workspace();
+        assert_eq!(ws.effective_path(), None);
+
+        // repositoryPath alone resolves (the monorepo#3778 case).
+        ws.repository_path = Some("/repo".to_string());
+        assert_eq!(ws.effective_path(), Some("/repo"));
+
+        // worktreePath beats repositoryPath; path beats both.
+        ws.worktree_path = Some("/worktree".to_string());
+        assert_eq!(ws.effective_path(), Some("/worktree"));
+        ws.path = Some("/path".to_string());
+        assert_eq!(ws.effective_path(), Some("/path"));
+
+        // Empty strings never win — each step falls through.
+        ws.path = Some(String::new());
+        assert_eq!(ws.effective_path(), Some("/worktree"));
+        ws.worktree_path = Some(String::new());
+        assert_eq!(ws.effective_path(), Some("/repo"));
+        ws.repository_path = Some(String::new());
+        assert_eq!(ws.effective_path(), None);
+    }
 
     /// [`note_list_slim_row`] projection (§5.2, monorepo#3573): `content` is
     /// removed and replaced by `contentPreview` (first
