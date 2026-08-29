@@ -1,8 +1,10 @@
 //! Wire-policy + filesystem glue for the `file.*` methods (PROTOCOL §5.10).
 //!
 //! Ports the TS `buildFileApi` / `LocalFileSystemAdapter` semantics: the
-//! workspace root is `worktreePath || repositoryPath` (falling back to the
-//! process CWD when unset, mirroring `path.resolve('', rel)`), every path is
+//! workspace root is `worktreePath || repositoryPath`; an unset/unknown root
+//! (empty string) is rejected rather than falling back to the process CWD, so a
+//! bogus `workspaceId` cannot escape workspace containment
+//! (intent-hq/intent#3839). Every path is
 //! validated within that root via a lexical prefix check (Node's `path.resolve`
 //! then `startsWith`, no symlink resolution), and all access/IO failures
 //! surface as [`Error::Internal`] (-32603), matching the TS handler which
@@ -27,7 +29,9 @@ const ACCESS_DENIED: &str = "Access denied: path outside workspace";
 pub(crate) const ATTACHMENTS_DIR: &str = ".intent/attachments";
 
 /// Resolve the workspace filesystem root the way the TS protocol adapter does:
-/// `worktreePath || repositoryPath`, else empty (→ CWD-relative resolution).
+/// `worktreePath || repositoryPath`, else empty — which [`is_within`] then
+/// fails closed instead of falling back to CWD-relative resolution
+/// (intent-hq/intent#3839).
 pub(crate) fn workspace_root(ws: &Workspace) -> String {
     git_ops::worktree_path(ws)
         .map(|p| p.to_string_lossy().into_owned())
@@ -36,8 +40,10 @@ pub(crate) fn workspace_root(ws: &Workspace) -> String {
 
 /// Load the workspace and resolve its filesystem root, preferring the calling
 /// agent's sandbox path when available (`CoW` containment). A missing workspace
-/// (or any load error) falls through to an empty root, mirroring the TS handler
-/// which swallows `getWorkspace` failures and proceeds with `workspacePath=''`.
+/// (or any load error) yields an empty root; the guard in [`is_within`] then
+/// fails such a request closed rather than resolving it CWD-relative, so a
+/// bogus `workspaceId` cannot escape workspace containment
+/// (intent-hq/intent#3839).
 pub(crate) async fn resolve_root(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -98,12 +104,21 @@ fn node_resolve(base: &str, rel: &str) -> PathBuf {
 
 /// TS `isWithinWorkspace`, hardened to a path-boundary check: the resolved
 /// path must BE the root or sit under it across a path separator — a raw
-/// string prefix would let `/tmp/ws-escape` pass for root `/tmp/ws`. An
-/// empty root matches everything (as in JS).
+/// string prefix would let `/tmp/ws-escape` pass for root `/tmp/ws`. An empty
+/// root (unknown or pathless workspace) is rejected outright: treating it as
+/// "matches everything" (as JS did) let a bogus `workspaceId` plus an absolute
+/// path escape workspace containment (intent-hq/intent#3839). A root that is
+/// itself the filesystem root (all separators, e.g. `/`) is distinguished from
+/// the empty root: it legitimately contains every absolute path.
 fn is_within(root: &str, full: &Path) -> bool {
+    if root.is_empty() {
+        return false;
+    }
     let root = root.trim_end_matches(['/', '\\']);
     if root.is_empty() {
-        return true;
+        // Non-empty root that was all separators: the workspace is rooted at
+        // the filesystem root, which contains any absolute resolved path.
+        return full.is_absolute();
     }
     let full = full.to_string_lossy();
     match full.strip_prefix(root) {
@@ -172,11 +187,11 @@ pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::transfer_import::IMPORT_MA
 /// returns just the remaining bytes. Directories are rejected as -32602;
 /// a missing file surfaces as -32603 per the existing file-op convention.
 ///
-/// Unlike the TS-parity CWD fallback the string `file.*` ops keep, an
-/// empty root (unknown or pathless workspace) is rejected outright:
-/// [`is_within`] treats an empty root as matching every path, so falling
-/// through would let an arbitrary `workspaceId` + absolute path turn this
-/// endpoint into an unrestricted raw-byte file reader.
+/// An empty root (unknown or pathless workspace) is rejected outright: the
+/// shared [`is_within`] guard fails closed on an empty root, and this explicit
+/// early-out keeps that rejection ahead of the length validation. Without it an
+/// arbitrary `workspaceId` + absolute path could turn this endpoint into an
+/// unrestricted raw-byte file reader (intent-hq/intent#3839).
 pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Result<Value> {
     use base64::Engine as _;
     use std::io::{Read as _, Seek as _};
@@ -900,6 +915,64 @@ mod tests {
     }
 
     #[test]
+    fn empty_root_rejects_absolute_paths() {
+        // An unknown/pathless workspace collapses the containment root to "".
+        // Every string `file.*` op must fail such a request closed rather than
+        // fall back to CWD/absolute resolution — otherwise a bogus workspaceId
+        // plus an absolute path is an arbitrary read/write primitive
+        // (intent-hq/intent#3839). `exists` folds a genuine lookup error to a
+        // present:false shape, but the containment guard fires ahead of the
+        // lookup, so it too surfaces ACCESS_DENIED here.
+        //
+        // Escape targets live in a unique per-run temp dir (never pre-created)
+        // so a leftover from another run/process can't flip the assertions.
+        let escape_dir =
+            std::env::temp_dir().join(format!("intentd-empty-root-{}", uuid::Uuid::new_v4()));
+        let escape_file = escape_dir.join("escape");
+        let escape_file_s = escape_file.to_string_lossy().into_owned();
+        let escape_dir_s = escape_dir.to_string_lossy().into_owned();
+        for res in [
+            read("", "/etc/passwd"),
+            write("", &escape_file_s, "x"),
+            list("", "/etc"),
+            delete("", "/etc/passwd"),
+            mkdir("", &escape_dir_s),
+            rename("", "/etc/passwd", &escape_file_s),
+            rename("", &escape_file_s, "/etc/passwd"),
+            stat("", "/etc/passwd"),
+            exists("", "/etc/passwd"),
+            read_chunk("", "/etc/passwd", 0, 16),
+        ] {
+            match res {
+                Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+                other => panic!("expected access denied for empty root, got {other:?}"),
+            }
+        }
+        // The bogus write/mkdir targets must not have been created.
+        assert!(!escape_file.exists());
+        assert!(!escape_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_root_workspace_is_not_rejected() {
+        // A workspace legitimately rooted at `/` must not be confused with
+        // the empty (unknown-workspace) root: trimming the sole separator
+        // yields "" too, but the fail-closed branch applies only to a root
+        // that was empty before trimming.
+        assert!(is_within("/", Path::new("/etc/passwd")));
+        assert!(is_within("/", Path::new("/")));
+        assert!(!is_within("/", Path::new("relative/path")));
+        // Empty root stays rejected even for the same paths.
+        assert!(!is_within("", Path::new("/etc/passwd")));
+        let r = read("/", "etc/hostname");
+        assert!(
+            !matches!(&r, Err(Error::Internal(m)) if m == ACCESS_DENIED),
+            "read with / root must pass containment, got {r:?}"
+        );
+    }
+
+    #[test]
     fn exists_reports_present_absent_and_type() {
         let t = TempRoot::new();
         let root = t.root();
@@ -1027,8 +1100,8 @@ mod tests {
             Err(Error::Internal(_))
         ));
         // Empty root (unknown/pathless workspace) → ACCESS_DENIED, never the
-        // CWD fallback: an empty root passes is_within for every path, which
-        // would make this an unrestricted raw-byte reader for absolute paths.
+        // CWD fallback: the empty-root guard fails closed, so this endpoint
+        // cannot become an unrestricted raw-byte reader for absolute paths.
         match read_chunk("", "/etc/hostname", 0, 16) {
             Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
             other => panic!("expected access denied for empty root, got {other:?}"),
