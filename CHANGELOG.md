@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.16] - 2026-08-29
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Stop reporting transient mergeable/merge-state transitions to unknown ([#1561](https://github.com/intent-hq/intentd/pull/1561))
+- *(services)* Provider-keyed usage-report accumulation semantics ([#1562](https://github.com/intent-hq/intentd/pull/1562))
+
+
 ## [0.8.15] - 2026-08-29
 
 ### 🐛 Bug Fixes
