@@ -16812,6 +16812,153 @@ async fn agent_waiting_monitoring_idle_gets_no_advisory() {
     );
 }
 
+/// Grouped (`after_all`) monitoring-idle advisory: a grouped child idling
+/// while only hook-waiting delivers ONE immediate advisory wake in the
+/// STAB-160 grouped shape — `watchStillArmed: true`, no re-arm instruction,
+/// the grouped watch stays armed, NO group settlement recorded — duplicate
+/// deferred idles stay silent (shared once-per-episode marker), and the
+/// group later settles normally at the child's genuine completion.
+#[tokio::test]
+async fn grouped_monitoring_idle_delivers_one_advisory_and_group_settles_later() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+
+    // (a) Idle while the hook is active: ONE grouped advisory wake; the
+    // grouped watch stays armed and nothing is recorded in the group.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "one grouped advisory wake for the monitoring idle"
+    );
+    let metadata = session.messages[0]
+        .metadata
+        .as_ref()
+        .expect("advisory wake carries metadata");
+    assert_eq!(
+        metadata["watchStillArmed"],
+        json!(true),
+        "grouped advisory keeps the watch armed"
+    );
+    assert_eq!(metadata["childExternallyWaiting"], json!(true));
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("still waiting on external monitoring"),
+        "advisory wording: {text}"
+    );
+    assert!(text.contains("pr-watch"), "names the hook: {text}");
+    assert!(
+        text.contains("grouped watch on it stays armed"),
+        "grouped trailer: {text}"
+    );
+    assert!(
+        !text.contains("ws.agent.watch("),
+        "no re-arm instruction on the grouped shape: {text}"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "grouped watch survives the advisory"
+    );
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group still open");
+    assert!(
+        group.completed_agent_ids.is_empty(),
+        "advisory records no group settlement"
+    );
+    assert!(
+        svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "once-per-episode marker persisted"
+    );
+
+    // (b) A duplicate deferred idle stays SILENT (marker stands).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "no second advisory this episode"
+    );
+
+    // (c) Hook dispatches; the child's next idle is its genuine completion:
+    // the group records it, seals at the parent's idle, and fires exactly
+    // one aggregated wake; the episode marker clears.
+    svc.store()
+        .update_hook_state(&hook.hook_id, intent_core::HookState::Dispatched)
+        .await
+        .expect("dispatch hook");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "handled the dispatch" }),
+    ))
+    .await;
+    assert!(
+        !svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "genuine settlement clears the episode marker"
+    );
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        2,
+        "group settles with exactly one aggregated wake"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("All 1 delegated child agent(s) settled"),
+        "{text}"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "grouped watches removed at settlement"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+}
+
 /// Idle-visibility does not fabricate the flag: a hookless child's completion
 /// wake stays the plain "completed" text with no waitingOnHooks mention.
 #[tokio::test]
@@ -16847,9 +16994,10 @@ async fn completion_wake_without_hooks_stays_plain() {
 }
 
 /// Idle-visibility deferral (c) in `after_all` groups: a hook-waiting child
-/// does NOT count as settled — the sealed group stays open past its idle —
-/// and the group settles with one aggregated wake when the child later
-/// completes for real (idle with no active hooks).
+/// does NOT count as settled — the sealed group stays open past its idle
+/// (its live monitoring idle delivers the ONE grouped advisory wake) — and
+/// the group settles with one aggregated wake when the child later completes
+/// for real (idle with no active hooks).
 #[tokio::test]
 async fn after_all_group_waits_for_hook_waiting_child() {
     let (_t, svc, ws) = setup().await;
@@ -16887,8 +17035,8 @@ async fn after_all_group_waits_for_hook_waiting_child() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        0,
-        "sealed group waits for the hook-waiting child"
+        1,
+        "sealed group waits for the hook-waiting child (only the grouped advisory delivered)"
     );
     assert_eq!(
         svc.find_watches_for_child(&child).len(),
@@ -16911,7 +17059,7 @@ async fn after_all_group_waits_for_hook_waiting_child() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        1,
+        2,
         "group settles with exactly one aggregated wake"
     );
     let text = parent_messages_text(&svc, &parent).await;
@@ -17150,7 +17298,8 @@ async fn after_all_group_waits_for_pr_monitor_waiting_child() {
     )
     .expect("grouped watch");
 
-    // Child idles while its PR monitor is active: NOT recorded as settled.
+    // Child idles while its PR monitor is active: NOT recorded as settled
+    // (the live monitoring idle delivers the ONE grouped advisory wake).
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -17170,8 +17319,8 @@ async fn after_all_group_waits_for_pr_monitor_waiting_child() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        0,
-        "sealed group waits for the pr-monitor-waiting child"
+        1,
+        "sealed group waits for the pr-monitor-waiting child (only the grouped advisory delivered)"
     );
     assert_eq!(
         svc.find_watches_for_child(&child).len(),
@@ -17199,7 +17348,7 @@ async fn after_all_group_waits_for_pr_monitor_waiting_child() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        1,
+        2,
         "group settles with exactly one aggregated wake"
     );
     let text = parent_messages_text(&svc, &parent).await;
@@ -19049,7 +19198,8 @@ async fn hook_waiting_child_settlement_still_deferred_after_seal() {
             .sealed
     );
 
-    // Child idles while its hook is active: deferred — not recorded, no fire.
+    // Child idles while its hook is active: deferred — not recorded, only
+    // the grouped monitoring-idle advisory wake delivers.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -19064,7 +19214,7 @@ async fn hook_waiting_child_settlement_still_deferred_after_seal() {
         group.completed_agent_ids.is_empty(),
         "hook-waiting idle is not recorded as settlement"
     );
-    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
     assert_eq!(
         svc.find_watches_for_child(&child).len(),
         1,
@@ -19086,7 +19236,7 @@ async fn hook_waiting_child_settlement_still_deferred_after_seal() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        1,
+        2,
         "group settles with exactly one aggregated wake"
     );
     assert!(svc.delegation_group_for_parent(&parent).is_none());
@@ -19171,7 +19321,7 @@ async fn pr_monitor_waiting_child_settlement_still_deferred_after_seal() {
     );
 
     // Child idles while its PR monitor is active: deferred — not recorded,
-    // no fire.
+    // only the grouped monitoring-idle advisory wake delivers.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -19186,7 +19336,7 @@ async fn pr_monitor_waiting_child_settlement_still_deferred_after_seal() {
         group.completed_agent_ids.is_empty(),
         "pr-monitor-waiting idle is not recorded as settlement"
     );
-    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
     assert_eq!(
         svc.find_watches_for_child(&child).len(),
         1,
@@ -19212,7 +19362,7 @@ async fn pr_monitor_waiting_child_settlement_still_deferred_after_seal() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        1,
+        2,
         "group settles with exactly one aggregated wake"
     );
     assert!(svc.delegation_group_for_parent(&parent).is_none());

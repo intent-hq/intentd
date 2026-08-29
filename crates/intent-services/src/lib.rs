@@ -5657,6 +5657,34 @@ impl Services {
                 if (hook_waiting || pr_monitor_waiting || agent_waiting)
                     && event.event_type == AGENT_IDLE
                 {
+                    // Grouped flavor of the monitoring-idle advisory (see the
+                    // ungrouped branch below): a LIVE idle deferred ONLY for
+                    // active hooks / PR monitors (not queue-interim/busy, not
+                    // agent-waiting) delivers ONE immediate advisory wake in
+                    // the STAB-160 grouped-failure shape — `watchStillArmed:
+                    // true`, the grouped watch stays armed, the group stays
+                    // open for the child's genuine settlement, and no re-arm
+                    // instruction is rendered. Shares the ungrouped path's
+                    // once-per-episode `advisory_wake_delivery` marker, so at
+                    // most one advisory per (parent, child) waiting episode
+                    // across both shapes.
+                    if advisory_allowed
+                        && (hook_waiting || pr_monitor_waiting)
+                        && !queue_interim
+                        && !agent_waiting
+                    {
+                        self.deliver_monitoring_idle_advisory(
+                            child_id,
+                            &watch,
+                            &parent_ws,
+                            event,
+                            &active_hooks,
+                            &active_pr_monitors,
+                            true,
+                            &mut ungrouped_delivery_failed,
+                        )
+                        .await;
+                    }
                     tracing::debug!(
                         child = %child_id.0,
                         parent = %watch.parent_agent_id.0,
@@ -5738,6 +5766,25 @@ impl Services {
                 let newly_recorded = self
                     .record_group_child_completion(&gid, child_id, deleted, summary, event.clone())
                     .await;
+                // The genuine settlement just recorded ends the child's
+                // monitoring-idle waiting episode (if any) — the grouped
+                // mirror of the ungrouped clear below: clear the
+                // once-per-episode advisory marker so a FUTURE episode may
+                // advise again. Best-effort, like that clear.
+                if newly_recorded {
+                    if let Err(e) = self
+                        .store
+                        .clear_advisory_wake_delivery(&watch.parent_agent_id, child_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            parent = %watch.parent_agent_id.0,
+                            child = %child_id.0,
+                            "failed to clear advisory-wake episode marker"
+                        );
+                    }
+                }
                 // STAB-160: a grouped child's failure must wake the parent
                 // immediately — a failed child is parked in Error and never
                 // auto-redriven (STAB-52), so deferring the notification until
@@ -5819,6 +5866,7 @@ impl Services {
                         event,
                         &active_hooks,
                         &active_pr_monitors,
+                        false,
                         &mut ungrouped_delivery_failed,
                     )
                     .await;
@@ -6065,18 +6113,24 @@ impl Services {
         }
     }
 
-    /// Deliver the ONE advisory wake for an ungrouped watch whose child went
-    /// idle while only externally monitoring (active hooks / PR monitors —
-    /// see the caller in `deliver_completion_to_watches_inner`). Consults the
+    /// Deliver the ONE advisory wake for a watch whose child went idle while
+    /// only externally monitoring (active hooks / PR monitors — see the
+    /// callers in `deliver_completion_to_watches_inner`). Consults the
     /// persisted once-per-episode marker first: a standing marker means the
     /// parent already heard the advisory for this waiting episode, so the
     /// deferred idle skips silently (the watch — typically a re-armed one —
-    /// stays armed for the genuine completion). On delivery the watch retires
-    /// via the standard durable path with NO completion identity recorded (a
-    /// later genuine completion must still deliver to a re-armed watch), and
-    /// the marker is persisted. Failures set `ungrouped_delivery_failed` but
-    /// deliberately do NOT schedule the completion retry task — the child's
-    /// next monitoring idle (or its genuine completion) re-runs this path.
+    /// stays armed for the genuine completion). For an ungrouped watch
+    /// (`grouped: false`) the delivery retires the watch via the standard
+    /// durable path with NO completion identity recorded (a later genuine
+    /// completion must still deliver to a re-armed watch); failures set
+    /// `ungrouped_delivery_failed` but deliberately do NOT schedule the
+    /// completion retry task — the child's next monitoring idle (or its
+    /// genuine completion) re-runs this path. For a grouped `after_all`
+    /// watch (`grouped: true`, STAB-160 shape) the watch stays armed and the
+    /// group stays open (`watchStillArmed: true`, no re-arm instruction, no
+    /// retirement, no `ungrouped_delivery_failed`); only the shared episode
+    /// marker is recorded. Both shapes persist the marker last, so a crash
+    /// or failure before it means at worst one repeated advisory next idle.
     #[allow(clippy::too_many_arguments)]
     async fn deliver_monitoring_idle_advisory(
         &self,
@@ -6086,6 +6140,7 @@ impl Services {
         event: &Event,
         active_hooks: &[serde_json::Value],
         active_pr_monitors: &[serde_json::Value],
+        grouped: bool,
         ungrouped_delivery_failed: &mut bool,
     ) -> bool {
         // Marker read fails CLOSED (skip, watch stays armed): the advisory is
@@ -6112,10 +6167,15 @@ impl Services {
             );
             return false;
         }
-        let wake =
-            format_monitoring_idle_advisory_wake(child_id, event, active_hooks, active_pr_monitors);
+        let wake = format_monitoring_idle_advisory_wake(
+            child_id,
+            event,
+            active_hooks,
+            active_pr_monitors,
+            !grouped,
+        );
         let mut metadata = build_event_notification_metadata(&[event]);
-        metadata["watchStillArmed"] = serde_json::json!(false);
+        metadata["watchStillArmed"] = serde_json::json!(grouped);
         metadata["childExternallyWaiting"] = serde_json::json!(true);
         if !active_hooks.is_empty() {
             metadata["waitingOnHooks"] = serde_json::Value::Array(active_hooks.to_vec());
@@ -6123,8 +6183,9 @@ impl Services {
         if !active_pr_monitors.is_empty() {
             metadata["waitingOnPrMonitors"] = serde_json::Value::Array(active_pr_monitors.to_vec());
         }
-        // Stable message id: a crash between delivery and retirement replays
-        // this pass; the durable-wake dedup makes the re-send idempotent.
+        // Stable message id: a crash between delivery and retirement (or the
+        // marker write) replays this pass; the durable-wake dedup makes the
+        // re-send idempotent.
         if let Err(e) = self
             .deliver_parent_wake_durable(
                 parent_ws,
@@ -6141,34 +6202,39 @@ impl Services {
                 watch = %watch.id,
                 "failed to deliver monitoring-idle advisory wake to parent; watch stays armed"
             );
-            *ungrouped_delivery_failed = true;
+            if !grouped {
+                *ungrouped_delivery_failed = true;
+            }
             return false;
         }
         let delivered_at = now_iso();
-        // Retire with NO completion identity: the advisory is not the child's
-        // completion, so nothing may be recorded as "delivered" for the
-        // genuine completion a re-armed watch waits for.
-        if let Err(e) = self
-            .store
-            .retire_completion_watch_after_delivery(
-                &watch.id,
-                &watch.parent_agent_id,
-                child_id,
-                None,
-                &delivered_at,
-            )
-            .await
-        {
-            tracing::warn!(
-                error = %e,
-                parent = %watch.parent_agent_id.0,
-                watch = %watch.id,
-                "advisory wake is durable but watch retirement failed; stable-id replay heals on the next pass"
-            );
-            *ungrouped_delivery_failed = true;
-            return false;
+        if !grouped {
+            // Retire with NO completion identity: the advisory is not the
+            // child's completion, so nothing may be recorded as "delivered"
+            // for the genuine completion a re-armed watch waits for. Grouped
+            // watches never retire here — group settlement owns them.
+            if let Err(e) = self
+                .store
+                .retire_completion_watch_after_delivery(
+                    &watch.id,
+                    &watch.parent_agent_id,
+                    child_id,
+                    None,
+                    &delivered_at,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %watch.parent_agent_id.0,
+                    watch = %watch.id,
+                    "advisory wake is durable but watch retirement failed; stable-id replay heals on the next pass"
+                );
+                *ungrouped_delivery_failed = true;
+                return false;
+            }
+            self.remove_watch_after_delivery_commit(&watch.id);
         }
-        self.remove_watch_after_delivery_commit(&watch.id);
         // Marker last: a crash before this write re-sends the (deduped)
         // advisory on the next monitoring idle and re-attempts the marker; a
         // write failure means at worst one repeated advisory next idle.
@@ -6184,8 +6250,10 @@ impl Services {
                 "failed to record advisory-wake episode marker"
             );
         }
-        self.publish_subscriptions_changed(parent_ws, &watch.parent_agent_id)
-            .await;
+        if !grouped {
+            self.publish_subscriptions_changed(parent_ws, &watch.parent_agent_id)
+                .await;
+        }
         true
     }
 
@@ -11068,14 +11136,19 @@ pub(crate) fn format_completion_wake(
 
 /// The advisory wake for a hook-/PR-monitor-deferred idle: the child is idle
 /// but still externally monitoring, so this is NOT its completion — the text
-/// names the active hooks (name + expiry) and PR monitors (repo#pr + title),
-/// states the one-shot watch was consumed, and instructs re-arming via
-/// `ws.agent.watch` to hear the genuine completion.
+/// names the active hooks (name + expiry) and PR monitors (repo#pr + title).
+/// `watch_retired` picks the trailer (same contract as
+/// [`format_completion_wake`]): `true` on the ungrouped path states the
+/// one-shot watch was consumed and instructs re-arming via `ws.agent.watch`
+/// to hear the genuine completion; `false` on the grouped `after_all` path
+/// says the grouped watch stays armed and the group still waits for the
+/// child's genuine settlement (no re-arm instruction).
 pub(crate) fn format_monitoring_idle_advisory_wake(
     child_id: &AgentId,
     event: &Event,
     active_hooks: &[serde_json::Value],
     active_pr_monitors: &[serde_json::Value],
+    watch_retired: bool,
 ) -> String {
     use std::fmt::Write as _;
     let label = event
@@ -11120,11 +11193,17 @@ pub(crate) fn format_monitoring_idle_advisory_wake(
             }
         }
     }
-    let _ = write!(
-        msg,
-        "\nThis advisory consumed your one-shot watch on it. If you want to be woken at its genuine completion, re-arm with ws.agent.watch(\"{}\").",
-        child_id.0
-    );
+    if watch_retired {
+        let _ = write!(
+            msg,
+            "\nThis advisory consumed your one-shot watch on it. If you want to be woken at its genuine completion, re-arm with ws.agent.watch(\"{}\").",
+            child_id.0
+        );
+    } else {
+        msg.push_str(
+            "\nYour grouped watch on it stays armed — its delegation group still waits for its genuine settlement; no re-arm needed.",
+        );
+    }
     msg
 }
 
