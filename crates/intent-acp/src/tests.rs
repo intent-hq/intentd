@@ -5987,6 +5987,21 @@ mod workspace_api_tool_tests {
     }
 
     #[tokio::test]
+    async fn workspace_api_info_binding_falls_back_to_repository_path() {
+        // Direct-checkout workspaces (`skipIsolation`) may persist only
+        // `repositoryPath` (monorepo#3778): `info()` must resolve it as the
+        // final fallback instead of returning `path: null`.
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        api.ws.lock().unwrap().repository_path = Some("/tmp/amber-repo".to_string());
+        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"));
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["id"], json!("amber-forest"));
+        assert_eq!(body["path"], json!("/tmp/amber-repo"));
+    }
+
+    #[tokio::test]
     async fn workspace_api_syntax_error_returns_readable_is_error_result() {
         let srv = server("amber-forest", None);
         let resp = call_workspace_api(&srv, "return (").await;
@@ -10944,9 +10959,12 @@ mod workspace_api_output_limit_tests {
     use crate::WorkspaceMcpServer;
 
     /// Mock whose `settings_get` serves configurable `workspaceApi.*` knobs
-    /// and whose `get_workspace` reports an optional on-disk checkout path.
+    /// and whose `get_workspace` reports an optional on-disk checkout path
+    /// (`worktreePath`) plus an optional `repositoryPath` for the
+    /// direct-checkout fallback (monorepo#3778).
     struct OutputLimitMockApi {
         checkout: Mutex<Option<String>>,
+        repository_path: Mutex<Option<String>>,
         toon_output: Mutex<Value>,
         max_output_chars: Mutex<Value>,
     }
@@ -10955,6 +10973,7 @@ mod workspace_api_output_limit_tests {
         fn new(checkout: Option<&str>, toon_output: bool, max_output_chars: u64) -> Arc<Self> {
             Arc::new(Self {
                 checkout: Mutex::new(checkout.map(str::to_string)),
+                repository_path: Mutex::new(None),
                 toon_output: Mutex::new(json!(toon_output)),
                 max_output_chars: Mutex::new(json!(max_output_chars)),
             })
@@ -10964,6 +10983,7 @@ mod workspace_api_output_limit_tests {
     impl WorkspaceApi for OutputLimitMockApi {
         fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
             let checkout = self.checkout.lock().unwrap().clone();
+            let repository_path = self.repository_path.lock().unwrap().clone();
             Box::pin(async move {
                 let now = "2026-01-01T00:00:00Z".to_string();
                 Ok(Workspace {
@@ -10982,7 +11002,7 @@ mod workspace_api_output_limit_tests {
                     last_activity: None,
                     tags: Vec::new(),
                     path: None,
-                    repository_path: None,
+                    repository_path,
                     repository_owner: None,
                     repository_name: None,
                     worktree_path: checkout,
@@ -11043,6 +11063,18 @@ mod workspace_api_output_limit_tests {
         max_output_chars: u64,
     ) -> WorkspaceMcpServer {
         let api = OutputLimitMockApi::new(checkout, toon_output, max_output_chars);
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
+    }
+
+    /// A server whose workspace persists ONLY `repositoryPath` — the
+    /// direct-checkout shape from monorepo#3778.
+    fn server_repository_only(
+        repository: &str,
+        toon_output: bool,
+        max_output_chars: u64,
+    ) -> WorkspaceMcpServer {
+        let api = OutputLimitMockApi::new(None, toon_output, max_output_chars);
+        *api.repository_path.lock().unwrap() = Some(repository.to_string());
         WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
     }
 
@@ -11111,6 +11143,25 @@ mod workspace_api_output_limit_tests {
         let head: String = full.chars().take(50).collect();
         assert!(text.contains(&head));
         assert!(text.contains("`ws.file.read` cannot reach it"));
+    }
+
+    #[tokio::test]
+    async fn repository_only_workspace_redirects_via_repository_path_fallback() {
+        // Direct-checkout workspaces (`skipIsolation`) may persist only
+        // `repositoryPath` (monorepo#3778): the oversized-output redirect
+        // must fall back to it instead of truncating inline.
+        let (folder, checkout) = temp_workspace_layout();
+        let srv = server_repository_only(&checkout, false, 50);
+        let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
+        let text = tool_text(&resp);
+
+        let path = only_tool_output(folder.path());
+        let full = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&full).unwrap();
+        assert_eq!(v["data"].as_str().unwrap().len(), 200);
+        assert!(text.contains("Output too large:"));
+        assert!(text.contains(path.to_str().unwrap()));
+        assert!(!text.contains("could NOT be written to a file"));
     }
 
     #[tokio::test]

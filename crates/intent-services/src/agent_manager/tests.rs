@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use super::{
-    budget_admits, charged_bytes, compute_process_cap, derive_agent_type,
+    budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
     is_cancel_transport_closed, recommended_memory_budget_bytes, resolve_npx_only, resolve_spawn,
     text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, ResolvedSpawn,
     TreeMemoryProbe, DEFAULT_AGENT_TYPE, PROVISIONAL_AGENT_BYTES,
@@ -13156,6 +13156,28 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
     assert_eq!(
         derive_agent_type(&services, &plain, Some(&workspace)),
         DEFAULT_AGENT_TYPE,
+    );
+
+    // Direct-checkout shape (monorepo#3778): only `repositoryPath` set — the
+    // project tier must still resolve via the effective-path fallback, for
+    // both spawn-time derivations.
+    let mut repo_only = workspace.clone();
+    repo_only.path = None;
+    repo_only.repository_path = Some(ws_dir.display().to_string());
+    assert_eq!(
+        derive_agent_type(&services, &session, Some(&repo_only)),
+        "worker-loop",
+        "derive_agent_type must fall back to repositoryPath"
+    );
+    std::fs::write(
+        specialists_dir.join("orch.md"),
+        "---\nname: \"Orch\"\ndescription: \"d\"\nrole: \"orchestrator\"\n---\n\nbody",
+    )
+    .unwrap();
+    let orch_session = session_with_specialist(Some("orch"));
+    assert!(
+        derive_is_orchestrator(&services, &orch_session, Some(&repo_only)),
+        "derive_is_orchestrator must fall back to repositoryPath"
     );
 
     let _ = std::fs::remove_dir_all(&ws_dir);

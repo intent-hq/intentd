@@ -213,16 +213,20 @@ impl Services {
             return;
         }
 
-        // Resolve worktree path for generation + fallback.
+        // Resolve the checkout path for generation + fallback. Direct
+        // checkouts may persist only `repositoryPath` (monorepo#3778), and
+        // `git_agent_commit` itself resolves via `git_ops::worktree_path`
+        // (worktreePath → repositoryPath), so skipping here would be the
+        // only thing blocking auto-commit for them.
         let worktree_path = match self.store().get_workspace(&session.workspace_id).await {
             Ok(ws) => {
-                if let Some(p) = ws.worktree_path.map(PathBuf::from) {
+                if let Some(p) = ws.effective_path().map(PathBuf::from) {
                     p
                 } else {
                     tracing::debug!(
                         agent = %agent_id.0,
                         workspace = %session.workspace_id.0,
-                        "auto-commit skipped: no worktree path"
+                        "auto-commit skipped: no on-disk checkout path"
                     );
                     return;
                 }

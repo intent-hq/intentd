@@ -416,7 +416,8 @@ impl WorkspaceMcpServer {
     /// Write one oversized output to
     /// `<workspace-folder>/tool-outputs/<utc-timestamp>-<short-id>.<ext>`,
     /// resolving `<workspace-folder>` as the parent of the workspace's
-    /// checkout (`worktreePath`, else `path`) — today's layout is
+    /// checkout ([`Workspace::effective_path`]: `path`, else `worktreePath`,
+    /// else `repositoryPath` — monorepo#3778) — today's layout is
     /// `<workspaces-root>/<workspace-name>/<repo-name>`, so the file lands
     /// next to (not inside) the git tree and needs no git exclusion. Writes
     /// through direct tokio fs on purpose: the `ws.file.*` surface is
@@ -433,10 +434,7 @@ impl WorkspaceMcpServer {
             .await
             .map_err(|e| format!("get_workspace: {e}"))?;
         let checkout = ws
-            .worktree_path
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .or(ws.path.as_deref().filter(|p| !p.is_empty()))
+            .effective_path()
             .ok_or_else(|| "workspace has no on-disk checkout path".to_string())?;
         let folder = std::path::Path::new(checkout)
             .parent()

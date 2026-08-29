@@ -147,7 +147,7 @@ impl WatcherRegistry {
             Ok(ws) => ws
                 .into_iter()
                 .filter_map(|ws| {
-                    let root = ws.path.clone().or_else(|| ws.worktree_path.clone())?;
+                    let root = ws.effective_path()?.to_string();
                     let path = PathBuf::from(&root);
                     path.is_dir().then_some((ws.id, path))
                 })
@@ -543,16 +543,26 @@ async fn lifecycle_loop(
 
 /// Resolve the on-disk root for a lifecycle event: prefer the self-sufficient
 /// `data.workspace` payload (`workspace:created`, §6.7), fall back to a
-/// `get_workspace` lookup (`workspace:opened` carries only the id). Returns
+/// `get_workspace` lookup (`workspace:opened` carries only the id). Both arms
+/// resolve `path`, else `worktreePath`, else `repositoryPath` — direct
+/// checkouts may persist only `repositoryPath` (monorepo#3778). Returns
 /// `None` when the workspace has no existing directory.
 async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf> {
     let from_payload = ev
         .data
         .get("workspace")
         .and_then(|ws| {
-            ws.get("path")
-                .and_then(|v| v.as_str())
-                .or_else(|| ws.get("worktreePath").and_then(|v| v.as_str()))
+            // Per-step empty-string filtering, matching `effective_path()`:
+            // an empty candidate falls through to the next one rather than
+            // masking it.
+            let candidate = |key: &str| {
+                ws.get(key)
+                    .and_then(|v| v.as_str())
+                    .filter(|p| !p.is_empty())
+            };
+            candidate("path")
+                .or_else(|| candidate("worktreePath"))
+                .or_else(|| candidate("repositoryPath"))
         })
         .map(PathBuf::from);
 
@@ -560,7 +570,7 @@ async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf
         Some(p)
     } else {
         let ws = services.get_workspace(ev.workspace_id.clone()).await.ok()?;
-        ws.path.or(ws.worktree_path).map(PathBuf::from)
+        ws.effective_path().map(PathBuf::from)
     }?;
 
     path.is_dir().then_some(path)
@@ -716,6 +726,55 @@ mod tests {
         ev
     }
 
+    /// Materialize a [`NewEvent`] as a stored [`Event`] so the private
+    /// `resolve_path` helper can be exercised directly.
+    fn stored_event(ev: NewEvent) -> Event {
+        Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ev.workspace_id,
+            timestamp: ev.timestamp,
+            event_type: ev.event_type,
+            actor: ev.actor,
+            session_id: ev.session_id,
+            correlation_id: ev.correlation_id,
+            parent_event_id: ev.parent_event_id,
+            metadata: ev.metadata,
+            data: ev.data,
+        }
+    }
+
+    /// `resolve_path` resolves `repositoryPath` as the final fallback in BOTH
+    /// arms (monorepo#3778): the self-sufficient `data.workspace` payload arm
+    /// and the `get_workspace` lookup arm — direct checkouts may persist only
+    /// `repositoryPath`.
+    #[tokio::test]
+    async fn resolve_path_falls_back_to_repository_path() {
+        let dir = TempDir::new("repo-fallback");
+        let mut ws = chief_workspace();
+        ws.id = WorkspaceId::from("ws-repo-only");
+        ws.title = "ws-repo-only".to_string();
+        ws.repository_path = Some(dir.path.to_string_lossy().into_owned());
+        let api = FakeApi::new(vec![ws.clone()]);
+
+        // Payload arm (`workspace:created` carries the row).
+        let ev = stored_event(lifecycle_event(WORKSPACE_CREATED, &ws, true));
+        assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
+
+        // Lookup arm (`workspace:opened` carries only the id).
+        let ev = stored_event(lifecycle_event(WORKSPACE_OPENED, &ws, false));
+        assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
+
+        // Payload arm with an empty `path`: each candidate is filtered
+        // per-step, so an empty string falls through to `repositoryPath`
+        // instead of resolving the whole chain to `None`. The API is left
+        // empty so the lookup arm cannot compensate — the payload arm alone
+        // must resolve.
+        ws.path = Some(String::new());
+        let api = FakeApi::new(vec![]);
+        let ev = stored_event(lifecycle_event(WORKSPACE_CREATED, &ws, true));
+        assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
+    }
+
     async fn bus_and_sub() -> (TempDb, EventBus, super::super::bus::Subscription) {
         let db = TempDb::new();
         let store = Store::open(&db.path).await.expect("open store");
@@ -853,6 +912,36 @@ mod tests {
 
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
         assert!(ev.is_some(), "boot-time workspace must emit file events");
+    }
+
+    /// The startup snapshot resolves `repositoryPath` as the final fallback
+    /// (monorepo#3778): a direct-checkout workspace persisting only
+    /// `repositoryPath` that exists at daemon start must be watched, not
+    /// silently skipped on every restart.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn boot_time_repository_only_workspace_is_watched() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let root = TempDir::new("boot-repo");
+        let mut ws = chief_workspace();
+        ws.id = WorkspaceId::from("ws-boot-repo");
+        ws.title = "ws-boot-repo".to_string();
+        ws.repository_path = Some(root.path.to_string_lossy().into_owned());
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
+
+        std::fs::write(root.path.join("hello.txt"), "hi").expect("write file");
+
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
+        assert!(
+            ev.is_some(),
+            "boot-time repository-only workspace must emit file events"
+        );
     }
 
     #[tokio::test]

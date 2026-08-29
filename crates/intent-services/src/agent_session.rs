@@ -2078,11 +2078,7 @@ impl Services {
             None
         } else {
             match self.store.get_workspace(&stored.workspace_id).await {
-                Ok(ws) => ws
-                    .path
-                    .clone()
-                    .or_else(|| ws.worktree_path.clone())
-                    .map(PathBuf::from),
+                Ok(ws) => ws.effective_path().map(PathBuf::from),
                 Err(e) => {
                     tracing::debug!(
                         workspace = %stored.workspace_id,

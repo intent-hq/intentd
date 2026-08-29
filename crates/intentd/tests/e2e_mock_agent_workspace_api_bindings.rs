@@ -5,7 +5,7 @@
 //! BE state changed via Services reads, not just tool-call success — proving the
 //! full loop works.
 //!
-//! This file covers: **task** and **comment** bindings.
+//! This file covers: **workspace**, **task**, and **comment** bindings.
 //! See `e2e_mock_agent_workspace_api_bindings2.rs` for note, file, git, agent, event.
 //!
 //! Pattern: modeled after `tests/e2e_mock_agent.rs` single-turn execution.
@@ -87,6 +87,153 @@ fn gate() -> Option<String> {
         return None;
     }
     Some(script)
+}
+
+//
+// Workspace bindings coverage
+//
+
+/// `ws.workspace.info()` resolves `repositoryPath` as the final fallback
+/// (monorepo#3778): a direct-checkout workspace persisting only
+/// `repositoryPath` reports it as `path` through the full mock-agent loop
+/// (agent → MCP bridge → binding → Services), not just at the binding unit.
+/// Adopted from PR intent-hq/intentd#1564.
+#[tokio::test]
+async fn workspace_info_uses_repository_path() {
+    let Some(script) = gate() else { return };
+
+    let db = std::env::temp_dir().join(format!(
+        "intentd-e2e-workspace-info-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
+        .with_event_bus(bus.clone());
+    services
+        .settings_update(serde_json::json!([
+            { "path": "workspaceApi.toonOutput", "value": false }
+        ]))
+        .await
+        .expect("disable toonOutput");
+
+    let repository_dir = common::test_tempdir("itd-direct-repository-");
+    let repository_path = repository_dir.path().to_string_lossy().into_owned();
+    let ws = WorkspaceId::new();
+    let mut repository_workspace = workspace(&ws, None);
+    repository_workspace.repository_path = Some(repository_path.clone());
+    repository_workspace.skip_worktree = true;
+    repository_workspace.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+    store
+        .insert_workspace(&repository_workspace)
+        .await
+        .expect("insert repository-only workspace");
+
+    let agent_val = services
+        .agent_create(
+            ws.clone(),
+            Some("E2E Workspace Info".into()),
+            None,
+            None,
+            None,
+            None,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create agent");
+    let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+    let behavior = serde_json::json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": {
+                "code": "return await ws.workspace.info();",
+                "summary": "workspace.info bindings e2e"
+            }
+        },
+        "response": "workspace inspected",
+        "emitToolBlocks": true,
+    })
+    .to_string();
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = AgentManager::new(services.clone(), sink, 8)
+        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    manager
+        .create_agent(
+            agent_id.clone(),
+            ws.clone(),
+            "E2E Workspace Info",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&agent_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(serde_json::json!({ "type": "text", "text": "inspect workspace" }))
+            .unwrap();
+    manager
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
+        .await
+        .expect("run_turn");
+
+    let transcript = services
+        .agent_get_conversation(
+            agent_id.clone(),
+            None,
+            Some(ws.clone()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("get conversation");
+    let info = transcript["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|message| message["contentBlocks"].as_array())
+        .flatten()
+        .find(|block| block["type"] == "tool_result")
+        .and_then(|block| block["output"].as_array())
+        .and_then(|output| output.first())
+        .and_then(|item| item["text"].as_str())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .unwrap_or_else(|| panic!("workspace.info tool result persisted: {transcript}"));
+    assert_eq!(info["id"], ws.0);
+    assert_eq!(info["path"], repository_path);
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
 }
 
 //

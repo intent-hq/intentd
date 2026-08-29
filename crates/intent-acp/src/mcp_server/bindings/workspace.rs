@@ -261,7 +261,7 @@ async fn propose_sibling(
 
 async fn info(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
     let workspace = api.get_workspace(ws.clone()).await.map_err(map_err)?;
-    let path = workspace.path.clone().or(workspace.worktree_path.clone());
+    let path = workspace.effective_path().map(String::from);
     Ok(json!({
         "id": ws.as_str(),
         "path": path,
