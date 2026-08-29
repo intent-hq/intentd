@@ -5561,6 +5561,27 @@ impl Services {
         // synthetic wake later.
         if !interim_idle {
             self.take_interim_skipped_idle(child_id);
+            // PR #1578 review: the child's genuine settlement
+            // (completion/failure/deletion/retirement) ends its
+            // monitoring-idle waiting episode for EVERY advised parent —
+            // clear the once-per-episode advisory markers BY CHILD, not per
+            // delivered watch: a parent that never re-armed after the
+            // advisory consumed its one-shot watch has no watch for a
+            // per-watch clear to run through, and the leaked marker would
+            // suppress every FUTURE episode's advisory for the pair.
+            // Best-effort: a failed clear only suppresses one future
+            // advisory, never a real wake.
+            if let Err(e) = self
+                .store
+                .clear_advisory_wake_deliveries_for_child(child_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    child = %child_id.0,
+                    "failed to clear advisory-wake episode markers at settlement"
+                );
+            }
         }
         let failure_error_text = (event.event_type == AGENT_FAILED).then(|| {
             event
@@ -6230,14 +6251,18 @@ impl Services {
     /// (`grouped: false`) the delivery retires the watch via the standard
     /// durable path with NO completion identity recorded (a later genuine
     /// completion must still deliver to a re-armed watch); failures set
-    /// `ungrouped_delivery_failed` but deliberately do NOT schedule the
-    /// completion retry task — the child's next monitoring idle (or its
-    /// genuine completion) re-runs this path. For a grouped `after_all`
-    /// watch (`grouped: true`, STAB-160 shape) the watch stays armed and the
-    /// group stays open (`watchStillArmed: true`, no re-arm instruction, no
-    /// retirement, no `ungrouped_delivery_failed`); only the shared episode
-    /// marker is recorded. Both shapes persist the marker last, so a crash
-    /// or failure before it means at worst one repeated advisory next idle.
+    /// `ungrouped_delivery_failed` AND schedule the per-child completion
+    /// retry task (PR #1578 review) — the advisory is the one event meant
+    /// to break the parent's unbounded silent wait (a PR monitor has no
+    /// TTL), so waiting for the child's next idle could park the parent
+    /// indefinitely. The retry replays the advisory-allowed delivery pass;
+    /// the stable message id keeps every attempt idempotent. For a grouped
+    /// `after_all` watch (`grouped: true`, STAB-160 shape) the watch stays
+    /// armed and the group stays open (`watchStillArmed: true`, no re-arm
+    /// instruction, no retirement, no `ungrouped_delivery_failed`); only
+    /// the shared episode marker is recorded. Both shapes persist the
+    /// marker last, so a crash or failure before it means at worst one
+    /// repeated advisory next idle.
     #[allow(clippy::too_many_arguments)]
     async fn deliver_monitoring_idle_advisory(
         &self,
@@ -6307,10 +6332,11 @@ impl Services {
                 error = %e,
                 parent = %watch.parent_agent_id.0,
                 watch = %watch.id,
-                "failed to deliver monitoring-idle advisory wake to parent; watch stays armed"
+                "failed to deliver monitoring-idle advisory wake to parent; watch stays armed, retry scheduled"
             );
             if !grouped {
                 *ungrouped_delivery_failed = true;
+                self.schedule_completion_delivery_retry(child_id.clone(), event.clone());
             }
             return false;
         }
@@ -6335,9 +6361,10 @@ impl Services {
                     error = %e,
                     parent = %watch.parent_agent_id.0,
                     watch = %watch.id,
-                    "advisory wake is durable but watch retirement failed; stable-id replay heals on the next pass"
+                    "advisory wake is durable but watch retirement failed; stable-id retry remains armed"
                 );
                 *ungrouped_delivery_failed = true;
+                self.schedule_completion_delivery_retry(child_id.clone(), event.clone());
                 return false;
             }
             self.remove_watch_after_delivery_commit(&watch.id);

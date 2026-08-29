@@ -16856,6 +16856,184 @@ async fn busy_suppressed_monitoring_idle_advisory_heals_on_worker_exit() {
     );
 }
 
+/// PR #1578 review: a FAILED ungrouped advisory wake must enter the
+/// per-child delivery retry loop, like the genuine-completion failure
+/// sites — the advisory is the one event meant to break the parent's
+/// silent wait (a PR monitor has no TTL), so losing it until an unrelated
+/// future idle parks the parent indefinitely. The retry replays the
+/// advisory-allowed delivery pass with the same stable message id, so the
+/// healed advisory delivers exactly once.
+#[tokio::test]
+async fn failed_advisory_wake_retries_without_another_event() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+    let watch_id = svc
+        .register_completion_watch_durable(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .await
+        .expect("register watch");
+    let event = completion_event(&ws, AGENT_IDLE, &child, json!({ "agentId": child.0 }));
+
+    sqlx::query(
+        "CREATE TRIGGER fail_advisory_wake BEFORE INSERT ON agent_message BEGIN
+         SELECT RAISE(FAIL, 'injected advisory wake failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install failure trigger");
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "failed advisory leaves the watch armed"
+    );
+
+    sqlx::query("DROP TRIGGER fail_advisory_wake")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove failure trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if parent_message_count(&svc, &parent).await == 1
+                && svc.find_watches_for_child(&child).is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry delivers the advisory and retires the watch without another event");
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(
+        session.messages[0].id,
+        format!("advisory-wake:{watch_id}"),
+        "retry keeps the stable advisory delivery id"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("still waiting on external monitoring"),
+        "advisory wording: {text}"
+    );
+    assert!(
+        svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "once-per-episode marker persisted after the healed delivery"
+    );
+    // A replayed monitoring idle stays silent: the marker stands and the
+    // one-shot watch is consumed.
+    svc.handle_completion_event(&event).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "no duplicate advisory after the retry healed"
+    );
+}
+
+/// PR #1578 review: the once-per-episode advisory marker must clear at the
+/// child's GENUINE settlement even when the parent never re-armed a watch
+/// after the advisory consumed it — the per-watch clear alone would leak
+/// the marker (no watch, no clear), silently suppressing every FUTURE
+/// monitoring episode's advisory for the same (parent, child) pair.
+#[tokio::test]
+async fn advisory_marker_clears_at_settlement_without_rearmed_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let hook = seed_active_hook(&svc, &ws, &child, "first-watch").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // Episode 1: the monitoring idle delivers the advisory and consumes the
+    // one-shot watch; the parent never re-arms.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert!(svc.find_watches_for_child(&child).is_empty());
+    assert!(svc
+        .store()
+        .has_advisory_wake_delivery(&parent, &child)
+        .await
+        .expect("marker read"));
+
+    // The hook dispatches and the child genuinely completes with NO watch
+    // armed: the settlement must still clear the episode marker.
+    svc.store()
+        .update_hook_state(&hook.hook_id, intent_core::HookState::Dispatched)
+        .await
+        .expect("dispatch hook");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+    assert!(
+        !svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "genuine settlement clears the episode marker even without a watch"
+    );
+
+    // Episode 2: a fresh waiting episode with a re-armed watch advises again.
+    seed_active_hook(&svc, &ws, &child, "second-watch").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-arm watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        2,
+        "the next episode's advisory is not suppressed by a leaked marker"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("second-watch"), "names the new hook: {text}");
+}
+
 /// The advisory is scoped to PURE hook-/monitor-waiting deferral: an idle
 /// that is ALSO agent-waiting (child holds outgoing watches on unsettled
 /// agents) defers silently with the watch armed.

@@ -2,8 +2,8 @@
 //! recording that the parent already received the advisory wake for the
 //! child's current hook-/PR-monitor-waiting episode. Consulted by
 //! completion-watch delivery so a monitoring idle fires at most one advisory
-//! per episode; cleared when a genuine completion/failure/deletion wake
-//! delivers, which opens the next episode.
+//! per episode; cleared at the child's genuine settlement
+//! (completion/failure/deletion), which opens the next episode.
 
 use intent_core::{AgentId, Error, Result};
 
@@ -79,6 +79,29 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("clear advisory_wake_delivery failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Clear every advisory-delivered marker naming `child_agent_id` as the
+    /// child: its genuine settlement ends the waiting episode for EVERY
+    /// advised parent, whether or not any still holds an armed watch (a
+    /// parent that never re-armed after the advisory has no watch to clear
+    /// through).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_advisory_wake_deliveries_for_child(
+        &self,
+        child_agent_id: &AgentId,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM advisory_wake_delivery WHERE child_agent_id = ?")
+            .bind(&child_agent_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("clear advisory_wake_delivery by child failed: {e}"))
+            })?;
         Ok(())
     }
 }
