@@ -5057,7 +5057,12 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        let classification = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
+        // No-advisory variant: this synthetic pass is non-interim by
+        // construction, but a hook/monitor registered in the guard→delivery
+        // window could re-classify it as monitoring-idle — that deferral
+        // keeps today's silent skip; only a LIVE idle fires the advisory.
+        let classification =
+            Box::pin(self.deliver_completion_to_watches_no_advisory(child_id, &event)).await;
         // Real completion: seal the agent's open after_all group and try to
         // fire it, mirroring `handle_completion_event`'s non-queue-interim
         // idle path (monorepo#1281). Gated on the delivery pass's own
@@ -5303,6 +5308,30 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
+        self.deliver_completion_to_watches_inner(child_id, event, true)
+            .await
+    }
+
+    /// [`Services::deliver_completion_to_watches`] with the advisory wake
+    /// suppressed: used by the registration-time / boot reconciliation
+    /// (`agent_subscriptions.rs`) and the synthetic mutation-path redelivery,
+    /// whose deferred idles must keep today's silent-skip behavior — only a
+    /// LIVE `agent:idle` may fire the hook-/PR-monitor-waiting advisory.
+    pub(crate) async fn deliver_completion_to_watches_no_advisory(
+        &self,
+        child_id: &AgentId,
+        event: &Event,
+    ) -> CompletionIdleClassification {
+        self.deliver_completion_to_watches_inner(child_id, event, false)
+            .await
+    }
+
+    async fn deliver_completion_to_watches_inner(
+        &self,
+        child_id: &AgentId,
+        event: &Event,
+        advisory_allowed: bool,
+    ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
         // worker is already busy in a new turn (monorepo#1297: an enqueue that
@@ -5341,19 +5370,32 @@ impl Services {
         // emit and delivery must not defer). Probed even when the idle is
         // already queue-interim, because the GROUPED branch below needs the
         // hook classification independently (an interim idle still records
-        // for groups; a hook-waiting one must not).
-        let hook_waiting = event.event_type == AGENT_IDLE
-            && !completion_reported
-            && !self.active_hooks_for_agent(child_id).await.is_empty();
+        // for groups; a hook-waiting one must not). The probed entries are
+        // kept: the advisory wake below names them.
+        let active_hooks: Vec<serde_json::Value> =
+            if event.event_type == AGENT_IDLE && !completion_reported {
+                self.active_hooks_for_agent(child_id).await
+            } else {
+                Vec::new()
+            };
+        let hook_waiting = !active_hooks.is_empty();
         // Idle-visibility deferral (unified external-wait, mirrors
         // `hook_waiting` exactly): an `agent:idle` for a child that owns
         // active PR monitors is not its real completion — a monitored PR's
         // own poll loop will wake the agent when it changes or settles.
         // Probed live, same as the hook probe, and independently of
         // `hook_waiting` so the GROUPED branch below can defer on either.
-        let pr_monitor_waiting = event.event_type == AGENT_IDLE
-            && !completion_reported
-            && !self.active_pr_monitors_for_agent(child_id).await.is_empty();
+        let active_pr_monitors: Vec<serde_json::Value> =
+            if event.event_type == AGENT_IDLE && !completion_reported {
+                self.active_pr_monitors_for_agent(child_id)
+                    .await
+                    .iter()
+                    .map(crate::pr_monitor::waiting_on_pr_monitors_entry)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let pr_monitor_waiting = !active_pr_monitors.is_empty();
         // Idle-visibility deferral (issue intent-hq/monorepo#1468): an
         // `agent:idle` for a child that itself holds live outgoing completion
         // watches on other, unsettled agents is not its real completion — it
@@ -5745,7 +5787,43 @@ impl Services {
             // follows the queue drain / running turn / hook resolution / PR
             // monitor resolution / watched-target completion. The
             // interim-skip marker was recorded up front (monorepo#1280).
+            //
+            // EXCEPT: an idle deferred ONLY because the child owns active
+            // hooks or PR monitors (not queue-interim/busy, not
+            // agent-waiting — the report-bypass already excluded reported
+            // idles from those flags) is an unbounded silent wait for the
+            // parent: PR monitors have no TTL, so a child merely monitoring
+            // a PR awaiting human review parks the watcher indefinitely.
+            // Deliver ONE advisory wake per (parent, child) waiting episode
+            // instead: it names the child's active hooks/monitors, consumes
+            // the one-shot watch (retired via the standard durable path,
+            // recording NO completion identity so a later genuine completion
+            // still delivers to a re-armed watch), and tells the parent to
+            // re-arm `agent.watch` for the genuine completion. A persisted
+            // once-per-episode marker (`advisory_wake_delivery`) keeps
+            // subsequent monitoring idles silently deferring exactly as
+            // before — cleared when a genuine completion/failure/deletion
+            // wake delivers below. Only a LIVE `agent:idle` may fire it
+            // (`advisory_allowed`): registration-time reconciliation and the
+            // synthetic mutation-path redelivery keep today's silent skip.
             if interim_idle {
+                if advisory_allowed
+                    && (hook_waiting || pr_monitor_waiting)
+                    && !queue_interim
+                    && !agent_waiting
+                {
+                    self.deliver_monitoring_idle_advisory(
+                        child_id,
+                        &watch,
+                        &parent_ws,
+                        event,
+                        &active_hooks,
+                        &active_pr_monitors,
+                        &mut ungrouped_delivery_failed,
+                    )
+                    .await;
+                    continue;
+                }
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
@@ -5906,6 +5984,23 @@ impl Services {
                 continue;
             }
             self.remove_watch_after_delivery_commit(&watch.id);
+            // A genuine completion/failure/deletion wake delivered — the
+            // child's monitoring-idle waiting episode (if any) is over, so
+            // clear the once-per-episode advisory marker: a FUTURE episode
+            // may advise again. Best-effort: a failed clear only suppresses
+            // one future advisory, never a real wake.
+            if let Err(e) = self
+                .store
+                .clear_advisory_wake_delivery(&watch.parent_agent_id, child_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %watch.parent_agent_id.0,
+                    child = %child_id.0,
+                    "failed to clear advisory-wake episode marker"
+                );
+            }
             // Record the delivered failure only after both the wake and watch
             // retirement are durable. A failed send or transaction therefore
             // never suppresses recovery.
@@ -5968,6 +6063,130 @@ impl Services {
             pr_monitor_waiting,
             ungrouped_delivery_failed,
         }
+    }
+
+    /// Deliver the ONE advisory wake for an ungrouped watch whose child went
+    /// idle while only externally monitoring (active hooks / PR monitors —
+    /// see the caller in `deliver_completion_to_watches_inner`). Consults the
+    /// persisted once-per-episode marker first: a standing marker means the
+    /// parent already heard the advisory for this waiting episode, so the
+    /// deferred idle skips silently (the watch — typically a re-armed one —
+    /// stays armed for the genuine completion). On delivery the watch retires
+    /// via the standard durable path with NO completion identity recorded (a
+    /// later genuine completion must still deliver to a re-armed watch), and
+    /// the marker is persisted. Failures set `ungrouped_delivery_failed` but
+    /// deliberately do NOT schedule the completion retry task — the child's
+    /// next monitoring idle (or its genuine completion) re-runs this path.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_monitoring_idle_advisory(
+        &self,
+        child_id: &AgentId,
+        watch: &agent_subscriptions::CompletionWatch,
+        parent_ws: &WorkspaceId,
+        event: &Event,
+        active_hooks: &[serde_json::Value],
+        active_pr_monitors: &[serde_json::Value],
+        ungrouped_delivery_failed: &mut bool,
+    ) -> bool {
+        // Marker read fails CLOSED (skip, watch stays armed): the advisory is
+        // a courtesy; a missed one only restores the pre-advisory silent
+        // deferral, while a duplicate would spam the parent every idle.
+        let already_advised = self
+            .store
+            .has_advisory_wake_delivery(&watch.parent_agent_id, child_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    error = %e,
+                    "advisory-wake marker read failed; deferring silently"
+                );
+                true
+            });
+        if already_advised {
+            tracing::debug!(
+                child = %child_id.0,
+                parent = %watch.parent_agent_id.0,
+                "skipping agent:idle wake — advisory already delivered this waiting episode; watch stays armed"
+            );
+            return false;
+        }
+        let wake =
+            format_monitoring_idle_advisory_wake(child_id, event, active_hooks, active_pr_monitors);
+        let mut metadata = build_event_notification_metadata(&[event]);
+        metadata["watchStillArmed"] = serde_json::json!(false);
+        metadata["childExternallyWaiting"] = serde_json::json!(true);
+        if !active_hooks.is_empty() {
+            metadata["waitingOnHooks"] = serde_json::Value::Array(active_hooks.to_vec());
+        }
+        if !active_pr_monitors.is_empty() {
+            metadata["waitingOnPrMonitors"] = serde_json::Value::Array(active_pr_monitors.to_vec());
+        }
+        // Stable message id: a crash between delivery and retirement replays
+        // this pass; the durable-wake dedup makes the re-send idempotent.
+        if let Err(e) = self
+            .deliver_parent_wake_durable(
+                parent_ws,
+                watch.parent_agent_id.clone(),
+                wake,
+                Some(metadata),
+                format!("advisory-wake:{}", watch.id),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                parent = %watch.parent_agent_id.0,
+                watch = %watch.id,
+                "failed to deliver monitoring-idle advisory wake to parent; watch stays armed"
+            );
+            *ungrouped_delivery_failed = true;
+            return false;
+        }
+        let delivered_at = now_iso();
+        // Retire with NO completion identity: the advisory is not the child's
+        // completion, so nothing may be recorded as "delivered" for the
+        // genuine completion a re-armed watch waits for.
+        if let Err(e) = self
+            .store
+            .retire_completion_watch_after_delivery(
+                &watch.id,
+                &watch.parent_agent_id,
+                child_id,
+                None,
+                &delivered_at,
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                parent = %watch.parent_agent_id.0,
+                watch = %watch.id,
+                "advisory wake is durable but watch retirement failed; stable-id replay heals on the next pass"
+            );
+            *ungrouped_delivery_failed = true;
+            return false;
+        }
+        self.remove_watch_after_delivery_commit(&watch.id);
+        // Marker last: a crash before this write re-sends the (deduped)
+        // advisory on the next monitoring idle and re-attempts the marker; a
+        // write failure means at worst one repeated advisory next idle.
+        if let Err(e) = self
+            .store
+            .record_advisory_wake_delivery(&watch.parent_agent_id, child_id, &delivered_at)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                parent = %watch.parent_agent_id.0,
+                child = %child_id.0,
+                "failed to record advisory-wake episode marker"
+            );
+        }
+        self.publish_subscriptions_changed(parent_ws, &watch.parent_agent_id)
+            .await;
+        true
     }
 
     /// Fire a delegation group's single aggregated wake if it is ready. The
@@ -10845,6 +11064,68 @@ pub(crate) fn format_completion_wake(
         &child_settlement_params(child_id, event, None, stall),
         watch_retired,
     )
+}
+
+/// The advisory wake for a hook-/PR-monitor-deferred idle: the child is idle
+/// but still externally monitoring, so this is NOT its completion — the text
+/// names the active hooks (name + expiry) and PR monitors (repo#pr + title),
+/// states the one-shot watch was consumed, and instructs re-arming via
+/// `ws.agent.watch` to hear the genuine completion.
+pub(crate) fn format_monitoring_idle_advisory_wake(
+    child_id: &AgentId,
+    event: &Event,
+    active_hooks: &[serde_json::Value],
+    active_pr_monitors: &[serde_json::Value],
+) -> String {
+    use std::fmt::Write as _;
+    let label = event
+        .data
+        .get("agentName")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || child_id.0.clone(),
+            |name| format!("{name} ({})", child_id.0),
+        );
+    let mut msg = format!(
+        "[WORKSPACE EVENTS] Child agent {label} is idle but still waiting on external monitoring — this is NOT its completion."
+    );
+    if !active_hooks.is_empty() {
+        msg.push_str("\nActive background hooks:");
+        for h in active_hooks {
+            let name = h
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unnamed)");
+            let _ = write!(msg, "\n- {name}");
+            if let Some(exp) = h.get("expiresAt").and_then(|v| v.as_str()) {
+                let _ = write!(msg, " (expires {exp})");
+            }
+        }
+    }
+    if !active_pr_monitors.is_empty() {
+        msg.push_str("\nActive PR monitors:");
+        for m in active_pr_monitors {
+            let repo = m.get("repo").and_then(|v| v.as_str()).unwrap_or("?");
+            match m.get("prNumber").and_then(serde_json::Value::as_i64) {
+                Some(n) => {
+                    let _ = write!(msg, "\n- {repo}#{n}");
+                }
+                None => {
+                    let _ = write!(msg, "\n- {repo}");
+                }
+            }
+            if let Some(title) = m.get("title").and_then(|v| v.as_str()) {
+                let _ = write!(msg, " — {title}");
+            }
+        }
+    }
+    let _ = write!(
+        msg,
+        "\nThis advisory consumed your one-shot watch on it. If you want to be woken at its genuine completion, re-arm with ws.agent.watch(\"{}\").",
+        child_id.0
+    );
+    msg
 }
 
 /// Extract the data half of a child-settlement report from its `agent:*`

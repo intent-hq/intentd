@@ -1654,7 +1654,11 @@ impl Services {
             metadata: None,
             data,
         };
-        self.deliver_completion_to_watches(child_id, &event).await;
+        // No-advisory variant: registration-time / boot reconciliation must
+        // never fire the monitoring-idle advisory — a deferred idle here
+        // leaves the watch armed, exactly as before the advisory existed.
+        self.deliver_completion_to_watches_no_advisory(child_id, &event)
+            .await;
     }
 
     /// Rehydrate undelivered delegation groups on resume (AS-2 rehydration).

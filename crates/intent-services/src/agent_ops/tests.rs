@@ -16568,12 +16568,14 @@ async fn seed_active_pr_monitor(
     monitor
 }
 
-/// Idle-visibility deferral (a)+(b): a watched child going idle while owning
-/// an active hook delivers NO wake and the watch STAYS ARMED; the child's
-/// later idle with no active hooks fires the watch exactly once as a normal
-/// completion.
+/// Monitoring-idle advisory (hook flavor): a watched child going idle while
+/// owning an active hook delivers ONE advisory wake that names the hook and
+/// consumes the watch; a re-armed watch stays SILENT through the next
+/// monitoring idle (once-per-episode marker); the child's later idle with no
+/// active hooks fires the re-armed watch exactly once as a normal completion,
+/// clearing the marker so a future episode can advise again.
 #[tokio::test]
-async fn hook_waiting_idle_defers_watch_until_hookless_idle() {
+async fn hook_waiting_idle_delivers_advisory_then_rearmed_watch_completes() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -16589,7 +16591,7 @@ async fn hook_waiting_idle_defers_watch_until_hookless_idle() {
     )
     .expect("register watch");
 
-    // (a) Idle while the hook is active: deferred — no wake, watch armed.
+    // (a) Idle while the hook is active: ONE advisory wake, watch consumed.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -16599,17 +16601,62 @@ async fn hook_waiting_idle_defers_watch_until_hookless_idle() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        0,
-        "no wake while the child waits on its hook"
+        1,
+        "one advisory wake for the monitoring idle"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("still waiting on external monitoring"),
+        "advisory wording: {text}"
+    );
+    assert!(text.contains("pr-watch"), "names the hook: {text}");
+    assert!(
+        text.contains("ws.agent.watch"),
+        "re-arm instruction: {text}"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "advisory consumed the one-shot watch"
+    );
+    assert!(
+        svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "once-per-episode marker persisted"
+    );
+
+    // (b) Re-arm; the next monitoring idle defers SILENTLY (marker stands).
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-arm watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "no second advisory this episode"
     );
     assert_eq!(
         svc.find_watches_for_child(&child).len(),
         1,
-        "watch stays armed through the deferred idle"
+        "re-armed watch stays armed through the deferred idle"
     );
 
-    // (b) The hook dispatches (terminal) and the wake turn ends: the next
-    // idle is the child's real completion — the watch fires once.
+    // (c) The hook dispatches (terminal) and the wake turn ends: the next
+    // idle is the child's real completion — the re-armed watch fires once
+    // and the episode marker clears.
     svc.store()
         .update_hook_state(&hook.hook_id, intent_core::HookState::Dispatched)
         .await
@@ -16621,12 +16668,147 @@ async fn hook_waiting_idle_defers_watch_until_hookless_idle() {
         json!({ "agentId": child.0, "lastResponseSummary": "handled the dispatch" }),
     ))
     .await;
-    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
     let text = parent_messages_text(&svc, &parent).await;
     assert!(text.contains("completed"), "{text}");
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
         "watch retires at the real completion"
+    );
+    assert!(
+        !svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "genuine completion clears the episode marker"
+    );
+}
+
+/// The advisory wake's metadata is machine-readable: `watchStillArmed: false`
+/// (the advisory consumed the watch), `childExternallyWaiting: true`, and the
+/// active hook/monitor lists.
+#[tokio::test]
+async fn monitoring_idle_advisory_metadata_flags() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "ci-poll").await;
+    seed_active_pr_monitor(&svc, &ws, &child, 7).await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    let metadata = session.messages[0]
+        .metadata
+        .as_ref()
+        .expect("advisory wake carries event_notification metadata");
+    assert_eq!(metadata["type"], json!("event_notification"));
+    assert_eq!(metadata["watchStillArmed"], json!(false));
+    assert_eq!(metadata["childExternallyWaiting"], json!(true));
+    let hooks = metadata["waitingOnHooks"].as_array().expect("hook list");
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks[0]["name"], json!("ci-poll"));
+    let monitors = metadata["waitingOnPrMonitors"]
+        .as_array()
+        .expect("monitor list");
+    assert_eq!(monitors.len(), 1);
+    assert_eq!(monitors[0]["prNumber"], json!(7));
+}
+
+/// The advisory is scoped to PURE hook-/monitor-waiting deferral: an idle
+/// that is ALSO queue-interim (child about to be redriven) defers silently
+/// with the watch armed, exactly as before the advisory existed.
+#[tokio::test]
+async fn queue_interim_monitoring_idle_gets_no_advisory() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    // A ready-to-send queue entry makes the idle queue-interim too.
+    svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no advisory on a queue-interim idle even with an active hook"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch survives the interim idle"
+    );
+}
+
+/// The advisory is scoped to PURE hook-/monitor-waiting deferral: an idle
+/// that is ALSO agent-waiting (child holds outgoing watches on unsettled
+/// agents) defers silently with the watch armed.
+#[tokio::test]
+async fn agent_waiting_monitoring_idle_gets_no_advisory() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+    seed_active_hook(&svc, &ws, &b, "pr-watch").await;
+
+    // A watches B; B watches C — B's idle is agent-waiting AND hook-waiting.
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        0,
+        "no advisory on an agent-waiting idle even with an active hook"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&b).len(),
+        1,
+        "A's watch stays armed through B's deferred idle"
     );
 }
 
@@ -16845,13 +17027,13 @@ async fn immediate_wake_paths_ignore_active_hooks() {
     );
 }
 
-/// Unified external-wait classification: a watched child going idle while
-/// owning an active PR monitor delivers NO wake and the watch STAYS ARMED,
-/// mirroring `hook_waiting_idle_defers_watch_until_hookless_idle` exactly;
-/// once the monitor is cancelled, the child's next idle is its real
-/// completion and the watch fires exactly once.
+/// Monitoring-idle advisory (PR-monitor flavor), mirroring the hook-flavor
+/// advisory test: the first monitoring idle delivers ONE advisory naming the
+/// monitored PR and consumes the watch; a re-armed watch stays silent through
+/// the next monitoring idle; once the monitor completes, the child's next
+/// idle is its real completion and the re-armed watch fires exactly once.
 #[tokio::test]
-async fn pr_monitor_waiting_idle_defers_watch_until_monitorless_idle() {
+async fn pr_monitor_waiting_idle_delivers_advisory_then_rearmed_watch_completes() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -16867,7 +17049,7 @@ async fn pr_monitor_waiting_idle_defers_watch_until_monitorless_idle() {
     )
     .expect("register watch");
 
-    // Idle while the monitor is active: deferred — no wake, watch armed.
+    // Idle while the monitor is active: ONE advisory wake, watch consumed.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -16877,17 +17059,50 @@ async fn pr_monitor_waiting_idle_defers_watch_until_monitorless_idle() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        0,
-        "no wake while the child waits on its PR monitor"
+        1,
+        "one advisory wake for the monitoring idle"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("still waiting on external monitoring"),
+        "advisory wording: {text}"
+    );
+    assert!(text.contains("#42"), "names the monitored PR: {text}");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "advisory consumed the one-shot watch"
+    );
+
+    // Re-arm; the next monitoring idle defers silently (marker stands).
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-arm watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "no second advisory this episode"
     );
     assert_eq!(
         svc.find_watches_for_child(&child).len(),
         1,
-        "watch stays armed through the deferred idle"
+        "re-armed watch stays armed through the deferred idle"
     );
 
     // The monitor completes (terminal) and the wake turn ends: the next idle
-    // is the child's real completion — the watch fires once.
+    // is the child's real completion — the re-armed watch fires once.
     svc.store()
         .update_pr_monitor_state(
             &monitor.monitor_id,
@@ -16903,7 +17118,7 @@ async fn pr_monitor_waiting_idle_defers_watch_until_monitorless_idle() {
         json!({ "agentId": child.0, "lastResponseSummary": "PR merged" }),
     ))
     .await;
-    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
     let text = parent_messages_text(&svc, &parent).await;
     assert!(text.contains("completed"), "{text}");
     assert!(
@@ -17019,7 +17234,12 @@ async fn external_hook_cancel_settles_deferred_watch() {
     )
     .expect("register watch");
 
-    // Idle with the hook active: deferred (marker recorded, watch armed).
+    // Advisory already delivered this episode: the monitoring idle defers
+    // silently (marker recorded, watch armed) — the backstop under test.
+    svc.store()
+        .record_advisory_wake_delivery(&parent, &child, &now_iso())
+        .await
+        .expect("seed advisory marker");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -17130,7 +17350,12 @@ async fn owner_pr_unmonitor_settles_deferred_watch() {
     )
     .expect("register watch");
 
-    // Idle with the monitor active: deferred (marker recorded, watch armed).
+    // Advisory already delivered this episode: the monitoring idle defers
+    // silently (marker recorded, watch armed) — the backstop under test.
+    svc.store()
+        .record_advisory_wake_delivery(&parent, &child, &now_iso())
+        .await
+        .expect("seed advisory marker");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -30202,8 +30427,13 @@ async fn retire_settles_hook_deferred_watch_with_retired_notice() {
     svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
         .await
         .expect("watch");
-    // The target idles while its hook is active: deferred — interim-skip
-    // marker recorded, no wake, watch armed.
+    // Advisory already delivered this episode, so the target's monitoring
+    // idle defers silently — interim-skip marker recorded, no wake, watch
+    // armed (the retire backstop under test).
+    svc.store()
+        .record_advisory_wake_delivery(&watcher, &target, &now_iso())
+        .await
+        .expect("seed advisory marker");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
