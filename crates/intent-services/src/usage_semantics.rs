@@ -356,6 +356,21 @@ mod tests {
     }
 
     #[test]
+    fn grok_cost_only_bill_is_kept() {
+        // A bill with zero counters but positive ticks is NOT empty: the
+        // cost must still be captured (the empty check requires no counters
+        // AND no trustworthy cost).
+        let meta = grok_meta(serde_json::json!({
+            "costUsdTicks": 100_000_000i64
+        }));
+        let (usage, cost) = prompt_meta_usage_bill(&meta).expect("cost-only bill parsed");
+        assert_eq!(usage.total_tokens, 0);
+        let cost = cost.expect("cost captured");
+        assert!((cost.amount - 0.01).abs() < f64::EPSILON, "{}", cost.amount);
+        assert_eq!(cost.currency, "USD");
+    }
+
+    #[test]
     fn grok_subset_overrun_saturates_at_zero() {
         // Defensive: a bill whose subsets exceed their supersets must not
         // underflow the disjoint buckets.
