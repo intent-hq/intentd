@@ -29,7 +29,9 @@ const ACCESS_DENIED: &str = "Access denied: path outside workspace";
 pub(crate) const ATTACHMENTS_DIR: &str = ".intent/attachments";
 
 /// Resolve the workspace filesystem root the way the TS protocol adapter does:
-/// `worktreePath || repositoryPath`, else empty (→ CWD-relative resolution).
+/// `worktreePath || repositoryPath`, else empty — which [`is_within`] then
+/// fails closed instead of falling back to CWD-relative resolution
+/// (intent-hq/intent#3839).
 pub(crate) fn workspace_root(ws: &Workspace) -> String {
     git_ops::worktree_path(ws)
         .map(|p| p.to_string_lossy().into_owned())
@@ -105,11 +107,18 @@ fn node_resolve(base: &str, rel: &str) -> PathBuf {
 /// string prefix would let `/tmp/ws-escape` pass for root `/tmp/ws`. An empty
 /// root (unknown or pathless workspace) is rejected outright: treating it as
 /// "matches everything" (as JS did) let a bogus `workspaceId` plus an absolute
-/// path escape workspace containment (intent-hq/intent#3839).
+/// path escape workspace containment (intent-hq/intent#3839). A root that is
+/// itself the filesystem root (all separators, e.g. `/`) is distinguished from
+/// the empty root: it legitimately contains every absolute path.
 fn is_within(root: &str, full: &Path) -> bool {
-    let root = root.trim_end_matches(['/', '\\']);
     if root.is_empty() {
         return false;
+    }
+    let root = root.trim_end_matches(['/', '\\']);
+    if root.is_empty() {
+        // Non-empty root that was all separators: the workspace is rooted at
+        // the filesystem root, which contains any absolute resolved path.
+        return full.is_absolute();
     }
     let full = full.to_string_lossy();
     match full.strip_prefix(root) {
@@ -914,14 +923,22 @@ mod tests {
         // (intent-hq/intent#3839). `exists` folds a genuine lookup error to a
         // present:false shape, but the containment guard fires ahead of the
         // lookup, so it too surfaces ACCESS_DENIED here.
+        //
+        // Escape targets live in a unique per-run temp dir (never pre-created)
+        // so a leftover from another run/process can't flip the assertions.
+        let escape_dir =
+            std::env::temp_dir().join(format!("intentd-empty-root-{}", uuid::Uuid::new_v4()));
+        let escape_file = escape_dir.join("escape");
+        let escape_file_s = escape_file.to_string_lossy().into_owned();
+        let escape_dir_s = escape_dir.to_string_lossy().into_owned();
         for res in [
             read("", "/etc/passwd"),
-            write("", "/tmp/intentd-empty-root-escape", "x"),
+            write("", &escape_file_s, "x"),
             list("", "/etc"),
             delete("", "/etc/passwd"),
-            mkdir("", "/tmp/intentd-empty-root-escape-dir"),
-            rename("", "/etc/passwd", "/tmp/intentd-empty-root-escape"),
-            rename("", "/tmp/a", "/etc/passwd"),
+            mkdir("", &escape_dir_s),
+            rename("", "/etc/passwd", &escape_file_s),
+            rename("", &escape_file_s, "/etc/passwd"),
             stat("", "/etc/passwd"),
             exists("", "/etc/passwd"),
             read_chunk("", "/etc/passwd", 0, 16),
@@ -931,9 +948,28 @@ mod tests {
                 other => panic!("expected access denied for empty root, got {other:?}"),
             }
         }
-        // The bogus write target must not have been created.
-        assert!(!std::path::Path::new("/tmp/intentd-empty-root-escape").exists());
-        assert!(!std::path::Path::new("/tmp/intentd-empty-root-escape-dir").exists());
+        // The bogus write/mkdir targets must not have been created.
+        assert!(!escape_file.exists());
+        assert!(!escape_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_root_workspace_is_not_rejected() {
+        // A workspace legitimately rooted at `/` must not be confused with
+        // the empty (unknown-workspace) root: trimming the sole separator
+        // yields "" too, but the fail-closed branch applies only to a root
+        // that was empty before trimming.
+        assert!(is_within("/", Path::new("/etc/passwd")));
+        assert!(is_within("/", Path::new("/")));
+        assert!(!is_within("/", Path::new("relative/path")));
+        // Empty root stays rejected even for the same paths.
+        assert!(!is_within("", Path::new("/etc/passwd")));
+        let r = read("/", "etc/hostname");
+        assert!(
+            !matches!(&r, Err(Error::Internal(m)) if m == ACCESS_DENIED),
+            "read with / root must pass containment, got {r:?}"
+        );
     }
 
     #[test]

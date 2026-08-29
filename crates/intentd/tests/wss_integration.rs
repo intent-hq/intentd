@@ -11404,6 +11404,73 @@ async fn wss_file_read_chunk_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Workspace-containment fail-closed guard over the real WSS wire
+/// (intent-hq/intent#3839): a `file.*` request carrying a `workspaceId` that
+/// does not exist — or one whose workspace row has no filesystem root — must
+/// be rejected with the containment `-32603`, never resolved CWD-relative or
+/// via the absolute path. A read of an absolute host path and a write to a
+/// unique temp target both fail closed, and the write target is never
+/// created on disk; the same requests against a real rooted workspace still
+/// succeed, proving the guard rejects only the empty-root case.
+#[tokio::test]
+async fn wss_file_ops_unknown_workspace_fail_closed() {
+    let srv = start(WsOptions::default()).await;
+
+    // A workspace that exists but has no path/worktree resolves to an empty
+    // containment root, exactly like an unknown workspaceId.
+    let pathless = WorkspaceId::new();
+    let w = fixture_workspace(&pathless);
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let escape = std::env::temp_dir().join(format!("intentd-wss-escape-{}", uuid::Uuid::new_v4()));
+    let escape_s = escape.to_string_lossy().into_owned();
+
+    for ws_id in ["ws-does-not-exist", pathless.0.as_str()] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"file.read","params":{{"workspaceId":"{ws_id}","path":"/etc/passwd"}}}}"#,
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32603), "{resp}");
+        assert!(
+            resp["error"]["data"]
+                .as_str()
+                .is_some_and(|m| m.contains("Access denied")),
+            "{resp}"
+        );
+
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"file.write","params":{{"workspaceId":"{ws_id}","path":"{escape_s}","content":"x"}}}}"#,
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32603), "{resp}");
+        assert!(!escape.exists(), "escape write must not land on disk");
+
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"file.readChunk","params":{{"workspaceId":"{ws_id}","path":"/etc/passwd","offset":0,"length":16}}}}"#,
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32603), "{resp}");
+    }
+
+    // Control: the same ops against a real rooted workspace succeed, so the
+    // rejections above are the empty-root guard, not a broken file path.
+    let rooted = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-failclosed-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    std::fs::write(root.join("ok.txt"), "ok").expect("write fixture");
+    let mut w = fixture_workspace(&rooted);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.read","params":{{"workspaceId":"{}","path":"ok.txt"}}}}"#,
+        rooted.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"], serde_json::json!("ok"), "{resp}");
+
+    srv.ws.stop().await;
+}
+
 /// `file.attachmentUpload.begin` / `.chunk` / `.commit` / `.abort` (§5.9,
 /// v6.16): the staged chunked attachment upload lifecycle over the real WSS
 /// transport. A two-chunk payload is staged and committed; the commit result
