@@ -3979,8 +3979,8 @@ impl Services {
             .get_agent_session(&agent_id)
             .await
             .ok()
-            .map(|s| (s.workspace_id, s.name));
-        let session_workspace_id = session_meta.as_ref().map(|(ws, _)| ws.clone());
+            .map(|s| (s.workspace_id, s.name, s.parent_agent_id));
+        let session_workspace_id = session_meta.as_ref().map(|(ws, _, _)| ws.clone());
         if let (Some(ws), Some(session_ws)) = (workspace_id.as_ref(), session_workspace_id.as_ref())
         {
             if session_ws != ws {
@@ -4039,7 +4039,17 @@ impl Services {
         // Drop the deleted agent's event subscriptions (monorepo#937): the
         // wake target is gone, so matching/batching for it is pure leak.
         self.remove_event_subscriptions_for_agent(&agent_id).await;
-        if let Some((workspace_id, agent_name)) = session_meta {
+        if let Some((workspace_id, agent_name, parent_agent_id)) = session_meta {
+            // intent-hq/monorepo#3906: the session row is already deleted, so
+            // the watch-wake label pass cannot resolve the delegation parent
+            // from the store — stamp it on the event (present only for
+            // delegated agents, mirroring the `agent:failed` `parentAgentId?`
+            // enrichment) so a genuine child's deletion wake still renders
+            // "Child agent".
+            let mut data = json!({ "agentId": agent_id.0, "agentName": agent_name });
+            if let Some(parent) = parent_agent_id {
+                data["parentAgentId"] = json!(parent.0);
+            }
             crate::publish_event(
                 self.event_bus.as_ref(),
                 intent_store::NewEvent {
@@ -4051,7 +4061,7 @@ impl Services {
                     correlation_id: None,
                     parent_event_id: None,
                     metadata: None,
-                    data: json!({ "agentId": agent_id.0, "agentName": agent_name }),
+                    data,
                 },
             )
             .await;
@@ -10043,6 +10053,10 @@ impl Services {
         // the live runtime-turn subset (`is_active`); unsettled also includes
         // idle children waiting on hooks or other background work. The legacy
         // running preserves the existing in-flight-status count. Fails open.
+        // intent-hq/monorepo#3906 (investigated): all three counters are
+        // scoped to rows whose `parent_agent_id` IS this agent — watched
+        // non-child peers (`agent.watch` targets) are NEVER included; they
+        // surface only in `agent_watches` above.
         let child_counts = self
             .store
             .count_child_agents(agent_id)

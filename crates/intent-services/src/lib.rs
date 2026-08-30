@@ -5603,6 +5603,32 @@ impl Services {
                 .to_string()
         });
         let watches = self.find_watches_for_child(child_id);
+        // intent-hq/monorepo#3906: the wake label must reflect the genuine
+        // delegation relationship, not the watch itself — a watch on a
+        // non-child (top-level peer, SUB-1 send target) renders "Watched
+        // agent". Resolve the settling agent's session `parentAgentId` once
+        // for the whole pass, preferring an event-carried `parentAgentId`
+        // stamp: the ordinary `agent.delete` path deletes the session row
+        // BEFORE publishing `agent:deleted`, so the store lookup misses there
+        // and the emit stamps the parent on the event instead (PR #1591
+        // review). When both are absent (session purged, no stamp) this fails
+        // open to `None`, labeling every watcher "Watched agent".
+        let genuine_parent: Option<AgentId> = if watches.is_empty() {
+            None
+        } else if let Some(parent) = event
+            .data
+            .get("parentAgentId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            Some(AgentId::from(parent))
+        } else {
+            self.store
+                .get_agent_session_summary(child_id)
+                .await
+                .ok()
+                .and_then(|s| s.parent_agent_id)
+        };
         // monorepo#1016: best-effort stall detection — an agent:idle with no
         // completion report while the child's assigned task note is still
         // incomplete gets its wake annotated (text + metadata). Store lookup
@@ -5776,6 +5802,9 @@ impl Services {
         let mut ungrouped_delivery_failed = false;
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
+            // intent-hq/monorepo#3906: "Child agent" only when this watcher
+            // is the settling agent's genuine delegation parent.
+            let child_of_recipient = genuine_parent.as_ref() == Some(&watch.parent_agent_id);
             if let Some(gid) = watch.group_id.clone() {
                 // Idle-visibility deferral: a hook-waiting OR agent-waiting
                 // idle is NOT settlement — the child will run again when a
@@ -5820,6 +5849,7 @@ impl Services {
                             &active_hooks,
                             &active_pr_monitors,
                             true,
+                            child_of_recipient,
                             &mut ungrouped_delivery_failed,
                         )
                         .await;
@@ -5940,7 +5970,8 @@ impl Services {
                     // machine-readably (`watchStillArmed: true`,
                     // monorepo#2060, mirroring the hook wakes'
                     // `hookStillActive` flag).
-                    let wake = format_completion_wake(child_id, event, None, false);
+                    let wake =
+                        format_completion_wake(child_id, event, None, false, child_of_recipient);
                     let mut metadata = build_event_notification_metadata(&[event]);
                     metadata["watchStillArmed"] = serde_json::json!(true);
                     if let Err(e) = self
@@ -6013,6 +6044,7 @@ impl Services {
                         &active_hooks,
                         &active_pr_monitors,
                         false,
+                        child_of_recipient,
                         &mut ungrouped_delivery_failed,
                     )
                     .await;
@@ -6102,7 +6134,8 @@ impl Services {
             // The terminal wake carries the one-shot retirement contract. Its
             // stable id makes a crash retry idempotent while the persisted
             // watch remains armed as the recovery record.
-            let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
+            let wake =
+                format_completion_wake(child_id, event, stall.as_ref(), true, child_of_recipient);
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
             // Join the child's recorded flipped completions (consumed at
@@ -6309,6 +6342,7 @@ impl Services {
         active_hooks: &[serde_json::Value],
         active_pr_monitors: &[serde_json::Value],
         grouped: bool,
+        child_of_recipient: bool,
         ungrouped_delivery_failed: &mut bool,
     ) -> bool {
         // Marker read fails CLOSED (skip, watch stays armed): the advisory is
@@ -6341,6 +6375,7 @@ impl Services {
             active_hooks,
             active_pr_monitors,
             !grouped,
+            child_of_recipient,
         );
         let mut metadata = build_event_notification_metadata(&[event]);
         metadata["watchStillArmed"] = serde_json::json!(grouped);
@@ -11305,14 +11340,20 @@ pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
 /// note with the machine-readable `watchStillArmed` flag on the wake's
 /// `event_notification` metadata (monorepo#2060, the `hookStillActive`
 /// twin): `!watch_retired` there.
+///
+/// `child_of_recipient` — intent-hq/monorepo#3906: `true` only when the
+/// settling agent's session `parentAgentId` is the wake's recipient, which
+/// renders the "Child agent" label; a watched non-child (top-level peer,
+/// SUB-1 send target) renders "Watched agent" instead.
 pub(crate) fn format_completion_wake(
     child_id: &AgentId,
     event: &Event,
     stall: Option<&StallSuspicion>,
     watch_retired: bool,
+    child_of_recipient: bool,
 ) -> String {
     harness::latest().completion_wake(
-        &child_settlement_params(child_id, event, None, stall),
+        &child_settlement_params(child_id, event, None, stall, child_of_recipient),
         watch_retired,
     )
 }
@@ -11326,12 +11367,15 @@ pub(crate) fn format_completion_wake(
 /// to hear the genuine completion; `false` on the grouped `after_all` path
 /// says the grouped watch stays armed and the group still waits for the
 /// child's genuine settlement (no re-arm instruction).
+/// `child_of_recipient` picks the relationship label, same contract as
+/// [`format_completion_wake`] (intent-hq/monorepo#3906).
 pub(crate) fn format_monitoring_idle_advisory_wake(
     child_id: &AgentId,
     event: &Event,
     active_hooks: &[serde_json::Value],
     active_pr_monitors: &[serde_json::Value],
     watch_retired: bool,
+    child_of_recipient: bool,
 ) -> String {
     use std::fmt::Write as _;
     let label = event
@@ -11343,8 +11387,13 @@ pub(crate) fn format_monitoring_idle_advisory_wake(
             || child_id.0.clone(),
             |name| format!("{name} ({})", child_id.0),
         );
+    let relationship = if child_of_recipient {
+        "Child agent"
+    } else {
+        "Watched agent"
+    };
     let mut msg = format!(
-        "[WORKSPACE EVENTS] Child agent {label} is idle but still waiting on external monitoring — this is NOT its completion."
+        "[WORKSPACE EVENTS] {relationship} {label} is idle but still waiting on external monitoring — this is NOT its completion."
     );
     if !active_hooks.is_empty() {
         msg.push_str("\nActive background hooks:");
@@ -11402,6 +11451,7 @@ fn child_settlement_params<'a>(
     event: &'a Event,
     completion_report: Option<&'a str>,
     stall: Option<&'a StallSuspicion>,
+    child_of_recipient: bool,
 ) -> harness::ChildSettlementParams<'a> {
     let data_str = |key: &str| {
         event
@@ -11422,6 +11472,7 @@ fn child_settlement_params<'a>(
     });
     harness::ChildSettlementParams {
         child_id: &child_id.0,
+        child_of_recipient,
         agent_name: event
             .data
             .get("agentName")
@@ -11452,11 +11503,14 @@ pub(crate) fn format_group_child_line(
     completion_report: Option<&str>,
     stall: Option<&StallSuspicion>,
 ) -> String {
+    // Group child lines render no relationship label ("- {name} ({id}) …"),
+    // so `child_of_recipient` is inert here — pass `true` unconditionally.
     harness::latest().group_child_line(&child_settlement_params(
         child_id,
         event,
         completion_report,
         stall,
+        true,
     ))
 }
 

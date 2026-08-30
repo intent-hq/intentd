@@ -8736,7 +8736,9 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
         )
         .await;
         let text = serde_json::to_string(&conv["messages"]).unwrap_or_default();
-        if text.contains("[WORKSPACE EVENTS] Child agent") && text.contains(&target_id) {
+        // The target is not the coordinator's delegation child, so the SUB-1
+        // sender wake renders "Watched agent" (monorepo#3906).
+        if text.contains("[WORKSPACE EVENTS] Watched agent") && text.contains(&target_id) {
             delivered = true;
             break;
         }

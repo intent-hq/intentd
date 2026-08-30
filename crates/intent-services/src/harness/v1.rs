@@ -122,6 +122,18 @@ fn stall_suffix_text(task_title: &str, task_status: &str) -> String {
     )
 }
 
+/// The relationship label for a watch-delivered wake
+/// (intent-hq/monorepo#3906): "Child agent" only when the settling agent is
+/// a genuine child of the recipient; any other watched agent (a top-level
+/// peer, a non-child send target) is a "Watched agent".
+fn relationship_label(child_of_recipient: bool) -> &'static str {
+    if child_of_recipient {
+        "Child agent"
+    } else {
+        "Watched agent"
+    }
+}
+
 /// The kind-flavored attention verb (`requests a discussion` / `reports a
 /// blocker`) shared by the parent and watcher attention wakes.
 fn attention_verb(kind: &str) -> &str {
@@ -519,7 +531,8 @@ impl Harness for V1 {
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String {
         let kind = settlement_kind(params.event_type);
         let label = child_label(params);
-        let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
+        let relationship = relationship_label(params.child_of_recipient);
+        let mut msg = format!("[WORKSPACE EVENTS] {relationship} {label} {kind}.");
         let mut report_rendered = false;
         if let Some(report) = params.completion_report {
             let _ = write!(msg, " Report: {report}");

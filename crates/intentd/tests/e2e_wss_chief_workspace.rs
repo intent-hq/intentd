@@ -1012,7 +1012,9 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
         )
         .await;
         let text = serde_json::to_string(&resp["result"]["messages"]).unwrap_or_default();
-        if text.contains("[WORKSPACE EVENTS] Child agent") && text.contains(&child_id) {
+        // The watched agent was created directly (no delegation parent), so
+        // the wake renders "Watched agent" (monorepo#3906).
+        if text.contains("[WORKSPACE EVENTS] Watched agent") && text.contains(&child_id) {
             delivered = true;
             break;
         }
@@ -1419,8 +1421,8 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     // The target ids also appear in the registration tool-result JSON, so
     // match the exact `format_completion_wake` line per target — one
     // individual wake each is the immediate-mode contract.
-    let wake1 = format!("[WORKSPACE EVENTS] Child agent Target One ({t1_id}) completed.");
-    let wake2 = format!("[WORKSPACE EVENTS] Child agent Target Two ({t2_id}) completed.");
+    let wake1 = format!("[WORKSPACE EVENTS] Watched agent Target One ({t1_id}) completed.");
+    let wake2 = format!("[WORKSPACE EVENTS] Watched agent Target Two ({t2_id}) completed.");
     poll_conversation(&mut rpc, 500, &chief_id, "both immediate wakes", |m| {
         let text = serde_json::to_string(m).unwrap_or_default();
         (text.contains(&wake1) && text.contains(&wake2)).then_some(())
@@ -1607,7 +1609,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
 ///   expected targets, before any target settles,
 /// - exactly ONE aggregated `All 2 delegated child agent(s) settled
 ///   (completionStatus: completed)` wake lands in the chief transcript — and
-///   NO per-target `[WORKSPACE EVENTS] Child agent` immediate wakes,
+///   NO per-target `[WORKSPACE EVENTS] Watched agent` immediate wakes,
 /// - subscriptions AND delegation groups are drained after settlement.
 #[tokio::test]
 async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
@@ -1787,7 +1789,8 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
         "exactly ONE aggregated wake"
     );
     assert!(
-        !transcript_text.contains("[WORKSPACE EVENTS] Child agent"),
+        !transcript_text.contains("[WORKSPACE EVENTS] Watched agent")
+            && !transcript_text.contains("[WORKSPACE EVENTS] Child agent"),
         "after_all must not deliver per-target immediate wakes"
     );
     // The aggregated wake folds in one per-child line per target.
@@ -2546,7 +2549,7 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
                 "response": "old busy turn completed",
             },
             {
-                "ifPromptContains": "[WORKSPACE EVENTS] Child agent Chief Ask Target",
+                "ifPromptContains": "[WORKSPACE EVENTS] Watched agent Chief Ask Target",
                 "toolCall": {
                     "name": "workspace_api",
                     "arguments": { "code": relay_js, "summary": "Read target result and build Chief relay" },
@@ -2686,7 +2689,8 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
     assert!(ask_result["watch"]["results"][0]["subscriptionId"].is_string());
     assert_eq!(ask_result["send"]["workspaceId"], json!(target_ws));
 
-    let wake = format!("[WORKSPACE EVENTS] Child agent Chief Ask Target ({target_id}) completed.");
+    let wake =
+        format!("[WORKSPACE EVENTS] Watched agent Chief Ask Target ({target_id}) completed.");
     let transcript =
         poll_conversation(&mut rpc, 500, &chief_id, "Chief ask completion wake", |m| {
             let text = serde_json::to_string(m).ok()?;

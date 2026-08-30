@@ -72,6 +72,13 @@ pub(crate) struct TurnEnvelopeParams<'a> {
 pub(crate) struct ChildSettlementParams<'a> {
     /// The child's agent id (`agent-…`), always present.
     pub child_id: &'a str,
+    /// Whether the settling agent is a genuine child of the wake's recipient
+    /// (its session's `parentAgentId` == the watcher). `true` renders the
+    /// "Child agent" label; `false` — an explicit `agent.watch` on a peer,
+    /// or a SUB-1 sender watch on a non-child — renders "Watched agent"
+    /// (intent-hq/monorepo#3906). Group child lines never render the
+    /// relationship label, so the field is inert there.
+    pub child_of_recipient: bool,
     /// Resolved display name (event `agentName`, falling back to the event
     /// actor); `None` renders the bare id.
     pub agent_name: Option<&'a str>,
@@ -194,8 +201,10 @@ pub(crate) trait Harness: Send + Sync {
 
     // --- Completion / group / watch wakes (`lib.rs`, `agent_ops.rs`) ---
 
-    /// `[WORKSPACE EVENTS] Child agent {label} {kind}.` completion wake with
-    /// report/summary/error tail and the #2051 watch-retired notes.
+    /// `[WORKSPACE EVENTS] {Child|Watched} agent {label} {kind}.` completion
+    /// wake with report/summary/error tail and the #2051 watch-retired notes;
+    /// the relationship label follows `params.child_of_recipient`
+    /// (intent-hq/monorepo#3906).
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String;
     /// One `- {label} {kind}.…` per-child line of an `after_all` group wake,
     /// including the attention fold.
