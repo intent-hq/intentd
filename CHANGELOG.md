@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.25] - 2026-08-30
+
+### 🐛 Bug Fixes
+
+- Label watch wakes for non-child agents as 'Watched agent' ([#1591](https://github.com/intent-hq/intentd/pull/1591))
+
+
 ## [0.8.24] - 2026-08-30
 
 ### 🚀 Features
