@@ -5011,8 +5011,11 @@ impl Services {
     /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
     /// §5.30). With no `providerId` this is the backward-compatible auggie
     /// path — auggie CLI (JSON → plain-text fallback) with a success cache
-    /// served fresh for [`crate::model_catalog::MODELS_STALE_AFTER`] (probe
-    /// on miss, aged entry, or `forceRefresh`), degrading
+    /// served fresh for [`crate::model_catalog::MODELS_STALE_AFTER`]; an
+    /// aged entry is served immediately (labeled `stale`) while a refresh
+    /// probe runs in the background (stale-while-revalidate,
+    /// intent-hq/intent#3874), a blocking probe runs only on a true miss or
+    /// `forceRefresh`, degrading
     /// to an empty list (`source: "static"`) when the CLI is unavailable;
     /// `forceRefresh` skips the cache read. With a `providerId` the request
     /// goes through the generic per-provider cache
@@ -5105,7 +5108,7 @@ impl Services {
 
     /// [`Self::models_list_auggie_op`] with an injectable fetch and clock
     /// (the unit-test seam). Delegates all cache policy — fresh-window
-    /// serving, age-based re-probe,
+    /// serving, stale-while-revalidate background refresh,
     /// negative window, single-flight, last-good fallback — to
     /// [`crate::model_catalog::resolve_with_cache`] and only maps the
     /// resolved rows onto the shared internal shape. The caller removes the
