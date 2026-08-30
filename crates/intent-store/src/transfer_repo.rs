@@ -53,6 +53,11 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
     (
+        "agent_message_payload",
+        "message_id IN (SELECT id FROM agent_message WHERE agent_id IN \
+         (SELECT id FROM agent_session WHERE workspace_id = ?1))",
+    ),
+    (
         "agent_queue",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
@@ -489,9 +494,8 @@ fn bind_json_value<'q>(
     })
 }
 
-/// Minimal standard-alphabet base64 encode (BLOB columns only; keeps
-/// intent-store free of a base64 dependency for a path that in practice
-/// never fires — no transfer table declares a BLOB column today).
+/// Minimal standard-alphabet base64 encode (BLOB columns only — in practice
+/// `agent_message_payload.body`, the sole BLOB column on a transfer table).
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -611,6 +615,7 @@ mod tests {
             format!("INSERT INTO comment (id, thread_id, note_id, workspace_id, kind, content, author, author_type, anchor_json, created_at, updated_at) VALUES ('c-{ws}', 'th', 'n1', '{ws}', 'comment', 'hi', 'u', 'user', '{{}}', '{t}', '{t}')"),
             format!("INSERT INTO draft (workspace_id, agent_id, client_id, text, updated_at) VALUES ('{ws}', '{agent}', '{client}', 'd', '{t}')"),
             format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}')"),
+            format!("INSERT INTO agent_message_payload (message_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', 0, 'tool_result_output', 'none', X'7B7D')"),
             format!("INSERT INTO agent_queue (id, agent_id, position, payload, created_at) VALUES ('q-{ws}', '{agent}', 0, '{{}}', '{t}')"),
             format!("INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) VALUES ('{agent}', '{ws}', 'working', '{t}')"),
             format!("INSERT INTO agent_flipped_completion (agent_id, workspace_id, task_note_id, recorded_at) VALUES ('{agent}', '{ws}', 'n1', '{t}')"),
@@ -863,6 +868,7 @@ comment: id, thread_id, note_id, workspace_id, kind, content, author, author_typ
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes
 agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails
+agent_message_payload: message_id, block_ordinal, kind, encoding, body
 agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
 agent_flipped_completion: agent_id, workspace_id, task_note_id, recorded_at

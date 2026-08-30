@@ -35,6 +35,7 @@ mod metrics_repo;
 mod note_line_attribution_repo;
 mod note_repo;
 mod note_version_repo;
+mod payload_codec;
 mod pr_monitor_repo;
 mod sandbox_repo;
 mod script_repo;
@@ -66,6 +67,11 @@ pub use event_subscription_repo::PersistedEventSubscription;
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
+pub use payload_codec::{
+    decode_payload, encode_payload, PAYLOAD_COMPRESS_MIN_BYTES, PAYLOAD_ENCODING_NONE,
+    PAYLOAD_ENCODING_ZSTD, PAYLOAD_KIND_THUMBNAILS, PAYLOAD_KIND_TOOL_RESULT_OUTPUT,
+    PAYLOAD_KIND_TOOL_USE_INPUT,
+};
 pub use pr_monitor_repo::PrMonitorPollUpdate;
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
