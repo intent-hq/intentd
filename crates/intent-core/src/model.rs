@@ -4018,11 +4018,12 @@ pub enum HookState {
     Expired,
 }
 
-/// A background hook: a small agent-owned script the daemon runs periodically
-/// (fixed `delayMs` between runs) until it signals a dispatch, fails, is
-/// cancelled, or its TTL expires. Persisted to the `hook` table so schedules
-/// survive a daemon restart; the name length cap (≤50 chars) is enforced at
-/// the service layer.
+/// A background hook: a small agent-owned script the daemon runs on one of
+/// three schedule kinds — a fixed `delayMs` cadence, a recurring `cron`
+/// expression, or a one-shot `runAt` timestamp — until it signals a
+/// dispatch, fails, is cancelled, or its TTL expires. Persisted to the
+/// `hook` table so schedules survive a daemon restart; the name length cap
+/// (≤50 chars) is enforced at the service layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hook {
@@ -4031,7 +4032,16 @@ pub struct Hook {
     pub agent_id: AgentId,
     pub name: String,
     pub code: String,
+    /// Inter-run delay for the fixed-cadence kind; 0 for cron/runAt hooks.
     pub delay_ms: i64,
+    /// Cron expression (standard 5-field, evaluated in UTC) for the
+    /// recurring kind; `None` for delayMs/runAt hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// Exact one-shot fire time (RFC3339) for the runAt kind; `None` for
+    /// delayMs/cron hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<String>,
     pub state: HookState,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

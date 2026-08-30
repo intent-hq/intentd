@@ -6211,7 +6211,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.hook.schedule` / wire `hook.schedule`: register a background hook
     /// (an agent-owned scheduled script) after one immediate real run.
-    /// `params` carries `{ name, code, delayMs }`; `agent_id` is the owning
+    /// `params` carries `{ name, code }` plus exactly one schedule kind —
+    /// `delayMs` (fixed cadence), `cron` (recurring UTC expression), or
+    /// `runAt` (one-shot RFC3339 fire time); `agent_id` is the owning
     /// agent (the MCP caller). Returns the persisted hook on success.
     fn hook_schedule(
         &self,
@@ -6279,7 +6281,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `ws.hook.runNow` / wire `hook.runNow`: trigger an immediate run of an
-    /// active hook, resetting its inter-run timer.
+    /// active hook, resetting its inter-run timer. On a `runAt` hook the
+    /// triggered run IS the one-shot fire: the hook fires early and retires
+    /// (the one-shot contract is honored over the timestamp).
     fn hook_run_now(
         &self,
         workspace_id: WorkspaceId,
