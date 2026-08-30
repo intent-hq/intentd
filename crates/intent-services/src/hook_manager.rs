@@ -1733,7 +1733,17 @@ impl Services {
                     let next = if expired {
                         None
                     } else {
-                        hook_next_fire(hook).ok()
+                        match hook_next_fire(hook) {
+                            Ok(next) => Some(next),
+                            Err(e) => {
+                                tracing::warn!(
+                                    hook = %hook.hook_id.0,
+                                    error = %e,
+                                    "cron schedule exhausted; expiring hook"
+                                );
+                                None
+                            }
+                        }
                     };
                     let mut next_delay = None;
                     if let Some((next_run_at, sleep)) = next {
