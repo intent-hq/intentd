@@ -125,6 +125,9 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
         r["memoryBytes"].as_u64().unwrap() > 0,
         "memoryBytes > 0: {resp}"
     );
+    // Supervision probe (intent-hq/intent#3875): always present, and false
+    // here — the daemon was spawned by the test harness, not a sitter.
+    assert_eq!(r["updateSupported"], false, "updateSupported: {resp}");
 
     // host.status is the §5.14 capability probe, answered on the same UDS
     // connection with the resolved locality (UDS ⇒ local) and host fields.

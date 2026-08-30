@@ -54,6 +54,7 @@ impl FakeControl {
                     total_roots: 5,
                     failed_roots: 0,
                 }),
+                update_supported: true,
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
@@ -164,6 +165,10 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
     assert_eq!(local["host"]["hasDisplay"], true);
+    // Supervision probe (intent-hq/intent#3875): a plain boolean, always
+    // present, so a client can gate its update affordance without probing
+    // system.requestUpdate.
+    assert_eq!(local["updateSupported"], true);
 
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
@@ -206,6 +211,7 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         workspaces_disk_available_bytes: None,
         workspaces_disk_total_bytes: None,
         file_watch: None,
+        update_supported: false,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -235,6 +241,9 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert!(!obj.contains_key("workspacesDiskTotalBytes"));
     // Watcher registry not started yet ⇒ fileWatch is ABSENT, not null.
     assert!(!obj.contains_key("fileWatch"));
+    // Unsupervised daemon ⇒ updateSupported is PRESENT and false — a plain
+    // boolean, never absent or null.
+    assert_eq!(v["updateSupported"], false);
 }
 
 /// The descendant-tree fields ride `system.status` so a debug

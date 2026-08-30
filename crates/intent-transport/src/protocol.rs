@@ -295,13 +295,20 @@
 //! updates now" signal), returning `{ ok: true }`; a daemon that is not
 //! sitter-supervised (missing/stale pidfile, or a platform without unix
 //! signals) gets `-32603` with the reason. Method catalog grows by one
-//! fast-path method — 297 router methods, 337 total.
+//! fast-path method — 297 router methods, 337 total. Version 8.7 adds the
+//! always-present `updateSupported` boolean result field to `system.status`
+//! (additive; §5.7, intent-hq/intent#3875): true exactly when the daemon is
+//! currently sitter-supervised — the same pidfile + parent/name verification
+//! `system.requestUpdate` performs, evaluated signal-free at read time — so
+//! a client can gate its update affordance without probing
+//! `system.requestUpdate`; always `false` on platforms without unix signals.
+//! No method-catalog change — 297 router methods, 337 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "8.6";
+pub const PROTOCOL_VERSION: &str = "8.7";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
