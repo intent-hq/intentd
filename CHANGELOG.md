@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.24] - 2026-08-30
+
+### 🚀 Features
+
+- *(store)* Heavy-payload side table for agent_message ([#1588](https://github.com/intent-hq/intentd/pull/1588))
+
+
 ## [0.8.23] - 2026-08-30
 
 ### 🚀 Features
