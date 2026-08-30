@@ -1161,7 +1161,7 @@ fn validate_row_scope(
         for row in objects {
             let ok = match table.as_str() {
                 "workspace" => field(row, "id") == workspace_id.0,
-                "agent_message" | "agent_queue" => {
+                "agent_message" | "agent_message_payload" | "agent_queue" => {
                     session_ids.contains(field(row, "agent_id").as_str())
                 }
                 "completion_watch" => {
