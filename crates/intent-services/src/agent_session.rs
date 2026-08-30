@@ -1860,6 +1860,12 @@ impl Services {
         owns_slot: bool,
     ) -> Option<String> {
         let block_count = live.blocks.len();
+        // A partial tail can already carry proposal blocks (the interrupt
+        // landed after the propose tool call): capture their ids BEFORE the
+        // blocks move into the persisted row, so the flushed row feeds the
+        // same stored-on-write pending-proposals recording as a normal turn
+        // end (PROTOCOL §5.5).
+        let proposal_ids = crate::tool_block::proposal_ids_in(&live.blocks);
         let mut metadata = json!({
             "interrupted": true,
             "stopReason": "interrupted",
@@ -1910,6 +1916,19 @@ impl Services {
                         None,
                     )
                     .await;
+                    // The flushed partial row is this turn's durable
+                    // assistant message: record any proposal blocks it
+                    // carries exactly as the normal turn-end persist would,
+                    // so an interrupted turn's proposals stay discoverable.
+                    if !proposal_ids.is_empty() {
+                        self.record_pending_proposals(
+                            &session.workspace_id,
+                            agent_id,
+                            &live.message_id,
+                            &proposal_ids,
+                        )
+                        .await;
+                    }
                 }
                 if owns_slot {
                     self.clear_live_turn(agent_id);

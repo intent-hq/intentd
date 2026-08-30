@@ -7041,6 +7041,70 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
     );
 }
 
+/// A partial tail flushed at interruption can already carry a proposal block
+/// (the interrupt landed after the propose tool call): the flush records its
+/// `{proposalId, messageId}` entry into the session's pending-proposals list
+/// exactly as a normal turn-end persist would, so an interrupted turn's
+/// proposal stays discoverable through the `AgentLite` projection.
+#[tokio::test]
+async fn interrupt_flush_records_pending_proposals_from_the_partial_tail() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+
+    let proposal = json!({
+        "kind": "settings-change",
+        "applyToolCallId": "tc-flush-1",
+        "preview": { "title": "Update Setting" },
+        "payload": { "key": "k", "value": "v" },
+    });
+    let blocks = vec![
+        json!({ "id": "m1:0", "type": "text", "text": "Proposing… " }),
+        json!({
+            "type": "resource",
+            "id": "m1:1",
+            "resource": {
+                "uri": "intent-proposal://settings-change/tc-flush-1",
+                "name": "Update Setting",
+                "mimeType": "application/vnd.intent.proposal+json",
+                "text": serde_json::to_string(&proposal).unwrap(),
+            }
+        }),
+    ];
+    let live = super::LiveTurn {
+        message_id: "m1".to_string(),
+        blocks,
+        final_text_block_open: false,
+        last_activity_at: "2026-01-01T00:00:00Z".to_string(),
+        last_activity_emit: None,
+        flush_pending: false,
+        flush_failed: false,
+    };
+    let flushed = services
+        .flush_partial_turn_on_interruption(
+            &agent_id,
+            live,
+            super::InterruptReason::UserStop,
+            None,
+            true,
+        )
+        .await;
+    assert_eq!(flushed.as_deref(), Some("m1"), "the partial row is durable");
+
+    let session = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.proposal_id.as_str(), p.message_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("tc-flush-1", "m1")],
+        "the flushed tail's proposal is recorded as pending"
+    );
+}
+
 /// The abandoned mark must not widen either pin-respecting clear
 /// ([`LiveTurn::flush_failed`]'s contract): the aborted worker's
 /// [`LiveTurnGuard`] drop can run AFTER the flush gave up — `worker.abort()`

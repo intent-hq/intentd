@@ -28208,6 +28208,134 @@ async fn record_pending_proposals_error_paths_leave_metadata_intact() {
     assert_eq!(session.pending_proposals()[0].proposal_id, "tc-1");
 }
 
+/// `agent.replaceMessages` re-mints every row id, so surviving
+/// pending-proposal entries are remapped onto the newest post-swap assistant
+/// row still carrying their proposal block; entries whose blocks are gone
+/// drop, and blocks NOT already pending are never re-added (resolution state
+/// survives the swap).
+#[tokio::test]
+async fn agent_replace_messages_reconciles_pending_proposals() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Swapper").await;
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-1"), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-1".to_string()])
+            .await
+    );
+
+    // Swap keeps tc-1's block and introduces a tc-2 block that was never
+    // recorded (e.g. it was already resolved before the swap).
+    let r = svc
+        .agent_replace_messages_op(
+            id.clone(),
+            json!([
+                { "role": "user", "contentBlocks": [{ "type": "text", "text": "u0" }] },
+                { "role": "assistant", "contentBlocks": proposal_blocks("tc-1") },
+                { "role": "assistant", "contentBlocks": proposal_blocks("tc-2") },
+            ]),
+        )
+        .await
+        .expect("replace");
+    let new_carrier = r["messages"][1]["id"].as_str().expect("new id").to_string();
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(pending.len(), 1, "tc-2 was not pending and is not re-added");
+    assert_eq!(pending[0].proposal_id, "tc-1");
+    assert_eq!(
+        pending[0].message_id, new_carrier,
+        "entry remapped to the re-minted carrier row"
+    );
+
+    // A second swap that drops tc-1's block empties the list — the proposal
+    // is no longer recoverable from the transcript.
+    svc.agent_replace_messages_op(
+        id.clone(),
+        json!([
+            { "role": "user", "contentBlocks": [{ "type": "text", "text": "u1" }] },
+        ]),
+    )
+    .await
+    .expect("replace again");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(session.pending_proposals().is_empty());
+}
+
+/// `agent.editAndRegenerate` truncation re-mints the kept rows and drops the
+/// rest: a pending entry whose carrier survives is remapped to its new row
+/// id; one whose carrier was truncated away is dropped.
+#[tokio::test]
+async fn agent_edit_truncate_reconciles_pending_proposals() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Truncator").await;
+    let u0 = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "u0" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append u0");
+    let a1 = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-keep"), &now_iso())
+        .await
+        .expect("append a1");
+    let u1 = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "u1" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append u1");
+    let a2 = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-drop"), &now_iso())
+        .await
+        .expect("append a2");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &a1.id, &["tc-keep".to_string()])
+            .await
+    );
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &a2.id, &["tc-drop".to_string()])
+            .await
+    );
+    let _ = u0;
+
+    // Truncate at u1: keeps [u0, a1] under fresh row ids; drops u1 + a2.
+    let removed = svc
+        .agent_edit_truncate_op(&id, &u1.id)
+        .await
+        .expect("truncate");
+    assert_eq!(removed, 2);
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let new_carrier = &messages[1].id;
+    assert_ne!(new_carrier, &a1.id, "kept rows are re-minted");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.proposal_id.as_str(), p.message_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("tc-keep", new_carrier.as_str())],
+        "surviving entry remapped, truncated-away entry dropped"
+    );
+}
+
 /// Pre-upgrade fallback coverage: these rows are appended straight through the
 /// store, so the session never gets a pending-questions marker and
 /// `question_hold_active` exercises the legacy transcript tail walk (the
