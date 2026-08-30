@@ -2822,8 +2822,22 @@ async fn batch_content_cols_and_payload_rows(
     Ok(out)
 }
 
-/// Insert one message's prepared `agent_message_payload` rows inside the
-/// caller's write transaction (the message row must already exist — FK).
+/// Upsert SQL for one `agent_message_payload` row. `ON CONFLICT DO UPDATE`
+/// (not plain INSERT) so a pre-staged row (0109, intent-hq/intent#3884
+/// part 2) is overwritten rather than a constraint violation: mid-turn
+/// re-staging of a re-patched block, and a finalizing append whose content
+/// still carries a heavy body that was also staged, both land on an existing
+/// key. The 0109 stats UPDATE trigger keeps `conversation_bytes` balanced
+/// across the overwrite. One-shot appends never conflict (fresh message id,
+/// orphans reaped at open), so this is a no-op for them.
+const PAYLOAD_UPSERT_SQL: &str = "INSERT INTO agent_message_payload \
+     (message_id, agent_id, block_ordinal, kind, encoding, body) \
+     VALUES (?,?,?,?,?,?) \
+     ON CONFLICT(message_id, block_ordinal, kind) \
+     DO UPDATE SET encoding = excluded.encoding, body = excluded.body";
+
+/// Insert (upsert, see [`PAYLOAD_UPSERT_SQL`]) one message's prepared
+/// `agent_message_payload` rows inside the caller's write transaction.
 async fn insert_payload_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message_id: &str,
@@ -2831,20 +2845,16 @@ async fn insert_payload_rows(
     rows: &[crate::message_payload::PayloadRow],
 ) -> Result<()> {
     for row in rows {
-        sqlx::query(
-            "INSERT INTO agent_message_payload \
-             (message_id, agent_id, block_ordinal, kind, encoding, body) \
-             VALUES (?,?,?,?,?,?)",
-        )
-        .bind(message_id)
-        .bind(agent_id)
-        .bind(row.block_ordinal)
-        .bind(row.kind)
-        .bind(row.encoding)
-        .bind(&row.body)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| Error::Internal(format!("insert message payload failed: {e}")))?;
+        sqlx::query(PAYLOAD_UPSERT_SQL)
+            .bind(message_id)
+            .bind(agent_id)
+            .bind(row.block_ordinal)
+            .bind(row.kind)
+            .bind(row.encoding)
+            .bind(&row.body)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Error::Internal(format!("insert message payload failed: {e}")))?;
     }
     Ok(())
 }
@@ -3159,6 +3169,142 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         created_at: &str,
     ) -> Result<AgentMessage> {
+        self.append_agent_message_inner(agent_id, id, role, content, metadata, created_at, false)
+            .await
+    }
+
+    /// Stage one completed content block's heavy payload into
+    /// `agent_message_payload` BEFORE the owning `agent_message` envelope row
+    /// exists (0109, intent-hq/intent#3884 part 2) — the envelope lands once,
+    /// at turn end, under the `message_id` minted at turn start, via
+    /// [`Store::append_agent_message_prestaged`], which adopts the staged
+    /// rows. Returns the block's placeholder form (the shared slim-projection
+    /// preview + `*Truncated`/`*Bytes` flags) when a body was staged — the
+    /// caller MUST substitute it at `block_ordinal` in its in-memory content
+    /// so the finalizing append writes only the delta — or `None` when the
+    /// block carries no over-threshold heavy body (nothing staged; keep the
+    /// block as-is). Re-staging the same block (a re-patched tool result)
+    /// upserts the row in place. The `agent_session` row must exist (FK).
+    /// Staged rows are invisible to every read path until the envelope adopts
+    /// them; if the turn never finalizes they are deleted by
+    /// [`Store::delete_prestaged_agent_message_payloads`] (in-process abort)
+    /// or reaped at [`Store::open`] (daemon died mid-turn).
+    ///
+    /// Extraction + compression of a multi-MB body is CPU-bound and runs on a
+    /// blocking thread, mirroring the one-shot append path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if encoding the extracted body or the upsert
+    /// fails (including the 0109 guard trigger, when an envelope with this id
+    /// already exists under a different agent).
+    pub async fn prestage_agent_message_payload(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        block_ordinal: usize,
+        block: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        if !crate::message_payload::block_needs_extraction(block) {
+            return Ok(None);
+        }
+        let owned = block.clone();
+        let ordinal = i64::try_from(block_ordinal).unwrap_or(i64::MAX);
+        let (slim, row) = tokio::task::spawn_blocking(move || {
+            crate::message_payload::extract_block_payload(owned, ordinal)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("payload extraction task failed: {e}")))??;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        sqlx::query(PAYLOAD_UPSERT_SQL)
+            .bind(message_id)
+            .bind(&agent_id.0)
+            .bind(row.block_ordinal)
+            .bind(row.kind)
+            .bind(row.encoding)
+            .bind(&row.body)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("prestage message payload failed: {e}")))?;
+        Ok(Some(slim))
+    }
+
+    /// [`Store::append_agent_message_with_id`] for a turn that pre-staged its
+    /// heavy payloads via [`Store::prestage_agent_message_payload`] (0109,
+    /// intent-hq/intent#3884 part 2). `content` is the turn's final content
+    /// WITH the placeholder blocks returned by the prestage calls substituted
+    /// in: placeholder blocks extract nothing (their rows are already staged
+    /// under `id` and are adopted by the envelope INSERT), so this writes
+    /// only the delta — the slim content column plus any rows not staged
+    /// mid-turn (late heavy blocks, the thumbnails map). Staged rows the
+    /// final content no longer references (a block re-patched below the
+    /// threshold, or removed) are deleted in the same transaction — a stale
+    /// row would otherwise be spliced over the inline field on hydration. A
+    /// placeholder block with no staged row is logged and left as-is (the
+    /// heavy body is unrecoverable; reads serve the stored preview).
+    ///
+    /// The returned [`AgentMessage`] echoes `content` as passed (placeholders
+    /// included); full-fidelity read paths hydrate the staged bodies back,
+    /// byte-identical to a one-shot append of the pre-extraction content.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if allocating the next `seq`, encoding the
+    /// message/metadata, reading the staged rows, or the insert transaction
+    /// fails.
+    pub async fn append_agent_message_prestaged(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        role: &str,
+        content: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+        created_at: &str,
+    ) -> Result<AgentMessage> {
+        self.append_agent_message_inner(agent_id, id, role, content, metadata, created_at, true)
+            .await
+    }
+
+    /// Delete `message_id`'s pre-staged `agent_message_payload` rows after an
+    /// in-process turn failure (the envelope will never be appended). Guarded:
+    /// a no-op returning 0 when the owning `agent_message` row exists — a
+    /// persisted message's payload rows are only removed by its own delete
+    /// cascade. Rows staged by a turn the daemon died in (no chance to call
+    /// this) are reaped at [`Store::open`] instead. Returns the number of
+    /// rows deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_prestaged_agent_message_payloads(&self, message_id: &str) -> Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM agent_message_payload WHERE message_id = ? \
+             AND NOT EXISTS (SELECT 1 FROM agent_message WHERE id = ?)",
+        )
+        .bind(message_id)
+        .bind(message_id)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("delete prestaged payloads failed: {e}")))?
+        .rows_affected())
+    }
+
+    /// Shared body of [`Store::append_agent_message_with_id`] (one-shot) and
+    /// [`Store::append_agent_message_prestaged`] (`prestaged` — adopt rows
+    /// staged mid-turn under `id` and reconcile stale ones).
+    #[allow(clippy::too_many_arguments)]
+    async fn append_agent_message_inner(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        role: &str,
+        content: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+        created_at: &str,
+        prestaged: bool,
+    ) -> Result<AgentMessage> {
         let seq: i64 = sqlx::query(
             "SELECT COALESCE(MAX(seq), -1) + 1 AS next FROM agent_message WHERE agent_id = ?",
         )
@@ -3191,9 +3337,56 @@ impl Store {
         // extraction/compression and thumbnail generation are CPU-bound and
         // run on blocking threads.
         let (content_json, payload_rows) = content_col_and_payload_rows(content).await?;
+        // Prestaged reconciliation (0109): staged rows the final content no
+        // longer references — not a placeholder block's key and not about to
+        // be (re-)inserted — are stale (the block was re-patched below the
+        // threshold or removed) and must go, or hydration would splice the
+        // outdated body over the inline field. A placeholder without its
+        // staged row degrades to the stored preview; WARN (the mid-turn
+        // staging writer is this same agent's serialized turn, so the gap is
+        // a caller bug or a crossed reap, never a race).
+        let stale_keys: Vec<(i64, String)> = if prestaged {
+            let staged: Vec<(i64, String)> = sqlx::query(
+                "SELECT block_ordinal, kind FROM agent_message_payload WHERE message_id = ?",
+            )
+            .bind(id)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("read prestaged payload keys failed: {e}")))?
+            .iter()
+            .map(|r| (r.get("block_ordinal"), r.get("kind")))
+            .collect();
+            let placeholders = crate::message_payload::placeholder_keys(content);
+            for (ordinal, kind) in &placeholders {
+                if !staged.iter().any(|(o, k)| o == ordinal && k == kind)
+                    && !payload_rows
+                        .iter()
+                        .any(|r| r.block_ordinal == *ordinal && &r.kind == kind)
+                {
+                    tracing::warn!(
+                        message_id = id,
+                        block_ordinal = ordinal,
+                        kind,
+                        "placeholder block has no pre-staged payload row; \
+                         reads will serve the stored preview"
+                    );
+                }
+            }
+            staged
+                .into_iter()
+                .filter(|(o, k)| {
+                    !placeholders.iter().any(|(po, pk)| po == o && pk == k)
+                        && !payload_rows
+                            .iter()
+                            .any(|r| r.block_ordinal == *o && r.kind == k)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let sql =
             format!("INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
-        if preview_update.is_none() && payload_rows.is_empty() {
+        if preview_update.is_none() && payload_rows.is_empty() && stale_keys.is_empty() {
             sqlx::query(&sql)
                 .bind(id)
                 .bind(&agent_id.0)
@@ -3234,6 +3427,20 @@ impl Store {
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
                 insert_payload_rows(&mut tx, id, &agent_id.0, &payload_rows).await?;
+                for (ordinal, kind) in &stale_keys {
+                    sqlx::query(
+                        "DELETE FROM agent_message_payload \
+                         WHERE message_id = ? AND block_ordinal = ? AND kind = ?",
+                    )
+                    .bind(id)
+                    .bind(ordinal)
+                    .bind(kind)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("delete stale prestaged payload failed: {e}"))
+                    })?;
+                }
                 if let (Some((_, value)), Some(update_sql)) = (&preview_update, &update_sql) {
                     sqlx::query(update_sql)
                         .bind(value.as_str())

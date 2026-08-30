@@ -280,6 +280,22 @@ impl Store {
             )),
             _ => Error::Internal(format!("migrations failed: {e}")),
         })?;
+        // Reap `agent_message_payload` rows pre-staged (0109,
+        // intent-hq/intent#3884 part 2) by a turn that died with the daemon
+        // before appending its envelope. Only valid at open, before any turn
+        // runs — a live turn's staged rows are envelope-less by design. The
+        // 0109 stats delete trigger rebalances `conversation_bytes`.
+        let reaped = sqlx::query(
+            "DELETE FROM agent_message_payload WHERE NOT EXISTS \
+             (SELECT 1 FROM agent_message m WHERE m.id = agent_message_payload.message_id)",
+        )
+        .execute(&write_pool)
+        .await
+        .map_err(|e| Error::Internal(format!("orphaned payload sweep failed: {e}")))?
+        .rows_affected();
+        if reaped > 0 {
+            tracing::info!(reaped, "reaped orphaned pre-staged agent_message_payload rows");
+        }
         Ok(Self {
             write_pool,
             read_pool,
