@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.21] - 2026-08-30
+
+### 🐛 Bug Fixes
+
+- *(services)* Resolve symlinks before enforcing file.* and host.exec workspace containment ([#1575](https://github.com/intent-hq/intentd/pull/1575))
+
+
 ## [0.8.20] - 2026-08-29
 
 ### 🚀 Features
