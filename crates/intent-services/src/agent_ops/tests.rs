@@ -4075,6 +4075,8 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
         .get_agent_session(&chief)
         .await
         .expect("Chief session");
+    // The ask target is not the Chief's delegation child, so the wake
+    // renders the "Watched agent" relationship label (monorepo#3906).
     let wakes = chief_session
         .messages
         .iter()
@@ -4082,7 +4084,7 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
             message
                 .content
                 .to_string()
-                .contains("[WORKSPACE EVENTS] Child agent")
+                .contains("[WORKSPACE EVENTS] Watched agent")
         })
         .count();
     assert_eq!(wakes, 1, "one ask must produce exactly one completion wake");
@@ -16938,6 +16940,108 @@ async fn monitoring_idle_advisory_metadata_flags() {
         .expect("monitor list");
     assert_eq!(monitors.len(), 1);
     assert_eq!(monitors[0]["prNumber"], json!(7));
+}
+
+/// intent-hq/monorepo#3906: a completion wake for a watched agent that is
+/// NOT the watcher's delegation child renders "Watched agent", while a
+/// genuine child renders "Child agent" — the label follows the session's
+/// `parent_agent_id`, not the watch itself.
+#[tokio::test]
+async fn completion_wake_labels_non_child_as_watched_agent() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let child = create_agent(&svc, &ws, "Kid").await;
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &watcher,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        peer.clone(),
+        None,
+    )
+    .expect("watch peer");
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        child.clone(),
+        None,
+    )
+    .expect("watch child");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &peer,
+        json!({ "agentId": peer.0, "agentName": "Peer" }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "agentName": "Kid" }),
+    ))
+    .await;
+
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains(&format!("Watched agent Peer ({})", peer.0)),
+        "non-child completion wake must say Watched agent: {text}"
+    );
+    assert!(
+        text.contains(&format!("Child agent Kid ({})", child.0)),
+        "genuine child completion wake must keep Child agent: {text}"
+    );
+}
+
+/// intent-hq/monorepo#3906: the externally-waiting advisory wake gets the
+/// same relationship-aware label — "Watched agent" for a non-child target,
+/// "Child agent" for a genuine child.
+#[tokio::test]
+async fn monitoring_idle_advisory_labels_non_child_as_watched_agent() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    seed_active_hook(&svc, &ws, &peer, "ci-poll").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        peer.clone(),
+        None,
+    )
+    .expect("watch peer");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &peer,
+        json!({ "agentId": peer.0, "agentName": "Peer" }),
+    ))
+    .await;
+
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains(&format!("Watched agent Peer ({})", peer.0)),
+        "non-child advisory wake must say Watched agent: {text}"
+    );
+    assert!(
+        !text.contains("Child agent"),
+        "non-child advisory wake must not say Child agent: {text}"
+    );
 }
 
 /// The advisory is scoped to PURE hook-/monitor-waiting deferral: an idle
@@ -33334,6 +33438,9 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     assert_eq!(v["queuedMessages"], json!(2));
     assert_eq!(v["eventSubscriptions"], json!(1));
     assert_eq!(v["activeSubAgents"], json!(1));
+    // intent-hq/monorepo#3906: the sub-agent counters are parent-scoped —
+    // the watch on `other` (a non-child peer) rides `agentWatches` only and
+    // never inflates the unsettled/active/running counts.
     assert_eq!(v["unsettledSubAgents"], json!(1));
     assert_eq!(v["runningSubAgents"], json!(1));
     assert_eq!(v["pendingAttention"], json!("blocker"));

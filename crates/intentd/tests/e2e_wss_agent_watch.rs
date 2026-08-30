@@ -913,8 +913,9 @@ async fn boot_watch_lifecycle(script: &str, budget: Budget) -> WatchLifecycle {
     }
 }
 
-/// WATCH-2a: the target's idle completion wakes the watcher ("Child agent …
-/// completed") and retires the watch (deliver-once).
+/// WATCH-2a: the target's idle completion wakes the watcher ("Watched agent …
+/// completed" — the target is a peer, not the watcher's delegation child;
+/// monorepo#3906) and retires the watch (deliver-once).
 #[tokio::test]
 async fn agent_watch_wakes_on_target_idle_completion_over_wss() {
     let Some(script) = gate("WSS agent.watch idle-wake E2E") else {
@@ -936,7 +937,7 @@ async fn agent_watch_wakes_on_target_idle_completion_over_wss() {
         &mut fx.req_id,
         &fx.ws_id,
         &fx.watcher,
-        "Child agent WatchTarget",
+        "Watched agent WatchTarget",
         budget.step(60),
     )
     .await;
@@ -1154,9 +1155,10 @@ async fn agent_unwatch_stops_further_wakes_over_wss() {
     assert_eq!(baseline, after, "no wake may be delivered after unwatch");
 }
 
-/// WATCH-2d: the target's terminal failure wakes the watcher ("Child agent …
-/// failed") — the mock kills every attempt on the DIE marker, so the one-shot
-/// silent redrive is spent and the failure goes terminal.
+/// WATCH-2d: the target's terminal failure wakes the watcher ("Watched agent
+/// … failed" — a peer target; monorepo#3906) — the mock kills every attempt
+/// on the DIE marker, so the one-shot silent redrive is spent and the
+/// failure goes terminal.
 #[tokio::test]
 async fn agent_watch_wakes_on_target_terminal_failure_over_wss() {
     let Some(script) = gate("WSS agent.watch failure-wake E2E") else {
@@ -1175,9 +1177,10 @@ async fn agent_watch_wakes_on_target_terminal_failure_over_wss() {
     assert_eq!(sent["success"], true, "target die turn accepted: {sent}");
     // The failure path includes a full silent-redrive cycle (kill + respawn +
     // re-prompt), so the window is generous. `format_completion_wake` renders
-    // an AGENT_FAILED completion as "Child agent <label> failed." — the
-    // `agent:failed` payload carries `agentName` (intent-hq/monorepo#2869), so
-    // the label is the session name, not the bare agent id.
+    // an AGENT_FAILED completion as "Watched agent <label> failed." for a
+    // non-child target — the `agent:failed` payload carries `agentName`
+    // (intent-hq/monorepo#2869), so the label is the session name, not the
+    // bare agent id.
     let text = await_conversation_contains(
         &mut fx.setup.rpc,
         &mut fx.req_id,
@@ -1188,7 +1191,7 @@ async fn agent_watch_wakes_on_target_terminal_failure_over_wss() {
     )
     .await;
     assert!(
-        text.contains("Child agent WatchTarget"),
+        text.contains("Watched agent WatchTarget"),
         "failure wake names the target by its session name: {text}"
     );
     // monorepo#2051: the terminal failure wake retired the watch and says so.
@@ -1378,7 +1381,7 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
         await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &coord, budget.step(60))
             .await;
     assert!(
-        !text.contains("Child agent"),
+        !text.contains("Watched agent") && !text.contains("Child agent"),
         "no completion wake may be delivered on the interim idle: {text}"
     );
     let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &coord, &middle).await;
@@ -1401,7 +1404,7 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
         &mut req_id,
         &ws_id,
         &coord,
-        "Child agent DeferMiddle",
+        "Watched agent DeferMiddle",
         budget.step(90),
     )
     .await;
@@ -1427,7 +1430,7 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
         req_id,
         &ws_id,
         &coord,
-        "Child agent DeferMiddle",
+        "Watched agent DeferMiddle",
     )
     .await;
     assert_eq!(wakes, 1, "exactly one completion wake for middle");
@@ -1552,7 +1555,7 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
     )
     .await;
     assert!(
-        !text.contains("Child agent"),
+        !text.contains("Watched agent") && !text.contains("Child agent"),
         "re-arm on an idle-but-waiting target must not fire synthetically: {text}"
     );
     let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &watcher, &middle).await;
@@ -1574,7 +1577,7 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
         &mut req_id,
         &ws_id,
         &watcher,
-        "Child agent RearmMiddle",
+        "Watched agent RearmMiddle",
         budget.step(90),
     )
     .await;
@@ -1605,7 +1608,7 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
         req_id,
         &ws_id,
         &watcher,
-        "Child agent RearmMiddle",
+        "Watched agent RearmMiddle",
     )
     .await;
     assert_eq!(wakes, 1, "exactly one completion wake for middle");
@@ -2074,7 +2077,7 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
     )
     .await;
     assert!(
-        !text.contains("Child agent"),
+        !text.contains("Watched agent") && !text.contains("Child agent"),
         "watch on a reported hook-waiting child must not fire instantly: {text}"
     );
     let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &watcher, &child).await;
@@ -2113,7 +2116,7 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
         &mut req_id,
         &ws_id,
         &watcher,
-        &format!("Child agent HookChild ({child})"),
+        &format!("Watched agent HookChild ({child})"),
         budget.step(90),
     )
     .await;
@@ -2148,7 +2151,7 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
         req_id,
         &ws_id,
         &watcher,
-        &format!("Child agent HookChild ({child})"),
+        &format!("Watched agent HookChild ({child})"),
     )
     .await;
     assert_eq!(wakes, 1, "exactly one completion wake for the hooked child");

@@ -10043,6 +10043,10 @@ impl Services {
         // the live runtime-turn subset (`is_active`); unsettled also includes
         // idle children waiting on hooks or other background work. The legacy
         // running preserves the existing in-flight-status count. Fails open.
+        // intent-hq/monorepo#3906 (investigated): all three counters are
+        // scoped to rows whose `parent_agent_id` IS this agent — watched
+        // non-child peers (`agent.watch` targets) are NEVER included; they
+        // surface only in `agent_watches` above.
         let child_counts = self
             .store
             .count_child_agents(agent_id)
