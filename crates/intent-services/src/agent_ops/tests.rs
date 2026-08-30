@@ -17014,7 +17014,17 @@ async fn monitoring_idle_advisory_labels_non_child_as_watched_agent() {
     let (_t, svc, ws) = setup().await;
     let watcher = create_agent(&svc, &ws, "Watcher").await;
     let peer = create_agent(&svc, &ws, "Peer").await;
+    let child = create_agent(&svc, &ws, "Kid").await;
     seed_active_hook(&svc, &ws, &peer, "ci-poll").await;
+    seed_active_hook(&svc, &ws, &child, "pr-poll").await;
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &watcher,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
 
     svc.register_completion_watch(
         &ws,
@@ -17025,11 +17035,27 @@ async fn monitoring_idle_advisory_labels_non_child_as_watched_agent() {
         None,
     )
     .expect("watch peer");
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        child.clone(),
+        None,
+    )
+    .expect("watch child");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
         &peer,
         json!({ "agentId": peer.0, "agentName": "Peer" }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "agentName": "Kid" }),
     ))
     .await;
 
@@ -17039,8 +17065,87 @@ async fn monitoring_idle_advisory_labels_non_child_as_watched_agent() {
         "non-child advisory wake must say Watched agent: {text}"
     );
     assert!(
-        !text.contains("Child agent"),
+        !text.contains(&format!("Child agent Peer ({})", peer.0)),
         "non-child advisory wake must not say Child agent: {text}"
+    );
+    assert!(
+        text.contains(&format!("Child agent Kid ({})", child.0)),
+        "genuine child advisory wake must keep Child agent: {text}"
+    );
+}
+
+/// intent-hq/monorepo#3906 (PR #1591 review): the ordinary `agent.delete`
+/// path deletes the session row BEFORE publishing `agent:deleted`, so the
+/// delivery pass cannot resolve the parent from the store — the emit stamps
+/// `parentAgentId` on the event instead, and a genuine child's deletion wake
+/// still renders "Child agent" while a peer's renders "Watched agent".
+#[tokio::test]
+async fn deletion_wake_keeps_child_agent_label_after_session_purge() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let child = create_agent(&svc, &ws, "Kid").await;
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &watcher,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        peer.clone(),
+        None,
+    )
+    .expect("watch peer");
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        child.clone(),
+        None,
+    )
+    .expect("watch child");
+
+    // Capture the REAL agent:deleted events the delete op publishes (post
+    // row-delete, parentAgentId stamped only for the genuine child) and run
+    // them through the delivery pass, mirroring the completion worker.
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_DELETED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_delete_op(peer.clone(), None)
+        .await
+        .expect("delete peer");
+    svc.agent_delete_op(child.clone(), None)
+        .await
+        .expect("delete child");
+    let mut handled = 0;
+    while handled < 2 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription closed");
+        for event in batch {
+            svc.handle_completion_event(&event).await;
+            handled += 1;
+        }
+    }
+
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains(&format!("Watched agent Peer ({})", peer.0)),
+        "non-child deletion wake must say Watched agent: {text}"
+    );
+    assert!(
+        text.contains(&format!("Child agent Kid ({})", child.0)),
+        "genuine child deletion wake must keep Child agent despite the purged session: {text}"
     );
 }
 

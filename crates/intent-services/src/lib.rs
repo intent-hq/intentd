@@ -5607,10 +5607,21 @@ impl Services {
         // delegation relationship, not the watch itself — a watch on a
         // non-child (top-level peer, SUB-1 send target) renders "Watched
         // agent". Resolve the settling agent's session `parentAgentId` once
-        // for the whole pass; a lookup failure (session already purged) fails
+        // for the whole pass, preferring an event-carried `parentAgentId`
+        // stamp: the ordinary `agent.delete` path deletes the session row
+        // BEFORE publishing `agent:deleted`, so the store lookup misses there
+        // and the emit stamps the parent on the event instead (PR #1591
+        // review). When both are absent (session purged, no stamp) this fails
         // open to `None`, labeling every watcher "Watched agent".
         let genuine_parent: Option<AgentId> = if watches.is_empty() {
             None
+        } else if let Some(parent) = event
+            .data
+            .get("parentAgentId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            Some(AgentId::from(parent))
         } else {
             self.store
                 .get_agent_session_summary(child_id)
