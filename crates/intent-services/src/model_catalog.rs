@@ -939,33 +939,23 @@ fn spawn_background_refresh<F>(
                 .acquire()
                 .await
                 .expect("refresh semaphore is never closed");
-            if let Ok(fetched) =
-                tokio::time::timeout(MODELS_BACKGROUND_REFRESH_TIMEOUT, fetch()).await
-            {
-                record_probe_outcome(
-                    &cache,
-                    &provider_id,
-                    &version_key,
-                    &fetched,
-                    outcome_ms(started),
-                );
-                fetched
-            } else {
-                let reason = format!(
-                    "model discovery for '{provider_id}' timed out after {}s",
-                    MODELS_BACKGROUND_REFRESH_TIMEOUT.as_secs()
-                );
-                cache.store_negative(
-                    &provider_id,
-                    &version_key,
-                    reason.clone(),
-                    outcome_ms(started),
-                );
-                ModelFetchResult {
+            let fetched = tokio::time::timeout(MODELS_BACKGROUND_REFRESH_TIMEOUT, fetch())
+                .await
+                .unwrap_or_else(|_| ModelFetchResult {
                     models: None,
-                    warning: Some(reason),
-                }
-            }
+                    warning: Some(format!(
+                        "model discovery for '{provider_id}' timed out after {}s",
+                        MODELS_BACKGROUND_REFRESH_TIMEOUT.as_secs()
+                    )),
+                });
+            record_probe_outcome(
+                &cache,
+                &provider_id,
+                &version_key,
+                &fetched,
+                outcome_ms(started),
+            );
+            fetched
         })
         .await;
         cache.finish_inflight(&provider_id, &version_key, &cell);
