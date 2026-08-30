@@ -213,7 +213,10 @@ pub(crate) fn placeholder_keys(content: &Value) -> Vec<(i64, &'static str)> {
         .iter()
         .enumerate()
         .filter_map(|(i, b)| {
-            let f = b.get("type").and_then(Value::as_str).and_then(heavy_field)?;
+            let f = b
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(heavy_field)?;
             (b.get(f.truncated_flag).and_then(Value::as_bool) == Some(true))
                 .then(|| (i64::try_from(i).unwrap_or(i64::MAX), f.kind))
         })

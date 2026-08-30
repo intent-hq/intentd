@@ -294,7 +294,10 @@ impl Store {
         .map_err(|e| Error::Internal(format!("orphaned payload sweep failed: {e}")))?
         .rows_affected();
         if reaped > 0 {
-            tracing::info!(reaped, "reaped orphaned pre-staged agent_message_payload rows");
+            tracing::info!(
+                reaped,
+                "reaped orphaned pre-staged agent_message_payload rows"
+            );
         }
         Ok(Self {
             write_pool,
