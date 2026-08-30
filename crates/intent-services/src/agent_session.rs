@@ -1860,6 +1860,12 @@ impl Services {
         owns_slot: bool,
     ) -> Option<String> {
         let block_count = live.blocks.len();
+        // A partial tail can already carry proposal blocks (the interrupt
+        // landed after the propose tool call): capture their ids BEFORE the
+        // blocks move into the persisted row, so the flushed row feeds the
+        // same stored-on-write pending-proposals recording as a normal turn
+        // end (PROTOCOL §5.5).
+        let proposal_ids = crate::tool_block::proposal_ids_in(&live.blocks);
         let mut metadata = json!({
             "interrupted": true,
             "stopReason": "interrupted",
@@ -1910,6 +1916,19 @@ impl Services {
                         None,
                     )
                     .await;
+                    // The flushed partial row is this turn's durable
+                    // assistant message: record any proposal blocks it
+                    // carries exactly as the normal turn-end persist would,
+                    // so an interrupted turn's proposals stay discoverable.
+                    if !proposal_ids.is_empty() {
+                        self.record_pending_proposals(
+                            &session.workspace_id,
+                            agent_id,
+                            &live.message_id,
+                            &proposal_ids,
+                        )
+                        .await;
+                    }
                 }
                 if owns_slot {
                     self.clear_live_turn(agent_id);
@@ -2756,6 +2775,12 @@ impl Services {
         // blocks (`ws.app.question.ask`) — computed BEFORE the append consumes
         // `blocks`, used for the pending-questions marker write below.
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        // Proposal ids carried by this turn's lifted proposal-resource blocks
+        // (both the registry/array path and the wrapped-echo path in
+        // `record_tool` land as persisted blocks) — computed BEFORE the
+        // append consumes `blocks`, used for the pending-proposals recording
+        // below (PROTOCOL §5.5).
+        let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
         // Sleep-induced turn failure (Task C): the turn died with a transient
         // upstream disconnect AND a detected host suspend overlapped its active
         // window `[turn_started, now]`. Enroll it as interrupted (so the wake
@@ -2951,6 +2976,15 @@ impl Services {
         // instead of relying on the dedup cache to stay silent.
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
+        }
+        // Stored-on-write pending-proposals recording (PROTOCOL §5.5): a
+        // proposal-bearing tail merges its `{ proposalId, messageId }`
+        // entries into the session's ordered pending set (dedupe by id,
+        // newest wins). A proposal-FREE turn leaves the list untouched —
+        // pendingness survives later turns until resolution.
+        if message_persisted && !proposal_ids.is_empty() {
+            self.record_pending_proposals(workspace_id, agent_id, &message_id, &proposal_ids)
+                .await;
         }
         // The turn's message is now durable: clear the live-turn slot so the next
         // `chat.subscribe` snapshot reflects the persisted message (not a stale
@@ -3562,6 +3596,9 @@ impl Services {
         let block_count = blocks.len();
         let preview_text_blocks = text_block_strings(&blocks);
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        // Same pre-append proposal-id scan as the prompt-turn persist
+        // (PROTOCOL §5.5, pending proposals).
+        let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
         // Empty-response classification (intent-hq/monorepo#3262): the wake
         // turn OPENED (a chunk/tool-call materialized content) but finalized
         // with nothing meaningful — whitespace-only text/thinking blocks, the
@@ -3619,6 +3656,12 @@ impl Services {
         // question-bearing tail moves the question-hold derivation.
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
+        }
+        // Same stored-on-write pending-proposals recording as the prompt-turn
+        // persist (PROTOCOL §5.5).
+        if message_persisted && !proposal_ids.is_empty() {
+            self.record_pending_proposals(workspace_id, agent_id, &message_id, &proposal_ids)
+                .await;
         }
         // Pin-respecting, same as the prompt-turn end above (monorepo#2110).
         self.clear_unpinned_live_turn(agent_id);

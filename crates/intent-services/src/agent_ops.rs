@@ -4886,6 +4886,12 @@ impl Services {
         // for entries a now-released hold parked.
         self.reconcile_pending_questions_marker(&session.workspace_id, &agent_id, &inserted)
             .await;
+        // Same re-mint hazard for the pending-proposals list: every entry's
+        // `messageId` names a pre-swap row id, so remap each entry to the
+        // newest post-swap assistant row still carrying its proposal block
+        // (dropping entries whose blocks are gone).
+        self.reconcile_pending_proposals(&session.workspace_id, &agent_id, &inserted)
+            .await;
         Ok(json!({ "success": true, "messages": inserted }))
     }
 
@@ -4972,6 +4978,12 @@ impl Services {
         // existing dangling-tolerant laxity.
         self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, &inserted)
             .await;
+        // Same re-mint hazard for the pending-proposals list (see
+        // `agent_replace_messages_op`): remap surviving entries onto the
+        // re-minted kept rows and drop entries whose carrying rows were
+        // truncated away.
+        self.reconcile_pending_proposals(&session.workspace_id, agent_id, &inserted)
+            .await;
         self.publish_agent_mutation_event(
             &session.workspace_id,
             agent_id,
@@ -4999,8 +5011,11 @@ impl Services {
     /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
     /// §5.30). With no `providerId` this is the backward-compatible auggie
     /// path — auggie CLI (JSON → plain-text fallback) with a success cache
-    /// served fresh for [`crate::model_catalog::MODELS_STALE_AFTER`] (probe
-    /// on miss, aged entry, or `forceRefresh`), degrading
+    /// served fresh for [`crate::model_catalog::MODELS_STALE_AFTER`]; an
+    /// aged entry is served immediately (labeled `stale`) while a refresh
+    /// probe runs in the background (stale-while-revalidate,
+    /// intent-hq/intent#3874), a blocking probe runs only on a true miss or
+    /// `forceRefresh`, degrading
     /// to an empty list (`source: "static"`) when the CLI is unavailable;
     /// `forceRefresh` skips the cache read. With a `providerId` the request
     /// goes through the generic per-provider cache
@@ -5093,7 +5108,7 @@ impl Services {
 
     /// [`Self::models_list_auggie_op`] with an injectable fetch and clock
     /// (the unit-test seam). Delegates all cache policy — fresh-window
-    /// serving, age-based re-probe,
+    /// serving, stale-while-revalidate background refresh,
     /// negative window, single-flight, last-good fallback — to
     /// [`crate::model_catalog::resolve_with_cache`] and only maps the
     /// resolved rows onto the shared internal shape. The caller removes the
@@ -6093,6 +6108,172 @@ impl Services {
             Ok(false) => false,
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+                false
+            }
+        }
+    }
+
+    /// Merge `proposal_ids` (the proposal-resource blocks of the assistant
+    /// message `message_id`, in block order) into the session's ordered
+    /// pending-proposals list ([`intent_core::PENDING_PROPOSALS_KEY`],
+    /// PROTOCOL §5.5): each id lands as `{ proposalId, messageId }` appended
+    /// last; a re-proposed id replaces its older entry (dedupe by
+    /// `proposalId`, newest wins). Called from the turn-end persist paths
+    /// after the carrying message committed. Serialized per agent on the
+    /// same mutation lock as the question markers so concurrent completions
+    /// cannot interleave the read-modify-write. Atomic single-key `json_set`
+    /// so sibling metadata keys are preserved. A committed change emits
+    /// `agent:updated` with the new list so clients re-read the `AgentLite`
+    /// projection; an unchanged list (same ids already recorded under the
+    /// same message) writes and emits nothing. Returns `true` only when this
+    /// call committed a change. Best-effort: a failure is logged and never
+    /// fails the turn (the list simply stays as it was).
+    pub(crate) async fn record_pending_proposals(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_id: &str,
+        proposal_ids: &[String],
+    ) -> bool {
+        if proposal_ids.is_empty() {
+            return false;
+        }
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
+
+        let session = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read pending proposals");
+                return false;
+            }
+        };
+        let existing = session.pending_proposals();
+        let mut merged: Vec<intent_core::PendingProposal> = existing
+            .iter()
+            .filter(|entry| !proposal_ids.contains(&entry.proposal_id))
+            .cloned()
+            .collect();
+        for id in proposal_ids {
+            merged.push(intent_core::PendingProposal {
+                proposal_id: id.clone(),
+                message_id: message_id.to_string(),
+            });
+        }
+        if merged == existing {
+            return false;
+        }
+        self.persist_pending_proposals(workspace_id, agent_id, &merged)
+            .await
+    }
+
+    /// Rebuild the pending-proposals list after a transcript swap that
+    /// re-mints row ids (`agent.editAndRegenerate` truncation,
+    /// `agent.replaceMessages`), where any surviving entry's `messageId` is by
+    /// construction dangling. `messages` is the post-swap transcript in order:
+    /// each pending entry is REMAPPED to the newest assistant row still
+    /// carrying its proposal block, and an entry whose proposal block no
+    /// longer exists anywhere in the transcript is dropped (clients could not
+    /// recover it). Resolution state is preserved — entries the list no
+    /// longer holds are never re-added, even when their blocks survive the
+    /// swap. A committed change emits `agent:updated` with the new list;
+    /// best-effort like [`Services::record_pending_proposals`].
+    pub(crate) async fn reconcile_pending_proposals(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        messages: &[intent_core::AgentMessage],
+    ) {
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
+
+        let session = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read pending proposals");
+                return;
+            }
+        };
+        let existing = session.pending_proposals();
+        if existing.is_empty() {
+            return;
+        }
+        // Newest carrying assistant row per proposal id in the post-swap
+        // transcript (later rows overwrite earlier ones).
+        let mut carriers: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::new();
+        for msg in messages {
+            if msg.role == "assistant" {
+                if let Some(blocks) = msg.content.as_array() {
+                    for id in crate::tool_block::proposal_ids_in(blocks) {
+                        carriers.insert(id, msg.id.as_str());
+                    }
+                }
+            }
+        }
+        let reconciled: Vec<intent_core::PendingProposal> = existing
+            .iter()
+            .filter_map(|entry| {
+                carriers
+                    .get(&entry.proposal_id)
+                    .map(|mid| intent_core::PendingProposal {
+                        proposal_id: entry.proposal_id.clone(),
+                        message_id: (*mid).to_string(),
+                    })
+            })
+            .collect();
+        if reconciled == existing {
+            return;
+        }
+        self.persist_pending_proposals(workspace_id, agent_id, &reconciled)
+            .await;
+    }
+
+    /// Shared persist+emit tail of the pending-proposals writers: atomic
+    /// single-key `json_set` (sibling metadata keys preserved) and, on
+    /// success, `agent:updated` carrying the new list so clients re-read the
+    /// `AgentLite` projection. Callers hold the per-agent mutation lock and
+    /// have already established the list changed. Returns `true` only when
+    /// the write committed; a failure is logged and swallowed.
+    async fn persist_pending_proposals(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        proposals: &[intent_core::PendingProposal],
+    ) -> bool {
+        let value = match serde_json::to_string(proposals) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to serialize pending proposals");
+                return false;
+            }
+        };
+        match self
+            .store
+            .set_agent_session_metadata_key_json(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_PROPOSALS_KEY,
+                &value,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(()) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "pendingProposals": proposals,
+                    }),
+                )
+                .await;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending proposals");
                 false
             }
         }

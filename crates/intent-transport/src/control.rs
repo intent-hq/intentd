@@ -21,6 +21,9 @@ use crate::protocol::PROTOCOL_VERSION;
 /// A point-in-time snapshot of daemon state for `system.status` (§5.7, §12.3).
 /// `locality` is derived per-connection (UDS ⇒ `local`, WSS ⇒ `remote`) and so
 /// is not stored here; it is applied when the snapshot is rendered to JSON.
+// The bools (`uds`, `tcp`, `has_display`, `update_supported`) are independent
+// wire-facing status flags, not an encoded state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct SystemStatus {
     /// Derived listen mode: `both` while the TCP listener (secure WSS, or
@@ -128,6 +131,13 @@ pub struct SystemStatus {
     /// down), so the whole `fileWatch` object is presence-detected on the
     /// wire — absent when `None`, never null.
     pub file_watch: Option<FileWatchStatus>,
+    /// Whether `system.requestUpdate` can currently succeed
+    /// (intent-hq/intent#3875): true exactly when the daemon is
+    /// sitter-supervised, per the same pidfile + parent/name verification
+    /// that method performs — evaluated signal-free at read time. Always
+    /// `false` on platforms without unix signals, where
+    /// `system.requestUpdate` is unsupported.
+    pub update_supported: bool,
 }
 
 /// Live file-watch coverage for `system.status` (intent-hq/intent#3708):
@@ -302,6 +312,7 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "hostname": status.hostname,
         "prettyHostname": status.pretty_hostname,
         "protocolVersion": PROTOCOL_VERSION,
+        "updateSupported": status.update_supported,
         "host": {
             "os": status.os,
             "arch": status.arch,

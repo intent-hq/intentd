@@ -3051,6 +3051,10 @@ impl SystemControl for DaemonControl {
                     total_roots: s.total_roots,
                     failed_roots: s.failed_roots,
                 }),
+            // Signal-free supervision probe (intent-hq/intent#3875): one
+            // pidfile read + one single-process sysinfo refresh, never a
+            // signal, so status stays cheap and side-effect free.
+            update_supported: sitter_update_supported(&self.sitter_pid_path),
         }
     }
 
@@ -3669,14 +3673,12 @@ fn signal_sitter_update(pid_path: &Path) -> Result<(), String> {
 /// test harness as the actual parent.
 #[cfg(unix)]
 fn signal_sitter_update_with_parent(pid_path: &Path, expected_parent: u32) -> Result<(), String> {
-    let pid = read_pid(pid_path)
-        .filter(|pid| (1..=i32::MAX as u32).contains(pid) && pid_is_sitter(*pid, expected_parent))
-        .ok_or_else(|| {
-            format!(
-                "daemon is not supervised by intentd-sitter (pid in {} is not the daemon's parent)",
-                pid_path.display()
-            )
-        })?;
+    let pid = supervising_sitter_pid(pid_path, expected_parent).ok_or_else(|| {
+        format!(
+            "daemon is not supervised by intentd-sitter (pid in {} is not the daemon's parent)",
+            pid_path.display()
+        )
+    })?;
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid.cast_signed()),
         nix::sys::signal::Signal::SIGUSR1,
@@ -3692,6 +3694,33 @@ fn signal_sitter_update_with_parent(pid_path: &Path, expected_parent: u32) -> Re
 #[cfg(not(unix))]
 fn signal_sitter_update(_pid_path: &Path) -> Result<(), String> {
     Err("system.requestUpdate is not supported on this platform (no unix signals)".to_string())
+}
+
+/// Signal-free core of the supervision check shared by `system.requestUpdate`
+/// and the `system.status` → `updateSupported` probe: the verified sitter pid
+/// from `pid_path` when the daemon is currently sitter-supervised — pidfile
+/// read, range clamp to `1..=i32::MAX` (see [`signal_sitter_update`]), and
+/// [`pid_is_sitter`] parent + name verification — else `None`. Sends no
+/// signals; the only OS work is one single-process sysinfo refresh inside
+/// `pid_is_sitter`.
+#[cfg(unix)]
+fn supervising_sitter_pid(pid_path: &Path, expected_parent: u32) -> Option<u32> {
+    read_pid(pid_path)
+        .filter(|pid| (1..=i32::MAX as u32).contains(pid) && pid_is_sitter(*pid, expected_parent))
+}
+
+/// `system.status` → `updateSupported` (§5.7, intent-hq/intent#3875): whether
+/// `system.requestUpdate` would find a supervising sitter right now.
+#[cfg(unix)]
+fn sitter_update_supported(pid_path: &Path) -> bool {
+    supervising_sitter_pid(pid_path, std::os::unix::process::parent_id()).is_some()
+}
+
+/// Non-unix hosts have no sitter supervision (`system.requestUpdate` is
+/// unsupported there), so `updateSupported` is constantly `false`.
+#[cfg(not(unix))]
+fn sitter_update_supported(_pid_path: &Path) -> bool {
+    false
 }
 
 /// Local-transport liveness probe: a successful connect means a daemon is
@@ -4821,6 +4850,10 @@ fn print_status(config: &Config, r: &Value) {
         r["cpuPercent"].as_f64().unwrap_or(0.0)
     );
     println!("  memoryBytes: {}", r["memoryBytes"].as_u64().unwrap_or(0));
+    println!(
+        "  updateSupported: {}",
+        r["updateSupported"].as_bool().unwrap_or(false)
+    );
     match r["fingerprint"].as_str() {
         Some(fp) => println!("  fingerprint: {fp}"),
         None => println!("  fingerprint: (none)"),
@@ -5784,6 +5817,73 @@ mod tests {
 
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// The `system.status` → `updateSupported` probe (intent-hq/intent#3875)
+    /// mirrors the `signal_sitter_update` gate for every unsupervised shape:
+    /// missing pidfile, garbage / out-of-range contents, and a stale
+    /// (reaped) pid all read `false`.
+    #[cfg(unix)]
+    #[test]
+    fn sitter_update_supported_is_false_when_not_supervised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let ppid = std::os::unix::process::parent_id();
+
+        // Missing pidfile ⇒ unsupervised (also exercises the real-ppid wrapper).
+        assert!(!sitter_update_supported(&path), "missing pidfile");
+
+        // Garbage / out-of-range contents ⇒ unsupervised.
+        for garbage in ["", "not a pid", "-4", "0", "2147483648", "4294967295"] {
+            std::fs::write(&path, garbage).unwrap();
+            assert!(
+                supervising_sitter_pid(&path, ppid).is_none(),
+                "garbage {garbage:?}"
+            );
+        }
+
+        // A stale pid (spawned and already reaped) ⇒ unsupervised.
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        std::fs::write(&path, dead_pid.to_string()).unwrap();
+        assert!(supervising_sitter_pid(&path, ppid).is_none(), "stale pid");
+    }
+
+    /// A verified supervising sitter reads `true` — and the probe is
+    /// signal-free: unlike `signal_sitter_update`, the stand-in sitter must
+    /// still be alive after the probe accepts it.
+    #[cfg(unix)]
+    #[test]
+    fn sitter_update_supported_probe_accepts_without_signaling() {
+        for name in ["intentd-sitter", "intentd"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sitter.pid");
+            let mut child = spawn_stand_in_sitter(dir.path(), name);
+            std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+
+            // Sitter name but not the daemon's parent ⇒ unsupervised.
+            assert!(
+                supervising_sitter_pid(&path, std::os::unix::process::parent_id()).is_none(),
+                "{name}: non-parent pid must be rejected"
+            );
+
+            // Sitter name AND expected parent ⇒ supervised.
+            assert_eq!(
+                supervising_sitter_pid(&path, child.id()),
+                Some(child.id()),
+                "{name}: parent sitter is accepted"
+            );
+
+            // No signal was sent: the stand-in (which dies on SIGUSR1) is
+            // still running.
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "{name}: probe must not signal the sitter"
+            );
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
     }
 
     #[test]

@@ -2588,6 +2588,18 @@ pub const DISMISSED_QUESTIONS_MESSAGE_ID_KEY: &str = "dismissedQuestionsMessageI
 /// [`AgentSession::pending_questions_marker_written`].
 pub const PENDING_QUESTIONS_MESSAGE_ID_KEY: &str = "pendingQuestionsMessageId";
 
+/// Metadata key under which the pending-proposals list is persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5): an ordered array of
+/// `{ proposalId, messageId }` entries, one per proposal resource block whose
+/// carrying assistant message persisted and whose proposal is still awaiting
+/// an Apply/Dismiss resolution. Unlike the single-slot question marker this
+/// is a SET — multiple proposals across turns stay pending together; a
+/// re-proposed id replaces its older entry (newest wins, appended last). No
+/// schema migration — the list rides the existing free-form `metadata`
+/// column and survives daemon restarts. Read back by
+/// [`AgentSession::pending_proposals`].
+pub const PENDING_PROPOSALS_KEY: &str = "pendingProposals";
+
 /// Metadata key under which the per-conversation seen marker is persisted on
 /// the `agent_session.metadata` JSON (PROTOCOL §5.5): the id of the newest
 /// transcript message the user has seen, advanced monotonically by
@@ -2903,6 +2915,30 @@ impl AgentSession {
             .is_some_and(serde_json::Value::is_string)
     }
 
+    /// The pending-proposals list persisted under [`PENDING_PROPOSALS_KEY`]
+    /// in the session's free-form `metadata`: the ordered
+    /// `{ proposalId, messageId }` entries still awaiting resolution. Order
+    /// is preserved; malformed entries (non-object, missing/empty ids) are
+    /// skipped defensively. Absent key, non-array value, or an empty array
+    /// all read as an empty list.
+    pub fn pending_proposals(&self) -> Vec<PendingProposal> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PENDING_PROPOSALS_KEY))
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| {
+                        serde_json::from_value::<PendingProposal>(e.clone())
+                            .ok()
+                            .filter(|p| !p.proposal_id.is_empty() && !p.message_id.is_empty())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The per-conversation seen marker persisted under
     /// [`LAST_SEEN_MESSAGE_ID_KEY`] in the session's free-form `metadata`:
     /// `Some` only when the metadata is an object carrying a non-empty string
@@ -2941,6 +2977,18 @@ impl AgentSession {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
     }
+}
+
+/// One pending-proposal entry in the [`PENDING_PROPOSALS_KEY`] list
+/// (PROTOCOL §5.5): the proposal's identity (`applyToolCallId ??
+/// preview.title`, the same identity `proposal_resource_uri` encodes) plus
+/// the id of the assistant message carrying the proposal resource block, so
+/// clients can recover the full proposal from the transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingProposal {
+    pub proposal_id: String,
+    pub message_id: String,
 }
 
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
@@ -3003,6 +3051,13 @@ pub struct AgentMetadata {
     /// raw metadata never carried the marker key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_questions_message_id: Option<String>,
+    /// Pending-proposals list (PROTOCOL §5.5): the ordered
+    /// `{ proposalId, messageId }` entries still awaiting an Apply/Dismiss
+    /// resolution, mirroring [`AgentSession::pending_proposals`]. Unlike the
+    /// single-slot question marker this is a set — multiple proposals across
+    /// turns stay pending together. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_proposals: Vec<PendingProposal>,
     /// Per-conversation seen marker (PROTOCOL §5.5): the id of the newest
     /// transcript message the user has seen, advanced monotonically by
     /// `agent.markSeen`. Clients position the "New messages" divider right
@@ -3252,6 +3307,7 @@ impl AgentLite {
                 .unwrap_or_default()
                 .to_string()
         });
+        let pending_proposals = session.pending_proposals();
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
@@ -3271,6 +3327,7 @@ impl AgentLite {
             sandbox_branch: session.sandbox_branch.clone(),
             dismissed_questions_message_id,
             pending_questions_message_id,
+            pending_proposals,
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,

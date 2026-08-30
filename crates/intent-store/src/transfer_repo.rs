@@ -148,6 +148,14 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          completion wake repeats once on the target",
     ),
     (
+        "advisory_wake_delivery",
+        "per-daemon once-per-episode advisory-wake dedup bookkeeping; its \
+         (parent, child) rows can span workspaces (chief parents) so a \
+         workspace-scoped export could violate the agent_session FKs on import, \
+         and losing a marker fails open — at worst one already-delivered \
+         advisory wake repeats once on the target",
+    ),
+    (
         "agent_message_fts",
         "derived FTS5 index over `agent_message`; the target's insert triggers \
          rebuild it from the imported rows",

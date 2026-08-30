@@ -831,6 +831,193 @@ async fn workspace_sibling_proposal_round_trip_over_wss() {
         .starts_with("sibling-workspace-"));
 }
 
+/// Pending-proposals wire projection (PROTOCOL §5.5) over the real WSS
+/// transport: a proposal-bearing turn (the mock calls
+/// `ws.workspace.proposeSibling`) must
+///
+/// 1. emit `agent:updated` carrying the recorded `pendingProposals` list
+///    (proposal identity = `applyToolCallId ?? preview.title`), and
+/// 2. surface the same list on `agent.get`'s `AgentLite` projection under
+///    `agent.metadata.pendingProposals`, with `messageId` naming the
+///    persisted assistant message whose transcript blocks carry the
+///    proposal resource — so clients can recover the full proposal.
+#[tokio::test]
+async fn pending_proposals_projection_over_wss() {
+    let Some(script) = gate("WSS pendingProposals E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let repo_path = data_dir.join("source-repository");
+    assert!(Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(&repo_path)
+        .status()
+        .expect("run git init")
+        .success());
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com")] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["config", key, value])
+            .status()
+            .expect("run git config")
+            .success());
+    }
+    std::fs::write(repo_path.join("README.md"), "pendingProposals test\n").unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["add", "README.md"])
+        .status()
+        .expect("run git add")
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["commit", "-m", "initial"])
+        .status()
+        .expect("run git commit")
+        .success());
+
+    let ws_id = seed_workspace_only(&data_dir, Some(&repo_path)).await;
+    let marker = "PROPOSE_FOR_PENDING_E2E";
+    let proposal_code = r#"return await ws.workspace.proposeSibling({
+        title: "Pending projection",
+        initialPrompt: "Verify the pendingProposals projection end to end."
+    });"#;
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": marker,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": {
+                    "code": proposal_code,
+                    "summary": "propose sibling workspace"
+                }
+            },
+            "response": "Proposal filed.",
+            "emitToolBlocks": true
+        }],
+        "response": "plain response"
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — before the turn so the `agent:updated` carrying the
+    // recorded list (emitted during turn-end persist, before `stream:end`)
+    // cannot be missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "PendingProposer", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": marker }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+
+    // Drain to stream:end, capturing the `agent:updated` that carries the
+    // recorded pendingProposals list along the way.
+    let mut pending_update: Option<Value> = None;
+    let end_data = loop {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        if ev["type"] == "agent:updated" && ev["data"].get("pendingProposals").is_some() {
+            pending_update = Some(ev["data"].clone());
+        }
+        if ev["type"] == "agent:stream:end" {
+            break ev["data"].clone();
+        }
+    };
+    let turn_message_id = end_data["messageId"].as_str().expect("turn messageId");
+
+    // 1. The live event carried the list: one entry, identity from the
+    //    proposal's `preview.title` (no applyToolCallId on workspace-create
+    //    proposals), messageId naming this turn's persisted assistant row.
+    let update = pending_update.expect("agent:updated with pendingProposals was emitted");
+    assert_eq!(
+        update["pendingProposals"],
+        json!([{
+            "proposalId": "Create workspace: Pending projection",
+            "messageId": turn_message_id,
+        }]),
+        "live event payload: {update}"
+    );
+
+    // 2. The `agent.get` AgentLite projection serves the same list.
+    let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": agent_id })).await;
+    assert_eq!(
+        lite["agent"]["metadata"]["pendingProposals"], update["pendingProposals"],
+        "agent.get projection matches the event: {lite}"
+    );
+
+    // 3. The named message really carries the proposal resource block, so a
+    //    client can recover the full proposal from the transcript.
+    let conversation = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conversation["messages"].as_array().unwrap();
+    let carrier = messages
+        .iter()
+        .find(|m| m["id"] == turn_message_id)
+        .unwrap_or_else(|| panic!("carrier message persisted: {conversation:#}"));
+    let block = carrier["contentBlocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|block| block["type"] == "resource" && block["resource"]["mimeType"] == PROPOSAL_MIME)
+        .unwrap_or_else(|| panic!("proposal resource on the carrier: {carrier:#}"));
+    let proposal: Value =
+        serde_json::from_str(block["resource"]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        proposal["preview"]["title"], "Create workspace: Pending projection",
+        "recovered proposal identity matches the pending entry"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Sub-agent gate: per-agent MCP bridge client (parse the generated
 // `intentd-mcp-*.json` and speak newline-delimited JSON-RPC to the loopback

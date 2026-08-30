@@ -735,6 +735,9 @@ async fn wss_system_status_includes_capacity_version_uptime() {
         r["memoryBytes"].as_u64().unwrap() > 0,
         "memoryBytes > 0: {r}"
     );
+    // Supervision probe (intent-hq/intent#3875): always present, and false
+    // here — the daemon was spawned by the test harness, not a sitter.
+    assert_eq!(r["updateSupported"], false, "updateSupported: {r}");
     // Routing fields (additive): localIps is a string array (may be empty on
     // hosts with no routable interface), hostname and prettyHostname are
     // non-empty strings.
