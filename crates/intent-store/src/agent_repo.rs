@@ -1899,6 +1899,54 @@ impl Store {
         Ok(true)
     }
 
+    /// [`Store::set_agent_session_metadata_key`] for a JSON-typed value:
+    /// `value` is a serialized JSON document (array/object/scalar) stored
+    /// through `SQLite`'s `json(?)` so it lands as real JSON under the key —
+    /// the string-binding sibling would store it as a JSON string literal.
+    /// Unconditional (no CAS guard): callers serialize competing writers with
+    /// a per-agent lock instead. Same NULL / non-object-column defenses and
+    /// `NotFound` semantics; `key` must be a trusted compile-time constant.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the
+    /// workspace; `Error::Internal` if the database operation fails (including
+    /// a malformed `value` rejected by `json(?)`).
+    pub async fn set_agent_session_metadata_key_json(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        key: &str,
+        value: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET \
+             metadata = json_set(\
+                 CASE \
+                     WHEN metadata IS NULL THEN '{}' \
+                     WHEN json_type(metadata) = 'object' THEN metadata \
+                     ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                 END, \
+                 '$.' || ?, json(?)), \
+             updated_at = ? \
+             WHERE id = ? AND workspace_id = ?",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set agent session metadata key json failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
     /// CAS-set one session metadata key unless a later user row already
     /// answers `question_message_id`. The answer observation and marker write
     /// share one SQL statement, so a delayed marker set cannot resurrect a

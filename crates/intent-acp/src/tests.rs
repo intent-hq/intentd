@@ -8817,6 +8817,7 @@ mod wsapi4_bindings_tests {
                 sandbox_branch: None,
                 dismissed_questions_message_id: None,
                 pending_questions_message_id: None,
+                pending_proposals: Vec::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,

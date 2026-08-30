@@ -2254,6 +2254,90 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
     );
 }
 
+/// Stored-on-write pending-proposals recording (PROTOCOL §5.5): the turn-end
+/// persist merges the tail's proposal ids into the session's ordered pending
+/// list under the turn's message id, and a subsequent proposal-FREE turn
+/// leaves the list in place (pendingness survives the agent's later turns
+/// until resolution).
+#[tokio::test]
+async fn turn_end_records_pending_proposals_and_proposal_free_turn_keeps_them() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let proposal = json!({
+        "kind": "settings-change",
+        "applyToolCallId": "tc-prop-1",
+        "preview": { "title": "Update Setting" },
+        "payload": { "key": "k", "value": "v" },
+    });
+    services.turn_attachments().register(
+        &agent_id,
+        intent_core::TurnAttachment {
+            id: "tar-p1".to_string(),
+            policy: intent_core::AttachmentPolicy::AtTurnEnd,
+            mime_type: intent_acp::mcp_server::PROPOSAL_RESOURCE_MIME_TYPE.to_string(),
+            uri: "intent-proposal://settings-change/tc-prop-1".to_string(),
+            name: "Update Setting".to_string(),
+            text: proposal.to_string(),
+        },
+    );
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("propose")],
+            None,
+        )
+        .await
+        .expect("turn 1 completes");
+
+    let carrying_id = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("messages")
+        .last()
+        .expect("assistant row")
+        .id
+        .clone();
+    let session = bus
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(pending.len(), 1, "turn end records the pending proposal");
+    assert_eq!(pending[0].proposal_id, "tc-prop-1");
+    assert_eq!(pending[0].message_id, carrying_id);
+
+    // A proposal-free turn must NOT touch the list.
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("continue")],
+            None,
+        )
+        .await
+        .expect("turn 2 completes");
+    let session = bus
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.pending_proposals(),
+        pending,
+        "a proposal-free turn end must not change the pending list"
+    );
+}
+
 /// Question resource content-block array — the tail shape
 /// `ws.app.question.ask` persists — for the monorepo#1266 regression tests
 /// over the transcript-mutation ops below.
@@ -6954,6 +7038,70 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
     assert!(
         services.live_turn(&agent_id).is_none(),
         "the owning flush releases the pin"
+    );
+}
+
+/// A partial tail flushed at interruption can already carry a proposal block
+/// (the interrupt landed after the propose tool call): the flush records its
+/// `{proposalId, messageId}` entry into the session's pending-proposals list
+/// exactly as a normal turn-end persist would, so an interrupted turn's
+/// proposal stays discoverable through the `AgentLite` projection.
+#[tokio::test]
+async fn interrupt_flush_records_pending_proposals_from_the_partial_tail() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+
+    let proposal = json!({
+        "kind": "settings-change",
+        "applyToolCallId": "tc-flush-1",
+        "preview": { "title": "Update Setting" },
+        "payload": { "key": "k", "value": "v" },
+    });
+    let blocks = vec![
+        json!({ "id": "m1:0", "type": "text", "text": "Proposing… " }),
+        json!({
+            "type": "resource",
+            "id": "m1:1",
+            "resource": {
+                "uri": "intent-proposal://settings-change/tc-flush-1",
+                "name": "Update Setting",
+                "mimeType": "application/vnd.intent.proposal+json",
+                "text": serde_json::to_string(&proposal).unwrap(),
+            }
+        }),
+    ];
+    let live = super::LiveTurn {
+        message_id: "m1".to_string(),
+        blocks,
+        final_text_block_open: false,
+        last_activity_at: "2026-01-01T00:00:00Z".to_string(),
+        last_activity_emit: None,
+        flush_pending: false,
+        flush_failed: false,
+    };
+    let flushed = services
+        .flush_partial_turn_on_interruption(
+            &agent_id,
+            live,
+            super::InterruptReason::UserStop,
+            None,
+            true,
+        )
+        .await;
+    assert_eq!(flushed.as_deref(), Some("m1"), "the partial row is durable");
+
+    let session = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.proposal_id.as_str(), p.message_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("tc-flush-1", "m1")],
+        "the flushed tail's proposal is recorded as pending"
     );
 }
 
