@@ -41,6 +41,8 @@ reqwest.workspace = true
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 sha2 = "0.11"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+croner = "3.0.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

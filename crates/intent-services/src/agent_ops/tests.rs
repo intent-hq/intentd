@@ -16516,6 +16516,8 @@ async fn seed_active_hook(
         name: name.to_string(),
         code: "return { dispatch: false };".to_string(),
         delay_ms: 10_000,
+        cron: None,
+        run_at: None,
         state: intent_core::HookState::Scheduled,
         created_at: now_iso(),
         last_run_at: None,

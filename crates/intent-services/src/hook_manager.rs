@@ -1,8 +1,12 @@
 //! Background hook scheduler (spec: "JS kernel" watchers). A hook is a small
-//! agent-owned JavaScript script the daemon runs periodically (fixed
-//! `delayMs` between runs) until it signals a dispatch, fails, is cancelled,
+//! agent-owned JavaScript script the daemon runs on one of three schedule
+//! kinds — a fixed `delayMs` cadence, a recurring `cron` expression
+//! (standard 5-field, evaluated in UTC), or a one-shot `runAt` timestamp —
+//! until it signals a dispatch, fails, is cancelled,
 //! or its TTL expires (`expiresAt` = creation + clamped `ttlMs`, capped at
-//! 24 hours — on expiry the owner is woken so it can reschedule). Each
+//! 24 hours for `delayMs` hooks and 7 days for `cron` hooks; `runAt` implies
+//! its own expiry — the fire time + 1 hour grace — and rejects an explicit
+//! `ttlMs`. On expiry the owner is woken so it can reschedule). Each
 //! active hook owns one tokio task; schedules persist to the `hook` table
 //! and rehydrate at boot ([`Services::rehydrate_hooks`]).
 //!
@@ -67,6 +71,14 @@ pub(crate) const MIN_HOOK_DELAY_MS: i64 = 10_000;
 /// `delayMs`); expiry counts from creation, not the last run.
 pub(crate) const MAX_HOOK_TTL_MS: i64 = 86_400_000;
 pub(crate) const DEFAULT_HOOK_TTL_MS: i64 = MAX_HOOK_TTL_MS;
+
+/// Cron hooks lift the 24-hour cap (spec decision): default and maximum TTL
+/// are both 7 days; the floor is shared with `delayMs`.
+pub(crate) const MAX_CRON_HOOK_TTL_MS: i64 = 7 * 86_400_000;
+
+/// A `runAt` hook's TTL is implied — the fire time plus this grace window —
+/// and an explicit `ttlMs` is rejected at schedule time.
+pub(crate) const RUN_AT_GRACE_MS: i64 = 3_600_000;
 
 /// Maximum hook name length (spec: name > 50 chars fails validation).
 pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
@@ -221,11 +233,180 @@ fn resumed_next_run(hook: &Hook) -> (String, Duration) {
 }
 
 /// Clamp a schedulable `ttlMs` into `[MIN_HOOK_DELAY_MS, MAX_HOOK_TTL_MS]`;
-/// `None` (omitted) takes the default (= the 24-hour cap).
+/// `None` (omitted) takes the default (= the 24-hour cap). `delayMs`-kind
+/// hooks only — cron hooks use [`clamp_cron_ttl_ms`].
 fn clamp_ttl_ms(ttl_ms: Option<i64>) -> i64 {
     ttl_ms
         .unwrap_or(DEFAULT_HOOK_TTL_MS)
         .clamp(MIN_HOOK_DELAY_MS, MAX_HOOK_TTL_MS)
+}
+
+/// Cron-kind TTL clamp: `[MIN_HOOK_DELAY_MS, MAX_CRON_HOOK_TTL_MS]`, with
+/// `None` (omitted) taking the 7-day default (= the cron cap).
+fn clamp_cron_ttl_ms(ttl_ms: Option<i64>) -> i64 {
+    ttl_ms
+        .unwrap_or(MAX_CRON_HOOK_TTL_MS)
+        .clamp(MIN_HOOK_DELAY_MS, MAX_CRON_HOOK_TTL_MS)
+}
+
+/// The exactly-one-of schedule kind `hook.schedule` accepts: a fixed
+/// `delayMs` cadence, a recurring `cron` expression (standard 5-field,
+/// evaluated in UTC), or a one-shot future `runAt` timestamp (normalized to
+/// UTC RFC3339 at validation).
+#[derive(Debug, Clone, PartialEq)]
+enum ScheduleKind {
+    Delay(i64),
+    Cron(String),
+    RunAt(String),
+}
+
+impl ScheduleKind {
+    /// The `delay_ms` column value: the cadence for the fixed kind, 0 for
+    /// cron/runAt hooks.
+    fn delay_ms(&self) -> i64 {
+        match self {
+            Self::Delay(ms) => *ms,
+            _ => 0,
+        }
+    }
+
+    fn cron(&self) -> Option<String> {
+        match self {
+            Self::Cron(expr) => Some(expr.clone()),
+            _ => None,
+        }
+    }
+
+    fn run_at(&self) -> Option<String> {
+        match self {
+            Self::RunAt(at) => Some(at.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a cron expression under the accepted grammar: standard 5-field
+/// (minute granularity — a seconds field is rejected), evaluated in UTC.
+fn parse_cron(expr: &str) -> Result<croner::Cron> {
+    croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Disallowed)
+        .build()
+        .parse(expr)
+        .map_err(|e| {
+            Error::InvalidParams(format!(
+                "hook.schedule: invalid `cron` expression (standard 5-field, no seconds): {e}"
+            ))
+        })
+}
+
+/// Next fire of `cron` strictly after now (UTC): the RFC3339 timestamp and
+/// the time until it. Errors when the expression has no computable next
+/// occurrence.
+fn cron_next_fire(cron: &croner::Cron) -> Result<(String, Duration)> {
+    let now = chrono::Utc::now();
+    let next = cron.find_next_occurrence(&now, false).map_err(|e| {
+        Error::InvalidParams(format!(
+            "hook.schedule: `cron` expression has no computable next fire: {e}"
+        ))
+    })?;
+    let until = (next - now).num_milliseconds().max(0);
+    Ok((
+        next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        Duration::from_millis(until.cast_unsigned()),
+    ))
+}
+
+/// Extract and validate the exactly-one-of `delayMs` | `cron` | `runAt`
+/// schedule kind from `hook.schedule` params.
+fn parse_schedule_kind(params: &Value) -> Result<ScheduleKind> {
+    let present: Vec<&str> = ["delayMs", "cron", "runAt"]
+        .into_iter()
+        .filter(|k| params.get(k).is_some())
+        .collect();
+    match present.as_slice() {
+        [] => {
+            return Err(Error::InvalidParams(
+                "hook.schedule: exactly one of `delayMs`, `cron`, or `runAt` is required".into(),
+            ))
+        }
+        [_] => {}
+        keys => {
+            let keys = keys
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            return Err(Error::InvalidParams(format!(
+                "hook.schedule: {keys} are mutually exclusive — pass exactly one schedule kind"
+            )));
+        }
+    }
+    if let Some(v) = params.get("delayMs") {
+        let delay_ms = v.as_i64().ok_or_else(|| {
+            Error::InvalidParams("hook.schedule: `delayMs` must be an integer".into())
+        })?;
+        if delay_ms < MIN_HOOK_DELAY_MS {
+            return Err(Error::InvalidParams(format!(
+                "hook.schedule: `delayMs` must be at least {MIN_HOOK_DELAY_MS}"
+            )));
+        }
+        return Ok(ScheduleKind::Delay(delay_ms));
+    }
+    if let Some(v) = params.get("cron") {
+        let expr = v
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::InvalidParams("hook.schedule: `cron` must be a non-empty string".into())
+            })?;
+        let cron = parse_cron(expr)?;
+        // Must have a computable next fire at schedule time.
+        cron_next_fire(&cron)?;
+        return Ok(ScheduleKind::Cron(expr.to_string()));
+    }
+    let raw = params.get("runAt").and_then(Value::as_str).ok_or_else(|| {
+        Error::InvalidParams("hook.schedule: `runAt` must be an RFC3339 timestamp string".into())
+    })?;
+    let at = OffsetDateTime::parse(raw, &Rfc3339).map_err(|e| {
+        Error::InvalidParams(format!(
+            "hook.schedule: `runAt` is not a valid RFC3339 timestamp: {e}"
+        ))
+    })?;
+    if at <= OffsetDateTime::now_utc() {
+        return Err(Error::InvalidParams(
+            "hook.schedule: `runAt` must be in the future".into(),
+        ));
+    }
+    let normalized = at
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|e| Error::Internal(format!("hook.schedule: format runAt: {e}")))?;
+    Ok(ScheduleKind::RunAt(normalized))
+}
+
+/// A freshly scheduled kind's next fire: the `nextRunAt` to persist and the
+/// scheduler task's first sleep. The cron re-parse cannot fail in practice —
+/// the expression was validated by [`parse_schedule_kind`].
+fn kind_next_fire(kind: &ScheduleKind) -> Result<(String, Duration)> {
+    match kind {
+        ScheduleKind::Delay(ms) => Ok((
+            next_run_at_iso(*ms),
+            Duration::from_millis((*ms).max(0).cast_unsigned()),
+        )),
+        ScheduleKind::Cron(expr) => cron_next_fire(&parse_cron(expr)?),
+        ScheduleKind::RunAt(at) => {
+            let deadline = OffsetDateTime::parse(at, &Rfc3339)
+                .map_err(|e| Error::Internal(format!("parse validated runAt: {e}")))?;
+            let remaining = deadline - OffsetDateTime::now_utc();
+            Ok((
+                at.clone(),
+                Duration::from_millis(
+                    u64::try_from(remaining.whole_milliseconds().max(0)).unwrap_or(u64::MAX),
+                ),
+            ))
+        }
+    }
 }
 
 /// Time remaining until `expires_at`, or `None` when the hook has no
@@ -587,23 +768,39 @@ impl Services {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| Error::InvalidParams("hook.schedule: `code` is required".into()))?;
-        let delay_ms = params
-            .get("delayMs")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| Error::InvalidParams("hook.schedule: `delayMs` is required".into()))?;
-        if delay_ms < MIN_HOOK_DELAY_MS {
-            return Err(Error::InvalidParams(format!(
-                "hook.schedule: `delayMs` must be at least {MIN_HOOK_DELAY_MS}"
-            )));
-        }
-        // TTL (spec: 24-hour cap): optional `ttlMs`, clamped — never
-        // rejected — into [10s, 24h]; omitted takes the 24-hour default.
-        let ttl_ms = clamp_ttl_ms(params.get("ttlMs").and_then(Value::as_i64));
+        // Exactly one of `delayMs` | `cron` | `runAt` (spec: schedule kinds).
+        let kind = parse_schedule_kind(params)?;
         // Perpetual hooks survive a dispatch; omitted defaults to one-shot.
+        // A `runAt` hook fires once by definition — `perpetual` is rejected.
         let perpetual = params
             .get("perpetual")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if perpetual && matches!(kind, ScheduleKind::RunAt(_)) {
+            return Err(Error::InvalidParams(
+                "hook.schedule: `perpetual` cannot be combined with `runAt` — a runAt hook \
+                 fires exactly once"
+                    .into(),
+            ));
+        }
+        // TTL per kind: `delayMs` keeps the 24-hour clamp, `cron` lifts it
+        // to 7 days, and `runAt` implies its own expiry (the fire time +
+        // 1h grace) — an explicit `ttlMs` is rejected there.
+        let ttl_ms = params.get("ttlMs").and_then(Value::as_i64);
+        let ttl_ms = match &kind {
+            ScheduleKind::Delay(_) => Some(clamp_ttl_ms(ttl_ms)),
+            ScheduleKind::Cron(_) => Some(clamp_cron_ttl_ms(ttl_ms)),
+            ScheduleKind::RunAt(_) => {
+                if params.get("ttlMs").is_some() {
+                    return Err(Error::InvalidParams(
+                        "hook.schedule: `ttlMs` cannot be combined with `runAt` — the hook \
+                         expires 1 hour after its fire time"
+                            .into(),
+                    ));
+                }
+                None
+            }
+        };
         // Per-agent cap on active hooks (`[hooks] maxPerAgent`).
         let cap = self.hooks_max_per_agent as usize;
         let active = self
@@ -619,19 +816,32 @@ impl Services {
             )));
         }
 
-        // expiresAt counts from creation: one instant feeds both fields.
+        // expiresAt: for `delayMs`/`cron` it counts from creation (one
+        // instant feeds both fields); for `runAt` it is the fire time + the
+        // grace window.
         let created = OffsetDateTime::now_utc();
         let created_at = created.format(&Rfc3339).unwrap_or_else(|_| now_iso());
-        let expires_at = (created + time::Duration::milliseconds(ttl_ms))
-            .format(&Rfc3339)
-            .unwrap_or_default();
+        let expires_at = match (&kind, ttl_ms) {
+            (ScheduleKind::RunAt(at), _) => {
+                let fire = OffsetDateTime::parse(at, &Rfc3339)
+                    .map_err(|e| Error::Internal(format!("parse validated runAt: {e}")))?;
+                (fire + time::Duration::milliseconds(RUN_AT_GRACE_MS))
+                    .format(&Rfc3339)
+                    .unwrap_or_default()
+            }
+            (_, ttl_ms) => (created + time::Duration::milliseconds(ttl_ms.unwrap_or_default()))
+                .format(&Rfc3339)
+                .unwrap_or_default(),
+        };
         let hook = Hook {
             hook_id: HookId::new(),
             workspace_id: workspace_id.clone(),
             agent_id: agent_id.clone(),
             name: name.to_string(),
             code: code.to_string(),
-            delay_ms,
+            delay_ms: kind.delay_ms(),
+            cron: kind.cron(),
+            run_at: kind.run_at(),
             state: HookState::Running,
             created_at,
             last_run_at: None,
@@ -693,10 +903,13 @@ impl Services {
                     } else {
                         HookState::Scheduled
                     };
+                    let mut initial_delay = None;
                     hook.next_run_at = if expired {
                         None
                     } else {
-                        Some(next_run_at_iso(delay_ms))
+                        let (next, sleep) = kind_next_fire(&kind)?;
+                        initial_delay = Some(sleep);
+                        Some(next)
                     };
                     self.store.insert_hook(&hook).await?;
                     self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
@@ -709,7 +922,7 @@ impl Services {
                     }
                     self.emit_hook_event(HOOK_SCHEDULED, &hook, hook.next_run_at.clone())
                         .await;
-                    self.spawn_hook_task(hook.clone());
+                    self.spawn_hook_task_with_initial_delay(hook.clone(), initial_delay);
                     // A newly persisted active hook can promote the derived
                     // displayStatus to `in_progress` (§6.5) and raise the
                     // orthogonal `waiting` flag (§5.1).
@@ -753,13 +966,14 @@ impl Services {
                     return Ok(json!({ "hook": hook, "dispatched": false }));
                 }
                 hook.state = HookState::Scheduled;
-                hook.next_run_at = Some(next_run_at_iso(delay_ms));
+                let (next, initial_delay) = kind_next_fire(&kind)?;
+                hook.next_run_at = Some(next);
                 self.store.insert_hook(&hook).await?;
                 self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, hook.next_run_at.clone())
                     .await;
                 self.emit_hook_event(HOOK_SCHEDULED, &hook, hook.next_run_at.clone())
                     .await;
-                self.spawn_hook_task(hook.clone());
+                self.spawn_hook_task_with_initial_delay(hook.clone(), Some(initial_delay));
                 // A newly persisted active hook can promote the derived
                 // displayStatus to `in_progress` (§6.5) and raise the
                 // orthogonal `waiting` flag (§5.1).
@@ -1220,20 +1434,18 @@ impl Services {
         }
     }
 
-    /// Spawn the per-hook scheduler task: sleep `delayMs` (or a `runNow`
-    /// control frame) raced against the TTL deadline, run the script, and
-    /// act on the outcome. A run is never STARTED at/after `expiresAt` (a
-    /// run already in flight at expiry completes normally). The task
-    /// deregisters itself from [`Services::hook_tasks`] on every exit path.
-    fn spawn_hook_task(&self, hook: Hook) {
-        self.spawn_hook_task_with_initial_delay(hook, None);
-    }
-
-    /// [`Services::spawn_hook_task`] with an explicit first-iteration sleep:
-    /// rehydration passes the resumed countdown (which may be shorter than
-    /// `delayMs`, or zero for an overdue row) so the persisted `nextRunAt`
-    /// is honored across restarts; every later iteration sleeps the plain
-    /// `delayMs` cadence.
+    /// Spawn the per-hook scheduler task: sleep until the next fire (or a
+    /// `runNow` control frame) raced against the TTL deadline, run the
+    /// script, and act on the outcome. A run is never STARTED at/after
+    /// `expiresAt` (a run already in flight at expiry completes normally).
+    /// The task deregisters itself from [`Services::hook_tasks`] on every
+    /// exit path. The explicit first-iteration sleep: schedule passes the
+    /// freshly computed time to the kind's next fire, and rehydration
+    /// passes the resumed countdown (which may be shorter than `delayMs`,
+    /// or zero for an overdue row) so the persisted `nextRunAt` is honored
+    /// across restarts; every later iteration sleeps the plain `delayMs`
+    /// cadence (scheduler-loop cron/runAt cadence semantics are the next
+    /// task).
     fn spawn_hook_task_with_initial_delay(&self, hook: Hook, initial_delay: Option<Duration>) {
         let (control_tx, mut control_rx) = mpsc::channel::<HookControl>(4);
         let services = self.clone();
@@ -2041,6 +2253,211 @@ mod tests {
         assert!(hooks.is_empty());
     }
 
+    /// `hook.schedule` accepts exactly one of `delayMs` | `cron` | `runAt`:
+    /// zero kinds and every pairing are rejected, and nothing persists.
+    #[tokio::test]
+    async fn schedule_requires_exactly_one_schedule_kind() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // No kind at all.
+        let err = svc
+            .hook_schedule_op(&ws, &owner, &json!({ "name": "ok", "code": "return;" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exactly one of `delayMs`, `cron`, or `runAt`"),
+            "{err}"
+        );
+        // Every pairing is mutually exclusive.
+        let future = (OffsetDateTime::now_utc() + time::Duration::hours(1))
+            .format(&Rfc3339)
+            .unwrap();
+        for params in [
+            json!({ "name": "ok", "code": "return;", "delayMs": 10_000, "cron": "*/5 * * * *" }),
+            json!({ "name": "ok", "code": "return;", "delayMs": 10_000, "runAt": future }),
+            json!({ "name": "ok", "code": "return;", "cron": "*/5 * * * *", "runAt": future }),
+        ] {
+            let err = svc
+                .hook_schedule_op(&ws, &owner, &params)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("mutually exclusive"), "{err}");
+        }
+        let hooks = svc.store().list_hooks_by_agent(&owner).await.unwrap();
+        assert!(hooks.is_empty());
+    }
+
+    /// Cron-kind validation: garbage and six-field (seconds) expressions are
+    /// rejected; a valid five-field expression schedules with `cron` set,
+    /// `delay_ms` 0, a computed `nextRunAt`, and the 7-day default TTL.
+    #[tokio::test]
+    async fn schedule_validates_cron_expression() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        for bad in ["not a cron", "61 * * * *", "*/5 * * * * *", ""] {
+            let err = svc
+                .hook_schedule_op(
+                    &ws,
+                    &owner,
+                    &json!({ "name": "bad-cron", "code": "return;", "cron": bad }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("cron"),
+                "expected cron error for {bad:?}, got: {err}"
+            );
+        }
+        assert!(svc
+            .store()
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "cron-hook",
+                    "code": "return { dispatch: false };",
+                    "cron": "*/5 * * * *",
+                }),
+            )
+            .await
+            .expect("schedule cron hook");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(hook.cron.as_deref(), Some("*/5 * * * *"));
+        assert_eq!(hook.run_at, None);
+        assert_eq!(hook.delay_ms, 0);
+        assert_eq!(hook.state, HookState::Scheduled);
+        let next = hook.next_run_at.as_deref().expect("nextRunAt computed");
+        assert!(OffsetDateTime::parse(next, &Rfc3339).unwrap() > OffsetDateTime::now_utc());
+        assert_eq!(ttl_of(&hook), MAX_CRON_HOOK_TTL_MS);
+        // Round-trips through the store.
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.cron.as_deref(), Some("*/5 * * * *"));
+        assert_eq!(stored.run_at, None);
+    }
+
+    /// runAt-kind validation: non-RFC3339 and past timestamps are rejected,
+    /// as are `perpetual` and `ttlMs` combinations; a valid future timestamp
+    /// schedules with `runAt` normalized to UTC and expiry = fire + 1h.
+    #[tokio::test]
+    async fn schedule_validates_run_at() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let future = (OffsetDateTime::now_utc() + time::Duration::hours(2))
+            .format(&Rfc3339)
+            .unwrap();
+        // Not a timestamp.
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "bad", "code": "return;", "runAt": "tomorrow" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("RFC3339"), "{err}");
+        // In the past.
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "past", "code": "return;", "runAt": "2020-01-01T00:00:00Z" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must be in the future"), "{err}");
+        // A one-shot fire time contradicts `perpetual`.
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "perp", "code": "return;", "runAt": future, "perpetual": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("`perpetual`"), "{err}");
+        // ...and implies its own TTL, so an explicit `ttlMs` is rejected.
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "ttl", "code": "return;", "runAt": future, "ttlMs": 60_000 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("`ttlMs`"), "{err}");
+        assert!(svc
+            .store()
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Valid: offset timestamps normalize to UTC; expiry = fire + grace.
+        let offset_future = (OffsetDateTime::now_utc() + time::Duration::hours(2))
+            .to_offset(time::UtcOffset::from_hms(2, 0, 0).unwrap())
+            .format(&Rfc3339)
+            .unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "run-at-hook",
+                    "code": "return { dispatch: false };",
+                    "runAt": offset_future,
+                }),
+            )
+            .await
+            .expect("schedule runAt hook");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        let run_at = hook.run_at.as_deref().expect("runAt persisted");
+        assert!(run_at.ends_with('Z'), "normalized to UTC: {run_at}");
+        assert_eq!(hook.cron, None);
+        assert_eq!(hook.delay_ms, 0);
+        assert!(!hook.perpetual);
+        assert_eq!(hook.next_run_at.as_deref(), Some(run_at));
+        let fire = OffsetDateTime::parse(run_at, &Rfc3339).unwrap();
+        let expires = OffsetDateTime::parse(hook.expires_at.as_deref().unwrap(), &Rfc3339).unwrap();
+        assert_eq!(
+            (expires - fire).whole_milliseconds(),
+            i128::from(RUN_AT_GRACE_MS)
+        );
+    }
+
+    /// Wire Hook JSON is additive: `cron` / `runAt` appear only when set.
+    #[tokio::test]
+    async fn hook_json_carries_schedule_kind_fields_only_when_set() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "legacy", "code": "return { dispatch: false };",
+                         "delayMs": 10_000 }),
+            )
+            .await
+            .expect("schedule delay hook");
+        let obj = out["hook"].as_object().unwrap();
+        assert!(!obj.contains_key("cron"), "cron absent for delayMs hooks");
+        assert!(!obj.contains_key("runAt"), "runAt absent for delayMs hooks");
+
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "cron", "code": "return { dispatch: false };",
+                         "cron": "0 * * * *" }),
+            )
+            .await
+            .expect("schedule cron hook");
+        assert_eq!(out["hook"]["cron"], json!("0 * * * *"));
+        assert!(!out["hook"].as_object().unwrap().contains_key("runAt"));
+    }
+
     #[tokio::test]
     async fn schedule_accepts_fifty_char_name() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
@@ -2425,6 +2842,8 @@ mod tests {
                    }"
             .to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -2599,6 +3018,8 @@ mod tests {
             name: "will-throw".to_string(),
             code: "throw new Error('kaput');".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -2640,6 +3061,8 @@ mod tests {
             name: "spinner".to_string(),
             code: "for (;;) {}".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -2966,6 +3389,8 @@ mod tests {
             name: "stranded".to_string(),
             code: "return { dispatch: false };".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -3445,6 +3870,8 @@ mod tests {
             name: name.to_string(),
             code: "return { dispatch: false };".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state,
             created_at: now_iso(),
             last_run_at: None,
@@ -3516,6 +3943,8 @@ mod tests {
             name: name.to_string(),
             code: "return { dispatch: false };".to_string(),
             delay_ms: 600_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -3831,6 +4260,8 @@ mod tests {
             name: "log-then-throw".to_string(),
             code: "console.log('made it here'); throw new Error('kaput');".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -4170,6 +4601,8 @@ mod tests {
             name: "rehydrated".to_string(),
             code: "return { dispatch: true, message: 'saw n=' + hookState.n };".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -4247,6 +4680,8 @@ mod tests {
             name: "survivor".to_string(),
             code: "return { dispatch: true, message: 'ran while disabled' };".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -4352,6 +4787,12 @@ mod tests {
         assert_eq!(clamp_ttl_ms(Some(-5)), MIN_HOOK_DELAY_MS);
         assert_eq!(clamp_ttl_ms(Some(300_000)), 300_000);
         assert_eq!(clamp_ttl_ms(Some(7_200_000)), 7_200_000);
+        // Cron-kind clamp: same floor, 7-day default and cap.
+        assert_eq!(clamp_cron_ttl_ms(None), MAX_CRON_HOOK_TTL_MS);
+        assert_eq!(clamp_cron_ttl_ms(Some(i64::MAX)), MAX_CRON_HOOK_TTL_MS);
+        assert_eq!(clamp_cron_ttl_ms(Some(0)), MIN_HOOK_DELAY_MS);
+        // A value over the 24h delay cap but under the cron cap survives.
+        assert_eq!(clamp_cron_ttl_ms(Some(2 * 86_400_000)), 2 * 86_400_000);
     }
 
     /// Milliseconds between a hook's `created_at` and `expires_at`.
@@ -4440,6 +4881,8 @@ mod tests {
             name: "short-ttl".to_string(),
             code: "return { dispatch: false };".to_string(),
             delay_ms: 600_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -4492,6 +4935,8 @@ mod tests {
             name: "expired-runnow".to_string(),
             code: "return { dispatch: true, message: 'must never run' };".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -4545,6 +4990,8 @@ mod tests {
                    }"
             .to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -4607,6 +5054,8 @@ mod tests {
                    }"
             .to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -4649,6 +5098,8 @@ mod tests {
             name: name.to_string(),
             code: "return { dispatch: false };".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -4754,6 +5205,8 @@ mod tests {
             name: "retired".to_string(),
             code: "return { dispatch: true, message: 'done' };".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Dispatched,
             created_at: now_iso(),
             last_run_at: None,
@@ -4793,6 +5246,8 @@ mod tests {
             name: "scoped".to_string(),
             code: "return { dispatch: false };".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,

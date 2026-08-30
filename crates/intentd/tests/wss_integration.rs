@@ -1457,6 +1457,8 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
             name: "retire-watchdog".to_string(),
             code: "return { dispatch: false };".to_string(),
             delay_ms: 600_000,
+            cron: None,
+            run_at: None,
             state: intent_core::HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,

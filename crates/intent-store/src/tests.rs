@@ -100,7 +100,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106
         ]
     );
     assert_eq!(
@@ -110,7 +110,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106
         ]
     );
 }
@@ -6017,6 +6017,8 @@ fn sample_hook(id: &HookId, ws: &WorkspaceId, agent: &AgentId, name: &str) -> Ho
         name: name.to_string(),
         code: "return { dispatch: false }".to_string(),
         delay_ms: 60_000,
+        cron: None,
+        run_at: None,
         state: HookState::Scheduled,
         created_at: now_iso(),
         last_run_at: None,
@@ -6064,6 +6066,52 @@ async fn hook_insert_get_round_trip() {
     let missing = HookId("hook-missing".to_string());
     let err = store.get_hook(&missing).await.expect_err("missing hook");
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+}
+
+/// Schedule-kind columns: `cron` / `run_at` round-trip when set, and a
+/// legacy row inserted without them (pre-0106 column list) reads back with
+/// both `None`.
+#[tokio::test]
+async fn hook_schedule_kind_columns_round_trip_and_legacy_null() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+
+    let cron_id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    let mut cron_hook = sample_hook(&cron_id, &ws, &agent, "cron-kind");
+    cron_hook.delay_ms = 0;
+    cron_hook.cron = Some("*/5 * * * *".to_string());
+    store.insert_hook(&cron_hook).await.expect("insert cron");
+    assert_eq!(store.get_hook(&cron_id).await.expect("get"), cron_hook);
+
+    let run_at_id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    let mut run_at_hook = sample_hook(&run_at_id, &ws, &agent, "run-at-kind");
+    run_at_hook.delay_ms = 0;
+    run_at_hook.run_at = Some("2027-01-02T03:04:05Z".to_string());
+    store.insert_hook(&run_at_hook).await.expect("insert runAt");
+    assert_eq!(store.get_hook(&run_at_id).await.expect("get"), run_at_hook);
+
+    // A legacy row (inserted without the 0106 columns) reads back null.
+    let legacy_id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    sqlx::query(
+        "INSERT INTO hook (hook_id, workspace_id, agent_id, name, code, delay_ms, state, \
+         created_at, run_count, perpetual, dispatch_count) \
+         VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, 0, 0, 0)",
+    )
+    .bind(&legacy_id.0)
+    .bind(&ws.0)
+    .bind(&agent.0)
+    .bind("legacy")
+    .bind("return { dispatch: false }")
+    .bind(60_000_i64)
+    .bind(now_iso())
+    .execute(store.write_pool())
+    .await
+    .expect("insert legacy row");
+    let legacy = store.get_hook(&legacy_id).await.expect("get legacy");
+    assert_eq!(legacy.cron, None);
+    assert_eq!(legacy.run_at, None);
+    assert_eq!(legacy.delay_ms, 60_000);
 }
 
 /// A perpetual hook round-trips its `perpetual` / `dispatch_count` columns,

@@ -10,7 +10,7 @@ use crate::Store;
 
 const COLUMNS: &str = "hook_id, workspace_id, agent_id, name, code, delay_ms, state, \
     created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, \
-    expires_at, perpetual, dispatch_count";
+    expires_at, perpetual, dispatch_count, cron, run_at";
 
 fn state_to_db(state: HookState) -> &'static str {
     match state {
@@ -61,6 +61,8 @@ fn hook_from_row(r: &SqliteRow) -> Result<Hook> {
         name: get("name")?,
         code: get("code")?,
         delay_ms: get_i64("delay_ms")?,
+        cron: get_opt("cron")?,
+        run_at: get_opt("run_at")?,
         state: state_from_db(&state)?,
         created_at: get("created_at")?,
         last_run_at: get_opt("last_run_at")?,
@@ -83,7 +85,8 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_hook(&self, h: &Hook) -> Result<()> {
         let sql = format!(
-            "INSERT INTO hook ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO hook ({COLUMNS}) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
         sqlx::query(&sql)
             .bind(&h.hook_id.0)
@@ -103,6 +106,8 @@ impl Store {
             .bind(&h.expires_at)
             .bind(i64::from(h.perpetual))
             .bind(h.dispatch_count)
+            .bind(&h.cron)
+            .bind(&h.run_at)
             .execute(self.write_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("insert hook failed: {e}")))?;
