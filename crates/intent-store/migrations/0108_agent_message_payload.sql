@@ -16,7 +16,7 @@
 -- The 0097 `thumbnails` column stops growing: new write-time thumbnail maps
 -- land here as `kind = 'thumbnails'` rows (`block_ordinal` -1 — the map is
 -- message-level, keyed internally by image ordinal). Reads fall back to the
--- legacy column for pre-0107 rows.
+-- legacy column for pre-0108 rows.
 --
 -- `body` holds the field's serialized JSON, zlib-compressed when that is
 -- smaller (`encoding = 'zlib'`), raw otherwise (`encoding = 'none'`).

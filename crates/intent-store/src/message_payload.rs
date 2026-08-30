@@ -1,4 +1,4 @@
-//! Heavy-payload extraction for `agent_message` (0107, intent-hq/intent#3884).
+//! Heavy-payload extraction for `agent_message` (0108, intent-hq/intent#3884).
 //!
 //! Multi-MB `tool_result.output` / `tool_use.input` bodies used to ride the
 //! `agent_message.content` JSON column. The write path now extracts any such
@@ -10,7 +10,7 @@
 //! serves straight from the content column with NO side-table access.
 //! Full-fidelity read paths splice the original body back (stripping the
 //! flags) before the content leaves the store, so their wire shapes are
-//! identical to pre-0107 behavior (`serde_json` maps serialize key-sorted, so
+//! identical to pre-0108 behavior (`serde_json` maps serialize key-sorted, so
 //! the flag round-trip is byte-invisible). Legacy rows (inline bodies, no
 //! side rows) hydrate as no-ops: splicing is driven purely by side-row
 //! presence.

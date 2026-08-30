@@ -10485,11 +10485,11 @@ async fn wss_agent_get_message_block_serves_full_block() {
     srv.ws.stop().await;
 }
 
-/// End-to-end 0107 heavy-payload round trip over the real WSS wire
+/// End-to-end 0108 heavy-payload round trip over the real WSS wire
 /// (intent-hq/intent#3884): a message whose tool bodies cross the extraction
 /// threshold is persisted with side-table rows and a slim-preview
 /// placeholder in the content column; the slim `agent.getConversation` read
-/// serves exactly the blocks a pre-0107 server would have produced by
+/// serves exactly the blocks a pre-0108 server would have produced by
 /// slimming the full body at serve time (shared transform — byte parity),
 /// and `agent.getMessageBlock` hydrates the FULL body back from the side
 /// table, byte-identical to what was appended.

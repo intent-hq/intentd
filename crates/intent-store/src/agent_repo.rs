@@ -2723,13 +2723,13 @@ fn encode_metadata(value: Option<&serde_json::Value>) -> Result<Option<String>> 
 const MESSAGE_COLUMNS: &str = "id, agent_id, seq, role, content, metadata, created_at";
 
 /// Insert-side alias of [`MESSAGE_COLUMNS`]. The 0097 `thumbnails` column is
-/// no longer written — write-time thumbnail maps land in the 0107
+/// no longer written — write-time thumbnail maps land in the 0108
 /// `agent_message_payload` side table instead (reads fall back to the legacy
-/// column for pre-0107 rows; see [`Store::get_agent_message_thumbnails`]).
+/// column for pre-0108 rows; see [`Store::get_agent_message_thumbnails`]).
 const MESSAGE_INSERT_COLUMNS: &str = MESSAGE_COLUMNS;
 
 /// Build the write-time thumbnail side-table row for `content` (0097 map,
-/// 0107 storage), or `None` when the message needs none. Generation failure
+/// 0108 storage), or `None` when the message needs none. Generation failure
 /// inside is non-fatal (logged per block); a serialization failure of the
 /// map itself is also non-fatal — thumbnails are an optimization, never
 /// worth failing the message write.
@@ -2776,7 +2776,7 @@ async fn thumbnails_payload_row(
 }
 
 /// Prepare one message content for persistence: the `content` column value
-/// (slim when any heavy body crossed the 0107 extraction threshold) plus the
+/// (slim when any heavy body crossed the 0108 extraction threshold) plus the
 /// `agent_message_payload` rows to insert alongside — extracted bodies and
 /// the write-time thumbnails map. Extraction + compression of a multi-MB
 /// body is CPU-bound, so like thumbnail generation it runs on a blocking
@@ -2957,7 +2957,7 @@ impl Store {
     /// `limit` `None` → no cap.
     ///
     /// Result `content` is served AS STORED — externalized heavy bodies
-    /// (0107 `agent_message_payload`) are NOT hydrated back, so a matching
+    /// (0108 `agent_message_payload`) are NOT hydrated back, so a matching
     /// message carries the write-time slim preview + `*Truncated`/`*Bytes`
     /// flags where a full body would be. Safe for today's caller (the
     /// service layer slims result content anyway, and heavy tool bodies are
@@ -3316,9 +3316,9 @@ impl Store {
             .map_err(|e| Error::Internal(format!("begin read snapshot failed: {e}")))
     }
 
-    /// Splice externalized heavy bodies (0107 `agent_message_payload`) back
+    /// Splice externalized heavy bodies (0108 `agent_message_payload`) back
     /// into `messages`' content — the full-fidelity read path's inverse of
-    /// the write-time extraction, so callers see pre-0107 wire shapes.
+    /// the write-time extraction, so callers see pre-0108 wire shapes.
     /// Cost is O(side rows for the fetched page): one bounded IN-list SELECT
     /// per 32k-id chunk, and legacy messages (no side rows) add zero decode
     /// work. A side row that fails to decode is skipped with a WARN — the
@@ -3611,7 +3611,7 @@ impl Store {
     /// Out-of-range windows (offset at/past the end, or an empty log) return
     /// an empty vec. Negative inputs are clamped to zero.
     ///
-    /// This is the FULL-FIDELITY page read: externalized heavy bodies (0107)
+    /// This is the FULL-FIDELITY page read: externalized heavy bodies (0108)
     /// are hydrated back. The default-slim conversation path must use
     /// [`Store::get_agent_messages_page_as_stored`] instead — slimming a
     /// hydrated page would decompress and materialize every multi-MB body
@@ -3634,7 +3634,7 @@ impl Store {
         Ok(messages)
     }
 
-    /// [`Store::get_agent_messages_page`] without 0107 payload hydration:
+    /// [`Store::get_agent_messages_page`] without 0108 payload hydration:
     /// content is served AS STORED, so a block whose heavy body was
     /// externalized carries the write-time slim preview +
     /// `*Truncated`/`*Bytes` flags in the body's position. That stored
@@ -3746,9 +3746,9 @@ impl Store {
     /// whose stored JSON fails to decode is skipped with a WARN (slim reads
     /// then degrade to data-omitted flags, same as a legacy row).
     ///
-    /// New (0107) maps live in `agent_message_payload` (`kind =
+    /// New (0108) maps live in `agent_message_payload` (`kind =
     /// 'thumbnails'`); the LEFT JOIN keeps serving the legacy 0097 column for
-    /// pre-0107 rows, side-table value winning when both exist.
+    /// pre-0108 rows, side-table value winning when both exist.
     ///
     /// # Errors
     ///
@@ -3856,7 +3856,7 @@ impl Store {
                 Error::Internal(format!("replace agent messages begin failed: {e}"))
             })?;
             // Cascade sweeps the old rows' agent_message_payload side rows;
-            // the 0107 AFTER DELETE trigger resolves the session through the
+            // the 0108 AFTER DELETE trigger resolves the session through the
             // denormalized agent_id, so conversation_bytes stays balanced.
             sqlx::query("DELETE FROM agent_message WHERE agent_id = ?")
                 .bind(&agent_id.0)
@@ -4721,10 +4721,10 @@ mod tests {
         );
     }
 
-    /// 0107 heavy-payload extraction: an over-threshold `tool_result.output`
+    /// 0108 heavy-payload extraction: an over-threshold `tool_result.output`
     /// / `tool_use.input` body is externalized into `agent_message_payload`
     /// (the stored `content` column carries a `null` placeholder) and every
-    /// read path splices it back — callers observe pre-0107 wire shapes.
+    /// read path splices it back — callers observe pre-0108 wire shapes.
     /// Under-threshold bodies stay inline with zero side rows. The FTS index
     /// (built from `m.content`) no longer sees externalized text.
     #[tokio::test]
@@ -4886,9 +4886,9 @@ mod tests {
         assert_eq!(hits.len(), 1, "inline text remains searchable");
     }
 
-    /// 0107 side rows follow the log's lifecycle: `replace_agent_messages`
+    /// 0108 side rows follow the log's lifecycle: `replace_agent_messages`
     /// cascades the old rows' payloads and re-extracts from the replacement
-    /// batch, and the incremental `conversation_bytes` counter (0103 + 0107
+    /// batch, and the incremental `conversation_bytes` counter (0103 + 0108
     /// triggers) never drifts from a from-scratch recount across append /
     /// replace / delete.
     #[tokio::test]
@@ -5002,7 +5002,7 @@ mod tests {
         assert_eq!(remaining, 0, "session delete cascades side rows");
     }
 
-    /// Legacy fallback: a pre-0107 row (inline heavy body, no side rows)
+    /// Legacy fallback: a pre-0108 row (inline heavy body, no side rows)
     /// reads back verbatim — hydration is a no-op driven purely by side-row
     /// presence — and a corrupt side row degrades that block to its stored
     /// slim preview instead of failing the read.
@@ -5082,7 +5082,7 @@ mod tests {
         );
     }
 
-    /// 0107 thumbnails storage: a new oversized-image append lands its
+    /// 0108 thumbnails storage: a new oversized-image append lands its
     /// thumbnail map in `agent_message_payload` (legacy `thumbnails` column
     /// stays NULL), while a legacy row with only the 0097 column still
     /// serves through the same getter.
@@ -10012,10 +10012,10 @@ mod tests {
             .append_agent_message(&with_tool, "system", &text("tail"), &ts)
             .await
             .expect("append system tail");
-        // Over the slim budget (2048) but under the 0107 extraction ceiling
+        // Over the slim budget (2048) but under the 0108 extraction ceiling
         // (4096): the input must stay INLINE — the 0098 backfill reads
         // `m.content` directly and in production only ever runs against
-        // pre-0107 (inline) rows, so an extracted body would not reproduce
+        // pre-0108 (inline) rows, so an extracted body would not reproduce
         // the migration-time shape.
         store
             .append_agent_message(

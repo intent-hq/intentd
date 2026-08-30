@@ -495,7 +495,7 @@ fn bind_json_value<'q>(
 
 /// Minimal standard-alphabet base64 encode (BLOB columns only; keeps
 /// intent-store free of a base64 dependency). Fires on every export of a
-/// session with 0107 `agent_message_payload` rows (externalized heavy
+/// session with 0108 `agent_message_payload` rows (externalized heavy
 /// bodies / write-time thumbnails, `body` BLOB); other transfer tables
 /// declare no BLOB columns.
 fn base64_encode(bytes: &[u8]) -> String {
@@ -730,7 +730,7 @@ mod tests {
             for row in rows.iter_mut() {
                 // Seed appends one user message with content "[]" (2 bytes)
                 // plus one 3-byte agent_message_payload body: the target's
-                // triggers (0103 + 0107) must have rebuilt exactly that.
+                // triggers (0103 + 0108) must have rebuilt exactly that.
                 assert_eq!(row["message_count"], 1, "counters rebuilt on target");
                 assert_eq!(row["assistant_message_count"], 0);
                 assert_eq!(row["conversation_bytes"], 5);
