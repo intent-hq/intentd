@@ -414,6 +414,16 @@ fn parse_schedule_kind(params: &Value) -> Result<ScheduleKind> {
             "hook.schedule: `runAt` must be in the future".into(),
         ));
     }
+    // The expiry is fire + grace; a timestamp at the date-range boundary
+    // (e.g. year 9999) would overflow that addition downstream.
+    if at
+        .checked_add(time::Duration::milliseconds(RUN_AT_GRACE_MS))
+        .is_none()
+    {
+        return Err(Error::InvalidParams(
+            "hook.schedule: `runAt` is too far in the future".into(),
+        ));
+    }
     let normalized = at
         .to_offset(time::UtcOffset::UTC)
         .format(&Rfc3339)
@@ -872,7 +882,14 @@ impl Services {
             (ScheduleKind::RunAt(at), _) => {
                 let fire = OffsetDateTime::parse(at, &Rfc3339)
                     .map_err(|e| Error::Internal(format!("parse validated runAt: {e}")))?;
-                (fire + time::Duration::milliseconds(RUN_AT_GRACE_MS))
+                // Overflow rejected by parse_schedule_kind; checked here too
+                // so a boundary timestamp can never panic.
+                fire.checked_add(time::Duration::milliseconds(RUN_AT_GRACE_MS))
+                    .ok_or_else(|| {
+                        Error::InvalidParams(
+                            "hook.schedule: `runAt` is too far in the future".into(),
+                        )
+                    })?
                     .format(&Rfc3339)
                     .unwrap_or_default()
             }
@@ -2492,6 +2509,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("must be in the future"), "{err}");
+        // Date-range boundary: fire + grace would overflow OffsetDateTime —
+        // a validation error, not a panic.
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "eon", "code": "return;", "runAt": "9999-12-31T23:59:59Z" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too far in the future"), "{err}");
         // A one-shot fire time contradicts `perpetual`.
         let err = svc
             .hook_schedule_op(
