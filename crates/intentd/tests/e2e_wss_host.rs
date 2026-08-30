@@ -767,6 +767,65 @@ async fn host_exec_over_wss() {
         "missing command ⇒ -32602: {err}"
     );
 
+    // 6) Symlink-aware cwd containment (intent-hq/intent#3847): a symlink
+    // INSIDE the workspace pointing OUTSIDE it passes the lexical guard, but
+    // the child would chdir through it — the canonicalize gate must reject
+    // it with the same -32603 containment error, while an in-workspace
+    // symlink cwd keeps working.
+    #[cfg(unix)]
+    {
+        let outside =
+            std::env::temp_dir().join(format!("itd-wss-exec-outside-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&outside).expect("mkdir outside dir");
+        std::os::unix::fs::symlink(&outside, root.join("escape")).expect("plant escape symlink");
+        let frame = json!({
+            "jsonrpc": "2.0", "id": 206, "method": "host.exec",
+            "params": {
+                "command": "pwd",
+                "cwd": "escape",
+                "workspaceId": ws_id,
+                "timeoutMs": 5000,
+            }
+        });
+        ws.send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+        let err = wss_expect_error(&mut ws, 206).await;
+        assert_eq!(
+            err["error"]["code"], -32603,
+            "symlinked cwd escape ⇒ -32603: {err}"
+        );
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("cwd outside workspace"),
+            "containment message on symlink escape: {err}"
+        );
+
+        // Control: an in-workspace symlink cwd still resolves and runs.
+        std::fs::create_dir_all(root.join("sub")).expect("mkdir sub");
+        std::os::unix::fs::symlink(root.join("sub"), root.join("alias")).expect("in-ws symlink");
+        let inside_link = wss_rpc(
+            &mut ws,
+            207,
+            "host.exec",
+            json!({
+                "command": "pwd",
+                "cwd": "alias",
+                "workspaceId": ws_id,
+                "timeoutMs": 5000,
+            }),
+        )
+        .await;
+        assert_eq!(
+            inside_link["exitCode"], 0,
+            "in-workspace symlink cwd ⇒ ok: {inside_link}"
+        );
+
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

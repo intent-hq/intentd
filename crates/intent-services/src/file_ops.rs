@@ -6,9 +6,12 @@
 //! bogus `workspaceId` cannot escape workspace containment
 //! (intent-hq/intent#3839). Every path is
 //! validated within that root via a lexical prefix check (Node's `path.resolve`
-//! then `startsWith`, no symlink resolution), and all access/IO failures
-//! surface as [`Error::Internal`] (-32603), matching the TS handler which
-//! wraps the builder errors in `INTERNAL_ERROR`.
+//! then `startsWith`), and all access/IO failures surface as
+//! [`Error::Internal`] (-32603), matching the TS handler which wraps the
+//! builder errors in `INTERNAL_ERROR`. On top of the TS-parity lexical check,
+//! a symlink-aware canonicalization gate re-verifies containment before any
+//! IO ([`enforce_symlink_containment`]; intent-hq/intent#3847) — the lexical
+//! check alone cannot see a symlink inside the workspace pointing outside it.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -140,14 +143,85 @@ pub(crate) fn workspace_relative(root: &str, path: &str) -> Option<String> {
     Some(crate::file_tracking::normalize_path(&rel.to_string_lossy()))
 }
 
-/// Resolve `rel` against `root` and enforce the within-workspace guard.
+/// Symlink-aware second containment gate (intent-hq/intent#3847), applied
+/// AFTER the lexical [`is_within`] check passes: the lexical guard cannot see
+/// symlinks, so a link inside the workspace pointing outside it would pass
+/// the prefix check while the OS follows it out of the root. Canonicalizes
+/// the root and the deepest existing ancestor of `full` (the leaf itself when
+/// it exists) and requires the canonical form to sit at or under the
+/// canonical root.
+///
+/// - `Path::starts_with` compares whole components, preserving `is_within`'s
+///   be-the-root-or-under-a-separator boundary (never a raw string prefix),
+///   and both operands go through `canonicalize`, keeping the comparison
+///   OS-consistent (on Windows both sides carry the same `\\?\` prefix).
+/// - Trailing non-existent components need no re-check of their own: they
+///   were lexically normalized by [`node_resolve`] (no `..`/`.` remain —
+///   re-rejected defensively below), so a new file/dir under a verified
+///   in-root parent cannot escape. This blocks writing THROUGH an
+///   out-of-root symlinked directory while allowing new-file creation.
+/// - An entry that exists but fails `canonicalize` (typically a broken
+///   symlink) fails closed: IO through it could still follow the link to an
+///   unverifiable target (e.g. `fs::write` would create the link's target).
+/// - An empty (or `/`, which trims to empty) root enforces nothing here,
+///   mirroring [`is_within`]'s empty-root TS parity — the fail-closed guards
+///   for empty roots live with the callers (see `read_chunk`).
+///
+/// Residual TOCTOU window (accepted, NOT a guarantee): this is a
+/// check-then-use gate — between the `canonicalize` here and the IO in the
+/// caller (`fs::write`, `create_dir_all`, `fs::rename`, …), a concurrently
+/// running local process could swap a verified in-root directory for an
+/// out-of-root symlink and the IO would follow it. Winning that race
+/// requires already having concurrent code execution on the daemon host,
+/// which is outside this guard's threat model (intent-hq/intent#3847 covers
+/// planted static symlinks, which this gate fully closes). Closing the race
+/// needs descriptor-anchored IO (`openat2(RESOLVE_BENEATH)` / `O_NOFOLLOW`
+/// per component), not more path checks.
+fn enforce_symlink_containment(root: &str, full: &Path) -> Result<()> {
+    let denied = || Error::Internal(ACCESS_DENIED.to_string());
+    if root.trim_end_matches(['/', '\\']).is_empty() {
+        return Ok(());
+    }
+    let canon_root = std::fs::canonicalize(root).map_err(|_| denied())?;
+    let mut probe = full.to_path_buf();
+    let canon = loop {
+        if let Ok(c) = std::fs::canonicalize(&probe) {
+            break c;
+        }
+        // Exists but won't canonicalize (broken symlink): fail closed.
+        if std::fs::symlink_metadata(&probe).is_ok() {
+            return Err(denied());
+        }
+        // A non-existent `..` leaf would re-escape the verified
+        // parent; node_resolve already removed these lexically.
+        if probe.file_name().is_none() {
+            return Err(denied());
+        }
+        if let Some(parent) = probe.parent().filter(|p| !p.as_os_str().is_empty()) {
+            probe = parent.to_path_buf();
+        } else {
+            return Err(denied());
+        }
+    };
+    if canon.starts_with(&canon_root) {
+        Ok(())
+    } else {
+        Err(denied())
+    }
+}
+
+/// Resolve `rel` against `root` and enforce the within-workspace guard:
+/// the lexical [`is_within`] check first, then the symlink-aware
+/// [`enforce_symlink_containment`] gate. Every `file.*` op routes through
+/// here (or replicates both checks), so the returned path is safe to hand
+/// to IO that follows symlinks.
 fn resolve_within(root: &str, rel: &str) -> Result<PathBuf> {
     let full = node_resolve(root, rel);
-    if is_within(root, &full) {
-        Ok(full)
-    } else {
-        Err(Error::Internal(ACCESS_DENIED.to_string()))
+    if !is_within(root, &full) {
+        return Err(Error::Internal(ACCESS_DENIED.to_string()));
     }
+    enforce_symlink_containment(root, &full)?;
+    Ok(full)
 }
 
 fn io_err(e: &std::io::Error) -> Error {
@@ -661,12 +735,12 @@ fn permissions_octal(_md: &std::fs::Metadata) -> String {
 }
 
 /// `file.rename` → `{ ok, oldPath, newPath, renamed: true, isDirectory }`.
+/// Both endpoints go through [`resolve_within`], so the symlink-aware gate
+/// covers the source and the destination (a rename through an out-of-root
+/// symlinked directory is denied on either side).
 pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value> {
-    let old_full = node_resolve(root, old_path);
-    let new_full = node_resolve(root, new_path);
-    if !is_within(root, &old_full) || !is_within(root, &new_full) {
-        return Err(Error::Internal(ACCESS_DENIED.to_string()));
-    }
+    let old_full = resolve_within(root, old_path)?;
+    let new_full = resolve_within(root, new_path)?;
     if !old_full.exists() {
         return Err(Error::Internal(format!(
             "Source file not found: {old_path}"
@@ -697,14 +771,14 @@ pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value
 /// Recursively list the regular files under `dir` (workspace-relative),
 /// returned as paths relative to `dir` itself, sorted. Used by the
 /// directory-rename attribution path (monorepo#957) to enumerate the moved
-/// tree. Enforces the same within-workspace guard as the other file ops
-/// (out-of-root dirs yield an empty list). Best-effort: unreadable entries
+/// tree. Enforces the same within-workspace guard as the other file ops —
+/// including the symlink-aware gate via [`resolve_within`] — with
+/// out-of-root dirs yielding an empty list. Best-effort: unreadable entries
 /// and symlinks (neither dir nor regular file without following) are skipped.
 pub(crate) fn walk_files(root: &str, dir: &str) -> Vec<String> {
-    let base = node_resolve(root, dir);
-    if !is_within(root, &base) {
+    let Ok(base) = resolve_within(root, dir) else {
         return Vec::new();
-    }
+    };
     let mut out = Vec::new();
     let mut stack = vec![base.clone()];
     while let Some(d) = stack.pop() {
@@ -1299,5 +1373,115 @@ mod tests {
         assert_eq!(s["isSymlink"], json!(true));
         assert_eq!(s["isFile"], json!(true));
         assert_eq!(s["size"], json!(3u64));
+    }
+
+    /// HIGH-severity regression (intent-hq/intent#3847): a symlink INSIDE the
+    /// workspace pointing OUTSIDE it passes the lexical `is_within` guard but
+    /// the OS follows it — every op must be stopped by the symlink-aware
+    /// gate with the containment `ACCESS_DENIED`, and the outside target must
+    /// be neither read nor written.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_rejected_for_all_ops() {
+        use std::os::unix::fs::symlink;
+        let outside = TempRoot::new();
+        let t = TempRoot::new();
+        let root = t.root();
+        std::fs::write(outside.path.join("secret.txt"), "secret").unwrap();
+        symlink(&outside.path, t.path.join("escape")).unwrap();
+        write(&root, "victim.txt", "x").unwrap();
+
+        for res in [
+            read(&root, "escape/secret.txt"),
+            write(&root, "escape/planted.txt", "x"),
+            write(&root, "escape/secret.txt", "clobbered"),
+            read_chunk(&root, "escape/secret.txt", 0, 16),
+            stat(&root, "escape/secret.txt"),
+            exists(&root, "escape/secret.txt"),
+            list(&root, "escape"),
+            tree(&root, "escape"),
+            delete(&root, "escape/secret.txt"),
+            mkdir(&root, "escape/newdir"),
+            rename(&root, "escape/secret.txt", "stolen.txt"),
+            rename(&root, "victim.txt", "escape/out.txt"),
+            rename(&root, "escape", "renamed-link"),
+        ] {
+            match res {
+                Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+                other => panic!("expected access denied, got {other:?}"),
+            }
+        }
+        // The outside directory is untouched: nothing read out is provable
+        // here, but nothing was written, moved, or created through the link.
+        assert_eq!(
+            std::fs::read_to_string(outside.path.join("secret.txt")).unwrap(),
+            "secret"
+        );
+        assert!(!outside.path.join("planted.txt").exists());
+        assert!(!outside.path.join("newdir").exists());
+        assert!(!outside.path.join("out.txt").exists());
+        // The attribution walker refuses the linked dir too.
+        assert!(walk_files(&root, "escape").is_empty());
+    }
+
+    /// A symlink leaf pointing directly at an outside FILE is rejected the
+    /// same way, and a BROKEN symlink pointing outside must not let a write
+    /// create the link's target (`fs::write` through a dangling link would).
+    #[cfg(unix)]
+    #[test]
+    fn symlink_file_leaf_and_broken_link_escapes_rejected() {
+        use std::os::unix::fs::symlink;
+        let outside = TempRoot::new();
+        let t = TempRoot::new();
+        let root = t.root();
+        std::fs::write(outside.path.join("host.txt"), "host").unwrap();
+        symlink(outside.path.join("host.txt"), t.path.join("leak.txt")).unwrap();
+        for res in [read(&root, "leak.txt"), write(&root, "leak.txt", "x")] {
+            match res {
+                Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+                other => panic!("expected access denied, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.path.join("host.txt")).unwrap(),
+            "host"
+        );
+
+        symlink(outside.path.join("never.txt"), t.path.join("dangle.txt")).unwrap();
+        match write(&root, "dangle.txt", "x") {
+            Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+            other => panic!("expected access denied, got {other:?}"),
+        }
+        assert!(!outside.path.join("never.txt").exists());
+    }
+
+    /// POSITIVE: symlinks whose targets stay INSIDE the workspace keep
+    /// working across the gate — reads and writes through an in-root dir
+    /// link resolve, and `stat` still reports `isSymlink` for in-root links.
+    #[cfg(unix)]
+    #[test]
+    fn in_workspace_symlinks_still_resolve() {
+        use std::os::unix::fs::symlink;
+        let t = TempRoot::new();
+        let root = t.root();
+        write(&root, "data/real.txt", "content").unwrap();
+        symlink(t.path.join("data"), t.path.join("alias")).unwrap();
+        assert_eq!(
+            read(&root, "alias/real.txt").unwrap(),
+            Value::String("content".to_string())
+        );
+        write(&root, "alias/new.txt", "via-link").unwrap();
+        assert_eq!(
+            read(&root, "data/new.txt").unwrap(),
+            Value::String("via-link".to_string())
+        );
+        assert_eq!(
+            exists(&root, "alias/real.txt").unwrap()["exists"],
+            json!(true)
+        );
+        symlink(t.path.join("data/real.txt"), t.path.join("file-link.txt")).unwrap();
+        let s = stat(&root, "file-link.txt").unwrap();
+        assert_eq!(s["isSymlink"], json!(true));
+        assert_eq!(s["isFile"], json!(true));
     }
 }
