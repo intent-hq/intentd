@@ -282,6 +282,10 @@ pub(crate) trait Harness: Send + Sync {
         run_count: i64,
         dispatch_count: i64,
     ) -> String;
+    /// One-shot `runAt` fire notice body (the timer fired and continued —
+    /// the hook is retired), with a `ws.hook.get("<hookId>")` pointer for
+    /// recovering the script.
+    fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String;
     /// FE-cancel notice body (`hook.cancel` with no agent caller).
     fn hook_cancelled_from_app_notice(&self) -> String;
     /// Archive-sweep cancel notice body.

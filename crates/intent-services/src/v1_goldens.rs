@@ -1015,6 +1015,19 @@ async fn golden_hook_expiry_notice_bytes() {
     );
 }
 
+/// One-shot `runAt` fired notice: exact bytes (fired wording, not the TTL
+/// expiry wording — the fire is the timer's purpose).
+#[test]
+fn golden_hook_run_at_fired_notice_bytes() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.hook_run_at_fired_notice("reminder", "hook-fire-1", "2026-01-02T03:04:05Z"),
+        "Your one-shot timer hook \"reminder\" (scheduled for 2026-01-02T03:04:05Z) fired and \
+         is now retired. Schedule a new hook via ws.hook.schedule if you need another timer — \
+         the original script is retrievable via ws.hook.get(\"hook-fire-1\")."
+    );
+}
+
 /// Hook eviction notice: exact bytes for a throwing run (failed-run wording
 /// + terminal note).
 #[tokio::test]

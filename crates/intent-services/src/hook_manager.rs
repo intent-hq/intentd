@@ -190,19 +190,63 @@ fn next_run_at_iso(delay_ms: i64) -> String {
         .unwrap_or_default()
 }
 
-/// Resumed countdown for a rehydrated hook: the EARLIER of the persisted
-/// `next_run_at` and a fresh `now + delay_ms` countdown, so a restart never
-/// pushes a run further out than it was already scheduled
-/// (intent-hq/monorepo#2856). Returns the timestamp to persist (the original
-/// string verbatim when the persisted deadline wins) and the time remaining
-/// until it — zero when overdue, so the run starts promptly, still gated by
-/// the scheduler task's pre-run expiry check. An absent or unparseable
-/// persisted deadline falls back to the fresh countdown. A row persisted as
-/// `Running` (daemon died mid-run) also gets the fresh countdown: its
-/// `next_run_at` is the deadline of the run that already STARTED
-/// ([`Services::execute_hook_run`] leaves it in place), so honoring it would
-/// immediately re-execute a potentially non-idempotent interrupted run.
+/// Time remaining until `deadline` as a scheduler sleep — zero when the
+/// deadline already passed, so the run starts promptly.
+fn duration_until(deadline: OffsetDateTime) -> Duration {
+    let remaining = deadline - OffsetDateTime::now_utc();
+    Duration::from_millis(u64::try_from(remaining.whole_milliseconds().max(0)).unwrap_or(u64::MAX))
+}
+
+/// Resumed countdown for a rehydrated hook, per schedule kind. Returns the
+/// timestamp to persist and the time remaining until it — zero when
+/// overdue, so the run starts promptly, still gated by the scheduler task's
+/// pre-run expiry check.
+///
+/// - `runAt`: the one-shot deadline is absolute — resume to it verbatim.
+///   This includes rows interrupted mid-run (`Running`): the timer never
+///   completed a run, and unlike the fixed cadence there is no later tick
+///   to defer to, so the interrupted fire re-runs (still bounded by the
+///   fire + grace `expiresAt`).
+/// - `cron`: a `Scheduled` row resumes to its persisted absolute deadline
+///   verbatim (the expression's next occurrence computed before the
+///   restart); an absent/unparseable deadline — and a row interrupted
+///   mid-run, whose persisted deadline belongs to the run that already
+///   started — recomputes from the expression.
+/// - `delayMs`: the EARLIER of the persisted `next_run_at` and a fresh
+///   `now + delay_ms` countdown, so a restart never pushes a run further
+///   out than it was already scheduled (intent-hq/monorepo#2856). An absent
+///   or unparseable persisted deadline falls back to the fresh countdown. A
+///   row persisted as `Running` (daemon died mid-run) also gets the fresh
+///   countdown: its `next_run_at` is the deadline of the run that already
+///   STARTED ([`Services::execute_hook_run`] leaves it in place), so
+///   honoring it would immediately re-execute a potentially non-idempotent
+///   interrupted run.
 fn resumed_next_run(hook: &Hook) -> (String, Duration) {
+    if let Some(at) = &hook.run_at {
+        let remaining = OffsetDateTime::parse(at, &Rfc3339).map_or(Duration::ZERO, duration_until);
+        return (at.clone(), remaining);
+    }
+    if let Some(expr) = &hook.cron {
+        // The recompute cannot fail in practice (the expression was
+        // validated at schedule time); the fallback resumes promptly and
+        // the post-run reschedule surfaces the error.
+        let recomputed = || {
+            parse_cron(expr)
+                .and_then(|c| cron_next_fire(&c))
+                .unwrap_or_else(|_| (next_run_at_iso(0), Duration::ZERO))
+        };
+        if hook.state == HookState::Running {
+            return recomputed();
+        }
+        return match hook
+            .next_run_at
+            .as_deref()
+            .and_then(|raw| Some((raw, OffsetDateTime::parse(raw, &Rfc3339).ok()?)))
+        {
+            Some((raw, persisted)) => (raw.to_string(), duration_until(persisted)),
+            None => recomputed(),
+        };
+    }
     let now = OffsetDateTime::now_utc();
     let fresh = now + time::Duration::milliseconds(hook.delay_ms.max(0));
     if hook.state == HookState::Running {
@@ -216,15 +260,7 @@ fn resumed_next_run(hook: &Hook) -> (String, Duration) {
         .as_deref()
         .and_then(|raw| Some((raw, OffsetDateTime::parse(raw, &Rfc3339).ok()?)))
     {
-        Some((raw, persisted)) if persisted < fresh => {
-            let remaining = persisted - now;
-            (
-                raw.to_string(),
-                Duration::from_millis(
-                    u64::try_from(remaining.whole_milliseconds().max(0)).unwrap_or(u64::MAX),
-                ),
-            )
-        }
+        Some((raw, persisted)) if persisted < fresh => (raw.to_string(), duration_until(persisted)),
         _ => (
             next_run_at_iso(hook.delay_ms),
             Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()),
@@ -398,14 +434,25 @@ fn kind_next_fire(kind: &ScheduleKind) -> Result<(String, Duration)> {
         ScheduleKind::RunAt(at) => {
             let deadline = OffsetDateTime::parse(at, &Rfc3339)
                 .map_err(|e| Error::Internal(format!("parse validated runAt: {e}")))?;
-            let remaining = deadline - OffsetDateTime::now_utc();
-            Ok((
-                at.clone(),
-                Duration::from_millis(
-                    u64::try_from(remaining.whole_milliseconds().max(0)).unwrap_or(u64::MAX),
-                ),
-            ))
+            Ok((at.clone(), duration_until(deadline)))
         }
+    }
+}
+
+/// Post-run next fire for a rescheduling hook: the `nextRunAt` to persist
+/// and the inter-run sleep. `delayMs` hooks tick their fixed cadence; cron
+/// hooks recompute the expression's next occurrence (strictly after now, so
+/// a run that overshoots a tick skips it rather than firing twice). Never
+/// called for `runAt` hooks — their fire is terminal. Errors only when a
+/// cron expression has no computable next occurrence (the schedule is
+/// exhausted).
+fn hook_next_fire(hook: &Hook) -> Result<(String, Duration)> {
+    match &hook.cron {
+        Some(expr) => cron_next_fire(&parse_cron(expr)?),
+        None => Ok((
+            next_run_at_iso(hook.delay_ms),
+            Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()),
+        )),
     }
 }
 
@@ -1347,14 +1394,16 @@ impl Services {
     /// and respawn its scheduler task. Rows whose owning agent is gone are
     /// cancelled instead of resumed; rows whose `expiresAt` passed while the
     /// daemon was down are expired (owner woken). `running` rows (daemon died
-    /// mid-run) are reset to `scheduled` and start a fresh `delayMs`
+    /// mid-run) are reset to `scheduled` with a kind-appropriate fresh
     /// countdown (their persisted `nextRunAt` is the started-run's deadline,
-    /// not a future schedule); every other resumed hook resumes the
-    /// EARLIER of its persisted `nextRunAt` and a fresh `now + delayMs`
-    /// countdown ([`resumed_next_run`] — a restart never pushes a run
-    /// further out, and an overdue row runs promptly, still gated by the
-    /// pre-run expiry check; intent-hq/monorepo#2856) and keeps its ORIGINAL
-    /// `expiresAt` (the TTL does not reset on restart).
+    /// not a future schedule); every other resumed hook resumes per its
+    /// schedule kind ([`resumed_next_run`] — `cron`/`runAt` rows resume to
+    /// their ABSOLUTE persisted deadline, `delayMs` rows to the EARLIER of
+    /// the persisted deadline and a fresh `now + delayMs` countdown, so a
+    /// restart never pushes a run further out, and an overdue row runs
+    /// promptly, still gated by the pre-run expiry check;
+    /// intent-hq/monorepo#2856) and keeps its ORIGINAL `expiresAt` (the TTL
+    /// does not reset on restart).
     /// `agentFeatures.backgroundHooks = false` does
     /// NOT cancel or skip active rows (decided semantics: the toggle only
     /// rejects NEW schedules; existing hooks run to their terminal
@@ -1441,22 +1490,21 @@ impl Services {
     /// The task deregisters itself from [`Services::hook_tasks`] on every
     /// exit path. The explicit first-iteration sleep: schedule passes the
     /// freshly computed time to the kind's next fire, and rehydration
-    /// passes the resumed countdown (which may be shorter than `delayMs`,
+    /// passes the resumed countdown (which may be shorter than the cadence,
     /// or zero for an overdue row) so the persisted `nextRunAt` is honored
-    /// across restarts; every later iteration sleeps the plain `delayMs`
-    /// cadence (scheduler-loop cron/runAt cadence semantics are the next
-    /// task).
+    /// across restarts; every later iteration sleeps the duration the
+    /// previous run computed for its kind ([`Services::execute_hook_run`] —
+    /// the fixed `delayMs` cadence or the cron expression's next
+    /// occurrence).
     fn spawn_hook_task_with_initial_delay(&self, hook: Hook, initial_delay: Option<Duration>) {
         let (control_tx, mut control_rx) = mpsc::channel::<HookControl>(4);
         let services = self.clone();
         let hook_id = hook.hook_id.clone();
         let join = tokio::spawn(async move {
             let mut hook = hook;
-            let mut initial_delay = initial_delay;
+            let mut delay = initial_delay
+                .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()));
             loop {
-                let delay = initial_delay
-                    .take()
-                    .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()));
                 // Race the inter-run sleep against the time to `expiresAt`
                 // (deadline-free legacy rows never take the expiry arm).
                 let to_expiry =
@@ -1490,9 +1538,13 @@ impl Services {
                     break;
                 }
                 match services.execute_hook_run(&mut hook).await {
-                    Ok(true) => {}
-                    // Terminal outcome (dispatch/evict): stop the loop.
-                    Ok(false) => break,
+                    // Rescheduled: sleep the duration the run computed for
+                    // its kind (fixed cadence, or the cron expression's
+                    // next occurrence).
+                    Ok(Some(next_delay)) => delay = next_delay,
+                    // Terminal outcome (dispatch/evict/one-shot fire): stop
+                    // the loop.
+                    Ok(None) => break,
                     // Unrecoverable store failure: the row may already be
                     // `running` with no task left to drive it — best-effort
                     // evict so it doesn't linger active-looking forever.
@@ -1513,15 +1565,17 @@ impl Services {
         );
     }
 
-    /// One scheduled run of `hook`'s script. Returns `Ok(true)` to keep the
-    /// loop alive (script continued), `Ok(false)` on a terminal outcome
-    /// (dispatched, evicted, or expired).
-    async fn execute_hook_run(&self, hook: &mut Hook) -> Result<bool> {
+    /// One scheduled run of `hook`'s script. Returns `Ok(Some(sleep))` to
+    /// keep the loop alive (script continued and the hook rescheduled —
+    /// `sleep` is the inter-run wait its kind computed), `Ok(None)` on a
+    /// terminal outcome (dispatched, evicted, expired, or a one-shot
+    /// `runAt` fire).
+    async fn execute_hook_run(&self, hook: &mut Hook) -> Result<Option<Duration>> {
         // A cancel can race the sleep expiry: re-read the persisted state and
         // stop silently if this hook is no longer active.
         match self.store.get_hook(&hook.hook_id).await {
             Ok(h) if matches!(h.state, HookState::Scheduled | HookState::Running) => {}
-            Ok(_) | Err(Error::NotFound(_)) => return Ok(false),
+            Ok(_) | Err(Error::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         }
         self.store
@@ -1554,8 +1608,30 @@ impl Services {
                 // In-flight-run-at-expiry: a run already executing when the
                 // TTL passes completes normally, but a continue at/after
                 // `expiresAt` expires the hook instead of rescheduling it
-                // (a dispatch still wins — see the Dispatch arm).
-                if is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms()) {
+                // (a dispatch still wins — see the Dispatch arm). A `runAt`
+                // fire that continues is likewise terminal — the one-shot
+                // timer has fired and there is no later tick — but retires
+                // with the fired notice, not the TTL wording. A cron
+                // schedule whose expression has no computable next
+                // occurrence is exhausted: expire it (owner woken) rather
+                // than leave the row active with no future fire.
+                let expired = is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms());
+                let next = if expired || hook.run_at.is_some() {
+                    None
+                } else {
+                    match hook_next_fire(hook) {
+                        Ok(next) => Some(next),
+                        Err(e) => {
+                            tracing::warn!(
+                                hook = %hook.hook_id.0,
+                                error = %e,
+                                "cron schedule exhausted; expiring hook"
+                            );
+                            None
+                        }
+                    }
+                };
+                let Some((next_run_at, next_delay)) = next else {
                     self.store
                         .update_hook_run(&hook.hook_id, &last_run_at, None)
                         .await?;
@@ -1571,10 +1647,13 @@ impl Services {
                     hook.run_count += 1;
                     hook.last_logs = logs;
                     self.emit_hook_event(HOOK_RUN_COMPLETED, hook, None).await;
-                    self.finish_expiry(hook).await;
-                    return Ok(false);
-                }
-                let next_run_at = next_run_at_iso(hook.delay_ms);
+                    if hook.run_at.is_some() && !expired {
+                        self.finish_run_at_fire(hook).await;
+                    } else {
+                        self.finish_expiry(hook).await;
+                    }
+                    return Ok(None);
+                };
                 self.store
                     .update_hook_run(&hook.hook_id, &last_run_at, Some(&next_run_at))
                     .await?;
@@ -1593,7 +1672,7 @@ impl Services {
                 hook.last_logs = logs;
                 self.emit_hook_event(HOOK_RUN_COMPLETED, hook, Some(next_run_at))
                     .await;
-                Ok(true)
+                Ok(Some(next_delay))
             }
             RunOutcome::Dispatch {
                 message,
@@ -1629,14 +1708,18 @@ impl Services {
                     // field reflects the real post-dispatch state rather than
                     // the transient `running` set at run start — matching the
                     // schedule-time validation path, which sets `state`
-                    // before emitting.
+                    // before emitting. An exhausted cron expression (no
+                    // computable next occurrence) expires the same way —
+                    // `perpetual` is rejected for `runAt`, so re-arming only
+                    // ever recomputes a delay or cron cadence.
                     let expired = is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms());
-                    if expired {
-                        self.store.expire_hook(&hook.hook_id).await?;
-                        hook.state = HookState::Expired;
-                        hook.next_run_at = None;
+                    let next = if expired {
+                        None
                     } else {
-                        let next_run_at = next_run_at_iso(hook.delay_ms);
+                        hook_next_fire(hook).ok()
+                    };
+                    let mut next_delay = None;
+                    if let Some((next_run_at, sleep)) = next {
                         self.store
                             .update_hook_next_run(&hook.hook_id, Some(&next_run_at))
                             .await?;
@@ -1645,18 +1728,23 @@ impl Services {
                             .await?;
                         hook.state = HookState::Scheduled;
                         hook.next_run_at = Some(next_run_at);
+                        next_delay = Some(sleep);
+                    } else {
+                        self.store.expire_hook(&hook.hook_id).await?;
+                        hook.state = HookState::Expired;
+                        hook.next_run_at = None;
                     }
                     self.emit_hook_event(HOOK_RUN_COMPLETED, hook, None).await;
                     let message = with_wake_logs(&message, hook.last_logs.as_deref());
                     self.wake_hook_owner(hook, &message, "dispatched").await;
                     self.emit_hook_event(HOOK_DISPATCHED, hook, None).await;
-                    if expired {
+                    let Some(next_delay) = next_delay else {
                         self.finish_expiry(hook).await;
-                        return Ok(false);
-                    }
+                        return Ok(None);
+                    };
                     self.emit_hook_event(HOOK_SCHEDULED, hook, hook.next_run_at.clone())
                         .await;
-                    return Ok(true);
+                    return Ok(Some(next_delay));
                 }
                 self.store
                     .increment_hook_dispatch_count(&hook.hook_id)
@@ -1679,7 +1767,7 @@ impl Services {
                 self.maybe_emit_display_status_changed(&hook.workspace_id)
                     .await;
                 self.maybe_emit_waiting_changed(&hook.workspace_id).await;
-                Ok(false)
+                Ok(None)
             }
             RunOutcome::Failed { error, logs } => {
                 self.store
@@ -1720,7 +1808,7 @@ impl Services {
                 self.maybe_emit_display_status_changed(&hook.workspace_id)
                     .await;
                 self.maybe_emit_waiting_changed(&hook.workspace_id).await;
-                Ok(false)
+                Ok(None)
             }
         }
     }
@@ -1847,6 +1935,27 @@ impl Services {
         // The last active hook settling can demote the derived displayStatus
         // (§6.5) and drop the `waiting` flag (§5.1) — best-effort,
         // transition-only emission.
+        self.maybe_emit_display_status_changed(&hook.workspace_id)
+            .await;
+        self.maybe_emit_waiting_changed(&hook.workspace_id).await;
+    }
+
+    /// Terminal tail for a `runAt` fire that continued (no dispatch): the
+    /// one-shot timer fired and is retired — same persisted terminal state
+    /// (`expired`) and event/wake plumbing as [`Services::finish_expiry`],
+    /// but the notice says the timer FIRED rather than that a TTL elapsed
+    /// (the fire is the hook's purpose, not a watchdog giving up). The
+    /// caller has already persisted `state = expired`.
+    async fn finish_run_at_fire(&self, hook: &Hook) {
+        self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
+        let notice = crate::harness::latest().hook_run_at_fired_notice(
+            &hook.name,
+            &hook.hook_id.0,
+            hook.run_at.as_deref().unwrap_or_default(),
+        );
+        let notice = with_wake_logs(&notice, hook.last_logs.as_deref());
+        self.wake_hook_owner(hook, &notice, "expired").await;
+        // Same settlement recompute as the expiry tail (§6.5 / §5.1).
         self.maybe_emit_display_status_changed(&hook.workspace_id)
             .await;
         self.maybe_emit_waiting_changed(&hook.workspace_id).await;
@@ -2168,6 +2277,20 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "timed out waiting for hook state; last = {:?}",
                 hook.state
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Poll until the hook's scheduler task deregisters itself — the
+    /// terminal state persists BEFORE the loop exits, so asserting
+    /// `!hook_task_alive` right after a state wait races the teardown.
+    async fn wait_for_task_exit(svc: &Services, id: &HookId) {
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        while svc.hook_task_alive(id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the scheduler task to exit"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -3989,6 +4112,75 @@ mod tests {
         );
     }
 
+    /// Kind-aware rehydration ([`resumed_next_run`]): `runAt` rows resume
+    /// to the ABSOLUTE one-shot deadline (verbatim, even when overdue or
+    /// interrupted mid-run — a `delay_ms` of 0 must never leak in as a
+    /// fresh countdown), and `cron` rows resume to the persisted absolute
+    /// deadline, recomputing from the expression only when the deadline is
+    /// absent/garbled or the row was interrupted mid-run.
+    #[test]
+    fn resumed_next_run_is_schedule_kind_aware() {
+        let (ws, owner) = (WorkspaceId::new(), AgentId::from("agent-hooks"));
+        let row = |cron: Option<&str>, run_at: Option<String>, next: Option<String>| {
+            let mut h = countdown_row(&ws, &owner, "kind", next, next_run_at_iso(MAX_HOOK_TTL_MS));
+            h.delay_ms = 0;
+            h.cron = cron.map(str::to_string);
+            h.run_at = run_at;
+            h
+        };
+
+        // runAt, future: absolute deadline verbatim, positive remaining.
+        let future = next_run_at_iso(60_000);
+        let hook = row(None, Some(future.clone()), Some(future.clone()));
+        let (next, delay) = resumed_next_run(&hook);
+        assert_eq!(next, future, "one-shot deadline kept verbatim");
+        assert!(delay > Duration::from_secs(30) && delay <= Duration::from_secs(60));
+
+        // runAt, overdue (fire passed while the daemon was down, still
+        // inside the grace window): resumes to the deadline with a prompt
+        // run — not `now + 0`-style drift.
+        let overdue = next_run_at_iso(-60_000);
+        let hook = row(None, Some(overdue.clone()), Some(overdue.clone()));
+        let (next, delay) = resumed_next_run(&hook);
+        assert_eq!(next, overdue);
+        assert_eq!(delay, Duration::ZERO, "overdue fire runs promptly");
+
+        // runAt interrupted mid-run: the timer never completed a run, so
+        // the deadline still stands (no fresh-cadence branch for one-shots).
+        let mut hook = row(None, Some(overdue.clone()), Some(overdue.clone()));
+        hook.state = HookState::Running;
+        let (next, delay) = resumed_next_run(&hook);
+        assert_eq!(next, overdue);
+        assert_eq!(delay, Duration::ZERO);
+
+        // cron, persisted deadline: resumes to it verbatim (overdue ⇒
+        // prompt run), not a recompute that would silently skip the tick.
+        let hook = row(Some("*/5 * * * *"), None, Some(overdue.clone()));
+        let (next, delay) = resumed_next_run(&hook);
+        assert_eq!(next, overdue, "persisted cron deadline kept verbatim");
+        assert_eq!(delay, Duration::ZERO);
+
+        // cron, no persisted deadline: recomputes from the expression —
+        // strictly in the future, within the 5-minute cadence.
+        let hook = row(Some("*/5 * * * *"), None, None);
+        let (next, delay) = resumed_next_run(&hook);
+        let parsed = OffsetDateTime::parse(&next, &Rfc3339).expect("recomputed deadline parses");
+        assert!(parsed > OffsetDateTime::now_utc() - time::Duration::seconds(1));
+        assert!(delay <= Duration::from_secs(300), "within the cadence");
+
+        // cron interrupted mid-run: the persisted deadline belongs to the
+        // run that already started — recompute instead of re-firing it.
+        let mut hook = row(Some("*/5 * * * *"), None, Some(overdue.clone()));
+        hook.state = HookState::Running;
+        let (next, _) = resumed_next_run(&hook);
+        assert_ne!(next, overdue, "interrupted tick's deadline dropped");
+        let parsed = OffsetDateTime::parse(&next, &Rfc3339).expect("recomputed deadline parses");
+        assert!(
+            parsed > OffsetDateTime::now_utc(),
+            "recomputed strictly in the future: {next}"
+        );
+    }
+
     /// A restart must not push a hook's countdown back: rehydration resumes
     /// with the EARLIER of the persisted `nextRunAt` and a fresh
     /// `now + delayMs` countdown (intent-hq/monorepo#2856), so a
@@ -4136,6 +4328,107 @@ mod tests {
         assert_eq!(expired.run_count, 1, "no run at/after expiry");
         assert!(expired.next_run_at.is_none());
         assert!(!svc.hook_task_alive(&hook.hook_id));
+    }
+
+    /// A cron hook's post-run reschedule recomputes the next fire from the
+    /// EXPRESSION — after a `runNow` just like a natural tick — instead of
+    /// ticking a fixed `delay_ms` cadence (which is 0 for cron rows and
+    /// would busy-loop the scheduler).
+    #[tokio::test]
+    async fn cron_run_reschedules_from_expression() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "cron-tick",
+                    "code": "return { dispatch: false };",
+                    "cron": "* * * * *",
+                }),
+            )
+            .await
+            .expect("schedule cron hook");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(hook.state, HookState::Scheduled);
+        let before = OffsetDateTime::now_utc();
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        // Wait on state too — `run_count` persists before the
+        // Running→Scheduled write (intent-hq/monorepo#3055).
+        let ran = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 2 && h.state == HookState::Scheduled
+        })
+        .await;
+        let next = OffsetDateTime::parse(ran.next_run_at.as_deref().unwrap(), &Rfc3339)
+            .expect("parse recomputed nextRunAt");
+        assert!(next > before, "strictly future: {next}");
+        assert!(
+            next <= before + time::Duration::seconds(121),
+            "the every-minute expression's next occurrence, not a stale or \
+             far-out deadline: {next}"
+        );
+        assert!(svc.hook_task_alive(&hook.hook_id), "task still alive");
+    }
+
+    /// A `runAt` fire that continues (no dispatch) is terminal: the one-shot
+    /// timer retires as `expired` with the FIRED notice — not the TTL
+    /// wording — and the task exits (no re-arm).
+    #[tokio::test]
+    async fn run_at_fire_without_dispatch_retires_hook() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Overdue-but-in-grace row (fire passed while the daemon was down):
+        // rehydration resumes it to the absolute deadline and the run starts
+        // promptly — the deterministic way to drive a one-shot fire without
+        // waiting out a real future timestamp.
+        let fire_at = next_run_at_iso(-5_000);
+        let mut hook = countdown_row(
+            &ws,
+            &owner,
+            "one-shot-timer",
+            Some(fire_at.clone()),
+            next_run_at_iso(RUN_AT_GRACE_MS - 5_000),
+        );
+        hook.delay_ms = 0;
+        hook.run_at = Some(fire_at);
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        let fired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
+        assert_eq!(fired.run_count, 2, "the fire ran exactly once");
+        assert!(fired.next_run_at.is_none(), "no re-arm after the fire");
+        wait_for_task_exit(&svc, &hook.hook_id).await;
+        let text = wait_for_wake(&svc, &owner, "fired and is now retired").await;
+        assert!(!text.contains("expired after reaching its TTL"), "{text}");
+        let types = hook_event_types(&svc, &ws, &[HOOK_RUN_COMPLETED, HOOK_EXPIRED]).await;
+        assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
+    }
+
+    /// A `runAt` fire that dispatches takes the normal one-shot dispatch
+    /// path: owner woken with the message + retired note, terminal
+    /// `dispatched` state.
+    #[tokio::test]
+    async fn run_at_fire_with_dispatch_wakes_owner() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let fire_at = next_run_at_iso(-5_000);
+        let mut hook = countdown_row(
+            &ws,
+            &owner,
+            "one-shot-dispatch",
+            Some(fire_at.clone()),
+            next_run_at_iso(RUN_AT_GRACE_MS - 5_000),
+        );
+        hook.delay_ms = 0;
+        hook.run_at = Some(fire_at);
+        hook.code = "return { dispatch: true, message: 'timer went off' };".to_string();
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        let fired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
+        assert_eq!(fired.dispatch_count, 1);
+        assert!(fired.next_run_at.is_none());
+        wait_for_task_exit(&svc, &hook.hook_id).await;
+        let text = wait_for_wake(&svc, &owner, "timer went off").await;
+        assert!(text.contains("now retired"), "{text}");
     }
 
     #[tokio::test]

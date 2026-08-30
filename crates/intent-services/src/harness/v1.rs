@@ -827,6 +827,14 @@ impl Harness for V1 {
         )
     }
 
+    fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String {
+        format!(
+            "Your one-shot timer hook \"{hook_name}\" (scheduled for {run_at}) fired and is \
+             now retired. Schedule a new hook via ws.hook.schedule if you need another timer \
+             — the original script is retrievable via ws.hook.get(\"{hook_id}\")."
+        )
+    }
+
     fn hook_cancelled_from_app_notice(&self) -> String {
         "This hook was cancelled from the app.".to_string()
     }
