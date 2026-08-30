@@ -12786,6 +12786,7 @@ impl SystemControl for WatchHealthControl {
                 total_roots: s.total_roots,
                 failed_roots: s.failed_roots,
             }),
+            update_supported: false,
         }
     }
     fn request_shutdown(&self) {}
