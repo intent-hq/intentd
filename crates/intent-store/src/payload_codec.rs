@@ -9,6 +9,15 @@
 //! [`decode_payload`] reverses the transform keyed by the row's `encoding`
 //! marker. Unknown markers fail loudly — they mean the row was written by a
 //! newer intentd with a codec this build does not know.
+//!
+//! [`externalize_content`] is the write-path entry point: it scans a message
+//! content array for heavy `tool_use.input` / `tool_result.output` bodies
+//! (strictly over the slim projection budget), replaces each in place with a
+//! [`payload_ref_marker`] envelope, and returns the [`PayloadRow`]s to insert
+//! alongside the message. The side-table row — keyed by
+//! `(message_id, block_ordinal, kind)` — is the source of truth on read; the
+//! marker is a self-describing hint carrying the body's byte size and a
+//! slim-budget preview so slim reads never touch the side table.
 
 use std::borrow::Cow;
 
@@ -33,6 +42,129 @@ pub const PAYLOAD_KIND_THUMBNAILS: &str = "thumbnails";
 /// Bodies below this size skip compression outright: the zstd frame overhead
 /// dominates and the write-lock benefit is nil for bodies this small.
 pub const PAYLOAD_COMPRESS_MIN_BYTES: usize = 512;
+
+/// Marker key of a reference envelope left in `agent_message.content` where
+/// an externalized body used to be. The value is [`PAYLOAD_REF_VERSION`].
+/// The marker is a self-describing hint only — the read path rehydrates from
+/// the `agent_message_payload` row keyed by `(message_id, block_ordinal,
+/// kind)`, so inline content that merely mimics this key can never address
+/// another message's payload.
+pub const PAYLOAD_REF_KEY: &str = "intentPayloadRef";
+
+/// Version stamped as the [`PAYLOAD_REF_KEY`] value. Bump when the envelope
+/// shape changes; readers treat unknown versions as an opaque body.
+pub const PAYLOAD_REF_VERSION: i64 = 1;
+
+/// A body is externalized only when its [`intent_core::slim_body_size`] is
+/// strictly over this bound (the slim projection budget): anything at or
+/// under it is served whole by slim reads anyway, and anything over it is
+/// exactly what slim previews — so the marker's embedded preview lets slim
+/// reads skip the side table entirely.
+pub const PAYLOAD_EXTERNALIZE_MIN_BYTES: usize = intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+
+/// One `agent_message_payload` row to insert alongside its message, produced
+/// by [`externalize_content`] (or the thumbnail write path). The body is
+/// already encoded — insert `encoding` + `body` verbatim.
+#[derive(Debug)]
+pub struct PayloadRow {
+    /// The block's 0-based index in the content array (`thumbnails` rows use
+    /// 0 — one map per message).
+    pub block_ordinal: i64,
+    /// `kind` column marker (one of the `PAYLOAD_KIND_*` constants).
+    pub kind: &'static str,
+    /// `encoding` column marker from [`encode_payload`].
+    pub encoding: &'static str,
+    /// The encoded body bytes.
+    pub body: Vec<u8>,
+}
+
+/// Encode a raw body into a [`PayloadRow`] via [`encode_payload`].
+#[must_use]
+pub fn payload_row(block_ordinal: i64, kind: &'static str, raw: &[u8]) -> PayloadRow {
+    let (encoding, stored) = encode_payload(raw);
+    PayloadRow {
+        block_ordinal,
+        kind,
+        encoding,
+        body: stored.into_owned(),
+    }
+}
+
+/// The reference envelope replacing an externalized field value:
+/// `{ "intentPayloadRef": 1, "kind": …, "bytes": …, "preview": … }` where
+/// `bytes` is the original body's [`intent_core::slim_body_size`] and
+/// `preview` is its [`intent_core::cap_json_value`] slim-budget preview —
+/// the same bound the serve-time slim projection applies, so slim reads can
+/// serve the marker's preview without touching the side table.
+#[must_use]
+pub fn payload_ref_marker(
+    kind: &str,
+    bytes: usize,
+    original: &serde_json::Value,
+) -> serde_json::Value {
+    let mut budget = intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    let mut marker = serde_json::Map::new();
+    marker.insert(PAYLOAD_REF_KEY.to_string(), PAYLOAD_REF_VERSION.into());
+    marker.insert("kind".to_string(), kind.into());
+    marker.insert("bytes".to_string(), bytes.into());
+    marker.insert(
+        "preview".to_string(),
+        intent_core::cap_json_value(original, &mut budget),
+    );
+    serde_json::Value::Object(marker)
+}
+
+/// Write-path externalization (intent-hq/intent#3884): scan a message
+/// content array for `tool_use` / `tool_result` blocks whose `input` /
+/// `output` body measures strictly over [`PAYLOAD_EXTERNALIZE_MIN_BYTES`],
+/// replace each such field value in place with a [`payload_ref_marker`],
+/// and return the encoded [`PayloadRow`]s to insert alongside the message
+/// (empty for the common light message — non-array content and light blocks
+/// pass through untouched). A body that fails to serialize is left inline
+/// (WARN) — externalization is an optimization, never worth failing the
+/// message write. Callers MUST run this (compression is CPU work) BEFORE
+/// opening the write transaction.
+#[must_use]
+pub fn externalize_content(content: &mut serde_json::Value) -> Vec<PayloadRow> {
+    let Some(blocks) = content.as_array_mut() else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for (ordinal, block) in blocks.iter_mut().enumerate() {
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
+        let (field, kind) = match obj.get("type").and_then(serde_json::Value::as_str) {
+            Some("tool_use") => ("input", PAYLOAD_KIND_TOOL_USE_INPUT),
+            Some("tool_result") => ("output", PAYLOAD_KIND_TOOL_RESULT_OUTPUT),
+            _ => continue,
+        };
+        let Some(body) = obj.get(field) else {
+            continue;
+        };
+        let bytes = intent_core::slim_body_size(body);
+        if bytes <= PAYLOAD_EXTERNALIZE_MIN_BYTES {
+            continue;
+        }
+        let raw = match serde_json::to_vec(body) {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!(
+                    ordinal,
+                    kind,
+                    error = %e,
+                    "serialize heavy block body failed; leaving it inline"
+                );
+                continue;
+            }
+        };
+        let ordinal_i64 = i64::try_from(ordinal).unwrap_or(i64::MAX);
+        let marker = payload_ref_marker(kind, bytes, body);
+        rows.push(payload_row(ordinal_i64, kind, &raw));
+        obj.insert(field.to_string(), marker);
+    }
+    rows
+}
 
 /// zstd compression level. Level 3 (the zstd default) compresses the highly
 /// repetitive JSON/text tool outputs several-fold while staying fast enough
@@ -178,6 +310,87 @@ mod tests {
     #[test]
     fn corrupt_zstd_frame_errors() {
         assert!(decode_payload(PAYLOAD_ENCODING_ZSTD, vec![0xde, 0xad, 0xbe, 0xef]).is_err());
+    }
+
+    /// Heavy `tool_use.input` / `tool_result.output` bodies are replaced by
+    /// versioned reference markers with correct ordinals/kinds, the payload
+    /// rows decode back to the exact original bodies, and light blocks /
+    /// text blocks pass through untouched.
+    #[test]
+    fn externalize_replaces_heavy_bodies_and_keeps_light_inline() {
+        let big_out = "output line\n".repeat(400);
+        let big_input = serde_json::json!({ "path": "/tmp/f", "content": "x".repeat(PAYLOAD_EXTERNALIZE_MIN_BYTES * 2) });
+        let mut content = serde_json::json!([
+            { "type": "text", "text": "hello" },
+            { "type": "tool_use", "id": "m:1", "name": "write_file", "input": big_input, "toolCallId": "t1" },
+            { "type": "tool_result", "toolCallId": "t1", "output": big_out },
+            { "type": "tool_result", "toolCallId": "t2", "output": "small" },
+        ]);
+        let rows = externalize_content(&mut content);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].block_ordinal, 1);
+        assert_eq!(rows[0].kind, PAYLOAD_KIND_TOOL_USE_INPUT);
+        assert_eq!(rows[1].block_ordinal, 2);
+        assert_eq!(rows[1].kind, PAYLOAD_KIND_TOOL_RESULT_OUTPUT);
+
+        // Payload rows decode back to the exact original field values.
+        let decoded_input =
+            decode_payload(rows[0].encoding, rows[0].body.clone()).expect("decode input");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&decoded_input).expect("json"),
+            big_input
+        );
+        let decoded_out =
+            decode_payload(rows[1].encoding, rows[1].body.clone()).expect("decode output");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&decoded_out).expect("json"),
+            serde_json::Value::String(big_out.clone())
+        );
+
+        // Heavy fields became markers; light ones stayed inline.
+        let blocks = content.as_array().expect("array");
+        assert_eq!(blocks[0]["text"], "hello");
+        let input_marker = &blocks[1]["input"];
+        assert_eq!(input_marker[PAYLOAD_REF_KEY], PAYLOAD_REF_VERSION);
+        assert_eq!(input_marker["kind"], PAYLOAD_KIND_TOOL_USE_INPUT);
+        assert!(input_marker["bytes"].as_u64().unwrap() > PAYLOAD_EXTERNALIZE_MIN_BYTES as u64);
+        assert_eq!(input_marker["preview"]["path"], "/tmp/f");
+        let out_marker = &blocks[2]["output"];
+        assert_eq!(out_marker[PAYLOAD_REF_KEY], PAYLOAD_REF_VERSION);
+        assert_eq!(out_marker["kind"], PAYLOAD_KIND_TOOL_RESULT_OUTPUT);
+        assert_eq!(
+            out_marker["bytes"].as_u64().unwrap(),
+            big_out.len() as u64,
+            "string bodies measured by raw length, matching slim_body_size"
+        );
+        assert_eq!(blocks[3]["output"], "small");
+        // The marker (envelope + slim preview) stays bounded well under the
+        // original body.
+        let marker_size = serde_json::to_vec(out_marker).expect("size").len();
+        assert!(
+            marker_size < PAYLOAD_EXTERNALIZE_MIN_BYTES * 2,
+            "marker stays bounded: {marker_size}"
+        );
+    }
+
+    /// Boundary + shape cases: an exactly-at-budget body stays inline
+    /// (strictly-over rule, matching the slim projection's `<=` serve-whole
+    /// check), non-array content and blockless/absent fields are untouched.
+    #[test]
+    fn externalize_boundary_and_shapes() {
+        let at_budget = "y".repeat(PAYLOAD_EXTERNALIZE_MIN_BYTES);
+        let mut content = serde_json::json!([
+            { "type": "tool_use", "id": "m:0", "name": "bash", "input": at_budget, "toolCallId": "t" },
+            { "type": "tool_use", "id": "m:1", "name": "noop", "toolCallId": "t2" },
+            "bare string block",
+        ]);
+        let before = content.clone();
+        assert!(externalize_content(&mut content).is_empty());
+        assert_eq!(content, before, "at-budget and inputless blocks untouched");
+
+        let mut bare = serde_json::json!("plain string message");
+        assert!(externalize_content(&mut bare).is_empty());
+        assert_eq!(bare, serde_json::json!("plain string message"));
     }
 
     /// Deleting an `agent_message` row cascades to its payload rows (0107

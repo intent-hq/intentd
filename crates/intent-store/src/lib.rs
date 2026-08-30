@@ -68,9 +68,10 @@ pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use payload_codec::{
-    decode_payload, encode_payload, PAYLOAD_COMPRESS_MIN_BYTES, PAYLOAD_ENCODING_NONE,
-    PAYLOAD_ENCODING_ZSTD, PAYLOAD_KIND_THUMBNAILS, PAYLOAD_KIND_TOOL_RESULT_OUTPUT,
-    PAYLOAD_KIND_TOOL_USE_INPUT,
+    decode_payload, encode_payload, externalize_content, payload_ref_marker, payload_row,
+    PayloadRow, PAYLOAD_COMPRESS_MIN_BYTES, PAYLOAD_ENCODING_NONE, PAYLOAD_ENCODING_ZSTD,
+    PAYLOAD_EXTERNALIZE_MIN_BYTES, PAYLOAD_KIND_THUMBNAILS, PAYLOAD_KIND_TOOL_RESULT_OUTPUT,
+    PAYLOAD_KIND_TOOL_USE_INPUT, PAYLOAD_REF_KEY, PAYLOAD_REF_VERSION,
 };
 pub use pr_monitor_repo::PrMonitorPollUpdate;
 pub use sandbox_repo::{Sandbox, SandboxStatus};

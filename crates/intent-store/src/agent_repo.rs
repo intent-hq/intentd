@@ -607,9 +607,10 @@ impl Store {
                 )
             })
             .collect();
-        // Thumbnail generation (CPU-bound image work) runs BEFORE the write
-        // transaction opens — never inside it or the retry closure.
-        let thumbnails = batch_thumbnails_col_values(&owned_messages).await;
+        // Externalization (compression) + thumbnail generation (CPU-bound
+        // image work) run BEFORE the write transaction opens — never inside
+        // it or the retry closure.
+        let forms = batch_message_persist_forms(&owned_messages).await?;
 
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
@@ -623,20 +624,16 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
-            let insert_sql = format!(
-                "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)"
-            );
+            let insert_sql =
+                format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
             let mut last_message_id: Option<String> = None;
-            for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
-                let content_json = serde_json::to_string(content)
-                    .map_err(|e| Error::Internal(format!("encode message content failed: {e}")))?;
+            for (idx, (role, _content, metadata, created_at)) in owned_messages.iter().enumerate() {
                 let metadata_json = match metadata {
                     Some(md) => Some(serde_json::to_string(md).map_err(|e| {
                         Error::Internal(format!("encode message metadata failed: {e}"))
                     })?),
                     None => None,
                 };
-                let thumbnails_json = thumbnails[idx].as_deref();
                 let id = Uuid::now_v7().to_string();
                 if role == "user" || role == "assistant" {
                     last_message_id = Some(id.clone());
@@ -646,13 +643,13 @@ impl Store {
                     .bind(&s.id.0)
                     .bind(i64::try_from(idx).unwrap_or(i64::MAX))
                     .bind(role)
-                    .bind(&content_json)
+                    .bind(&forms[idx].content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
-                    .bind(thumbnails_json)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
+                insert_payload_rows(&mut tx, &id, &forms[idx].payload_rows).await?;
             }
             let (assistant_preview, user_preview, last_message_role, last_tool_use) =
                 batch_preview_col_values(&owned_messages)?;
@@ -2723,60 +2720,108 @@ fn encode_metadata(value: Option<&serde_json::Value>) -> Result<Option<String>> 
 
 const MESSAGE_COLUMNS: &str = "id, agent_id, seq, role, content, metadata, created_at";
 
-/// Insert-side superset of [`MESSAGE_COLUMNS`]: message writes also persist
-/// the write-time image `thumbnails` map (0097, slim projection). Reads keep
-/// selecting [`MESSAGE_COLUMNS`] only — the full-fidelity read path never
-/// pays for the column; slim reads fetch it separately via
-/// [`Store::get_agent_message_thumbnails_page`].
-const MESSAGE_INSERT_COLUMNS: &str =
-    "id, agent_id, seq, role, content, metadata, created_at, thumbnails";
-
-/// Serialize the write-time thumbnail map for `content` (0097), or `None`
-/// when the message needs none. Generation failure inside is non-fatal
-/// (logged per block); a serialization failure of the map itself is also
-/// non-fatal — thumbnails are an optimization, never worth failing the
-/// message write.
-///
-/// Generation decodes + downscales + re-encodes the image (hundreds of ms of
-/// CPU for a multi-MB screenshot), so callers MUST await this BEFORE opening
-/// the write transaction / entering the `with_write_txn_retry` closure — never
-/// inside — and the work itself runs on a blocking thread, off the tokio
-/// worker. The cheap `needs_thumbnails` pre-check keeps the common
-/// no-oversized-image message free of the clone + thread hop.
-async fn thumbnails_col_value(content: &serde_json::Value) -> Option<String> {
-    if !crate::message_thumbnails::needs_thumbnails(content) {
-        return None;
-    }
-    let owned = content.clone();
-    let map = match tokio::task::spawn_blocking(move || {
-        crate::message_thumbnails::generate_message_thumbnails(&owned)
-    })
-    .await
-    {
-        Ok(map) => map?,
-        Err(e) => {
-            tracing::warn!(error = %e, "thumbnail generation task failed; persisting none");
-            return None;
-        }
-    };
-    match serde_json::to_string(&map) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(error = %e, "encode message thumbnails failed; persisting none");
-            None
-        }
-    }
+/// The storage forms of one message's content, computed BEFORE the write
+/// transaction opens (intent-hq/intent#3884): heavy `tool_use.input` /
+/// `tool_result.output` bodies and the write-time thumbnail map are
+/// externalized into `agent_message_payload` rows, so `content_json` — what
+/// lands in `agent_message.content` — carries bounded reference markers in
+/// their place. The 0097 `agent_message.thumbnails` column is no longer
+/// written (thumbnails ride the side table as `kind='thumbnails'` rows);
+/// it stays for legacy reads via [`Store::get_agent_message_thumbnails`].
+struct MessagePersistForms {
+    /// Serialized content with heavy bodies replaced by reference markers.
+    content_json: String,
+    /// `agent_message_payload` rows to insert alongside the message row.
+    payload_rows: Vec<crate::payload_codec::PayloadRow>,
 }
 
-/// [`thumbnails_col_value`] for a whole batch, positionally aligned with
+/// Compute [`MessagePersistForms`] for `content`: externalize heavy tool
+/// bodies (compression is CPU work) and generate + externalize the
+/// write-time thumbnail map (0097 layout, now stored as a
+/// `kind='thumbnails'` payload row at `block_ordinal` 0). Thumbnail
+/// generation decodes + downscales + re-encodes the image (hundreds of ms of
+/// CPU for a multi-MB screenshot) on a blocking thread, and generation /
+/// serialization failure is non-fatal (WARN) — thumbnails are an
+/// optimization, never worth failing the message write.
+///
+/// Callers MUST await this BEFORE opening the write transaction / entering
+/// the `with_write_txn_retry` closure — never inside — so a `SQLITE_BUSY`
+/// retry re-runs only the SQL, never the CPU work.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the (marker-carrying) content fails to
+/// serialize.
+async fn message_persist_forms(content: &serde_json::Value) -> Result<MessagePersistForms> {
+    let mut stored = content.clone();
+    let mut payload_rows = crate::payload_codec::externalize_content(&mut stored);
+    if crate::message_thumbnails::needs_thumbnails(content) {
+        let owned = content.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::message_thumbnails::generate_message_thumbnails(&owned)
+        })
+        .await
+        {
+            Ok(Some(map)) => match serde_json::to_vec(&map) {
+                Ok(raw) => payload_rows.push(crate::payload_codec::payload_row(
+                    0,
+                    crate::payload_codec::PAYLOAD_KIND_THUMBNAILS,
+                    &raw,
+                )),
+                Err(e) => {
+                    tracing::warn!(error = %e, "encode message thumbnails failed; persisting none");
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "thumbnail generation task failed; persisting none");
+            }
+        }
+    }
+    let content_json = serde_json::to_string(&stored)
+        .map_err(|e| Error::Internal(format!("encode message content failed: {e}")))?;
+    Ok(MessagePersistForms {
+        content_json,
+        payload_rows,
+    })
+}
+
+/// [`message_persist_forms`] for a whole batch, positionally aligned with
 /// `messages`. Awaited before the batch write transaction opens, so a
-/// `SQLITE_BUSY` retry re-runs only the SQL, never the image work.
-async fn batch_thumbnails_col_values(messages: &[OwnedBatchMessage]) -> Vec<Option<String>> {
+/// `SQLITE_BUSY` retry re-runs only the SQL, never the CPU work.
+async fn batch_message_persist_forms(
+    messages: &[OwnedBatchMessage],
+) -> Result<Vec<MessagePersistForms>> {
     let mut out = Vec::with_capacity(messages.len());
     for (_, content, _, _) in messages {
-        out.push(thumbnails_col_value(content).await);
+        out.push(message_persist_forms(content).await?);
     }
-    out
+    Ok(out)
+}
+
+/// Insert one message's `agent_message_payload` rows inside the message's
+/// own write transaction (0107): either the message and its payload rows all
+/// commit, or none do.
+async fn insert_payload_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: &str,
+    rows: &[crate::payload_codec::PayloadRow],
+) -> Result<()> {
+    for row in rows {
+        sqlx::query(
+            "INSERT INTO agent_message_payload (message_id, block_ordinal, kind, encoding, body) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(message_id)
+        .bind(row.block_ordinal)
+        .bind(row.kind)
+        .bind(row.encoding)
+        .bind(&row.body)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| Error::Internal(format!("insert agent message payload failed: {e}")))?;
+    }
+    Ok(())
 }
 
 /// SQL scalar expression extracting the searchable plain text of an
@@ -3088,8 +3133,6 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("next agent message seq failed: {e}")))?
         .get::<i64, _>("next");
-        let content_json = serde_json::to_string(content)
-            .map_err(|e| Error::Internal(format!("encode message content failed: {e}")))?;
         let metadata_json = match metadata {
             Some(m) => Some(
                 serde_json::to_string(m)
@@ -3110,38 +3153,38 @@ impl Store {
             Some(_) => last_tool_use_col_value(content)?,
             None => None,
         };
-        // Awaited before any write transaction below opens: thumbnail
-        // generation is CPU-bound image work and runs on a blocking thread.
-        let thumbnails_json = thumbnails_col_value(content).await;
-        let sql = format!(
-            "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)"
-        );
+        // Awaited before any write transaction below opens: externalization
+        // (compression) and thumbnail generation are CPU-bound and run off
+        // the transaction (thumbnails on a blocking thread).
+        let forms = message_persist_forms(content).await?;
+        let sql = format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
         match &preview_update {
-            None => {
+            None if forms.payload_rows.is_empty() => {
                 sqlx::query(&sql)
                     .bind(id)
                     .bind(&agent_id.0)
                     .bind(seq)
                     .bind(role)
-                    .bind(&content_json)
+                    .bind(&forms.content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
-                    .bind(thumbnails_json.as_deref())
                     .execute(self.write_pool())
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
             }
-            Some((column, value)) => {
+            preview_update => {
                 let pool = self.write_pool();
                 // A user/assistant append is by construction the session's
                 // newest message of any role, so `last_message_role` (0070),
                 // `last_message_id` (0088), and `last_tool_use_preview`
                 // (0098) are overwritten unconditionally alongside the
                 // preview.
-                let update_sql = format!(
-                    "UPDATE agent_session SET {column} = ?, last_message_role = ?, \
-                     last_message_id = ?, last_tool_use_preview = ? WHERE id = ?"
-                );
+                let update_sql = preview_update.as_ref().map(|(column, _)| {
+                    format!(
+                        "UPDATE agent_session SET {column} = ?, last_message_role = ?, \
+                         last_message_id = ?, last_tool_use_preview = ? WHERE id = ?"
+                    )
+                });
                 crate::with_write_txn_retry(|| async {
                     let mut tx = pool.begin().await.map_err(|e| {
                         Error::Internal(format!("append agent message begin failed: {e}"))
@@ -3151,26 +3194,30 @@ impl Store {
                         .bind(&agent_id.0)
                         .bind(seq)
                         .bind(role)
-                        .bind(&content_json)
+                        .bind(&forms.content_json)
                         .bind(metadata_json.as_deref())
                         .bind(created_at)
-                        .bind(thumbnails_json.as_deref())
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| {
                             Error::Internal(format!("append agent message failed: {e}"))
                         })?;
-                    sqlx::query(&update_sql)
-                        .bind(value.as_str())
-                        .bind(role)
-                        .bind(id)
-                        .bind(last_tool_use.as_deref())
-                        .bind(&agent_id.0)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            Error::Internal(format!("update session message preview failed: {e}"))
-                        })?;
+                    insert_payload_rows(&mut tx, id, &forms.payload_rows).await?;
+                    if let (Some(update_sql), Some((_, value))) = (&update_sql, preview_update) {
+                        sqlx::query(update_sql)
+                            .bind(value.as_str())
+                            .bind(role)
+                            .bind(id)
+                            .bind(last_tool_use.as_deref())
+                            .bind(&agent_id.0)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!(
+                                    "update session message preview failed: {e}"
+                                ))
+                            })?;
+                    }
                     tx.commit().await.map_err(|e| {
                         Error::Internal(format!("append agent message commit failed: {e}"))
                     })?;
@@ -3497,14 +3544,17 @@ impl Store {
             .collect()
     }
 
-    /// Read the persisted image-thumbnail maps (0097) for the message ids in
-    /// `message_ids`, keyed by message id. Only rows with a non-NULL
-    /// `thumbnails` column appear in the result — the common all-text page
-    /// returns an empty map. One bounded SELECT sized by the page (slim reads
-    /// only; the full-fidelity read path never calls this). Each value is the
-    /// stored JSON map `{"<image ordinal>": {"data", "mimeType"}}`; a row
-    /// whose stored JSON fails to decode is skipped with a WARN (slim reads
-    /// then degrade to data-omitted flags, same as a legacy row).
+    /// Read the persisted image-thumbnail maps for the message ids in
+    /// `message_ids`, keyed by message id — dual-layout (0107): new rows
+    /// store the map as a `kind='thumbnails'` `agent_message_payload` row,
+    /// legacy rows keep it in the 0097 `thumbnails` column (a message has
+    /// one or the other, never both; the payload row wins if forced). Rows
+    /// with neither are absent — the common all-text page returns an empty
+    /// map. Two bounded SELECTs sized by the page (slim reads only; the
+    /// full-fidelity read path never calls this). Each value is the stored
+    /// JSON map `{"<image ordinal>": {"data", "mimeType"}}`; a row whose
+    /// stored form fails to decode is skipped with a WARN (slim reads then
+    /// degrade to data-omitted flags, same as a pre-0097 row).
     ///
     /// # Errors
     ///
@@ -3543,6 +3593,43 @@ impl Store {
                         message = %id,
                         error = %e,
                         "decode message thumbnails failed; serving block with data omitted"
+                    );
+                }
+            }
+        }
+        let payload_sql = format!(
+            "SELECT p.message_id, p.encoding, p.body \
+             FROM agent_message_payload p \
+             JOIN agent_message m ON m.id = p.message_id \
+             WHERE m.agent_id = ? AND p.kind = ? AND p.message_id IN ({placeholders})"
+        );
+        let mut payload_query = sqlx::query(&payload_sql)
+            .bind(&agent_id.0)
+            .bind(crate::payload_codec::PAYLOAD_KIND_THUMBNAILS);
+        for id in message_ids {
+            payload_query = payload_query.bind(id);
+        }
+        let payload_rows = payload_query
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent message thumbnails failed: {e}")))?;
+        for row in &payload_rows {
+            let id: String = col(row, "message_id")?;
+            let encoding: String = col(row, "encoding")?;
+            let body: Vec<u8> = col(row, "body")?;
+            match crate::payload_codec::decode_payload(&encoding, body).and_then(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| {
+                    Error::Internal(format!("decode thumbnail payload JSON failed: {e}"))
+                })
+            }) {
+                Ok(v) => {
+                    map.insert(id, v);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        message = %id,
+                        error = %e,
+                        "decode message thumbnail payload failed; serving block with data omitted"
                     );
                 }
             }
@@ -3590,14 +3677,18 @@ impl Store {
                 .collect();
         let (assistant_preview, user_preview, last_message_role, last_tool_use) =
             batch_preview_col_values(&owned_messages)?;
-        // Thumbnail generation (CPU-bound image work) runs BEFORE the write
-        // transaction opens — never inside it or the retry closure.
-        let thumbnails = batch_thumbnails_col_values(&owned_messages).await;
+        // Externalization (compression) + thumbnail generation (CPU-bound
+        // image work) run BEFORE the write transaction opens — never inside
+        // it or the retry closure.
+        let forms = batch_message_persist_forms(&owned_messages).await?;
 
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("replace agent messages begin failed: {e}"))
             })?;
+            // The DELETE cascades to the old rows' agent_message_payload
+            // rows (0107 ON DELETE CASCADE), so the swap never orphans
+            // payloads.
             sqlx::query("DELETE FROM agent_message WHERE agent_id = ?")
                 .bind(&agent_id.0)
                 .execute(&mut *tx)
@@ -3607,39 +3698,34 @@ impl Store {
                 })?;
             let mut inserted = Vec::with_capacity(owned_messages.len());
             let mut last_message_id: Option<String> = None;
-            let insert_sql = format!(
-                "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)"
-            );
+            let insert_sql =
+                format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
             for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
                 let seq = i64::try_from(idx).unwrap_or(i64::MAX);
                 let id = Uuid::now_v7().to_string();
                 if role == "user" || role == "assistant" {
                     last_message_id = Some(id.clone());
                 }
-                let content_json = serde_json::to_string(content).map_err(|e| {
-                    Error::Internal(format!("encode replaced message content failed: {e}"))
-                })?;
                 let metadata_json = match metadata {
                     Some(md) => Some(serde_json::to_string(md).map_err(|e| {
                         Error::Internal(format!("encode replaced message metadata failed: {e}"))
                     })?),
                     None => None,
                 };
-                let thumbnails_json = thumbnails[idx].as_deref();
                 sqlx::query(&insert_sql)
                     .bind(&id)
                     .bind(&agent_id.0)
                     .bind(seq)
                     .bind(role)
-                    .bind(&content_json)
+                    .bind(&forms[idx].content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
-                    .bind(thumbnails_json)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| {
                         Error::Internal(format!("replace agent messages insert failed: {e}"))
                     })?;
+                insert_payload_rows(&mut tx, &id, &forms[idx].payload_rows).await?;
                 inserted.push(AgentMessage {
                     id,
                     agent_id: agent_id.clone(),
@@ -4379,14 +4465,14 @@ mod tests {
         }
     }
 
-    /// Write-time thumbnails (0097): appending a message with an oversized
-    /// image block persists a thumbnail map on the row, the page-scoped
-    /// getter returns it keyed by message id, and text-only / under-budget
-    /// rows persist NULL (absent from the getter's map). Legacy rows
-    /// (thumbnails column NULL) are simply absent — the slim read then
-    /// serves the block with data omitted.
+    /// Write-time thumbnails after 0107: appending a message with an
+    /// oversized image block persists the thumbnail map as a
+    /// `kind='thumbnails'` payload row (0097 JSON map layout) and leaves the
+    /// legacy `thumbnails` column NULL; text-only / under-budget rows
+    /// persist no payload row. The legacy column keeps serving pre-0107 rows
+    /// through the page-scoped getter.
     #[tokio::test]
-    async fn append_persists_image_thumbnails_and_page_getter_reads_them() {
+    async fn append_persists_image_thumbnails_to_side_table() {
         use base64::Engine as _;
         use intent_core::now_iso;
 
@@ -4437,23 +4523,55 @@ mod tests {
             .await
             .expect("append text message");
 
-        let ids = vec![with_image.id.clone(), text_only.id.clone()];
-        let thumbs = store
-            .get_agent_message_thumbnails(&agent_id, &ids)
-            .await
-            .expect("read thumbnails");
-        let entry = thumbs
-            .get(&with_image.id)
-            .expect("image row has a persisted thumbnail map");
-        let thumb = entry.get("0").expect("keyed by image ordinal");
+        // Legacy column stays NULL; the map lands in the side table.
+        let col: Option<String> =
+            sqlx::query_scalar("SELECT thumbnails FROM agent_message WHERE id = ?")
+                .bind(&with_image.id)
+                .fetch_one(store.write_pool())
+                .await
+                .expect("read thumbnails column");
+        assert!(col.is_none(), "0097 column no longer written");
+        let (encoding, body): (String, Vec<u8>) = sqlx::query_as(
+            "SELECT encoding, body FROM agent_message_payload \
+             WHERE message_id = ? AND kind = ? AND block_ordinal = 0",
+        )
+        .bind(&with_image.id)
+        .bind(crate::payload_codec::PAYLOAD_KIND_THUMBNAILS)
+        .fetch_one(store.write_pool())
+        .await
+        .expect("thumbnail payload row");
+        let decoded =
+            crate::payload_codec::decode_payload(&encoding, body).expect("decode thumbnails");
+        let map: serde_json::Value = serde_json::from_slice(&decoded).expect("thumbnail map json");
+        let thumb = map.get("0").expect("keyed by image ordinal");
         assert!(thumb
             .get("data")
             .and_then(serde_json::Value::as_str)
             .is_some());
-        assert!(
-            !thumbs.contains_key(&text_only.id),
-            "text-only row persists NULL and is absent from the map"
-        );
+        let text_only_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_payload WHERE message_id = ?")
+                .bind(&text_only.id)
+                .fetch_one(store.write_pool())
+                .await
+                .expect("count");
+        assert_eq!(text_only_rows, 0, "text-only row persists no payload rows");
+
+        // The legacy 0097 column still serves pre-0107 rows via the getter,
+        // and the same call serves the new payload-row layout.
+        sqlx::query("UPDATE agent_message SET thumbnails = ? WHERE id = ?")
+            .bind(r#"{"0":{"data":"bGVnYWN5","mimeType":"image/webp"}}"#)
+            .bind(&text_only.id)
+            .execute(store.write_pool())
+            .await
+            .expect("inject legacy thumbnails");
+        let thumbs = store
+            .get_agent_message_thumbnails(&agent_id, &[with_image.id.clone(), text_only.id.clone()])
+            .await
+            .expect("read thumbnails");
+        let entry = thumbs.get(&text_only.id).expect("legacy row served");
+        assert_eq!(entry.get("0").unwrap()["mimeType"], "image/webp");
+        let new_entry = thumbs.get(&with_image.id).expect("payload-row map served");
+        assert!(new_entry.get("0").unwrap().get("data").is_some());
         assert!(
             store
                 .get_agent_message_thumbnails(&agent_id, &[])
@@ -4461,6 +4579,295 @@ mod tests {
                 .expect("empty read")
                 .is_empty(),
             "empty id list short-circuits"
+        );
+    }
+
+    /// Write-path externalization (0107): heavy `tool_use.input` /
+    /// `tool_result.output` bodies land as compressed payload rows keyed by
+    /// (message, block ordinal, kind); the stored content keeps the block
+    /// envelope with a versioned reference marker in the field's place;
+    /// light bodies stay inline with no payload rows.
+    #[tokio::test]
+    async fn append_externalizes_heavy_tool_bodies() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-externalize");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-ext".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-ext".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        let big_out = "tool output line\n".repeat(500);
+        let heavy = store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([
+                    { "type": "text", "text": "running" },
+                    { "type": "tool_use", "id": "m:1", "name": "bash",
+                      "input": { "cmd": "ls" }, "toolCallId": "t1" },
+                    { "type": "tool_result", "toolCallId": "t1", "output": big_out },
+                ]),
+                &ts,
+            )
+            .await
+            .expect("append heavy message");
+        let light = store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([
+                    { "type": "tool_result", "toolCallId": "t2", "output": "ok" },
+                ]),
+                &ts,
+            )
+            .await
+            .expect("append light message");
+
+        // Stored content: envelope kept, heavy field replaced by the marker.
+        let raw: String = sqlx::query_scalar("SELECT content FROM agent_message WHERE id = ?")
+            .bind(&heavy.id)
+            .fetch_one(store.write_pool())
+            .await
+            .expect("read stored content");
+        assert!(
+            raw.len() < big_out.len(),
+            "stored row no longer carries the heavy body"
+        );
+        let stored: serde_json::Value = serde_json::from_str(&raw).expect("stored json");
+        assert_eq!(stored[0]["text"], "running");
+        assert_eq!(stored[1]["input"], serde_json::json!({ "cmd": "ls" }));
+        let marker = &stored[2]["output"];
+        assert_eq!(
+            marker[crate::payload_codec::PAYLOAD_REF_KEY],
+            crate::payload_codec::PAYLOAD_REF_VERSION
+        );
+        assert_eq!(
+            marker["kind"],
+            crate::payload_codec::PAYLOAD_KIND_TOOL_RESULT_OUTPUT
+        );
+        assert_eq!(marker["bytes"].as_u64().unwrap(), big_out.len() as u64);
+        assert!(marker["preview"].as_str().is_some());
+
+        // Payload row decodes back to the exact original body.
+        let (encoding, body): (String, Vec<u8>) = sqlx::query_as(
+            "SELECT encoding, body FROM agent_message_payload \
+             WHERE message_id = ? AND block_ordinal = 2 AND kind = ?",
+        )
+        .bind(&heavy.id)
+        .bind(crate::payload_codec::PAYLOAD_KIND_TOOL_RESULT_OUTPUT)
+        .fetch_one(store.write_pool())
+        .await
+        .expect("payload row");
+        let decoded = crate::payload_codec::decode_payload(&encoding, body).expect("decode");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&decoded).expect("json"),
+            serde_json::Value::String(big_out)
+        );
+
+        // Light message: inline content, no payload rows.
+        let light_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_payload WHERE message_id = ?")
+                .bind(&light.id)
+                .fetch_one(store.write_pool())
+                .await
+                .expect("count");
+        assert_eq!(light_rows, 0);
+        let light_raw: String =
+            sqlx::query_scalar("SELECT content FROM agent_message WHERE id = ?")
+                .bind(&light.id)
+                .fetch_one(store.write_pool())
+                .await
+                .expect("read light content");
+        let light_stored: serde_json::Value = serde_json::from_str(&light_raw).expect("light json");
+        assert_eq!(light_stored[0]["output"], "ok");
+
+        // Roles without a preview update (e.g. tool) still externalize.
+        let tool_role = store
+            .append_agent_message(
+                &agent_id,
+                "tool",
+                &serde_json::json!([
+                    { "type": "tool_result", "toolCallId": "t3",
+                      "output": "role line\n".repeat(500) },
+                ]),
+                &ts,
+            )
+            .await
+            .expect("append tool-role message");
+        let tool_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_payload WHERE message_id = ?")
+                .bind(&tool_role.id)
+                .fetch_one(store.write_pool())
+                .await
+                .expect("count");
+        assert_eq!(tool_rows, 1, "non-preview roles externalize too");
+    }
+
+    /// `replace_agent_messages` externalizes the replacement batch and the
+    /// delete+reinsert swap clears the old rows' payload rows atomically
+    /// (0107 cascade) — an empty replacement leaves zero payload rows.
+    /// `insert_agent_session_with_messages` (transcript import) externalizes
+    /// the same way.
+    #[tokio::test]
+    async fn replace_and_import_externalize_and_swap_payload_rows() {
+        use intent_core::now_iso;
+
+        async fn agent_payload_count(store: &Store, agent_id: &AgentId) -> i64 {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_message_payload p \
+                 JOIN agent_message m ON m.id = p.message_id WHERE m.agent_id = ?",
+            )
+            .bind(&agent_id.0)
+            .fetch_one(store.write_pool())
+            .await
+            .expect("count")
+        }
+
+        let tmp = TempDb::new("test-externalize-swap");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-ext-swap".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-ext-swap".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        let heavy_row = serde_json::json!([
+            { "type": "tool_result", "toolCallId": "t1", "output": "old body\n".repeat(500) },
+        ]);
+        store
+            .append_agent_message(&agent_id, "assistant", &heavy_row, &ts)
+            .await
+            .expect("append heavy");
+        assert_eq!(agent_payload_count(&store, &agent_id).await, 1);
+
+        // Replace with a new heavy batch: old payload rows gone, new ones in.
+        let replacement = serde_json::json!([
+            { "type": "tool_result", "toolCallId": "t2", "output": "new body\n".repeat(500) },
+        ]);
+        let inserted = store
+            .replace_agent_messages(
+                &agent_id,
+                &[ReplaceMessage {
+                    role: "assistant",
+                    content: &replacement,
+                    metadata: None,
+                    created_at: &ts,
+                }],
+            )
+            .await
+            .expect("replace");
+        assert_eq!(agent_payload_count(&store, &agent_id).await, 1);
+        let (message_id,): (String,) = sqlx::query_as(
+            "SELECT p.message_id FROM agent_message_payload p \
+             JOIN agent_message m ON m.id = p.message_id WHERE m.agent_id = ?",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.write_pool())
+        .await
+        .expect("payload row");
+        assert_eq!(
+            message_id, inserted[0].id,
+            "surviving payload row belongs to the replacement message"
+        );
+
+        // Empty replacement clears everything.
+        store
+            .replace_agent_messages(&agent_id, &[])
+            .await
+            .expect("replace empty");
+        assert_eq!(agent_payload_count(&store, &agent_id).await, 0);
+
+        // Transcript import externalizes too.
+        let import_id = AgentId("agent-ext-import".to_string());
+        let import_row = serde_json::json!([
+            { "type": "tool_result", "toolCallId": "t3", "output": "imported\n".repeat(500) },
+        ]);
+        store
+            .insert_agent_session_with_messages(
+                &baseline_test_session(&import_id, &ws_id, &ts, None),
+                &[ReplaceMessage {
+                    role: "assistant",
+                    content: &import_row,
+                    metadata: None,
+                    created_at: &ts,
+                }],
+            )
+            .await
+            .expect("import session with messages");
+        assert_eq!(agent_payload_count(&store, &import_id).await, 1);
+
+        // Session delete cascades transitively to payload rows.
+        store
+            .delete_agent_session(&ws_id, &import_id)
+            .await
+            .expect("delete session");
+        assert_eq!(agent_payload_count(&store, &import_id).await, 0);
+    }
+
+    /// FTS coherence across externalization: the indexed text of a message
+    /// is its blocks' `text` fields — tool bodies were never indexed — so a
+    /// message whose heavy output became a reference marker indexes exactly
+    /// the same text, and a token buried in an externalized output is not
+    /// searchable (as before).
+    #[tokio::test]
+    async fn externalized_content_keeps_fts_text_unchanged() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-externalize-fts");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-ext-fts".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-ext-fts".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([
+                    { "type": "text", "text": "zebratext marker here" },
+                    { "type": "tool_result", "toolCallId": "t1",
+                      "output": format!("zebraoutput {}", "filler line\n".repeat(500)) },
+                ]),
+                &ts,
+            )
+            .await
+            .expect("append heavy message");
+
+        let text_hits = store
+            .search_agent_messages_fts("zebratext", None, None, None, None, None)
+            .await
+            .expect("search text token");
+        assert_eq!(text_hits.len(), 1, "block text stays indexed");
+        let output_hits = store
+            .search_agent_messages_fts("zebraoutput", None, None, None, None, None)
+            .await
+            .expect("search output token");
+        assert!(
+            output_hits.is_empty(),
+            "tool bodies were never indexed; externalization preserves that"
         );
     }
 
