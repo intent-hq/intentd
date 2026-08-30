@@ -5434,12 +5434,14 @@ async fn wss_models_list_legacy_fresh_entry_served_and_forced_failure_stale() {
 async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
     // models.list legacy path staleness contract (§5.30) over the real WSS
     // transport: a NON-forced read whose persisted entry is past the 24h
-    // staleness threshold (fetchedAtMs: 0) re-probes; when the probe fails,
-    // the last-good list keeps being served labeled `stale: true` +
-    // `warning` — exactly `{ models, source, stale, warning }` with
-    // `source: "auggie"`, never a silent static fallback. The fake auggie
-    // appends to a counter file per invocation and always fails, making CLI
-    // spawns observable.
+    // staleness threshold (fetchedAtMs: 0) serves the last-good list
+    // immediately, labeled `stale: true` + `warning` — exactly
+    // `{ models, source, stale, warning }` with `source: "auggie"`, never a
+    // silent static fallback — while the refresh probe runs in the
+    // BACKGROUND (stale-while-revalidate, intent-hq/intent#3874); the failed
+    // probe then arms the negative window so subsequent reads do not
+    // re-spawn the CLI. The fake auggie appends to a counter file per
+    // invocation and always fails, making CLI spawns observable.
     use std::os::unix::fs::PermissionsExt;
     let dir = test_tempdir("intentd-wss-models-aged-");
     let count = dir.path().join("count");
@@ -5473,8 +5475,8 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
     )
     .await;
 
-    // Non-forced: the aged entry triggers a re-probe; the probe fails, so
-    // the last-good list is served with the degradation labels.
+    // Non-forced: the aged entry is served immediately with the degradation
+    // labels; the refresh probe runs in the background.
     let frame = r#"{"jsonrpc":"2.0","id":47,"method":"models.list"}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
     assert_eq!(resp["id"], 47);
@@ -5494,11 +5496,18 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
-    assert!(calls() > 0, "aged non-forced read must spawn the CLI");
+    // The detached background refresh spawns the CLI shortly after the
+    // response; poll until the counter file shows the spawn.
+    let mut waited = 0u32;
+    while calls() == 0 && waited < 200 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        waited += 1;
+    }
+    assert!(calls() > 0, "background refresh must spawn the CLI");
     let after_probe = calls();
 
     // Within the negative window: the stale last-good list keeps being
-    // served without re-spawning the CLI.
+    // served without re-spawning the CLI (no new background refresh).
     let frame = r#"{"jsonrpc":"2.0","id":48,"method":"models.list"}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
     assert_eq!(resp["id"], 48);
