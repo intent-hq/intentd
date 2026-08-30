@@ -23635,6 +23635,20 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_resolve_proposal(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        proposal_id: String,
+        outcome: String,
+        detail: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_resolve_proposal_op(workspace_id, agent_id, proposal_id, outcome, detail)
+                .await
+        })
+    }
+
     fn agent_mark_seen(
         &self,
         workspace_id: WorkspaceId,

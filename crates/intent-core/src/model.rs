@@ -2600,6 +2600,18 @@ pub const PENDING_QUESTIONS_MESSAGE_ID_KEY: &str = "pendingQuestionsMessageId";
 /// [`AgentSession::pending_proposals`].
 pub const PENDING_PROPOSALS_KEY: &str = "pendingProposals";
 
+/// Metadata key under which resolved-proposal outcomes are persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, `agent.resolveProposal`): a
+/// `proposalId -> "applied" | "dismissed"` map recording how each formerly
+/// pending proposal was resolved. Doubles as the durable idempotency marker
+/// for `agent.resolveProposal`: re-resolving an id that is no longer pending
+/// succeeds without a duplicate notice, across daemon restarts. A
+/// re-proposed id re-enters the pending list; its re-resolution overwrites
+/// the earlier outcome (latest wins). No schema migration — the map rides
+/// the existing free-form `metadata` column. Read back by
+/// [`AgentSession::proposal_resolutions`].
+pub const PROPOSAL_RESOLUTIONS_KEY: &str = "proposalResolutions";
+
 /// Metadata key under which the per-conversation seen marker is persisted on
 /// the `agent_session.metadata` JSON (PROTOCOL §5.5): the id of the newest
 /// transcript message the user has seen, advanced monotonically by
@@ -2939,6 +2951,26 @@ impl AgentSession {
             .unwrap_or_default()
     }
 
+    /// The resolved-proposal outcomes persisted under
+    /// [`PROPOSAL_RESOLUTIONS_KEY`] in the session's free-form `metadata`:
+    /// a `proposalId -> "applied" | "dismissed"` map. Malformed entries
+    /// (non-string outcomes, empty ids) are skipped defensively; absent key
+    /// or a non-object value reads as an empty map.
+    pub fn proposal_resolutions(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PROPOSAL_RESOLUTIONS_KEY))
+            .and_then(serde_json::Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(id, outcome)| !id.is_empty() && outcome.is_string())
+                    .map(|(id, outcome)| (id.clone(), outcome.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The per-conversation seen marker persisted under
     /// [`LAST_SEEN_MESSAGE_ID_KEY`] in the session's free-form `metadata`:
     /// `Some` only when the metadata is an object carrying a non-empty string
@@ -3058,6 +3090,13 @@ pub struct AgentMetadata {
     /// turns stay pending together. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_proposals: Vec<PendingProposal>,
+    /// Resolved-proposal outcomes (PROTOCOL §5.5, `agent.resolveProposal`):
+    /// a `proposalId -> "applied" | "dismissed"` map recording how each
+    /// formerly pending proposal was resolved, mirroring
+    /// [`AgentSession::proposal_resolutions`]. Clients render resolved
+    /// transcript proposal cards from it. Omitted when empty.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub proposal_resolutions: serde_json::Map<String, serde_json::Value>,
     /// Per-conversation seen marker (PROTOCOL §5.5): the id of the newest
     /// transcript message the user has seen, advanced monotonically by
     /// `agent.markSeen`. Clients position the "New messages" divider right
@@ -3308,6 +3347,7 @@ impl AgentLite {
                 .to_string()
         });
         let pending_proposals = session.pending_proposals();
+        let proposal_resolutions = session.proposal_resolutions();
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
@@ -3328,6 +3368,7 @@ impl AgentLite {
             dismissed_questions_message_id,
             pending_questions_message_id,
             pending_proposals,
+            proposal_resolutions,
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,

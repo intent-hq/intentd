@@ -1189,4 +1189,21 @@ impl Harness for V1 {
              your turn and wait for the user's next message."
         )
     }
+
+    fn proposal_applied_notice(&self, title: &str, detail: Option<&str>) -> String {
+        let mut notice = format!("User applied the proposal '{title}'.");
+        if let Some(detail) = detail {
+            notice.push(' ');
+            notice.push_str(detail);
+        }
+        notice
+    }
+
+    fn proposal_dismissed_notice(&self, title: &str) -> String {
+        format!(
+            "User dismissed the proposal '{title}' without applying it. This is \
+             an informative notice only — do not re-propose it; continue with \
+             your other work or end your turn."
+        )
+    }
 }

@@ -840,6 +840,7 @@ mod tests {
                 dismissed_questions_message_id: None,
                 pending_questions_message_id: None,
                 pending_proposals: Vec::new(),
+                proposal_resolutions: serde_json::Map::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
