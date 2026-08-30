@@ -12262,6 +12262,33 @@ impl Services {
             .is_some_and(|q| q.iter().any(|m| !m.editing && m.user_origin))
     }
 
+    /// `true` iff at least one ready-to-send user-origin entry was queued at
+    /// or after `since` (RFC-3339). The archived-drain exemption uses this so
+    /// only a user send made INTO the archived workspace — the explicit
+    /// resurrection signal — releases the park (intent-hq/intent#3883): a
+    /// user entry parked by a busy race BEFORE archival must stay parked with
+    /// everything else, or the interrupted worker's end-of-turn re-kick would
+    /// auto-unarchive a freshly archived workspace with no post-archive user
+    /// action. An entry with an unparseable `queued_at` never matches; an
+    /// unparseable `since` falls back to [`Self::has_user_origin_ready`]
+    /// (fail open — a row without a usable `archivedAt` cannot be compared).
+    pub(crate) fn has_user_origin_ready_since(&self, agent_id: &AgentId, since: &str) -> bool {
+        let Some(cutoff) = parse_iso(since) else {
+            return self.has_user_origin_ready(agent_id);
+        };
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .is_some_and(|q| {
+                q.iter().any(|m| {
+                    !m.editing
+                        && m.user_origin
+                        && parse_iso(&m.queued_at).is_some_and(|t| t >= cutoff)
+                })
+            })
+    }
+
     /// The `turn_id` of the oldest **ready-to-send** queued message, without
     /// removing it (the same entry [`Services::dequeue_message`] would pop).
     /// `agent.retry` reads it before kicking the drain so its RPC response
