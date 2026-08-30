@@ -10438,6 +10438,161 @@ async fn wss_agent_get_message_block_serves_full_block() {
     srv.ws.stop().await;
 }
 
+/// End-to-end 0107 heavy-payload round trip over the real WSS wire
+/// (intent-hq/intent#3884): a message whose tool bodies cross the extraction
+/// threshold is persisted with side-table rows and a slim-preview
+/// placeholder in the content column; the slim `agent.getConversation` read
+/// serves exactly the blocks a pre-0107 server would have produced by
+/// slimming the full body at serve time (shared transform — byte parity),
+/// and `agent.getMessageBlock` hydrates the FULL body back from the side
+/// table, byte-identical to what was appended.
+#[tokio::test]
+async fn wss_extracted_payload_round_trip_slim_and_full() {
+    use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Extract"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Extract"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // Bodies well past the 4 KiB extraction threshold (and the 2 KiB slim
+    // budget), plus an under-threshold body that must stay inline.
+    let big_in = "i".repeat(64 * 1024);
+    let big_out = "o".repeat(64 * 1024);
+    let content = json!([
+        { "type": "tool_use", "id": "b:0", "name": "bash", "toolCallId": "tc-1",
+          "input": { "cmd": big_in } },
+        { "type": "tool_result", "id": "b:1", "tool_use_id": "tc-1",
+          "output": big_out, "is_error": false },
+        { "type": "tool_result", "id": "b:2", "tool_use_id": "tc-2",
+          "output": "small", "is_error": false },
+    ]);
+    let row_id = srv
+        .store
+        .append_agent_message(&agent, "assistant", &content, &now_iso())
+        .await
+        .expect("append message")
+        .id;
+
+    // The write path externalized exactly the two heavy bodies, and the
+    // stored content column is bounded — no multi-KB body inline.
+    let side_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_payload WHERE message_id = ?")
+            .bind(&row_id)
+            .fetch_one(srv.store.read_pool())
+            .await
+            .expect("count side rows");
+    assert_eq!(side_rows, 2, "both heavy bodies externalized");
+    let stored_len: i64 =
+        sqlx::query_scalar("SELECT LENGTH(content) FROM agent_message WHERE id = ?")
+            .bind(&row_id)
+            .fetch_one(srv.store.read_pool())
+            .await
+            .expect("stored content length");
+    assert!(
+        stored_len < 8 * 1024,
+        "stored column is bounded, got {stored_len} bytes"
+    );
+
+    // Slim read (the v8.0 default): served straight from the stored column,
+    // byte-identical to slimming the full bodies at serve time.
+    let conv = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let msg = conv["result"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"].as_str() == Some(row_id.as_str()))
+        .expect("appended message served");
+    let blocks = msg["contentBlocks"].as_array().expect("content blocks");
+    assert_eq!(blocks[0]["inputTruncated"], json!(true));
+    assert_eq!(
+        blocks[0]["inputBytes"],
+        json!(intent_core::slim_body_size(&content[0]["input"]))
+    );
+    let preview = blocks[0]["input"]["cmd"].as_str().expect("input preview");
+    assert!(big_in.starts_with(preview) && preview.len() < big_in.len());
+    assert_eq!(blocks[1]["outputTruncated"], json!(true));
+    assert_eq!(blocks[1]["outputBytes"], json!(big_out.len()));
+    let preview = blocks[1]["output"].as_str().expect("output preview");
+    assert!(big_out.starts_with(preview) && preview.len() < big_out.len());
+    assert!(preview.len() <= SLIM_PROJECTION_BUDGET_BYTES);
+    // The under-threshold body is served whole, no flags.
+    assert_eq!(blocks[2]["output"], "small");
+    assert!(blocks[2].get("outputTruncated").is_none());
+    // Byte parity with the serve-time transform on the full body.
+    let mut served_like = content.clone();
+    for (i, field, tflag, bflag) in [
+        (0, "input", "inputTruncated", "inputBytes"),
+        (1, "output", "outputTruncated", "outputBytes"),
+    ] {
+        drop(intent_core::slim_heavy_body(
+            &mut served_like[i],
+            field,
+            tflag,
+            bflag,
+            SLIM_PROJECTION_BUDGET_BYTES,
+        ));
+    }
+    assert_eq!(
+        &json!(blocks),
+        &served_like,
+        "stored placeholder equals serve-time slim of the full body"
+    );
+
+    // Full-fidelity read: agent.getMessageBlock hydrates the original body
+    // back from the side table, byte-identical, no flags.
+    for (block_id, field, want) in [("b:0", "input", None), ("b:1", "output", Some(&big_out))] {
+        let got = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{row_id}","blockId":"{block_id}"}}}}"#
+            ),
+        )
+        .await;
+        let block = &got["result"]["block"];
+        match want {
+            Some(s) => assert_eq!(block[field].as_str(), Some(s.as_str())),
+            None => assert_eq!(block[field]["cmd"].as_str(), Some(big_in.as_str())),
+        }
+        assert!(
+            block.get(format!("{field}Truncated")).is_none(),
+            "hydrated block carries no slim flags: {block}"
+        );
+    }
+
+    srv.ws.stop().await;
+}
+
 /// `agent.listUserMessages` over the real WSS wire (§5.5): all user-role
 /// messages of one agent as lightweight index items, oldest→newest —
 /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }`.

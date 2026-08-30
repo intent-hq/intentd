@@ -5,11 +5,13 @@
 -- transcript read decoded) the whole blob. Bodies whose size exceeds the
 -- inline ceiling (`message_payload::PAYLOAD_INLINE_MAX_BYTES`) are now
 -- extracted into this table at write time — the content array keeps the
--- block envelope with a NULL placeholder in the field's position — and
--- spliced back transparently on every read path, so wire shapes are
--- unchanged. Small bodies stay inline (no join for tiny blocks). Legacy rows
--- (inline bodies, no side rows) are NOT backfilled and keep reading as-is:
--- hydration is driven purely by side-row presence.
+-- block envelope with a slim-projection preview plus `*Truncated`/`*Bytes`
+-- flags in the field's position, so a slim page read serves straight from
+-- the content column with NO side-table access — and full-fidelity reads
+-- splice the body back (stripping the flags) transparently, so wire shapes
+-- are unchanged. Small bodies stay inline (no join for tiny blocks). Legacy
+-- rows (inline bodies, no side rows) are NOT backfilled and keep reading
+-- as-is: hydration is driven purely by side-row presence.
 --
 -- The 0097 `thumbnails` column stops growing: new write-time thumbnail maps
 -- land here as `kind = 'thumbnails'` rows (`block_ordinal` -1 — the map is
@@ -24,20 +26,32 @@
 -- message row is deleted its payload rows cascade AFTER the parent row is
 -- gone, so a `SELECT agent_id FROM agent_message WHERE id = old.message_id`
 -- would find nothing and `conversation_bytes` would drift upward on every
--- `agent.replaceMessages` swap.
+-- `agent.replaceMessages` swap. The composite FK below ties the pair
+-- `(message_id, agent_id)` to the SAME `agent_message` row (backed by the
+-- unique index on `agent_message(id, agent_id)`), so the database itself
+-- rejects a payload row whose denormalized `agent_id` names a different
+-- session than the message it attaches to — hydration and the triggers can
+-- never disagree about ownership.
 --
 -- Transfer: rides the archive (see `TRANSFER_TABLES`), scoped through
 -- `agent_id` like `agent_message`; BLOB bodies serialize as `$base64`
 -- objects in `rows/<table>.jsonl`.
 
+-- Parent key for the composite FK (SQLite requires the referenced column
+-- pair to be collectively unique; `id` alone is the PK, so this index is a
+-- superset and cheap).
+CREATE UNIQUE INDEX idx_agent_message_id_agent ON agent_message(id, agent_id);
+
 CREATE TABLE agent_message_payload (
-  message_id    TEXT NOT NULL REFERENCES agent_message(id) ON DELETE CASCADE,
+  message_id    TEXT NOT NULL,
   agent_id      TEXT NOT NULL REFERENCES agent_session(id) ON DELETE CASCADE,
   block_ordinal INTEGER NOT NULL,               -- index into the content array; -1 = message-level
   kind          TEXT NOT NULL,                  -- tool_use_input | tool_result_output | thumbnails
   encoding      TEXT NOT NULL,                  -- none | zlib
   body          BLOB NOT NULL,                  -- serialized JSON, possibly compressed
-  PRIMARY KEY (message_id, block_ordinal, kind)
+  PRIMARY KEY (message_id, block_ordinal, kind),
+  FOREIGN KEY (message_id, agent_id)
+    REFERENCES agent_message(id, agent_id) ON DELETE CASCADE
 );
 
 -- 0103 parity: externalized bytes keep counting toward the session's

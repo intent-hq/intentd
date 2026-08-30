@@ -4,11 +4,16 @@
 //! `agent_message.content` JSON column. The write path now extracts any such
 //! body larger than [`PAYLOAD_INLINE_MAX_BYTES`] into the
 //! `agent_message_payload` side table (zlib-compressed when that is smaller)
-//! and leaves a `null` placeholder in the field's position — in-place, so key
-//! order and every other byte of the content JSON are unchanged. Read paths
-//! splice the bodies back before the content leaves the store, so wire shapes
-//! are identical to pre-0107 behavior. Legacy rows (inline bodies, no side
-//! rows) hydrate as no-ops: splicing is driven purely by side-row presence.
+//! and leaves the slim-projection preview plus `*Truncated`/`*Bytes` flags in
+//! the field's position — the SAME transform the serve-time slim projection
+//! applies ([`intent_core::slim_heavy_body`], shared), so a slim page read
+//! serves straight from the content column with NO side-table access.
+//! Full-fidelity read paths splice the original body back (stripping the
+//! flags) before the content leaves the store, so their wire shapes are
+//! identical to pre-0107 behavior (`serde_json` maps serialize key-sorted, so
+//! the flag round-trip is byte-invisible). Legacy rows (inline bodies, no
+//! side rows) hydrate as no-ops: splicing is driven purely by side-row
+//! presence.
 //!
 //! Write-time image thumbnail maps (0097) also land here as message-level
 //! rows (`kind = 'thumbnails'`, `block_ordinal` -1) instead of growing the
@@ -16,7 +21,7 @@
 
 use std::io::Write as _;
 
-use intent_core::{slim_body_size, Error, Result};
+use intent_core::{slim_body_size, slim_heavy_body, Error, Result};
 use serde_json::Value;
 
 /// Ceiling for a `tool_use.input` / `tool_result.output` body to stay inline
@@ -50,74 +55,110 @@ pub(crate) struct PayloadRow {
     pub body: Vec<u8>,
 }
 
-/// The externalizable field of a content block, by block type.
-fn heavy_field(block_type: &str) -> Option<(&'static str, &'static str)> {
+/// The externalizable field of a content block plus its slim-preview flags,
+/// by block type. The flag names match the serve-time slim projection
+/// (intent-services `tool_block`) — the write-time preview must be
+/// indistinguishable from a serve-time one.
+struct HeavyField {
+    field: &'static str,
+    kind: &'static str,
+    truncated_flag: &'static str,
+    bytes_flag: &'static str,
+}
+
+fn heavy_field(block_type: &str) -> Option<HeavyField> {
     match block_type {
-        "tool_use" => Some(("input", KIND_TOOL_USE_INPUT)),
-        "tool_result" => Some(("output", KIND_TOOL_RESULT_OUTPUT)),
+        "tool_use" => Some(HeavyField {
+            field: "input",
+            kind: KIND_TOOL_USE_INPUT,
+            truncated_flag: "inputTruncated",
+            bytes_flag: "inputBytes",
+        }),
+        "tool_result" => Some(HeavyField {
+            field: "output",
+            kind: KIND_TOOL_RESULT_OUTPUT,
+            truncated_flag: "outputTruncated",
+            bytes_flag: "outputBytes",
+        }),
+        _ => None,
+    }
+}
+
+/// The block type + field targeted by a side-table row's `kind`.
+fn kind_target(kind: &str) -> Option<(&'static str, HeavyField)> {
+    match kind {
+        KIND_TOOL_USE_INPUT => Some(("tool_use", heavy_field("tool_use")?)),
+        KIND_TOOL_RESULT_OUTPUT => Some(("tool_result", heavy_field("tool_result")?)),
         _ => None,
     }
 }
 
 /// Cheap write-path predicate: does `content` carry a block whose heavy field
 /// exceeds [`PAYLOAD_INLINE_MAX_BYTES`]? Lets callers skip the content clone
-/// for the common all-small message.
+/// for the common all-small message. Mirrors [`slim_heavy_body`]'s guards
+/// exactly (already-flagged blocks pass through), so `true` here means
+/// [`extract_payloads`] will produce at least one row.
 pub(crate) fn needs_extraction(content: &Value) -> bool {
     content.as_array().is_some_and(|blocks| {
         blocks.iter().any(|b| {
-            b.get("type")
-                .and_then(Value::as_str)
-                .and_then(heavy_field)
-                .and_then(|(field, _)| b.get(field))
-                .is_some_and(|v| !v.is_null() && slim_body_size(v) > PAYLOAD_INLINE_MAX_BYTES)
+            let Some(f) = b.get("type").and_then(Value::as_str).and_then(heavy_field) else {
+                return false;
+            };
+            if b.get(f.truncated_flag).and_then(Value::as_bool) == Some(true) {
+                return false;
+            }
+            b.get(f.field)
+                .is_some_and(|v| slim_body_size(v) > PAYLOAD_INLINE_MAX_BYTES)
         })
     })
 }
 
 /// Split `content` into its slim inline form plus the extracted side-table
-/// rows. Returns `None` when nothing crosses the threshold (the common case —
-/// callers then persist the original content untouched). Each externalized
-/// field is replaced by `null` IN PLACE, preserving key order, so a hydrated
-/// read re-serializes to the exact pre-extraction bytes.
+/// rows (empty when nothing crosses the threshold — the common case). Each
+/// externalized field is replaced IN PLACE by the shared slim-projection
+/// preview + `*Truncated`/`*Bytes` flags ([`slim_heavy_body`]), so a slim
+/// page read serves the stored column as-is; [`splice_payload`] strips the
+/// flags again, and content-JSON serialization is key-sorted, so a hydrated
+/// read re-serializes to the exact pre-extraction bytes. Takes `content` by
+/// value: the caller already cloned it onto the blocking thread, and this
+/// consumes that clone instead of making a second multi-MB copy.
 ///
 /// # Errors
 ///
 /// Returns `Error::Internal` if serializing an extracted body fails.
-pub(crate) fn extract_payloads(content: &Value) -> Result<Option<(Value, Vec<PayloadRow>)>> {
-    if !needs_extraction(content) {
-        return Ok(None);
-    }
-    let mut slim = content.clone();
+pub(crate) fn extract_payloads(mut content: Value) -> Result<(Value, Vec<PayloadRow>)> {
     let mut rows = Vec::new();
-    if let Some(blocks) = slim.as_array_mut() {
+    if let Some(blocks) = content.as_array_mut() {
         for (ordinal, block) in blocks.iter_mut().enumerate() {
-            let Some((field, kind)) = block
+            let Some(f) = block
                 .get("type")
                 .and_then(Value::as_str)
                 .and_then(heavy_field)
             else {
                 continue;
             };
-            let Some(body) = block.get_mut(field) else {
+            let Some(body) = slim_heavy_body(
+                block,
+                f.field,
+                f.truncated_flag,
+                f.bytes_flag,
+                PAYLOAD_INLINE_MAX_BYTES,
+            ) else {
                 continue;
             };
-            if body.is_null() || slim_body_size(body) <= PAYLOAD_INLINE_MAX_BYTES {
-                continue;
-            }
-            let taken = std::mem::replace(body, Value::Null);
-            let json = serde_json::to_vec(&taken).map_err(|e| {
+            let json = serde_json::to_vec(&body).map_err(|e| {
                 Error::Internal(format!("encode extracted payload body failed: {e}"))
             })?;
             let (encoding, stored) = encode_body(&json);
             rows.push(PayloadRow {
                 block_ordinal: i64::try_from(ordinal).unwrap_or(i64::MAX),
-                kind,
+                kind: f.kind,
                 encoding,
                 body: stored,
             });
         }
     }
-    Ok(Some((slim, rows)))
+    Ok((content, rows))
 }
 
 /// Compress `json` with zlib when that is smaller; otherwise store raw.
@@ -161,33 +202,33 @@ pub(crate) fn decode_body(encoding: &str, body: &[u8]) -> Result<Value> {
 
 /// Splice one decoded side-table body back into `content` at
 /// `block_ordinal`'s heavy field — the write-time extraction in reverse. The
-/// placeholder is overwritten in place, so key order is preserved. A row that
-/// no longer lines up with its block (ordinal out of range, block type
-/// mismatch) is skipped with a WARN — reads degrade to the `null` placeholder
-/// rather than failing the whole transcript.
+/// preview placeholder is overwritten and the write-time `*Truncated` /
+/// `*Bytes` flags removed, restoring the pre-extraction block exactly
+/// (content JSON serializes key-sorted, so the round-trip is
+/// byte-invisible). A row that no longer lines up with its block (ordinal
+/// out of range, block type mismatch) is skipped with a WARN — reads degrade
+/// to the stored preview rather than failing the whole transcript.
 pub(crate) fn splice_payload(content: &mut Value, block_ordinal: i64, kind: &str, body: Value) {
-    let expected = match kind {
-        KIND_TOOL_USE_INPUT => ("tool_use", "input"),
-        KIND_TOOL_RESULT_OUTPUT => ("tool_result", "output"),
-        _ => {
-            tracing::warn!(kind, "unknown payload kind; serving null placeholder");
-            return;
-        }
+    let Some((expected_type, f)) = kind_target(kind) else {
+        tracing::warn!(kind, "unknown payload kind; serving stored preview");
+        return;
     };
     let block = usize::try_from(block_ordinal)
         .ok()
         .and_then(|i| content.as_array_mut()?.get_mut(i));
     match block {
-        Some(b) if b.get("type").and_then(Value::as_str) == Some(expected.0) => {
+        Some(b) if b.get("type").and_then(Value::as_str) == Some(expected_type) => {
             if let Some(obj) = b.as_object_mut() {
-                obj.insert(expected.1.to_string(), body);
+                obj.insert(f.field.to_string(), body);
+                obj.remove(f.truncated_flag);
+                obj.remove(f.bytes_flag);
             }
         }
         _ => {
             tracing::warn!(
                 block_ordinal,
                 kind,
-                "payload row does not match its content block; serving null placeholder"
+                "payload row does not match its content block; serving stored preview"
             );
         }
     }
@@ -210,7 +251,9 @@ mod tests {
             {"type": "tool_result", "toolCallId": "t1", "output": "ok"},
         ]);
         assert!(!needs_extraction(&content));
-        assert!(extract_payloads(&content).unwrap().is_none());
+        let (slim, rows) = extract_payloads(content.clone()).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(slim, content);
     }
 
     #[test]
@@ -221,14 +264,27 @@ mod tests {
             {"type": "tool_result", "toolCallId": "t1", "output": big_string()},
         ]);
         assert!(needs_extraction(&content));
-        let (mut slim, rows) = extract_payloads(&content).unwrap().unwrap();
+        let (mut slim, rows) = extract_payloads(content.clone()).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].block_ordinal, 0);
         assert_eq!(rows[0].kind, KIND_TOOL_USE_INPUT);
         assert_eq!(rows[1].block_ordinal, 2);
         assert_eq!(rows[1].kind, KIND_TOOL_RESULT_OUTPUT);
-        assert!(slim[0]["input"].is_null());
-        assert!(slim[2]["output"].is_null());
+        // The stored placeholder is the shared slim-projection preview plus
+        // the serve-time flag names — a slim page read serves it as-is.
+        assert_eq!(slim[0]["inputTruncated"], json!(true));
+        assert_eq!(
+            slim[0]["inputBytes"],
+            json!(slim_body_size(&content[0]["input"]))
+        );
+        let preview_cmd = slim[0]["input"]["cmd"].as_str().unwrap();
+        assert!(preview_cmd.len() < big_string().len());
+        assert!(big_string().starts_with(preview_cmd));
+        assert_eq!(slim[2]["outputTruncated"], json!(true));
+        assert_eq!(slim[2]["outputBytes"], json!(big_string().len()));
+        assert!(slim[2]["output"].as_str().unwrap().len() < big_string().len());
+        // The stored form must NOT re-extract (idempotent write path).
+        assert!(!needs_extraction(&slim));
         // Repetitive bodies compress.
         assert_eq!(rows[0].encoding, ENCODING_ZLIB);
         for row in rows {
@@ -236,7 +292,7 @@ mod tests {
             splice_payload(&mut slim, row.block_ordinal, row.kind, body);
         }
         assert_eq!(slim, content);
-        // Placeholder-in-place: the re-serialized bytes match exactly.
+        // Flags stripped, body restored: the re-serialized bytes match.
         assert_eq!(
             serde_json::to_string(&slim).unwrap(),
             serde_json::to_string(&content).unwrap()

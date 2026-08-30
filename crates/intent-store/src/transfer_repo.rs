@@ -494,8 +494,10 @@ fn bind_json_value<'q>(
 }
 
 /// Minimal standard-alphabet base64 encode (BLOB columns only; keeps
-/// intent-store free of a base64 dependency for a path that in practice
-/// never fires — no transfer table declares a BLOB column today).
+/// intent-store free of a base64 dependency). Fires on every export of a
+/// session with 0107 `agent_message_payload` rows (externalized heavy
+/// bodies / write-time thumbnails, `body` BLOB); other transfer tables
+/// declare no BLOB columns.
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

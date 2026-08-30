@@ -64,7 +64,7 @@ pub use model::PENDING_PROPOSALS_KEY;
 pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
-    cap_json_value, last_tool_use_preview, note_list_slim_row, slim_body_size,
+    cap_json_value, last_tool_use_preview, note_list_slim_row, slim_body_size, slim_heavy_body,
     ConversationProjection, NoteListProjection, AGENT_LIST_PREVIEW_BUDGET_BYTES,
     NOTE_LIST_PREVIEW_CHARS, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };

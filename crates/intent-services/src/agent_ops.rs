@@ -2814,14 +2814,25 @@ impl Services {
         // re-budget pass.
         let mut page_start = start;
         let mut page_end = end;
-        let mut page: Vec<AgentMessage> = self
-            .store
-            .get_agent_messages_page(
-                &agent_id,
-                i64::try_from(start).expect("value fits in i64"),
-                i64::try_from(end - start).expect("value fits in i64"),
-            )
-            .await?
+        // The slim projection reads the page AS STORED: an externalized
+        // heavy body's stored placeholder IS the slim preview
+        // (`intent_core::slim_heavy_body`, shared write/serve transform), so
+        // hydrating multi-MB bodies only for `apply_slim_projection` to
+        // re-truncate them would be pure waste — this is the hot
+        // default-slim path's "no full-blob hydration" guarantee. The
+        // full-fidelity (absent-projection) read hydrates as before.
+        let page_offset = i64::try_from(start).expect("value fits in i64");
+        let page_limit = i64::try_from(end - start).expect("value fits in i64");
+        let raw_page = if projection == Some(ConversationProjection::Slim) {
+            self.store
+                .get_agent_messages_page_as_stored(&agent_id, page_offset, page_limit)
+                .await?
+        } else {
+            self.store
+                .get_agent_messages_page(&agent_id, page_offset, page_limit)
+                .await?
+        };
+        let mut page: Vec<AgentMessage> = raw_page
             .into_iter()
             .map(strip_anonymous_tool_blocks)
             .map(stamp_synthetic_block_ids)

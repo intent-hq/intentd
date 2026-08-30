@@ -2782,15 +2782,18 @@ async fn thumbnails_payload_row(
 /// body is CPU-bound, so like thumbnail generation it runs on a blocking
 /// thread and MUST be awaited BEFORE the write transaction opens; the cheap
 /// `needs_extraction` pre-check keeps the common all-small message free of
-/// the clone + thread hop.
+/// the clone + thread hop, and the blocking task consumes the one clone it
+/// is handed (`extract_payloads` takes the value) — no second multi-MB copy.
 async fn content_col_and_payload_rows(
     content: &serde_json::Value,
 ) -> Result<(String, Vec<crate::message_payload::PayloadRow>)> {
     let extracted = if crate::message_payload::needs_extraction(content) {
         let owned = content.clone();
-        tokio::task::spawn_blocking(move || crate::message_payload::extract_payloads(&owned))
-            .await
-            .map_err(|e| Error::Internal(format!("payload extraction task failed: {e}")))??
+        Some(
+            tokio::task::spawn_blocking(move || crate::message_payload::extract_payloads(owned))
+                .await
+                .map_err(|e| Error::Internal(format!("payload extraction task failed: {e}")))??,
+        )
     } else {
         None
     };
@@ -2952,6 +2955,15 @@ impl Store {
     /// soft, so a decisively better bm25 match still wins. Rows order by
     /// adjusted rank, then newest-first, one row per matching message.
     /// `limit` `None` → no cap.
+    ///
+    /// Result `content` is served AS STORED — externalized heavy bodies
+    /// (0107 `agent_message_payload`) are NOT hydrated back, so a matching
+    /// message carries the write-time slim preview + `*Truncated`/`*Bytes`
+    /// flags where a full body would be. Safe for today's caller (the
+    /// service layer slims result content anyway, and heavy tool bodies are
+    /// not in the FTS text — [`MESSAGE_FTS_TEXT_SQL`] extracts `.text`
+    /// fields only); a future full-fidelity consumer must hydrate
+    /// explicitly.
     ///
     /// Shape (monorepo#3529): ranking and result materialization split into
     /// two phases inside one statement, and — critically — the ranking phase
@@ -3275,18 +3287,33 @@ impl Store {
                 "SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? ORDER BY seq ASC"
             ),
         };
+        let mut tx = self.begin_read_snapshot().await?;
         let mut query = sqlx::query(&sql).bind(&agent_id.0);
         if let Some(n) = limit {
             query = query.bind(n);
         }
         let rows = query
-            .fetch_all(self.read_pool())
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("get agent messages failed: {e}")))?;
         let mut messages: Vec<AgentMessage> =
             rows.iter().map(map_message_row).collect::<Result<_>>()?;
-        self.hydrate_message_payloads(&mut messages).await?;
+        Self::hydrate_message_payloads(&mut tx, &mut messages).await?;
         Ok(messages)
+    }
+
+    /// Open a read-pool transaction serving as a CONSISTENT SNAPSHOT for a
+    /// multi-statement read (WAL: the snapshot pins at the transaction's
+    /// first read). Every hydrating read path pairs its `agent_message`
+    /// SELECT with the payload SELECT inside one of these, so a concurrent
+    /// `replace_agent_messages` / session delete between the two statements
+    /// can never yield a message whose side rows have been swept out from
+    /// under it. Dropped without commit — read-only.
+    async fn begin_read_snapshot(&self) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+        self.read_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("begin read snapshot failed: {e}")))
     }
 
     /// Splice externalized heavy bodies (0107 `agent_message_payload`) back
@@ -3295,8 +3322,15 @@ impl Store {
     /// Cost is O(side rows for the fetched page): one bounded IN-list SELECT
     /// per 32k-id chunk, and legacy messages (no side rows) add zero decode
     /// work. A side row that fails to decode is skipped with a WARN — the
-    /// block degrades to its `null` placeholder rather than failing the read.
-    async fn hydrate_message_payloads(&self, messages: &mut [AgentMessage]) -> Result<()> {
+    /// block degrades to its stored slim preview rather than failing the
+    /// read. Takes the caller's read transaction: message SELECT and payload
+    /// SELECT must share one WAL snapshot ([`Store::begin_read_snapshot`]),
+    /// or a concurrent replace/delete between them would strand the old
+    /// message rows without their side rows.
+    async fn hydrate_message_payloads(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        messages: &mut [AgentMessage],
+    ) -> Result<()> {
         const IDS_PER_STATEMENT: usize = 32_000;
         if messages.is_empty() {
             return Ok(());
@@ -3321,7 +3355,7 @@ impl Store {
                 query = query.bind(id);
             }
             let rows = query
-                .fetch_all(self.read_pool())
+                .fetch_all(&mut **tx)
                 .await
                 .map_err(|e| Error::Internal(format!("get message payloads failed: {e}")))?;
             for row in &rows {
@@ -3341,7 +3375,7 @@ impl Store {
                             block_ordinal,
                             kind,
                             error = %e,
-                            "decode message payload failed; serving null placeholder"
+                            "decode message payload failed; serving stored preview"
                         );
                     }
                 }
@@ -3378,15 +3412,16 @@ impl Store {
             "SELECT {MESSAGE_COLUMNS} FROM agent_message \
              WHERE agent_id = ? AND role != 'system' ORDER BY seq DESC LIMIT 1"
         );
+        let mut tx = self.begin_read_snapshot().await?;
         let row = sqlx::query(&sql)
             .bind(&agent_id.0)
-            .fetch_optional(self.read_pool())
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("get last non-system message failed: {e}")))?;
         match row.as_ref().map(map_message_row).transpose()? {
             Some(msg) => {
                 let mut messages = [msg];
-                self.hydrate_message_payloads(&mut messages).await?;
+                Self::hydrate_message_payloads(&mut tx, &mut messages).await?;
                 let [msg] = messages;
                 Ok(Some(msg))
             }
@@ -3410,16 +3445,17 @@ impl Store {
     ) -> Result<Option<AgentMessage>> {
         let sql =
             format!("SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? AND id = ?");
+        let mut tx = self.begin_read_snapshot().await?;
         let row = sqlx::query(&sql)
             .bind(&agent_id.0)
             .bind(message_id)
-            .fetch_optional(self.read_pool())
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("get agent message by id failed: {e}")))?;
         match row.as_ref().map(map_message_row).transpose()? {
             Some(msg) => {
                 let mut messages = [msg];
-                self.hydrate_message_payloads(&mut messages).await?;
+                Self::hydrate_message_payloads(&mut tx, &mut messages).await?;
                 let [msg] = messages;
                 Ok(Some(msg))
             }
@@ -3575,6 +3611,12 @@ impl Store {
     /// Out-of-range windows (offset at/past the end, or an empty log) return
     /// an empty vec. Negative inputs are clamped to zero.
     ///
+    /// This is the FULL-FIDELITY page read: externalized heavy bodies (0107)
+    /// are hydrated back. The default-slim conversation path must use
+    /// [`Store::get_agent_messages_page_as_stored`] instead — slimming a
+    /// hydrated page would decompress and materialize every multi-MB body
+    /// only to throw it away.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
@@ -3584,21 +3626,65 @@ impl Store {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<AgentMessage>> {
+        let mut tx = self.begin_read_snapshot().await?;
+        let rows = Self::select_messages_page(&mut tx, agent_id, offset, limit).await?;
+        let mut messages: Vec<AgentMessage> =
+            rows.iter().map(map_message_row).collect::<Result<_>>()?;
+        Self::hydrate_message_payloads(&mut tx, &mut messages).await?;
+        Ok(messages)
+    }
+
+    /// [`Store::get_agent_messages_page`] without 0107 payload hydration:
+    /// content is served AS STORED, so a block whose heavy body was
+    /// externalized carries the write-time slim preview +
+    /// `*Truncated`/`*Bytes` flags in the body's position. That stored
+    /// placeholder is byte-identical to what the serve-time slim projection
+    /// produces (`intent_core::slim_heavy_body`, shared transform), which
+    /// makes this the slim-projection page read: zero side-table access,
+    /// zero decompression, cost O(stored page bytes) no matter how many
+    /// multi-MB bodies the page's messages own. NOT for full-fidelity
+    /// serving — hydrated wire shapes come from
+    /// [`Store::get_agent_messages_page`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_agent_messages_page_as_stored(
+        &self,
+        agent_id: &AgentId,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<AgentMessage>> {
+        let mut conn = self
+            .read_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("acquire read connection failed: {e}")))?;
+        let rows = Self::select_messages_page(&mut conn, agent_id, offset, limit).await?;
+        rows.iter().map(map_message_row).collect::<Result<_>>()
+    }
+
+    /// The shared page SELECT behind [`Store::get_agent_messages_page`]
+    /// (hydrating, runs inside a snapshot transaction) and
+    /// [`Store::get_agent_messages_page_as_stored`] (single statement, plain
+    /// connection).
+    async fn select_messages_page(
+        conn: &mut sqlx::SqliteConnection,
+        agent_id: &AgentId,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
         let sql = format!(
             "SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? \
              ORDER BY seq ASC LIMIT ? OFFSET ?"
         );
-        let rows = sqlx::query(&sql)
+        sqlx::query(&sql)
             .bind(&agent_id.0)
             .bind(limit.max(0))
             .bind(offset.max(0))
-            .fetch_all(self.read_pool())
+            .fetch_all(conn)
             .await
-            .map_err(|e| Error::Internal(format!("get agent messages page failed: {e}")))?;
-        let mut messages: Vec<AgentMessage> =
-            rows.iter().map(map_message_row).collect::<Result<_>>()?;
-        self.hydrate_message_payloads(&mut messages).await?;
-        Ok(messages)
+            .map_err(|e| Error::Internal(format!("get agent messages page failed: {e}")))
     }
 
     /// Read an agent's user-role messages as lightweight index items in
@@ -4682,19 +4768,64 @@ mod tests {
             .await
             .expect("append small message");
 
-        // Stored column is slim (placeholders), side table has exactly the
-        // heavy rows, small message has none.
+        // Stored column is slim — each heavy body replaced by the shared
+        // slim-projection preview (bounded, here a prefix of the 8 KiB body)
+        // plus the serve-time flags — side table has exactly the heavy rows,
+        // small message has none.
         let raw: String = sqlx::query_scalar("SELECT content FROM agent_message WHERE id = ?")
             .bind(&msg.id)
             .fetch_one(store.read_pool())
             .await
             .expect("raw content");
         assert!(
-            !raw.contains("payloadtoken"),
-            "heavy bodies must not remain inline"
+            raw.len() < serde_json::to_string(&content).expect("encode").len() / 2,
+            "stored content must be bounded, not the full heavy bodies"
         );
         let stored: serde_json::Value = serde_json::from_str(&raw).expect("stored json");
-        assert!(stored[0]["input"].is_null() && stored[1]["output"].is_null());
+        assert_eq!(stored[0]["inputTruncated"], serde_json::json!(true));
+        assert_eq!(
+            stored[0]["inputBytes"],
+            serde_json::json!(intent_core::slim_body_size(&content[0]["input"]))
+        );
+        assert!(
+            stored[0]["input"]["cmd"]
+                .as_str()
+                .is_some_and(|p| big.starts_with(p) && p.len() < big.len()),
+            "stored input is the bounded slim preview"
+        );
+        assert_eq!(stored[1]["outputTruncated"], serde_json::json!(true));
+        assert_eq!(stored[1]["outputBytes"], serde_json::json!(big.len()));
+        assert!(
+            stored[1]["output"]
+                .as_str()
+                .is_some_and(|p| big.starts_with(p) && p.len() < big.len()),
+            "stored output is the bounded slim preview"
+        );
+        // Byte-parity with the serve-time slim projection: slimming the
+        // ORIGINAL content produces exactly the stored placeholder blocks.
+        {
+            let mut served = content.clone();
+            if let Some(blocks) = served.as_array_mut() {
+                for block in blocks.iter_mut() {
+                    for (field, tflag, bflag) in [
+                        ("input", "inputTruncated", "inputBytes"),
+                        ("output", "outputTruncated", "outputBytes"),
+                    ] {
+                        drop(intent_core::slim_heavy_body(
+                            block,
+                            field,
+                            tflag,
+                            bflag,
+                            intent_core::SLIM_PROJECTION_BUDGET_BYTES,
+                        ));
+                    }
+                }
+            }
+            assert_eq!(
+                stored, served,
+                "stored placeholder must equal the serve-time slim projection"
+            );
+        }
         let side_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_payload WHERE message_id = ?")
                 .bind(&msg.id)
@@ -4740,13 +4871,14 @@ mod tests {
             ])
         );
 
-        // FTS regression: externalized text is no longer indexed; inline
-        // text still is.
+        // FTS: heavy tool bodies remain unindexed — they never were, even
+        // inline (`MESSAGE_FTS_TEXT_SQL` extracts `.text` fields only), so
+        // externalization causes no search regression. Inline text still is.
         let hits = store
             .search_agent_messages_fts("payloadtoken", None, None, None, None, None)
             .await
             .expect("fts search");
-        assert!(hits.is_empty(), "externalized body text is not searchable");
+        assert!(hits.is_empty(), "heavy tool bodies are not FTS-indexed");
         let hits = store
             .search_agent_messages_fts("smalltextmarker", None, None, None, None, None)
             .await
@@ -4872,8 +5004,8 @@ mod tests {
 
     /// Legacy fallback: a pre-0107 row (inline heavy body, no side rows)
     /// reads back verbatim — hydration is a no-op driven purely by side-row
-    /// presence — and a corrupt side row degrades that block to its `null`
-    /// placeholder instead of failing the read.
+    /// presence — and a corrupt side row degrades that block to its stored
+    /// slim preview instead of failing the read.
     #[tokio::test]
     async fn heavy_payload_legacy_inline_and_corrupt_row_fallbacks() {
         use intent_core::now_iso;
@@ -4913,14 +5045,16 @@ mod tests {
             .expect("read legacy");
         assert_eq!(all[0].content, legacy_content, "legacy inline reads as-is");
 
-        // Corrupt side row: decode fails, block degrades to placeholder.
+        // Corrupt side row: decode fails, block degrades to the stored slim
+        // preview (flags intact) instead of failing the read.
+        let corrupt_body = "C".repeat(10 * 1024);
         let corrupt = store
             .append_agent_message(
                 &agent_id,
                 "assistant",
                 &serde_json::json!([
                     { "type": "tool_result", "toolCallId": "t2",
-                      "output": "C".repeat(10 * 1024) },
+                      "output": corrupt_body.clone() },
                 ]),
                 &ts,
             )
@@ -4939,9 +5073,12 @@ mod tests {
             .await
             .expect("read survives corrupt side row")
             .expect("found");
+        assert_eq!(read.content[0]["outputTruncated"], serde_json::json!(true));
         assert!(
-            read.content[0]["output"].is_null(),
-            "corrupt row degrades to null placeholder"
+            read.content[0]["output"]
+                .as_str()
+                .is_some_and(|p| corrupt_body.starts_with(p) && p.len() < corrupt_body.len()),
+            "corrupt row degrades to the stored slim preview"
         );
     }
 
