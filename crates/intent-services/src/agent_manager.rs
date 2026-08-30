@@ -5706,23 +5706,35 @@ impl AgentManager {
         // turns but KEEPS pending queues persisted, so the automatic drain
         // must not respawn a turn while the workspace is archived — messages
         // park until unarchive, which kicks this drain for every parked
-        // queue (see `unarchive_workspace`). A parked USER-origin entry is
-        // exempt (intent-hq/intent#3883, mirroring the question-hold
-        // `hold_drain` exemption below): a user message is the explicit
-        // resurrection signal, so the drain proceeds — its `try_begin` claim
-        // performs the auto-unarchive at the single existing choke point,
-        // and the batch flush carries every parked ready entry FIFO in the
-        // same combined turn. With NO user-origin entry ready everything
-        // stays parked (no regression on the archive/auto-unarchive loop).
-        // Chief is virtual and never archived, so skip the row read. Fail
-        // open on a lookup error: the gate only parks affirmatively-archived
-        // workspaces; a transient store error must not strand the queue.
+        // queue (see `unarchive_workspace`). A USER-origin entry queued at
+        // or after `archivedAt` is exempt (intent-hq/intent#3883, mirroring
+        // the question-hold `hold_drain` exemption below): a user send made
+        // INTO the archived workspace is the explicit resurrection signal,
+        // so the drain proceeds — its `try_begin` claim performs the
+        // auto-unarchive at the single existing choke point, and the batch
+        // flush carries every parked ready entry FIFO in the same combined
+        // turn. The timestamp cut matters: a user entry parked by a busy
+        // race BEFORE archival is not a post-archive user action, so it
+        // stays parked with everything else — without the cut the
+        // interrupted worker's end-of-turn re-kick would find that older
+        // entry and immediately unarchive a freshly archived workspace
+        // (PR #1587 review). With no post-archive user entry ready
+        // everything stays parked (no regression on the archive/
+        // auto-unarchive loop). Chief is virtual and never archived, so
+        // skip the row read. Fail open on a lookup error: the gate only
+        // parks affirmatively-archived workspaces; a transient store error
+        // must not strand the queue. A row missing `archivedAt` (legacy
+        // data) also fails open to the untimed user-origin check.
         let archived_drain = if workspace_id.is_chief() {
             false
         } else {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    if !self.services.has_user_origin_ready(&agent_id) {
+                    let user_ready = match ws.archived_at.as_deref() {
+                        Some(at) => self.services.has_user_origin_ready_since(&agent_id, at),
+                        None => self.services.has_user_origin_ready(&agent_id),
+                    };
+                    if !user_ready {
                         tracing::debug!(
                             agent = %agent_id,
                             workspace = %workspace_id.as_str(),

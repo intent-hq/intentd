@@ -17250,8 +17250,9 @@ mod archived_flush_gates {
         let row = mgr.services.store.get_workspace(&ws).await.unwrap();
         assert!(row.archived, "no auto-unarchive without a user entry");
 
-        // A parked user-origin entry (busy-race leftover) exempts the gate:
-        // the next kick drains everything and unarchives.
+        // A user-origin entry queued INTO the archived workspace (at or
+        // after `archivedAt`) exempts the gate: the next kick drains
+        // everything and unarchives.
         mgr.services.enqueue_message_with_origin(
             &id,
             "user follow-up".to_string(),
@@ -17270,6 +17271,77 @@ mod archived_flush_gates {
         );
         let after = mgr.services.store.get_workspace(&ws).await.unwrap();
         assert!(!after.archived, "the drain's claim auto-unarchived");
+    }
+
+    /// Regression (PR #1587 review): a user-origin entry parked by a busy
+    /// race BEFORE archival is not a post-archive user action, so it must
+    /// NOT release the archived gate — in the busy-user → archive flow the
+    /// interrupted worker's end-of-turn re-kick would otherwise find that
+    /// older entry and immediately auto-unarchive the freshly archived
+    /// workspace. Only a user send made at or after `archivedAt` resurrects.
+    #[tokio::test]
+    async fn pre_archival_user_entry_does_not_release_the_gate() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-ua-pre"), AgentId::from("a-ua-pre"));
+        seed_mock_agent(&mgr, &ws, &id).await;
+
+        // A user message parked by the busy race BEFORE the archive.
+        mgr.services.enqueue_message_with_origin(
+            &id,
+            "pre-archival user leftover".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        // Ensure `queuedAt` strictly precedes `archivedAt` even at coarse
+        // clock resolution.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        archive_row(&mgr, &ws).await;
+
+        // The end-of-turn / unarchive-window re-kick path: the drain must
+        // stay parked despite the ready user-origin entry.
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        assert!(!mgr.is_busy(&id), "pre-archival user entry stays parked");
+        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+        let row = mgr.services.store.get_workspace(&ws).await.unwrap();
+        assert!(
+            row.archived,
+            "no auto-unarchive without a post-archive user send"
+        );
+
+        // A fresh user send INTO the archived workspace releases the park
+        // and carries the older leftover FIFO in the same combined turn.
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "please resume".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("user send");
+        assert_eq!(r["queued"], json!(true), "send converts to enqueue: {r}");
+        await_settled(&mgr, &id).await;
+        let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+        assert!(
+            !after.archived,
+            "the post-archive user send auto-unarchived"
+        );
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "both entries drained in the combined turn"
+        );
     }
 }
 
