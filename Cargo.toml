@@ -32,7 +32,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = "0.14"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order keeps JSON maps in insertion order (IndexMap-backed). The
+# proposal-resolutions eviction logic in intent-services (oldest-evicted via
+# shift_remove) depends on this; declare it explicitly instead of relying on
+# transitive enablement (agent-client-protocol, serde_with, toon-format).
+serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.23"
 # `unstable_end_turn_token_usage` surfaces the optional end-of-turn `usage`
 # snapshot on `PromptResponse` (cumulative-per-session token counts).
