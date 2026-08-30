@@ -6257,7 +6257,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `ws.hook.runNow` / wire `hook.runNow`: trigger an immediate run of an
-    /// active hook, resetting its inter-run timer.
+    /// active hook, resetting its inter-run timer. On a `runAt` hook the
+    /// triggered run IS the one-shot fire: the hook fires early and retires
+    /// (the one-shot contract is honored over the timestamp).
     fn hook_run_now(
         &self,
         workspace_id: WorkspaceId,

@@ -1374,7 +1374,11 @@ impl Services {
     }
 
     /// `hook.runNow`: signal an active hook's task to run immediately (the
-    /// inter-run timer resets after the run).
+    /// inter-run timer resets after the run). On a `runAt` hook the
+    /// triggered run IS the one-shot fire — the hook fires early and
+    /// retires whether or not it dispatched ([`Services::execute_hook_run`]
+    /// treats any `runAt` run as terminal), so the one-shot contract is
+    /// honored over the timestamp.
     pub(crate) async fn hook_run_now_op(
         &self,
         workspace_id: &WorkspaceId,
@@ -4408,6 +4412,41 @@ mod tests {
              far-out deadline: {next}"
         );
         assert!(svc.hook_task_alive(&hook.hook_id), "task still alive");
+    }
+
+    /// `runNow` on a `runAt` hook fires the one-shot EARLY and retires it —
+    /// the manual trigger is honored over the timestamp: the hook goes
+    /// terminal with the FIRED notice and there is no re-arm back to the
+    /// original fire time.
+    #[tokio::test]
+    async fn run_now_on_run_at_fires_early_and_retires() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "early-timer",
+                    "code": "return { dispatch: false };",
+                    "runAt": next_run_at_iso(3_600_000),
+                }),
+            )
+            .await
+            .expect("schedule runAt hook");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(hook.state, HookState::Scheduled);
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        let fired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
+        assert_eq!(fired.run_count, 2, "validation run + the early fire");
+        assert!(
+            fired.next_run_at.is_none(),
+            "no re-arm to the original fire time"
+        );
+        wait_for_task_exit(&svc, &hook.hook_id).await;
+        let text = wait_for_wake(&svc, &owner, "fired and is now retired").await;
+        assert!(!text.contains("expired after reaching its TTL"), "{text}");
     }
 
     /// A `runAt` fire that continues (no dispatch) is terminal: the one-shot
