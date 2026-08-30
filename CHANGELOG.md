@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.23] - 2026-08-30
+
+### 🚀 Features
+
+- *(models)* Stale-while-revalidate background refresh for models.list ([#1583](https://github.com/intent-hq/intentd/pull/1583))
+- *(services)* Agent.resolveProposal RPC with resolution notices ([#1581](https://github.com/intent-hq/intentd/pull/1581))
+- *(hooks)* Cron and runAt schedule kinds for ws.hook.schedule ([#1586](https://github.com/intent-hq/intentd/pull/1586))
+
+### 🐛 Bug Fixes
+
+- Flush parked archive notices in the auto-unarchiving user turn ([#1587](https://github.com/intent-hq/intentd/pull/1587))
+
+
 ## [0.8.22] - 2026-08-30
 
 ### 🚀 Features
