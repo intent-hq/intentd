@@ -19,7 +19,8 @@ use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ConversationProjection, Error, Event, EventActor, NoteId, Result, SessionStats, TaskStatus,
-    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, SLIM_PAGE_BUDGET_BYTES,
+    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED,
+    PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -1838,14 +1839,18 @@ pub(crate) const QUESTIONS_DISMISSED_METADATA_TYPE: &str = "questions_dismissed"
 /// [`QUESTIONS_DISMISSED_METADATA_TYPE`] conventions.
 pub(crate) const PROPOSAL_RESOLVED_METADATA_TYPE: &str = "proposal_resolved";
 
-/// The two accepted `outcome` values of `agent.resolveProposal`.
-const PROPOSAL_OUTCOME_APPLIED: &str = "applied";
-const PROPOSAL_OUTCOME_DISMISSED: &str = "dismissed";
-
 /// Cap on the caller-supplied `agent.resolveProposal` `detail` string — it is
 /// appended verbatim to the applied notice, so bound it against oversized
 /// payloads riding into the transcript.
 const MAX_DETAIL_LEN: usize = 2_000;
+
+/// Retention cap on the persisted `proposalResolutions` map: past it the
+/// OLDEST entries are evicted on insert. Bounds both the session metadata
+/// blob and the `AgentLite` projection that lifts the map into the hot
+/// `agent.list` / `agent.get` payloads (the RPC cost contract). Idempotent
+/// re-resolution of an evicted id degrades to `NotFound` — acceptable, the
+/// entry is long-resolved and no longer renderable as a pending card.
+const MAX_PROPOSAL_RESOLUTIONS: usize = 100;
 
 /// Build the persisted `agent_session.metadata` blob for the create branch of
 /// `agent.wakeOrCreate` (C1d-10a). Starts from any caller-supplied
@@ -6759,19 +6764,23 @@ impl Services {
     }
 
     /// `agent.resolveProposal` (PROTOCOL §5.5): record the user's resolution
-    /// of a pending proposal. Removes the entry from the session's
-    /// `pendingProposals` list, persists the `proposalId -> outcome` entry in
-    /// the [`intent_core::PROPOSAL_RESOLUTIONS_KEY`] map (both atomic
-    /// single-key `json_set`s — sibling metadata keys preserved), emits
-    /// `agent:updated` carrying both, and delivers the proposal-resolved
-    /// system notice ([`Services::notify_proposal_resolved`]) for BOTH
-    /// outcomes. The whole read-modify-write is serialized per agent on the
-    /// same mutation lock as the pending-proposals writers, so a concurrent
-    /// double-resolve races to a single winner — the loser sees the entry
-    /// already gone and takes the idempotent path. **Idempotent**: re-resolving
-    /// an id that is no longer pending but present in the resolutions map
-    /// succeeds (echoing the CURRENT persisted outcome) without a duplicate
-    /// notice or event. An id that was never pending and never resolved →
+    /// of a pending proposal. Persists the `proposalId -> outcome` entry in
+    /// the [`intent_core::PROPOSAL_RESOLUTIONS_KEY`] map (bounded — oldest
+    /// entries evicted past [`MAX_PROPOSAL_RESOLUTIONS`]), THEN removes the
+    /// entry from the session's `pendingProposals` list (two atomic
+    /// single-key `json_set`s in that order, so a failure between them
+    /// leaves the entry pending with its outcome recorded and a retry
+    /// converges instead of losing the resolution — sibling metadata keys
+    /// preserved), emits `agent:updated` carrying both, and delivers the
+    /// proposal-resolved system notice
+    /// ([`Services::notify_proposal_resolved`]) for BOTH outcomes. The whole
+    /// read-modify-write is serialized per agent on the same mutation lock
+    /// as the pending-proposals writers, so a concurrent double-resolve
+    /// races to a single winner — the loser sees the entry already gone and
+    /// takes the idempotent path. **Idempotent**: re-resolving an id that is
+    /// no longer pending but present in the resolutions map succeeds
+    /// (echoing the CURRENT persisted outcome) without a duplicate notice or
+    /// event. An id that was never pending and never resolved →
     /// `NotFound`. Nonexistent agent or workspace mismatch → `NotFound`.
     pub(crate) async fn agent_resolve_proposal_op(
         &self,
@@ -6781,8 +6790,11 @@ impl Services {
         outcome: String,
         detail: Option<String>,
     ) -> Result<Value> {
-        let proposal_id = proposal_id.trim().to_string();
-        if proposal_id.is_empty() {
+        // The id is matched VERBATIM against the recorded pending entries —
+        // recording preserves `applyToolCallId` / `preview.title` exactly as
+        // proposed (including any incidental whitespace), so normalizing here
+        // would orphan such a proposal as unresolvable `NotFound`.
+        if proposal_id.trim().is_empty() {
             return Err(Error::InvalidParams("proposalId is required".to_string()));
         }
         if proposal_id.len() > MAX_MESSAGE_ID_LEN {
@@ -6850,29 +6862,42 @@ impl Services {
             .collect();
         let remaining_json = serde_json::to_string(&remaining)
             .map_err(|e| Error::Internal(format!("serialize pending proposals: {e}")))?;
-        self.store
-            .set_agent_session_metadata_key_json(
-                &workspace_id,
-                &agent_id,
-                intent_core::PENDING_PROPOSALS_KEY,
-                &remaining_json,
-                &now_iso(),
-            )
-            .await?;
         resolutions.insert(proposal_id.clone(), json!(outcome));
+        // Retention cap: evict the OLDEST entries (the map is
+        // insertion-ordered — serde_json's `preserve_order` rides the
+        // workspace dependency tree) so the persisted blob and the AgentLite
+        // projection lifting it into hot list payloads stay bounded.
+        while resolutions.len() > MAX_PROPOSAL_RESOLUTIONS {
+            let Some(oldest) = resolutions.keys().next().cloned() else {
+                break;
+            };
+            resolutions.shift_remove(&oldest);
+        }
         let resolutions_json = serde_json::to_string(&resolutions)
             .map_err(|e| Error::Internal(format!("serialize proposal resolutions: {e}")))?;
-        // Second single-key write: a failure here leaves the entry removed
-        // from the pending list but unrecorded in the resolutions map — the
-        // RPC errors, and a retry takes the NotFound arm. Accepted: the
-        // alternative (resolution first) would let a retry duplicate the
-        // notice, which is worse than a lost resolution record.
+        // Persist the resolution FIRST (it doubles as the durable idempotency
+        // marker), then shrink the pending list. A failure between the two
+        // writes leaves the entry pending WITH its outcome recorded: the RPC
+        // errors and a retry re-runs this path — the re-insert is an
+        // idempotent overwrite, and no notice was sent (the notice follows
+        // both writes), so none can duplicate. The reverse order could
+        // permanently lose the resolution: pending entry gone, no recorded
+        // outcome, every retry NotFound.
         self.store
             .set_agent_session_metadata_key_json(
                 &workspace_id,
                 &agent_id,
                 intent_core::PROPOSAL_RESOLUTIONS_KEY,
                 &resolutions_json,
+                &now_iso(),
+            )
+            .await?;
+        self.store
+            .set_agent_session_metadata_key_json(
+                &workspace_id,
+                &agent_id,
+                intent_core::PENDING_PROPOSALS_KEY,
+                &remaining_json,
                 &now_iso(),
             )
             .await?;

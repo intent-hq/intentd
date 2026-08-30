@@ -29765,6 +29765,137 @@ async fn resolve_proposal_removes_only_named_entry() {
     assert_eq!(session.proposal_resolutions().get("tc-b"), None);
 }
 
+/// A caller-seeded `proposalResolutions` metadata entry with an outcome
+/// outside the `applied|dismissed` set is NOT authoritative: the session
+/// reader filters it, so resolving that id is `NotFound` (never pending,
+/// never validly resolved) instead of an idempotent success echoing an
+/// invalid outcome — session creation persists caller metadata unchanged.
+#[tokio::test]
+async fn resolve_proposal_ignores_seeded_invalid_outcome() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &id,
+            intent_core::PROPOSAL_RESOLUTIONS_KEY,
+            &serde_json::to_string(&json!({ "tc-seeded": "ignored" })).unwrap(),
+            &now_iso(),
+        )
+        .await
+        .expect("seed invalid resolution");
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(
+        session.proposal_resolutions().is_empty(),
+        "reader must filter non-contract outcomes"
+    );
+    let err = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            "tc-seeded".to_string(),
+            "applied".to_string(),
+            None,
+        )
+        .await
+        .expect_err("seeded invalid entry must not resolve");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+}
+
+/// A pending proposal whose recorded id carries leading/trailing whitespace
+/// (recording preserves `applyToolCallId` / `preview.title` verbatim) is
+/// resolvable: the lookup matches the id verbatim rather than normalizing
+/// it into an unresolvable `NotFound`.
+#[tokio::test]
+async fn resolve_proposal_matches_whitespace_id_verbatim() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let ws_id = " tc-padded ";
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks(ws_id), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &[ws_id.to_string()])
+            .await
+    );
+
+    let r = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            ws_id.to_string(),
+            "dismissed".to_string(),
+            None,
+        )
+        .await
+        .expect("whitespace-padded id must resolve");
+    assert_eq!(r["proposalId"], json!(ws_id));
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(session.pending_proposals().is_empty());
+    assert_eq!(
+        session.proposal_resolutions().get(ws_id),
+        Some(&json!("dismissed"))
+    );
+}
+
+/// The resolutions map is bounded: past the retention cap the OLDEST
+/// entries are evicted on insert, keeping the persisted blob and the
+/// `AgentLite` projection lifted into hot list payloads from growing
+/// without bound.
+#[tokio::test]
+async fn resolve_proposal_resolutions_map_evicts_oldest_past_cap() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    // Seed a full map (cap = 100), oldest first.
+    let mut seeded = serde_json::Map::new();
+    for i in 0..100 {
+        seeded.insert(format!("tc-old-{i}"), json!("applied"));
+    }
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &id,
+            intent_core::PROPOSAL_RESOLUTIONS_KEY,
+            &serde_json::to_string(&seeded).unwrap(),
+            &now_iso(),
+        )
+        .await
+        .expect("seed full map");
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-new"), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-new".to_string()])
+            .await
+    );
+
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        id.clone(),
+        "tc-new".to_string(),
+        "applied".to_string(),
+        None,
+    )
+    .await
+    .expect("resolve");
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let resolutions = session.proposal_resolutions();
+    assert_eq!(resolutions.len(), 100, "capped at the retention limit");
+    assert!(
+        !resolutions.contains_key("tc-old-0"),
+        "oldest entry evicted"
+    );
+    assert_eq!(resolutions.get("tc-old-1"), Some(&json!("applied")));
+    assert_eq!(resolutions.get("tc-new"), Some(&json!("applied")));
+}
+
 /// Pre-upgrade fallback coverage: these rows are appended straight through the
 /// store, so the session never gets a pending-questions marker and
 /// `question_hold_active` exercises the legacy transcript tail walk (the

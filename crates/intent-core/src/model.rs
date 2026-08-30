@@ -2607,10 +2607,22 @@ pub const PENDING_PROPOSALS_KEY: &str = "pendingProposals";
 /// for `agent.resolveProposal`: re-resolving an id that is no longer pending
 /// succeeds without a duplicate notice, across daemon restarts. A
 /// re-proposed id re-enters the pending list; its re-resolution overwrites
-/// the earlier outcome (latest wins). No schema migration — the map rides
-/// the existing free-form `metadata` column. Read back by
+/// the earlier outcome (latest wins). Bounded: the resolver evicts the
+/// oldest entries past its retention cap, so the map (and the `AgentLite`
+/// projection lifting it into hot `agent.list` / `agent.get` payloads) never
+/// grows without bound. No schema migration — the map rides the existing
+/// free-form `metadata` column. Read back by
 /// [`AgentSession::proposal_resolutions`].
 pub const PROPOSAL_RESOLUTIONS_KEY: &str = "proposalResolutions";
+
+/// The only two `outcome` values `agent.resolveProposal` accepts and the
+/// [`PROPOSAL_RESOLUTIONS_KEY`] map may carry. The reader
+/// ([`AgentSession::proposal_resolutions`]) filters entries against this set
+/// so caller-seeded session metadata cannot smuggle an unknown outcome into
+/// the projection or the RPC's idempotent echo.
+pub const PROPOSAL_OUTCOME_APPLIED: &str = "applied";
+/// See [`PROPOSAL_OUTCOME_APPLIED`].
+pub const PROPOSAL_OUTCOME_DISMISSED: &str = "dismissed";
 
 /// Metadata key under which the per-conversation seen marker is persisted on
 /// the `agent_session.metadata` JSON (PROTOCOL §5.5): the id of the newest
@@ -2953,9 +2965,12 @@ impl AgentSession {
 
     /// The resolved-proposal outcomes persisted under
     /// [`PROPOSAL_RESOLUTIONS_KEY`] in the session's free-form `metadata`:
-    /// a `proposalId -> "applied" | "dismissed"` map. Malformed entries
-    /// (non-string outcomes, empty ids) are skipped defensively; absent key
-    /// or a non-object value reads as an empty map.
+    /// a `proposalId -> "applied" | "dismissed"` map. Malformed entries are
+    /// skipped defensively — empty ids, and any outcome outside the
+    /// [`PROPOSAL_OUTCOME_APPLIED`] / [`PROPOSAL_OUTCOME_DISMISSED`] set
+    /// (session creation persists caller metadata unchanged, so a seeded
+    /// entry with an arbitrary outcome must not read as authoritative).
+    /// Absent key or a non-object value reads as an empty map.
     pub fn proposal_resolutions(&self) -> serde_json::Map<String, serde_json::Value> {
         self.metadata
             .as_ref()
@@ -2964,7 +2979,12 @@ impl AgentSession {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|(id, outcome)| !id.is_empty() && outcome.is_string())
+                    .filter(|(id, outcome)| {
+                        !id.is_empty()
+                            && outcome.as_str().is_some_and(|o| {
+                                o == PROPOSAL_OUTCOME_APPLIED || o == PROPOSAL_OUTCOME_DISMISSED
+                            })
+                    })
                     .map(|(id, outcome)| (id.clone(), outcome.clone()))
                     .collect()
             })

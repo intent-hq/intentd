@@ -62,6 +62,8 @@ pub use model::LAST_SEEN_MESSAGE_ID_KEY;
 pub use model::MAX_DELEGATION_DEPTH;
 pub use model::PENDING_PROPOSALS_KEY;
 pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
+pub use model::PROPOSAL_OUTCOME_APPLIED;
+pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
