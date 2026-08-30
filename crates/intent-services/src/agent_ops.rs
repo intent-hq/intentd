@@ -6098,6 +6098,94 @@ impl Services {
         }
     }
 
+    /// Merge `proposal_ids` (the proposal-resource blocks of the assistant
+    /// message `message_id`, in block order) into the session's ordered
+    /// pending-proposals list ([`intent_core::PENDING_PROPOSALS_KEY`],
+    /// PROTOCOL §5.5): each id lands as `{ proposalId, messageId }` appended
+    /// last; a re-proposed id replaces its older entry (dedupe by
+    /// `proposalId`, newest wins). Called from the turn-end persist paths
+    /// after the carrying message committed. Serialized per agent on the
+    /// same mutation lock as the question markers so concurrent completions
+    /// cannot interleave the read-modify-write. Atomic single-key `json_set`
+    /// so sibling metadata keys are preserved. A committed change emits
+    /// `agent:updated` with the new list so clients re-read the `AgentLite`
+    /// projection; an unchanged list (same ids already recorded under the
+    /// same message) writes and emits nothing. Returns `true` only when this
+    /// call committed a change. Best-effort: a failure is logged and never
+    /// fails the turn (the list simply stays as it was).
+    pub(crate) async fn record_pending_proposals(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_id: &str,
+        proposal_ids: &[String],
+    ) -> bool {
+        if proposal_ids.is_empty() {
+            return false;
+        }
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
+
+        let session = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read pending proposals");
+                return false;
+            }
+        };
+        let existing = session.pending_proposals();
+        let mut merged: Vec<intent_core::PendingProposal> = existing
+            .iter()
+            .filter(|entry| !proposal_ids.contains(&entry.proposal_id))
+            .cloned()
+            .collect();
+        for id in proposal_ids {
+            merged.push(intent_core::PendingProposal {
+                proposal_id: id.clone(),
+                message_id: message_id.to_string(),
+            });
+        }
+        if merged == existing {
+            return false;
+        }
+        let value = match serde_json::to_string(&merged) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to serialize pending proposals");
+                return false;
+            }
+        };
+        match self
+            .store
+            .set_agent_session_metadata_key_json(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_PROPOSALS_KEY,
+                &value,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(()) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "pendingProposals": merged,
+                    }),
+                )
+                .await;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending proposals");
+                false
+            }
+        }
+    }
+
     /// Re-derive the pending-questions marker after a transcript swap that
     /// re-mints row ids (`agent.editAndRegenerate` truncation,
     /// `agent.replaceMessages`), where any surviving marker is by construction

@@ -2254,6 +2254,90 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
     );
 }
 
+/// Stored-on-write pending-proposals recording (PROTOCOL §5.5): the turn-end
+/// persist merges the tail's proposal ids into the session's ordered pending
+/// list under the turn's message id, and a subsequent proposal-FREE turn
+/// leaves the list in place (pendingness survives the agent's later turns
+/// until resolution).
+#[tokio::test]
+async fn turn_end_records_pending_proposals_and_proposal_free_turn_keeps_them() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let proposal = json!({
+        "kind": "settings-change",
+        "applyToolCallId": "tc-prop-1",
+        "preview": { "title": "Update Setting" },
+        "payload": { "key": "k", "value": "v" },
+    });
+    services.turn_attachments().register(
+        &agent_id,
+        intent_core::TurnAttachment {
+            id: "tar-p1".to_string(),
+            policy: intent_core::AttachmentPolicy::AtTurnEnd,
+            mime_type: intent_acp::mcp_server::PROPOSAL_RESOURCE_MIME_TYPE.to_string(),
+            uri: "intent-proposal://settings-change/tc-prop-1".to_string(),
+            name: "Update Setting".to_string(),
+            text: proposal.to_string(),
+        },
+    );
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("propose")],
+            None,
+        )
+        .await
+        .expect("turn 1 completes");
+
+    let carrying_id = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("messages")
+        .last()
+        .expect("assistant row")
+        .id
+        .clone();
+    let session = bus
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(pending.len(), 1, "turn end records the pending proposal");
+    assert_eq!(pending[0].proposal_id, "tc-prop-1");
+    assert_eq!(pending[0].message_id, carrying_id);
+
+    // A proposal-free turn must NOT touch the list.
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("continue")],
+            None,
+        )
+        .await
+        .expect("turn 2 completes");
+    let session = bus
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.pending_proposals(),
+        pending,
+        "a proposal-free turn end must not change the pending list"
+    );
+}
+
 /// Question resource content-block array — the tail shape
 /// `ws.app.question.ask` persists — for the monorepo#1266 regression tests
 /// over the transcript-mutation ops below.

@@ -303,6 +303,54 @@ fn repair_wrapped_json(text: &str) -> Option<String> {
     removed.then_some(repaired)
 }
 
+/// The proposal identity of one lifted proposal-resource block:
+/// `applyToolCallId ?? preview.title` parsed from the block's embedded
+/// proposal JSON (`resource.text`) — the SAME identity
+/// `intent_acp::mcp_server::proposal_resource_uri` encodes into the resource
+/// URI, so pending-tracking and rendering agree on which proposal is which.
+/// `None` for non-proposal blocks (wrong type/MIME), unparseable `text`, or
+/// a proposal carrying neither identity field (no fabricated fallback: an
+/// identity-less proposal cannot be deduped or resolved, so it is not
+/// tracked).
+pub(crate) fn proposal_block_id(block: &Value) -> Option<String> {
+    if block.get("type").and_then(Value::as_str) != Some("resource") {
+        return None;
+    }
+    let resource = block.get("resource")?;
+    if resource.get("mimeType").and_then(Value::as_str) != Some(PROPOSAL_RESOURCE_MIME) {
+        return None;
+    }
+    let proposal: Value = serde_json::from_str(resource.get("text")?.as_str()?).ok()?;
+    proposal
+        .get("applyToolCallId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            proposal
+                .get("preview")
+                .and_then(|p| p.get("title"))
+                .and_then(Value::as_str)
+        })
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Proposal ids carried by a message's content blocks, in block order,
+/// deduped within the slice (a later duplicate wins its position — last
+/// occurrence order). Backs the turn-end pending-proposals recording: both
+/// the registry/array path and the wrapped-echo path in `record_tool` land
+/// as lifted proposal-resource blocks in the persisted array, so one scan
+/// covers both.
+pub(crate) fn proposal_ids_in(blocks: &[Value]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for block in blocks {
+        if let Some(id) = proposal_block_id(block) {
+            ids.retain(|existing| existing != &id);
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 /// Rebuild the MCP proposal resource item exactly as the `ws.app.*` bindings
 /// construct it (`proposal.rs::show`), reusing the bindings' own
 /// `proposal_resource_uri`: uri from kind + applyToolCallId (or
@@ -727,6 +775,72 @@ mod tests {
         let lifted: Value =
             serde_json::from_str(item["resource"]["text"].as_str().unwrap()).unwrap();
         assert_eq!(lifted["preview"]["title"], "Tab");
+    }
+
+    /// A persisted proposal-resource block carrying `proposal_json` as its
+    /// embedded `resource.text`, id-stamped like the turn-end drain leaves it.
+    fn proposal_block(proposal: &Value) -> Value {
+        json!({
+            "type": "resource",
+            "id": "m:5",
+            "resource": {
+                "uri": intent_acp::mcp_server::proposal_resource_uri(proposal),
+                "name": "P",
+                "mimeType": PROPOSAL_RESOURCE_MIME,
+                "text": serde_json::to_string(proposal).unwrap(),
+            }
+        })
+    }
+
+    #[test]
+    fn proposal_block_id_prefers_apply_tool_call_id() {
+        let mut proposal = valid_proposal();
+        proposal["applyToolCallId"] = json!("tc-apply-9");
+        assert_eq!(
+            proposal_block_id(&proposal_block(&proposal)).as_deref(),
+            Some("tc-apply-9")
+        );
+    }
+
+    #[test]
+    fn proposal_block_id_falls_back_to_preview_title() {
+        assert_eq!(
+            proposal_block_id(&proposal_block(&valid_proposal())).as_deref(),
+            Some("Update Test Setting")
+        );
+    }
+
+    #[test]
+    fn proposal_block_id_rejects_non_proposal_and_malformed_blocks() {
+        // Wrong type / MIME.
+        assert!(proposal_block_id(&json!({ "type": "text", "text": "hi" })).is_none());
+        let mut wrong_mime = proposal_block(&valid_proposal());
+        wrong_mime["resource"]["mimeType"] = json!("text/plain");
+        assert!(proposal_block_id(&wrong_mime).is_none());
+        // Unparseable embedded text.
+        let mut bad_text = proposal_block(&valid_proposal());
+        bad_text["resource"]["text"] = json!("not json");
+        assert!(proposal_block_id(&bad_text).is_none());
+        // No identity: neither applyToolCallId nor preview.title.
+        let mut no_identity = valid_proposal();
+        no_identity["preview"] = json!({});
+        assert!(proposal_block_id(&proposal_block(&no_identity)).is_none());
+    }
+
+    #[test]
+    fn proposal_ids_in_collects_in_order_and_dedupes_last_wins() {
+        let mut a = valid_proposal();
+        a["applyToolCallId"] = json!("tc-a");
+        let mut b = valid_proposal();
+        b["applyToolCallId"] = json!("tc-b");
+        let blocks = vec![
+            json!({ "type": "text", "text": "two proposals" }),
+            proposal_block(&a),
+            proposal_block(&b),
+            proposal_block(&a),
+        ];
+        assert_eq!(proposal_ids_in(&blocks), vec!["tc-b", "tc-a"]);
+        assert!(proposal_ids_in(&[json!({ "type": "text", "text": "none" })]).is_empty());
     }
 
     #[test]

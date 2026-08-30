@@ -28005,6 +28005,209 @@ fn question_blocks() -> serde_json::Value {
     ])
 }
 
+/// A persisted assistant content-block array carrying one lifted
+/// proposal-resource block whose embedded proposal identifies as
+/// `proposal_id` (the shape the §7.1 turn-end drain appends for
+/// `ws.app.proposal.show` / `proposeSibling`).
+fn proposal_blocks(proposal_id: &str) -> serde_json::Value {
+    let proposal = json!({
+        "kind": "settings-change",
+        "applyToolCallId": proposal_id,
+        "preview": { "title": "Update Setting" },
+        "payload": { "key": "k", "value": "v" },
+    });
+    json!([
+        { "type": "text", "text": "Here is a proposal." },
+        {
+            "type": "resource",
+            "id": "m:1",
+            "resource": {
+                "uri": format!("intent-proposal://settings-change/{proposal_id}"),
+                "name": "Update Setting",
+                "mimeType": "application/vnd.intent.proposal+json",
+                "text": serde_json::to_string(&proposal).unwrap(),
+            }
+        }
+    ])
+}
+
+/// Single proposal-bearing turn: the `{proposalId, messageId}` entry persists
+/// in session metadata, survives a re-read (restart equivalence — the list
+/// rides the persisted metadata column), lifts into the `AgentLite`
+/// projection, and the write emits `agent:updated` carrying the list.
+#[tokio::test]
+async fn record_pending_proposals_persists_and_emits_agent_updated() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-1"), &now_iso())
+        .await
+        .expect("append proposal");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+    let ids = vec!["tc-1".to_string()];
+    assert!(svc.record_pending_proposals(&ws, &id, &msg.id, &ids).await);
+
+    // Persisted on the session row and lifted into the AgentLite projection.
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].proposal_id, "tc-1");
+    assert_eq!(pending[0].message_id, msg.id);
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None, None);
+    assert_eq!(lite.metadata.pending_proposals, pending);
+
+    // `agent:updated` emitted, scoped to the workspace, carrying the list.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].event_type, AGENT_UPDATED);
+    assert_eq!(batch[0].workspace_id, ws);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(
+        batch[0].data["pendingProposals"],
+        json!([{ "proposalId": "tc-1", "messageId": msg.id }])
+    );
+
+    // Idempotent: re-recording the same ids under the same message changes
+    // nothing and emits nothing.
+    assert!(!svc.record_pending_proposals(&ws, &id, &msg.id, &ids).await);
+}
+
+/// Proposals accumulate across turns as an ordered SET (unlike the
+/// single-slot question marker), and a re-proposed id replaces its older
+/// entry — newest wins, appended last, sibling metadata keys preserved.
+#[tokio::test]
+async fn record_pending_proposals_accumulates_and_dedupes_newest_wins() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let m1 = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-a"), &now_iso())
+        .await
+        .expect("append first");
+    let m2 = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-b"), &now_iso())
+        .await
+        .expect("append second");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &m1.id, &["tc-a".to_string()])
+            .await
+    );
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &m2.id, &["tc-b".to_string()])
+            .await
+    );
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.proposal_id.as_str(), p.message_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("tc-a", m1.id.as_str()), ("tc-b", m2.id.as_str())]
+    );
+
+    // Re-propose tc-a from a NEWER message: the old entry is replaced and
+    // the fresh one appends last.
+    let m3 = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-a"), &now_iso())
+        .await
+        .expect("append third");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &m3.id, &["tc-a".to_string()])
+            .await
+    );
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.proposal_id.as_str(), p.message_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("tc-b", m2.id.as_str()), ("tc-a", m3.id.as_str())]
+    );
+
+    // Sibling metadata keys survive the single-key json_set writes.
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+    assert!(
+        svc.record_pending_questions_marker(&ws, &id, &asked.id)
+            .await
+    );
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked.id.as_str())
+    );
+    assert_eq!(session.pending_proposals().len(), 2);
+}
+
+/// Error paths never corrupt metadata: an empty id slice is a no-op, a
+/// missing session fails soft (`false`), and a malformed persisted list
+/// (non-array / malformed entries) is read defensively then replaced by a
+/// well-formed write.
+#[tokio::test]
+async fn record_pending_proposals_error_paths_leave_metadata_intact() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-1"), &now_iso())
+        .await
+        .expect("append proposal");
+
+    // Empty ids: no write, no marker key.
+    assert!(!svc.record_pending_proposals(&ws, &id, &msg.id, &[]).await);
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(session.pending_proposals().is_empty());
+    assert!(session
+        .metadata
+        .as_ref()
+        .is_none_or(|m| m.get(intent_core::PENDING_PROPOSALS_KEY).is_none()));
+
+    // Missing session: fails soft.
+    let ghost = AgentId::new();
+    assert!(
+        !svc.record_pending_proposals(&ws, &ghost, &msg.id, &["tc-1".to_string()])
+            .await
+    );
+
+    // A malformed persisted value (non-array) reads back as empty and the
+    // next record replaces it with a well-formed list.
+    svc.store()
+        .set_agent_session_metadata_key(
+            &ws,
+            &id,
+            intent_core::PENDING_PROPOSALS_KEY,
+            "corrupt",
+            None,
+            &now_iso(),
+        )
+        .await
+        .expect("corrupt marker");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(session.pending_proposals().is_empty());
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-1".to_string()])
+            .await
+    );
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.pending_proposals().len(), 1);
+    assert_eq!(session.pending_proposals()[0].proposal_id, "tc-1");
+}
+
 /// Pre-upgrade fallback coverage: these rows are appended straight through the
 /// store, so the session never gets a pending-questions marker and
 /// `question_hold_active` exercises the legacy transcript tail walk (the
