@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.22] - 2026-08-30
+
+### 🚀 Features
+
+- *(services)* Advisory wake for monitoring-idle children (hooks/PR monitors) ([#1578](https://github.com/intent-hq/intentd/pull/1578))
+
+
 ## [0.8.21] - 2026-08-30
 
 ### 🐛 Bug Fixes
