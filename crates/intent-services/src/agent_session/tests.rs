@@ -1578,6 +1578,260 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
     );
 }
 
+/// Mid-turn heavy-payload prestage (0109, intent-hq/intent#3884 part 2): a
+/// tool completing with an over-threshold output stages its body into
+/// `agent_message_payload` WHILE THE TURN IS STILL RUNNING — the side row
+/// exists (and the live transcript carries the slim placeholder) before the
+/// `agent_message` envelope does — and the turn-end append adopts the staged
+/// row: the persisted message hydrates the full body byte-identical while the
+/// stored content column stays bounded. Crash safety: had the daemon died in
+/// the held window, the staged row is exactly the orphan shape
+/// `Store::open` reaps (covered store-side).
+#[tokio::test]
+async fn heavy_tool_output_prestages_mid_turn_and_final_append_adopts() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let big_out = "o".repeat(64 * 1024);
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "Run tests", "kind": "execute", "status": "in_progress",
+                "rawInput": { "path": "." } }
+        }
+    })
+    .to_string();
+    let tool_done = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed", "rawOutput": big_out }
+        }
+    })
+    .to_string();
+    // Gate the prompt open so the mid-turn window is observable.
+    let (conn, mut note_rx, _agent, release) = connect_gated_prompt(vec![tool_call, tool_done]);
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("go")],
+                    None,
+                )
+                .await
+        })
+    };
+    // Wait for the completing update to route: the live transcript's
+    // tool_result block flips to the slim placeholder once staged.
+    let mid = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(slot) = services.live_turn(&agent_id) {
+                if slot
+                    .blocks
+                    .iter()
+                    .any(|b| b["outputTruncated"] == json!(true))
+                {
+                    break slot.message_id;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the completed tool's block becomes a placeholder mid-turn");
+
+    // The heavy body is durable BEFORE the envelope exists.
+    let store = services.store.clone();
+    let side_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_payload WHERE message_id = ?")
+            .bind(&mid)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("count staged rows");
+    assert_eq!(side_rows, 1, "the heavy output is staged mid-turn");
+    let envelopes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_message WHERE id = ?")
+        .bind(&mid)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("count envelopes");
+    assert_eq!(envelopes, 0, "no envelope yet — the turn is still running");
+
+    // Release the turn: the final append adopts the staged row.
+    release.send(()).expect("mock alive");
+    timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("prompt turn ok");
+
+    let messages = store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, mid, "persisted under the turn-start id");
+    // Hydration restores the full body byte-identical, no slim flags.
+    let result_block = messages[0]
+        .content
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .find(|b| b["type"] == json!("tool_result"))
+        .expect("tool_result persisted");
+    assert_eq!(result_block["output"], json!(big_out));
+    assert!(result_block.get("outputTruncated").is_none());
+    // The stored column carries only the placeholder — bounded.
+    let stored_len: i64 =
+        sqlx::query_scalar("SELECT LENGTH(content) FROM agent_message WHERE id = ?")
+            .bind(&mid)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("stored content length");
+    assert!(
+        stored_len < 8 * 1024,
+        "turn-end write is the slim delta, got {stored_len} bytes"
+    );
+    let side_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_payload WHERE message_id = ?")
+            .bind(&mid)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("count adopted rows");
+    assert_eq!(side_rows, 1, "the staged row was adopted, not re-written");
+}
+
+/// The interruption flush adopts mid-turn staged rows (0109): a flushed
+/// partial turn whose transcript carries a prestage placeholder persists via
+/// the prestaged append, so the interrupted row hydrates the full heavy body.
+#[tokio::test]
+async fn interruption_flush_adopts_prestaged_payloads() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let heavy = json!({
+        "id": "m1:0", "type": "tool_result", "tool_use_id": "t1",
+        "output": "z".repeat(32 * 1024), "is_error": false
+    });
+    let placeholder = services
+        .store
+        .prestage_agent_message_payload(&agent_id, "m1", 0, &heavy)
+        .await
+        .expect("prestage")
+        .expect("over-threshold body stages");
+    assert_eq!(placeholder["outputTruncated"], json!(true));
+
+    services.set_live_turn(&agent_id, "m1", vec![placeholder]);
+    services.pin_live_turn(&agent_id);
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("pinned slot flushes");
+    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+
+    let read = services
+        .store
+        .get_agent_message_by_id(&agent_id, "m1")
+        .await
+        .expect("read")
+        .expect("interrupted row persisted");
+    assert_eq!(
+        read.content,
+        json!([heavy]),
+        "the flushed row hydrates the staged heavy body"
+    );
+}
+
+/// A re-patched tool block invalidates its prestage placeholder (0109): the
+/// first completing update stages the heavy output, a second completing
+/// update replaces it with a small one — `record_tool` strips the slim flags,
+/// so the final append persists the new body inline and the reconcile drops
+/// the stale staged row.
+#[tokio::test]
+async fn repatched_tool_output_invalidates_prestaged_placeholder() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let update = |status: &str, output: Value| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": ACP_SID,
+                "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                    "status": status, "rawOutput": output }
+            }
+        })
+        .to_string()
+    };
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "Run", "kind": "execute", "status": "in_progress" }
+        }
+    })
+    .to_string();
+    let updates = vec![
+        tool_call,
+        update("completed", json!("h".repeat(64 * 1024))),
+        update("completed", json!("tiny")),
+    ];
+    let (conn, mut note_rx, _agent) = connect_with(updates);
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    let result_block = messages[0]
+        .content
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .find(|b| b["type"] == json!("tool_result"))
+        .expect("tool_result persisted");
+    assert_eq!(
+        result_block["output"],
+        json!("tiny"),
+        "re-patched body wins"
+    );
+    assert!(
+        result_block.get("outputTruncated").is_none(),
+        "no stale slim flags: {result_block}"
+    );
+    let side_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_payload WHERE message_id = ?")
+            .bind(&messages[0].id)
+            .fetch_one(services.store.read_pool())
+            .await
+            .expect("count side rows");
+    assert_eq!(side_rows, 0, "the stale staged row was reconciled away");
+}
+
 /// A prompt turn that streams a sparse `tool_call` (short title, no input),
 /// then a `tool_call_update` carrying the richer title + input, then a
 /// status-only completing update — the Claude shape that collapsed rows to a
