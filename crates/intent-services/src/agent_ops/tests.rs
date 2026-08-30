@@ -16684,6 +16684,209 @@ async fn hook_waiting_idle_delivers_advisory_then_rearmed_watch_completes() {
     );
 }
 
+/// A real turn start ends the monitoring-idle waiting period: the advisory
+/// marker clears at the turn-start choke point (`try_begin_outcome`
+/// `Started`), so a child that leaves monitoring-idle for a real turn and
+/// then stalls monitoring-idle AGAIN delivers a fresh advisory to a re-armed
+/// watch — the settlement-only clear parked the re-armed watcher in silence
+/// through every later waiting period. Same-period dedup is unchanged: a
+/// second idle before any turn stays silent.
+#[tokio::test]
+async fn turn_start_opens_new_waiting_period_for_rearmed_watch() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // Period 1: monitoring idle → ONE advisory, watch consumed, marker set.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // Re-arm; a second idle in the SAME period defers silently (regression
+    // guard: the turn-start clear must not weaken same-period dedup).
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-arm watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "no second advisory in the same waiting period"
+    );
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // Tear down the parent's wake-turn worker (its background spawn attempt
+    // errors without a provider but holds the busy slot meanwhile — see
+    // `deliv1_wake_or_create_drives_turn_via_runtime`) so the period-2
+    // advisory persists to the transcript instead of parking in the queue.
+    manager.stop(&parent).await;
+
+    // The child starts a REAL turn (e.g. a user message or hook-dispatch
+    // wake): the period is over and the marker clears at the claim.
+    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    assert!(
+        !svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "turn start clears the once-per-period advisory marker"
+    );
+    manager.release_slot(&child).await;
+
+    // Period 2: the child stalls monitoring-idle again — the re-armed watch
+    // hears a FRESH advisory instead of waiting in silence.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        2,
+        "new waiting period delivers a fresh advisory"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("still waiting on external monitoring"),
+        "advisory wording: {text}"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "second advisory consumed the re-armed watch"
+    );
+    assert!(
+        svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "period-2 marker persisted"
+    );
+}
+
+/// Grouped counterpart of the turn-start period boundary: an `after_all`
+/// group watch stays armed across periods and KEEPS ITS ID, so the second
+/// period's advisory must not be lost to the stable-message-id dedup — the
+/// grouped stable id carries the triggering event id as the per-period
+/// discriminator. A bare `advisory-wake:{watch.id}` would silently swallow
+/// every advisory after the first even though the marker cleared.
+#[tokio::test]
+async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+
+    // Period 1: ONE grouped advisory; the watch stays armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // Same period: a duplicate idle stays silent.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+
+    // Tear down the parent's wake-turn worker (spawn errors without a
+    // provider but holds the busy slot meanwhile) so the period-2 advisory
+    // persists to the transcript instead of parking in the queue.
+    manager.stop(&parent).await;
+
+    // Real turn: marker clears, period 2 opens.
+    assert!(manager.try_begin_turn(&child, &ws).await, "claim slot");
+    assert!(
+        !svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "turn start clears the grouped pair's marker too"
+    );
+    manager.release_slot(&child).await;
+
+    // Period 2: the SAME armed watch (same id) delivers a second advisory —
+    // the per-period stable id keeps it out of the durable-wake dedup.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        2,
+        "grouped watch hears a fresh advisory in the new waiting period"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(
+        session.messages[1].metadata.as_ref().expect("metadata")["watchStillArmed"],
+        json!(true),
+        "grouped advisory keeps the watch armed"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "grouped watch survives both advisories for group settlement"
+    );
+}
+
 /// The advisory wake's metadata is machine-readable: `watchStillArmed: false`
 /// (the advisory consumed the watch), `childExternallyWaiting: true`, and the
 /// active hook/monitor lists.

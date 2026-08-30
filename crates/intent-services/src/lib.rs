@@ -5142,7 +5142,8 @@ impl Services {
         // solely by the busy probe, so this heal pass stands in for it and
         // runs the advisory-ALLOWED variant — the still-active hooks/monitors
         // re-classify the synthesized idle as monitoring-idle and the owed
-        // advisory delivers (once per episode, via the persisted marker).
+        // advisory delivers (once per waiting period, via the persisted
+        // marker).
         let classification = if advisory_pending {
             Box::pin(self.deliver_completion_to_watches(child_id, &event)).await
         } else {
@@ -5566,14 +5567,15 @@ impl Services {
             self.take_interim_skipped_idle(child_id);
             // PR #1578 review: the child's genuine settlement
             // (completion/failure/deletion/retirement) ends its
-            // monitoring-idle waiting episode for EVERY advised parent —
-            // clear the once-per-episode advisory markers BY CHILD, not per
+            // monitoring-idle waiting period for EVERY advised parent —
+            // clear the once-per-period advisory markers BY CHILD, not per
             // delivered watch: a parent that never re-armed after the
             // advisory consumed its one-shot watch has no watch for a
             // per-watch clear to run through, and the leaked marker would
-            // suppress every FUTURE episode's advisory for the pair.
-            // Best-effort: a failed clear only suppresses one future
-            // advisory, never a real wake.
+            // suppress the NEXT period's advisory for the pair (the
+            // turn-start clear in `AgentManager` is the other period
+            // boundary). Best-effort: a failed clear only suppresses one
+            // future advisory, never a real wake.
             if let Err(e) = self
                 .store
                 .clear_advisory_wake_deliveries_for_child(child_id)
@@ -5582,7 +5584,7 @@ impl Services {
                 tracing::warn!(
                     error = %e,
                     child = %child_id.0,
-                    "failed to clear advisory-wake episode markers at settlement"
+                    "failed to clear advisory-wake period markers at settlement"
                 );
             }
         }
@@ -5796,8 +5798,8 @@ impl Services {
                     // true`, the grouped watch stays armed, the group stays
                     // open for the child's genuine settlement, and no re-arm
                     // instruction is rendered. Shares the ungrouped path's
-                    // once-per-episode `advisory_wake_delivery` marker, so at
-                    // most one advisory per (parent, child) waiting episode
+                    // once-per-period `advisory_wake_delivery` marker, so at
+                    // most one advisory per (parent, child) waiting period
                     // across both shapes.
                     if advisory_allowed
                         && (hook_waiting || pr_monitor_waiting)
@@ -5898,10 +5900,10 @@ impl Services {
                     .record_group_child_completion(&gid, child_id, deleted, summary, event.clone())
                     .await;
                 // The genuine settlement just recorded ends the child's
-                // monitoring-idle waiting episode (if any) — the grouped
+                // monitoring-idle waiting period (if any) — the grouped
                 // mirror of the ungrouped clear below: clear the
-                // once-per-episode advisory marker so a FUTURE episode may
-                // advise again. Best-effort, like that clear.
+                // once-per-period advisory marker so a FUTURE waiting period
+                // may advise again. Best-effort, like that clear.
                 if newly_recorded {
                     if let Err(e) = self
                         .store
@@ -5912,7 +5914,7 @@ impl Services {
                             error = %e,
                             parent = %watch.parent_agent_id.0,
                             child = %child_id.0,
-                            "failed to clear advisory-wake episode marker"
+                            "failed to clear advisory-wake period marker"
                         );
                     }
                 }
@@ -5972,16 +5974,20 @@ impl Services {
             // idles from those flags) is an unbounded silent wait for the
             // parent: PR monitors have no TTL, so a child merely monitoring
             // a PR awaiting human review parks the watcher indefinitely.
-            // Deliver ONE advisory wake per (parent, child) waiting episode
+            // Deliver ONE advisory wake per (parent, child) waiting period
             // instead: it names the child's active hooks/monitors, consumes
             // the one-shot watch (retired via the standard durable path,
             // recording NO completion identity so a later genuine completion
             // still delivers to a re-armed watch), and tells the parent to
             // re-arm `agent.watch` for the genuine completion. A persisted
-            // once-per-episode marker (`advisory_wake_delivery`) keeps
-            // subsequent monitoring idles silently deferring exactly as
-            // before — cleared when a genuine completion/failure/deletion
-            // wake delivers below. Only a LIVE `agent:idle` may fire it
+            // once-per-period marker (`advisory_wake_delivery`) keeps
+            // subsequent monitoring idles in the SAME continuous waiting
+            // period silently deferring exactly as before — cleared when a
+            // genuine completion/failure/deletion wake delivers below OR
+            // when the child starts a real turn (the `AgentManager`
+            // turn-start clear), each of which ends the waiting period so
+            // the next one may advise again. Only a LIVE `agent:idle` may
+            // fire it
             // (`advisory_allowed`): registration-time reconciliation and the
             // synthetic mutation-path redelivery keep today's silent skip —
             // except the redelivery's advisory-pending heal (monorepo#1297),
@@ -6167,10 +6173,10 @@ impl Services {
             }
             self.remove_watch_after_delivery_commit(&watch.id);
             // A genuine completion/failure/deletion wake delivered — the
-            // child's monitoring-idle waiting episode (if any) is over, so
-            // clear the once-per-episode advisory marker: a FUTURE episode
-            // may advise again. Best-effort: a failed clear only suppresses
-            // one future advisory, never a real wake.
+            // child's monitoring-idle waiting period (if any) is over, so
+            // clear the once-per-period advisory marker: a FUTURE waiting
+            // period may advise again. Best-effort: a failed clear only
+            // suppresses one future advisory, never a real wake.
             if let Err(e) = self
                 .store
                 .clear_advisory_wake_delivery(&watch.parent_agent_id, child_id)
@@ -6250,34 +6256,43 @@ impl Services {
     /// Deliver the ONE advisory wake for a watch whose child went idle while
     /// only externally monitoring (active hooks / PR monitors — see the
     /// callers in `deliver_completion_to_watches_inner`). Consults the
-    /// persisted once-per-episode marker first: a standing marker means the
-    /// parent already heard the advisory for this waiting episode, so the
-    /// deferred idle skips silently (the watch — typically a re-armed one —
-    /// stays armed for the genuine completion). For an ungrouped watch
-    /// (`grouped: false`) the delivery retires the watch via the standard
-    /// durable path with NO completion identity recorded (a later genuine
-    /// completion must still deliver to a re-armed watch); failures set
-    /// `ungrouped_delivery_failed` AND schedule the per-child completion
-    /// retry task (PR #1578 review) — the advisory is the one event meant
-    /// to break the parent's unbounded silent wait (a PR monitor has no
-    /// TTL), so waiting for the child's next idle could park the parent
-    /// indefinitely. The retry replays the advisory-allowed delivery pass;
-    /// the stable message id keeps every attempt idempotent. The ungrouped
-    /// marker write and watch retirement commit in ONE transaction
+    /// persisted once-per-waiting-period marker first: a standing marker
+    /// means the parent already heard the advisory for this continuous
+    /// waiting period, so the deferred idle skips silently (the watch —
+    /// typically a re-armed one — stays armed for the genuine completion).
+    /// The marker clears when the period ends — genuine settlement OR a real
+    /// turn start (the `AgentManager` turn-start clear) — so a LATER
+    /// monitoring-idle period advises re-armed watchers again. For an
+    /// ungrouped watch (`grouped: false`) the delivery retires the watch via
+    /// the standard durable path with NO completion identity recorded (a
+    /// later genuine completion must still deliver to a re-armed watch);
+    /// failures set `ungrouped_delivery_failed` AND schedule the per-child
+    /// completion retry task (PR #1578 review) — the advisory is the one
+    /// event meant to break the parent's unbounded silent wait (a PR monitor
+    /// has no TTL), so waiting for the child's next idle could park the
+    /// parent indefinitely. The retry replays the advisory-allowed delivery
+    /// pass; the stable message id keeps every attempt idempotent. The
+    /// ungrouped marker write and watch retirement commit in ONE transaction
     /// (`retire_advisory_watch_after_delivery`, PR #1578 review): a crash
     /// between them could otherwise retire the watch without its marker,
     /// and the parent's re-armed watch — carrying a NEW id, hence a new
     /// stable message id — would fire a second advisory in the same
-    /// episode. A crash or failure BEFORE the transaction leaves the old
-    /// watch (same id) as the recovery record, so the replayed send is
+    /// waiting period. A crash or failure BEFORE the transaction leaves the
+    /// old watch (same id) as the recovery record, so the replayed send is
     /// deduped, never lost. For a grouped `after_all` watch
     /// (`grouped: true`, STAB-160 shape) the watch stays armed and the
     /// group stays open (`watchStillArmed: true`, no re-arm instruction,
     /// no retirement, no `ungrouped_delivery_failed`); only the shared
-    /// episode marker is recorded, and since the armed watch keeps its id,
-    /// a crash or failure before that write means a stable-id-deduped
-    /// replay next idle — at worst a repeated marker attempt, never a
-    /// duplicate advisory.
+    /// period marker is recorded. Because the armed grouped watch keeps its
+    /// id ACROSS waiting periods, its stable message id carries the
+    /// triggering idle event's id as a per-period discriminator — a bare
+    /// `advisory-wake:{watch.id}` would be dedup-suppressed in every period
+    /// after the first. Within one period a replay of the SAME event
+    /// (delivery retry) still dedups on the identical id, and a fresh idle
+    /// is marker-suppressed before the id matters; the one residual window
+    /// is a crash after the wake persists but before the best-effort marker
+    /// write, where the next idle's fresh event id re-sends one duplicate
+    /// advisory — accepted, matching the "at worst one duplicate" contract.
     #[allow(clippy::too_many_arguments)]
     async fn deliver_monitoring_idle_advisory(
         &self,
@@ -6310,7 +6325,7 @@ impl Services {
             tracing::debug!(
                 child = %child_id.0,
                 parent = %watch.parent_agent_id.0,
-                "skipping agent:idle wake — advisory already delivered this waiting episode; watch stays armed"
+                "skipping agent:idle wake — advisory already delivered this waiting period; watch stays armed"
             );
             return false;
         }
@@ -6332,14 +6347,21 @@ impl Services {
         }
         // Stable message id: a crash between delivery and retirement (or the
         // marker write) replays this pass; the durable-wake dedup makes the
-        // re-send idempotent.
+        // re-send idempotent. Ungrouped ids are per-watch (retirement mints a
+        // new watch id each period); grouped ids append the triggering event
+        // id since the grouped watch id repeats across waiting periods.
+        let message_id = if grouped {
+            format!("advisory-wake:{}:{}", watch.id, event.id)
+        } else {
+            format!("advisory-wake:{}", watch.id)
+        };
         if let Err(e) = self
             .deliver_parent_wake_durable(
                 parent_ws,
                 watch.parent_agent_id.clone(),
                 wake,
                 Some(metadata),
-                format!("advisory-wake:{}", watch.id),
+                message_id,
             )
             .await
         {
@@ -6358,10 +6380,11 @@ impl Services {
         let delivered_at = now_iso();
         if grouped {
             // Grouped watches never retire here — group settlement owns
-            // them. Only the shared episode marker is recorded; the armed
-            // watch keeps its id, so a crash or failure before this write
-            // means a stable-id-deduped replay next idle, never a duplicate
-            // advisory.
+            // them. Only the shared period marker is recorded; a failure
+            // here means the next idle in this period replays the send
+            // under a fresh event id (see the per-period discriminator
+            // above), so the parent may hear one duplicate advisory —
+            // accepted worst case.
             if let Err(e) = self
                 .store
                 .record_advisory_wake_delivery(&watch.parent_agent_id, child_id, &delivered_at)
@@ -6371,19 +6394,19 @@ impl Services {
                     error = %e,
                     parent = %watch.parent_agent_id.0,
                     child = %child_id.0,
-                    "failed to record advisory-wake episode marker"
+                    "failed to record advisory-wake period marker"
                 );
             }
         } else {
-            // Retire the watch and write the episode marker in ONE
+            // Retire the watch and write the period marker in ONE
             // transaction (with NO completion identity: the advisory is not
             // the child's completion, so nothing may be recorded as
             // "delivered" for the genuine completion a re-armed watch waits
             // for). Atomicity closes the crash window where the watch is
             // retired without its marker — the re-armed watch's NEW id
             // would defeat the stable-id dedup and a second advisory would
-            // fire this episode. A failed transaction leaves the old watch
-            // (same id) armed for the deduped retry.
+            // fire this waiting period. A failed transaction leaves the old
+            // watch (same id) armed for the deduped retry.
             if let Err(e) = self
                 .store
                 .retire_advisory_watch_after_delivery(

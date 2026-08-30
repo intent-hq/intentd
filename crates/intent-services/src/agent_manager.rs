@@ -4788,6 +4788,27 @@ impl AgentManager {
                     .await;
                 self.arm_auto_unarchive_flag_if_slot_held(agent_id);
             }
+            // A real turn is starting: this agent's monitoring-idle waiting
+            // period (if any) is over, so clear its once-per-period advisory
+            // markers — the NEXT hook-/PR-monitor-waiting idle opens a NEW
+            // period and may advise re-armed watchers again. Without this,
+            // the markers only cleared at genuine settlement, so a child
+            // woken mid-wait (user message, hook dispatch) that stalled
+            // monitoring-idle again parked its re-armed watchers in silence
+            // indefinitely. Best-effort: a failed clear only suppresses one
+            // future advisory, never a real wake — settlement still clears.
+            if let Err(e) = self
+                .services
+                .store
+                .clear_advisory_wake_deliveries_for_child(agent_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    agent = %agent_id.0,
+                    "failed to clear advisory-wake markers at turn start"
+                );
+            }
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
             self.persist_status_with_stop_reason(

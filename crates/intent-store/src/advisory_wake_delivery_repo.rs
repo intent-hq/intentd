@@ -1,9 +1,11 @@
-//! Once-per-episode advisory-wake markers: one row per (parent, child) pair
-//! recording that the parent already received the advisory wake for the
-//! child's current hook-/PR-monitor-waiting episode. Consulted by
+//! Once-per-waiting-period advisory-wake markers: one row per (parent, child)
+//! pair recording that the parent already received the advisory wake for the
+//! child's current hook-/PR-monitor-waiting period. Consulted by
 //! completion-watch delivery so a monitoring idle fires at most one advisory
-//! per episode; cleared at the child's genuine settlement
-//! (completion/failure/deletion), which opens the next episode.
+//! per continuous waiting period; cleared when the period ends — at the
+//! child's genuine settlement (completion/failure/deletion) or when the child
+//! starts a real turn (the turn-start clear in `AgentManager`) — so the
+//! child's NEXT monitoring-idle period may advise re-armed watchers again.
 
 use intent_core::{AgentId, Error, Result};
 
@@ -39,10 +41,11 @@ impl Store {
 
     /// Atomically record the advisory-delivered marker AND retire the
     /// ungrouped watch the advisory consumed — one transaction, so a crash
-    /// can never leave the watch retired without its episode marker (the
+    /// can never leave the watch retired without its period marker (the
     /// re-armed watch would carry a NEW id, so neither the old stable
     /// message id nor a marker would cover the next monitoring idle and a
-    /// second advisory would fire in the same episode — PR #1578 review).
+    /// second advisory would fire in the same waiting period — PR #1578
+    /// review).
     /// The caller invokes this only after the advisory wake is durable: a
     /// failed transaction leaves the watch as the retry/restart-recovery
     /// record, and the stable message id keeps the replayed send idempotent.
@@ -117,7 +120,8 @@ impl Store {
     }
 
     /// Clear the advisory-delivered marker for the pair (the child's genuine
-    /// completion/failure/deletion wake delivered — the episode is over).
+    /// completion/failure/deletion wake delivered — the waiting period is
+    /// over).
     ///
     /// # Errors
     ///
@@ -140,10 +144,11 @@ impl Store {
     }
 
     /// Clear every advisory-delivered marker naming `child_agent_id` as the
-    /// child: its genuine settlement ends the waiting episode for EVERY
-    /// advised parent, whether or not any still holds an armed watch (a
-    /// parent that never re-armed after the advisory has no watch to clear
-    /// through).
+    /// child: its genuine settlement — or a real turn start (the child left
+    /// monitoring-idle, so the current waiting period is over) — ends the
+    /// waiting period for EVERY advised parent, whether or not any still
+    /// holds an armed watch (a parent that never re-armed after the advisory
+    /// has no watch to clear through).
     ///
     /// # Errors
     ///

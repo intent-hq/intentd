@@ -1234,6 +1234,29 @@ async fn wake_row_count(
         .count()
 }
 
+/// Poll until the parent's transcript holds exactly `expected` wake rows
+/// containing `needle` (delivery is async after the triggering event).
+async fn await_wake_row_count(
+    rpc: &mut TlsWs,
+    req_id: &mut i64,
+    ws_id: &str,
+    agent_id: &str,
+    needle: &str,
+    expected: usize,
+    deadline: tokio::time::Instant,
+) {
+    let mut last = 0;
+    while tokio::time::Instant::now() < deadline {
+        last = wake_row_count(rpc, *req_id, ws_id, agent_id, needle).await;
+        *req_id += 1;
+        if last == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("expected {expected} wake rows containing {needle:?}, last saw {last}");
+}
+
 /// DEFER-1 (monorepo#1468): live-path agent-waiting deferral through the real
 /// MCP bridge. Coord watches Middle; Middle's turn registers its own watch on
 /// Leaf, so Middle's idle is interim (stamped `isWaitingForOtherAgents: true`)
@@ -2422,11 +2445,15 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
 ///    `waitingOnHooks` metadata and the re-arm instruction — the advisory
 ///    consumes the one-shot watch;
 ///  - the parent re-arms `ws.agent.watch`; the registration-time reconcile
-///    defers silently and the once-per-episode marker keeps the child's NEXT
-///    live monitoring idle silent (no second advisory, watch stays armed);
-///  - the hook's terminal dispatch settles the child and the re-armed watch
-///    delivers the genuine completion wake exactly once
-///    (`watchStillArmed: false`, no advisory flag).
+///    defers silently under the standing once-per-period marker (no second
+///    advisory in the SAME waiting period, watch stays armed);
+///  - a poke drives the child through a REAL turn — the turn start ends the
+///    waiting period (clears the marker) — and its next monitoring idle
+///    opens a NEW period: the re-armed watch hears a SECOND advisory instead
+///    of parking silently (the settlement-only clear regression);
+///  - the parent re-arms once more, the hook's terminal dispatch settles the
+///    child, and the re-armed watch delivers the genuine completion wake
+///    exactly once (`watchStillArmed: false`, no advisory flag).
 ///
 /// Exercises the monorepo#1297 busy-slot advisory race end-to-end: the
 /// child's `agent:idle` is published while its worker still holds the busy
@@ -2629,9 +2656,10 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
     )
     .await;
 
-    // Drive the child through ANOTHER live monitoring idle: the standing
-    // once-per-episode marker keeps it silent — no second advisory, no
-    // completion wake, the re-armed watch stays armed.
+    // Poke the child through a REAL turn: the turn start ends the waiting
+    // period, so its next monitoring idle opens a NEW period — the re-armed
+    // watch hears a SECOND advisory (consumed again); still no completion
+    // wake while the hook stays active.
     let sent = wss_rpc(
         &mut setup.rpc,
         40,
@@ -2645,7 +2673,16 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
         poke_idle["data"]["waitingOnHooks"].is_array(),
         "child's second idle is still hook-waiting: {poke_idle}"
     );
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    await_wake_row_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        ADVISORY_NEEDLE,
+        2,
+        budget.step(90),
+    )
+    .await;
     let text = await_conversation_settled(
         &mut setup.rpc,
         &mut req_id,
@@ -2658,15 +2695,28 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
         !text.contains("completed."),
         "no completion wake while the child still monitors: {text}"
     );
-    let advisories = wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, ADVISORY_NEEDLE).await;
-    req_id += 1;
-    assert_eq!(
-        advisories, 1,
-        "the advisory never repeats within an episode"
-    );
-    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
-    req_id += 1;
-    assert_eq!(n, 1, "re-armed watch survives the silent monitoring idle");
+    // The second advisory consumed the re-armed watch too: re-arm once more
+    // so the genuine completion below has a watch to deliver to. The
+    // period-2 marker stands, so this registration reconciles silently — no
+    // third advisory.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        45,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": REARM_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "second re-arm send ok: {sent}");
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        1,
+        budget.step(60),
+    )
+    .await;
 
     // Fire the hook (its terminal one-shot dispatch): the child's wake turn
     // ends in its GENUINE completion — the re-armed watch delivers it.
@@ -2745,7 +2795,7 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
     );
     assert_eq!(
         rows.iter().filter(|r| r.contains(ADVISORY_NEEDLE)).count(),
-        1,
-        "exactly one advisory wake for the whole episode: {rows:?}"
+        2,
+        "exactly one advisory wake per waiting period — two periods: {rows:?}"
     );
 }
