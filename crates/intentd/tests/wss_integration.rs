@@ -5504,13 +5504,49 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
         waited += 1;
     }
     assert!(calls() > 0, "background refresh must spawn the CLI");
+
+    // Wait for the failed probe's OUTCOME to land, not just its start: the
+    // SWR spawn path and the negative-window path serve distinguishable
+    // warnings ("refreshing in the background" vs "serving last known model
+    // list"), so poll reads until the negative-cache wording shows up. A
+    // read landing while the in-flight slot is still held serves the former
+    // and spawns nothing, so this cannot pass on slot suppression alone; if
+    // the outcome were never recorded, reads after the slot release would
+    // keep re-spawning and the spawn-count assertion below would fail.
+    let mut req_id = 48u32;
+    let mut waited = 0u32;
+    let resp = loop {
+        let frame = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"method":"models.list"}}"#);
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        assert_eq!(resp["id"], req_id);
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(resp["result"]["source"], "auggie");
+        assert_eq!(resp["result"]["stale"], true, "{resp}");
+        let warning = resp["result"]["warning"].as_str().unwrap_or_default();
+        if warning.contains("serving last known model list") {
+            break resp;
+        }
+        assert!(
+            waited < 200,
+            "probe failure never reached the negative cache: {resp}"
+        );
+        waited += 1;
+        req_id += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        resp["result"]["models"],
+        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
+    );
     let after_probe = calls();
 
     // Within the negative window: the stale last-good list keeps being
     // served without re-spawning the CLI (no new background refresh).
-    let frame = r#"{"jsonrpc":"2.0","id":48,"method":"models.list"}"#;
-    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
-    assert_eq!(resp["id"], 48);
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":{},"method":"models.list"}}"#,
+        req_id + 1
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert!(resp.get("error").is_none(), "{resp}");
     assert_eq!(resp["result"]["source"], "auggie");
     assert_eq!(resp["result"]["stale"], true, "{resp}");

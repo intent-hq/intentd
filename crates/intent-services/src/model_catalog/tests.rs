@@ -162,7 +162,9 @@ async fn aged_entry_failed_background_refresh_arms_negative_window() {
     assert_eq!(r.models, Some(rows("last-good")));
     assert!(r.stale);
     assert!(r.warning.is_some());
-    wait_until(|| cache.test_negative_reason("p", "v1", now).is_some()).await;
+    // The negative entry is stamped at probe *completion* (spawn `now` plus
+    // the probe's real elapsed time), so observe it a little after `now`.
+    wait_until(|| cache.test_negative_reason("p", "v1", now + 5_000).is_some()).await;
     assert!(!cache.test_inflight_active("p", "v1"), "slot released");
     let r = resolve_with_cache(
         &cache,
@@ -253,11 +255,63 @@ async fn background_refresh_timeout_releases_slot_and_negative_caches() {
     // slot become observable.
     tokio::time::sleep(MODELS_BACKGROUND_REFRESH_TIMEOUT + std::time::Duration::from_secs(1)).await;
     wait_until(|| !cache.test_inflight_active("p", "v1")).await;
+    // The negative entry is stamped at *completion* (spawn time + the ~30s
+    // the probe spent timing out), so it runs its full TTL from when the
+    // failure was observed: at `now + NEG_TTL_MS` — where a spawn-time stamp
+    // would already have expired — the window is still armed.
     let reason = cache
-        .test_negative_reason("p", "v1", now)
-        .expect("timeout is negatively cached");
+        .test_negative_reason("p", "v1", now + NEG_TTL_MS)
+        .expect("negative TTL counts from the timeout, not the spawn");
     assert!(reason.contains("timed out"), "{reason}");
     assert_eq!(cache.last_good("p", "v1"), Some(rows("last-good")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_refreshes_respect_global_concurrency_cap() {
+    // Each (provider, version key) slot reaches the spawn independently, so
+    // simultaneous stale reads across providers would otherwise fan out one
+    // adapter/CLI spawn per provider at once; the cache-wide semaphore caps
+    // concurrent background fetches at MODELS_BACKGROUND_REFRESH_CONCURRENCY
+    // (the RPC cost contract's global cap on a rung-2 refresher). Excess
+    // refreshes queue and still complete.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let providers: Vec<String> = (0..5).map(|i| format!("p{i}")).collect();
+    for p in &providers {
+        cache.store(p, "v1", rows("old"), 1_000);
+    }
+    let now = 1_000 + STALE_MS;
+    let current = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    for p in &providers {
+        let current = current.clone();
+        let max_seen = max_seen.clone();
+        let fetch = move || -> BoxFuture<'static, ModelFetchResult> {
+            Box::pin(async move {
+                let running = current.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(running, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                current.fetch_sub(1, Ordering::SeqCst);
+                ModelFetchResult {
+                    models: Some(rows("refreshed")),
+                    warning: None,
+                }
+            })
+        };
+        let r = resolve_with_cache(&cache, p, "v1", false, now, fetch).await;
+        assert_eq!(r.models, Some(rows("old")), "every read serves immediately");
+        assert!(r.stale);
+    }
+    wait_until(|| {
+        providers
+            .iter()
+            .all(|p| cache.last_good(p, "v1") == Some(rows("refreshed")))
+    })
+    .await;
+    assert!(
+        max_seen.load(Ordering::SeqCst) <= MODELS_BACKGROUND_REFRESH_CONCURRENCY,
+        "at most {MODELS_BACKGROUND_REFRESH_CONCURRENCY} refreshes may run concurrently, saw {}",
+        max_seen.load(Ordering::SeqCst)
+    );
 }
 
 #[tokio::test]

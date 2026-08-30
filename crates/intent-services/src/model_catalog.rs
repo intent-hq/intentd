@@ -17,7 +17,7 @@
 //! `warning` — only when the probe fails, so an aged entry whose provider
 //! is unreachable never degrades below the last-good list.
 //!
-//! Probes are bounded three ways so a broken adapter cannot be re-spawned on
+//! Probes are bounded four ways so a broken adapter cannot be re-spawned on
 //! every `models.list` call: concurrent fetches for one (provider, version
 //! key) are **single-flighted** (one probe runs; blocking callers share its
 //! result, and a stale-serving read neither starts a second probe nor awaits
@@ -26,9 +26,12 @@
 //! not a fresh hit skips the probe and serves what the cache has: the
 //! stale-labeled last-good list for an aged entry (a fresh entry is a plain
 //! hit before the negative window is even consulted), or nothing to serve on
-//! a true miss — and a background refresh is bounded by a hard timeout
+//! a true miss — a background refresh is bounded by a hard timeout
 //! ([`MODELS_BACKGROUND_REFRESH_TIMEOUT`]) that records a negative entry and
-//! releases the in-flight slot, so a wedged probe cannot pin it forever.
+//! releases the in-flight slot, so a wedged probe cannot pin it forever, and
+//! background refreshes across providers share a daemon-wide concurrency cap
+//! ([`MODELS_BACKGROUND_REFRESH_CONCURRENCY`]), so simultaneous stale reads
+//! cannot fan out one adapter/CLI spawn per provider at once.
 //! `force_refresh` bypasses the negative entry but still single-flights.
 //!
 //! The registry lists every provider with a daemon-side model source: auggie
@@ -72,6 +75,16 @@ pub(crate) const MODELS_STALE_AFTER: std::time::Duration =
 /// probe latency (~1s): the timeout only exists to unwedge, not to race.
 pub(crate) const MODELS_BACKGROUND_REFRESH_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
+
+/// Daemon-wide cap on concurrently running background refresh probes — the
+/// global concurrency cap the RPC cost contract requires on a rung-2
+/// (stale-while-revalidate) refresher (AGENTS.md → Performance). Every
+/// (provider, version key) slot reaches the spawn independently, so without
+/// this cap simultaneous stale reads across providers would spawn one
+/// adapter/CLI subprocess per provider at once. Excess refreshes queue on
+/// the semaphore — they are detached and latency-insensitive — and the hard
+/// timeout starts only once the fetch actually runs.
+pub(crate) const MODELS_BACKGROUND_REFRESH_CONCURRENCY: usize = 2;
 
 /// Outcome of one provider model probe: `models: None` means the probe failed
 /// (CLI unavailable / nothing parseable) and the caller may fall back;
@@ -355,6 +368,11 @@ pub(crate) struct ModelCatalogCache {
     negative: Mutex<HashMap<String, NegativeEntry>>,
     /// In-flight probes keyed by (provider id, version key).
     inflight: Mutex<HashMap<(String, String), InflightCell>>,
+    /// Cache-wide permit pool bounding concurrent background refresh probes
+    /// ([`MODELS_BACKGROUND_REFRESH_CONCURRENCY`]); the production daemon
+    /// holds one cache, so this is the daemon-wide refresher cap the RPC
+    /// cost contract requires. Never closed.
+    refresh_permits: tokio::sync::Semaphore,
 }
 
 impl ModelCatalogCache {
@@ -370,6 +388,7 @@ impl ModelCatalogCache {
             persist_path,
             negative: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
+            refresh_permits: tokio::sync::Semaphore::new(MODELS_BACKGROUND_REFRESH_CONCURRENCY),
         }
     }
 
@@ -883,10 +902,17 @@ fn record_probe_outcome(
 /// The claimed cell is initialized through the same `get_or_init` protocol
 /// as the blocking path, so a `force_refresh` caller arriving mid-refresh
 /// joins this probe and awaits its result rather than racing a second fetch.
-/// The fetch is capped at [`MODELS_BACKGROUND_REFRESH_TIMEOUT`]; on expiry
-/// the future is dropped, the timeout is negatively cached (like any probe
-/// failure, so stale reads within [`MODELS_NEGATIVE_TTL`] do not re-spawn a
-/// wedged adapter), and the slot is released either way.
+/// The fetch waits for a cache-wide permit
+/// ([`MODELS_BACKGROUND_REFRESH_CONCURRENCY`]) before running — the
+/// daemon-wide cap on concurrent refresh adapter/CLI spawns — and is then
+/// capped at [`MODELS_BACKGROUND_REFRESH_TIMEOUT`]; on expiry the future is
+/// dropped, the timeout is negatively cached (like any probe failure, so
+/// stale reads within [`MODELS_NEGATIVE_TTL`] do not re-spawn a wedged
+/// adapter), and the slot is released either way. Outcomes are stamped at
+/// **completion** time (`now_ms` + elapsed on the tokio clock), so the
+/// negative window always runs its full TTL from when the failure was
+/// observed — a probe that spends 30s timing out must not burn 30s of the
+/// 60s window before it even starts.
 fn spawn_background_refresh<F>(
     cache: &Arc<ModelCatalogCache>,
     provider_id: &str,
@@ -903,18 +929,38 @@ fn spawn_background_refresh<F>(
     let provider_id = provider_id.to_string();
     let version_key = version_key.to_string();
     tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let outcome_ms = |started: tokio::time::Instant| {
+            now_ms.saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+        };
         cell.get_or_init(|| async {
+            let _permit = cache
+                .refresh_permits
+                .acquire()
+                .await
+                .expect("refresh semaphore is never closed");
             if let Ok(fetched) =
                 tokio::time::timeout(MODELS_BACKGROUND_REFRESH_TIMEOUT, fetch()).await
             {
-                record_probe_outcome(&cache, &provider_id, &version_key, &fetched, now_ms);
+                record_probe_outcome(
+                    &cache,
+                    &provider_id,
+                    &version_key,
+                    &fetched,
+                    outcome_ms(started),
+                );
                 fetched
             } else {
                 let reason = format!(
                     "model discovery for '{provider_id}' timed out after {}s",
                     MODELS_BACKGROUND_REFRESH_TIMEOUT.as_secs()
                 );
-                cache.store_negative(&provider_id, &version_key, reason.clone(), now_ms);
+                cache.store_negative(
+                    &provider_id,
+                    &version_key,
+                    reason.clone(),
+                    outcome_ms(started),
+                );
                 ModelFetchResult {
                     models: None,
                     warning: Some(reason),
