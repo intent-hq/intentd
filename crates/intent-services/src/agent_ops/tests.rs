@@ -29354,6 +29354,548 @@ async fn agent_edit_truncate_reconciles_pending_proposals() {
     );
 }
 
+/// `agent.resolveProposal` outcome `applied`: removes the entry from the
+/// pending list, persists the `proposalId -> outcome` resolution (both
+/// lifted into the `AgentLite` projection), emits `agent:updated` carrying
+/// both, delivers the applied notice (idle agent → immediate user row) with
+/// the proposal title + detail and the `proposal_resolved` metadata, and
+/// returns `{ success, proposalId, outcome }`.
+#[tokio::test]
+async fn resolve_proposal_applied_persists_notifies_and_emits() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-1"), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-1".to_string()])
+            .await
+    );
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+    let r = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            "tc-1".to_string(),
+            "applied".to_string(),
+            Some("Created workspace ws-123.".to_string()),
+        )
+        .await
+        .expect("resolve");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["proposalId"], json!("tc-1"));
+    assert_eq!(r["outcome"], json!("applied"));
+
+    // Pending list emptied, resolution persisted, both in the projection.
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(session.pending_proposals().is_empty());
+    assert_eq!(
+        session.proposal_resolutions().get("tc-1"),
+        Some(&json!("applied"))
+    );
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None, None);
+    assert!(lite.metadata.pending_proposals.is_empty());
+    assert_eq!(
+        lite.metadata.proposal_resolutions.get("tc-1"),
+        Some(&json!("applied"))
+    );
+
+    // `agent:updated` carries the emptied list and the resolutions map.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].event_type, AGENT_UPDATED);
+    assert_eq!(batch[0].workspace_id, ws);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(batch[0].data["pendingProposals"], json!([]));
+    assert_eq!(
+        batch[0].data["proposalResolutions"],
+        json!({ "tc-1": "applied" })
+    );
+
+    // Idle agent → immediate delivery: the notice lands as a user row naming
+    // the proposal title, with the applied wording + detail and the
+    // `proposal_resolved` metadata on both the block and the row.
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let last = messages.last().expect("notice delivered");
+    assert_eq!(last.role, "user");
+    assert_eq!(
+        last.content[0]["text"],
+        json!("User applied the proposal 'Update Setting'. Created workspace ws-123."),
+    );
+    let expected_metadata = json!({
+        "type": "proposal_resolved",
+        "source": "system",
+        "proposalId": "tc-1",
+        "outcome": "applied",
+    });
+    assert_eq!(last.content[0]["messageMetadata"], expected_metadata);
+    assert_eq!(last.metadata, Some(expected_metadata));
+    assert!(
+        svc.queue_snapshot(&id).is_empty(),
+        "immediate delivery never queues"
+    );
+}
+
+/// `agent.resolveProposal` outcome `dismissed`: same persistence/event
+/// mechanics, dismissed notice wording (no detail), metadata outcome
+/// `dismissed`.
+#[tokio::test]
+async fn resolve_proposal_dismissed_delivers_dismissed_notice() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-1"), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-1".to_string()])
+            .await
+    );
+
+    let r = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            "tc-1".to_string(),
+            "dismissed".to_string(),
+            None,
+        )
+        .await
+        .expect("resolve");
+    assert_eq!(r["outcome"], json!("dismissed"));
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(session.pending_proposals().is_empty());
+    assert_eq!(
+        session.proposal_resolutions().get("tc-1"),
+        Some(&json!("dismissed"))
+    );
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let last = messages.last().expect("notice delivered");
+    assert_eq!(last.role, "user");
+    assert_eq!(
+        last.content[0]["text"],
+        json!(
+            "User dismissed the proposal 'Update Setting' without applying it. \
+             This is an informative notice only — do not re-propose it; continue \
+             with your other work or end your turn."
+        ),
+    );
+    assert_eq!(
+        last.content[0]["messageMetadata"],
+        json!({
+            "type": "proposal_resolved",
+            "source": "system",
+            "proposalId": "tc-1",
+            "outcome": "dismissed",
+        })
+    );
+}
+
+/// Idempotency: re-resolving an already-resolved id succeeds echoing the
+/// persisted outcome — even with a DIFFERENT requested outcome — without a
+/// duplicate notice. Restart equivalence comes free: the check reads the
+/// persisted resolutions map.
+#[tokio::test]
+async fn resolve_proposal_repeat_resolution_is_idempotent() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-1"), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-1".to_string()])
+            .await
+    );
+
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        id.clone(),
+        "tc-1".to_string(),
+        "applied".to_string(),
+        None,
+    )
+    .await
+    .expect("resolve");
+    let count_after_first = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages")
+        .len();
+
+    // Re-resolve (requesting the other outcome): success echoes the
+    // PERSISTED outcome, and no second notice lands.
+    let again = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            "tc-1".to_string(),
+            "dismissed".to_string(),
+            None,
+        )
+        .await
+        .expect("re-resolve");
+    assert_eq!(again["success"], json!(true));
+    assert_eq!(again["outcome"], json!("applied"), "persisted outcome wins");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.proposal_resolutions().get("tc-1"),
+        Some(&json!("applied"))
+    );
+    let count_after_second = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages")
+        .len();
+    assert_eq!(
+        count_after_first, count_after_second,
+        "re-resolution must not deliver a duplicate notice"
+    );
+}
+
+/// Error paths: unknown `proposalId` (never pending, never resolved) →
+/// `NotFound`; workspace mismatch → `NotFound`; bad outcome / empty
+/// `proposalId` → `InvalidParams`; nonexistent agent → `NotFound`.
+#[tokio::test]
+async fn resolve_proposal_error_paths() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-1"), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-1".to_string()])
+            .await
+    );
+
+    // Unknown proposal id.
+    let err = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            "tc-unknown".to_string(),
+            "applied".to_string(),
+            None,
+        )
+        .await
+        .expect_err("unknown proposal must fail");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+
+    // Workspace mismatch.
+    let other_ws = WorkspaceId::new();
+    let err = svc
+        .agent_resolve_proposal_op(
+            other_ws,
+            id.clone(),
+            "tc-1".to_string(),
+            "applied".to_string(),
+            None,
+        )
+        .await
+        .expect_err("workspace mismatch must fail");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+
+    // Invalid outcome.
+    let err = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            "tc-1".to_string(),
+            "ignored".to_string(),
+            None,
+        )
+        .await
+        .expect_err("bad outcome must fail");
+    assert!(matches!(err, Error::InvalidParams(_)), "got {err:?}");
+
+    // Empty proposal id.
+    let err = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            "  ".to_string(),
+            "applied".to_string(),
+            None,
+        )
+        .await
+        .expect_err("empty proposalId must fail");
+    assert!(matches!(err, Error::InvalidParams(_)), "got {err:?}");
+
+    // Nonexistent agent.
+    let ghost = AgentId::new();
+    let err = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            ghost,
+            "tc-1".to_string(),
+            "applied".to_string(),
+            None,
+        )
+        .await
+        .expect_err("nonexistent agent must fail");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+
+    // All failures left the pending entry intact.
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.pending_proposals().len(), 1);
+    assert!(session.proposal_resolutions().is_empty());
+}
+
+/// Title recovery is best-effort: when the carrying message no longer
+/// exists (or carries no matching block) the notice falls back to the
+/// proposal id as the title — the resolution still lands.
+#[tokio::test]
+async fn resolve_proposal_title_falls_back_to_id_when_carrier_gone() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    // Entry pointing at a message id that was never persisted.
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &id,
+            intent_core::PENDING_PROPOSALS_KEY,
+            &serde_json::to_string(
+                &json!([{ "proposalId": "tc-dangling", "messageId": "msg-gone" }]),
+            )
+            .unwrap(),
+            &now_iso(),
+        )
+        .await
+        .expect("seed dangling entry");
+
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        id.clone(),
+        "tc-dangling".to_string(),
+        "dismissed".to_string(),
+        None,
+    )
+    .await
+    .expect("resolve");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let last = messages.last().expect("notice delivered");
+    assert!(
+        last.content[0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("User dismissed the proposal 'tc-dangling'")),
+        "id fallback title: {last:?}"
+    );
+}
+
+/// A busy agent (in-flight turn) gets the notice queued — promoted to the
+/// front of the queue — instead of an immediate turn; resolving multiple
+/// pending proposals removes only the named entry.
+#[tokio::test]
+async fn resolve_proposal_removes_only_named_entry() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let m1 = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-a"), &now_iso())
+        .await
+        .expect("append a");
+    let m2 = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-b"), &now_iso())
+        .await
+        .expect("append b");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &m1.id, &["tc-a".to_string()])
+            .await
+    );
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &m2.id, &["tc-b".to_string()])
+            .await
+    );
+
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        id.clone(),
+        "tc-a".to_string(),
+        "dismissed".to_string(),
+        None,
+    )
+    .await
+    .expect("resolve");
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let pending = session.pending_proposals();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| p.proposal_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tc-b"],
+        "only the named entry is removed"
+    );
+    assert_eq!(
+        session.proposal_resolutions().get("tc-a"),
+        Some(&json!("dismissed"))
+    );
+    assert_eq!(session.proposal_resolutions().get("tc-b"), None);
+}
+
+/// A caller-seeded `proposalResolutions` metadata entry with an outcome
+/// outside the `applied|dismissed` set is NOT authoritative: the session
+/// reader filters it, so resolving that id is `NotFound` (never pending,
+/// never validly resolved) instead of an idempotent success echoing an
+/// invalid outcome — session creation persists caller metadata unchanged.
+#[tokio::test]
+async fn resolve_proposal_ignores_seeded_invalid_outcome() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &id,
+            intent_core::PROPOSAL_RESOLUTIONS_KEY,
+            &serde_json::to_string(&json!({ "tc-seeded": "ignored" })).unwrap(),
+            &now_iso(),
+        )
+        .await
+        .expect("seed invalid resolution");
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(
+        session.proposal_resolutions().is_empty(),
+        "reader must filter non-contract outcomes"
+    );
+    let err = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            "tc-seeded".to_string(),
+            "applied".to_string(),
+            None,
+        )
+        .await
+        .expect_err("seeded invalid entry must not resolve");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+}
+
+/// A pending proposal whose recorded id carries leading/trailing whitespace
+/// (recording preserves `applyToolCallId` / `preview.title` verbatim) is
+/// resolvable: the lookup matches the id verbatim rather than normalizing
+/// it into an unresolvable `NotFound`.
+#[tokio::test]
+async fn resolve_proposal_matches_whitespace_id_verbatim() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    let ws_id = " tc-padded ";
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks(ws_id), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &[ws_id.to_string()])
+            .await
+    );
+
+    let r = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            id.clone(),
+            ws_id.to_string(),
+            "dismissed".to_string(),
+            None,
+        )
+        .await
+        .expect("whitespace-padded id must resolve");
+    assert_eq!(r["proposalId"], json!(ws_id));
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(session.pending_proposals().is_empty());
+    assert_eq!(
+        session.proposal_resolutions().get(ws_id),
+        Some(&json!("dismissed"))
+    );
+}
+
+/// The resolutions map is bounded: past the retention cap the OLDEST
+/// entries are evicted on insert, keeping the persisted blob and the
+/// `AgentLite` projection lifted into hot list payloads from growing
+/// without bound.
+#[tokio::test]
+async fn resolve_proposal_resolutions_map_evicts_oldest_past_cap() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Proposer").await;
+    // Seed a full map (cap = 100), oldest first.
+    let mut seeded = serde_json::Map::new();
+    for i in 0..100 {
+        seeded.insert(format!("tc-old-{i}"), json!("applied"));
+    }
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &id,
+            intent_core::PROPOSAL_RESOLUTIONS_KEY,
+            &serde_json::to_string(&seeded).unwrap(),
+            &now_iso(),
+        )
+        .await
+        .expect("seed full map");
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks("tc-new"), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-new".to_string()])
+            .await
+    );
+
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        id.clone(),
+        "tc-new".to_string(),
+        "applied".to_string(),
+        None,
+    )
+    .await
+    .expect("resolve");
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let resolutions = session.proposal_resolutions();
+    assert_eq!(resolutions.len(), 100, "capped at the retention limit");
+    assert!(
+        !resolutions.contains_key("tc-old-0"),
+        "oldest entry evicted"
+    );
+    assert_eq!(resolutions.get("tc-old-1"), Some(&json!("applied")));
+    assert_eq!(resolutions.get("tc-new"), Some(&json!("applied")));
+}
+
 /// Pre-upgrade fallback coverage: these rows are appended straight through the
 /// store, so the session never gets a pending-questions marker and
 /// `question_hold_active` exercises the legacy transcript tail walk (the

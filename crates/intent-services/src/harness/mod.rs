@@ -324,6 +324,13 @@ pub(crate) trait Harness: Send + Sync {
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String;
     /// System notice after the user dismissed pending structured questions.
     fn questions_dismissed_notice(&self, count: usize) -> String;
+    /// System notice after the user applied a pending proposal
+    /// (`agent.resolveProposal`, outcome `applied`); `detail` is the
+    /// caller-supplied context (e.g. the created workspace id).
+    fn proposal_applied_notice(&self, title: &str, detail: Option<&str>) -> String;
+    /// System notice after the user dismissed a pending proposal without
+    /// applying it (`agent.resolveProposal`, outcome `dismissed`).
+    fn proposal_dismissed_notice(&self, title: &str) -> String;
 }
 
 /// One registry row: a stamped `harnessVersion` and everything that version

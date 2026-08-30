@@ -1802,6 +1802,30 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.resolveProposal`: record the user's resolution of a pending
+    /// proposal (`outcome` is `"applied"` or `"dismissed"`) — remove the
+    /// entry from the session's `pendingProposals` list, persist the
+    /// `proposalId -> outcome` resolution, emit `agent:updated`, and deliver
+    /// a system-origin notice to the agent naming the proposal and outcome
+    /// (PROTOCOL §5.5). Idempotent: re-resolving an already-resolved id
+    /// succeeds without a duplicate notice. Unknown `proposalId` (never
+    /// pending, never resolved) → `NotFound`.
+    fn agent_resolve_proposal(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        proposal_id: String,
+        outcome: String,
+        detail: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, proposal_id, outcome, detail);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_resolve_proposal not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.markSeen`: persist the per-conversation seen marker
     /// (`message_id` — the newest transcript message the user has seen) on
     /// the agent session and emit `agent:updated` (PROTOCOL §5.5). Monotonic:

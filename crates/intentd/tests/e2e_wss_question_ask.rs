@@ -1016,6 +1016,113 @@ async fn pending_proposals_projection_over_wss() {
         proposal["preview"]["title"], "Create workspace: Pending projection",
         "recovered proposal identity matches the pending entry"
     );
+
+    // 4. `agent.resolveProposal` (dismissed): the response envelope carries
+    //    `{ success, proposalId, outcome }`, the pending list empties and
+    //    the resolution persists (event + `agent.get` projection), and the
+    //    dismissal notice reaches the model as a system-origin user row
+    //    carrying the `proposal_resolved` messageMetadata.
+    let proposal_id = "Create workspace: Pending projection";
+    let resolved = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.resolveProposal",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "proposalId": proposal_id,
+            "outcome": "dismissed",
+        }),
+    )
+    .await;
+    assert_eq!(resolved["success"], true, "resolve response: {resolved}");
+    assert_eq!(resolved["proposalId"], proposal_id);
+    assert_eq!(resolved["outcome"], "dismissed");
+
+    // The resolution's `agent:updated` carries the emptied list and the
+    // outcome map.
+    let resolve_update = loop {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        if ev["type"] == "agent:updated" && ev["data"].get("proposalResolutions").is_some() {
+            break ev["data"].clone();
+        }
+    };
+    assert_eq!(resolve_update["pendingProposals"], json!([]));
+    assert_eq!(
+        resolve_update["proposalResolutions"],
+        json!({ proposal_id: "dismissed" })
+    );
+
+    // Idempotent re-resolution over the wire: success echoing the persisted
+    // outcome even when the caller asks for the other one.
+    let again = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.resolveProposal",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "proposalId": proposal_id,
+            "outcome": "applied",
+        }),
+    )
+    .await;
+    assert_eq!(again["success"], true);
+    assert_eq!(again["outcome"], "dismissed", "persisted outcome wins");
+
+    // The idle agent got the notice as an immediate turn: drain to its
+    // stream:end, then check the transcript for the notice row.
+    loop {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end"
+            && ev["data"]["agentId"].as_str() == Some(agent_id.as_str())
+        {
+            break;
+        }
+    }
+    let lite = wss_rpc(&mut rpc, 16, "agent.get", json!({ "agentId": agent_id })).await;
+    assert!(
+        lite["agent"]["metadata"].get("pendingProposals").is_none()
+            || lite["agent"]["metadata"]["pendingProposals"] == json!([]),
+        "pending list emptied in the projection: {lite}"
+    );
+    assert_eq!(
+        lite["agent"]["metadata"]["proposalResolutions"],
+        json!({ proposal_id: "dismissed" }),
+        "resolution served on agent.get: {lite}"
+    );
+    let conversation = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let notice = conversation["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| {
+            m["role"] == "user"
+                && m["metadata"]["type"] == "proposal_resolved"
+                && m["metadata"]["outcome"] == "dismissed"
+                && m["metadata"]["proposalId"] == proposal_id
+        })
+        .unwrap_or_else(|| panic!("dismissal notice persisted: {conversation:#}"))
+        .clone();
+    let notice_text = notice["contentBlocks"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        notice_text.starts_with(
+            "User dismissed the proposal 'Create workspace: Pending projection' \
+             without applying it."
+        ),
+        "notice names the proposal: {notice_text}"
+    );
 }
 
 // ---------------------------------------------------------------------------

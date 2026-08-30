@@ -19,7 +19,8 @@ use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ConversationProjection, Error, Event, EventActor, NoteId, Result, SessionStats, TaskStatus,
-    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, SLIM_PAGE_BUDGET_BYTES,
+    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED,
+    PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -1830,6 +1831,26 @@ pub(crate) fn answered_questions_message_id(metadata: Option<&Value>) -> Option<
 /// the notice as a system chip instead of a plain user message. Follows the
 /// `hook_wake` / `event_notification` metadata conventions.
 pub(crate) const QUESTIONS_DISMISSED_METADATA_TYPE: &str = "questions_dismissed";
+
+/// `messageMetadata.type` marker on the proposal-resolved system notice
+/// (PROTOCOL §5.5, `agent.resolveProposal`) — carried on BOTH outcomes
+/// (`applied` and `dismissed`) so the FE renders the notice as a system chip
+/// naming the proposal instead of a plain user message. Follows the
+/// [`QUESTIONS_DISMISSED_METADATA_TYPE`] conventions.
+pub(crate) const PROPOSAL_RESOLVED_METADATA_TYPE: &str = "proposal_resolved";
+
+/// Cap on the caller-supplied `agent.resolveProposal` `detail` string — it is
+/// appended verbatim to the applied notice, so bound it against oversized
+/// payloads riding into the transcript.
+const MAX_DETAIL_LEN: usize = 2_000;
+
+/// Retention cap on the persisted `proposalResolutions` map: past it the
+/// OLDEST entries are evicted on insert. Bounds both the session metadata
+/// blob and the `AgentLite` projection that lifts the map into the hot
+/// `agent.list` / `agent.get` payloads (the RPC cost contract). Idempotent
+/// re-resolution of an evicted id degrades to `NotFound` — acceptable, the
+/// entry is long-resolved and no longer renderable as a pending card.
+const MAX_PROPOSAL_RESOLUTIONS: usize = 100;
 
 /// Build the persisted `agent_session.metadata` blob for the create branch of
 /// `agent.wakeOrCreate` (C1d-10a). Starts from any caller-supplied
@@ -6740,6 +6761,254 @@ impl Services {
                     agent = %agent_id,
                     error = %e,
                     "questions-dismissed notice delivery failed"
+                );
+            }
+        }
+    }
+
+    /// `agent.resolveProposal` (PROTOCOL §5.5): record the user's resolution
+    /// of a pending proposal. Persists the `proposalId -> outcome` entry in
+    /// the [`intent_core::PROPOSAL_RESOLUTIONS_KEY`] map (bounded — oldest
+    /// entries evicted past [`MAX_PROPOSAL_RESOLUTIONS`]), THEN removes the
+    /// entry from the session's `pendingProposals` list (two atomic
+    /// single-key `json_set`s in that order, so a failure between them
+    /// leaves the entry pending with its outcome recorded and a retry
+    /// converges instead of losing the resolution — sibling metadata keys
+    /// preserved), emits `agent:updated` carrying both, and delivers the
+    /// proposal-resolved system notice
+    /// ([`Services::notify_proposal_resolved`]) for BOTH outcomes. The whole
+    /// read-modify-write is serialized per agent on the same mutation lock
+    /// as the pending-proposals writers, so a concurrent double-resolve
+    /// races to a single winner — the loser sees the entry already gone and
+    /// takes the idempotent path. **Idempotent**: re-resolving an id that is
+    /// no longer pending but present in the resolutions map succeeds
+    /// (echoing the CURRENT persisted outcome) without a duplicate notice or
+    /// event. An id that was never pending and never resolved →
+    /// `NotFound`. Nonexistent agent or workspace mismatch → `NotFound`.
+    pub(crate) async fn agent_resolve_proposal_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        proposal_id: String,
+        outcome: String,
+        detail: Option<String>,
+    ) -> Result<Value> {
+        // The id is matched VERBATIM against the recorded pending entries —
+        // recording preserves `applyToolCallId` / `preview.title` exactly as
+        // proposed (including any incidental whitespace), so normalizing here
+        // would orphan such a proposal as unresolvable `NotFound`.
+        if proposal_id.trim().is_empty() {
+            return Err(Error::InvalidParams("proposalId is required".to_string()));
+        }
+        if proposal_id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "proposalId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
+            )));
+        }
+        if outcome != PROPOSAL_OUTCOME_APPLIED && outcome != PROPOSAL_OUTCOME_DISMISSED {
+            return Err(Error::InvalidParams(format!(
+                "outcome must be \"{PROPOSAL_OUTCOME_APPLIED}\" or \
+                 \"{PROPOSAL_OUTCOME_DISMISSED}\""
+            )));
+        }
+        let detail = detail
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
+        if detail.as_ref().is_some_and(|d| d.len() > MAX_DETAIL_LEN) {
+            return Err(Error::InvalidParams(format!(
+                "detail exceeds maximum length of {MAX_DETAIL_LEN}"
+            )));
+        }
+        // Serialize with the pending-proposals writers (turn-end recording,
+        // transcript-swap reconciliation) so the remove-and-persist below
+        // cannot interleave with a concurrent list rewrite.
+        let lock = self.pending_question_mutation_locks.lock_for(&agent_id);
+        let _guard = lock.lock().await;
+
+        // Metadata-only lookup (no transcript hydration); workspace mismatch
+        // surfaces as NotFound (defense-in-depth against bare-id probes).
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {agent_id}")));
+        }
+        let pending = session.pending_proposals();
+        let entry = pending
+            .iter()
+            .find(|p| p.proposal_id == proposal_id)
+            .cloned();
+        let mut resolutions = session.proposal_resolutions();
+        let Some(entry) = entry else {
+            // Not pending: idempotent success when already resolved (echo the
+            // persisted outcome — no rewrite, no duplicate notice), NotFound
+            // when the id was never tracked.
+            if let Some(existing) = resolutions.get(&proposal_id).and_then(Value::as_str) {
+                return Ok(json!({
+                    "success": true,
+                    "proposalId": proposal_id,
+                    "outcome": existing,
+                }));
+            }
+            return Err(Error::NotFound(format!("proposal {proposal_id}")));
+        };
+        // Resolve the human-readable title from the carrying message's
+        // proposal resource block BEFORE mutating anything (best-effort —
+        // the id doubles as the fallback title).
+        let title = self
+            .proposal_title_from_message(&agent_id, &entry.message_id, &proposal_id)
+            .await
+            .unwrap_or_else(|| proposal_id.clone());
+
+        let remaining: Vec<intent_core::PendingProposal> = pending
+            .iter()
+            .filter(|p| p.proposal_id != proposal_id)
+            .cloned()
+            .collect();
+        let remaining_json = serde_json::to_string(&remaining)
+            .map_err(|e| Error::Internal(format!("serialize pending proposals: {e}")))?;
+        resolutions.insert(proposal_id.clone(), json!(outcome));
+        // Retention cap: evict the OLDEST entries (the map is
+        // insertion-ordered — serde_json's `preserve_order` rides the
+        // workspace dependency tree) so the persisted blob and the AgentLite
+        // projection lifting it into hot list payloads stay bounded.
+        while resolutions.len() > MAX_PROPOSAL_RESOLUTIONS {
+            let Some(oldest) = resolutions.keys().next().cloned() else {
+                break;
+            };
+            resolutions.shift_remove(&oldest);
+        }
+        let resolutions_json = serde_json::to_string(&resolutions)
+            .map_err(|e| Error::Internal(format!("serialize proposal resolutions: {e}")))?;
+        // Persist the resolution FIRST (it doubles as the durable idempotency
+        // marker), then shrink the pending list. A failure between the two
+        // writes leaves the entry pending WITH its outcome recorded: the RPC
+        // errors and a retry re-runs this path — the re-insert is an
+        // idempotent overwrite, and no notice was sent (the notice follows
+        // both writes), so none can duplicate. The reverse order could
+        // permanently lose the resolution: pending entry gone, no recorded
+        // outcome, every retry NotFound.
+        self.store
+            .set_agent_session_metadata_key_json(
+                &workspace_id,
+                &agent_id,
+                intent_core::PROPOSAL_RESOLUTIONS_KEY,
+                &resolutions_json,
+                &now_iso(),
+            )
+            .await?;
+        self.store
+            .set_agent_session_metadata_key_json(
+                &workspace_id,
+                &agent_id,
+                intent_core::PENDING_PROPOSALS_KEY,
+                &remaining_json,
+                &now_iso(),
+            )
+            .await?;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &agent_id,
+            AGENT_UPDATED,
+            json!({
+                "agentId": agent_id.0,
+                "pendingProposals": remaining,
+                "proposalResolutions": resolutions,
+            }),
+        )
+        .await;
+        // Deliver the proposal-resolved system notice — fail-soft, the
+        // persisted resolution is the source of truth.
+        self.notify_proposal_resolved(
+            &workspace_id,
+            &agent_id,
+            &proposal_id,
+            &outcome,
+            &title,
+            detail.as_deref(),
+        )
+        .await;
+        Ok(json!({
+            "success": true,
+            "proposalId": proposal_id,
+            "outcome": outcome,
+        }))
+    }
+
+    /// The `preview.title` of the proposal `proposal_id` as carried by the
+    /// persisted message `message_id`'s lifted proposal-resource block.
+    /// Bounded: one index lookup + one single-message page, mirroring
+    /// [`Services::dismissed_question_count`]. `None` when the message is
+    /// gone, carries no matching block, or the proposal has no title.
+    async fn proposal_title_from_message(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        proposal_id: &str,
+    ) -> Option<String> {
+        let idx = self
+            .store
+            .get_agent_message_index(agent_id, message_id)
+            .await
+            .ok()??;
+        let page = self
+            .store
+            .get_agent_messages_page(agent_id, idx, 1)
+            .await
+            .ok()?;
+        let msg = page.first().filter(|m| m.id == message_id)?;
+        let blocks = msg.content.as_array()?;
+        crate::tool_block::proposal_title_in(blocks, proposal_id)
+    }
+
+    /// Deliver the proposal-resolved system notice (`agent.resolveProposal`,
+    /// PROTOCOL §5.5): a system-origin message telling the agent the user
+    /// applied or dismissed the named proposal. Mirrors
+    /// [`Services::notify_questions_dismissed`]: reuses the wake-delivery
+    /// machinery ([`Services::deliver_wake_message`]) — an idle agent gets
+    /// the notice as an immediate turn; when it lands in the queue instead
+    /// (busy turn or store-append fallback) the entry is promoted to the
+    /// FRONT of the queue so the notice is the next delivery. Fail-soft:
+    /// delivery problems are logged, never surfaced to the RPC — the durable
+    /// resolution record is the source of truth.
+    async fn notify_proposal_resolved(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        proposal_id: &str,
+        outcome: &str,
+        title: &str,
+        detail: Option<&str>,
+    ) {
+        let harness = crate::harness::latest();
+        let content = if outcome == PROPOSAL_OUTCOME_APPLIED {
+            harness.proposal_applied_notice(title, detail)
+        } else {
+            harness.proposal_dismissed_notice(title)
+        };
+        let metadata = json!({
+            "type": PROPOSAL_RESOLVED_METADATA_TYPE,
+            "source": "system",
+            "proposalId": proposal_id,
+            "outcome": outcome,
+        });
+        match self
+            .deliver_wake_message(workspace_id, agent_id, &content, Some(&metadata))
+            .await
+        {
+            Ok(result) => {
+                if result["queued"] == json!(true) {
+                    if let Some(qid) = result["queuedMessage"]["id"].as_str() {
+                        if self.move_queued_message_front(agent_id, qid) {
+                            self.publish_queue_updated(agent_id).await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    proposal = %proposal_id,
+                    error = %e,
+                    "proposal-resolved notice delivery failed"
                 );
             }
         }
