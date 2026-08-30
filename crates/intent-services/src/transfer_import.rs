@@ -1139,8 +1139,12 @@ fn sandbox_for_materialize(row: &serde_json::Value) -> Sandbox {
 /// `workspace_id` column must match it, `completion_watch` must touch it
 /// from at least one end, and `agent_message`/`agent_queue` rows (scoped
 /// through their owning session) must name an `agent_session` in the
-/// archive. Collision validation ran only for the manifest's id, so
-/// anything else would land unvalidated.
+/// archive. `agent_message_payload` rows additionally must name an
+/// `agent_message` in the archive — the row attaches (and hydrates) by
+/// `message_id`, so an in-scope `agent_id` alone would let a hostile
+/// archive splice payload bytes into an existing message elsewhere.
+/// Collision validation ran only for the manifest's id, so anything else
+/// would land unvalidated.
 fn validate_row_scope(
     rows: &[(String, Vec<serde_json::Value>)],
     workspace_id: &WorkspaceId,
@@ -1148,6 +1152,12 @@ fn validate_row_scope(
     let session_ids: std::collections::HashSet<&str> = rows
         .iter()
         .filter(|(t, _)| t == "agent_session")
+        .flat_map(|(_, objects)| objects)
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+        .collect();
+    let message_ids: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|(t, _)| t == "agent_message")
         .flat_map(|(_, objects)| objects)
         .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
         .collect();
@@ -1163,6 +1173,10 @@ fn validate_row_scope(
                 "workspace" => field(row, "id") == workspace_id.0,
                 "agent_message" | "agent_queue" => {
                     session_ids.contains(field(row, "agent_id").as_str())
+                }
+                "agent_message_payload" => {
+                    session_ids.contains(field(row, "agent_id").as_str())
+                        && message_ids.contains(field(row, "message_id").as_str())
                 }
                 "completion_watch" => {
                     field(row, "parent_workspace_id") == workspace_id.0
@@ -1596,6 +1610,29 @@ mod tests {
             vec![serde_json::json!({ "id": 1, "agent_id": "agent-elsewhere" })],
         )])
         .is_err());
+        // Payload row with an in-scope agent_id but a message_id pointing
+        // outside the archive: rejected — it would splice payload bytes
+        // into an existing message of another workspace.
+        assert!(scoped(vec![
+            ("workspace", vec![serde_json::json!({ "id": "ws-import" })],),
+            (
+                "agent_session",
+                vec![serde_json::json!({ "id": "agent-a", "workspace_id": "ws-import" })],
+            ),
+            (
+                "agent_message",
+                vec![serde_json::json!({ "id": "msg-a", "agent_id": "agent-a" })],
+            ),
+            (
+                "agent_message_payload",
+                vec![serde_json::json!({
+                    "message_id": "msg-foreign", "agent_id": "agent-a",
+                    "block_ordinal": 0, "kind": "tool_result_output",
+                    "encoding": "none", "body": { "$base64": "e30=" }
+                })],
+            ),
+        ])
+        .is_err());
         assert!(scoped(vec![(
             "completion_watch",
             vec![serde_json::json!({
@@ -1612,7 +1649,15 @@ mod tests {
             ),
             (
                 "agent_message",
-                vec![serde_json::json!({ "id": 1, "agent_id": "agent-a" })],
+                vec![serde_json::json!({ "id": "msg-a", "agent_id": "agent-a" })],
+            ),
+            (
+                "agent_message_payload",
+                vec![serde_json::json!({
+                    "message_id": "msg-a", "agent_id": "agent-a",
+                    "block_ordinal": 0, "kind": "tool_result_output",
+                    "encoding": "none", "body": { "$base64": "e30=" }
+                })],
             ),
             (
                 "completion_watch",

@@ -2393,6 +2393,7 @@ name = "intent-store"
 version = "0.8.23"
 dependencies = [
  "base64 0.23.1",
+ "flate2",
  "image",
  "intent-core",
  "rand 0.10.2",

@@ -2418,6 +2418,45 @@ pub fn cap_json_value(value: &serde_json::Value, budget: &mut usize) -> serde_js
     }
 }
 
+/// Bound one `tool_use.input` / `tool_result.output` body in place — THE
+/// slim-preview transform (PROTOCOL §5.5), shared by the serve-time slim
+/// projection (intent-services `tool_block`, `threshold` =
+/// [`SLIM_PROJECTION_BUDGET_BYTES`]) and the write-time heavy-payload
+/// extraction (intent-store `message_payload`, `threshold` = its inline
+/// ceiling), so a persisted preview is byte-identical to what serving the
+/// full body slim would have produced. A body over `threshold` is replaced
+/// by [`cap_json_value`]'s bounded preview (budget always
+/// [`SLIM_PROJECTION_BUDGET_BYTES`]) plus additive `truncated_flag: true` /
+/// `bytes_flag: <original size>` and the ORIGINAL body is returned (the
+/// extraction side persists it; the serve side drops it). At-or-under
+/// threshold bodies — and blocks already carrying `truncated_flag` (a
+/// persisted write-time preview; re-capping would corrupt `bytes_flag` and
+/// shrink the preview) — pass through untouched as `None`.
+pub fn slim_heavy_body(
+    block: &mut serde_json::Value,
+    field: &str,
+    truncated_flag: &str,
+    bytes_flag: &str,
+    threshold: usize,
+) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    if block.get(truncated_flag).and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let body = block.get(field)?;
+    let size = slim_body_size(body);
+    if size <= threshold {
+        return None;
+    }
+    let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+    let capped = cap_json_value(body, &mut budget);
+    let obj = block.as_object_mut()?;
+    let original = obj.insert(field.to_string(), capped)?;
+    obj.insert(truncated_flag.to_string(), Value::Bool(true));
+    obj.insert(bytes_flag.to_string(), serde_json::json!(size));
+    Some(original)
+}
+
 /// The `lastToolUse` preview of one message's content blocks (PROTOCOL §5.5 /
 /// §6.5): the LAST `tool_use` block's `name` plus its `input` bounded by
 /// [`SLIM_PROJECTION_BUDGET_BYTES`] — an over-budget input is replaced by

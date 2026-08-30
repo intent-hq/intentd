@@ -30,6 +30,7 @@ mod hook_repo;
 mod idempotency_repo;
 mod known_repo_repo;
 mod mcp_oauth_repo;
+mod message_payload;
 mod message_thumbnails;
 mod metrics_repo;
 mod note_line_attribution_repo;

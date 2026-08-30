@@ -26,7 +26,7 @@
 //! subscriber's accumulated state stays byte-identical to a fresh slim
 //! snapshot — the same invariant the factory above upholds for block shape.
 
-use intent_core::{cap_json_value, slim_body_size, SLIM_PROJECTION_BUDGET_BYTES};
+use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
 use serde_json::{json, Map, Value};
 
 /// Apply the slim conversation projection (PROTOCOL §5.5, the wire default
@@ -69,23 +69,22 @@ pub fn slim_tool_block(block: &mut Value) {
 
 /// Slim one `tool_use.input` / `tool_result.output` body in place: measured
 /// against [`SLIM_PROJECTION_BUDGET_BYTES`] (string bodies by length, JSON
-/// bodies by serialized length), an over-budget body is replaced by
-/// [`cap_json_value`]'s bounded preview plus the additive truncation flags.
+/// bodies by serialized length), an over-budget body is replaced by the
+/// bounded preview plus the additive truncation flags. Delegates to
+/// [`intent_core::slim_heavy_body`] — the SAME transform the write-time
+/// heavy-payload extraction persists (intent-store `message_payload`), so a
+/// stored placeholder served without hydration is byte-identical to slimming
+/// the full body here; that sharing is also why an already-flagged block
+/// (a persisted write-time preview) passes through untouched instead of
+/// being re-capped. The extracted original body is dropped (serve side).
 fn slim_body(block: &mut Value, field: &str, truncated_flag: &str, bytes_flag: &str) {
-    let Some(body) = block.get(field) else {
-        return;
-    };
-    let size = slim_body_size(body);
-    if size <= SLIM_PROJECTION_BUDGET_BYTES {
-        return;
-    }
-    let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
-    let capped = cap_json_value(body, &mut budget);
-    if let Some(obj) = block.as_object_mut() {
-        obj.insert(field.to_string(), capped);
-        obj.insert(truncated_flag.to_string(), json!(true));
-        obj.insert(bytes_flag.to_string(), json!(size));
-    }
+    drop(intent_core::slim_heavy_body(
+        block,
+        field,
+        truncated_flag,
+        bytes_flag,
+        SLIM_PROJECTION_BUDGET_BYTES,
+    ));
 }
 
 /// Slim one `image` block in place: an over-budget base64 `data` is replaced
