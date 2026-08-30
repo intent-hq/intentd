@@ -1802,6 +1802,30 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.resolveProposal`: record the user's resolution of a pending
+    /// proposal (`outcome` is `"applied"` or `"dismissed"`) — remove the
+    /// entry from the session's `pendingProposals` list, persist the
+    /// `proposalId -> outcome` resolution, emit `agent:updated`, and deliver
+    /// a system-origin notice to the agent naming the proposal and outcome
+    /// (PROTOCOL §5.5). Idempotent: re-resolving an already-resolved id
+    /// succeeds without a duplicate notice. Unknown `proposalId` (never
+    /// pending, never resolved) → `NotFound`.
+    fn agent_resolve_proposal(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        proposal_id: String,
+        outcome: String,
+        detail: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, proposal_id, outcome, detail);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_resolve_proposal not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.markSeen`: persist the per-conversation seen marker
     /// (`message_id` — the newest transcript message the user has seen) on
     /// the agent session and emit `agent:updated` (PROTOCOL §5.5). Monotonic:
@@ -6187,7 +6211,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.hook.schedule` / wire `hook.schedule`: register a background hook
     /// (an agent-owned scheduled script) after one immediate real run.
-    /// `params` carries `{ name, code, delayMs }`; `agent_id` is the owning
+    /// `params` carries `{ name, code }` plus exactly one schedule kind —
+    /// `delayMs` (fixed cadence), `cron` (recurring UTC expression), or
+    /// `runAt` (one-shot RFC3339 fire time); `agent_id` is the owning
     /// agent (the MCP caller). Returns the persisted hook on success.
     fn hook_schedule(
         &self,
@@ -6255,7 +6281,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `ws.hook.runNow` / wire `hook.runNow`: trigger an immediate run of an
-    /// active hook, resetting its inter-run timer.
+    /// active hook, resetting its inter-run timer. On a `runAt` hook the
+    /// triggered run IS the one-shot fire: the hook fires early and retires
+    /// (the one-shot contract is honored over the timestamp).
     fn hook_run_now(
         &self,
         workspace_id: WorkspaceId,

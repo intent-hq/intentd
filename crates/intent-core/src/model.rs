@@ -2639,6 +2639,30 @@ pub const PENDING_QUESTIONS_MESSAGE_ID_KEY: &str = "pendingQuestionsMessageId";
 /// [`AgentSession::pending_proposals`].
 pub const PENDING_PROPOSALS_KEY: &str = "pendingProposals";
 
+/// Metadata key under which resolved-proposal outcomes are persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, `agent.resolveProposal`): a
+/// `proposalId -> "applied" | "dismissed"` map recording how each formerly
+/// pending proposal was resolved. Doubles as the durable idempotency marker
+/// for `agent.resolveProposal`: re-resolving an id that is no longer pending
+/// succeeds without a duplicate notice, across daemon restarts. A
+/// re-proposed id re-enters the pending list; its re-resolution overwrites
+/// the earlier outcome (latest wins). Bounded: the resolver evicts the
+/// oldest entries past its retention cap, so the map (and the `AgentLite`
+/// projection lifting it into hot `agent.list` / `agent.get` payloads) never
+/// grows without bound. No schema migration — the map rides the existing
+/// free-form `metadata` column. Read back by
+/// [`AgentSession::proposal_resolutions`].
+pub const PROPOSAL_RESOLUTIONS_KEY: &str = "proposalResolutions";
+
+/// The only two `outcome` values `agent.resolveProposal` accepts and the
+/// [`PROPOSAL_RESOLUTIONS_KEY`] map may carry. The reader
+/// ([`AgentSession::proposal_resolutions`]) filters entries against this set
+/// so caller-seeded session metadata cannot smuggle an unknown outcome into
+/// the projection or the RPC's idempotent echo.
+pub const PROPOSAL_OUTCOME_APPLIED: &str = "applied";
+/// See [`PROPOSAL_OUTCOME_APPLIED`].
+pub const PROPOSAL_OUTCOME_DISMISSED: &str = "dismissed";
+
 /// Metadata key under which the per-conversation seen marker is persisted on
 /// the `agent_session.metadata` JSON (PROTOCOL §5.5): the id of the newest
 /// transcript message the user has seen, advanced monotonically by
@@ -2978,6 +3002,34 @@ impl AgentSession {
             .unwrap_or_default()
     }
 
+    /// The resolved-proposal outcomes persisted under
+    /// [`PROPOSAL_RESOLUTIONS_KEY`] in the session's free-form `metadata`:
+    /// a `proposalId -> "applied" | "dismissed"` map. Malformed entries are
+    /// skipped defensively — empty ids, and any outcome outside the
+    /// [`PROPOSAL_OUTCOME_APPLIED`] / [`PROPOSAL_OUTCOME_DISMISSED`] set
+    /// (session creation persists caller metadata unchanged, so a seeded
+    /// entry with an arbitrary outcome must not read as authoritative).
+    /// Absent key or a non-object value reads as an empty map.
+    pub fn proposal_resolutions(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PROPOSAL_RESOLUTIONS_KEY))
+            .and_then(serde_json::Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(id, outcome)| {
+                        !id.is_empty()
+                            && outcome.as_str().is_some_and(|o| {
+                                o == PROPOSAL_OUTCOME_APPLIED || o == PROPOSAL_OUTCOME_DISMISSED
+                            })
+                    })
+                    .map(|(id, outcome)| (id.clone(), outcome.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The per-conversation seen marker persisted under
     /// [`LAST_SEEN_MESSAGE_ID_KEY`] in the session's free-form `metadata`:
     /// `Some` only when the metadata is an object carrying a non-empty string
@@ -3097,6 +3149,13 @@ pub struct AgentMetadata {
     /// turns stay pending together. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_proposals: Vec<PendingProposal>,
+    /// Resolved-proposal outcomes (PROTOCOL §5.5, `agent.resolveProposal`):
+    /// a `proposalId -> "applied" | "dismissed"` map recording how each
+    /// formerly pending proposal was resolved, mirroring
+    /// [`AgentSession::proposal_resolutions`]. Clients render resolved
+    /// transcript proposal cards from it. Omitted when empty.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub proposal_resolutions: serde_json::Map<String, serde_json::Value>,
     /// Per-conversation seen marker (PROTOCOL §5.5): the id of the newest
     /// transcript message the user has seen, advanced monotonically by
     /// `agent.markSeen`. Clients position the "New messages" divider right
@@ -3347,6 +3406,7 @@ impl AgentLite {
                 .to_string()
         });
         let pending_proposals = session.pending_proposals();
+        let proposal_resolutions = session.proposal_resolutions();
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
@@ -3367,6 +3427,7 @@ impl AgentLite {
             dismissed_questions_message_id,
             pending_questions_message_id,
             pending_proposals,
+            proposal_resolutions,
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,
@@ -3996,11 +4057,12 @@ pub enum HookState {
     Expired,
 }
 
-/// A background hook: a small agent-owned script the daemon runs periodically
-/// (fixed `delayMs` between runs) until it signals a dispatch, fails, is
-/// cancelled, or its TTL expires. Persisted to the `hook` table so schedules
-/// survive a daemon restart; the name length cap (≤50 chars) is enforced at
-/// the service layer.
+/// A background hook: a small agent-owned script the daemon runs on one of
+/// three schedule kinds — a fixed `delayMs` cadence, a recurring `cron`
+/// expression, or a one-shot `runAt` timestamp — until it signals a
+/// dispatch, fails, is cancelled, or its TTL expires. Persisted to the
+/// `hook` table so schedules survive a daemon restart; the name length cap
+/// (≤50 chars) is enforced at the service layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hook {
@@ -4009,7 +4071,16 @@ pub struct Hook {
     pub agent_id: AgentId,
     pub name: String,
     pub code: String,
+    /// Inter-run delay for the fixed-cadence kind; 0 for cron/runAt hooks.
     pub delay_ms: i64,
+    /// Cron expression (standard 5-field, evaluated in UTC) for the
+    /// recurring kind; `None` for delayMs/runAt hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// Exact one-shot fire time (RFC3339) for the runAt kind; `None` for
+    /// delayMs/cron hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<String>,
     pub state: HookState,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

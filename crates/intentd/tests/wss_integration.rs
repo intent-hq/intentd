@@ -1457,6 +1457,8 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
             name: "retire-watchdog".to_string(),
             code: "return { dispatch: false };".to_string(),
             delay_ms: 600_000,
+            cron: None,
+            run_at: None,
             state: intent_core::HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -5434,12 +5436,14 @@ async fn wss_models_list_legacy_fresh_entry_served_and_forced_failure_stale() {
 async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
     // models.list legacy path staleness contract (§5.30) over the real WSS
     // transport: a NON-forced read whose persisted entry is past the 24h
-    // staleness threshold (fetchedAtMs: 0) re-probes; when the probe fails,
-    // the last-good list keeps being served labeled `stale: true` +
-    // `warning` — exactly `{ models, source, stale, warning }` with
-    // `source: "auggie"`, never a silent static fallback. The fake auggie
-    // appends to a counter file per invocation and always fails, making CLI
-    // spawns observable.
+    // staleness threshold (fetchedAtMs: 0) serves the last-good list
+    // immediately, labeled `stale: true` + `warning` — exactly
+    // `{ models, source, stale, warning }` with `source: "auggie"`, never a
+    // silent static fallback — while the refresh probe runs in the
+    // BACKGROUND (stale-while-revalidate, intent-hq/intent#3874); the failed
+    // probe then arms the negative window so subsequent reads do not
+    // re-spawn the CLI. The fake auggie appends to a counter file per
+    // invocation and always fails, making CLI spawns observable.
     use std::os::unix::fs::PermissionsExt;
     let dir = test_tempdir("intentd-wss-models-aged-");
     let count = dir.path().join("count");
@@ -5473,8 +5477,8 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
     )
     .await;
 
-    // Non-forced: the aged entry triggers a re-probe; the probe fails, so
-    // the last-good list is served with the degradation labels.
+    // Non-forced: the aged entry is served immediately with the degradation
+    // labels; the refresh probe runs in the background.
     let frame = r#"{"jsonrpc":"2.0","id":47,"method":"models.list"}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
     assert_eq!(resp["id"], 47);
@@ -5494,14 +5498,57 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
-    assert!(calls() > 0, "aged non-forced read must spawn the CLI");
+    // The detached background refresh spawns the CLI shortly after the
+    // response; poll until the counter file shows the spawn.
+    let mut waited = 0u32;
+    while calls() == 0 && waited < 200 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        waited += 1;
+    }
+    assert!(calls() > 0, "background refresh must spawn the CLI");
+
+    // Wait for the failed probe's OUTCOME to land, not just its start: the
+    // SWR spawn path and the negative-window path serve distinguishable
+    // warnings ("refreshing in the background" vs "serving last known model
+    // list"), so poll reads until the negative-cache wording shows up. A
+    // read landing while the in-flight slot is still held serves the former
+    // and spawns nothing, so this cannot pass on slot suppression alone; if
+    // the outcome were never recorded, reads after the slot release would
+    // keep re-spawning and the spawn-count assertion below would fail.
+    let mut req_id = 48u32;
+    let mut waited = 0u32;
+    let resp = loop {
+        let frame = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"method":"models.list"}}"#);
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        assert_eq!(resp["id"], req_id);
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(resp["result"]["source"], "auggie");
+        assert_eq!(resp["result"]["stale"], true, "{resp}");
+        let warning = resp["result"]["warning"].as_str().unwrap_or_default();
+        if warning.contains("serving last known model list") {
+            break resp;
+        }
+        assert!(
+            waited < 200,
+            "probe failure never reached the negative cache: {resp}"
+        );
+        waited += 1;
+        req_id += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        resp["result"]["models"],
+        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
+    );
     let after_probe = calls();
 
     // Within the negative window: the stale last-good list keeps being
-    // served without re-spawning the CLI.
-    let frame = r#"{"jsonrpc":"2.0","id":48,"method":"models.list"}"#;
-    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
-    assert_eq!(resp["id"], 48);
+    // served without re-spawning the CLI (no new background refresh).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":{},"method":"models.list"}}"#,
+        req_id + 1
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert!(resp.get("error").is_none(), "{resp}");
     assert_eq!(resp["result"]["source"], "auggie");
     assert_eq!(resp["result"]["stale"], true, "{resp}");

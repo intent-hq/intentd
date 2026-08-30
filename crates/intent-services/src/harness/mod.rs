@@ -282,6 +282,10 @@ pub(crate) trait Harness: Send + Sync {
         run_count: i64,
         dispatch_count: i64,
     ) -> String;
+    /// One-shot `runAt` fire notice body (the timer fired and continued —
+    /// the hook is retired), with a `ws.hook.get("<hookId>")` pointer for
+    /// recovering the script.
+    fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String;
     /// FE-cancel notice body (`hook.cancel` with no agent caller).
     fn hook_cancelled_from_app_notice(&self) -> String;
     /// Archive-sweep cancel notice body.
@@ -324,6 +328,13 @@ pub(crate) trait Harness: Send + Sync {
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String;
     /// System notice after the user dismissed pending structured questions.
     fn questions_dismissed_notice(&self, count: usize) -> String;
+    /// System notice after the user applied a pending proposal
+    /// (`agent.resolveProposal`, outcome `applied`); `detail` is the
+    /// caller-supplied context (e.g. the created workspace id).
+    fn proposal_applied_notice(&self, title: &str, detail: Option<&str>) -> String;
+    /// System notice after the user dismissed a pending proposal without
+    /// applying it (`agent.resolveProposal`, outcome `dismissed`).
+    fn proposal_dismissed_notice(&self, title: &str) -> String;
 }
 
 /// One registry row: a stamped `harnessVersion` and everything that version

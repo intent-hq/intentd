@@ -5449,6 +5449,60 @@ impl AgentManager {
                 .await;
             return Ok(result);
         }
+        // Combined flush of parked archive notices (intent-hq/intent#3883):
+        // a USER send into an ARCHIVED workspace whose queue holds parked
+        // ready-to-send entries (hook/PR-monitor archive-cancellation wakes)
+        // must not bypass them with a direct turn — the model would reason
+        // about the user message first and learn its hooks were cancelled
+        // in later turns, in confusing order. Convert the send into a
+        // queue-fallback enqueue (user-origin) and kick the drain: its
+        // archived gate exempts user-origin entries, the `try_begin` claim
+        // auto-unarchives at the single existing choke point, and the batch
+        // flush delivers the parked entries FIFO in the SAME combined turn
+        // as this user message with the trailing unarchive prompt notice.
+        // Same guards as the #1791 hold arm above: requires the `all` flush
+        // mode (without batching no combined turn exists to carry the
+        // parked entries), skipped when nothing is parked (the common
+        // direct-send path is untouched), and skipped for a session parked
+        // in `Error`, whose documented recovery IS the direct fresh send
+        // (the STAB-52 gate in `try_drain_queue` would strand a converted
+        // entry there). Chief is virtual and never archived, so skip the
+        // row read; fail open on a lookup error — only an affirmatively-
+        // archived row converts.
+        if options.origin.is_user()
+            && session.status != AgentStatus::Error
+            && !workspace_id.is_chief()
+            && self.services.flush_queued_messages_mode()
+                == intent_core::FlushQueuedMessagesMode::All
+            && self.services.has_ready_to_send(&agent_id)
+            && matches!(
+                self.services.store.get_workspace(&workspace_id).await,
+                Ok(ws) if ws.archived
+            )
+        {
+            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+                &agent_id,
+                Some(message_id.clone()),
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+                options.message_metadata.clone(),
+                options.queued_prepend(),
+                options.interrupt_priority,
+                true,
+            );
+            let result = json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": queued.to_value(position),
+                "turnId": queued.turn_id,
+            });
+            self.services.publish_queue_updated(&agent_id).await;
+            self.clone()
+                .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                .await;
+            return Ok(result);
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                 &agent_id,
@@ -5652,21 +5706,45 @@ impl AgentManager {
         // turns but KEEPS pending queues persisted, so the automatic drain
         // must not respawn a turn while the workspace is archived — messages
         // park until unarchive, which kicks this drain for every parked
-        // queue (see `unarchive_workspace`). Chief is virtual and never
-        // archived, so skip the row read. Fail open on a lookup error: the
-        // gate only parks affirmatively-archived workspaces; a transient
-        // store error must not strand the queue.
-        if !workspace_id.is_chief() {
+        // queue (see `unarchive_workspace`). A USER-origin entry queued at
+        // or after `archivedAt` is exempt (intent-hq/intent#3883, mirroring
+        // the question-hold `hold_drain` exemption below): a user send made
+        // INTO the archived workspace is the explicit resurrection signal,
+        // so the drain proceeds — its `try_begin` claim performs the
+        // auto-unarchive at the single existing choke point, and the batch
+        // flush carries every parked ready entry FIFO in the same combined
+        // turn. The timestamp cut matters: a user entry parked by a busy
+        // race BEFORE archival is not a post-archive user action, so it
+        // stays parked with everything else — without the cut the
+        // interrupted worker's end-of-turn re-kick would find that older
+        // entry and immediately unarchive a freshly archived workspace
+        // (PR #1587 review). With no post-archive user entry ready
+        // everything stays parked (no regression on the archive/
+        // auto-unarchive loop). Chief is virtual and never archived, so
+        // skip the row read. Fail open on a lookup error: the gate only
+        // parks affirmatively-archived workspaces; a transient store error
+        // must not strand the queue. A row missing `archivedAt` (legacy
+        // data) also fails open to the untimed user-origin check.
+        let archived_drain = if workspace_id.is_chief() {
+            false
+        } else {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    tracing::debug!(
-                        agent = %agent_id,
-                        workspace = %workspace_id.as_str(),
-                        "skipping queue drain: workspace is archived"
-                    );
-                    return;
+                    let user_ready = match ws.archived_at.as_deref() {
+                        Some(at) => self.services.has_user_origin_ready_since(&agent_id, at),
+                        None => self.services.has_user_origin_ready(&agent_id),
+                    };
+                    if !user_ready {
+                        tracing::debug!(
+                            agent = %agent_id,
+                            workspace = %workspace_id.as_str(),
+                            "skipping queue drain: workspace is archived"
+                        );
+                        return;
+                    }
+                    true
                 }
-                Ok(_) => {}
+                Ok(_) => false,
                 Err(e) => {
                     tracing::warn!(
                         agent = %agent_id,
@@ -5674,9 +5752,10 @@ impl AgentManager {
                         error = %e,
                         "queue drain: workspace archived-state lookup failed; proceeding"
                     );
+                    false
                 }
             }
-        }
+        };
         // Question hold (PROTOCOL §5.5): AUTOMATIC queued messages stay
         // parked while the agent has un-dismissed pending questions — the
         // turn a drained entry starts would bury the pending Q&A. The park
@@ -5769,16 +5848,19 @@ impl AgentManager {
         // Batch flush (`agents.flushQueuedMessages`, default `all`): with a
         // batching mode and MORE THAN ONE eligible entry waiting, drain them
         // all into ONE combined provider turn while persisting each entry as
-        // its own transcript row. Under an active hold (`hold_drain`) the
-        // flush fires only because a user-origin entry is ready — the parked
-        // automatic entries ride its combined turn FIFO instead of being
-        // bypassed (monorepo#1791). A single eligible entry (or the `off`
-        // mode) falls through to the existing single-entry path unchanged.
+        // its own transcript row. Under an active hold (`hold_drain`) or an
+        // archived-workspace exemption (`archived_drain`) the flush fires
+        // only because a user-origin entry is ready — the parked automatic
+        // entries ride its combined turn FIFO instead of being bypassed
+        // (monorepo#1791; intent-hq/intent#3883). A single eligible entry
+        // (or the `off` mode) falls through to the existing single-entry
+        // path unchanged.
+        let user_led_drain = hold_drain || archived_drain;
         {
             let mode = self.services.flush_queued_messages_mode();
-            if let Some(batch) = self
-                .services
-                .dequeue_flush_batch(&agent_id, mode, hold_drain, 2)
+            if let Some(batch) =
+                self.services
+                    .dequeue_flush_batch(&agent_id, mode, user_led_drain, 2)
             {
                 match prepare_flush_turn(&self, &agent_id, &workspace_id, batch).await {
                     FlushPrep::Turn { content, options } => {
@@ -5794,9 +5876,10 @@ impl AgentManager {
                 return;
             }
         }
-        // Under an active hold only a user-origin entry may drain; the
-        // normal path pops the queue head as before.
-        let dequeued = if hold_drain {
+        // Under an active hold (or the archived-workspace exemption) only a
+        // user-origin entry may drain; the normal path pops the queue head
+        // as before.
+        let dequeued = if user_led_drain {
             self.services.dequeue_user_origin_message(&agent_id)
         } else {
             self.services.dequeue_message(&agent_id)

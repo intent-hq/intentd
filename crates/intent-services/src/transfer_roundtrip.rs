@@ -333,6 +333,8 @@ async fn seed_source(
             name: "watcher".to_string(),
             code: "return { dispatch: false }".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: t.clone(),
             last_run_at: None,

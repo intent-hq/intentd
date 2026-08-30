@@ -333,6 +333,33 @@ pub(crate) fn proposal_block_id(block: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The human-readable `preview.title` of the proposal-resource block whose
+/// identity ([`proposal_block_id`]) equals `proposal_id`, scanning `blocks`
+/// in order (last match wins, consistent with [`proposal_ids_in`] dedupe).
+/// `None` when no block carries the id or the matching proposal has no
+/// title — callers fall back to the id itself.
+pub(crate) fn proposal_title_in(blocks: &[Value], proposal_id: &str) -> Option<String> {
+    let mut title = None;
+    for block in blocks {
+        if proposal_block_id(block).as_deref() == Some(proposal_id) {
+            title = block
+                .get("resource")
+                .and_then(|r| r.get("text"))
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .and_then(|proposal| {
+                    proposal
+                        .get("preview")
+                        .and_then(|p| p.get("title"))
+                        .and_then(Value::as_str)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                });
+        }
+    }
+    title
+}
+
 /// Proposal ids carried by a message's content blocks, in block order,
 /// deduped within the slice (a later duplicate wins its position — last
 /// occurrence order). Backs the turn-end pending-proposals recording: both

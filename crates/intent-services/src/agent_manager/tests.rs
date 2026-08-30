@@ -16892,6 +16892,459 @@ mod question_hold_gates {
     }
 }
 
+/// Combined flush of parked archive notices on auto-unarchive
+/// (intent-hq/intent#3883): a USER send into an ARCHIVED workspace whose
+/// queue holds parked ready-to-send entries (hook/PR-monitor archive
+/// cancellation wakes) converts to a user-origin enqueue + drain kick, so
+/// the batch flush delivers the parked entries FIFO in ONE combined turn
+/// with the user message — and the drain's `try_begin` performs the
+/// auto-unarchive, so the same turn carries the one-shot prompt notice.
+mod archived_flush_gates {
+    use super::*;
+    use crate::agent_manager::TurnOptions;
+    use intent_core::MessageOrigin;
+
+    async fn seed_mock_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+        seed_agent(mgr, ws, id).await;
+        set_session_provider(mgr, ws, id, "mock").await;
+    }
+
+    async fn archive_row(mgr: &AgentManager, ws: &WorkspaceId) {
+        let mut row = mgr.services.store.get_workspace(ws).await.unwrap();
+        row.status = WorkspaceStatus::Archived;
+        row.archived = true;
+        row.archived_at = Some(now_iso());
+        mgr.services
+            .store
+            .update_workspace(&row)
+            .await
+            .expect("archive row");
+    }
+
+    async fn await_settled(mgr: &Arc<AgentManager>, id: &AgentId) {
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if !mgr.is_busy(id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent settles");
+    }
+
+    fn read_prompt_log(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).expect("prompt log line")["text"]
+                    .as_str()
+                    .expect("text")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Regression (intent-hq/intent#3883): an archive-cancellation wake
+    /// parked behind the archived gate must ride the SAME combined turn as
+    /// the user message that auto-unarchives the workspace — wake row FIRST,
+    /// user message after, the `auto_unarchived` system row persisted, and
+    /// ONE outbound prompt ending with the one-shot unarchive notice.
+    #[tokio::test]
+    async fn parked_archive_wake_rides_the_unarchiving_user_turn() {
+        let script = mock_agent_script();
+        let prompt_log =
+            std::env::temp_dir().join(format!("itd-ua-flush-{}.log", uuid::Uuid::new_v4()));
+        let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-ua-flush"),
+            AgentId::from("a-ua-flush"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+        archive_row(&mgr, &ws).await;
+
+        // The hook-cancellation wake (automatic) parks behind the archived
+        // gate on the idle agent.
+        let wake = "[Background hook \"ci-watch\"] cancelled: workspace archived";
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                wake.to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("wake send");
+        assert_eq!(r["archivedParked"], json!(true), "wake parks: {r}");
+
+        // The user's later message converts to an enqueue + flush instead
+        // of a direct turn that would bypass the parked wake.
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "back to work".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("user send");
+        assert_eq!(
+            r["queued"],
+            json!(true),
+            "converted to enqueue + flush: {r}"
+        );
+        await_settled(&mgr, &id).await;
+
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "no parked leftovers"
+        );
+        let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+        assert!(!after.archived, "the drain's claim auto-unarchived");
+
+        // Transcript order: wake row BEFORE the user message, and the
+        // `auto_unarchived` system row persisted by the same claim.
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let row_idx = |needle: &str| {
+            messages.iter().position(|m| {
+                m.role == "user"
+                    && m.content.as_array().is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
+                    })
+            })
+        };
+        let wake_idx = row_idx("cancelled: workspace archived").expect("wake row landed");
+        let user_idx = row_idx("back to work").expect("user row landed");
+        assert!(
+            wake_idx < user_idx,
+            "parked wake delivered FIFO ahead of the user message: \
+             wake={wake_idx} user={user_idx}"
+        );
+        assert!(
+            messages.iter().any(|m| m.role == "system"
+                && m.metadata
+                    == Some(json!({ "type": "auto_unarchived", "reason": "agent_activity" }))),
+            "the auto_unarchived system row persisted"
+        );
+
+        // ONE combined provider turn whose prompt carries the wake, the
+        // user message, and the trailing one-shot unarchive notice.
+        let prompts = read_prompt_log(&prompt_log);
+        let _ = std::fs::remove_file(&prompt_log);
+        assert_eq!(prompts.len(), 1, "one combined turn: {prompts:?}");
+        let text = &prompts[0];
+        let w = text
+            .find("cancelled: workspace archived")
+            .expect("wake in prompt");
+        let u = text.find("back to work").expect("user msg in prompt");
+        assert!(w < u, "prompt order wake → user: {text}");
+        assert!(
+            text.ends_with(super::super::AUTO_UNARCHIVE_PROMPT_NOTICE),
+            "the combined prompt ends with the unarchive notice: {text}"
+        );
+    }
+
+    /// EMPTY queue: a user send to an archived workspace keeps today's
+    /// direct-turn path byte-for-byte (no queue hop).
+    #[tokio::test]
+    async fn user_send_with_empty_queue_stays_direct() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-ua-empty"),
+            AgentId::from("a-ua-empty"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+        archive_row(&mgr, &ws).await;
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "revive".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("user send");
+        assert_eq!(r["queued"], json!(false), "direct turn, no queue hop: {r}");
+        await_settled(&mgr, &id).await;
+        let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+        assert!(!after.archived, "direct claim auto-unarchived");
+    }
+
+    /// The conversion requires the `all` flush mode: without batching no
+    /// combined turn exists to carry the parked entries, so the user send
+    /// stays a DIRECT send under `off` — the pre-fix contract.
+    #[tokio::test]
+    async fn user_send_stays_direct_when_flush_mode_off() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[("agents.flushQueuedMessages".to_string(), json!("off"))])
+            .expect("disable flush");
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        let mgr = Arc::new(AgentManager::new(services, sink, 8));
+        let (ws, id) = (WorkspaceId::from("ws-ua-off"), AgentId::from("a-ua-off"));
+        seed_mock_agent(&mgr, &ws, &id).await;
+        archive_row(&mgr, &ws).await;
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("wake send");
+        assert_eq!(r["archivedParked"], json!(true));
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "revive".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("user send");
+        assert_eq!(
+            r["queued"],
+            json!(false),
+            "no combined turn exists in `off` mode — the direct send stands: {r}"
+        );
+        await_settled(&mgr, &id).await;
+    }
+
+    /// A session parked in Error keeps the documented direct fresh-send
+    /// recovery path — no conversion (the STAB-52 gate in `try_drain_queue`
+    /// would strand a converted entry).
+    #[tokio::test]
+    async fn user_send_to_error_session_stays_direct() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-ua-error"),
+            AgentId::from("a-ua-error"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+        archive_row(&mgr, &ws).await;
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("wake send");
+        assert_eq!(r["archivedParked"], json!(true));
+
+        mgr.services
+            .store
+            .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso(), None)
+            .await
+            .expect("park session in Error");
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "recover".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("user send");
+        assert_eq!(
+            r["queued"],
+            json!(false),
+            "Error session keeps the direct fresh-send recovery: {r}"
+        );
+        await_settled(&mgr, &id).await;
+    }
+
+    /// `try_drain_queue`'s archived gate: a parked USER-origin entry exempts
+    /// the drain (the user message is the explicit resurrection signal) —
+    /// the claim auto-unarchives and the batch carries every parked entry
+    /// FIFO; with NO user-origin entry ready the gate still parks everything
+    /// (no regression on the archive/auto-unarchive loop, intentd#1293).
+    #[tokio::test]
+    async fn drain_archived_gate_exempts_user_origin_entries() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-ua-drain"),
+            AgentId::from("a-ua-drain"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+        archive_row(&mgr, &ws).await;
+
+        // Automatic entries alone stay parked.
+        mgr.services
+            .enqueue_message(&id, "auto wake".to_string(), None, None, None, None, false);
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        assert!(!mgr.is_busy(&id), "automatic-only queue stays parked");
+        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+        let row = mgr.services.store.get_workspace(&ws).await.unwrap();
+        assert!(row.archived, "no auto-unarchive without a user entry");
+
+        // A user-origin entry queued INTO the archived workspace (at or
+        // after `archivedAt`) exempts the gate: the next kick drains
+        // everything and unarchives.
+        mgr.services.enqueue_message_with_origin(
+            &id,
+            "user follow-up".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        await_settled(&mgr, &id).await;
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "both entries drained"
+        );
+        let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+        assert!(!after.archived, "the drain's claim auto-unarchived");
+    }
+
+    /// Regression (PR #1587 review): a user-origin entry parked by a busy
+    /// race BEFORE archival is not a post-archive user action, so it must
+    /// NOT release the archived gate — in the busy-user → archive flow the
+    /// interrupted worker's end-of-turn re-kick would otherwise find that
+    /// older entry and immediately auto-unarchive the freshly archived
+    /// workspace. Only a user send made at or after `archivedAt` resurrects.
+    #[tokio::test]
+    async fn pre_archival_user_entry_does_not_release_the_gate() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-ua-pre"), AgentId::from("a-ua-pre"));
+        seed_mock_agent(&mgr, &ws, &id).await;
+
+        // A user message parked by the busy race BEFORE the archive.
+        mgr.services.enqueue_message_with_origin(
+            &id,
+            "pre-archival user leftover".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        // Ensure `queuedAt` strictly precedes `archivedAt` even at coarse
+        // clock resolution.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        archive_row(&mgr, &ws).await;
+
+        // The end-of-turn / unarchive-window re-kick path: the drain must
+        // stay parked despite the ready user-origin entry.
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        assert!(!mgr.is_busy(&id), "pre-archival user entry stays parked");
+        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+        let row = mgr.services.store.get_workspace(&ws).await.unwrap();
+        assert!(
+            row.archived,
+            "no auto-unarchive without a post-archive user send"
+        );
+
+        // A fresh user send INTO the archived workspace releases the park
+        // and carries the older leftover FIFO in the same combined turn.
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "please resume".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("user send");
+        assert_eq!(r["queued"], json!(true), "send converts to enqueue: {r}");
+        await_settled(&mgr, &id).await;
+        let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+        assert!(
+            !after.archived,
+            "the post-archive user send auto-unarchived"
+        );
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "both entries drained in the combined turn"
+        );
+    }
+}
+
 /// Attention-request clear gating (PROTOCOL §5.5): a pending
 /// `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` request retires on
 /// a USER-ORIGIN delivery for every agent, and ALSO on an automatic delivery

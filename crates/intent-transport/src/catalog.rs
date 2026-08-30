@@ -50,6 +50,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveInterrupted",
+    "agent.resolveProposal",
     "agent.respondPermission",
     "agent.restore",
     "agent.retry",

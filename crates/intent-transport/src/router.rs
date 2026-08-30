@@ -1575,6 +1575,18 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.resolveProposal" => {
+            let agent_id = require_agent_id(params)?;
+            let proposal_id = require_str_param(params, "proposalId")?;
+            let outcome = require_str_param(params, "outcome")?;
+            let detail = opt_str(params, "detail");
+            let ws = require_ws_note(params)?;
+            let result = api
+                .agent_resolve_proposal(ws, agent_id, proposal_id, outcome, detail)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.markSeen" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;

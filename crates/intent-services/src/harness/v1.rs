@@ -827,6 +827,14 @@ impl Harness for V1 {
         )
     }
 
+    fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String {
+        format!(
+            "Your one-shot timer hook \"{hook_name}\" (scheduled for {run_at}) fired and is \
+             now retired. Schedule a new hook via ws.hook.schedule if you need another timer \
+             — the original script is retrievable via ws.hook.get(\"{hook_id}\")."
+        )
+    }
+
     fn hook_cancelled_from_app_notice(&self) -> String {
         "This hook was cancelled from the app.".to_string()
     }
@@ -1187,6 +1195,23 @@ impl Harness for V1 {
             "User dismissed your {noun} without answering. This is an informative \
              notice only — do not re-ask and do not proceed with any work; end \
              your turn and wait for the user's next message."
+        )
+    }
+
+    fn proposal_applied_notice(&self, title: &str, detail: Option<&str>) -> String {
+        let mut notice = format!("User applied the proposal '{title}'.");
+        if let Some(detail) = detail {
+            notice.push(' ');
+            notice.push_str(detail);
+        }
+        notice
+    }
+
+    fn proposal_dismissed_notice(&self, title: &str) -> String {
+        format!(
+            "User dismissed the proposal '{title}' without applying it. This is \
+             an informative notice only — do not re-propose it; continue with \
+             your other work or end your turn."
         )
     }
 }
