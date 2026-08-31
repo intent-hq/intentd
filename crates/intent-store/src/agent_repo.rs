@@ -2672,9 +2672,10 @@ const DELETE_CASCADE_BATCH: i64 = 500;
 const DELETE_PAYLOAD_BATCH_SQL: &str = "DELETE FROM agent_message_payload WHERE rowid IN \
      (SELECT rowid FROM agent_message_payload WHERE agent_id = ? LIMIT ?)";
 
-/// One batch of a session's `agent_message` rows. Seeks via the
-/// `UNIQUE(agent_id, seq)` index (0004); the per-row AFTER DELETE triggers
-/// (FTS 0074, payload 0109) keep the side tables aligned.
+/// One batch of a session's `agent_message` rows. Seeks via an
+/// `agent_id`-prefixed index (the planner picks `idx_agent_message_agent_role_seq`,
+/// 0064); the per-row AFTER DELETE triggers (FTS 0074, payload 0109) keep the
+/// side tables aligned.
 const DELETE_MESSAGE_BATCH_SQL: &str = "DELETE FROM agent_message WHERE rowid IN \
      (SELECT rowid FROM agent_message WHERE agent_id = ? LIMIT ?)";
 
