@@ -373,40 +373,54 @@ mod tests {
     /// caller gets the shared result (monorepo#1926).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_calls_share_one_flight() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let spawns = Arc::new(AtomicUsize::new(0));
-        let entered = Arc::new(AtomicUsize::new(0));
-        let mut tasks = Vec::new();
+        let all_joined = Arc::new(AtomicBool::new(false));
+        let mut callers: Vec<Pin<Box<dyn Future<Output = Result<RemoteBranches>> + Send>>> =
+            Vec::new();
         for _ in 0..8 {
             let spawns = Arc::clone(&spawns);
-            let entered = Arc::clone(&entered);
-            let gate = Arc::clone(&entered);
-            tasks.push(tokio::spawn(async move {
-                // No await point separates this increment from the registry
-                // join inside `single_flight` — both run in the same poll —
-                // so once the gate below sees 8, every caller has joined
-                // (or is a few instructions from the map lock, which it
-                // reaches long before the driver's cross-pool retirement).
-                entered.fetch_add(1, Ordering::SeqCst);
-                single_flight("flight-shared", move || {
-                    spawns.fetch_add(1, Ordering::SeqCst);
-                    // Hold the flight open until every caller has entered
-                    // `single_flight`, instead of assuming a fixed sleep
-                    // outlasts task scheduling.
-                    while gate.load(Ordering::SeqCst) < 8 {
-                        std::thread::yield_now();
-                    }
-                    Ok(RemoteBranches {
-                        branches: vec!["main".to_string()],
-                        default_branch: Some("main".to_string()),
-                    })
+            let gate = Arc::clone(&all_joined);
+            callers.push(Box::pin(single_flight("flight-shared", move || {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                // Hold the flight open until every caller has demonstrably
+                // joined it (been polled once below), so no caller can
+                // arrive after the flight retired (monorepo#2276).
+                while !gate.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                Ok(RemoteBranches {
+                    branches: vec!["main".to_string()],
+                    default_branch: Some("main".to_string()),
                 })
-                .await
-            }));
+            })));
         }
-        for task in tasks {
-            let r = task.await.unwrap().expect("shared flight result");
+        // A caller joins the flight on its first poll — the registry lookup
+        // precedes any await point in `single_flight` — so after this loop
+        // every caller holds the same flight, which the still-closed gate
+        // has kept from completing and retiring. No scheduler-timing
+        // assumption: joining is observed, not inferred from a counter
+        // incremented before the call.
+        let mut all_first_polls_pending = true;
+        for caller in &mut callers {
+            all_first_polls_pending &= std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(caller.as_mut().poll(cx).is_pending())
+            })
+            .await;
+        }
+        // Release the gate before asserting: a failed assertion here would
+        // otherwise leave the blocking `work` spinning on the gate forever,
+        // hanging the test binary instead of failing it.
+        all_joined.store(true, Ordering::SeqCst);
+        assert!(
+            all_first_polls_pending,
+            "each caller must be waiting on the shared flight"
+        );
+        for caller in callers {
+            let r = caller.await.expect("shared flight result");
             assert_eq!(r.branches, vec!["main"]);
             assert_eq!(r.default_branch.as_deref(), Some("main"));
         }
