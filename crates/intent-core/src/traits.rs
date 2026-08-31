@@ -4948,13 +4948,18 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `mcp.servers.toggle` → enable (start) / disable (stop) a server; returns
-    /// `{ status: McpServerStatus }` (PROTOCOL §5.22).
+    /// `{ status: McpServerStatus }` (PROTOCOL §5.22). With a `workspace_id`
+    /// scope the toggle sets/clears the **per-workspace** disabled marker
+    /// instead of the global config/lifecycle, returning
+    /// `{ status, workspaceDisabled }` — global disable always wins; the
+    /// workspace layer only narrows an otherwise-enabled server.
     fn mcp_servers_toggle(
         &self,
         server_id: String,
         enabled: bool,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (server_id, enabled);
+        let _ = (server_id, enabled, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mcp_servers_toggle not implemented".to_string(),
@@ -5059,10 +5064,16 @@ pub trait WorkspaceApi: Send + Sync {
     /// `ws.mcp.listServers` (agent bridge/hook surface only — no wire
     /// method): the configured external MCP servers projected to a
     /// non-sensitive allowlist — `{ servers: [{ id, name, transport,
-    /// enabled, state, toolCount? }] }`. `env`/`headers` never appear.
-    /// Gated server-side on `agentFeatures.mcpTools` and
-    /// `mcp.enableUserServers`.
-    fn mcp_list_servers(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+    /// enabled, state, toolCount?, workspaceDisabled? }] }`. `env`/`headers`
+    /// never appear. Gated server-side on `agentFeatures.mcpTools` and
+    /// `mcp.enableUserServers`. `workspace_id` scopes the per-workspace
+    /// disabled layer (`workspaceDisabled: true` on servers disabled in that
+    /// workspace).
+    fn mcp_list_servers(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mcp_list_servers not implemented".to_string(),
@@ -5073,9 +5084,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// `ws.mcp.listTools` (agent bridge/hook surface only — no wire method):
     /// forward `tools/list` to one running external MCP server, returning
     /// the raw MCP result (`{ tools: [...] }`). Same settings gates as
-    /// [`Self::mcp_list_servers`], plus the per-server disabled list.
-    fn mcp_list_tools(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = server_id;
+    /// [`Self::mcp_list_servers`], plus the per-server disabled list and the
+    /// per-workspace disabled layer for `workspace_id`.
+    fn mcp_list_tools(
+        &self,
+        server_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mcp_list_tools not implemented".to_string(),
@@ -5086,15 +5102,17 @@ pub trait WorkspaceApi: Send + Sync {
     /// `ws.mcp.callTool` (agent bridge/hook surface only — no wire method):
     /// forward `tools/call` to one running external MCP server, returning
     /// the raw MCP result. `timeout_ms` is a caller override the hub caps at
-    /// its own bound. Same settings gates as [`Self::mcp_list_tools`].
+    /// its own bound. Same settings gates as [`Self::mcp_list_tools`],
+    /// including the per-workspace disabled layer for `workspace_id`.
     fn mcp_call_tool(
         &self,
         server_id: String,
         tool_name: String,
         args: serde_json::Value,
         timeout_ms: Option<u64>,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (server_id, tool_name, args, timeout_ms);
+        let _ = (server_id, tool_name, args, timeout_ms, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mcp_call_tool not implemented".to_string(),

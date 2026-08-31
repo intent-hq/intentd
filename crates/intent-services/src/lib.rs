@@ -3278,6 +3278,7 @@ impl Services {
             self.settings_registry.as_deref(),
             &self.secrets,
             &self.mcp_hub,
+            Some(&self.store),
         )
     }
 
@@ -13150,8 +13151,36 @@ impl WorkspaceApi for Services {
         &self,
         server_id: String,
         enabled: bool,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_servers_service().toggle(&server_id, enabled).await })
+        Box::pin(async move {
+            match workspace_id {
+                Some(ws) => {
+                    let out = self
+                        .mcp_servers_service()
+                        .toggle_workspace(ws.as_str(), &server_id, enabled)
+                        .await?;
+                    // Self-sufficient `workspace:updated` delta (§6.5) so live
+                    // clients mirror the workspace-scoped toggle without a
+                    // follow-up read.
+                    publish_event(
+                        self.event_bus.as_ref(),
+                        workspace_updated_event(
+                            &ws,
+                            &serde_json::json!({
+                                "mcpServerToggled": {
+                                    "serverId": server_id,
+                                    "workspaceDisabled": !enabled,
+                                }
+                            }),
+                        ),
+                    )
+                    .await;
+                    Ok(out)
+                }
+                None => self.mcp_servers_service().toggle(&server_id, enabled).await,
+            }
+        })
     }
 
     fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -13218,14 +13247,25 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn mcp_list_servers(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.mcp_servers_service().agent_list_servers().await })
-    }
-
-    fn mcp_list_tools(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn mcp_list_servers(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.mcp_servers_service()
-                .agent_list_tools(&server_id)
+                .agent_list_servers(workspace_id.as_ref().map(WorkspaceId::as_str))
+                .await
+        })
+    }
+
+    fn mcp_list_tools(
+        &self,
+        server_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.mcp_servers_service()
+                .agent_list_tools(workspace_id.as_ref().map(WorkspaceId::as_str), &server_id)
                 .await
         })
     }
@@ -13236,10 +13276,17 @@ impl WorkspaceApi for Services {
         tool_name: String,
         args: serde_json::Value,
         timeout_ms: Option<u64>,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.mcp_servers_service()
-                .agent_call_tool(&server_id, &tool_name, args, timeout_ms)
+                .agent_call_tool(
+                    workspace_id.as_ref().map(WorkspaceId::as_str),
+                    &server_id,
+                    &tool_name,
+                    args,
+                    timeout_ms,
+                )
                 .await
         })
     }

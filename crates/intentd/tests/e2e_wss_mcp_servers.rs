@@ -563,3 +563,131 @@ async fn mcp_test_connection_over_wss() {
     let e = wss_rpc_expect_error(&mut rpc, 3, "mcp.testConnection", json!({})).await;
     assert_eq!(e["code"], json!(-32602));
 }
+
+/// Seed one workspace row into the daemon DB before boot and return its id.
+async fn seed_workspace_only(data_dir: &Path) -> String {
+    use intent_core::{now_iso, WorkspaceId};
+    use intent_store::Store;
+    let db_path = data_dir.join("intentd.db");
+    let store = Store::open(&db_path).await.expect("open store");
+    let mut ws = intent_core::chief_workspace();
+    ws.id = WorkspaceId::new();
+    ws.title = "WSS-MCP-WS-E2E".to_string();
+    let ts = now_iso();
+    ws.created_at = ts.clone();
+    ws.updated_at = ts;
+    store.insert_workspace(&ws).await.expect("insert ws");
+    ws.id.0
+}
+
+/// Per-workspace disable layer (PROTOCOL §5.22) over the production WSS
+/// transport: workspace-scoped `mcp.servers.toggle` returns
+/// `{ status, workspaceDisabled }` and leaves the global config untouched;
+/// the scoped list carries `workspaceDisabled`; the unscoped list does not;
+/// an unknown workspaceId on the write path is the `-32602`/not-found
+/// envelope while the scoped read stays lenient.
+#[tokio::test]
+async fn mcp_servers_workspace_scoped_toggle_over_wss() {
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // create — stays enabled globally throughout; the bogus command never
+    // spawns, only persisted state matters here.
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "WS Scoped",
+            "transport": "stdio",
+            "command": "/does/not/exist-mcp-cmd",
+            "enabled": true,
+        } }),
+    )
+    .await;
+    let server_id = created["server"]["id"].as_str().expect("id").to_string();
+
+    // Workspace-scoped disable → { status, workspaceDisabled: true }.
+    let toggled = wss_rpc(
+        &mut rpc,
+        2,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": false, "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(toggled["workspaceDisabled"], json!(true));
+    assert!(toggled["status"].is_object(), "got: {toggled}");
+
+    // Scoped list: flag set, global enabled untouched.
+    let list = wss_rpc(
+        &mut rpc,
+        3,
+        "mcp.servers.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let entry = &list["servers"].as_array().expect("servers")[0];
+    assert_eq!(entry["id"], json!(server_id));
+    assert_eq!(entry["enabled"], json!(true), "global flag untouched");
+    assert_eq!(entry["workspaceDisabled"], json!(true));
+
+    // Unscoped list: no workspaceDisabled key.
+    let list = wss_rpc(&mut rpc, 4, "mcp.servers.list", json!({})).await;
+    assert!(list["servers"][0].get("workspaceDisabled").is_none());
+
+    // Re-enable clears the marker.
+    let toggled = wss_rpc(
+        &mut rpc,
+        5,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true, "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(toggled["workspaceDisabled"], json!(false));
+    let list = wss_rpc(
+        &mut rpc,
+        6,
+        "mcp.servers.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(list["servers"][0]["workspaceDisabled"], json!(false));
+
+    // Unknown workspaceId on the write path → not-found error envelope.
+    let e = wss_rpc_expect_error(
+        &mut rpc,
+        7,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": false, "workspaceId": "ws-ghost" }),
+    )
+    .await;
+    assert_eq!(e["code"], json!(-32602));
+    assert_eq!(e["data"]["code"], json!("not-found"));
+
+    // Unknown workspaceId on the read path stays lenient.
+    let list = wss_rpc(
+        &mut rpc,
+        8,
+        "mcp.servers.list",
+        json!({ "workspaceId": "ws-ghost" }),
+    )
+    .await;
+    assert_eq!(list["servers"][0]["workspaceDisabled"], json!(false));
+}

@@ -129,6 +129,12 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "source-local tombstones guarding workspace-id reuse, not live workspace state",
     ),
     (
+        "workspace_mcp_disabled_server",
+        "rows reference daemon-local MCP server config ids; the `mcp.servers` \
+         setting itself never transfers (settings/mcp_oauth_tokens are excluded), \
+         so the markers would dangle on the target daemon",
+    ),
+    (
         "usage_stats_hourly",
         "daemon-global usage accounting, not workspace-scoped",
     ),
