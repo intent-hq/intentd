@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.30] - 2026-08-31
+
+### 🚀 Features
+
+- Debounce reportToParent parent wake and combine with completion ([#1605](https://github.com/intent-hq/intentd/pull/1605))
+- Daemon-owned agent lock state over the protocol ([#1603](https://github.com/intent-hq/intentd/pull/1603))
+
+
 ## [0.8.29] - 2026-08-31
 
 ### 🚀 Features
