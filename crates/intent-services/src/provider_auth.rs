@@ -9,8 +9,14 @@
 //!   (`token print`; exit 0 ⇒ authenticated). The command's output IS the auth
 //!   session secret, so it rides the generic exit-code arm where stdout and
 //!   stderr are discarded — never captured, logged, or surfaced.
-//! - **claude-code** — the real `claude` CLI with its registry
-//!   `auth_check_args` (exit 0 ⇒ authenticated).
+//! - **claude-code** — two-stage (intent-hq/intent#3941): the real `claude`
+//!   CLI with its registry `auth_check_args` (exit 0 ⇒ authenticated, no
+//!   adapter spawn); any non-confirming CLI outcome falls back to an ACP
+//!   probe via the pinned claude-agent-acp npx adapter — `claude auth
+//!   status` has known false negatives (anthropics/claude-code#76168) while
+//!   the adapter walks the credential chain Intent's runtime actually uses:
+//!   non-empty model list ⇒ `true`; explicit auth-required error ⇒ `false`;
+//!   else unknown.
 //! - **codex** — the real `codex` CLI with `login status` (same exit-code
 //!   semantics; the codex-acp adapter is never spawned here).
 //! - **opencode** — `opencode models`: non-zero exit ⇒ `false`; `true` iff at
@@ -35,7 +41,11 @@
 //! probe.
 //!
 //! `intentd doctor` shares [`check_provider_auth_cli`] (the exit-code + grok
-//! CLI probe) so the doctor report and the RPC cannot drift.
+//! CLI probe) so the doctor report and the RPC cannot drift. claude-code's
+//! ACP fallback lives only here, above that shared helper — no doctor drift
+//! is possible because doctor never prints an auth annotation for npx-only
+//! providers (`report_provider_availability` skips their auth probe;
+//! claude-code's doctor line reports npx availability only).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -254,11 +264,13 @@ fn opencode_models_ready(stdout: &str) -> bool {
 /// Run one provider's auth probe. The caller has already gated on the
 /// provider being installed (`program` is its resolved binary; pi passes the
 /// resolved `pi` CLI purely as the install gate — its probe runs the pinned
-/// npx adapter). CLI-probed providers (auggie, claude-code, codex, opencode,
-/// grok) share [`check_provider_auth_cli`] with `intentd doctor`.
+/// npx adapter). CLI-probed providers (auggie, codex, opencode, grok) share
+/// [`check_provider_auth_cli`] with `intentd doctor`; claude-code runs that
+/// same CLI probe first, then [`claude_code_auth_verdict`] decides whether
+/// the ACP fallback probe is consulted.
 async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) -> Option<bool> {
     match provider_id {
-        "auggie" | "claude-code" | "codex" | "opencode" | "grok" => {
+        "auggie" | "codex" | "opencode" | "grok" => {
             let args = intent_providers::find_provider(provider_id)
                 .and_then(|cfg| cfg.auth_check_args)
                 .unwrap_or_default();
@@ -269,9 +281,44 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
                 .await
                 .auth_status()
         }
+        "claude-code" => {
+            let args = intent_providers::find_provider(provider_id)
+                .and_then(|cfg| cfg.auth_check_args)
+                .unwrap_or_default();
+            if args.is_empty() {
+                return None;
+            }
+            let cli = check_provider_auth_cli(provider_id, &program, args).await;
+            claude_code_auth_verdict(cli, crate::provider_models::probe_claude_code_auth).await
+        }
         "droid" => crate::provider_models::probe_droid_auth(program.into()).await,
         "pi" => crate::provider_models::probe_pi_auth().await,
         _ => None,
+    }
+}
+
+/// Two-stage claude-code auth verdict (intent-hq/intent#3941). Fast path: a
+/// CLI probe that CONFIRMS auth (`claude auth status` exit 0) is trusted
+/// as-is — cheap, no false positives, no adapter spawn. Any non-confirming
+/// outcome (`NotAuthenticated` / `StatusUnknown` / `Failed` / `TimedOut`) consults
+/// `acp_fallback` — [`crate::provider_models::probe_claude_code_auth`], the
+/// pinned claude-agent-acp adapter probe — because `claude auth status` is
+/// known to report logged-out even when a working CLI credential exists
+/// (interactive `/login` sessions, account switches —
+/// anthropics/claude-code#76168), while the adapter walks the credential
+/// chain Intent's runtime actually uses. The fallback is injected so the
+/// mapping is unit-testable without spawning real CLIs.
+async fn claude_code_auth_verdict<F, Fut>(cli: CliAuthProbe, acp_fallback: F) -> Option<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<bool>>,
+{
+    match cli {
+        CliAuthProbe::Authenticated => Some(true),
+        CliAuthProbe::NotAuthenticated
+        | CliAuthProbe::StatusUnknown
+        | CliAuthProbe::Failed
+        | CliAuthProbe::TimedOut => acp_fallback().await,
     }
 }
 
@@ -659,6 +706,54 @@ mod tests {
         assert!(!opencode_models_ready(""));
         assert!(!opencode_models_ready("# provider/model header\n"));
         assert!(!opencode_models_ready("no models configured\n"));
+    }
+
+    /// intent-hq/intent#3941 regression: a claude-code CLI probe reporting
+    /// `NotAuthenticated` used to be a hard `Some(false)` on the wire — the FE
+    /// then showed "Log in" to users whose CLI credentials actually work
+    /// (anthropics/claude-code#76168). Every non-confirming CLI outcome now
+    /// consults the ACP fallback, whose verdict (or unknown) is what ships.
+    #[tokio::test]
+    async fn claude_code_non_confirming_cli_consults_acp_fallback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for cli in [
+            CliAuthProbe::NotAuthenticated,
+            CliAuthProbe::StatusUnknown,
+            CliAuthProbe::Failed,
+            CliAuthProbe::TimedOut,
+        ] {
+            for fallback in [Some(true), Some(false), None] {
+                let called = AtomicBool::new(false);
+                let verdict = claude_code_auth_verdict(cli, || async {
+                    called.store(true, Ordering::SeqCst);
+                    fallback
+                })
+                .await;
+                assert!(
+                    called.load(Ordering::SeqCst),
+                    "{cli:?} must consult the fallback"
+                );
+                assert_eq!(verdict, fallback, "{cli:?} verdict follows the fallback");
+            }
+        }
+    }
+
+    /// The fast path: a confirming CLI probe (exit 0) is trusted without
+    /// spawning the adapter.
+    #[tokio::test]
+    async fn claude_code_confirming_cli_skips_acp_fallback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let called = AtomicBool::new(false);
+        let verdict = claude_code_auth_verdict(CliAuthProbe::Authenticated, || async {
+            called.store(true, Ordering::SeqCst);
+            None
+        })
+        .await;
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "a confirming CLI probe must not spawn the adapter"
+        );
+        assert_eq!(verdict, Some(true));
     }
 
     #[tokio::test]

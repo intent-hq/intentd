@@ -85,6 +85,10 @@ fn registry_field_parity() {
     assert_eq!(cc.command, "claude-agent-acp");
     assert_eq!(cc.base_args, &[] as &[&str]);
     assert_eq!(cc.auth_check_args, Some(&["auth", "status"][..]));
+    // The hint must name the real `claude` CLI — the `{command} login`
+    // fallback would print the non-runnable "claude-agent-acp login"
+    // (intent-hq/intent#3941).
+    assert_eq!(cc.login_command_hint, Some("claude auth login"));
     assert!(cc.model_flag.is_none() && cc.can_be_disabled);
     assert_eq!(cc.npx_only_package, Some(CLAUDE_AGENT_ACP_NPX_PACKAGE));
     assert_eq!(cc.fallback_npx_package, None);
@@ -1101,12 +1105,20 @@ fn auth_error_pattern_matching_is_case_insensitive_across_patterns() {
 
 #[test]
 fn auth_error_message_remote_falls_back_to_command_login() {
-    // claude-code has no login_command_hint → falls back to `{command} login`,
+    // codex has no login_command_hint → falls back to `{command} login`,
     // and the remote variant includes the remote-server phrasing.
-    let msg = auth_error_message("claude-code", true);
-    assert!(msg.contains("Anthropic Claude Code"));
-    assert!(msg.contains("claude-agent-acp login"));
+    let msg = auth_error_message("codex", true);
+    assert!(msg.contains("codex-acp login"));
     assert!(msg.contains("on the remote server"));
+
+    // claude-code carries an explicit hint (intent-hq/intent#3941): the
+    // `{command} login` fallback would print the non-runnable
+    // "claude-agent-acp login".
+    let cc = auth_error_message("claude-code", true);
+    assert!(cc.contains("Anthropic Claude Code"));
+    assert!(cc.contains("claude auth login"));
+    assert!(!cc.contains("claude-agent-acp login"));
+    assert!(cc.contains("on the remote server"));
 
     // Unknown provider ids resolve to the first registered provider's message.
     let unknown = auth_error_message("not-a-real-provider", false);
