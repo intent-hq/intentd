@@ -301,6 +301,79 @@ async fn get_agent_locks_wire_shape() {
     assert_eq!(v["lockedFilePaths"], serde_json::json!(["src/a.rs"]));
 }
 
+/// The subscriber loop reacts to `agent:retired` / `agent:restored` — the
+/// only events soft retire/restore emit (§5.5): retiring a locked agent
+/// publishes the unlocked snapshot, restoring it publishes the relock.
+#[tokio::test]
+async fn loop_reacts_to_retire_and_restore() {
+    let (_tmp, svc, ws) = setup().await;
+    let bus = crate::EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus.clone());
+    let agent = session("agent-1", &ws, AgentStatus::Active, None);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    track(&svc, &ws, "agent-1", "src/a.rs", "unstaged").await;
+
+    let handle = svc.spawn_agent_locks_loop();
+    let mut sub = bus.subscribe(crate::SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        event_types: vec![intent_core::events::CHANGES_AGENT_LOCKS.to_string()],
+        ..Default::default()
+    });
+
+    // Retire: flip retired_at in the store, then emit the lifecycle event —
+    // exactly what retire_one_session does (no status-changed rides along).
+    let now = now_iso();
+    svc.store()
+        .set_agent_session_retired_at(&ws, &AgentId::from("agent-1"), Some(&now), &now)
+        .await
+        .unwrap();
+    publish_lifecycle(&bus, &ws, intent_core::events::AGENT_RETIRED, "agent-1").await;
+    let ev = recv_locks_event(&mut sub).await;
+    assert_eq!(ev["data"]["lockedAgentIds"], serde_json::json!([]));
+    assert_eq!(ev["data"]["lockedFilePaths"], serde_json::json!([]));
+
+    // Restore: clear the mark, emit agent:restored — the agent relocks.
+    let now = now_iso();
+    svc.store()
+        .set_agent_session_retired_at(&ws, &AgentId::from("agent-1"), None, &now)
+        .await
+        .unwrap();
+    publish_lifecycle(&bus, &ws, intent_core::events::AGENT_RESTORED, "agent-1").await;
+    let ev = recv_locks_event(&mut sub).await;
+    assert_eq!(ev["data"]["lockedAgentIds"], serde_json::json!(["agent-1"]));
+    assert_eq!(
+        ev["data"]["lockedFilePaths"],
+        serde_json::json!(["src/a.rs"])
+    );
+
+    handle.abort();
+}
+
+async fn publish_lifecycle(bus: &crate::EventBus, ws: &WorkspaceId, event_type: &str, agent: &str) {
+    bus.publish(&intent_store::NewEvent {
+        workspace_id: ws.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: crate::system_actor(),
+        session_id: Some(agent.to_string()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({ "agentId": agent }),
+    })
+    .await
+    .unwrap();
+}
+
+async fn recv_locks_event(sub: &mut crate::Subscription) -> serde_json::Value {
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+        .await
+        .expect("changes:agent-locks delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1, "expected exactly one lock event");
+    serde_json::to_value(&batch[0]).expect("serialize event")
+}
+
 fn task_note(ws: &WorkspaceId, id: &str, status: TaskStatus) -> Note {
     let ts = now_iso();
     Note {

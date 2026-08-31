@@ -18,9 +18,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use intent_core::events::{
-    AGENT_COMPLETED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_STARTED, AGENT_STATUS_CHANGED,
-    CHANGES_AGENT_LOCKS, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED, SETTINGS_CHANGED,
-    TASK_STATUS_CHANGED, WORKSPACE_UPDATED,
+    AGENT_COMPLETED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RESTORED, AGENT_RETIRED,
+    AGENT_STARTED, AGENT_STATUS_CHANGED, CHANGES_AGENT_LOCKS, CHANGES_GIT_STATUS,
+    CHANGES_METRICS_CHANGED, SETTINGS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::{now_iso, AgentSession, AgentStatus, TaskStatus, WorkspaceId};
 use intent_store::NewEvent;
@@ -208,6 +208,11 @@ impl Services {
                     AGENT_COMPLETED.to_string(),
                     AGENT_FAILED.to_string(),
                     AGENT_DELETED.to_string(),
+                    // Soft retire/restore flip `retired_at` (which
+                    // `is_actively_working` keys off) and emit ONLY these
+                    // events — no status-changed rides along (§5.5).
+                    AGENT_RETIRED.to_string(),
+                    AGENT_RESTORED.to_string(),
                     TASK_STATUS_CHANGED.to_string(),
                     WORKSPACE_UPDATED.to_string(),
                     SETTINGS_CHANGED.to_string(),
