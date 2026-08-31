@@ -1321,6 +1321,23 @@ impl<'a> McpServersService<'a> {
         }
     }
 
+    /// Single-pair point read for the per-tool-call hot path
+    /// (`require_agent_server`); same leniency as `workspace_disabled_ids`.
+    async fn workspace_disabled(
+        &self,
+        workspace_id: Option<&str>,
+        server_id: &str,
+    ) -> Result<bool> {
+        match (self.store, workspace_id) {
+            (Some(store), Some(ws)) => {
+                store
+                    .workspace_mcp_server_disabled(&WorkspaceId(ws.to_string()), server_id)
+                    .await
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// `mcp.servers.list` → `{ servers: McpServerConfig[] }` (env/headers redacted),
     /// sorted by id for a stable wire order. With a `workspaceId` scope each
     /// entry additionally carries `workspaceDisabled` — the per-workspace
@@ -1566,12 +1583,7 @@ impl<'a> McpServersService<'a> {
                 "mcp server {server_id} is disabled"
             )));
         }
-        if self
-            .workspace_disabled_ids(workspace_id)
-            .await?
-            .iter()
-            .any(|d| d == server_id)
-        {
+        if self.workspace_disabled(workspace_id, server_id).await? {
             return Err(Error::InvalidParams(format!(
                 "mcp server {server_id} is disabled for this workspace"
             )));
