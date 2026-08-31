@@ -289,8 +289,8 @@ API:
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
   ws.terminal.readOutput(terminalId, maxLines?) → string  // Read a terminal output buffer. Use `ws.terminal.list()` first to discover terminal IDs.
 
-  ws.mcp.listServers() → { servers: [{ id, name, transport, enabled, state, toolCount? }] }  // The user-configured external MCP servers, projected to non-sensitive fields only (`env`/`headers`/`command` never appear); `state` is the live hub state (running|stopped|error|starting).
-  ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled or not running.
+  ws.mcp.listServers() → { servers: [{ id, name, transport, enabled, state, toolCount?, workspaceDisabled? }] }  // The user-configured external MCP servers, projected to non-sensitive fields only (`env`/`headers`/`command` never appear). `state` is the live hub state (running|stopped|error|starting); `workspaceDisabled: true` marks a server disabled for this workspace only (still listed, like globally disabled servers with `enabled: false`).
+  ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled (globally or for this workspace) or not running.
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
   ws.crossWorkspace.listSiblings() → [workspaces]  // Other workspaces sharing the same repository (repo-scoped).
@@ -530,8 +530,8 @@ API:
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
   ws.terminal.readOutput(terminalId, maxLines?) → string  // Read a terminal output buffer. Use `ws.terminal.list()` first to discover terminal IDs.
 
-  ws.mcp.listServers() → { servers: [{ id, name, transport, enabled, state, toolCount? }] }  // The user-configured external MCP servers, projected to non-sensitive fields only (`env`/`headers`/`command` never appear); `state` is the live hub state (running|stopped|error|starting).
-  ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled or not running.
+  ws.mcp.listServers() → { servers: [{ id, name, transport, enabled, state, toolCount?, workspaceDisabled? }] }  // The user-configured external MCP servers, projected to non-sensitive fields only (`env`/`headers`/`command` never appear). `state` is the live hub state (running|stopped|error|starting); `workspaceDisabled: true` marks a server disabled for this workspace only (still listed, like globally disabled servers with `enabled: false`).
+  ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled (globally or for this workspace) or not running.
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
   ws.crossWorkspace.listSiblings() → [workspaces]  // Other workspaces sharing the same repository (repo-scoped).

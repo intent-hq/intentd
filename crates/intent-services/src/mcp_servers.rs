@@ -16,7 +16,7 @@ use std::time::Duration;
 use intent_acp::{Connection, ConnectionHooks};
 use intent_core::settings_file::SettingsFile;
 use intent_core::{events::MCP_SERVERS_STATUS_CHANGED, now_iso, Error, Result, WorkspaceId};
-use intent_store::NewEvent;
+use intent_store::{NewEvent, Store};
 use serde_json::{json, Map, Value};
 use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
@@ -1266,12 +1266,15 @@ fn kill_group(
 
 /// Stateless executor for the `mcp.servers.*` namespace (PROTOCOL §5.22) over
 /// the settings registry (`mcp.enableUserServers`/`mcp.disabledServers`), the
-/// [`AsyncSecretStore`] (the sensitive `mcp.servers` config), and the runtime
-/// [`McpHub`]. Construct one per call from the long-lived `Services`.
+/// [`AsyncSecretStore`] (the sensitive `mcp.servers` config), the runtime
+/// [`McpHub`], and the [`Store`] (per-workspace disabled state, layered over
+/// the global setting — global disable always wins, a workspace row only
+/// narrows). Construct one per call from the long-lived `Services`.
 pub(crate) struct McpServersService<'a> {
     registry: Option<&'a SettingsRegistry>,
     secrets: &'a AsyncSecretStore,
     hub: &'a McpHub,
+    store: Option<&'a Store>,
 }
 
 impl<'a> McpServersService<'a> {
@@ -1279,11 +1282,13 @@ impl<'a> McpServersService<'a> {
         registry: Option<&'a SettingsRegistry>,
         secrets: &'a AsyncSecretStore,
         hub: &'a McpHub,
+        store: Option<&'a Store>,
     ) -> Self {
         Self {
             registry,
             secrets,
             hub,
+            store,
         }
     }
 
@@ -1302,12 +1307,55 @@ impl<'a> McpServersService<'a> {
             .ok_or_else(|| Error::NotFound(format!("mcp server not found: {server_id}")))
     }
 
+    /// The server ids disabled in `workspace_id` (§5.22 per-workspace layer).
+    /// Empty without a store (unit-test construction) or for unknown ids —
+    /// reads are lenient; the strict path is the toggle write.
+    async fn workspace_disabled_ids(&self, workspace_id: Option<&str>) -> Result<Vec<String>> {
+        match (self.store, workspace_id) {
+            (Some(store), Some(ws)) => {
+                store
+                    .workspace_mcp_disabled_servers(&WorkspaceId(ws.to_string()))
+                    .await
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Single-pair point read for the per-tool-call hot path
+    /// (`require_agent_server`); same leniency as `workspace_disabled_ids`.
+    async fn workspace_disabled(
+        &self,
+        workspace_id: Option<&str>,
+        server_id: &str,
+    ) -> Result<bool> {
+        match (self.store, workspace_id) {
+            (Some(store), Some(ws)) => {
+                store
+                    .workspace_mcp_server_disabled(&WorkspaceId(ws.to_string()), server_id)
+                    .await
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// `mcp.servers.list` → `{ servers: McpServerConfig[] }` (env/headers redacted),
-    /// sorted by id for a stable wire order.
-    pub(crate) async fn list(&self, _workspace_id: Option<&str>) -> Result<Value> {
+    /// sorted by id for a stable wire order. With a `workspaceId` scope each
+    /// entry additionally carries `workspaceDisabled` — the per-workspace
+    /// disable layered over the global setting (global disable wins; the
+    /// workspace layer only narrows an otherwise-enabled server).
+    pub(crate) async fn list(&self, workspace_id: Option<&str>) -> Result<Value> {
         let configs = read_configs(self.secrets).await;
         let mut servers: Vec<Value> = configs.values().map(redact_config).collect();
         servers.sort_by_key(config_id);
+        if workspace_id.is_some() {
+            let ws_disabled = self.workspace_disabled_ids(workspace_id).await?;
+            for server in &mut servers {
+                let id = config_id(server);
+                if let Some(obj) = server.as_object_mut() {
+                    obj.insert("workspaceDisabled".into(), json!(ws_disabled.contains(&id)));
+                }
+            }
+        }
         Ok(json!({ "servers": servers }))
     }
 
@@ -1360,6 +1408,35 @@ impl<'a> McpServersService<'a> {
         self.hub.stop(server_id).await;
         write_configs(self.secrets, &configs).await?;
         Ok(json!({ "success": true }))
+    }
+
+    /// `mcp.servers.toggle` with a `workspaceId` scope → set/clear the
+    /// per-workspace disabled marker only. The global config (`enabled` flag,
+    /// `mcp.disabledServers`) and the hub lifecycle are untouched — the hub
+    /// is a single shared runtime and other workspaces may still use the
+    /// server; enforcement happens per call on the agent surface. Returns
+    /// `{ status, workspaceDisabled }`.
+    pub(crate) async fn toggle_workspace(
+        &self,
+        workspace_id: &str,
+        server_id: &str,
+        enabled: bool,
+    ) -> Result<Value> {
+        self.require_config(server_id).await?;
+        let store = self.store.ok_or_else(|| {
+            Error::Internal("workspace-scoped mcp toggle requires a store".to_string())
+        })?;
+        store
+            .set_workspace_mcp_server_disabled(
+                &WorkspaceId(workspace_id.to_string()),
+                server_id,
+                !enabled,
+            )
+            .await?;
+        Ok(json!({
+            "status": self.hub.status(server_id),
+            "workspaceDisabled": !enabled,
+        }))
     }
 
     /// `mcp.servers.toggle` → enable (start) / disable (stop). Updates the config's
@@ -1487,8 +1564,14 @@ impl<'a> McpServersService<'a> {
 
     /// Preconditions for forwarding one tool request on behalf of an agent:
     /// the settings gates, the server is defined, and it is neither
-    /// `enabled: false` nor listed in `mcp.disabledServers`.
-    async fn require_agent_server(&self, server_id: &str) -> Result<()> {
+    /// `enabled: false`, listed in `mcp.disabledServers`, nor disabled in the
+    /// calling workspace (per-workspace layer; global disable wins, the
+    /// workspace row only narrows).
+    async fn require_agent_server(
+        &self,
+        workspace_id: Option<&str>,
+        server_id: &str,
+    ) -> Result<()> {
         let settings = self.require_agent_mcp()?;
         let config = self.require_config(server_id).await?;
         let enabled = config
@@ -1500,6 +1583,11 @@ impl<'a> McpServersService<'a> {
                 "mcp server {server_id} is disabled"
             )));
         }
+        if self.workspace_disabled(workspace_id, server_id).await? {
+            return Err(Error::InvalidParams(format!(
+                "mcp server {server_id} is disabled for this workspace"
+            )));
+        }
         Ok(())
     }
 
@@ -1507,8 +1595,12 @@ impl<'a> McpServersService<'a> {
     /// non-sensitive allowlist — id, name, transport, enabled, live state
     /// and toolCount — sorted by id. The shape is built fresh (never a
     /// redacted config copy) so `env`/`headers`/`command` cannot leak.
-    pub(crate) async fn agent_list_servers(&self) -> Result<Value> {
+    /// With a workspace scope, servers disabled in that workspace carry
+    /// `workspaceDisabled: true` (they stay listed — parity with globally
+    /// disabled servers, which surface with `enabled: false`).
+    pub(crate) async fn agent_list_servers(&self, workspace_id: Option<&str>) -> Result<Value> {
         self.require_agent_mcp()?;
+        let ws_disabled = self.workspace_disabled_ids(workspace_id).await?;
         let configs = read_configs(self.secrets).await;
         let mut servers: Vec<Value> = configs
             .values()
@@ -1542,6 +1634,9 @@ impl<'a> McpServersService<'a> {
                 if let Some(tc) = status.get("toolCount") {
                     m.insert("toolCount".into(), tc.clone());
                 }
+                if ws_disabled.contains(&id) {
+                    m.insert("workspaceDisabled".into(), json!(true));
+                }
                 Value::Object(m)
             })
             .collect();
@@ -1551,8 +1646,12 @@ impl<'a> McpServersService<'a> {
 
     /// `ws.mcp.listTools`: forward `tools/list` to one enabled server after
     /// the settings gates; the raw MCP result (`{ tools: [...] }`).
-    pub(crate) async fn agent_list_tools(&self, server_id: &str) -> Result<Value> {
-        self.require_agent_server(server_id).await?;
+    pub(crate) async fn agent_list_tools(
+        &self,
+        workspace_id: Option<&str>,
+        server_id: &str,
+    ) -> Result<Value> {
+        self.require_agent_server(workspace_id, server_id).await?;
         self.hub.list_tools(server_id).await
     }
 
@@ -1561,12 +1660,13 @@ impl<'a> McpServersService<'a> {
     /// override the hub caps at its own bound.
     pub(crate) async fn agent_call_tool(
         &self,
+        workspace_id: Option<&str>,
         server_id: &str,
         tool_name: &str,
         args: Value,
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
-        self.require_agent_server(server_id).await?;
+        self.require_agent_server(workspace_id, server_id).await?;
         self.hub
             .call_tool(
                 server_id,
@@ -1997,7 +2097,18 @@ mod tests {
         secrets: &'a AsyncSecretStore,
         hub: &'a McpHub,
     ) -> McpServersService<'a> {
-        McpServersService::new(registry, secrets, hub)
+        McpServersService::new(registry, secrets, hub, None)
+    }
+
+    /// Like [`svc`] but with a [`Store`] wired, for the per-workspace
+    /// disabled-layer tests.
+    fn svc_with_store<'a>(
+        registry: Option<&'a SettingsRegistry>,
+        secrets: &'a AsyncSecretStore,
+        hub: &'a McpHub,
+        store: &'a Store,
+    ) -> McpServersService<'a> {
+        McpServersService::new(registry, secrets, hub, Some(store))
     }
 
     #[tokio::test]
@@ -2199,6 +2310,157 @@ mod tests {
         let list = disabled_servers(&reg.snapshot().effective);
         assert!(!list.iter().any(|d| d == "t3"));
         assert!(list.iter().any(|d| d == "other"));
+    }
+
+    // -- per-workspace disable layer (§5.22) --------------------------------
+
+    /// Store with one workspace row inserted (the FK target a
+    /// `workspace_mcp_disabled_server` row needs).
+    async fn store_with_workspace() -> (TempDb, Store, String) {
+        let (tmp, store) = open_store().await;
+        let mut ws = intent_core::chief_workspace();
+        let ws_id = format!("ws-{}", Uuid::new_v4());
+        ws.id = intent_core::WorkspaceId(ws_id.clone());
+        ws.title = "Test".to_string();
+        store.insert_workspace(&ws).await.expect("insert workspace");
+        (tmp, store, ws_id)
+    }
+
+    #[tokio::test]
+    async fn toggle_workspace_persists_marker_without_touching_global() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        let s = svc_with_store(Some(&reg), &secrets, &h, &store);
+        s.create(json!({ "id": "w1", "transport": "stdio", "command": "x", "enabled": true }))
+            .await
+            .unwrap();
+
+        let out = s.toggle_workspace(&ws_id, "w1", false).await.unwrap();
+        assert_eq!(out["workspaceDisabled"], json!(true));
+        assert!(out["status"].is_object());
+        // Global layers untouched: config stays enabled, global list empty.
+        assert_eq!(read_configs(&secrets).await["w1"]["enabled"], json!(true));
+        assert!(disabled_servers(&reg.snapshot().effective).is_empty());
+
+        // Re-enable clears the marker.
+        let out = s.toggle_workspace(&ws_id, "w1", true).await.unwrap();
+        assert_eq!(out["workspaceDisabled"], json!(false));
+        let ws = intent_core::WorkspaceId(ws_id.clone());
+        assert!(store
+            .workspace_mcp_disabled_servers(&ws)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn toggle_workspace_unknown_server_or_workspace_is_not_found() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        let s = svc_with_store(Some(&reg), &secrets, &h, &store);
+
+        let err = s
+            .toggle_workspace(&ws_id, "ghost", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+
+        s.create(json!({ "id": "w2", "transport": "stdio", "command": "x", "enabled": true }))
+            .await
+            .unwrap();
+        let err = s
+            .toggle_workspace("ws-ghost", "w2", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn list_with_workspace_scope_carries_workspace_disabled_flag() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        let s = svc_with_store(Some(&reg), &secrets, &h, &store);
+        s.create(json!({ "id": "a", "transport": "stdio", "command": "x", "enabled": true }))
+            .await
+            .unwrap();
+        s.create(json!({ "id": "b", "transport": "stdio", "command": "x", "enabled": true }))
+            .await
+            .unwrap();
+        s.toggle_workspace(&ws_id, "a", false).await.unwrap();
+
+        // Workspace scope: every entry carries the flag.
+        let r = s.list(Some(&ws_id)).await.unwrap();
+        let arr = r["servers"].as_array().unwrap();
+        assert_eq!(arr[0]["id"], json!("a"));
+        assert_eq!(arr[0]["workspaceDisabled"], json!(true));
+        assert_eq!(arr[1]["id"], json!("b"));
+        assert_eq!(arr[1]["workspaceDisabled"], json!(false));
+
+        // Global (unscoped) list: no flag at all.
+        let r = s.list(None).await.unwrap();
+        for server in r["servers"].as_array().unwrap() {
+            assert!(server.get("workspaceDisabled").is_none());
+        }
+
+        // Unknown workspace id: lenient read, everything enabled.
+        let r = s.list(Some("ws-ghost")).await.unwrap();
+        for server in r["servers"].as_array().unwrap() {
+            assert_eq!(server["workspaceDisabled"], json!(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_surface_honors_workspace_disable_global_wins() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        let s = svc_with_store(Some(&reg), &secrets, &h, &store);
+        s.create(json!({ "id": "w3", "transport": "stdio", "command": "x", "enabled": true }))
+            .await
+            .unwrap();
+        s.toggle_workspace(&ws_id, "w3", false).await.unwrap();
+
+        // Workspace-scoped agent calls are rejected with the workspace flavor.
+        let err = s.agent_list_tools(Some(&ws_id), "w3").await.unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(format!("{err}").contains("disabled for this workspace"));
+        let err = s
+            .agent_call_tool(Some(&ws_id), "w3", "t", json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+
+        // Other workspaces (or unscoped callers) are unaffected.
+        assert!(s
+            .agent_list_tools(None, "w3")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not running"));
+
+        // agent_list_servers keeps the server listed with the flag.
+        let r = s.agent_list_servers(Some(&ws_id)).await.unwrap();
+        let arr = r["servers"].as_array().unwrap();
+        assert_eq!(arr[0]["id"], json!("w3"));
+        assert_eq!(arr[0]["workspaceDisabled"], json!(true));
+        // Unscoped projection carries no flag.
+        let r = s.agent_list_servers(None).await.unwrap();
+        assert!(r["servers"][0].get("workspaceDisabled").is_none());
+
+        // Global disable wins regardless of the workspace layer: clear the
+        // workspace marker, disable globally, and the reject flips flavor.
+        s.toggle_workspace(&ws_id, "w3", true).await.unwrap();
+        set_disabled_servers(Some(&reg), &["w3".to_string()]).unwrap();
+        let err = s.agent_list_tools(Some(&ws_id), "w3").await.unwrap_err();
+        assert!(format!("{err}").contains("is disabled"));
+        assert!(!format!("{err}").contains("for this workspace"));
     }
 
     #[tokio::test]
@@ -2425,7 +2687,10 @@ mod tests {
         );
         write_configs(&secrets, &m).await.unwrap();
 
-        let r = svc(None, &secrets, &h).agent_list_servers().await.unwrap();
+        let r = svc(None, &secrets, &h)
+            .agent_list_servers(None)
+            .await
+            .unwrap();
         let arr = r["servers"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         // Sorted by id; only allowlisted keys appear.
@@ -2464,9 +2729,9 @@ mod tests {
         let s = svc(Some(&reg), &secrets, &h);
 
         for err in [
-            s.agent_list_servers().await.unwrap_err(),
-            s.agent_list_tools("any").await.unwrap_err(),
-            s.agent_call_tool("any", "t", json!({}), None)
+            s.agent_list_servers(None).await.unwrap_err(),
+            s.agent_list_tools(None, "any").await.unwrap_err(),
+            s.agent_call_tool(None, "any", "t", json!({}), None)
                 .await
                 .unwrap_err(),
         ] {
@@ -2485,9 +2750,9 @@ mod tests {
         let s = svc(Some(&reg), &secrets, &h);
 
         for err in [
-            s.agent_list_servers().await.unwrap_err(),
-            s.agent_list_tools("any").await.unwrap_err(),
-            s.agent_call_tool("any", "t", json!({}), None)
+            s.agent_list_servers(None).await.unwrap_err(),
+            s.agent_list_tools(None, "any").await.unwrap_err(),
+            s.agent_call_tool(None, "any", "t", json!({}), None)
                 .await
                 .unwrap_err(),
         ] {
@@ -2501,7 +2766,7 @@ mod tests {
         let secrets = mem_async();
         let h = McpHub::new();
         let err = svc(None, &secrets, &h)
-            .agent_list_tools("ghost")
+            .agent_list_tools(None, "ghost")
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
@@ -2528,11 +2793,11 @@ mod tests {
         let s = svc(Some(&reg), &secrets, &h);
 
         for id in ["off", "blocked"] {
-            let err = s.agent_list_tools(id).await.unwrap_err();
+            let err = s.agent_list_tools(None, id).await.unwrap_err();
             assert!(matches!(err, Error::InvalidParams(_)), "{id}");
             assert!(format!("{err}").contains("disabled"), "{id}");
             let err = s
-                .agent_call_tool(id, "t", json!({}), None)
+                .agent_call_tool(None, id, "t", json!({}), None)
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::InvalidParams(_)), "{id}");

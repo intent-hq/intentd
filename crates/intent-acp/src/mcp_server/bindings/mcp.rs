@@ -27,22 +27,31 @@ pub(crate) const PRELUDE: &str = r"
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
-    _ws: &WorkspaceId,
+    ws: &WorkspaceId,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "listServers" => api.mcp_list_servers().await.map_err(map_err),
+        "listServers" => api
+            .mcp_list_servers(Some(ws.clone()))
+            .await
+            .map_err(map_err),
         "listTools" => {
             let server_id = req_str(args, "serverId")?;
-            api.mcp_list_tools(server_id).await.map_err(map_err)
+            api.mcp_list_tools(server_id, Some(ws.clone()))
+                .await
+                .map_err(map_err)
         }
-        "callTool" => call_tool(api, args).await,
+        "callTool" => call_tool(api, ws, args).await,
         other => Err(format!("host: unknown method `mcp.{other}`")),
     }
 }
 
-async fn call_tool(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+async fn call_tool(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
     let server_id = req_str(args, "serverId")?;
     let tool_name = req_str(args, "toolName")?;
     let tool_args = match args.get("args") {
@@ -58,9 +67,15 @@ async fn call_tool(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, S
             _ => return Err("timeoutMs must be a positive integer".to_string()),
         },
     };
-    api.mcp_call_tool(server_id, tool_name, tool_args, timeout_ms)
-        .await
-        .map_err(map_err)
+    api.mcp_call_tool(
+        server_id,
+        tool_name,
+        tool_args,
+        timeout_ms,
+        Some(ws.clone()),
+    )
+    .await
+    .map_err(map_err)
 }
 
 #[cfg(test)]
@@ -83,6 +98,7 @@ mod tests {
             _tool_name: String,
             _args: Value,
             timeout_ms: Option<u64>,
+            _workspace_id: Option<WorkspaceId>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.seen_timeouts.lock().unwrap().push(timeout_ms);
             Box::pin(async move { Ok(json!({ "content": [] })) })
@@ -97,7 +113,8 @@ mod tests {
         if let Some(t) = timeout {
             args["timeoutMs"] = t;
         }
-        call_tool(api, &args).await
+        let ws = WorkspaceId("ws-test".to_string());
+        call_tool(api, &ws, &args).await
     }
 
     #[tokio::test]

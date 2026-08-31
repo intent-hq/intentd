@@ -494,3 +494,162 @@ async fn mcp_servers_http_probe_running_and_unreachable() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// Per-workspace disable layer (PROTOCOL §5.22): a workspace-scoped
+/// `mcp.servers.toggle` persists only the per-workspace marker (global config
+/// untouched), the scoped list carries `workspaceDisabled`, other workspaces
+/// are unaffected, and an unknown workspace id on the write path is
+/// `not-found` while the scoped read stays lenient.
+#[tokio::test]
+async fn mcp_servers_workspace_scoped_toggle_and_list() {
+    use intent_core::{now_iso, WorkspaceId};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    // Two workspaces to prove the marker is scoped.
+    let ts = now_iso();
+    let mut ws_ids = Vec::new();
+    for title in ["ws-one", "ws-two"] {
+        let mut ws = intent_core::chief_workspace();
+        ws.id = WorkspaceId::new();
+        ws.title = title.to_string();
+        ws.created_at = ts.clone();
+        ws.updated_at = ts.clone();
+        store.insert_workspace(&ws).await.expect("insert ws");
+        ws_ids.push(ws.id.0.clone());
+    }
+    let (ws_a, ws_b) = (ws_ids[0].clone(), ws_ids[1].clone());
+
+    let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
+    let services: Arc<dyn WorkspaceApi> = Arc::new(
+        Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone())
+            .with_secret_store(Arc::new(InMemorySecretStore::default())),
+    );
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-mcpw-");
+    let socket = sock_dir.path().join("uds.sock");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let bus = bus.clone();
+        let socket = socket.clone();
+        async move {
+            let _ = serve_uds(services, bus, &socket, None, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        }
+    });
+
+    let (rpc_read, mut w) = connect_retry(&socket).await.into_split();
+    let mut r = BufReader::new(rpc_read);
+
+    // create — a definition that stays enabled globally throughout. The bogus
+    // command never spawns; only the persisted state matters here.
+    let created = rpc(
+        &mut w,
+        &mut r,
+        1,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "WS Scoped",
+            "transport": "stdio",
+            "command": "/does/not/exist-mcp-cmd",
+            "enabled": true,
+        } }),
+    )
+    .await;
+    let server_id = created["server"]["id"].as_str().expect("id").to_string();
+
+    // Workspace-scoped disable: returns status + workspaceDisabled, does not
+    // flip the global enabled flag.
+    let toggled = rpc(
+        &mut w,
+        &mut r,
+        2,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": false, "workspaceId": ws_a }),
+    )
+    .await;
+    assert_eq!(toggled["workspaceDisabled"], json!(true));
+    assert!(toggled["status"].is_object());
+
+    // Scoped list for ws_a: workspaceDisabled true, global enabled untouched.
+    let list = rpc(
+        &mut w,
+        &mut r,
+        3,
+        "mcp.servers.list",
+        json!({ "workspaceId": ws_a }),
+    )
+    .await;
+    let entry = &list["servers"].as_array().unwrap()[0];
+    assert_eq!(entry["id"], json!(server_id));
+    assert_eq!(entry["enabled"], json!(true), "global flag untouched");
+    assert_eq!(entry["workspaceDisabled"], json!(true));
+
+    // Scoped list for ws_b: unaffected.
+    let list = rpc(
+        &mut w,
+        &mut r,
+        4,
+        "mcp.servers.list",
+        json!({ "workspaceId": ws_b }),
+    )
+    .await;
+    assert_eq!(
+        list["servers"][0]["workspaceDisabled"],
+        json!(false),
+        "other workspace unaffected"
+    );
+
+    // Unscoped (global) list: no workspaceDisabled key at all.
+    let list = rpc(&mut w, &mut r, 5, "mcp.servers.list", json!({})).await;
+    assert!(list["servers"][0].get("workspaceDisabled").is_none());
+
+    // Re-enable in ws_a clears the marker.
+    let toggled = rpc(
+        &mut w,
+        &mut r,
+        6,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true, "workspaceId": ws_a }),
+    )
+    .await;
+    assert_eq!(toggled["workspaceDisabled"], json!(false));
+    let list = rpc(
+        &mut w,
+        &mut r,
+        7,
+        "mcp.servers.list",
+        json!({ "workspaceId": ws_a }),
+    )
+    .await;
+    assert_eq!(list["servers"][0]["workspaceDisabled"], json!(false));
+
+    // Unknown workspace id on the WRITE path → not-found error envelope.
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 8, "method": "mcp.servers.toggle",
+        "params": { "serverId": server_id, "enabled": false, "workspaceId": "ws-ghost" },
+    });
+    send(&mut w, &serde_json::to_string(&frame).unwrap()).await;
+    let resp = read_json(&mut r).await;
+    assert_eq!(resp["id"], json!(8));
+    assert_eq!(resp["error"]["data"]["code"], json!("not-found"));
+
+    // Unknown workspace id on the READ path stays lenient (all enabled).
+    let list = rpc(
+        &mut w,
+        &mut r,
+        9,
+        "mcp.servers.list",
+        json!({ "workspaceId": "ws-ghost" }),
+    )
+    .await;
+    assert_eq!(list["servers"][0]["workspaceDisabled"], json!(false));
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
