@@ -12516,6 +12516,45 @@ impl Services {
         Some(entry)
     }
 
+    /// Restore a retracted held entry after the combined wake it was folded
+    /// into failed to commit (the settlement-combine failure path in
+    /// `deliver_completion_to_watches`): re-insert the entry verbatim —
+    /// same id, hold marker, and deadline — re-arm its release timer, and
+    /// persist/publish, so the stable-id retry can retract and fold it again
+    /// instead of losing the report event. No-op when a held entry for the
+    /// same `(child_agent_id, hold_kind)` key already exists: a fresh report
+    /// enqueued in the failure window supersedes the retracted one, and the
+    /// restore must not resurrect a stale duplicate beside it. An already
+    /// expired `hold_until` is fine — the re-armed timer fires immediately
+    /// and flushes the entry (fail open, nothing is stranded).
+    pub(crate) async fn restore_held_message(&self, agent_id: &AgentId, entry: QueuedMessage) {
+        let hold_until = entry.hold_until.clone().unwrap_or_default();
+        let message_id = entry.id.clone();
+        let restored = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let queue = guard.entry(agent_id.clone()).or_default();
+            let superseded = queue.iter().any(|m| {
+                m.hold_kind.is_some()
+                    && m.hold_kind == entry.hold_kind
+                    && m.child_agent_id == entry.child_agent_id
+            });
+            if superseded {
+                false
+            } else {
+                queue.push(entry);
+                true
+            }
+        };
+        if !restored {
+            return;
+        }
+        self.arm_hold_release_timer(agent_id, &message_id, &hold_until);
+        self.publish_queue_updated(agent_id).await;
+    }
+
     /// Arm (or re-arm) the per-entry release timer for a held queue entry: a
     /// spawned sleeper that fires at `hold_until` and flushes the hold via
     /// [`Services::flush_expired_hold`]. A missing/unparseable/past deadline
@@ -13409,6 +13448,24 @@ impl Services {
                     .or_default()
                     .splice(0..0, drained);
                 return Err(e);
+            }
+            // Re-arm release timers for migrated held entries against the
+            // TARGET agent (mirrors the boot-rehydration re-arm): the timer
+            // armed at enqueue time captured the poisoned agent id, so left
+            // alone it would fire against a queue that no longer holds the
+            // entry and the migrated hold would sit parked until an
+            // unrelated queue event. Entries keep their ids, and arming
+            // replaces (aborts) any previous timer for the same id, so the
+            // stale poisoned-agent sleeper dies here too. An already expired
+            // `hold_until` flushes immediately (fail open).
+            for message in &drained {
+                if message.hold_kind.is_some() {
+                    self.arm_hold_release_timer(
+                        target_id,
+                        &message.id,
+                        message.hold_until.as_deref().unwrap_or_default(),
+                    );
+                }
             }
             let queue = self.queue_snapshot(target_id);
             self.publish_queue_event(target_id, workspace_id, queue)

@@ -9749,6 +9749,107 @@ async fn report_to_parent_debounce_expiry_flushes_wake() {
     assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 }
 
+/// A failed combined wake must not lose the folded report: the send-failure
+/// path restores the retracted held entry, so the stable-id retry retracts
+/// and folds it again — the parent still gets exactly ONE wake carrying both
+/// the report event and the terminal event.
+#[tokio::test]
+async fn report_to_parent_debounce_send_failure_restores_held_entry_for_retry() {
+    let (_t, svc, ws) = setup().await;
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("agents.reportToParentDebounceSeconds".into(), json!(60))])
+        .expect("set debounce");
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("progress"), Some(child.clone()))
+        .await
+        .expect("report");
+    let parked = svc.queue_snapshot(&parent);
+    assert_eq!(parked.len(), 1, "wake parked");
+    let held_id = parked[0]["id"].as_str().expect("entry id").to_string();
+
+    // Settlement with the durable send failing: the retraction must be
+    // rolled back so the retry can fold the report again.
+    sqlx::query(
+        "CREATE TRIGGER fail_combined_wake BEFORE INSERT ON agent_message BEGIN
+         SELECT RAISE(FAIL, 'injected combined wake failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install failure trigger");
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "report": "progress" }),
+    );
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline);
+    let restored = svc.queue_snapshot(&parent);
+    assert_eq!(restored.len(), 1, "held entry restored after send failure");
+    assert_eq!(restored[0]["id"], json!(held_id));
+    assert_eq!(
+        restored[0]["holdKind"],
+        json!(crate::agent_ops::REPORT_DEBOUNCE_HOLD_KIND)
+    );
+    assert!(!svc.has_ready_to_send(&parent), "restored entry stays held");
+
+    // Recovery: the stable-id retry delivers ONE combined wake and the held
+    // entry is gone for good.
+    sqlx::query("DROP TRIGGER fail_combined_wake")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove failure trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if parent_message_count(&svc, &parent).await == baseline + 1
+                && svc.find_watches_for_child(&child).is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry delivers the combined wake");
+    assert!(
+        svc.queue_snapshot(&parent).is_empty(),
+        "retry re-retracted the restored entry"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let wake = session.messages.last().expect("terminal wake");
+    let metadata = wake.metadata.as_ref().expect("wake metadata");
+    let types: Vec<&str> = metadata["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .map(|e| e["type"].as_str().expect("event type"))
+        .collect();
+    assert_eq!(
+        types[0], "agent:reportToParent",
+        "retry wake still folds the report event first: {types:?}"
+    );
+    assert!(types.contains(&AGENT_IDLE));
+}
+
 #[tokio::test]
 async fn durable_completion_wake_retry_reuses_transcript_message_id() {
     let (_t, svc, ws) = setup().await;
@@ -26878,6 +26979,66 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
         Err(Error::NotFound(_))
     ));
     assert_eq!(persisted_queue(&svc, &target).await.len(), 2);
+}
+
+/// Migration re-arms hold release timers against the TARGET agent (mirrors
+/// the boot-rehydration re-arm): a held entry migrated off a poisoned
+/// session still flushes at its deadline on the replacement's queue instead
+/// of sitting parked until an unrelated queue event.
+#[tokio::test]
+async fn migrate_queue_rearms_hold_timers_for_target() {
+    let (_t, svc, ws) = setup().await;
+    let poisoned = create_agent(&svc, &ws, "PoisonedHeld").await;
+    let target = create_agent(&svc, &ws, "FreshHeld").await;
+
+    // Park one short-deadline held entry on the poisoned session (armed
+    // against the poisoned agent id) alongside a normal entry.
+    let soon = intent_core::iso_ms_from_now(300);
+    let (held, _) = svc
+        .enqueue_held_message(
+            &poisoned,
+            "held wake".into(),
+            None,
+            "debounce",
+            &soon,
+            "child-1",
+        )
+        .await;
+    svc.enqueue_message(&poisoned, "plain".into(), None, None, None, None, false);
+
+    let migrated = svc
+        .migrate_queue_and_gc_poisoned_session(&poisoned, &target, &ws)
+        .await
+        .expect("migrate");
+    assert_eq!(migrated, 2);
+
+    // The held entry moved with its marker intact...
+    let snapshot = svc.queue_snapshot(&target);
+    let moved = snapshot
+        .iter()
+        .find(|e| e["id"] == json!(held.id))
+        .expect("held entry migrated");
+    assert_eq!(moved["holdKind"], "debounce");
+
+    // ...and the re-armed timer flushes it on the TARGET at the deadline —
+    // no manual release, no unrelated queue event.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = svc.queue_snapshot(&target);
+        let entry = snapshot
+            .iter()
+            .find(|e| e["id"] == json!(held.id))
+            .expect("held entry stays queued");
+        if entry["holdKind"].is_null() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "migrated hold was not flushed by a re-armed timer"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(svc.has_ready_to_send(&target));
 }
 
 /// Soft-retire inertness: a session interrupted mid-turn and then retired

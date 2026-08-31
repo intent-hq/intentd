@@ -6155,15 +6155,18 @@ impl Services {
             // deletion settlements alike, including boot reconciliation
             // replaying a settlement from downtime. A `None` retraction means
             // no hold was pending (flushed, released, or never held) — the
-            // legacy single-wake shape.
-            if let Some(held) = self
+            // legacy single-wake shape. The retracted entry is kept until the
+            // durable send below commits: a failed send restores it so the
+            // stable-id retry can retract and fold it again instead of
+            // silently dropping the report event.
+            let retracted_held = self
                 .retract_held_message(
                     &watch.parent_agent_id,
                     &child_id.0,
                     crate::agent_ops::REPORT_DEBOUNCE_HOLD_KIND,
                 )
-                .await
-            {
+                .await;
+            if let Some(held) = retracted_held.as_ref() {
                 merge_held_report_metadata(&mut metadata, held.message_metadata.as_ref());
             }
             // Join the child's recorded flipped completions (consumed at
@@ -6212,6 +6215,16 @@ impl Services {
                     watch = %watch.id,
                     "failed to deliver completion wake to parent; retry scheduled"
                 );
+                // The combined wake never committed: restore the retracted
+                // held report so the retry pass can retract and fold it
+                // again — otherwise the eventual retry wake would silently
+                // lose the report event. (The retirement-failure branch
+                // below must NOT restore: its wake is already durable and
+                // carries the folded report.)
+                if let Some(held) = retracted_held {
+                    self.restore_held_message(&watch.parent_agent_id, held)
+                        .await;
+                }
                 ungrouped_delivery_failed = true;
                 self.schedule_completion_delivery_retry(child_id.clone(), retry_event.clone());
                 continue;
