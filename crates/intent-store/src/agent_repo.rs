@@ -5292,6 +5292,173 @@ mod tests {
         assert_eq!(remaining, 0, "session delete cascades side rows");
     }
 
+    /// Seed `count` small `agent_message` rows for `agent_id` in one
+    /// transaction, plus one payload side row per message.
+    async fn seed_messages_with_payloads(store: &Store, agent_id: &AgentId, count: i64, ts: &str) {
+        let mut tx = store.write_pool().begin().await.expect("begin seed");
+        for i in 0..count {
+            let id = format!("m-{i}");
+            sqlx::query(
+                "INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
+                 VALUES (?, ?, ?, 'assistant', '[]', ?)",
+            )
+            .bind(&id)
+            .bind(&agent_id.0)
+            .bind(i)
+            .bind(ts)
+            .execute(&mut *tx)
+            .await
+            .expect("seed message");
+            sqlx::query(
+                "INSERT INTO agent_message_payload \
+                 (message_id, agent_id, block_ordinal, kind, encoding, body) \
+                 VALUES (?, ?, 0, 'tool_result_output', 'none', X'00')",
+            )
+            .bind(&id)
+            .bind(&agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .expect("seed payload");
+        }
+        tx.commit().await.expect("commit seed");
+    }
+
+    async fn count_rows(store: &Store, table: &str, agent_id: &AgentId) -> i64 {
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE agent_id = ?"))
+            .bind(&agent_id.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("count rows")
+    }
+
+    /// intent-hq/intent#3827: deleting a session with a history far larger
+    /// than one batch removes every child row — envelope-owned payload rows,
+    /// pre-staged orphans (0109), messages, and FTS entries — and the
+    /// session itself, while a wrong-workspace delete stays a complete no-op
+    /// (children untouched, not just the session row).
+    #[tokio::test]
+    async fn delete_agent_session_chunked_sweep_removes_large_history() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-chunked-delete");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-chunked-delete".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-chunked-delete".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        // 1_100 messages + 1_100 payload rows: both sweeps need 3 batches.
+        seed_messages_with_payloads(&store, &agent_id, 1_100, &ts).await;
+        // Pre-staged orphans: payload rows whose envelope never landed.
+        for i in 0..7 {
+            sqlx::query(
+                "INSERT INTO agent_message_payload \
+                 (message_id, agent_id, block_ordinal, kind, encoding, body) \
+                 VALUES (?, ?, 0, 'tool_use_input', 'none', X'00')",
+            )
+            .bind(format!("prestaged-{i}"))
+            .bind(&agent_id.0)
+            .execute(store.write_pool())
+            .await
+            .expect("seed prestaged orphan");
+        }
+        assert_eq!(
+            count_rows(&store, "agent_message_payload", &agent_id).await,
+            1_107
+        );
+
+        // Wrong workspace: no-op end to end, children included.
+        let other_ws = WorkspaceId("ws-other".to_string());
+        let removed = store
+            .delete_agent_session(&other_ws, &agent_id)
+            .await
+            .expect("wrong-workspace delete");
+        assert!(!removed, "wrong workspace removes nothing");
+        assert_eq!(count_rows(&store, "agent_message", &agent_id).await, 1_100);
+        assert_eq!(
+            count_rows(&store, "agent_message_payload", &agent_id).await,
+            1_107
+        );
+
+        let removed = store
+            .delete_agent_session(&ws_id, &agent_id)
+            .await
+            .expect("delete session");
+        assert!(removed, "session row removed");
+        assert_eq!(count_rows(&store, "agent_message", &agent_id).await, 0);
+        assert_eq!(
+            count_rows(&store, "agent_message_payload", &agent_id).await,
+            0
+        );
+        let fts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_fts")
+            .fetch_one(store.read_pool())
+            .await
+            .expect("fts count");
+        assert_eq!(fts, 0, "FTS rows swept via per-row delete trigger");
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session WHERE id = ?")
+            .bind(&agent_id.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("session count");
+        assert_eq!(sessions, 0, "session row gone");
+    }
+
+    /// Regression (intent-hq/intent#3827): the pre-sweep never deletes more
+    /// than one batch of rows per statement — 1201 rows at batch size 500
+    /// take exactly 3 statements — so the write lock is only ever held for
+    /// one bounded batch at a time.
+    #[tokio::test]
+    async fn delete_in_bounded_batches_caps_rows_per_statement() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-bounded-batches");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-bounded".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-bounded".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        seed_messages_with_payloads(&store, &agent_id, 1_201, &ts).await;
+
+        let batches = delete_in_bounded_batches(
+            store.write_pool(),
+            DELETE_PAYLOAD_BATCH_SQL,
+            &agent_id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await
+        .expect("payload sweep");
+        assert_eq!(batches, 3, "1201 payload rows / 500 = 3 bounded statements");
+        assert_eq!(
+            count_rows(&store, "agent_message_payload", &agent_id).await,
+            0
+        );
+
+        let batches = delete_in_bounded_batches(
+            store.write_pool(),
+            DELETE_MESSAGE_BATCH_SQL,
+            &agent_id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await
+        .expect("message sweep");
+        assert_eq!(batches, 3, "1201 message rows / 500 = 3 bounded statements");
+        assert_eq!(count_rows(&store, "agent_message", &agent_id).await, 0);
+    }
+
     /// Legacy fallback: a pre-0108 row (inline heavy body, no side rows)
     /// reads back verbatim — hydration is a no-op driven purely by side-row
     /// presence — and a corrupt side row degrades that block to its stored
