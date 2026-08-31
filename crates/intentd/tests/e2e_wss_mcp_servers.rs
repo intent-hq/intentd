@@ -606,6 +606,22 @@ async fn mcp_servers_workspace_scoped_toggle_over_wss() {
         .expect("fingerprint")
         .to_string();
     let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — `workspace:updated` BEFORE any toggle so the
+    // `mcpServerToggled` delta (§6.5) is observable.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscriptionId in subscribe result: {sub_resp}"
+    );
+
     let mut rpc = connect_ws(port, cfg).await;
 
     // create — stays enabled globally throughout; the bogus command never
@@ -634,6 +650,19 @@ async fn mcp_servers_workspace_scoped_toggle_over_wss() {
     .await;
     assert_eq!(toggled["workspaceDisabled"], json!(true));
     assert!(toggled["status"].is_object(), "got: {toggled}");
+
+    // The scoped toggle emits a self-sufficient `workspace:updated` delta
+    // (§6.5) carrying { mcpServerToggled: { serverId, workspaceDisabled } }.
+    let changes = wait_for_workspace_updated(&mut sub, &ws_id).await;
+    assert_eq!(
+        changes["mcpServerToggled"]["serverId"],
+        json!(server_id),
+        "got: {changes}"
+    );
+    assert_eq!(
+        changes["mcpServerToggled"]["workspaceDisabled"],
+        json!(true)
+    );
 
     // Scoped list: flag set, global enabled untouched.
     let list = wss_rpc(
@@ -690,4 +719,51 @@ async fn mcp_servers_workspace_scoped_toggle_over_wss() {
     )
     .await;
     assert_eq!(list["servers"][0]["workspaceDisabled"], json!(false));
+
+    // Malformed (non-string / empty) workspaceId on the write path is a
+    // strict -32602 — it must NOT fall through to a global toggle.
+    for (id, bad_ws) in [(9, json!(0)), (10, json!(""))] {
+        let e = wss_rpc_expect_error(
+            &mut rpc,
+            id,
+            "mcp.servers.toggle",
+            json!({ "serverId": server_id, "enabled": false, "workspaceId": bad_ws }),
+        )
+        .await;
+        assert_eq!(e["code"], json!(-32602), "got: {e}");
+    }
+    // …and the global config is untouched by the rejected calls.
+    let list = wss_rpc(&mut rpc, 11, "mcp.servers.list", json!({})).await;
+    assert_eq!(list["servers"][0]["enabled"], json!(true));
+}
+
+/// Read frames on `ws` until a `workspace:updated` event for `ws_id` arrives;
+/// return its `changes` delta.
+async fn wait_for_workspace_updated<S>(ws: &mut WebSocketStream<S>, ws_id: &str) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for _ in 0..20 {
+        let next = timeout(common::rpc_read_timeout(), ws.next())
+            .await
+            .expect("wss event timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] != "events.event" {
+                    continue;
+                }
+                let event = &v["params"]["event"];
+                if event["type"] == "workspace:updated" && event["data"]["workspaceId"] == ws_id {
+                    return event["data"]["changes"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    panic!("never observed workspace:updated for {ws_id}");
 }

@@ -3712,8 +3712,18 @@ async fn dispatch(
                 .and_then(Value::as_bool)
                 .ok_or_else(|| invalid_params("enabled is required"))?;
             // Optional workspaceId scopes the toggle to the per-workspace
-            // disabled layer (PROTOCOL §5.22); absent → global toggle.
-            let workspace_id = opt_workspace_id(params);
+            // disabled layer (PROTOCOL §5.22); absent/null → global toggle.
+            // Strict on this mutating arm: a present-but-malformed value must
+            // NOT silently degrade into a global toggle.
+            let workspace_id = match params.get("workspaceId") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(WorkspaceId::from)
+                        .ok_or_else(|| invalid_params("workspaceId must be a non-empty string"))?,
+                ),
+            };
             match api
                 .mcp_servers_toggle(server_id, enabled, workspace_id)
                 .await
