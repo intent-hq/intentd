@@ -404,17 +404,21 @@ mod tests {
         // has kept from completing and retiring. No scheduler-timing
         // assumption: joining is observed, not inferred from a counter
         // incremented before the call.
+        let mut all_first_polls_pending = true;
         for caller in &mut callers {
-            let first_poll_pending = std::future::poll_fn(|cx| {
+            all_first_polls_pending &= std::future::poll_fn(|cx| {
                 std::task::Poll::Ready(caller.as_mut().poll(cx).is_pending())
             })
             .await;
-            assert!(
-                first_poll_pending,
-                "each caller must be waiting on the shared flight"
-            );
         }
+        // Release the gate before asserting: a failed assertion here would
+        // otherwise leave the blocking `work` spinning on the gate forever,
+        // hanging the test binary instead of failing it.
         all_joined.store(true, Ordering::SeqCst);
+        assert!(
+            all_first_polls_pending,
+            "each caller must be waiting on the shared flight"
+        );
         for caller in callers {
             let r = caller.await.expect("shared flight result");
             assert_eq!(r.branches, vec!["main"]);
