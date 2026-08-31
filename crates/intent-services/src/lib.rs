@@ -9437,6 +9437,60 @@ fn remove_workspace_dir_if_empty(ws_dir: &Path) {
     let _ = std::fs::remove_dir(ws_dir);
 }
 
+/// Loud degradation probe for PR-aware creates (§5.1): when the workspace
+/// branch was derived from a PR head but the source repo has neither a local
+/// branch nor a `refs/remotes/{remote}/{branch}` tip — a fork-hosted head
+/// (the base repo carries no ref for it), or a never-fetched branch on a
+/// local-repo create (provisioning does no network fetch) — the checkout
+/// silently materializes as a FRESH branch at the base commit, named like
+/// the PR head but carrying none of its commits, while `pr_number`/`pr_url`
+/// claim PR linkage. Warn so the degradation is visible; best-effort and
+/// read-only (probe errors are ignored — provisioning surfaces real
+/// failures itself).
+fn warn_if_pr_head_missing(
+    repo_path: &Path,
+    branch: &str,
+    remote: &str,
+    link: Option<&intent_core::ContextLink>,
+) {
+    let Some(link) = link else { return };
+    let Ok(repo) = git2::Repository::open(repo_path) else {
+        return;
+    };
+    let local = repo.find_branch(branch, git2::BranchType::Local).is_ok();
+    let remote_tip = repo
+        .find_reference(&format!("refs/remotes/{remote}/{branch}"))
+        .is_ok();
+    if !local && !remote_tip {
+        tracing::warn!(
+            owner = %link.owner,
+            repo = %link.repo,
+            pr = link.number,
+            branch = %branch,
+            "workspace.create: PR head branch has no local or remote-tracking ref (fork-hosted head, or never fetched); the checkout will be a fresh branch at the base commit WITHOUT the PR's commits"
+        );
+    }
+}
+
+/// `baseCommitSha` for a PR-derived checkout (§5.1): the provisioning helpers
+/// return the CHECKED-OUT tip, which for a materialized PR head is the head
+/// SHA — not the base boundary the `baseCommitSha` contract records. Resolve
+/// the merge-base of the checkout's HEAD with the (PR-derived) `baseRef`
+/// instead, falling back to the checked-out tip when the boundary cannot be
+/// resolved (e.g. the head degraded to a fresh branch at the base commit,
+/// where tip == boundary anyway).
+fn pr_aware_base_commit_sha(
+    checkout_path: &Path,
+    base_ref: Option<&str>,
+    checked_out_sha: String,
+) -> String {
+    match intent_git::diff::resolve_branch_boundary(checkout_path, base_ref, None, &checked_out_sha)
+    {
+        Ok(Some(boundary)) => boundary,
+        _ => checked_out_sha,
+    }
+}
+
 /// Drop the `repositoryPath` a `workspace.duplicate` of a **standalone**
 /// source copied from the source row, after checkout provisioning failed
 /// (intent-hq/monorepo#1560).
@@ -15354,6 +15408,127 @@ impl WorkspaceApi for Services {
                             input.repository_name = Some(name);
                         }
                     }
+                    // PR-aware create (§5.1): a pr-kind contextLink links the
+                    // workspace to its PR from birth — `pr_number`/`pr_url`
+                    // seed from the link itself (so linkage survives a failed
+                    // forge lookup), and a successful forge lookup fills the
+                    // blanks the caller left: `branch` defaults to the PR
+                    // head branch (checked out as the EXISTING branch — no
+                    // slug generation, no uniquification; the git layer
+                    // materializes remote-only branches at the remote tip)
+                    // and `baseRef` to the PR base branch, so ahead/behind
+                    // and diffs reflect the merge target. Explicit `branch`/
+                    // `baseRef` params always win. Lookup failure is
+                    // non-fatal: the create proceeds without the PR-derived
+                    // git setup. With multiple pr-kind links the FIRST one
+                    // wins (deliberate tie-break: the FE puts the primary
+                    // link first).
+                    let pr_link = input.context_links.as_deref().and_then(|links| {
+                        links
+                            .iter()
+                            .find(|l| l.kind == intent_core::ContextLinkKind::Pr)
+                            .cloned()
+                    });
+                    // Cross-repo guard: a link whose owner/repo mismatch the
+                    // workspace's known repository identity (caller-supplied
+                    // or STAB-64-derived above) is ignored with a warn —
+                    // deriving another repository's branch names onto this
+                    // checkout would silently check out unrelated content or
+                    // fail the create on an unresolvable `baseRef`.
+                    let pr_link = pr_link.filter(|link| {
+                        let owner_mismatch = input.repository_owner.as_deref().is_some_and(|o| {
+                            !o.is_empty() && !o.eq_ignore_ascii_case(&link.owner)
+                        });
+                        let name_mismatch = input.repository_name.as_deref().is_some_and(|n| {
+                            !n.is_empty() && !n.eq_ignore_ascii_case(&link.repo)
+                        });
+                        if owner_mismatch || name_mismatch {
+                            tracing::warn!(
+                                link_owner = %link.owner,
+                                link_repo = %link.repo,
+                                repository_owner = input.repository_owner.as_deref().unwrap_or(""),
+                                repository_name = input.repository_name.as_deref().unwrap_or(""),
+                                pr = link.number,
+                                "workspace.create: pr contextLink targets a different repository; ignoring it for PR-aware setup"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    // The PR linkage is only functional (the §7.6 background
+                    // refresh keys the forge repo off the row's owner/name)
+                    // when the row carries the repository identity — seed
+                    // blank owner/name from the link itself.
+                    if let Some(link) = pr_link.as_ref() {
+                        if input.repository_owner.as_deref().is_none_or(str::is_empty) {
+                            input.repository_owner = Some(link.owner.clone());
+                        }
+                        if input.repository_name.as_deref().is_none_or(str::is_empty) {
+                            input.repository_name = Some(link.repo.clone());
+                        }
+                    }
+                    let mut linked_pr: Option<intent_sourcecontrol::PullRequest> = None;
+                    let mut pr_derived_branch = false;
+                    if let Some(link) = pr_link.as_ref() {
+                        match pr_ops::resolve_source_control(services.source_control.clone())
+                            .await
+                        {
+                            Ok(sc) => {
+                                let repo = intent_sourcecontrol::RepoRef::new(
+                                    link.owner.clone(),
+                                    link.repo.clone(),
+                                );
+                                // Bounded like every sweep `get_pr`
+                                // (`pr_ops` `per_entry_timeout`): a hung
+                                // forge connection degrades instead of
+                                // stalling the interactive create a user is
+                                // waiting on.
+                                match tokio::time::timeout(
+                                    services.pr_refresh_fetch_timeout,
+                                    sc.get_pr(&repo, link.number),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(pr)) => {
+                                        if input.branch.as_deref().is_none_or(str::is_empty) {
+                                            input.branch = Some(pr.source_branch.clone());
+                                            pr_derived_branch = true;
+                                        }
+                                        if input.base_ref.as_deref().is_none_or(str::is_empty) {
+                                            input.base_ref = Some(pr.target_branch.clone());
+                                        }
+                                        linked_pr = Some(pr);
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(
+                                            owner = %link.owner,
+                                            repo = %link.repo,
+                                            pr = link.number,
+                                            error = %e,
+                                            "workspace.create: PR contextLink forge lookup failed; creating without PR-derived git setup"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            owner = %link.owner,
+                                            repo = %link.repo,
+                                            pr = link.number,
+                                            timeout = ?services.pr_refresh_fetch_timeout,
+                                            "workspace.create: PR contextLink forge lookup timed out; creating without PR-derived git setup"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    pr = link.number,
+                                    error = %e,
+                                    "workspace.create: no source-control provider for PR contextLink; creating without PR-derived git setup"
+                                );
+                            }
+                        }
+                    }
                     // Branch naming (TS parity): an explicit `branch` wins
                     // untouched; otherwise the branch is a friendly slug —
                     // extracted from `initialAgent.prompt` when possible
@@ -15471,11 +15646,17 @@ impl WorkspaceApi for Services {
                         setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
-                        pr_number: None,
-                        pr_url: None,
-                        pr_status: None,
-                        active_pull_request: None,
-                        pull_requests: None,
+                        // PR linkage from a pr-kind contextLink: number/url
+                        // come from the link itself (kept even when the forge
+                        // lookup failed); status + snapshot only from a
+                        // successful lookup.
+                        pr_number: pr_link.as_ref().map(|l| l.number),
+                        pr_url: pr_link.as_ref().map(|l| l.url.clone()),
+                        pr_status: linked_pr.as_ref().map(pr_ops::derive_pr_status),
+                        active_pull_request: linked_pr.as_ref().map(pr_ops::build_pr_info),
+                        pull_requests: linked_pr
+                            .as_ref()
+                            .map(|pr| vec![pr_ops::build_pr_info(pr)]),
                         // Validated pre-insert above; an empty list persists
                         // as absent so the wire shape omits it (§5.1).
                         context_links: input.context_links.filter(|l| !l.is_empty()),
@@ -15605,6 +15786,14 @@ impl WorkspaceApi for Services {
                             }
                             let branch = ws.branch.clone();
                             let base_ref = ws.base_ref.clone();
+                            if pr_derived_branch {
+                                warn_if_pr_head_missing(
+                                    &cache_path,
+                                    &branch,
+                                    "origin",
+                                    pr_link.as_ref(),
+                                );
+                            }
                             let provision_progress = progress.clone();
                             let provision = |mode: intent_core::CheckoutMode| {
                                 let cache = cache_path.clone();
@@ -15737,7 +15926,18 @@ impl WorkspaceApi for Services {
                                 Some(checkout_path.to_string_lossy().to_string());
                             ws.checkout_mode = Some(mode);
                             if ws.base_commit_sha.is_none() {
-                                ws.base_commit_sha = Some(sha);
+                                // A PR-derived branch checks out at the PR
+                                // head, not the base — record the merge-base
+                                // boundary, not the checked-out tip.
+                                ws.base_commit_sha = Some(if pr_derived_branch {
+                                    pr_aware_base_commit_sha(
+                                        &checkout_path,
+                                        ws.base_ref.as_deref(),
+                                        sha,
+                                    )
+                                } else {
+                                    sha
+                                });
                             }
                         }
                     } else if new_repo_direct {
@@ -15841,6 +16041,14 @@ impl WorkspaceApi for Services {
                                 let base_ref = ws.base_ref.clone();
                                 let remote =
                                     input.remote.unwrap_or_else(|| "origin".to_string());
+                                if pr_derived_branch {
+                                    warn_if_pr_head_missing(
+                                        &repo_dir,
+                                        &branch,
+                                        &remote,
+                                        pr_link.as_ref(),
+                                    );
+                                }
                                 let mut mode = if cow_isolation
                                     && repo_dir.join(".git").is_file()
                                 {
@@ -16088,7 +16296,18 @@ impl WorkspaceApi for Services {
                                     Some(wt_path.to_string_lossy().to_string());
                                 ws.checkout_mode = Some(mode);
                                 if ws.base_commit_sha.is_none() {
-                                    ws.base_commit_sha = Some(sha);
+                                    // A PR-derived branch checks out at the
+                                    // PR head, not the base — record the
+                                    // merge-base boundary, not the tip.
+                                    ws.base_commit_sha = Some(if pr_derived_branch {
+                                        pr_aware_base_commit_sha(
+                                            &wt_path,
+                                            ws.base_ref.as_deref(),
+                                            sha,
+                                        )
+                                    } else {
+                                        sha
+                                    });
                                 }
                             } else {
                                 tracing::warn!(
