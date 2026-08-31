@@ -105,6 +105,10 @@ pub struct ContextLink {
     pub url: String,
     pub owner: String,
     pub repo: String,
+    /// Issue/PR number. `u64` on purpose: a negative or fractional wire value
+    /// rejects `-32602` at deserialization time (like an unknown `kind`),
+    /// before the service validation that names `contextLinks[i].number` —
+    /// only a zero gets the entry-named error.
     pub number: u64,
 }
 

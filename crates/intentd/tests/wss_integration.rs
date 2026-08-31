@@ -770,6 +770,40 @@ async fn wss_workspace_create_context_links_round_trip_and_validation() {
     )
     .await;
     assert_eq!(bad_kind["error"]["code"], -32602, "bad kind: {bad_kind}");
+
+    // A negative `number` also rejects at parse time (`u64` field): still
+    // `-32602`, but without the `contextLinks[i].number` naming — that
+    // wording is reserved for the in-range zero case above.
+    let bad_number = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"workspace.create","params":{"title":"WSS Bad Number","contextLinks":[{"kind":"pr","url":"https://example.com","owner":"o","repo":"r","number":-1}]}}"#,
+    )
+    .await;
+    assert_eq!(
+        bad_number["error"]["code"], -32602,
+        "bad number: {bad_number}"
+    );
+
+    // Atomic validation: none of the rejected creates left a row behind.
+    let after = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":8,"method":"workspace.list","params":{}}"#,
+    )
+    .await;
+    let titles: Vec<&str> = after["result"]["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .filter_map(|w| w["title"].as_str())
+        .collect();
+    for rejected in ["WSS Bad Links", "WSS Bad Kind", "WSS Bad Number"] {
+        assert!(
+            !titles.contains(&rejected),
+            "rejected create `{rejected}` must not persist a workspace: {titles:?}"
+        );
+    }
     srv.ws.stop().await;
 }
 
