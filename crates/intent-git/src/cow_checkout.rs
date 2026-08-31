@@ -517,13 +517,26 @@ fn checkout_in_clone_impl(
     };
 
     // Create the branch at the base commit, or reuse an existing branch of
-    // the same name (provision_worktree parity).
-    let branch_ref = match repo.find_branch(branch, BranchType::Local) {
-        Ok(b) => b.into_reference(),
-        Err(_) => repo
-            .branch(branch, &base_commit, false)
-            .map_err(map_git_err)?
-            .into_reference(),
+    // the same name (provision_worktree parity). A branch that exists only
+    // as a remote-tracking ref (e.g. a PR head branch never checked out
+    // locally) materializes as a local branch at the remote tip — with
+    // upstream tracking — instead of a fresh branch at the base commit, so
+    // the checkout carries the branch's existing commits.
+    let branch_ref = if let Ok(b) = repo.find_branch(branch, BranchType::Local) {
+        b.into_reference()
+    } else {
+        let remote_tip = repo
+            .find_reference(&format!("refs/remotes/{remote}/{branch}"))
+            .ok()
+            .and_then(|r| r.peel_to_commit().ok());
+        let target = remote_tip.as_ref().unwrap_or(&base_commit);
+        let mut b = repo.branch(branch, target, false).map_err(map_git_err)?;
+        if remote_tip.is_some() {
+            // Best-effort: a failure to record tracking never fails
+            // provisioning.
+            let _ = b.set_upstream(Some(&format!("{remote}/{branch}")));
+        }
+        b.into_reference()
     };
     let target = branch_ref.peel_to_commit().map_err(map_git_err)?;
     let checked_out_sha = target.id().to_string();
@@ -973,6 +986,53 @@ mod tests {
             provision_cow_checkout(dir.path(), &checkout, "cow-ws", Some(&base), "origin", &[])
                 .unwrap();
         assert_eq!(sha, pinned_sha, "existing branch is reused, not recreated");
+    }
+
+    /// A branch that exists ONLY as a remote-tracking ref (e.g. a PR head
+    /// branch never checked out locally) checks out at the remote tip — not
+    /// as a fresh branch at the base commit — and records upstream tracking.
+    #[test]
+    fn checkout_in_clone_materializes_remote_only_branch_at_remote_tip() {
+        let dir = init_repo("cowchk-remote-only");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let base_sha = head_sha(&dir);
+        let base = head_branch(&dir);
+        // A remote-tracking ref one commit AHEAD of the base branch, with no
+        // local branch of that name.
+        commit_file(dir.path(), "b.txt", "y\n");
+        let tip_sha = head_sha(&dir);
+        {
+            let repo = Repository::open(dir.path()).unwrap();
+            repo.remote("origin", &dir.path().display().to_string())
+                .unwrap();
+            let tip = git2::Oid::from_str(&tip_sha).unwrap();
+            repo.reference("refs/remotes/origin/pr-head", tip, false, "test")
+                .unwrap();
+            let base_oid = git2::Oid::from_str(&base_sha).unwrap();
+            repo.reference(&format!("refs/heads/{base}"), base_oid, true, "test")
+                .unwrap();
+            let base_obj = repo.find_object(base_oid, None).unwrap();
+            repo.reset(&base_obj, git2::ResetType::Hard, None).unwrap();
+        }
+
+        let sha = checkout_in_clone(dir.path(), "pr-head", Some(&base), "origin").unwrap();
+        assert_eq!(sha, tip_sha, "checkout lands on the remote tip");
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand().unwrap(), "pr-head");
+        let local = repo.find_branch("pr-head", BranchType::Local).unwrap();
+        assert_eq!(
+            local
+                .upstream()
+                .ok()
+                .and_then(|u| u.name().ok().flatten().map(str::to_string))
+                .as_deref(),
+            Some("origin/pr-head"),
+            "upstream tracking recorded"
+        );
+        assert!(
+            repo.find_reference("refs/heads/pr-head").is_ok(),
+            "local branch materialized"
+        );
     }
 
     #[test]
