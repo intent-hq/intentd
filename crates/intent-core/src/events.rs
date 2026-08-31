@@ -368,6 +368,11 @@ pub const COMMENT_RESOLVED: &str = "comment:resolved";
 pub(crate) const CHANGES_TRACKED: &str = "changes:tracked";
 pub const CHANGES_GIT_STATUS: &str = "changes:git-status";
 pub const CHANGES_METRICS_CHANGED: &str = "changes:metrics-changed";
+// `changes:agent-locks` → `{ workspaceId, autoCommitEnabled, lockedAgentIds,
+// lockedFilePaths }` — the daemon-computed agent-lock snapshot (§5.19, §6.5):
+// which agents' files must not be manually staged/reverted because the agent
+// is actively working with auto-commit enabled. Emitted on change only.
+pub const CHANGES_AGENT_LOCKS: &str = "changes:agent-locks";
 
 // Search streaming events (new in intentd; §5.15 / §6.5). Large or long-running
 // `search.*` requests return `{ requestId }` promptly, then the daemon pushes
@@ -575,6 +580,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     CHANGES_TRACKED,
     CHANGES_GIT_STATUS,
     CHANGES_METRICS_CHANGED,
+    CHANGES_AGENT_LOCKS,
     SEARCH_RESULT,
     SEARCH_DONE,
     DRAFT_CHANGED,

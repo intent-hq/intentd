@@ -1767,6 +1767,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
     // event bus. Aborted on clean shutdown.
     let auto_commit_loop = services.spawn_auto_commit_loop();
+    // Agent-locks recompute worker (§5.19/§6.5): watch agent lifecycle, task
+    // status, auto-commit policy, and tracked-change events and publish the
+    // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
+    // without an event bus. Aborted on clean shutdown.
+    let agent_locks_loop = services.spawn_agent_locks_loop();
     // CRDT session sweeper (A5, §5.2 CRDT): every hour, drop cached yrs docs
     // for `(workspace, note)` pairs whose last access is older than 24h so
     // long-lived daemons do not accumulate per-note session state. Aborted on
@@ -2208,6 +2213,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     token_usage_scan.abort();
     completion_delivery.abort();
     auto_commit_loop.abort();
+    agent_locks_loop.abort();
     crdt_session_sweep.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();

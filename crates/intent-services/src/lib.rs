@@ -51,6 +51,7 @@ use intent_store::{EventQuery, NewEvent, Store};
 pub use intent_core::{Error, Result, WorkspaceApi};
 
 mod acp_adapter;
+mod agent_locks;
 mod agent_manager;
 mod agent_ops;
 mod agent_session;
@@ -26185,6 +26186,19 @@ impl WorkspaceApi for Services {
                 worktree.as_deref(),
                 &parsed,
             ))
+        })
+    }
+
+    fn file_tracking_get_agent_locks(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let this = self.clone();
+        Box::pin(async move {
+            // On-demand hydration read for `changes:agent-locks` (§5.19);
+            // store failures inside degrade to an empty (unlocked) snapshot.
+            let snap = this.compute_agent_locks(&workspace_id).await;
+            Ok(snap.to_result_value())
         })
     }
 
