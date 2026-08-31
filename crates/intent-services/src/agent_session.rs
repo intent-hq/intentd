@@ -477,8 +477,19 @@ impl Transcript {
                         obj.remove("inputBytes");
                     }
                 } else if !tc.title.is_empty() {
-                    if let Some(obj) = block.get_mut("input").and_then(Value::as_object_mut) {
-                        obj.insert("_acpTitle".to_string(), Value::String(tc.title.clone()));
+                    // 0109: skip the title-only patch when the block carries a
+                    // prestage placeholder (`inputTruncated`) — the full input
+                    // lives ONLY in the staged row (old title), so patching the
+                    // preview would make it disagree with what hydration
+                    // splices back. Keeping the preview untouched keeps slim
+                    // and hydrated reads consistent; the rare post-terminal
+                    // title-only update is carried by the live event, and any
+                    // later input replace above re-attaches the fresh title
+                    // and re-stages.
+                    if block.get("inputTruncated").and_then(Value::as_bool) != Some(true) {
+                        if let Some(obj) = block.get_mut("input").and_then(Value::as_object_mut) {
+                            obj.insert("_acpTitle".to_string(), Value::String(tc.title.clone()));
+                        }
                     }
                 }
                 if let Some(meta) = block.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -3442,6 +3453,13 @@ impl Services {
             flush_pending: false,
             flush_failed: false,
         };
+        // A failed flush deliberately does NOT reap the turn's mid-turn
+        // staged rows (unlike the turn-end/wake failure arms): this path does
+        // not own the slot, so a `None` here can coexist with a concurrent
+        // teardown whose pinned retry flush is still entitled to adopt them —
+        // reaping would delete the only copy of the heavy bodies out from
+        // under it. Truly orphaned rows are bounded and reaped by the
+        // `Store::open` sweep.
         let interrupted_message_id = self
             .flush_partial_turn_on_interruption(
                 agent_id,
@@ -4543,6 +4561,14 @@ impl Services {
                 // upsert in place. Runs AFTER the event publish so staging
                 // latency never delays the live stream.
                 if tc.status == "completed" || tc.status == "error" {
+                    // Sync the live-turn slot FIRST: the staging await below
+                    // is a suspension point, and an interruption that pins the
+                    // slot mid-await must flush a snapshot that already
+                    // carries this update (inline heavy body — the prestaged
+                    // append's reconcile then drops any newly staged row as
+                    // stale and extracts one-shot), never a pre-update
+                    // snapshot adopted under fresher staged rows.
+                    self.update_live_turn(agent_id, transcript);
                     self.prestage_completed_tool_blocks(
                         agent_id,
                         transcript,

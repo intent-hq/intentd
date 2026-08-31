@@ -2462,9 +2462,14 @@ pub fn slim_heavy_body(
 /// [`SLIM_PROJECTION_BUDGET_BYTES`] — an over-budget input is replaced by
 /// [`cap_json_value`]'s structure-preserving preview with additive
 /// `inputTruncated` / `inputBytes` flags (the same treatment as the slim
-/// conversation projection), an absent input is omitted. `None` when the
-/// content is not a block array or carries no `tool_use` block. Shared by
-/// the write-time `agent_session.last_tool_use_preview` column maintenance
+/// conversation projection), an absent input is omitted. A block already
+/// carrying `inputTruncated: true` (a write-time extraction placeholder —
+/// 0108/0109 — whose `input` is the persisted bounded preview) serves that
+/// preview as-is WITH its flags propagated: the capped input fits the budget
+/// here, so recomputing would silently drop the truncation signal even
+/// though the transcript hydrates the full body. `None` when the content is
+/// not a block array or carries no `tool_use` block. Shared by the
+/// write-time `agent_session.last_tool_use_preview` column maintenance
 /// (intent-store, 0098) and the `agent:last-message` event payload
 /// (intent-services), so the persisted column and the event always agree.
 pub fn last_tool_use_preview(content: &serde_json::Value) -> Option<serde_json::Value> {
@@ -2478,14 +2483,22 @@ pub fn last_tool_use_preview(content: &serde_json::Value) -> Option<serde_json::
     let mut preview = serde_json::Map::new();
     preview.insert("name".to_string(), Value::String(name.to_string()));
     if let Some(input) = block.get("input") {
-        let size = slim_body_size(input);
-        if size <= SLIM_PROJECTION_BUDGET_BYTES {
+        if block.get("inputTruncated").and_then(Value::as_bool) == Some(true) {
             preview.insert("input".to_string(), input.clone());
-        } else {
-            let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
-            preview.insert("input".to_string(), cap_json_value(input, &mut budget));
             preview.insert("inputTruncated".to_string(), Value::Bool(true));
-            preview.insert("inputBytes".to_string(), serde_json::json!(size));
+            if let Some(bytes) = block.get("inputBytes") {
+                preview.insert("inputBytes".to_string(), bytes.clone());
+            }
+        } else {
+            let size = slim_body_size(input);
+            if size <= SLIM_PROJECTION_BUDGET_BYTES {
+                preview.insert("input".to_string(), input.clone());
+            } else {
+                let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+                preview.insert("input".to_string(), cap_json_value(input, &mut budget));
+                preview.insert("inputTruncated".to_string(), Value::Bool(true));
+                preview.insert("inputBytes".to_string(), serde_json::json!(size));
+            }
         }
     }
     Some(Value::Object(preview))
@@ -4412,6 +4425,26 @@ mod tests {
             served.len() <= SLIM_PROJECTION_BUDGET_BYTES * 2,
             "capped input stays near the budget, got {} bytes",
             served.len()
+        );
+
+        // A write-time extraction placeholder (0108/0109): the block's
+        // `input` is already the capped preview and fits the budget here —
+        // the flags must propagate rather than be recomputed away, so the
+        // session preview keeps saying the input is truncated.
+        let placeholder = json!([{
+            "type": "tool_use", "id": "m:0", "name": "write_file",
+            "input": {"path": "/tmp/a.txt"},
+            "inputTruncated": true, "inputBytes": 99_999,
+            "toolCallId": "tp",
+        }]);
+        assert_eq!(
+            last_tool_use_preview(&placeholder),
+            Some(json!({
+                "name": "write_file",
+                "input": {"path": "/tmp/a.txt"},
+                "inputTruncated": true,
+                "inputBytes": 99_999,
+            }))
         );
 
         // Missing input omits the field; missing name degrades to "".

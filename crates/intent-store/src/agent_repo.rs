@@ -5431,6 +5431,21 @@ mod tests {
             recount(&store, &agent_id).await,
             "prestage + adopt keeps the counter balanced"
         );
+        // The 0098 session preview is computed from the PLACEHOLDER content
+        // (the appended form), whose `tool_use.input` is already the capped
+        // preview: the placeholder's truncation flags must propagate to the
+        // column, not be recomputed away because the capped input fits the
+        // budget.
+        let col = read_tool_use_column(&store, &agent_id)
+            .await
+            .expect("tool_use column stamped");
+        assert_eq!(col["name"], serde_json::json!("bash"));
+        assert_eq!(
+            col["inputTruncated"],
+            serde_json::json!(true),
+            "placeholder truncation flag survives into the session preview"
+        );
+        assert_eq!(col["inputBytes"], slim0["inputBytes"]);
 
         // Stale reconciliation: a block staged mid-turn but re-patched below
         // the threshold before finalize — the final content carries it inline,

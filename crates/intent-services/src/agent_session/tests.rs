@@ -1832,6 +1832,106 @@ async fn repatched_tool_output_invalidates_prestaged_placeholder() {
     assert_eq!(side_rows, 0, "the stale staged row was reconciled away");
 }
 
+/// A title-only `tool_call_update` arriving AFTER a block's heavy input was
+/// prestaged must not patch `_acpTitle` into the placeholder's preview
+/// (0109): the full input lives only in the staged row (old title), so a
+/// preview-only mutation would make the stored slim content disagree with
+/// what hydration splices back. The placeholder is left untouched — the
+/// persisted column keeps the staging-time preview, and hydration restores
+/// the staged body byte-identical.
+#[tokio::test]
+async fn title_only_update_leaves_prestaged_placeholder_untouched() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let big_in = "i".repeat(64 * 1024);
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "Old title", "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": big_in } }
+        }
+    })
+    .to_string();
+    let completed = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed" }
+        }
+    })
+    .to_string();
+    let title_only = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed", "title": "New title" }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent) = connect_with(vec![tool_call, completed, title_only]);
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    // Hydration restores the staged input byte-identical (staging-time
+    // title), not a preview mutated by the later title-only update.
+    let tool_use = messages[0]
+        .content
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .find(|b| b["type"] == json!("tool_use"))
+        .expect("tool_use persisted");
+    assert_eq!(tool_use["input"]["cmd"], json!(big_in));
+    assert_eq!(tool_use["input"]["_acpTitle"], json!("Old title"));
+    assert!(tool_use.get("inputTruncated").is_none());
+    // The stored placeholder's INPUT was not patched: its `_acpTitle` keeps
+    // the staging-time value, so slim reads agree with the staged body
+    // instead of advertising a title hydration discards. (The block-level
+    // `name` field lives inline in the slim row — not in the staged body —
+    // so the title-only update may refresh it consistently.)
+    let stored: String = sqlx::query_scalar("SELECT content FROM agent_message WHERE id = ?")
+        .bind(&messages[0].id)
+        .fetch_one(services.store.read_pool())
+        .await
+        .expect("stored content");
+    let stored: serde_json::Value = serde_json::from_str(&stored).expect("stored JSON");
+    let placeholder = stored
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .find(|b| b["type"] == json!("tool_use"))
+        .expect("tool_use placeholder");
+    assert_eq!(placeholder["inputTruncated"], json!(true));
+    assert_eq!(
+        placeholder["input"]["_acpTitle"],
+        json!("Old title"),
+        "the placeholder preview must not carry the post-staging title"
+    );
+}
+
 /// A prompt turn that streams a sparse `tool_call` (short title, no input),
 /// then a `tool_call_update` carrying the richer title + input, then a
 /// status-only completing update — the Claude shape that collapsed rows to a
