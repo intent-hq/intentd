@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.31] - 2026-08-31
+
+### 🐛 Bug Fixes
+
+- *(store)* Project workspace.list pr_monitor read, skip snapshot blobs ([#1611](https://github.com/intent-hq/intentd/pull/1611))
+
+### 🧪 Testing
+
+- *(git)* Deflake concurrent_calls_share_one_flight ([#1608](https://github.com/intent-hq/intentd/pull/1608))
+
+
 ## [0.8.30] - 2026-08-31
 
 ### 🚀 Features
