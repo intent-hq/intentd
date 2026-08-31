@@ -14213,6 +14213,92 @@ mod pr {
         assert!(created.pr_url.is_none());
         assert!(created.base_ref.is_none());
     }
+
+    /// A hung forge connection degrades like a lookup error instead of
+    /// stalling the interactive create: the bounded `get_pr` times out, the
+    /// create succeeds, and the linkage from the link itself survives.
+    #[tokio::test]
+    async fn create_with_pr_context_link_hung_forge_times_out() {
+        let (_t, _r, svc) = create_services(StubForge {
+            hang_get_pr: Some(42),
+            ..Default::default()
+        })
+        .await;
+        let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(200));
+        let created = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            svc.create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws hung forge".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("create does not stall on a hung forge")
+        .expect("create succeeds despite the timeout")
+        .workspace;
+        assert_ne!(created.branch, "feature", "no PR-derived branch");
+        assert!(created.base_ref.is_none(), "no PR-derived baseRef");
+        assert_eq!(created.pr_number, Some(42), "linkage from the link itself");
+        assert!(created.pr_status.is_none(), "no snapshot without a lookup");
+    }
+
+    /// A pr-kind link whose owner/repo mismatch the workspace's known
+    /// repository identity is ignored entirely: no forge lookup, no PR
+    /// linkage, no derived branches.
+    #[tokio::test]
+    async fn create_with_cross_repo_pr_context_link_is_ignored() {
+        let (_t, _r, svc) = create_services(StubForge::default()).await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws cross-repo".to_string()),
+                    repository_owner: Some("other".to_string()),
+                    repository_name: Some("elsewhere".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(created.pr_number.is_none(), "cross-repo link is ignored");
+        assert!(created.pr_url.is_none());
+        assert_ne!(created.branch, "feature", "no PR-derived branch");
+        assert!(created.base_ref.is_none(), "no PR-derived baseRef");
+    }
+
+    /// A context-link-only create seeds `repository_owner`/`repository_name`
+    /// from the link so the persisted PR linkage stays functional (the §7.6
+    /// background refresh keys the forge repo off the row's owner/name) —
+    /// including on the degraded forge-failure path.
+    #[tokio::test]
+    async fn create_with_pr_context_link_seeds_repository_identity() {
+        let (_t, _r, svc) = create_services(StubForge {
+            missing_pr: Some(42),
+            ..Default::default()
+        })
+        .await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws repo identity".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(created.repository_owner.as_deref(), Some("o"));
+        assert_eq!(created.repository_name.as_deref(), Some("r"));
+        assert_eq!(created.pr_number, Some(42));
+    }
 }
 
 /// `file-tracking.*` reads + stage/unstage over the M4.7 `tracked_changes` table
