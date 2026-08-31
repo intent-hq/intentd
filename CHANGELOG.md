@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.28] - 2026-08-31
+
+### 🐛 Bug Fixes
+
+- *(store)* Chunked cascade pre-delete for agent session delete ([#1597](https://github.com/intent-hq/intentd/pull/1597))
+
+
 ## [0.8.27] - 2026-08-31
 
 ### 🚀 Features
