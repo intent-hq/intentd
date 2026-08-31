@@ -1093,6 +1093,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         pending_delete_at: None,

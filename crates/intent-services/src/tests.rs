@@ -183,6 +183,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -8833,6 +8834,118 @@ mod change_event_parity {
             ev["data"]["workspace"],
             serde_json::to_value(&created).expect("workspace json")
         );
+    }
+
+    /// `workspace.create` persists a valid `contextLinks` param (§5.1): the
+    /// returned workspace carries it, the row round-trips it through the
+    /// store, and its JSON wire shape matches the documented camelCase +
+    /// lowercase-kind contract.
+    #[tokio::test]
+    async fn workspace_create_persists_context_links() {
+        use intent_core::{ContextLink, ContextLinkKind, WorkspaceCreate};
+        let h = harness().await;
+        let links = vec![ContextLink {
+            kind: ContextLinkKind::Issue,
+            url: "https://github.com/intent-hq/intent/issues/42".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intent".to_string(),
+            number: 42,
+        }];
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Ctx links".to_string()),
+                    context_links: Some(links.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(created.context_links.as_deref(), Some(&links[..]));
+        let row = h.store.get_workspace(&created.id).await.expect("get row");
+        assert_eq!(row.context_links.as_deref(), Some(&links[..]));
+        let v = serde_json::to_value(&row).expect("workspace json");
+        assert_eq!(
+            v["contextLinks"],
+            json!([{
+                "kind": "issue",
+                "url": "https://github.com/intent-hq/intent/issues/42",
+                "owner": "intent-hq",
+                "repo": "intent",
+                "number": 42,
+            }])
+        );
+    }
+
+    /// `workspace.create` `contextLinks` validation (§5.1): empty string
+    /// fields, a zero `number`, or an over-bound list reject `-32602` before
+    /// any state change; an empty list persists as absent (wire omits it).
+    #[tokio::test]
+    async fn workspace_create_context_links_validation() {
+        use intent_core::{ContextLink, ContextLinkKind, WorkspaceCreate};
+        let h = harness().await;
+        let valid = ContextLink {
+            kind: ContextLinkKind::Pr,
+            url: "https://github.com/intent-hq/intentd/pull/7".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intentd".to_string(),
+            number: 7,
+        };
+        let create = |links: Vec<ContextLink>| WorkspaceCreate {
+            title: Some("Ctx invalid".to_string()),
+            context_links: Some(links),
+            ..Default::default()
+        };
+        let cases: Vec<(Vec<ContextLink>, &str)> = vec![
+            (
+                vec![ContextLink {
+                    url: "  ".to_string(),
+                    ..valid.clone()
+                }],
+                "contextLinks[0].url",
+            ),
+            (
+                vec![ContextLink {
+                    owner: String::new(),
+                    ..valid.clone()
+                }],
+                "contextLinks[0].owner",
+            ),
+            (
+                vec![ContextLink {
+                    number: 0,
+                    ..valid.clone()
+                }],
+                "contextLinks[0].number",
+            ),
+            (vec![valid.clone(); 21], "at most 20 entries"),
+        ];
+        for (links, needle) in cases {
+            let err = h
+                .services
+                .create_workspace(create(links), None)
+                .await
+                .expect_err("invalid contextLinks must reject");
+            match err {
+                intent_core::Error::InvalidParams(msg) => {
+                    assert!(msg.contains(needle), "expected `{needle}` in `{msg}`");
+                }
+                other => panic!("expected InvalidParams, got {other:?}"),
+            }
+        }
+        // Empty list: accepted, persisted as absent, omitted from the wire.
+        let created = h
+            .services
+            .create_workspace(create(vec![]), None)
+            .await
+            .expect("empty list accepted")
+            .workspace;
+        assert!(created.context_links.is_none());
+        let v = serde_json::to_value(&created).expect("workspace json");
+        assert!(v.get("contextLinks").is_none(), "wire omits empty list");
     }
 
     /// Mirror-at-creation (spec Diagnosis §3b): `workspace.create` seeds the
@@ -20111,6 +20224,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20256,6 +20370,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20392,6 +20507,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20523,6 +20639,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20653,6 +20770,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20788,6 +20906,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -21663,6 +21782,7 @@ mod known_repo {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             token_usage: None,
