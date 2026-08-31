@@ -2822,8 +2822,22 @@ async fn batch_content_cols_and_payload_rows(
     Ok(out)
 }
 
-/// Insert one message's prepared `agent_message_payload` rows inside the
-/// caller's write transaction (the message row must already exist — FK).
+/// Upsert SQL for one `agent_message_payload` row. `ON CONFLICT DO UPDATE`
+/// (not plain INSERT) so a pre-staged row (0109, intent-hq/intent#3884
+/// part 2) is overwritten rather than a constraint violation: mid-turn
+/// re-staging of a re-patched block, and a finalizing append whose content
+/// still carries a heavy body that was also staged, both land on an existing
+/// key. The 0109 stats UPDATE trigger keeps `conversation_bytes` balanced
+/// across the overwrite. One-shot appends never conflict (fresh message id,
+/// orphans reaped at open), so this is a no-op for them.
+const PAYLOAD_UPSERT_SQL: &str = "INSERT INTO agent_message_payload \
+     (message_id, agent_id, block_ordinal, kind, encoding, body) \
+     VALUES (?,?,?,?,?,?) \
+     ON CONFLICT(message_id, block_ordinal, kind) \
+     DO UPDATE SET encoding = excluded.encoding, body = excluded.body";
+
+/// Insert (upsert, see [`PAYLOAD_UPSERT_SQL`]) one message's prepared
+/// `agent_message_payload` rows inside the caller's write transaction.
 async fn insert_payload_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message_id: &str,
@@ -2831,20 +2845,16 @@ async fn insert_payload_rows(
     rows: &[crate::message_payload::PayloadRow],
 ) -> Result<()> {
     for row in rows {
-        sqlx::query(
-            "INSERT INTO agent_message_payload \
-             (message_id, agent_id, block_ordinal, kind, encoding, body) \
-             VALUES (?,?,?,?,?,?)",
-        )
-        .bind(message_id)
-        .bind(agent_id)
-        .bind(row.block_ordinal)
-        .bind(row.kind)
-        .bind(row.encoding)
-        .bind(&row.body)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| Error::Internal(format!("insert message payload failed: {e}")))?;
+        sqlx::query(PAYLOAD_UPSERT_SQL)
+            .bind(message_id)
+            .bind(agent_id)
+            .bind(row.block_ordinal)
+            .bind(row.kind)
+            .bind(row.encoding)
+            .bind(&row.body)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Error::Internal(format!("insert message payload failed: {e}")))?;
     }
     Ok(())
 }
@@ -3159,6 +3169,142 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         created_at: &str,
     ) -> Result<AgentMessage> {
+        self.append_agent_message_inner(agent_id, id, role, content, metadata, created_at, false)
+            .await
+    }
+
+    /// Stage one completed content block's heavy payload into
+    /// `agent_message_payload` BEFORE the owning `agent_message` envelope row
+    /// exists (0109, intent-hq/intent#3884 part 2) — the envelope lands once,
+    /// at turn end, under the `message_id` minted at turn start, via
+    /// [`Store::append_agent_message_prestaged`], which adopts the staged
+    /// rows. Returns the block's placeholder form (the shared slim-projection
+    /// preview + `*Truncated`/`*Bytes` flags) when a body was staged — the
+    /// caller MUST substitute it at `block_ordinal` in its in-memory content
+    /// so the finalizing append writes only the delta — or `None` when the
+    /// block carries no over-threshold heavy body (nothing staged; keep the
+    /// block as-is). Re-staging the same block (a re-patched tool result)
+    /// upserts the row in place. The `agent_session` row must exist (FK).
+    /// Staged rows are invisible to every read path until the envelope adopts
+    /// them; if the turn never finalizes they are deleted by
+    /// [`Store::delete_prestaged_agent_message_payloads`] (in-process abort)
+    /// or reaped at [`Store::open`] (daemon died mid-turn).
+    ///
+    /// Extraction + compression of a multi-MB body is CPU-bound and runs on a
+    /// blocking thread, mirroring the one-shot append path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if encoding the extracted body or the upsert
+    /// fails (including the 0109 guard trigger, when an envelope with this id
+    /// already exists under a different agent).
+    pub async fn prestage_agent_message_payload(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        block_ordinal: usize,
+        block: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        if !crate::message_payload::block_needs_extraction(block) {
+            return Ok(None);
+        }
+        let owned = block.clone();
+        let ordinal = i64::try_from(block_ordinal).unwrap_or(i64::MAX);
+        let (slim, row) = tokio::task::spawn_blocking(move || {
+            crate::message_payload::extract_block_payload(owned, ordinal)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("payload extraction task failed: {e}")))??;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        sqlx::query(PAYLOAD_UPSERT_SQL)
+            .bind(message_id)
+            .bind(&agent_id.0)
+            .bind(row.block_ordinal)
+            .bind(row.kind)
+            .bind(row.encoding)
+            .bind(&row.body)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("prestage message payload failed: {e}")))?;
+        Ok(Some(slim))
+    }
+
+    /// [`Store::append_agent_message_with_id`] for a turn that pre-staged its
+    /// heavy payloads via [`Store::prestage_agent_message_payload`] (0109,
+    /// intent-hq/intent#3884 part 2). `content` is the turn's final content
+    /// WITH the placeholder blocks returned by the prestage calls substituted
+    /// in: placeholder blocks extract nothing (their rows are already staged
+    /// under `id` and are adopted by the envelope INSERT), so this writes
+    /// only the delta — the slim content column plus any rows not staged
+    /// mid-turn (late heavy blocks, the thumbnails map). Staged rows the
+    /// final content no longer references (a block re-patched below the
+    /// threshold, or removed) are deleted in the same transaction — a stale
+    /// row would otherwise be spliced over the inline field on hydration. A
+    /// placeholder block with no staged row is logged and left as-is (the
+    /// heavy body is unrecoverable; reads serve the stored preview).
+    ///
+    /// The returned [`AgentMessage`] echoes `content` as passed (placeholders
+    /// included); full-fidelity read paths hydrate the staged bodies back,
+    /// byte-identical to a one-shot append of the pre-extraction content.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if allocating the next `seq`, encoding the
+    /// message/metadata, reading the staged rows, or the insert transaction
+    /// fails.
+    pub async fn append_agent_message_prestaged(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        role: &str,
+        content: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+        created_at: &str,
+    ) -> Result<AgentMessage> {
+        self.append_agent_message_inner(agent_id, id, role, content, metadata, created_at, true)
+            .await
+    }
+
+    /// Delete `message_id`'s pre-staged `agent_message_payload` rows after an
+    /// in-process turn failure (the envelope will never be appended). Guarded:
+    /// a no-op returning 0 when the owning `agent_message` row exists — a
+    /// persisted message's payload rows are only removed by its own delete
+    /// cascade. Rows staged by a turn the daemon died in (no chance to call
+    /// this) are reaped at [`Store::open`] instead. Returns the number of
+    /// rows deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_prestaged_agent_message_payloads(&self, message_id: &str) -> Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM agent_message_payload WHERE message_id = ? \
+             AND NOT EXISTS (SELECT 1 FROM agent_message WHERE id = ?)",
+        )
+        .bind(message_id)
+        .bind(message_id)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("delete prestaged payloads failed: {e}")))?
+        .rows_affected())
+    }
+
+    /// Shared body of [`Store::append_agent_message_with_id`] (one-shot) and
+    /// [`Store::append_agent_message_prestaged`] (`prestaged` — adopt rows
+    /// staged mid-turn under `id` and reconcile stale ones).
+    #[allow(clippy::too_many_arguments)]
+    async fn append_agent_message_inner(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        role: &str,
+        content: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+        created_at: &str,
+        prestaged: bool,
+    ) -> Result<AgentMessage> {
         let seq: i64 = sqlx::query(
             "SELECT COALESCE(MAX(seq), -1) + 1 AS next FROM agent_message WHERE agent_id = ?",
         )
@@ -3191,9 +3337,56 @@ impl Store {
         // extraction/compression and thumbnail generation are CPU-bound and
         // run on blocking threads.
         let (content_json, payload_rows) = content_col_and_payload_rows(content).await?;
+        // Prestaged reconciliation (0109): staged rows the final content no
+        // longer references — not a placeholder block's key and not about to
+        // be (re-)inserted — are stale (the block was re-patched below the
+        // threshold or removed) and must go, or hydration would splice the
+        // outdated body over the inline field. A placeholder without its
+        // staged row degrades to the stored preview; WARN (the mid-turn
+        // staging writer is this same agent's serialized turn, so the gap is
+        // a caller bug or a crossed reap, never a race).
+        let stale_keys: Vec<(i64, String)> = if prestaged {
+            let staged: Vec<(i64, String)> = sqlx::query(
+                "SELECT block_ordinal, kind FROM agent_message_payload WHERE message_id = ?",
+            )
+            .bind(id)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("read prestaged payload keys failed: {e}")))?
+            .iter()
+            .map(|r| (r.get("block_ordinal"), r.get("kind")))
+            .collect();
+            let placeholders = crate::message_payload::placeholder_keys(content);
+            for (ordinal, kind) in &placeholders {
+                if !staged.iter().any(|(o, k)| o == ordinal && k == kind)
+                    && !payload_rows
+                        .iter()
+                        .any(|r| r.block_ordinal == *ordinal && &r.kind == kind)
+                {
+                    tracing::warn!(
+                        message_id = id,
+                        block_ordinal = ordinal,
+                        kind,
+                        "placeholder block has no pre-staged payload row; \
+                         reads will serve the stored preview"
+                    );
+                }
+            }
+            staged
+                .into_iter()
+                .filter(|(o, k)| {
+                    !placeholders.iter().any(|(po, pk)| po == o && pk == k)
+                        && !payload_rows
+                            .iter()
+                            .any(|r| r.block_ordinal == *o && r.kind == k)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let sql =
             format!("INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
-        if preview_update.is_none() && payload_rows.is_empty() {
+        if preview_update.is_none() && payload_rows.is_empty() && stale_keys.is_empty() {
             sqlx::query(&sql)
                 .bind(id)
                 .bind(&agent_id.0)
@@ -3234,6 +3427,20 @@ impl Store {
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
                 insert_payload_rows(&mut tx, id, &agent_id.0, &payload_rows).await?;
+                for (ordinal, kind) in &stale_keys {
+                    sqlx::query(
+                        "DELETE FROM agent_message_payload \
+                         WHERE message_id = ? AND block_ordinal = ? AND kind = ?",
+                    )
+                    .bind(id)
+                    .bind(ordinal)
+                    .bind(kind)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("delete stale prestaged payload failed: {e}"))
+                    })?;
+                }
                 if let (Some((_, value)), Some(update_sql)) = (&preview_update, &update_sql) {
                     sqlx::query(update_sql)
                         .bind(value.as_str())
@@ -5079,6 +5286,345 @@ mod tests {
                 .as_str()
                 .is_some_and(|p| corrupt_body.starts_with(p) && p.len() < corrupt_body.len()),
             "corrupt row degrades to the stored slim preview"
+        );
+    }
+
+    /// 0109 prestage + delta append (intent-hq/intent#3884 part 2): heavy
+    /// blocks staged mid-turn are adopted by the finalizing envelope append —
+    /// no duplicate rows, hydration byte-identical to a one-shot append, a
+    /// balanced `conversation_bytes` counter — staged rows the final content
+    /// no longer references are reconciled away, and an in-process abort
+    /// deletes its staged rows (guarded against persisted messages).
+    #[tokio::test]
+    async fn prestaged_payload_append_round_trip_and_reconciliation() {
+        use intent_core::now_iso;
+
+        async fn recount(store: &Store, agent: &AgentId) -> i64 {
+            let content_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(OCTET_LENGTH(content)), 0) FROM agent_message \
+                 WHERE agent_id = ?",
+            )
+            .bind(&agent.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("recount content");
+            let payload_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(OCTET_LENGTH(body)), 0) FROM agent_message_payload \
+                 WHERE agent_id = ?",
+            )
+            .bind(&agent.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("recount payload");
+            content_bytes + payload_bytes
+        }
+        async fn counter(store: &Store, agent: &AgentId) -> i64 {
+            sqlx::query_scalar("SELECT conversation_bytes FROM agent_session WHERE id = ?")
+                .bind(&agent.0)
+                .fetch_one(store.read_pool())
+                .await
+                .expect("counter")
+        }
+        async fn side_count(store: &Store, message_id: &str) -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_payload WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_one(store.read_pool())
+                .await
+                .expect("side count")
+        }
+
+        let tmp = TempDb::new("test-payload-prestage");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-prestage".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-prestage".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        let big_in = format!("inputtoken {}", "x".repeat(8 * 1024));
+        let big_out = format!("outputtoken {}", "y".repeat(8 * 1024));
+        let original = serde_json::json!([
+            { "type": "tool_use", "id": "m1:0", "name": "bash",
+              "input": { "cmd": big_in }, "toolCallId": "t1" },
+            { "type": "tool_result", "toolCallId": "t1", "output": big_out },
+            { "type": "text", "text": "small" },
+        ]);
+        let adopted_id = "msg-prestaged-1";
+
+        // Stage the heavy blocks as they complete mid-turn.
+        let slim0 = store
+            .prestage_agent_message_payload(&agent_id, adopted_id, 0, &original[0])
+            .await
+            .expect("prestage block 0")
+            .expect("heavy tool_use stages");
+        let slim1 = store
+            .prestage_agent_message_payload(&agent_id, adopted_id, 1, &original[1])
+            .await
+            .expect("prestage block 1")
+            .expect("heavy tool_result stages");
+        assert!(
+            store
+                .prestage_agent_message_payload(&agent_id, adopted_id, 2, &original[2])
+                .await
+                .expect("prestage block 2")
+                .is_none(),
+            "under-threshold block stages nothing"
+        );
+        // Re-staging the same block (a re-patched result) upserts in place.
+        store
+            .prestage_agent_message_payload(&agent_id, adopted_id, 1, &original[1])
+            .await
+            .expect("re-prestage block 1")
+            .expect("still stages");
+        assert_eq!(side_count(&store, adopted_id).await, 2);
+        // Staged rows are invisible until the envelope adopts them.
+        assert!(
+            store
+                .get_agent_messages(&agent_id, None)
+                .await
+                .expect("read before finalize")
+                .is_empty(),
+            "no envelope yet — staged rows are invisible"
+        );
+
+        // Finalize: append the envelope with the placeholders substituted in.
+        let final_content = serde_json::json!([slim0, slim1, original[2].clone()]);
+        let msg = store
+            .append_agent_message_prestaged(
+                &agent_id,
+                adopted_id,
+                "assistant",
+                &final_content,
+                None,
+                &ts,
+            )
+            .await
+            .expect("prestaged append");
+        assert_eq!(
+            msg.content, final_content,
+            "append echoes content as passed"
+        );
+        assert_eq!(
+            side_count(&store, adopted_id).await,
+            2,
+            "envelope adopts the staged rows — no duplicates"
+        );
+        // Hydration restores the heavy bodies, byte-identical to a one-shot
+        // append of the pre-extraction content.
+        let read = store
+            .get_agent_message_by_id(&agent_id, adopted_id)
+            .await
+            .expect("by id")
+            .expect("found");
+        assert_eq!(
+            read.content, original,
+            "hydration restores the heavy bodies"
+        );
+        assert_eq!(
+            counter(&store, &agent_id).await,
+            recount(&store, &agent_id).await,
+            "prestage + adopt keeps the counter balanced"
+        );
+        // The 0098 session preview is computed from the PLACEHOLDER content
+        // (the appended form), whose `tool_use.input` is already the capped
+        // preview: the placeholder's truncation flags must propagate to the
+        // column, not be recomputed away because the capped input fits the
+        // budget.
+        let col = read_tool_use_column(&store, &agent_id)
+            .await
+            .expect("tool_use column stamped");
+        assert_eq!(col["name"], serde_json::json!("bash"));
+        assert_eq!(
+            col["inputTruncated"],
+            serde_json::json!(true),
+            "placeholder truncation flag survives into the session preview"
+        );
+        assert_eq!(col["inputBytes"], slim0["inputBytes"]);
+
+        // Stale reconciliation: a block staged mid-turn but re-patched below
+        // the threshold before finalize — the final content carries it inline,
+        // so the staged row is deleted in the finalizing transaction.
+        let repatched_id = "msg-prestaged-2";
+        let heavy2 = serde_json::json!(
+            { "type": "tool_result", "toolCallId": "t2", "output": "z".repeat(9 * 1024) }
+        );
+        store
+            .prestage_agent_message_payload(&agent_id, repatched_id, 0, &heavy2)
+            .await
+            .expect("prestage msg2")
+            .expect("heavy block stages");
+        let repatched = serde_json::json!([
+            { "type": "tool_result", "toolCallId": "t2", "output": "tiny" },
+        ]);
+        store
+            .append_agent_message_prestaged(
+                &agent_id,
+                repatched_id,
+                "assistant",
+                &repatched,
+                None,
+                &ts,
+            )
+            .await
+            .expect("append repatched");
+        assert_eq!(
+            side_count(&store, repatched_id).await,
+            0,
+            "stale staged row reconciled away"
+        );
+        let read2 = store
+            .get_agent_message_by_id(&agent_id, repatched_id)
+            .await
+            .expect("by id")
+            .expect("found");
+        assert_eq!(
+            read2.content, repatched,
+            "inline re-patched block reads as-is"
+        );
+        assert_eq!(
+            counter(&store, &agent_id).await,
+            recount(&store, &agent_id).await,
+            "stale reconciliation keeps the counter balanced"
+        );
+
+        // In-process abort: the envelope will never be appended — the turn
+        // deletes its staged rows.
+        let aborted_id = "msg-prestaged-3";
+        store
+            .prestage_agent_message_payload(&agent_id, aborted_id, 0, &heavy2)
+            .await
+            .expect("prestage msg3")
+            .expect("heavy block stages");
+        assert_eq!(
+            store
+                .delete_prestaged_agent_message_payloads(aborted_id)
+                .await
+                .expect("abort delete"),
+            1
+        );
+        assert_eq!(side_count(&store, aborted_id).await, 0);
+        // Guard: a persisted message's payload rows are untouched.
+        assert_eq!(
+            store
+                .delete_prestaged_agent_message_payloads(adopted_id)
+                .await
+                .expect("guarded delete"),
+            0,
+            "persisted message's rows are only removed by its delete cascade"
+        );
+        assert_eq!(side_count(&store, adopted_id).await, 2);
+        assert_eq!(
+            counter(&store, &agent_id).await,
+            recount(&store, &agent_id).await,
+            "abort delete keeps the counter balanced"
+        );
+    }
+
+    /// Rows pre-staged by a turn the daemon died in (envelope never appended)
+    /// are reaped at the next [`Store::open`]; adopted rows survive and the
+    /// 0109 delete trigger rebalances `conversation_bytes`.
+    #[tokio::test]
+    async fn prestaged_orphans_reaped_at_open() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-payload-reap");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-reap".to_string());
+        let agent_id = AgentId("agent-reap".to_string());
+        let heavy = serde_json::json!(
+            { "type": "tool_result", "toolCallId": "t1", "output": "r".repeat(9 * 1024) }
+        );
+        {
+            let store = Store::open(&tmp).await.expect("create test store");
+            store
+                .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+                .await
+                .expect("insert workspace");
+            store
+                .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+            // Adopted row: staged, then finalized.
+            let slim = store
+                .prestage_agent_message_payload(&agent_id, "msg-survivor", 0, &heavy)
+                .await
+                .expect("prestage survivor")
+                .expect("stages");
+            store
+                .append_agent_message_prestaged(
+                    &agent_id,
+                    "msg-survivor",
+                    "assistant",
+                    &serde_json::json!([slim]),
+                    None,
+                    &ts,
+                )
+                .await
+                .expect("finalize survivor");
+            // Orphan: staged by a turn the daemon then died in.
+            store
+                .prestage_agent_message_payload(&agent_id, "msg-dead-turn", 0, &heavy)
+                .await
+                .expect("prestage orphan")
+                .expect("stages");
+        }
+
+        let store = Store::open(&tmp).await.expect("reopen");
+        let orphan_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_message_payload WHERE message_id = 'msg-dead-turn'",
+        )
+        .fetch_one(store.read_pool())
+        .await
+        .expect("orphan rows");
+        assert_eq!(orphan_rows, 0, "orphaned staged rows reaped at open");
+        let survivor_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_message_payload WHERE message_id = 'msg-survivor'",
+        )
+        .fetch_one(store.read_pool())
+        .await
+        .expect("survivor rows");
+        assert_eq!(survivor_rows, 1, "adopted rows survive the sweep");
+        let hydrated = store
+            .get_agent_message_by_id(&agent_id, "msg-survivor")
+            .await
+            .expect("by id")
+            .expect("found");
+        assert_eq!(
+            hydrated.content,
+            serde_json::json!([heavy]),
+            "survivor hydrates after the sweep"
+        );
+        let counter: i64 =
+            sqlx::query_scalar("SELECT conversation_bytes FROM agent_session WHERE id = ?")
+                .bind(&agent_id.0)
+                .fetch_one(store.read_pool())
+                .await
+                .expect("counter");
+        let content_bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(OCTET_LENGTH(content)), 0) FROM agent_message WHERE agent_id = ?",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("content bytes");
+        let payload_bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(OCTET_LENGTH(body)), 0) FROM agent_message_payload \
+             WHERE agent_id = ?",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("payload bytes");
+        assert_eq!(
+            counter,
+            content_bytes + payload_bytes,
+            "reap's delete trigger rebalances conversation_bytes"
         );
     }
 

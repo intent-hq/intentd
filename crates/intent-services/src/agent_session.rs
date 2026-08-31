@@ -467,10 +467,29 @@ impl Transcript {
                             "input".to_string(),
                             crate::tool_block::attach_acp_title(tc.input.clone(), &title),
                         );
+                        // 0109 (intent-hq/intent#3884 part 2): a replaced
+                        // input invalidates any mid-turn prestage placeholder
+                        // — strip the slim flags so the block re-extracts on
+                        // its next terminal update (or the final append), and
+                        // the prestaged append's reconcile drops the stale
+                        // staged row if the new body stays inline.
+                        obj.remove("inputTruncated");
+                        obj.remove("inputBytes");
                     }
                 } else if !tc.title.is_empty() {
-                    if let Some(obj) = block.get_mut("input").and_then(Value::as_object_mut) {
-                        obj.insert("_acpTitle".to_string(), Value::String(tc.title.clone()));
+                    // 0109: skip the title-only patch when the block carries a
+                    // prestage placeholder (`inputTruncated`) — the full input
+                    // lives ONLY in the staged row (old title), so patching the
+                    // preview would make it disagree with what hydration
+                    // splices back. Keeping the preview untouched keeps slim
+                    // and hydrated reads consistent; the rare post-terminal
+                    // title-only update is carried by the live event, and any
+                    // later input replace above re-attaches the fresh title
+                    // and re-stages.
+                    if block.get("inputTruncated").and_then(Value::as_bool) != Some(true) {
+                        if let Some(obj) = block.get_mut("input").and_then(Value::as_object_mut) {
+                            obj.insert("_acpTitle".to_string(), Value::String(tc.title.clone()));
+                        }
                     }
                 }
                 if let Some(meta) = block.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -520,6 +539,11 @@ impl Transcript {
                     if let Some(obj) = self.blocks[ri].as_object_mut() {
                         obj.insert("output".to_string(), output.clone());
                         obj.insert("is_error".to_string(), Value::Bool(is_error));
+                        // 0109: same placeholder invalidation as the input
+                        // replace above — a re-patched output supersedes any
+                        // prestage placeholder for this block.
+                        obj.remove("outputTruncated");
+                        obj.remove("outputBytes");
                     }
                 } else {
                     self.flush_text();
@@ -1880,9 +1904,14 @@ impl Services {
                 metadata["interruptedBy"] = by.to_json();
             }
         }
+        // Prestaged variant (0109, intent-hq/intent#3884 part 2): a flushed
+        // partial turn can already carry mid-turn placeholder blocks whose
+        // heavy bodies sit staged in `agent_message_payload` under this
+        // message id — adopt those rows (and reconcile stale ones) instead of
+        // treating the placeholders as the full content.
         match self
             .store
-            .append_agent_message_with_id(
+            .append_agent_message_prestaged(
                 agent_id,
                 &live.message_id,
                 "assistant",
@@ -2927,9 +2956,14 @@ impl Services {
             let row_metadata = abnormal_finish_reason
                 .as_ref()
                 .map(|reason| json!({ "finishReason": reason }));
-            let message = self
+            // Prestaged variant (0109, intent-hq/intent#3884 part 2): heavy
+            // tool bodies were staged mid-turn as their calls completed and
+            // sit in the transcript as placeholders — the append adopts those
+            // rows (reconciling any stale ones) so the turn-end write carries
+            // only the delta, not the heavy bytes again.
+            let append = self
                 .store
-                .append_agent_message_with_id(
+                .append_agent_message_prestaged(
                     agent_id,
                     &message_id,
                     "assistant",
@@ -2937,7 +2971,31 @@ impl Services {
                     row_metadata.as_ref(),
                     &now_iso(),
                 )
-                .await?;
+                .await;
+            let message = match append {
+                Ok(message) => message,
+                Err(e) => {
+                    // The envelope will never be appended (the live guard
+                    // clears the slot on this exit): reap the turn's staged
+                    // rows now instead of leaving orphans until the next
+                    // `Store::open` sweep. Guarded server-side — a no-op when
+                    // a racing teardown flush already persisted the envelope
+                    // under this id (its append adopted the rows).
+                    if let Err(del) = self
+                        .store
+                        .delete_prestaged_agent_message_payloads(&message_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            message_id = %message_id,
+                            error = %del,
+                            "failed to reap prestaged payloads after append failure (#3884)"
+                        );
+                    }
+                    return Err(e);
+                }
+            };
             trace_stream_lifecycle(
                 Some(message_id.as_str()),
                 "message",
@@ -3395,6 +3453,13 @@ impl Services {
             flush_pending: false,
             flush_failed: false,
         };
+        // A failed flush deliberately does NOT reap the turn's mid-turn
+        // staged rows (unlike the turn-end/wake failure arms): this path does
+        // not own the slot, so a `None` here can coexist with a concurrent
+        // teardown whose pinned retry flush is still entitled to adopt them —
+        // reaping would delete the only copy of the heavy bodies out from
+        // under it. Truly orphaned rows are bounded and reaped by the
+        // `Store::open` sweep.
         let interrupted_message_id = self
             .flush_partial_turn_on_interruption(
                 agent_id,
@@ -3608,9 +3673,12 @@ impl Services {
         let empty_response = harness_wake_response_is_empty(&blocks);
         let mut message_persisted = false;
         if !blocks.is_empty() {
+            // Prestaged variant (0109, intent-hq/intent#3884 part 2): wake
+            // turns route through the same `route_notification` prestage as
+            // prompt turns, so the append adopts any mid-turn staged rows.
             match self
                 .store
-                .append_agent_message_with_id(
+                .append_agent_message_prestaged(
                     agent_id,
                     &message_id,
                     "assistant",
@@ -3638,6 +3706,21 @@ impl Services {
                 }
                 Err(e) => {
                     tracing::warn!(agent = %agent_id, error = %e, "harness-wake turn persist failed");
+                    // The envelope will never be appended: reap this turn's
+                    // staged rows (guarded server-side — no-op if a racing
+                    // flush persisted the envelope under this id).
+                    if let Err(del) = self
+                        .store
+                        .delete_prestaged_agent_message_payloads(&message_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            message_id = %message_id,
+                            error = %del,
+                            "failed to reap prestaged payloads after wake-turn persist failure (#3884)"
+                        );
+                    }
                 }
             }
         } else if !updates_applied {
@@ -4220,6 +4303,46 @@ impl Services {
         }
     }
 
+    /// Mid-turn heavy-payload prestage (0109, intent-hq/intent#3884 part 2):
+    /// stage each listed transcript block's over-threshold body into
+    /// `agent_message_payload` under the live turn's message id and substitute
+    /// the returned slim placeholder in place, so the end-of-turn
+    /// [`Store::append_agent_message_prestaged`] adopts the rows instead of
+    /// re-writing the heavy bytes. Under-threshold (or already-placeholder)
+    /// blocks stage nothing and stay untouched. Fail-soft: a staging error
+    /// leaves the full block inline — the one-shot extraction inside the
+    /// final append still externalizes it — so a mid-turn store hiccup never
+    /// fails the turn.
+    async fn prestage_completed_tool_blocks(
+        &self,
+        agent_id: &AgentId,
+        transcript: &mut Transcript,
+        ordinals: impl IntoIterator<Item = usize>,
+    ) {
+        for ordinal in ordinals {
+            let Some(block) = transcript.blocks.get(ordinal) else {
+                continue;
+            };
+            match self
+                .store
+                .prestage_agent_message_payload(agent_id, &transcript.message_id, ordinal, block)
+                .await
+            {
+                Ok(Some(placeholder)) => transcript.blocks[ordinal] = placeholder,
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        message_id = %transcript.message_id,
+                        block_ordinal = ordinal,
+                        error = %e,
+                        "mid-turn payload prestage failed — leaving block inline (#3884)"
+                    );
+                }
+            }
+        }
+    }
+
     /// Map one `session/update` notification and publish/accumulate its
     /// effects. Returns whether the notification mapped to a turn update
     /// (`true` even when a dropped tool update published no event) — the
@@ -4426,6 +4549,35 @@ impl Services {
                 }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_TOOL_CALL, data)
                     .await;
+                // Mid-turn heavy-payload prestage (0109, intent-hq/intent#3884
+                // part 2): a terminal status means this call's blocks are
+                // final — stage any over-threshold `tool_use.input` /
+                // `tool_result.output` body into `agent_message_payload` NOW
+                // (under the turn's minted message id) and substitute the
+                // returned placeholder in the transcript, so the end-of-turn
+                // append writes only the remaining delta. The live event
+                // above already carried the full content. A re-patched block
+                // (record_tool stripped its slim flags) re-stages here —
+                // upsert in place. Runs AFTER the event publish so staging
+                // latency never delays the live stream.
+                if tc.status == "completed" || tc.status == "error" {
+                    // Sync the live-turn slot FIRST: the staging await below
+                    // is a suspension point, and an interruption that pins the
+                    // slot mid-await must flush a snapshot that already
+                    // carries this update (inline heavy body — the prestaged
+                    // append's reconcile then drops any newly staged row as
+                    // stale and extracts one-shot), never a pre-update
+                    // snapshot adopted under fresher staged rows.
+                    self.update_live_turn(agent_id, transcript);
+                    self.prestage_completed_tool_blocks(
+                        agent_id,
+                        transcript,
+                        [Some(block_index), recorded.result_index]
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .await;
+                }
                 // External activity signal (§7): tool calls keep the liveness
                 // tick (and the pushed preview) alive through tool-heavy
                 // stretches where no assistant text streams — otherwise a

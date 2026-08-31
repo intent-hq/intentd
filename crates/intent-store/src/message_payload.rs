@@ -99,18 +99,27 @@ fn kind_target(kind: &str) -> Option<(&'static str, HeavyField)> {
 /// exactly (already-flagged blocks pass through), so `true` here means
 /// [`extract_payloads`] will produce at least one row.
 pub(crate) fn needs_extraction(content: &Value) -> bool {
-    content.as_array().is_some_and(|blocks| {
-        blocks.iter().any(|b| {
-            let Some(f) = b.get("type").and_then(Value::as_str).and_then(heavy_field) else {
-                return false;
-            };
-            if b.get(f.truncated_flag).and_then(Value::as_bool) == Some(true) {
-                return false;
-            }
-            b.get(f.field)
-                .is_some_and(|v| slim_body_size(v) > PAYLOAD_INLINE_MAX_BYTES)
-        })
-    })
+    content
+        .as_array()
+        .is_some_and(|blocks| blocks.iter().any(block_needs_extraction))
+}
+
+/// [`needs_extraction`] for a single content block: `true` iff
+/// [`extract_block_payload`] would produce a row for it.
+pub(crate) fn block_needs_extraction(block: &Value) -> bool {
+    let Some(f) = block
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(heavy_field)
+    else {
+        return false;
+    };
+    if block.get(f.truncated_flag).and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    block
+        .get(f.field)
+        .is_some_and(|v| slim_body_size(v) > PAYLOAD_INLINE_MAX_BYTES)
 }
 
 /// Split `content` into its slim inline form plus the extracted side-table
@@ -130,35 +139,88 @@ pub(crate) fn extract_payloads(mut content: Value) -> Result<(Value, Vec<Payload
     let mut rows = Vec::new();
     if let Some(blocks) = content.as_array_mut() {
         for (ordinal, block) in blocks.iter_mut().enumerate() {
-            let Some(f) = block
-                .get("type")
-                .and_then(Value::as_str)
-                .and_then(heavy_field)
-            else {
-                continue;
-            };
-            let Some(body) = slim_heavy_body(
-                block,
-                f.field,
-                f.truncated_flag,
-                f.bytes_flag,
-                PAYLOAD_INLINE_MAX_BYTES,
-            ) else {
-                continue;
-            };
-            let json = serde_json::to_vec(&body).map_err(|e| {
-                Error::Internal(format!("encode extracted payload body failed: {e}"))
-            })?;
-            let (encoding, stored) = encode_body(&json);
-            rows.push(PayloadRow {
-                block_ordinal: i64::try_from(ordinal).unwrap_or(i64::MAX),
-                kind: f.kind,
-                encoding,
-                body: stored,
-            });
+            let (slim, row) = extract_block_payload(
+                std::mem::take(block),
+                i64::try_from(ordinal).unwrap_or(i64::MAX),
+            )?;
+            *block = slim;
+            if let Some(row) = row {
+                rows.push(row);
+            }
         }
     }
     Ok((content, rows))
+}
+
+/// [`extract_payloads`] for one content block: returns the block back —
+/// slimmed to its placeholder form when its heavy field crossed the
+/// threshold, untouched otherwise — plus the extracted side-table row keyed
+/// at `block_ordinal` (`None` when nothing was externalized). This is the
+/// unit the mid-turn prestage path stages block-by-block as blocks complete
+/// (intent-hq/intent#3884 part 2); the whole-message path above delegates
+/// here so both produce byte-identical placeholders and rows.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if serializing the extracted body fails.
+pub(crate) fn extract_block_payload(
+    mut block: Value,
+    block_ordinal: i64,
+) -> Result<(Value, Option<PayloadRow>)> {
+    let Some(f) = block
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(heavy_field)
+    else {
+        return Ok((block, None));
+    };
+    let Some(body) = slim_heavy_body(
+        &mut block,
+        f.field,
+        f.truncated_flag,
+        f.bytes_flag,
+        PAYLOAD_INLINE_MAX_BYTES,
+    ) else {
+        return Ok((block, None));
+    };
+    let json = serde_json::to_vec(&body)
+        .map_err(|e| Error::Internal(format!("encode extracted payload body failed: {e}")))?;
+    let (encoding, stored) = encode_body(&json);
+    Ok((
+        block,
+        Some(PayloadRow {
+            block_ordinal,
+            kind: f.kind,
+            encoding,
+            body: stored,
+        }),
+    ))
+}
+
+/// The `(block_ordinal, kind)` side-table keys `content`'s placeholder
+/// blocks reference: every block already carrying its `*Truncated` flag,
+/// i.e. whose heavy body lives (or is expected to live) in
+/// `agent_message_payload` rather than inline. The prestaged append path
+/// uses these to reconcile staged rows against the final content — a staged
+/// row not referenced by a placeholder (and not re-inserted) is stale and
+/// must be deleted, or hydration would splice an outdated body over the
+/// inline field.
+pub(crate) fn placeholder_keys(content: &Value) -> Vec<(i64, &'static str)> {
+    let Some(blocks) = content.as_array() else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            let f = b
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(heavy_field)?;
+            (b.get(f.truncated_flag).and_then(Value::as_bool) == Some(true))
+                .then(|| (i64::try_from(i).unwrap_or(i64::MAX), f.kind))
+        })
+        .collect()
 }
 
 /// Compress `json` with zlib when that is smaller; otherwise store raw.
@@ -338,5 +400,56 @@ mod tests {
             {"type": "tool_result", "toolCallId": "t1", "output": null},
         ]);
         assert!(!needs_extraction(&content));
+    }
+
+    #[test]
+    fn block_extraction_matches_whole_message_extraction() {
+        let heavy = json!({"type": "tool_use", "id": "t1", "name": "bash",
+            "input": {"cmd": big_string()}});
+        let small = json!({"type": "text", "text": "hi"});
+        assert!(block_needs_extraction(&heavy));
+        assert!(!block_needs_extraction(&small));
+
+        let (slim_small, row) = extract_block_payload(small.clone(), 3).unwrap();
+        assert!(row.is_none());
+        assert_eq!(slim_small, small);
+
+        // The single-block path at ordinal 5 produces the same placeholder
+        // and body as the whole-message path (which sees the block at 0).
+        let (slim_block, row) = extract_block_payload(heavy.clone(), 5).unwrap();
+        let row = row.unwrap();
+        assert_eq!(row.block_ordinal, 5);
+        assert_eq!(row.kind, KIND_TOOL_USE_INPUT);
+        let (whole_slim, whole_rows) = extract_payloads(json!([heavy.clone()])).unwrap();
+        assert_eq!(slim_block, whole_slim[0]);
+        assert_eq!(row.encoding, whole_rows[0].encoding);
+        assert_eq!(row.body, whole_rows[0].body);
+
+        // A block already slimmed to its placeholder form re-extracts as a
+        // no-op (idempotent), and hydration restores the original exactly.
+        let (again, no_row) = extract_block_payload(slim_block.clone(), 5).unwrap();
+        assert!(no_row.is_none());
+        assert_eq!(again, slim_block);
+        let mut content = json!([slim_block]);
+        let body = decode_body(row.encoding, &row.body).unwrap();
+        splice_payload(&mut content, 0, row.kind, body);
+        assert_eq!(content[0], heavy);
+    }
+
+    #[test]
+    fn placeholder_keys_lists_flagged_blocks_only() {
+        let content = json!([
+            {"type": "tool_use", "id": "t1", "name": "bash",
+             "input": {"cmd": "preview"}, "inputTruncated": true, "inputBytes": 99999},
+            {"type": "text", "text": "between"},
+            {"type": "tool_result", "toolCallId": "t1", "output": "inline"},
+            {"type": "tool_result", "toolCallId": "t2", "output": "preview",
+             "outputTruncated": true, "outputBytes": 88888},
+        ]);
+        assert_eq!(
+            placeholder_keys(&content),
+            vec![(0, KIND_TOOL_USE_INPUT), (3, KIND_TOOL_RESULT_OUTPUT)]
+        );
+        assert!(placeholder_keys(&json!("bare string")).is_empty());
     }
 }
