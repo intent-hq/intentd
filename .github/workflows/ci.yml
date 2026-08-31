@@ -135,6 +135,17 @@ jobs:
               // runners (currently none — the degraded mode keeps
               // bursting). An empty list still routes to burst by design
               // (never deadlock on an invisible fleet).
+              // NOTE: the org list is NOT scoped to the runner groups this
+              // repo can access, so the probe assumes every online
+              // self-hosted+Linux+X64 org runner is the tinybox fleet in a
+              // group visible to this repo. Ops invariant: keep the fleet's
+              // group visible to the CI repos, and never register
+              // generically-labeled org runners outside it — a matching but
+              // inaccessible runner would route jobs onto labels nothing
+              // can serve. (Group-scoped listing via the runner-groups API
+              // was considered and rejected: it needs extra calls per group
+              // and fails on plans without runner-group support, which
+              // would silently regress the probe to always-burst.)
               let runners;
               let runnerSource = "org";
               try {
