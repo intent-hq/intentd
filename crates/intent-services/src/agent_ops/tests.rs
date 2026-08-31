@@ -67,6 +67,11 @@ pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::Se
         .apply(&[
             ("providers.active".into(), json!("auggie")),
             ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
+            // The report-debounce default (10s) would park progress wakes on
+            // the parent's queue for the whole window; the suites assert the
+            // legacy immediate-wake shape, so disable it here. Debounce tests
+            // opt back in with an explicit non-zero value.
+            ("agents.reportToParentDebounceSeconds".into(), json!(0)),
         ])
         .expect("seed default provider");
     registry
@@ -9538,6 +9543,210 @@ async fn report_to_parent_progress_keeps_watch_armed_until_terminal_wake() {
     .await;
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
     assert!(svc.find_watches_for_child(&child).is_empty());
+}
+
+/// With a non-zero `agents.reportToParentDebounceSeconds`, a progress report
+/// parks the wake as a held entry on the parent's queue instead of delivering
+/// it, and a repeat report from the same child upserts that entry in place.
+#[tokio::test]
+async fn report_to_parent_debounce_parks_wake_as_held_entry() {
+    let (_t, svc, ws) = setup().await;
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("agents.reportToParentDebounceSeconds".into(), json!(60))])
+        .expect("set debounce");
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("first update"), Some(child.clone()))
+        .await
+        .expect("report");
+    // No immediate wake: the entry is parked (held) on the parent's queue.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline);
+    assert!(!svc.has_ready_to_send(&parent), "held entry never drains");
+    let snapshot = svc.queue_snapshot(&parent);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(
+        snapshot[0]["holdKind"],
+        json!(crate::agent_ops::REPORT_DEBOUNCE_HOLD_KIND)
+    );
+    assert_eq!(snapshot[0]["childAgentId"], json!(child.0));
+    let entry_id = snapshot[0]["id"].as_str().expect("entry id").to_string();
+    assert!(
+        snapshot[0]["content"]
+            .as_str()
+            .expect("content")
+            .contains("Report: first update"),
+        "held wake carries the report text: {}",
+        snapshot[0]["content"]
+    );
+
+    // A repeat report upserts the same entry (same id, refreshed content) —
+    // no duplicate held wakes accumulate.
+    svc.agent_report_to_parent_op(ws.clone(), json!("second update"), Some(child.clone()))
+        .await
+        .expect("second report");
+    let snapshot = svc.queue_snapshot(&parent);
+    assert_eq!(snapshot.len(), 1, "upsert keeps a single held entry");
+    assert_eq!(snapshot[0]["id"], json!(entry_id));
+    assert!(snapshot[0]["content"]
+        .as_str()
+        .expect("content")
+        .contains("Report: second update"));
+    // The watch stays armed for the terminal completion throughout.
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+}
+
+/// Settlement inside the debounce window supersedes the parked report wake:
+/// the held entry is retracted and its `agent:reportToParent` event is folded
+/// into the single terminal wake's metadata — the parent gets exactly ONE
+/// wake carrying both facts.
+#[tokio::test]
+async fn report_to_parent_debounce_settlement_retracts_and_combines() {
+    let (_t, svc, ws) = setup().await;
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("agents.reportToParentDebounceSeconds".into(), json!(60))])
+        .expect("set debounce");
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    let report = "shipped it";
+    svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(svc.queue_snapshot(&parent).len(), 1, "wake parked");
+
+    // Terminal idle inside the window: ONE wake, held entry gone.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "report": report }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert!(
+        svc.queue_snapshot(&parent).is_empty(),
+        "held report wake retracted at settlement"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // The terminal wake's metadata folds in the held report's event: the
+    // report event first (it happened first), then the terminal idle.
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let wake = session.messages.last().expect("terminal wake");
+    let wake_text = serde_json::to_string(&wake.content).expect("serialize content");
+    assert!(
+        wake_text.contains(&format!("Report: {report}")),
+        "terminal wake text carries the persisted report: {wake_text}"
+    );
+    let metadata = wake.metadata.as_ref().expect("wake metadata");
+    assert_eq!(metadata["watchStillArmed"], json!(false));
+    let events = metadata["events"].as_array().expect("events array");
+    assert_eq!(metadata["eventCount"], json!(events.len()));
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["type"].as_str().expect("event type"))
+        .collect();
+    assert!(
+        types.contains(&"agent:reportToParent"),
+        "combined metadata carries the report event: {types:?}"
+    );
+    assert!(
+        types.contains(&AGENT_IDLE),
+        "combined metadata carries the terminal event: {types:?}"
+    );
+    assert_eq!(
+        types[0], "agent:reportToParent",
+        "report event ordered before the terminal event"
+    );
+    let event_types = metadata["eventTypes"].as_array().expect("eventTypes");
+    assert!(event_types.contains(&json!("agent:reportToParent")));
+    assert!(event_types.contains(&json!(AGENT_IDLE)));
+}
+
+/// A quiet child: the debounce window expires with no settlement, the hold
+/// timer flushes the parked wake, and it delivers as a normal progress wake.
+#[tokio::test]
+async fn report_to_parent_debounce_expiry_flushes_wake() {
+    let (_t, svc, ws) = setup().await;
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("agents.reportToParentDebounceSeconds".into(), json!(1))])
+        .expect("set debounce");
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("slow burn"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert!(!svc.has_ready_to_send(&parent), "parked during the window");
+
+    // The 1s hold expires; the release timer clears the hold marker so the
+    // entry becomes a normal ready-to-send wake.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = svc.queue_snapshot(&parent);
+        assert_eq!(snapshot.len(), 1, "parked wake stays queued: {snapshot:?}");
+        if snapshot[0]["holdKind"].is_null() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "debounce expiry did not flush the parked wake"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let drained = svc.dequeue_message(&parent).expect("flushed wake drains");
+    assert!(drained.hold_kind.is_none(), "flush cleared the marker");
+    assert!(
+        drained.content.contains("Report: slow burn"),
+        "flushed wake carries the report: {}",
+        drained.content
+    );
+    // The completion watch is untouched — the terminal settlement still owns
+    // the final wake.
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 }
 
 #[tokio::test]
@@ -26293,13 +26502,23 @@ async fn retract_removes_held_entry() {
         .await;
     assert_eq!(persisted_queue(&svc, &id).await.len(), 1);
 
-    assert!(svc.retract_held_message(&id, "child-1", "debounce").await);
+    let retracted = svc
+        .retract_held_message(&id, "child-1", "debounce")
+        .await
+        .expect("held entry retracts");
+    assert_eq!(retracted.content, "to retract");
     assert!(svc.queue_snapshot(&id).is_empty());
     assert!(persisted_queue(&svc, &id).await.is_empty());
 
-    // Second retract (and a retract on a never-held key) reports false.
-    assert!(!svc.retract_held_message(&id, "child-1", "debounce").await);
-    assert!(!svc.retract_held_message(&id, "child-2", "debounce").await);
+    // Second retract (and a retract on a never-held key) reports None.
+    assert!(svc
+        .retract_held_message(&id, "child-1", "debounce")
+        .await
+        .is_none());
+    assert!(svc
+        .retract_held_message(&id, "child-2", "debounce")
+        .await
+        .is_none());
 }
 
 /// Restart semantics: an EXPIRED hold flushes on rehydration (entry becomes

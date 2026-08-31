@@ -926,6 +926,11 @@ pub(crate) struct QueuedMessage {
     pub child_agent_id: Option<String>,
 }
 
+/// `hold_kind` for a debounced `agent.reportToParent` progress wake parked on
+/// the parent's queue (spec Design §2): flushed as-is when the window expires,
+/// retracted and folded into the terminal wake when the child settles first.
+pub(crate) const REPORT_DEBOUNCE_HOLD_KIND: &str = "report-debounce";
+
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
     /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
@@ -7185,11 +7190,16 @@ impl Services {
     /// parity; P3-1.2b) — emitting `agent:updated` — and, when the caller has a
     /// linked task note whose current status is non-terminal, the note is
     /// transitioned to `review_required` (TASK-B, mirroring the reference
-    /// `reportToParent` writer). No immediate parent wake is issued (SUB-2):
-    /// the child's `agent:idle` (via the still-armed completion watch)
-    /// delivers the single wake, whose formatted text/metadata includes the
-    /// persisted `completionReport`. `after_all` grouping path is unchanged —
-    /// the group's aggregated wake still folds this child's report in.
+    /// `reportToParent` writer). For non-grouped children a progress wake is
+    /// issued to the parent, gated by `agents.reportToParentDebounceSeconds`:
+    /// zero delivers it immediately; a non-zero window parks it as a held
+    /// queue entry that either flushes at expiry or is retracted and folded
+    /// into the terminal wake when the child settles first (spec Design
+    /// §2/§4). The report never consumes the completion watch — the child's
+    /// `agent:idle` still delivers the terminal wake, whose formatted
+    /// text/metadata includes the persisted `completionReport`. `after_all`
+    /// grouping path is unchanged — the group's aggregated wake still folds
+    /// this child's report in.
     pub(crate) async fn agent_report_to_parent_op(
         &self,
         workspace_id: WorkspaceId,
@@ -7248,21 +7258,12 @@ impl Services {
                 .await;
         }
 
-        // Immediate progress wake for non-grouped children. A report does not
+        // Progress wake for non-grouped children. A report does not
         // consume a terminal completion watch: idle/failure/deletion still owns
         // the final wake and durable one-shot retirement. Grouped reports remain
         // deferred to the single after_all aggregate.
         let grouped = self.child_in_undelivered_group(&parent, &caller);
         if !grouped {
-            // Deliver the wake in the parent's HOME workspace: for a
-            // cross-workspace (chief) parent this differs from the child's;
-            // fall back to the child's workspace when the parent session
-            // cannot be resolved (matches the pre-lift behavior).
-            let parent_home_ws = self
-                .store
-                .get_agent_session(&parent)
-                .await
-                .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
             let watches = self.find_watches_for_child(&caller);
             let watch_still_armed = watches
                 .iter()
@@ -7306,17 +7307,52 @@ impl Services {
             if watch_still_armed {
                 metadata["watchStillArmed"] = json!(true);
             }
-            // Deliver the wake to the parent unconditionally (even if no watch exists).
-            if let Err(e) = self
-                .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    parent = %parent.0,
-                    child = %caller.0,
-                    "failed to deliver reportToParent progress wake to parent"
-                );
+            // Debounce (spec Design §2/§6): with a non-zero
+            // `agents.reportToParentDebounceSeconds` (read live from the
+            // settings snapshot) the wake is PARKED as a held entry on the
+            // parent's durable queue instead of delivered now — the per-entry
+            // timer flushes it at `holdUntil`, and a child settlement inside
+            // the window retracts it and folds its event into the single
+            // terminal wake (`deliver_completion_to_watches`). A repeat
+            // report from the same child upserts the held entry in place and
+            // resets `holdUntil`. Zero disables the debounce entirely:
+            // immediate wake, identical to the legacy behavior.
+            let debounce_secs =
+                crate::settings::report_to_parent_debounce_seconds(&self.effective_settings());
+            if debounce_secs > 0 {
+                let hold_until = intent_core::iso_ms_from_now(u64::from(debounce_secs) * 1000);
+                self.enqueue_held_message(
+                    &parent,
+                    wake_text,
+                    Some(metadata),
+                    REPORT_DEBOUNCE_HOLD_KIND,
+                    &hold_until,
+                    &caller.0,
+                )
+                .await;
+            } else {
+                // Deliver the wake in the parent's HOME workspace: for a
+                // cross-workspace (chief) parent this differs from the child's;
+                // fall back to the child's workspace when the parent session
+                // cannot be resolved (matches the pre-lift behavior).
+                let parent_home_ws = self
+                    .store
+                    .get_agent_session(&parent)
+                    .await
+                    .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
+                // Deliver the wake to the parent unconditionally (even if no
+                // watch exists).
+                if let Err(e) = self
+                    .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        parent = %parent.0,
+                        child = %caller.0,
+                        "failed to deliver reportToParent progress wake to parent"
+                    );
+                }
             }
         }
 
@@ -12352,9 +12388,6 @@ impl Services {
     /// already exists, its content/metadata/deadline are replaced in place
     /// (same entry id, same queue position) and the timer is re-armed —
     /// repeated debounce extensions never accumulate duplicate entries.
-    // Unit-tested now; the debounced child-completion wake path is the
-    // production caller and lands with its own task.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn enqueue_held_message(
         &self,
         agent_id: &AgentId,
@@ -12453,15 +12486,15 @@ impl Services {
 
     /// Retract (remove) the held entry keyed by `(child_agent_id, hold_kind)`
     /// without delivering it, cancelling its release timer and persisting the
-    /// shrunken queue. Returns `true` iff a held entry existed for the key —
-    /// `false` when the hold already flushed, was released, or never existed.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// shrunken queue. Returns the removed entry when one existed for the key
+    /// (so the caller can fold its metadata into a combined wake) — `None`
+    /// when the hold already flushed, was released, or never existed.
     pub(crate) async fn retract_held_message(
         &self,
         agent_id: &AgentId,
         child_agent_id: &str,
         hold_kind: &str,
-    ) -> bool {
+    ) -> Option<QueuedMessage> {
         let removed = {
             let mut guard = self
                 .agent_queues
@@ -12477,12 +12510,10 @@ impl Services {
                     .map(|idx| queue.remove(idx))
             })
         };
-        let Some(entry) = removed else {
-            return false;
-        };
+        let entry = removed?;
         self.cancel_hold_release_timer(&entry.id);
         self.publish_queue_updated(agent_id).await;
-        true
+        Some(entry)
     }
 
     /// Arm (or re-arm) the per-entry release timer for a held queue entry: a
@@ -12536,13 +12567,27 @@ impl Services {
     /// Timer-expiry flush for a held entry: clear its hold marker so it
     /// becomes ready-to-send, persist/publish the updated queue, and kick
     /// delivery. Idempotent — an entry already released, retracted, or
-    /// missing leaves the queue untouched (no publish, no kick).
+    /// missing leaves the queue untouched (no publish, no kick). An entry
+    /// whose hold deadline sits clearly in the FUTURE is not flushed either:
+    /// a stale timer (already fired, waiting on the lock) can race a
+    /// same-key upsert that extended `hold_until` and re-armed a fresh timer
+    /// — the extended deadline must win, so the stale fire re-arms for the
+    /// remaining time instead (harmless duplicate of the fresh timer;
+    /// arming replaces any previous handle for the entry). A small grace
+    /// margin absorbs timer/clock rounding so an on-time fire always
+    /// flushes.
     async fn flush_expired_hold(&self, agent_id: &AgentId, message_id: &str) {
+        const EXPIRY_GRACE_MS: i128 = 250;
+        enum Disposition {
+            Cleared,
+            Rearm(String),
+            Gone,
+        }
         self.hold_release_timers
             .lock()
             .expect("hold timer registry poisoned")
             .remove(message_id);
-        let cleared = {
+        let disposition = {
             let mut guard = self
                 .agent_queues
                 .lock()
@@ -12554,17 +12599,34 @@ impl Services {
                         .iter_mut()
                         .find(|m| m.id == message_id && m.hold_kind.is_some())
                 })
-                .map(|m| {
-                    m.hold_kind = None;
-                    m.hold_until = None;
+                .map_or(Disposition::Gone, |m| {
+                    let remaining_ms = m
+                        .hold_until
+                        .as_deref()
+                        .and_then(parse_iso)
+                        .map(|t| (t - time::OffsetDateTime::now_utc()).whole_milliseconds());
+                    match (remaining_ms, &m.hold_until) {
+                        (Some(ms), Some(until)) if ms > EXPIRY_GRACE_MS => {
+                            Disposition::Rearm(until.clone())
+                        }
+                        _ => {
+                            m.hold_kind = None;
+                            m.hold_until = None;
+                            Disposition::Cleared
+                        }
+                    }
                 })
-                .is_some()
         };
-        if !cleared {
-            return;
+        match disposition {
+            Disposition::Gone => {}
+            Disposition::Rearm(until) => {
+                self.arm_hold_release_timer(agent_id, message_id, &until);
+            }
+            Disposition::Cleared => {
+                self.publish_queue_updated(agent_id).await;
+                self.kick_queue_drain(agent_id).await;
+            }
         }
-        self.publish_queue_updated(agent_id).await;
-        self.kick_queue_drain(agent_id).await;
     }
 
     /// Kick the runtime drain for an agent (hold release/flush path): look up

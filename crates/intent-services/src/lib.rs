@@ -6146,6 +6146,26 @@ impl Services {
                 format_completion_wake(child_id, event, stall.as_ref(), true, child_of_recipient);
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
+            // Debounce combine (spec Design §4): a pending held report wake
+            // toward this parent is superseded by the terminal settlement —
+            // retract it (cancelling its release timer) and fold its
+            // `agent:reportToParent` event into THIS wake's metadata, so the
+            // parent gets exactly ONE wake carrying both facts. The wake text
+            // already renders the persisted report. Covers idle, failure, and
+            // deletion settlements alike, including boot reconciliation
+            // replaying a settlement from downtime. A `None` retraction means
+            // no hold was pending (flushed, released, or never held) — the
+            // legacy single-wake shape.
+            if let Some(held) = self
+                .retract_held_message(
+                    &watch.parent_agent_id,
+                    &child_id.0,
+                    crate::agent_ops::REPORT_DEBOUNCE_HOLD_KIND,
+                )
+                .await
+            {
+                merge_held_report_metadata(&mut metadata, held.message_metadata.as_ref());
+            }
             // Join the child's recorded flipped completions (consumed at
             // this first stamp) into the trigger set alongside its own
             // linked task — a genuine `agent:idle` completion only; failure
@@ -7462,6 +7482,45 @@ fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
         }
     }
     metadata
+}
+
+/// Fold a retracted held report wake's metadata into a terminal wake's
+/// event-notification metadata (spec Design §4): the held entry's
+/// `agent:reportToParent` event rows are PREPENDED to the terminal metadata's
+/// `events` (the report happened first), `eventTypes` gains
+/// `agent:reportToParent` ahead of the terminal type, and `eventCount` is
+/// recomputed. A held entry without usable metadata (missing, or no `events`
+/// array) leaves the terminal metadata untouched — the wake text already
+/// carries the persisted report, so nothing is lost.
+fn merge_held_report_metadata(
+    metadata: &mut serde_json::Value,
+    held_metadata: Option<&serde_json::Value>,
+) {
+    let Some(held_events) = held_metadata
+        .and_then(|m| m.get("events"))
+        .and_then(|e| e.as_array())
+        .filter(|e| !e.is_empty())
+    else {
+        return;
+    };
+    let Some(obj) = metadata.as_object_mut() else {
+        return;
+    };
+    let mut events = held_events.clone();
+    if let Some(existing) = obj.get("events").and_then(|e| e.as_array()) {
+        events.extend(existing.iter().cloned());
+    }
+    let mut event_types: Vec<String> = Vec::new();
+    for e in &events {
+        if let Some(t) = e.get("type").and_then(|t| t.as_str()) {
+            if !event_types.iter().any(|s| s == t) {
+                event_types.push(t.to_string());
+            }
+        }
+    }
+    obj.insert("eventCount".to_string(), serde_json::json!(events.len()));
+    obj.insert("eventTypes".to_string(), serde_json::json!(event_types));
+    obj.insert("events".to_string(), serde_json::Value::Array(events));
 }
 
 /// Fetch a note scoped to `workspace_id`; `NotFound` if absent. Note identity
