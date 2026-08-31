@@ -15195,6 +15195,65 @@ impl WorkspaceApi for Services {
                             input.repository_name = Some(name);
                         }
                     }
+                    // PR-aware create (§5.1): a pr-kind contextLink links the
+                    // workspace to its PR from birth — `pr_number`/`pr_url`
+                    // seed from the link itself (so linkage survives a failed
+                    // forge lookup), and a successful forge lookup fills the
+                    // blanks the caller left: `branch` defaults to the PR
+                    // head branch (checked out as the EXISTING branch — no
+                    // slug generation, no uniquification; the git layer
+                    // materializes remote-only branches at the remote tip)
+                    // and `baseRef` to the PR base branch, so ahead/behind
+                    // and diffs reflect the merge target. Explicit `branch`/
+                    // `baseRef` params always win. Lookup failure is
+                    // non-fatal: the create proceeds without the PR-derived
+                    // git setup.
+                    let pr_link = input.context_links.as_deref().and_then(|links| {
+                        links
+                            .iter()
+                            .find(|l| l.kind == intent_core::ContextLinkKind::Pr)
+                            .cloned()
+                    });
+                    let mut linked_pr: Option<intent_sourcecontrol::PullRequest> = None;
+                    if let Some(link) = pr_link.as_ref() {
+                        match pr_ops::resolve_source_control(services.source_control.clone())
+                            .await
+                        {
+                            Ok(sc) => {
+                                let repo = intent_sourcecontrol::RepoRef::new(
+                                    link.owner.clone(),
+                                    link.repo.clone(),
+                                );
+                                match sc.get_pr(&repo, link.number).await {
+                                    Ok(pr) => {
+                                        if input.branch.as_deref().is_none_or(str::is_empty) {
+                                            input.branch = Some(pr.source_branch.clone());
+                                        }
+                                        if input.base_ref.as_deref().is_none_or(str::is_empty) {
+                                            input.base_ref = Some(pr.target_branch.clone());
+                                        }
+                                        linked_pr = Some(pr);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            owner = %link.owner,
+                                            repo = %link.repo,
+                                            pr = link.number,
+                                            error = %e,
+                                            "workspace.create: PR contextLink forge lookup failed; creating without PR-derived git setup"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    pr = link.number,
+                                    error = %e,
+                                    "workspace.create: no source-control provider for PR contextLink; creating without PR-derived git setup"
+                                );
+                            }
+                        }
+                    }
                     // Branch naming (TS parity): an explicit `branch` wins
                     // untouched; otherwise the branch is a friendly slug —
                     // extracted from `initialAgent.prompt` when possible
@@ -15312,11 +15371,17 @@ impl WorkspaceApi for Services {
                         setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
-                        pr_number: None,
-                        pr_url: None,
-                        pr_status: None,
-                        active_pull_request: None,
-                        pull_requests: None,
+                        // PR linkage from a pr-kind contextLink: number/url
+                        // come from the link itself (kept even when the forge
+                        // lookup failed); status + snapshot only from a
+                        // successful lookup.
+                        pr_number: pr_link.as_ref().map(|l| l.number),
+                        pr_url: pr_link.as_ref().map(|l| l.url.clone()),
+                        pr_status: linked_pr.as_ref().map(pr_ops::derive_pr_status),
+                        active_pull_request: linked_pr.as_ref().map(pr_ops::build_pr_info),
+                        pull_requests: linked_pr
+                            .as_ref()
+                            .map(|pr| vec![pr_ops::build_pr_info(pr)]),
                         // Validated pre-insert above; an empty list persists
                         // as absent so the wire shape omits it (§5.1).
                         context_links: input.context_links.filter(|l| !l.is_empty()),
