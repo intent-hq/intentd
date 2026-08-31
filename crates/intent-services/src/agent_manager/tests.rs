@@ -10970,6 +10970,9 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         prepend_file_blocks: None,
         interrupt_priority: false,
         user_origin: false,
+        hold_kind: None,
+        hold_until: None,
+        child_agent_id: None,
     };
     let batch = vec![entry("head", true), entry("tail", false)];
 
@@ -13885,6 +13888,9 @@ mod stale_redrive_tests {
             prepend_file_blocks: None,
             interrupt_priority: false,
             user_origin: false,
+            hold_kind: None,
+            hold_until: None,
+            child_agent_id: None,
         }
     }
 
@@ -14322,6 +14328,9 @@ mod dequeue_wait_tests {
             prepend_file_blocks: None,
             interrupt_priority: false,
             user_origin: false,
+            hold_kind: None,
+            hold_until: None,
+            child_agent_id: None,
         }
     }
 
@@ -17755,6 +17764,9 @@ mod flush_queued_messages_tests {
             prepend_file_blocks: None,
             interrupt_priority: false,
             user_origin: false,
+            hold_kind: None,
+            hold_until: None,
+            child_agent_id: None,
         }
     }
 

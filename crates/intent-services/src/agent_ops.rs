@@ -906,6 +906,24 @@ pub(crate) struct QueuedMessage {
     /// survives daemon restarts.
     #[serde(default)]
     pub user_origin: bool,
+    /// Debounce-hold marker: `Some` marks the entry **held** — excluded from
+    /// the ready-to-send queue (like `editing`) until `hold_until` passes or
+    /// the hold is released/retracted via the `(agent, child_agent_id,
+    /// hold_kind)` key. Persisted so holds survive daemon restarts
+    /// ([`Services::rehydrate_agent_queues`] re-arms the release timers).
+    #[serde(default)]
+    pub hold_kind: Option<String>,
+    /// RFC-3339 deadline at which the hold expires: the per-entry release
+    /// timer ([`Services::arm_hold_release_timer`]) flushes the hold at this
+    /// time and kicks delivery. A held entry with a missing or unparseable
+    /// deadline counts as already expired (fail open) so corrupt data can
+    /// never strand a message.
+    #[serde(default)]
+    pub hold_until: Option<String>,
+    /// Child agent whose activity this held entry debounces; together with
+    /// `hold_kind` it forms the release/retract key.
+    #[serde(default)]
+    pub child_agent_id: Option<String>,
 }
 
 impl QueuedMessage {
@@ -950,7 +968,36 @@ impl QueuedMessage {
         if self.interrupt_priority {
             v["interruptPriority"] = Value::Bool(true);
         }
+        if let Some(kind) = &self.hold_kind {
+            v["holdKind"] = Value::String(kind.clone());
+        }
+        if let Some(until) = &self.hold_until {
+            v["holdUntil"] = Value::String(until.clone());
+        }
+        if let Some(child) = &self.child_agent_id {
+            v["childAgentId"] = Value::String(child.clone());
+        }
         v
+    }
+
+    /// `true` while the entry carries an **unexpired** hold marker: excluded
+    /// from the ready-to-send queue until `hold_until` passes or the hold is
+    /// released/retracted. A hold with a missing or unparseable `hold_until`
+    /// counts as expired (fail open) so corrupt data can never strand a
+    /// message.
+    pub(crate) fn is_held(&self) -> bool {
+        self.hold_kind.is_some()
+            && self
+                .hold_until
+                .as_deref()
+                .and_then(parse_iso)
+                .is_some_and(|t| t > time::OffsetDateTime::now_utc())
+    }
+
+    /// The ready-to-send predicate shared by every drain path and idle gate
+    /// (PROTOCOL §5.5/§6.5): not under edit and not held.
+    pub(crate) fn ready_to_send(&self) -> bool {
+        !self.editing && !self.is_held()
     }
 }
 
@@ -12280,6 +12327,9 @@ impl Services {
             prepend_file_blocks: prepend.file_blocks,
             interrupt_priority: interrupt,
             user_origin,
+            hold_kind: None,
+            hold_until: None,
+            child_agent_id: None,
         };
         let position = if interrupt {
             // Behind earlier interrupts, ahead of every normal entry.
@@ -12291,6 +12341,248 @@ impl Services {
             queue.len() - 1
         };
         (queued, position)
+    }
+
+    /// Enqueue (or refresh) a **held** entry on an agent's queue: the entry
+    /// carries a `(hold_kind, hold_until, child_agent_id)` debounce-hold
+    /// marker, is excluded from every drain path until released, persists
+    /// through the write-through snapshot, and gets a per-entry release timer
+    /// that flushes the hold at `hold_until` and kicks delivery. Upsert by
+    /// `(child_agent_id, hold_kind)`: when a held entry for the same key
+    /// already exists, its content/metadata/deadline are replaced in place
+    /// (same entry id, same queue position) and the timer is re-armed —
+    /// repeated debounce extensions never accumulate duplicate entries.
+    // Unit-tested now; the debounced child-completion wake path is the
+    // production caller and lands with its own task.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn enqueue_held_message(
+        &self,
+        agent_id: &AgentId,
+        content: String,
+        message_metadata: Option<Value>,
+        hold_kind: &str,
+        hold_until: &str,
+        child_agent_id: &str,
+    ) -> (QueuedMessage, usize) {
+        let (queued, position) = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let queue = guard.entry(agent_id.clone()).or_default();
+            let existing = queue.iter_mut().enumerate().find(|(_, m)| {
+                m.hold_kind.as_deref() == Some(hold_kind)
+                    && m.child_agent_id.as_deref() == Some(child_agent_id)
+            });
+            if let Some((position, entry)) = existing {
+                entry.content = content;
+                entry.message_metadata = message_metadata;
+                entry.hold_until = Some(hold_until.to_string());
+                entry.queued_at = now_iso();
+                (entry.clone(), position)
+            } else {
+                let id = new_message_id();
+                let queued = QueuedMessage {
+                    turn_id: id.clone(),
+                    id,
+                    content,
+                    image_blocks: None,
+                    file_blocks: None,
+                    queued_at: now_iso(),
+                    editing: false,
+                    persisted: false,
+                    requeued_after_failure: false,
+                    message_metadata,
+                    prepend_content: None,
+                    prepend_image_blocks: None,
+                    prepend_file_blocks: None,
+                    interrupt_priority: false,
+                    user_origin: false,
+                    hold_kind: Some(hold_kind.to_string()),
+                    hold_until: Some(hold_until.to_string()),
+                    child_agent_id: Some(child_agent_id.to_string()),
+                };
+                queue.push(queued.clone());
+                (queued, queue.len() - 1)
+            }
+        };
+        self.arm_hold_release_timer(agent_id, &queued.id, hold_until);
+        self.publish_queue_updated(agent_id).await;
+        (queued, position)
+    }
+
+    /// Release the held entry keyed by `(child_agent_id, hold_kind)`: clear
+    /// its hold marker so it becomes ready-to-send, cancel its release timer,
+    /// persist/publish the updated queue, and kick delivery (wakes an idle
+    /// agent; a busy agent picks the entry up at its next drain). Returns
+    /// `true` iff a held entry existed for the key.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn release_held_message(
+        &self,
+        agent_id: &AgentId,
+        child_agent_id: &str,
+        hold_kind: &str,
+    ) -> bool {
+        let released = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            guard.get_mut(agent_id).and_then(|queue| {
+                queue
+                    .iter_mut()
+                    .find(|m| {
+                        m.hold_kind.as_deref() == Some(hold_kind)
+                            && m.child_agent_id.as_deref() == Some(child_agent_id)
+                    })
+                    .map(|m| {
+                        m.hold_kind = None;
+                        m.hold_until = None;
+                        m.id.clone()
+                    })
+            })
+        };
+        let Some(message_id) = released else {
+            return false;
+        };
+        self.cancel_hold_release_timer(&message_id);
+        self.publish_queue_updated(agent_id).await;
+        self.kick_queue_drain(agent_id).await;
+        true
+    }
+
+    /// Retract (remove) the held entry keyed by `(child_agent_id, hold_kind)`
+    /// without delivering it, cancelling its release timer and persisting the
+    /// shrunken queue. Returns `true` iff a held entry existed for the key —
+    /// `false` when the hold already flushed, was released, or never existed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn retract_held_message(
+        &self,
+        agent_id: &AgentId,
+        child_agent_id: &str,
+        hold_kind: &str,
+    ) -> bool {
+        let removed = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            guard.get_mut(agent_id).and_then(|queue| {
+                queue
+                    .iter()
+                    .position(|m| {
+                        m.hold_kind.as_deref() == Some(hold_kind)
+                            && m.child_agent_id.as_deref() == Some(child_agent_id)
+                    })
+                    .map(|idx| queue.remove(idx))
+            })
+        };
+        let Some(entry) = removed else {
+            return false;
+        };
+        self.cancel_hold_release_timer(&entry.id);
+        self.publish_queue_updated(agent_id).await;
+        true
+    }
+
+    /// Arm (or re-arm) the per-entry release timer for a held queue entry: a
+    /// spawned sleeper that fires at `hold_until` and flushes the hold via
+    /// [`Services::flush_expired_hold`]. A missing/unparseable/past deadline
+    /// fires immediately (fail open — a hold must never strand a message).
+    /// Re-arming replaces (aborts) any previous timer for the same entry id,
+    /// so debounce extensions keep exactly one live sleeper per entry.
+    pub(crate) fn arm_hold_release_timer(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        hold_until: &str,
+    ) {
+        let delay_ms = parse_iso(hold_until).map_or(0, |t| {
+            let remaining = t - time::OffsetDateTime::now_utc();
+            u64::try_from(remaining.whole_milliseconds()).unwrap_or(0)
+        });
+        let services = self.clone();
+        let agent = agent_id.clone();
+        let mid = message_id.to_string();
+        let task = tokio::spawn(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            services.flush_expired_hold(&agent, &mid).await;
+        });
+        let previous = self
+            .hold_release_timers
+            .lock()
+            .expect("hold timer registry poisoned")
+            .insert(message_id.to_string(), task.abort_handle());
+        if let Some(old) = previous {
+            old.abort();
+        }
+    }
+
+    /// Abort and forget the release timer for a held entry (release/retract
+    /// path). A missing entry is a no-op — the timer may already have fired.
+    fn cancel_hold_release_timer(&self, message_id: &str) {
+        let removed = self
+            .hold_release_timers
+            .lock()
+            .expect("hold timer registry poisoned")
+            .remove(message_id);
+        if let Some(handle) = removed {
+            handle.abort();
+        }
+    }
+
+    /// Timer-expiry flush for a held entry: clear its hold marker so it
+    /// becomes ready-to-send, persist/publish the updated queue, and kick
+    /// delivery. Idempotent — an entry already released, retracted, or
+    /// missing leaves the queue untouched (no publish, no kick).
+    async fn flush_expired_hold(&self, agent_id: &AgentId, message_id: &str) {
+        self.hold_release_timers
+            .lock()
+            .expect("hold timer registry poisoned")
+            .remove(message_id);
+        let cleared = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            guard
+                .get_mut(agent_id)
+                .and_then(|queue| {
+                    queue
+                        .iter_mut()
+                        .find(|m| m.id == message_id && m.hold_kind.is_some())
+                })
+                .map(|m| {
+                    m.hold_kind = None;
+                    m.hold_until = None;
+                })
+                .is_some()
+        };
+        if !cleared {
+            return;
+        }
+        self.publish_queue_updated(agent_id).await;
+        self.kick_queue_drain(agent_id).await;
+    }
+
+    /// Kick the runtime drain for an agent (hold release/flush path): look up
+    /// the owning workspace and defer to the manager's `try_drain_queue` —
+    /// which no-ops when the agent is busy (the released entry then rides the
+    /// normal end-of-turn drain) and starts a turn when idle. Quiet no-op
+    /// when no manager is attached (read-only/test wiring) or the session row
+    /// is gone.
+    async fn kick_queue_drain(&self, agent_id: &AgentId) {
+        let Some(manager) = self.agent_manager() else {
+            return;
+        };
+        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+            return;
+        };
+        manager
+            .try_drain_queue(agent_id.clone(), session.workspace_id)
+            .await;
     }
 
     /// Move an already-enqueued entry to position 0 (the head of the queue,
@@ -12329,16 +12621,17 @@ impl Services {
 
     /// Pop the oldest **ready-to-send** queued message for an agent, if any. Used
     /// by the runtime turn loop to flip a queued message to in-flight when the
-    /// current turn ends. Entries with `editing = true` are skipped (left in
-    /// place) so the agent stays idle only when *every* remaining entry is under
-    /// edit (PROTOCOL §5.5/§6.5 invariant).
+    /// current turn ends. Entries with `editing = true` — and entries under an
+    /// unexpired debounce hold — are skipped (left in place) so the agent stays
+    /// idle only when *every* remaining entry is under edit or held
+    /// (PROTOCOL §5.5/§6.5 invariant).
     pub(crate) fn dequeue_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        let idx = queue.iter().position(|m| !m.editing)?;
+        let idx = queue.iter().position(QueuedMessage::ready_to_send)?;
         Some(queue.remove(idx))
     }
 
@@ -12354,7 +12647,9 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        let idx = queue.iter().position(|m| !m.editing && m.user_origin)?;
+        let idx = queue
+            .iter()
+            .position(|m| m.ready_to_send() && m.user_origin)?;
         Some(queue.remove(idx))
     }
 
@@ -12384,7 +12679,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        let ready = |m: &QueuedMessage| !m.editing;
+        let ready = QueuedMessage::ready_to_send;
         if require_user_origin && !queue.iter().any(|m| ready(m) && m.user_origin) {
             return None;
         }
@@ -12423,7 +12718,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        let eligible = |m: &QueuedMessage| !m.editing && !m.user_origin;
+        let eligible = |m: &QueuedMessage| m.ready_to_send() && !m.user_origin;
         if queue.iter().filter(|m| eligible(m)).count() < min_ready {
             return None;
         }
@@ -12534,15 +12829,16 @@ impl Services {
     }
 
     /// `true` iff the agent has at least one queued message that is **not**
-    /// under edit (i.e. the "ready-to-send" queue is non-empty). Drives the
-    /// self-drain trigger and gates `agent:idle` emission so the agent never
-    /// reports idle while ready-to-send work remains (PROTOCOL §5.5/§6.5).
+    /// under edit and **not** under an unexpired debounce hold (i.e. the
+    /// "ready-to-send" queue is non-empty). Drives the self-drain trigger and
+    /// gates `agent:idle` emission so the agent never reports idle while
+    /// ready-to-send work remains (PROTOCOL §5.5/§6.5).
     pub(crate) fn has_ready_to_send(&self, agent_id: &AgentId) -> bool {
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .is_some_and(|q| q.iter().any(|m| !m.editing))
+            .is_some_and(|q| q.iter().any(QueuedMessage::ready_to_send))
     }
 
     /// `true` iff at least one ready-to-send queued entry is user-origin
@@ -12553,7 +12849,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .is_some_and(|q| q.iter().any(|m| !m.editing && m.user_origin))
+            .is_some_and(|q| q.iter().any(|m| m.ready_to_send() && m.user_origin))
     }
 
     /// `true` iff at least one ready-to-send user-origin entry was queued at
@@ -12576,7 +12872,7 @@ impl Services {
             .get(agent_id)
             .is_some_and(|q| {
                 q.iter().any(|m| {
-                    !m.editing
+                    m.ready_to_send()
                         && m.user_origin
                         && parse_iso(&m.queued_at).is_some_and(|t| t >= cutoff)
                 })
@@ -12594,7 +12890,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get(agent_id)?;
-        let entry = queue.iter().find(|m| !m.editing)?;
+        let entry = queue.iter().find(|m| m.ready_to_send())?;
         (!entry.turn_id.is_empty()).then(|| entry.turn_id.clone())
     }
 
@@ -12710,7 +13006,12 @@ impl Services {
     /// client's hold is gone; `persisted` / `requeuedAfterFailure` flags are
     /// preserved so a later drain does not double-append transcript rows
     /// (STAB-112/STAB-52). Rehydration never kicks `try_drain_queue`: messages
-    /// sit until an explicit kick (resume, sendMessage, queueMessage, retry).
+    /// sit until an explicit kick (resume, sendMessage, queueMessage, retry) —
+    /// with ONE exception: entries carrying a debounce-hold marker get their
+    /// release timer re-armed for the remaining time, and holds whose
+    /// `holdUntil` already passed while the daemon was down are flushed
+    /// immediately (the flush clears the marker, persists, and kicks
+    /// delivery).
     /// Legacy payloads without a `turnId` (pre-monorepo#1022) rehydrate with
     /// `turn_id = id` so every in-memory entry carries a correlation id.
     /// Returns the number of messages actually inserted into the in-memory
@@ -12746,15 +13047,34 @@ impl Services {
             }
         }
         let mut count = 0;
-        let mut guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        for (agent_id, queue) in map {
-            if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(agent_id) {
-                count += queue.len();
-                entry.insert(queue);
+        let mut held: Vec<(AgentId, String, String)> = Vec::new();
+        {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            for (agent_id, queue) in map {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    guard.entry(agent_id.clone())
+                {
+                    count += queue.len();
+                    for m in &queue {
+                        if m.hold_kind.is_some() {
+                            held.push((
+                                agent_id.clone(),
+                                m.id.clone(),
+                                m.hold_until.clone().unwrap_or_default(),
+                            ));
+                        }
+                    }
+                    entry.insert(queue);
+                }
             }
+        }
+        // Re-arm outside the queue lock: an expired hold's timer fires
+        // immediately and the flush relocks the registry.
+        for (agent_id, message_id, hold_until) in held {
+            self.arm_hold_release_timer(&agent_id, &message_id, &hold_until);
         }
         Ok(count)
     }

@@ -10768,6 +10768,9 @@ async fn publish_error_status_and_requeue(
         prepend_file_blocks: options.prepend_file_blocks.clone(),
         interrupt_priority: options.interrupt_priority,
         user_origin: options.origin.is_user(),
+        hold_kind: None,
+        hold_until: None,
+        child_agent_id: None,
     };
     mgr.services.requeue_front(agent_id, queued);
 

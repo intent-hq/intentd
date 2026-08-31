@@ -25478,6 +25478,9 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         prepend_file_blocks: None,
         interrupt_priority: false,
         user_origin: false,
+        hold_kind: None,
+        hold_until: None,
+        child_agent_id: None,
     };
 
     svc.requeue_front(&id, queued);
@@ -26030,6 +26033,9 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
             prepend_file_blocks: None,
             interrupt_priority: false,
             user_origin: false,
+            hold_kind: None,
+            hold_until: None,
+            child_agent_id: None,
         },
     );
     svc.publish_queue_updated(&id).await;
@@ -26177,6 +26183,194 @@ async fn rehydrate_preserves_live_map() {
     assert_eq!(queue[0]["content"], "live");
 }
 
+// ── Debounce-hold queue entries ─────────────────────────────────────────────
+
+/// A held entry is excluded from every ready-to-send surface (drain, idle
+/// gate, peek) while its `holdUntil` is in the future, yet stays visible in
+/// the queue snapshot with the hold marker on the wire — and a repeat enqueue
+/// for the same `(child, kind)` key upserts in place instead of duplicating.
+#[tokio::test]
+async fn held_entry_excluded_from_drain_until_release() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Held").await;
+
+    let far = intent_core::iso_ms_from_now(60_000);
+    let (queued, position) = svc
+        .enqueue_held_message(
+            &id,
+            "child update".into(),
+            None,
+            "debounce",
+            &far,
+            "child-1",
+        )
+        .await;
+    assert_eq!(position, 0);
+    assert!(queued.is_held());
+    assert!(
+        !svc.has_ready_to_send(&id),
+        "held entry is not ready-to-send"
+    );
+    assert!(svc.dequeue_message(&id).is_none(), "drain skips held entry");
+    assert!(svc.peek_ready_turn_id(&id).is_none());
+
+    // Snapshot still carries the entry, with the hold marker on the wire.
+    let snapshot = svc.queue_snapshot(&id);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0]["holdKind"], "debounce");
+    assert_eq!(snapshot[0]["holdUntil"], json!(far));
+    assert_eq!(snapshot[0]["childAgentId"], "child-1");
+
+    // Same-key re-enqueue upserts in place (same id, refreshed content).
+    let farther = intent_core::iso_ms_from_now(120_000);
+    let (updated, _) = svc
+        .enqueue_held_message(
+            &id,
+            "newer update".into(),
+            None,
+            "debounce",
+            &farther,
+            "child-1",
+        )
+        .await;
+    assert_eq!(updated.id, queued.id, "upsert keeps the entry id");
+    assert_eq!(svc.queue_snapshot(&id).len(), 1, "no duplicate entry");
+
+    // The hold marker survives the write-through snapshot.
+    let rows = persisted_queue(&svc, &id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["holdKind"], "debounce");
+    assert_eq!(rows[0]["holdUntil"], json!(farther));
+    assert_eq!(rows[0]["childAgentId"], "child-1");
+
+    // Manual release clears the marker and makes the entry deliverable.
+    assert!(svc.release_held_message(&id, "child-1", "debounce").await);
+    assert!(svc.has_ready_to_send(&id));
+    let drained = svc.dequeue_message(&id).expect("released entry drains");
+    assert_eq!(drained.id, queued.id);
+    assert_eq!(drained.content, "newer update");
+    assert!(drained.hold_kind.is_none(), "release cleared the marker");
+
+    // Release with no matching held entry reports false.
+    assert!(!svc.release_held_message(&id, "child-1", "debounce").await);
+}
+
+/// The per-entry release timer flushes the hold at `holdUntil`: the entry
+/// becomes ready-to-send without any manual release call.
+#[tokio::test]
+async fn hold_timer_flush_makes_entry_ready() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "TimerFlush").await;
+
+    let soon = intent_core::iso_ms_from_now(150);
+    svc.enqueue_held_message(&id, "debounced".into(), None, "debounce", &soon, "child-1")
+        .await;
+    assert!(!svc.has_ready_to_send(&id), "held before the deadline");
+
+    // Wait past the deadline for the spawned timer to flush the hold.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !svc.has_ready_to_send(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timer flush did not release the hold in time"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let drained = svc.dequeue_message(&id).expect("flushed entry drains");
+    assert!(drained.hold_kind.is_none(), "flush cleared the marker");
+    assert_eq!(drained.content, "debounced");
+}
+
+/// Retract removes a held entry without delivering it and reports whether one
+/// existed; the retracted entry's timer never resurrects it.
+#[tokio::test]
+async fn retract_removes_held_entry() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Retract").await;
+
+    let far = intent_core::iso_ms_from_now(60_000);
+    svc.enqueue_held_message(&id, "to retract".into(), None, "debounce", &far, "child-1")
+        .await;
+    assert_eq!(persisted_queue(&svc, &id).await.len(), 1);
+
+    assert!(svc.retract_held_message(&id, "child-1", "debounce").await);
+    assert!(svc.queue_snapshot(&id).is_empty());
+    assert!(persisted_queue(&svc, &id).await.is_empty());
+
+    // Second retract (and a retract on a never-held key) reports false.
+    assert!(!svc.retract_held_message(&id, "child-1", "debounce").await);
+    assert!(!svc.retract_held_message(&id, "child-2", "debounce").await);
+}
+
+/// Restart semantics: an EXPIRED hold flushes on rehydration (entry becomes
+/// ready-to-send), while an UNEXPIRED hold stays held with its re-armed timer
+/// carrying the remaining time.
+#[tokio::test]
+async fn rehydrate_flushes_expired_and_rearms_unexpired_holds() {
+    let (tmp, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "HoldRestart").await;
+
+    // Seed one expired and one far-future hold, persisted the way a
+    // pre-shutdown daemon would have left them.
+    let expired = intent_core::iso_ms_from_now(0);
+    svc.enqueue_held_message(
+        &id,
+        "expired hold".into(),
+        None,
+        "debounce",
+        &expired,
+        "child-1",
+    )
+    .await;
+    let far = intent_core::iso_ms_from_now(60_000);
+    svc.enqueue_held_message(
+        &id,
+        "unexpired hold".into(),
+        None,
+        "debounce",
+        &far,
+        "child-2",
+    )
+    .await;
+    assert_eq!(persisted_queue(&svc, &id).await.len(), 2);
+
+    // Fresh Services over the same store = a daemon restart.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
+    assert_eq!(rehydrated, 2);
+
+    // The expired hold's re-armed timer fires immediately and flushes it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !restarted.has_ready_to_send(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expired hold was not flushed after rehydration"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let drained = restarted.dequeue_message(&id).expect("expired hold drains");
+    assert_eq!(drained.content, "expired hold");
+    assert!(drained.hold_kind.is_none(), "flush cleared the marker");
+
+    // The unexpired hold is still held (excluded from drain), marker intact.
+    assert!(!restarted.has_ready_to_send(&id));
+    assert!(restarted.dequeue_message(&id).is_none());
+    let snapshot = restarted.queue_snapshot(&id);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0]["content"], "unexpired hold");
+    assert_eq!(snapshot[0]["holdKind"], "debounce");
+    assert_eq!(snapshot[0]["childAgentId"], "child-2");
+
+    // ...and its re-armed timer is live: releasing manually still works.
+    assert!(
+        restarted
+            .release_held_message(&id, "child-2", "debounce")
+            .await
+    );
+    assert!(restarted.has_ready_to_send(&id));
+}
+
 // ── Poisoned-session queue migration + GC (monorepo#847) ───────────────────
 
 /// Build a parked queue entry with every flag/field set, so the migration's
@@ -26198,6 +26392,9 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         prepend_file_blocks: None,
         interrupt_priority: false,
         user_origin: false,
+        hold_kind: None,
+        hold_until: None,
+        child_agent_id: None,
     }
 }
 

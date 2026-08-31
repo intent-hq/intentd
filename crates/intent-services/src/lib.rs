@@ -267,6 +267,12 @@ pub struct Services {
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Per-entry debounce-hold release timers, keyed by queue-entry id: each
+    /// held [`agent_ops::QueuedMessage`] gets a spawned sleeper that flushes
+    /// the hold marker at `holdUntil` and kicks delivery. Release/retract
+    /// aborts the entry's timer; rehydration re-arms timers for surviving
+    /// holds. Shared across clones so the abort reaches the live task.
+    hold_release_timers: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Per-agent ordering for pending-question marker writes plus their events.
     pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks,
     /// Test-only deterministic park before a selected marker mutation.
@@ -925,6 +931,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
