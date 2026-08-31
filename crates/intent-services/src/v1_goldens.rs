@@ -120,6 +120,9 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
         .apply(&[
             ("providers.active".into(), json!("auggie")),
             ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
+            // Goldens assert the legacy immediate report wake — disable the
+            // default 10s report debounce.
+            ("agents.reportToParentDebounceSeconds".into(), json!(0)),
         ])
         .expect("seed default provider");
     let services = Services::new(store).with_settings_registry(registry);

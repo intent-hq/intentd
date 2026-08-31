@@ -1849,6 +1849,23 @@ async fn in_turn_progress_is_followed_by_terminal_wake_over_wss() {
     let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
     let ws_id = setup.ws_id.clone();
 
+    // This scenario audits the IMMEDIATE in-turn progress wake — disable the
+    // report debounce (default 10s), which would otherwise park the wake and
+    // fold it into the terminal wake.
+    let upd = wss_rpc(
+        &mut setup.rpc,
+        9,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "agents.reportToParentDebounceSeconds", "value": 0 }
+        ] }),
+    )
+    .await;
+    assert_eq!(
+        upd["applied"][0]["path"], "agents.reportToParentDebounceSeconds",
+        "debounce disabled: {upd}"
+    );
+
     // Parent spawns the child through the bridge: parent linkage makes
     // reportToParent legal and arms the auto parent→child watch.
     let parent = create_agent(&mut setup.rpc, 10, &ws_id, "DedupParent").await;
@@ -1995,6 +2012,23 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
     .to_string();
     let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
     let ws_id = setup.ws_id.clone();
+
+    // The scenario audits the immediate report wake on the spawner — disable
+    // the report debounce (default 10s) so the wake lands as soon as the
+    // child reports.
+    let upd = wss_rpc(
+        &mut setup.rpc,
+        9,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "agents.reportToParentDebounceSeconds", "value": 0 }
+        ] }),
+    )
+    .await;
+    assert_eq!(
+        upd["applied"][0]["path"], "agents.reportToParentDebounceSeconds",
+        "debounce disabled: {upd}"
+    );
 
     // The spawner is the child's parent (reportToParent target); the WATCHER
     // is a separate fresh agent whose NEW registration is the gap under test.
@@ -2263,6 +2297,23 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
     .to_string();
     let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
     let ws_id = setup.ws_id.clone();
+
+    // This scenario audits the IMMEDIATE per-report wake shape — disable the
+    // report debounce (default 10s), which would otherwise park the wakes on
+    // the parent's queue and fold them into the terminal wake.
+    let upd = wss_rpc(
+        &mut setup.rpc,
+        9,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "agents.reportToParentDebounceSeconds", "value": 0 }
+        ] }),
+    )
+    .await;
+    assert_eq!(
+        upd["applied"][0]["path"], "agents.reportToParentDebounceSeconds",
+        "debounce disabled: {upd}"
+    );
 
     // The parent spawns the child through the bridge (parent linkage makes
     // reportToParent legal and arms the auto parent→child watch).

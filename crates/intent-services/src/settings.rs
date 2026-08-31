@@ -1420,6 +1420,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
             f64::from(intent_core::config::DEFAULT_IDLE_REAP_MINUTES),
         ),
+        number(
+            "agents.reportToParentDebounceSeconds",
+            "Report-to-parent debounce seconds",
+            "Grace window in seconds before an ungrouped child's reportToParent wake is delivered to the parent, so a child that finishes its turn within the window produces one combined wake instead of two (0 disables the debounce — immediate wake; applies live, no restart required)",
+            "agents",
+            Some(0.0),
+            None,
+            f64::from(intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS),
+        ),
         enumerated(
             "agents.flushQueuedMessages",
             "Flush queued messages",
@@ -1650,6 +1659,16 @@ pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
     } else {
         n
     }
+}
+
+/// The effective `agents.reportToParentDebounceSeconds` setting: the grace
+/// window before an ungrouped child's `reportToParent` wake is delivered to
+/// the parent. `0` disables the debounce (legacy immediate wake), so the
+/// value passes through as-is — read live from the settings snapshot at each
+/// call, no restart required.
+#[must_use]
+pub fn report_to_parent_debounce_seconds(settings: &SettingsFile) -> u32 {
+    settings.agents.report_to_parent_debounce_seconds
 }
 
 /// One-time boot import of legacy `config.toml` keys back into the `SQLite`
@@ -2749,6 +2768,53 @@ mod tests {
             .expect("the minimum itself is legal");
         def.validate(&json!(0))
             .expect_err("0 must be rejected — there is no unlimited value");
+    }
+
+    /// `agents.reportToParentDebounceSeconds` is a TOML-backed number
+    /// (minimum 0 = disabled/immediate wake, no maximum, default 10)
+    /// registered in `KNOWN_PATHS`, and its catalog default matches the
+    /// schema default so the FE never shows a default the daemon does not
+    /// use.
+    #[test]
+    fn report_to_parent_debounce_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.reportToParentDebounceSeconds")
+            .expect("agents.reportToParentDebounceSeconds missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: None
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(10.0)));
+        assert_eq!(
+            intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+            10
+        );
+        assert_eq!(
+            SettingsFile::default()
+                .agents
+                .report_to_parent_debounce_seconds,
+            intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.reportToParentDebounceSeconds"));
+        def.validate(&json!(0))
+            .expect("0 is legal — it disables the debounce");
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(
+            report_to_parent_debounce_seconds(&settings),
+            intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS
+        );
+        settings.agents.report_to_parent_debounce_seconds = 0;
+        assert_eq!(
+            report_to_parent_debounce_seconds(&settings),
+            0,
+            "0 must pass through — it means disabled, not \"fall back to default\""
+        );
     }
 
     /// `server.maxOutstandingRpcs` is a non-secret TOML-backed bounded number

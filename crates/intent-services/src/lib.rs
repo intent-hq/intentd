@@ -149,7 +149,8 @@ pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
     max_concurrent_adapters, max_concurrent_agents, migrate_default_vocabulary,
-    migrate_quick_action_settings, InMemorySecretStore, SecretStore,
+    migrate_quick_action_settings, report_to_parent_debounce_seconds, InMemorySecretStore,
+    SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
@@ -266,6 +267,12 @@ pub struct Services {
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Per-entry debounce-hold release timers, keyed by queue-entry id: each
+    /// held [`agent_ops::QueuedMessage`] gets a spawned sleeper that flushes
+    /// the hold marker at `holdUntil` and kicks delivery. Release/retract
+    /// aborts the entry's timer; rehydration re-arms timers for surviving
+    /// holds. Shared across clones so the abort reaches the live task.
+    hold_release_timers: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     /// Per-agent ordering for pending-question marker writes plus their events.
     pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks,
     /// Test-only deterministic park before a selected marker mutation.
@@ -924,6 +931,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -6138,6 +6146,29 @@ impl Services {
                 format_completion_wake(child_id, event, stall.as_ref(), true, child_of_recipient);
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
+            // Debounce combine (spec Design §4): a pending held report wake
+            // toward this parent is superseded by the terminal settlement —
+            // retract it (cancelling its release timer) and fold its
+            // `agent:reportToParent` event into THIS wake's metadata, so the
+            // parent gets exactly ONE wake carrying both facts. The wake text
+            // already renders the persisted report. Covers idle, failure, and
+            // deletion settlements alike, including boot reconciliation
+            // replaying a settlement from downtime. A `None` retraction means
+            // no hold was pending (flushed, released, or never held) — the
+            // legacy single-wake shape. The retracted entry is kept until the
+            // durable send below commits: a failed send restores it so the
+            // stable-id retry can retract and fold it again instead of
+            // silently dropping the report event.
+            let retracted_held = self
+                .retract_held_message(
+                    &watch.parent_agent_id,
+                    &child_id.0,
+                    crate::agent_ops::REPORT_DEBOUNCE_HOLD_KIND,
+                )
+                .await;
+            if let Some(held) = retracted_held.as_ref() {
+                merge_held_report_metadata(&mut metadata, held.message_metadata.as_ref());
+            }
             // Join the child's recorded flipped completions (consumed at
             // this first stamp) into the trigger set alongside its own
             // linked task — a genuine `agent:idle` completion only; failure
@@ -6184,6 +6215,16 @@ impl Services {
                     watch = %watch.id,
                     "failed to deliver completion wake to parent; retry scheduled"
                 );
+                // The combined wake never committed: restore the retracted
+                // held report so the retry pass can retract and fold it
+                // again — otherwise the eventual retry wake would silently
+                // lose the report event. (The retirement-failure branch
+                // below must NOT restore: its wake is already durable and
+                // carries the folded report.)
+                if let Some(held) = retracted_held {
+                    self.restore_held_message(&watch.parent_agent_id, held)
+                        .await;
+                }
                 ungrouped_delivery_failed = true;
                 self.schedule_completion_delivery_retry(child_id.clone(), retry_event.clone());
                 continue;
@@ -6521,6 +6562,29 @@ impl Services {
             }
         }
         crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
+        // Debounce combine, grouped mirror of the ungrouped retract in
+        // `deliver_completion_to_watches`: a report parked while the child's
+        // watch was still ungrouped is superseded by the aggregate wake when
+        // the watch is adopted into this group mid-window — without the
+        // retract the held entry would flush at `holdUntil` as a standalone
+        // report wake beside the aggregate. Retract each member's pending
+        // hold and fold its `agent:reportToParent` event into the aggregate
+        // metadata; entries are kept until the durable send commits so a
+        // failed send restores them for the retry.
+        let mut retracted_holds: Vec<crate::agent_ops::QueuedMessage> = Vec::new();
+        for child in &group.expected_agent_ids {
+            if let Some(held) = self
+                .retract_held_message(
+                    &group.parent_agent_id,
+                    &child.0,
+                    crate::agent_ops::REPORT_DEBOUNCE_HOLD_KIND,
+                )
+                .await
+            {
+                merge_held_report_metadata(&mut metadata, held.message_metadata.as_ref());
+                retracted_holds.push(held);
+            }
+        }
         if let Err(e) = self
             .deliver_parent_wake_durable(
                 workspace_id,
@@ -6537,6 +6601,14 @@ impl Services {
                 group = %group_id,
                 "failed to deliver aggregated after_all wake to parent; retry scheduled"
             );
+            // The aggregate wake never committed: restore the retracted
+            // holds so the retry can retract and fold them again. (The
+            // settlement-failure branch below must NOT restore: its wake
+            // is already durable and carries the folded reports.)
+            for held in retracted_holds {
+                self.restore_held_message(&group.parent_agent_id, held)
+                    .await;
+            }
             self.release_group_delivery(group_id);
             self.schedule_completion_group_delivery_retry(group_id.to_string());
             return;
@@ -7454,6 +7526,45 @@ fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
         }
     }
     metadata
+}
+
+/// Fold a retracted held report wake's metadata into a terminal wake's
+/// event-notification metadata (spec Design §4): the held entry's
+/// `agent:reportToParent` event rows are PREPENDED to the terminal metadata's
+/// `events` (the report happened first), `eventTypes` gains
+/// `agent:reportToParent` ahead of the terminal type, and `eventCount` is
+/// recomputed. A held entry without usable metadata (missing, or no `events`
+/// array) leaves the terminal metadata untouched — the wake text already
+/// carries the persisted report, so nothing is lost.
+fn merge_held_report_metadata(
+    metadata: &mut serde_json::Value,
+    held_metadata: Option<&serde_json::Value>,
+) {
+    let Some(held_events) = held_metadata
+        .and_then(|m| m.get("events"))
+        .and_then(|e| e.as_array())
+        .filter(|e| !e.is_empty())
+    else {
+        return;
+    };
+    let Some(obj) = metadata.as_object_mut() else {
+        return;
+    };
+    let mut events = held_events.clone();
+    if let Some(existing) = obj.get("events").and_then(|e| e.as_array()) {
+        events.extend(existing.iter().cloned());
+    }
+    let mut event_types: Vec<String> = Vec::new();
+    for e in &events {
+        if let Some(t) = e.get("type").and_then(|t| t.as_str()) {
+            if !event_types.iter().any(|s| s == t) {
+                event_types.push(t.to_string());
+            }
+        }
+    }
+    obj.insert("eventCount".to_string(), serde_json::json!(events.len()));
+    obj.insert("eventTypes".to_string(), serde_json::json!(event_types));
+    obj.insert("events".to_string(), serde_json::Value::Array(events));
 }
 
 /// Fetch a note scoped to `workspace_id`; `NotFound` if absent. Note identity
