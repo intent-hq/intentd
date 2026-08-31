@@ -26521,6 +26521,54 @@ async fn retract_removes_held_entry() {
         .is_none());
 }
 
+/// A stale timer fire — one armed before a same-key upsert extended the
+/// deadline — must NOT flush the hold: `flush_expired_hold` re-checks
+/// `hold_until`, sees it clearly in the future, and re-arms for the
+/// remaining time instead (the `Disposition::Rearm` branch). The entry
+/// stays held and a later release still delivers it.
+#[tokio::test]
+async fn stale_timer_fire_rearms_instead_of_flushing_extended_hold() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "StaleFire").await;
+
+    let far = intent_core::iso_ms_from_now(60_000);
+    let (queued, _) = svc
+        .enqueue_held_message(
+            &id,
+            "extended hold".into(),
+            None,
+            "debounce",
+            &far,
+            "child-1",
+        )
+        .await;
+
+    // Simulate the stale timer firing while the deadline is still 60s out.
+    svc.flush_expired_hold(&id, &queued.id).await;
+
+    // The entry stays held: marker intact, excluded from every drain path.
+    assert!(
+        !svc.has_ready_to_send(&id),
+        "stale fire must not release the hold"
+    );
+    assert!(
+        svc.dequeue_message(&id).is_none(),
+        "drain still skips the held entry"
+    );
+    let snapshot = svc.queue_snapshot(&id);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0]["holdKind"], "debounce");
+    assert_eq!(snapshot[0]["holdUntil"], json!(far));
+
+    // The re-armed path is live: a manual release still works and the entry
+    // becomes deliverable.
+    assert!(svc.release_held_message(&id, "child-1", "debounce").await);
+    assert!(svc.has_ready_to_send(&id));
+    let drained = svc.dequeue_message(&id).expect("released entry drains");
+    assert_eq!(drained.id, queued.id);
+    assert!(drained.hold_kind.is_none(), "release cleared the marker");
+}
+
 /// Restart semantics: an EXPIRED hold flushes on rehydration (entry becomes
 /// ready-to-send), while an UNEXPIRED hold stays held with its re-armed timer
 /// carrying the remaining time.
