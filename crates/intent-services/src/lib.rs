@@ -2213,7 +2213,9 @@ impl Services {
     /// an emit-path merge: nothing is persisted, `workspace.pull_requests`
     /// stays daemon-owned, and no forge calls are made (rung 1 of the
     /// derived-field ladder: two SQL-filtered bulk reads + in-memory merge,
-    /// O(PR-bearing rows) regardless of workspace count). Dedup is by PR
+    /// O(PR-bearing rows) regardless of workspace count; the monitor read is
+    /// the narrow [`intent_store::PrMonitorListEntry`] projection — snapshot
+    /// blobs never hydrate on this path, intent-hq/monorepo#3878). Dedup is by PR
     /// `url` — the one field every source carries that stays unambiguous
     /// across repos — first-wins in source-priority order: workspace's own
     /// PRs, then git-root PRs, then monitor-derived entries. One exception
@@ -2251,7 +2253,7 @@ impl Services {
         };
         let monitors = match self
             .store
-            .load_non_cancelled_pr_monitors(include_archived)
+            .load_non_cancelled_pr_monitor_list_entries(include_archived)
             .await
         {
             Ok(monitors) => monitors,
