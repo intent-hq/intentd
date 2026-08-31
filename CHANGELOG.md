@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.27] - 2026-08-31
+
+### 🚀 Features
+
+- Incremental mid-turn persistence of heavy tool blocks (#3884 part 2) ([#1595](https://github.com/intent-hq/intentd/pull/1595))
+
+
 ## [0.8.26] - 2026-08-30
 
 ### ⚙️ Miscellaneous Tasks
