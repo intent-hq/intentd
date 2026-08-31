@@ -119,13 +119,26 @@ pub fn provision_worktree(
     };
 
     // Create the branch at the base commit, or reuse an existing branch of the
-    // same name (the TS flow reuses it rather than failing).
-    let branch_ref = match repo.find_branch(branch, BranchType::Local) {
-        Ok(b) => b.into_reference(),
-        Err(_) => repo
-            .branch(branch, &base_commit, false)
-            .map_err(map_git_err)?
-            .into_reference(),
+    // same name (the TS flow reuses it rather than failing). A branch that
+    // exists only as a remote-tracking ref (e.g. a PR head branch never
+    // checked out locally) materializes as a local branch at the remote tip —
+    // with upstream tracking — instead of a fresh branch at the base commit,
+    // so the checkout carries the branch's existing commits.
+    let branch_ref = if let Ok(b) = repo.find_branch(branch, BranchType::Local) {
+        b.into_reference()
+    } else {
+        let remote_tip = repo
+            .find_reference(&format!("refs/remotes/{remote}/{branch}"))
+            .ok()
+            .and_then(|r| r.peel_to_commit().ok());
+        let target = remote_tip.as_ref().unwrap_or(&base_commit);
+        let mut b = repo.branch(branch, target, false).map_err(map_git_err)?;
+        if remote_tip.is_some() {
+            // Best-effort: a failure to record tracking never fails
+            // provisioning (push resolution can still name the remote).
+            let _ = b.set_upstream(Some(&format!("{remote}/{branch}")));
+        }
+        b.into_reference()
     };
     let checked_out_sha = branch_ref
         .peel_to_commit()
@@ -415,6 +428,68 @@ mod tests {
         assert_eq!(
             wt_repo.head().unwrap().shorthand().expect("branch name"),
             "amber-forest"
+        );
+        let _ = std::fs::remove_dir_all(&wt_path);
+    }
+
+    /// A branch that exists ONLY as a remote-tracking ref (e.g. a PR head
+    /// branch never checked out locally) provisions at the remote tip — not
+    /// as a fresh branch at the base commit — and records upstream tracking.
+    #[test]
+    fn provisions_worktree_on_remote_only_branch_at_remote_tip() {
+        let dir = init_repo("wt-remote-only");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let (base_branch, base_sha) = {
+            let repo = Repository::open(dir.path()).unwrap();
+            let head = repo.head().unwrap();
+            (
+                head.shorthand().expect("branch name").to_string(),
+                head.target().unwrap(),
+            )
+        };
+        // A remote-tracking ref one commit AHEAD of the base branch, with no
+        // local branch of that name.
+        commit_file(dir.path(), "b.txt", "y\n");
+        let tip_sha = {
+            let repo = Repository::open(dir.path()).unwrap();
+            repo.remote("origin", &dir.path().display().to_string())
+                .unwrap();
+            let tip = repo.head().unwrap().target().unwrap();
+            repo.reference("refs/remotes/origin/pr-head", tip, false, "test")
+                .unwrap();
+            // Rewind the base branch back so the remote tip is distinct.
+            repo.reference(&format!("refs/heads/{base_branch}"), base_sha, true, "test")
+                .unwrap();
+            let base_obj = repo.find_object(base_sha, None).unwrap();
+            repo.reset(&base_obj, git2::ResetType::Hard, None).unwrap();
+            tip.to_string()
+        };
+        let wt_path = std::env::temp_dir().join(format!("wt-remote-only-{}", uuid_ish()));
+        let sha = provision_worktree(
+            dir.path(),
+            "pr-head-ws",
+            &wt_path,
+            "pr-head",
+            Some(&base_branch),
+            "origin",
+        )
+        .unwrap();
+        assert_eq!(sha, tip_sha, "checkout lands on the remote tip");
+        let wt_repo = Repository::open(&wt_path).unwrap();
+        assert_eq!(
+            wt_repo.head().unwrap().shorthand().expect("branch name"),
+            "pr-head"
+        );
+        let main_repo = Repository::open(dir.path()).unwrap();
+        let local = main_repo.find_branch("pr-head", BranchType::Local).unwrap();
+        assert_eq!(
+            local
+                .upstream()
+                .ok()
+                .and_then(|u| u.name().ok().flatten().map(str::to_string))
+                .as_deref(),
+            Some("origin/pr-head"),
+            "upstream tracking recorded"
         );
         let _ = std::fs::remove_dir_all(&wt_path);
     }
