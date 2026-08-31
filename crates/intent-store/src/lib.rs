@@ -68,7 +68,7 @@ pub use event_subscription_repo::PersistedEventSubscription;
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
-pub use pr_monitor_repo::PrMonitorPollUpdate;
+pub use pr_monitor_repo::{PrMonitorListEntry, PrMonitorPollUpdate};
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use transfer_repo::TRANSFER_TABLES;

@@ -35,7 +35,7 @@ use intent_core::{
     PullRequestInfo, PullRequestStatus, Result, WorkspaceId,
 };
 use intent_sourcecontrol::{RepoRef, SourceControl};
-use intent_store::{NewEvent, PrMonitorPollUpdate};
+use intent_store::{NewEvent, PrMonitorListEntry, PrMonitorPollUpdate};
 use serde_json::{json, Value};
 
 use crate::pr_ops::{self, MergeRequirements};
@@ -372,40 +372,35 @@ pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
     v
 }
 
-/// Synthesize a [`PullRequestInfo`] from a monitor row — the monitor-derived
-/// entry the `workspace.list` / `workspace.subscribe` seq-0 PR merge appends
-/// when no persisted source already carries the PR. Everything is read off
-/// the persisted row (the snapshot column is parsed, never re-fetched).
+/// Synthesize a [`PullRequestInfo`] from a monitor list-entry projection —
+/// the monitor-derived entry the `workspace.list` / `workspace.subscribe`
+/// seq-0 PR merge appends when no persisted source already carries the PR.
+/// Everything is read off the persisted row's [`PrMonitorListEntry`]
+/// projection (the snapshot scalars were extracted in SQL, never re-fetched
+/// and never hydrated as a blob — intent-hq/monorepo#3878).
 /// Mirrors the FE's `mergeMonitoredPRs` fallbacks: URL/title synthesized from
 /// the repo identity when the monitor has no snapshot yet, and status
 /// resolved as snapshot state → draft flag → `completed` ⇒ closed (terminal
 /// covers both merged and closed; don't falsely claim merged) → open.
-pub(crate) fn pr_monitor_pr_info(m: &PrMonitor) -> PullRequestInfo {
-    let snapshot: Option<PrMonitorSnapshot> = m
-        .last_snapshot
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok());
-    let status = match snapshot.as_ref().map(|s| s.requirements.state.as_str()) {
+pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
+    let status = match m.snapshot_state.as_deref() {
         Some("merged") => PullRequestStatus::Merged,
         Some("closed") => PullRequestStatus::Closed,
         Some("draft") => PullRequestStatus::Draft,
-        _ if snapshot.as_ref().is_some_and(|s| s.requirements.is_draft) => PullRequestStatus::Draft,
+        _ if m.snapshot_is_draft == Some(true) => PullRequestStatus::Draft,
         _ if m.state == PrMonitorState::Completed => PullRequestStatus::Closed,
         _ => PullRequestStatus::Open,
     };
-    let url = snapshot.as_ref().map_or_else(
-        || {
-            format!(
-                "https://github.com/{}/{}/pull/{}",
-                m.repo_owner, m.repo_name, m.pr_number
-            )
-        },
-        |s| s.url.clone(),
-    );
-    let title = snapshot.as_ref().map_or_else(
-        || format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number),
-        |s| s.title.clone(),
-    );
+    let url = m.snapshot_url.clone().unwrap_or_else(|| {
+        format!(
+            "https://github.com/{}/{}/pull/{}",
+            m.repo_owner, m.repo_name, m.pr_number
+        )
+    });
+    let title = m
+        .snapshot_title
+        .clone()
+        .unwrap_or_else(|| format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number));
     PullRequestInfo {
         id: m.pr_number.to_string(),
         number: m.pr_number.cast_unsigned(),
@@ -418,11 +413,11 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitor) -> PullRequestInfo {
         updated_at: m.updated_at.clone(),
         base_ref: None,
         head_ref: None,
-        head_sha: snapshot.as_ref().and_then(|s| s.head_sha.clone()),
+        head_sha: m.snapshot_head_sha.clone(),
         author: None,
-        mergeable: snapshot.as_ref().and_then(|s| s.requirements.mergeable),
+        mergeable: m.snapshot_mergeable,
         mergeable_state: None,
-        is_draft: snapshot.as_ref().map(|s| s.requirements.is_draft),
+        is_draft: m.snapshot_is_draft,
     }
 }
 

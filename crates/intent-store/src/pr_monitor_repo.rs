@@ -68,6 +68,73 @@ pub struct PrMonitorPollUpdate<'a> {
     pub expected_updated_at: &'a str,
 }
 
+/// The narrow projection of one non-cancelled monitor row consumed by the
+/// `workspace.list` / `workspace.subscribe` seq-0 PR merge: the identity /
+/// lifecycle columns plus the handful of scalar fields the list decoration
+/// reads out of `last_snapshot`. The snapshot scalars are extracted in SQL
+/// (`json_extract`), so the row's JSON blob columns (`last_snapshot`,
+/// `baseline_snapshot`, `pending_changes`) are never shipped to Rust or
+/// deserialized on this hot path — deliberately not a [`PrMonitor`], so the
+/// type itself guarantees the bulk read cannot regrow the blobs
+/// (intent-hq/monorepo#3878).
+///
+/// The `snapshot_*` fields are `None` when the monitor has no snapshot yet or
+/// the persisted blob is not valid JSON (mirroring the tolerant
+/// `serde_json::from_str(..).ok()` parse this projection replaced);
+/// `snapshot_url` / `snapshot_title` / `snapshot_is_draft` are mandatory in
+/// a serialized snapshot, so `Some` on any of them means "snapshot present".
+#[derive(Debug, Clone)]
+pub struct PrMonitorListEntry {
+    pub workspace_id: WorkspaceId,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: i64,
+    pub state: PrMonitorState,
+    pub created_at: String,
+    pub updated_at: String,
+    /// `$.url` of `last_snapshot` — the PR's HTML URL.
+    pub snapshot_url: Option<String>,
+    /// `$.title` of `last_snapshot`.
+    pub snapshot_title: Option<String>,
+    /// `$.headSha` of `last_snapshot` (optional in the snapshot itself).
+    pub snapshot_head_sha: Option<String>,
+    /// `$.requirements.state` of `last_snapshot` — the checklist's 4-value
+    /// lifecycle word (`open` / `draft` / `closed` / `merged`).
+    pub snapshot_state: Option<String>,
+    /// `$.requirements.isDraft` of `last_snapshot`.
+    pub snapshot_is_draft: Option<bool>,
+    /// `$.requirements.mergeable` of `last_snapshot` (tri-state: omitted
+    /// while the forge is still computing).
+    pub snapshot_mergeable: Option<bool>,
+}
+
+fn list_entry_from_row(r: &SqliteRow) -> Result<PrMonitorListEntry> {
+    let err =
+        |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor list row: {e}"));
+    let get = |col: &str| -> Result<String> { r.try_get::<String, _>(col).map_err(err) };
+    let get_opt =
+        |col: &str| -> Result<Option<String>> { r.try_get::<Option<String>, _>(col).map_err(err) };
+    Ok(PrMonitorListEntry {
+        workspace_id: WorkspaceId(get("workspace_id")?),
+        repo_owner: get("repo_owner")?,
+        repo_name: get("repo_name")?,
+        pr_number: r.try_get::<i64, _>("pr_number").map_err(err)?,
+        state: state_from_db(&get("state")?)?,
+        created_at: get("created_at")?,
+        updated_at: get("updated_at")?,
+        snapshot_url: get_opt("snapshot_url")?,
+        snapshot_title: get_opt("snapshot_title")?,
+        snapshot_head_sha: get_opt("snapshot_head_sha")?,
+        snapshot_state: get_opt("snapshot_state")?,
+        snapshot_is_draft: r
+            .try_get::<Option<bool>, _>("snapshot_is_draft")
+            .map_err(err)?,
+        snapshot_mergeable: r
+            .try_get::<Option<bool>, _>("snapshot_mergeable")
+            .map_err(err)?,
+    })
+}
+
 fn monitor_from_row(r: &SqliteRow) -> Result<PrMonitor> {
     let err = |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor row: {e}"));
     let get = |col: &str| -> Result<String> { r.try_get::<String, _>(col).map_err(err) };
@@ -340,37 +407,57 @@ impl Store {
     }
 
     /// Every non-cancelled (active or completed) monitor across all
-    /// workspaces, oldest first — the single bulk read backing the
-    /// `workspace.list` / `workspace.subscribe` seq-0 PR merge. Completed
-    /// rows are retained so merged PRs stay visible; cancelled rows are
-    /// excluded (they are removed from the UI), matching the services-level
-    /// per-workspace view ([`Services::pr_monitors_for_workspace`]). Unless
-    /// `include_archived`, rows owned by archived workspaces are filtered in
-    /// SQL so cost tracks the workspaces the list call actually returns.
+    /// workspaces, oldest first, as narrow [`PrMonitorListEntry`] projections
+    /// — the single bulk read backing the `workspace.list` /
+    /// `workspace.subscribe` seq-0 PR merge. Completed rows are retained so
+    /// merged PRs stay visible; cancelled rows are excluded (they are removed
+    /// from the UI), matching the services-level per-workspace view
+    /// ([`Services::pr_monitors_for_workspace`]). Unless `include_archived`,
+    /// rows owned by archived workspaces are filtered in SQL so cost tracks
+    /// the workspaces the list call actually returns.
+    ///
+    /// The blob columns are never selected: the few `last_snapshot` scalars
+    /// the merge consumes are `json_extract`ed in SQL (guarded by
+    /// `json_valid` so a malformed blob degrades to NULL scalars instead of
+    /// failing the query), and `baseline_snapshot` / `pending_changes` are
+    /// not touched at all — this read grows with monitor history, and
+    /// hydrating full snapshot JSON per row put it at 1.26s for 440 rows on
+    /// one of the hottest RPCs (intent-hq/monorepo#3878).
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn load_non_cancelled_pr_monitors(
+    pub async fn load_non_cancelled_pr_monitor_list_entries(
         &self,
         include_archived: bool,
-    ) -> Result<Vec<PrMonitor>> {
+    ) -> Result<Vec<PrMonitorListEntry>> {
         let archived_filter = if include_archived {
             ""
         } else {
             " AND workspace_id IN (SELECT id FROM workspace WHERE archived = 0)"
         };
         let sql = format!(
-            "SELECT {COLUMNS} FROM pr_monitor WHERE state != 'cancelled'\
-             {archived_filter} ORDER BY created_at"
+            "SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
+             updated_at, \
+             json_extract(snapshot, '$.url') AS snapshot_url, \
+             json_extract(snapshot, '$.title') AS snapshot_title, \
+             json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
+             json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
+             json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
+             json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable \
+             FROM (SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
+             updated_at, \
+             CASE WHEN json_valid(last_snapshot) THEN last_snapshot END AS snapshot \
+             FROM pr_monitor WHERE state != 'cancelled'{archived_filter}) \
+             ORDER BY created_at"
         );
         let rows = sqlx::query(&sql)
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| {
-                intent_core::Error::Internal(format!("load non-cancelled pr monitors failed: {e}"))
+                intent_core::Error::Internal(format!("load pr monitor list entries failed: {e}"))
             })?;
-        rows.iter().map(monitor_from_row).collect()
+        rows.iter().map(list_entry_from_row).collect()
     }
 
     /// Set a monitor's lifecycle state. Every legal transition starts from
@@ -680,6 +767,127 @@ mod tests {
                 completed_latest.monitor_id.0.as_str(),
             ],
             "all active rows + only the latest completed row, oldest first"
+        );
+    }
+
+    /// The `workspace.list` bulk read (intent-hq/monorepo#3878) returns
+    /// [`PrMonitorListEntry`] projections: the snapshot scalars the list
+    /// decoration consumes arrive `json_extract`ed in SQL, and the blob
+    /// columns (`last_snapshot`, `baseline_snapshot`, `pending_changes`) are
+    /// never returned or deserialized — the entry type carries no fields for
+    /// them, so the shape is enforced at compile time. A missing or malformed
+    /// `last_snapshot` degrades to NULL scalars instead of failing the query,
+    /// cancelled rows are excluded, and archived-workspace rows are filtered
+    /// unless `include_archived`.
+    #[tokio::test]
+    async fn list_entries_project_snapshot_scalars_without_blobs() {
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let snapshot = serde_json::json!({
+            "title": "Monitored PR",
+            "url": "https://github.com/o/r/pull/1",
+            "headSha": "abc123",
+            "conversationCount": 0,
+            "reviewCommentCount": 0,
+            "requirements": {
+                "state": "merged",
+                "isDraft": false,
+                "hasConflicts": false,
+                "isBehind": false,
+                "mergeable": true,
+                "checks": {
+                    "total": 0, "passed": 0, "failed": 0, "pending": 0,
+                    "items": [], "failingRequired": [], "pendingRequired": [],
+                    "requiredKnown": true
+                },
+                "approvals": { "decision": "none", "have": 0, "changesRequested": 0 },
+                "threads": { "unresolved": 0 },
+                "rulesKnown": false
+            }
+        })
+        .to_string();
+        let mk = |pr_number: i64, state: PrMonitorState, snap: Option<String>, created: &str| {
+            let mut m = test_monitor(&ws_id, &agent_id, created);
+            m.pr_number = pr_number;
+            m.state = state;
+            m.last_snapshot = snap;
+            m.baseline_snapshot = Some(r#"{"big":"blob"}"#.to_string());
+            m.pending_changes = vec!["mergeable: true → false".to_string()];
+            m
+        };
+        for m in [
+            mk(
+                1,
+                PrMonitorState::Active,
+                Some(snapshot),
+                "2026-01-01T00:00:00Z",
+            ),
+            mk(2, PrMonitorState::Completed, None, "2026-01-02T00:00:00Z"),
+            mk(
+                3,
+                PrMonitorState::Active,
+                Some("{not json".to_string()),
+                "2026-01-03T00:00:00Z",
+            ),
+            mk(4, PrMonitorState::Cancelled, None, "2026-01-04T00:00:00Z"),
+        ] {
+            assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+        }
+        // A monitor in an archived workspace: excluded unless include_archived.
+        let ts = now_iso();
+        let archived_ws = WorkspaceId("ws-pr-monitor-archived".to_string());
+        let mut w = test_workspace(&archived_ws, &ts);
+        w.archived = true;
+        w.status = WorkspaceStatus::Archived;
+        store.insert_workspace(&w).await.expect("archived ws");
+        let mut m = test_monitor(&archived_ws, &agent_id, "2026-01-05T00:00:00Z");
+        m.pr_number = 5;
+        assert!(store.insert_pr_monitor(&m).await.expect("insert archived"));
+
+        let entries = store
+            .load_non_cancelled_pr_monitor_list_entries(false)
+            .await
+            .expect("list entries");
+        let numbers: Vec<i64> = entries.iter().map(|e| e.pr_number).collect();
+        assert_eq!(
+            numbers,
+            vec![1, 2, 3],
+            "cancelled + archived-workspace rows excluded, oldest first"
+        );
+
+        // Snapshot-backed row: scalars extracted from the JSON blob in SQL.
+        let with_snap = &entries[0];
+        assert_eq!(with_snap.workspace_id, ws_id);
+        assert_eq!(with_snap.state, PrMonitorState::Active);
+        assert_eq!(
+            with_snap.snapshot_url.as_deref(),
+            Some("https://github.com/o/r/pull/1")
+        );
+        assert_eq!(with_snap.snapshot_title.as_deref(), Some("Monitored PR"));
+        assert_eq!(with_snap.snapshot_head_sha.as_deref(), Some("abc123"));
+        assert_eq!(with_snap.snapshot_state.as_deref(), Some("merged"));
+        assert_eq!(with_snap.snapshot_is_draft, Some(false));
+        assert_eq!(with_snap.snapshot_mergeable, Some(true));
+
+        // Snapshotless and malformed-snapshot rows read as NULL scalars
+        // (mirroring the tolerant serde parse this projection replaced).
+        for e in [&entries[1], &entries[2]] {
+            assert_eq!(e.snapshot_url, None, "pr {}", e.pr_number);
+            assert_eq!(e.snapshot_title, None, "pr {}", e.pr_number);
+            assert_eq!(e.snapshot_head_sha, None, "pr {}", e.pr_number);
+            assert_eq!(e.snapshot_state, None, "pr {}", e.pr_number);
+            assert_eq!(e.snapshot_is_draft, None, "pr {}", e.pr_number);
+            assert_eq!(e.snapshot_mergeable, None, "pr {}", e.pr_number);
+        }
+
+        let all = store
+            .load_non_cancelled_pr_monitor_list_entries(true)
+            .await
+            .expect("list entries incl. archived");
+        let numbers: Vec<i64> = all.iter().map(|e| e.pr_number).collect();
+        assert_eq!(
+            numbers,
+            vec![1, 2, 3, 5],
+            "include_archived adds the archived workspace's row; cancelled stays excluded"
         );
     }
 
