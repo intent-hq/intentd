@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.29] - 2026-08-31
+
+### 🚀 Features
+
+- ContextLinks param on workspace.create persisted on the Workspace wire shape ([#1601](https://github.com/intent-hq/intentd/pull/1601))
+
+### 🐛 Bug Fixes
+
+- ACP fallback probe + real-CLI login hint for the claude-code auth verdict ([#1599](https://github.com/intent-hq/intentd/pull/1599))
+
+
 ## [0.8.28] - 2026-08-31
 
 ### 🐛 Bug Fixes
