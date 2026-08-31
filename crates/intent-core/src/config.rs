@@ -40,6 +40,14 @@ pub const MAX_CONCURRENT_ADAPTERS_LIMIT: u32 = 64;
 /// unlimited value.
 pub const DEFAULT_MAX_TOP_LEVEL_AGENTS: u32 = 20;
 
+/// Default grace window in seconds (`agents.reportToParentDebounceSeconds`)
+/// before an ungrouped child's `reportToParent` wake is delivered to the
+/// parent, giving the child time to finish its turn so the parent receives
+/// one combined wake instead of two; `0` disables the debounce (legacy
+/// immediate wake). Read live from the settings snapshot at each call — no
+/// restart required.
+pub const DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS: u32 = 10;
+
 /// Default ephemeral-event retention TTL in hours (`events.streamRetentionHours`,
 /// §10.2); `0` disables the retention/compaction sweep entirely. Defaults to 72h
 /// (3 days) so dev/release databases do not grow unboundedly; set to `0` to opt

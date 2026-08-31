@@ -99,6 +99,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agents.maxTopLevelAgents",
     "agents.memoryBudgetMb",
     "agents.idleReapMinutes",
+    "agents.reportToParentDebounceSeconds",
     "agents.flushQueuedMessages",
     "agents.resumeInterruptedOnStart",
     "events.streamRetentionHours",

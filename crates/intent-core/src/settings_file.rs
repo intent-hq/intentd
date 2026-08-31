@@ -37,10 +37,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::{
     DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS,
     DEFAULT_MAX_TOP_LEVEL_AGENTS, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
-    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
-    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
-    DEFAULT_WORKSPACE_API_TOON_OUTPUT, MAX_CONCURRENT_ADAPTERS_LIMIT,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    MAX_CONCURRENT_ADAPTERS_LIMIT,
 };
 use crate::error::{Error, Result};
 
@@ -671,6 +672,12 @@ pub struct AgentsSettings {
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
+    /// `agents.reportToParentDebounceSeconds` — grace window in seconds
+    /// before an ungrouped child's `reportToParent` wake is delivered to the
+    /// parent, so a child that finishes its turn within the window produces
+    /// one combined wake instead of two (0 disables the debounce — legacy
+    /// immediate wake; read live per call, no restart required).
+    pub report_to_parent_debounce_seconds: u32,
     /// `agents.flushQueuedMessages` — how the whole queued-message backlog
     /// is delivered when an idle agent drains its queue: `all` batches every
     /// ready entry into one turn, `systemOnly` batches only system-origin
@@ -693,6 +700,7 @@ impl Default for AgentsSettings {
             max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
             max_top_level_agents: DEFAULT_MAX_TOP_LEVEL_AGENTS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
+            report_to_parent_debounce_seconds: DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
             flush_queued_messages: FlushQueuedMessagesMode::All,
             resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
         }
@@ -1505,6 +1513,12 @@ maxTopLevelAgents = 20
 # memory comes back as each kill completes, so a large idle set drains over a
 # tail rather than all at once.
 idleReapMinutes = 10
+# Report-to-parent debounce seconds -- grace window before an ungrouped
+# child's reportToParent wake is delivered to the parent, so a child that
+# finishes its turn within the window produces one combined wake instead of
+# two (0 disables the debounce -- immediate wake; read live per call, no
+# restart required).
+reportToParentDebounceSeconds = 10
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
 flushQueuedMessages = "all"
