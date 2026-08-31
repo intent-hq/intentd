@@ -14069,6 +14069,150 @@ mod pr {
             .find(|r| r.pr_status == Some(intent_core::PullRequestStatus::Merged));
         assert!(merged.is_some(), "merged status delta persists");
     }
+
+    // ---- PR-aware workspace.create (pr-kind contextLink) ------------------
+
+    fn pr_context_link() -> intent_core::ContextLink {
+        intent_core::ContextLink {
+            kind: intent_core::ContextLinkKind::Pr,
+            url: "https://github.com/o/r/pull/42".to_string(),
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 42,
+        }
+    }
+
+    async fn create_services(forge: StubForge) -> (TempDb, super::WorkspacesRoot, Services) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = super::WorkspacesRoot::new();
+        let services = Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_source_control(Arc::new(forge));
+        (tmp, ws_root, services)
+    }
+
+    /// A pr-kind contextLink on `workspace.create` links the workspace from
+    /// birth: branch defaults to the PR head branch, `baseRef` to the PR base
+    /// branch, and `pr_number`/`pr_url`/status/snapshot are seeded.
+    #[tokio::test]
+    async fn create_with_pr_context_link_derives_branch_and_base_ref() {
+        let (_t, _r, svc) = create_services(StubForge::default()).await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(created.branch, "feature", "PR head branch checked out");
+        assert_eq!(created.base_ref.as_deref(), Some("main"), "PR base branch");
+        assert_eq!(created.pr_number, Some(42));
+        assert_eq!(
+            created.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+        assert_eq!(
+            created.pr_status,
+            Some(intent_core::PullRequestStatus::Open)
+        );
+        let info = created.active_pull_request.expect("pr snapshot");
+        assert_eq!(info.number, 42);
+        assert_eq!(created.pull_requests.map(|v| v.len()), Some(1));
+    }
+
+    /// Explicit `branch`/`baseRef` params win over PR-derived values; the PR
+    /// linkage (number/url) still seeds from the link.
+    #[tokio::test]
+    async fn create_with_pr_context_link_explicit_params_win() {
+        let (_t, _r, svc) = create_services(StubForge::default()).await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws explicit".to_string()),
+                    branch: Some("my-branch".to_string()),
+                    base_ref: Some("develop".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(created.branch, "my-branch", "explicit branch wins");
+        assert_eq!(
+            created.base_ref.as_deref(),
+            Some("develop"),
+            "explicit baseRef wins"
+        );
+        assert_eq!(created.pr_number, Some(42));
+    }
+
+    /// A failed forge lookup is non-fatal: the create succeeds without the
+    /// PR-derived git setup, keeping the number/url linkage from the link.
+    #[tokio::test]
+    async fn create_with_pr_context_link_forge_failure_is_non_fatal() {
+        let (_t, _r, svc) = create_services(StubForge {
+            missing_pr: Some(42),
+            ..Default::default()
+        })
+        .await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws degraded".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create succeeds despite forge failure")
+            .workspace;
+        assert_ne!(created.branch, "feature", "no PR-derived branch");
+        assert!(created.base_ref.is_none(), "no PR-derived baseRef");
+        assert_eq!(created.pr_number, Some(42), "linkage from the link itself");
+        assert_eq!(
+            created.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+        assert!(created.pr_status.is_none(), "no snapshot without a lookup");
+        assert!(created.active_pull_request.is_none());
+    }
+
+    /// An issue-kind contextLink (no pr-kind entry) leaves the create
+    /// unchanged: no forge lookup, no PR linkage.
+    #[tokio::test]
+    async fn create_with_issue_context_link_stays_unlinked() {
+        let (_t, _r, svc) = create_services(StubForge::default()).await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("Issue ws".to_string()),
+                    context_links: Some(vec![intent_core::ContextLink {
+                        kind: intent_core::ContextLinkKind::Issue,
+                        url: "https://github.com/o/r/issues/7".to_string(),
+                        owner: "o".to_string(),
+                        repo: "r".to_string(),
+                        number: 7,
+                    }]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(created.pr_number.is_none());
+        assert!(created.pr_url.is_none());
+        assert!(created.base_ref.is_none());
+    }
 }
 
 /// `file-tracking.*` reads + stage/unstage over the M4.7 `tracked_changes` table
