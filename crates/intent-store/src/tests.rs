@@ -72,6 +72,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived,
         archived_at: if archived { Some(now_iso()) } else { None },
         task_stats: None,
@@ -100,7 +101,8 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+            110
         ]
     );
     assert_eq!(
@@ -110,7 +112,8 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+            110
         ]
     );
 }
@@ -648,6 +651,45 @@ async fn workspace_pull_requests_round_trip_and_clear() {
     store.update_workspace(&cleared).await.expect("update");
     let reread = store.get_workspace(&id).await.expect("re-get");
     assert!(reread.pull_requests.is_none());
+}
+
+/// `context_links` round-trips through insert → get and clears via a full-row
+/// update (`None` drops the JSON column, so the wire shape omits it again).
+#[tokio::test]
+async fn workspace_context_links_round_trip_and_clear() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    let mut ws = sample_workspace(&id, "Context links", false);
+    let links = vec![
+        intent_core::ContextLink {
+            kind: intent_core::ContextLinkKind::Issue,
+            url: "https://github.com/intent-hq/intent/issues/42".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intent".to_string(),
+            number: 42,
+        },
+        intent_core::ContextLink {
+            kind: intent_core::ContextLinkKind::Pr,
+            url: "https://github.com/intent-hq/intentd/pull/7".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intentd".to_string(),
+            number: 7,
+        },
+    ];
+    ws.context_links = Some(links.clone());
+    store.insert_workspace(&ws).await.expect("insert");
+
+    let got = store.get_workspace(&id).await.expect("get");
+    assert_eq!(got.context_links.as_deref(), Some(&links[..]));
+
+    // Clear via update: `context_links = None` drops the column.
+    let mut cleared = got.clone();
+    cleared.context_links = None;
+    store.update_workspace(&cleared).await.expect("update");
+    let reread = store.get_workspace(&id).await.expect("re-get");
+    assert!(reread.context_links.is_none());
 }
 
 /// `update_workspace_pr_linkage` writes ONLY the PR columns + `updated_at`:
@@ -5285,6 +5327,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     pr_status: None,
                     active_pull_request: None,
                     pull_requests: None,
+                    context_links: None,
                     archived: false,
                     archived_at: None,
                     task_stats: None,

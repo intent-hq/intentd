@@ -83,6 +83,35 @@ pub struct PullRequestInfo {
     pub is_draft: Option<bool>,
 }
 
+/// Kind of a workspace context link (§5.1). Wire values are lowercase
+/// (`"issue"` / `"pr"`); the set is deliberately extensible for future
+/// link kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextLinkKind {
+    Issue,
+    Pr,
+}
+
+/// A GitHub issue/PR context link persisted on a [`Workspace`] as
+/// `contextLinks` (§5.1). Supplied by clients on `workspace.create` from the
+/// initializer's issue/PR context mentions and returned on the `Workspace`
+/// wire shape so any client opening the workspace can seed its layout from
+/// the linked pages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextLink {
+    pub kind: ContextLinkKind,
+    pub url: String,
+    pub owner: String,
+    pub repo: String,
+    /// Issue/PR number. `u64` on purpose: a negative or fractional wire value
+    /// rejects `-32602` at deserialization time (like an unknown `kind`),
+    /// before the service validation that names `contextLinks[i].number` —
+    /// only a zero gets the entry-named error.
+    pub number: u64,
+}
+
 /// Note body content type (§9.1). `PlainText` serializes as `plain_text` to
 /// match the TS `ContentType` enum (`src/shared/types.ts`); the others are their
 /// lowercase names.
@@ -205,6 +234,11 @@ pub struct Workspace {
     /// FE reconciles stale PR links against this collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_requests: Option<Vec<PullRequestInfo>>,
+    /// Issue/PR context links supplied at `workspace.create` (§5.1), persisted
+    /// on the row and returned on every `Workspace` payload. Omitted (not
+    /// `null`) when the workspace was created without links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_links: Option<Vec<ContextLink>>,
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
@@ -386,6 +420,7 @@ pub fn chief_workspace() -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -872,6 +907,10 @@ pub struct WorkspaceCreate {
     /// today (worktree / `CoW` / direct) emit milestone frames. Absent keeps
     /// the legacy event behavior exactly. Never persisted.
     pub progress_id: Option<String>,
+    /// Issue/PR context links from the initializer's context mentions (§5.1).
+    /// Validated and bounded by the service; persisted on the workspace row
+    /// and returned as `Workspace.contextLinks`.
+    pub context_links: Option<Vec<ContextLink>>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
 }
@@ -4689,6 +4728,54 @@ mod tests {
         assert_eq!(snake.is_new_repo, None);
     }
 
+    /// `contextLinks` (§5.1) parses from its camelCase wire name with
+    /// lowercase `kind` values; absent keeps `None`, and an unknown `kind`
+    /// rejects at deserialization time.
+    #[test]
+    fn workspace_create_parses_context_links() {
+        let parsed: WorkspaceCreate = serde_json::from_value(json!({
+            "contextLinks": [
+                {
+                    "kind": "issue",
+                    "url": "https://github.com/intent-hq/intent/issues/42",
+                    "owner": "intent-hq",
+                    "repo": "intent",
+                    "number": 42,
+                },
+                {
+                    "kind": "pr",
+                    "url": "https://github.com/intent-hq/intentd/pull/7",
+                    "owner": "intent-hq",
+                    "repo": "intentd",
+                    "number": 7,
+                },
+            ]
+        }))
+        .unwrap();
+        let links = parsed.context_links.expect("parsed links");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].kind, ContextLinkKind::Issue);
+        assert_eq!(links[0].owner, "intent-hq");
+        assert_eq!(links[0].number, 42);
+        assert_eq!(links[1].kind, ContextLinkKind::Pr);
+        assert_eq!(links[1].repo, "intentd");
+
+        let absent: WorkspaceCreate = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.context_links.is_none());
+
+        // Unknown `kind` is a deserialization error, not a silent skip.
+        let bad = serde_json::from_value::<WorkspaceCreate>(json!({
+            "contextLinks": [{
+                "kind": "discussion",
+                "url": "https://example.com",
+                "owner": "o",
+                "repo": "r",
+                "number": 1,
+            }]
+        }));
+        assert!(bad.is_err(), "unknown kind must reject");
+    }
+
     #[test]
     fn known_repo_wire_shape_matches_ts() {
         // Mirrors `KnownRepo` in src/shared/types/known-repo.ts: camelCase
@@ -4955,6 +5042,7 @@ mod tests {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -4978,6 +5066,7 @@ mod tests {
             "prStatus",
             "activePullRequest",
             "pullRequests",
+            "contextLinks",
             "repositoryOwner",
             "lastActivity",
             "archivedAt",

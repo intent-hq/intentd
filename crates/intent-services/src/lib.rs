@@ -9180,6 +9180,44 @@ async fn initialize_repository_for_create(repo_path: PathBuf) -> Result<()> {
         })
 }
 
+/// Upper bound on `workspace.create`'s `contextLinks` list (§5.1): generous
+/// for real initializer context, tight enough to keep the persisted JSON
+/// column and every `Workspace` wire payload bounded.
+const MAX_CONTEXT_LINKS: usize = 20;
+
+/// Validate the optional `workspace.create` `contextLinks` param (§5.1):
+/// bounded list, non-empty `url`/`owner`/`repo`, positive `number`. Rejects
+/// with `-32602` naming the offending entry; `kind` is enforced by serde at
+/// deserialization time.
+fn validate_context_links(links: Option<&[intent_core::ContextLink]>) -> Result<()> {
+    let Some(links) = links else { return Ok(()) };
+    if links.len() > MAX_CONTEXT_LINKS {
+        return Err(Error::InvalidParams(format!(
+            "contextLinks: at most {MAX_CONTEXT_LINKS} entries allowed (got {})",
+            links.len()
+        )));
+    }
+    for (i, link) in links.iter().enumerate() {
+        for (field, value) in [
+            ("url", &link.url),
+            ("owner", &link.owner),
+            ("repo", &link.repo),
+        ] {
+            if value.trim().is_empty() {
+                return Err(Error::InvalidParams(format!(
+                    "contextLinks[{i}].{field} must be a non-empty string"
+                )));
+            }
+        }
+        if link.number == 0 {
+            return Err(Error::InvalidParams(format!(
+                "contextLinks[{i}].number must be a positive integer"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Locked phase of the blocking `workspace.delete` cleanup (ports the TS
 /// `removeGitWorktree` body). Runs under the per-repo worktree lock, so it
 /// does git-metadata work only: capture the checked-out branch, detach the
@@ -14664,6 +14702,12 @@ impl WorkspaceApi for Services {
                             )
                             .await?;
                     }
+                    // Context-links validation (PROTOCOL §5.1), also hoisted
+                    // BEFORE any state change: a malformed `contextLinks`
+                    // rejects `-32602` without leaving a partially created
+                    // workspace behind. Bounded list, non-empty string
+                    // fields, positive PR/issue number.
+                    validate_context_links(input.context_links.as_deref())?;
                     // Caller-supplied paths may carry a leading `~` (the FE
                     // onboarding default is `~/Developer`); expand to `$HOME`
                     // before the existing-repo check, clone targeting, and
@@ -15273,6 +15317,9 @@ impl WorkspaceApi for Services {
                         pr_status: None,
                         active_pull_request: None,
                         pull_requests: None,
+                        // Validated pre-insert above; an empty list persists
+                        // as absent so the wire shape omits it (§5.1).
+                        context_links: input.context_links.filter(|l| !l.is_empty()),
                         archived: false,
                         archived_at: None,
                         // Card aggregates are computed on the list/get emit path only.
@@ -17562,6 +17609,7 @@ impl WorkspaceApi for Services {
                 pr_status: None,
                 active_pull_request: None,
                 pull_requests: None,
+                context_links: None,
                 archived: false,
                 archived_at: None,
                 task_stats: None,

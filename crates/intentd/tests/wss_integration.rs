@@ -668,6 +668,145 @@ async fn wss_workspace_auto_commit_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `workspace.create` `contextLinks` over WSS (§5.1): a valid list persists
+/// and returns on the created workspace and on `workspace.get` /
+/// `workspace.list` rows in the documented camelCase + lowercase-kind wire
+/// shape; a workspace created without the param omits the field; a malformed
+/// list rejects `-32602` before any state change.
+#[tokio::test]
+async fn wss_workspace_create_context_links_round_trip_and_validation() {
+    let srv = start(WsOptions::default()).await;
+    let links = serde_json::json!([
+        {
+            "kind": "issue",
+            "url": "https://github.com/intent-hq/intent/issues/42",
+            "owner": "intent-hq",
+            "repo": "intent",
+            "number": 42,
+        },
+        {
+            "kind": "pr",
+            "url": "https://github.com/intent-hq/intentd/pull/7",
+            "owner": "intent-hq",
+            "repo": "intentd",
+            "number": 7,
+        },
+    ]);
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS Ctx Links","contextLinks":{links}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        created["result"]["workspace"]["contextLinks"], links,
+        "create result carries the persisted links: {created}"
+    );
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    // Read-back on `workspace.get` serves the same wire shape.
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.get","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(got["result"]["workspace"]["contextLinks"], links);
+
+    // `workspace.list` rows carry it too.
+    let listed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.list","params":{}}"#,
+    )
+    .await;
+    let row = listed["result"]["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == ws_id.as_str())
+        .expect("created row listed");
+    assert_eq!(row["contextLinks"], links);
+
+    // A create without the param omits the field (absent, never null/[]).
+    let plain = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"workspace.create","params":{"title":"WSS No Links"}}"#,
+    )
+    .await;
+    assert!(
+        plain["result"]["workspace"].get("contextLinks").is_none(),
+        "no-links create omits the field: {plain}"
+    );
+
+    // Empty-field validation → -32602 naming the offending entry, no row.
+    let bad = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"workspace.create","params":{"title":"WSS Bad Links","contextLinks":[{"kind":"issue","url":"","owner":"o","repo":"r","number":1}]}}"#,
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602, "bad: {bad}");
+    assert!(
+        bad["error"]["message"]
+            .as_str()
+            .is_some_and(|s| s.contains("contextLinks[0].url")),
+        "error names the offending entry: {bad}"
+    );
+
+    // Unknown `kind` rejects at parse time, same code.
+    let bad_kind = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":6,"method":"workspace.create","params":{"title":"WSS Bad Kind","contextLinks":[{"kind":"discussion","url":"https://example.com","owner":"o","repo":"r","number":1}]}}"#,
+    )
+    .await;
+    assert_eq!(bad_kind["error"]["code"], -32602, "bad kind: {bad_kind}");
+
+    // A negative `number` also rejects at parse time (`u64` field): still
+    // `-32602`, but without the `contextLinks[i].number` naming — that
+    // wording is reserved for the in-range zero case above.
+    let bad_number = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"workspace.create","params":{"title":"WSS Bad Number","contextLinks":[{"kind":"pr","url":"https://example.com","owner":"o","repo":"r","number":-1}]}}"#,
+    )
+    .await;
+    assert_eq!(
+        bad_number["error"]["code"], -32602,
+        "bad number: {bad_number}"
+    );
+
+    // Atomic validation: none of the rejected creates left a row behind.
+    let after = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":8,"method":"workspace.list","params":{}}"#,
+    )
+    .await;
+    let titles: Vec<&str> = after["result"]["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .filter_map(|w| w["title"].as_str())
+        .collect();
+    for rejected in ["WSS Bad Links", "WSS Bad Kind", "WSS Bad Number"] {
+        assert!(
+            !titles.contains(&rejected),
+            "rejected create `{rejected}` must not persist a workspace: {titles:?}"
+        );
+    }
+    srv.ws.stop().await;
+}
+
 /// Regression (PROTOCOL §5.16 "Opaque keys & reserved sentinels"): draft keys
 /// are opaque — the FE's New Workspace modal saves its pre-creation draft
 /// under `__new-workspace__` / `__initializer__` before any workspace row
@@ -6676,6 +6815,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,

@@ -393,6 +393,7 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         pr_status,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
