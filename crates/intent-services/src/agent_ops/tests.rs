@@ -3233,6 +3233,95 @@ async fn grouped_report_records_no_marker_and_aggregated_wake_carries_report() {
     );
 }
 
+/// Group adoption mid-window must not double-wake: a report parked while the
+/// child's watch was still UNGROUPED is retracted when the watch is adopted
+/// into an `after_all` group and the aggregate wake fires — the report event
+/// folds into the aggregate metadata instead of flushing at `holdUntil` as a
+/// standalone wake beside it.
+#[tokio::test]
+async fn group_adoption_mid_window_retracts_held_report_into_aggregate_wake() {
+    let (_t, svc, ws) = setup().await;
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("agents.reportToParentDebounceSeconds".into(), json!(60))])
+        .expect("set debounce");
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate immediate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    // Report while the watch is still ungrouped: parks as a held entry.
+    svc.agent_report_to_parent_op(ws.clone(), json!("parked progress"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(svc.queue_snapshot(&parent).len(), 1, "wake parked");
+
+    // The watch is then adopted into an after_all group mid-window.
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid),
+    )
+    .expect("grouped adoption");
+
+    // Settle: child idle records into the group, parent idle seals it.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "turn summary" }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+
+    // Exactly ONE aggregate wake; the held entry was retracted, so nothing
+    // is left to flush at holdUntil as a standalone report wake.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert!(
+        svc.queue_snapshot(&parent).is_empty(),
+        "held report retracted by the aggregate wake"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let wake = session.messages.last().expect("aggregate wake");
+    let metadata = wake.metadata.as_ref().expect("wake metadata");
+    let types: Vec<&str> = metadata["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .map(|e| e["type"].as_str().expect("event type"))
+        .collect();
+    assert_eq!(
+        types[0], "agent:reportToParent",
+        "aggregate wake folds the report event first: {types:?}"
+    );
+    assert!(types.contains(&AGENT_IDLE));
+}
+
 /// monorepo#2889 guard: a completion with NO prior reportToParent wake keeps
 /// today's behavior — the completion wake delivers and carries the event's
 /// summary.

@@ -6562,6 +6562,29 @@ impl Services {
             }
         }
         crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
+        // Debounce combine, grouped mirror of the ungrouped retract in
+        // `deliver_completion_to_watches`: a report parked while the child's
+        // watch was still ungrouped is superseded by the aggregate wake when
+        // the watch is adopted into this group mid-window — without the
+        // retract the held entry would flush at `holdUntil` as a standalone
+        // report wake beside the aggregate. Retract each member's pending
+        // hold and fold its `agent:reportToParent` event into the aggregate
+        // metadata; entries are kept until the durable send commits so a
+        // failed send restores them for the retry.
+        let mut retracted_holds: Vec<crate::agent_ops::QueuedMessage> = Vec::new();
+        for child in &group.expected_agent_ids {
+            if let Some(held) = self
+                .retract_held_message(
+                    &group.parent_agent_id,
+                    &child.0,
+                    crate::agent_ops::REPORT_DEBOUNCE_HOLD_KIND,
+                )
+                .await
+            {
+                merge_held_report_metadata(&mut metadata, held.message_metadata.as_ref());
+                retracted_holds.push(held);
+            }
+        }
         if let Err(e) = self
             .deliver_parent_wake_durable(
                 workspace_id,
@@ -6578,6 +6601,14 @@ impl Services {
                 group = %group_id,
                 "failed to deliver aggregated after_all wake to parent; retry scheduled"
             );
+            // The aggregate wake never committed: restore the retracted
+            // holds so the retry can retract and fold them again. (The
+            // settlement-failure branch below must NOT restore: its wake
+            // is already durable and carries the folded reports.)
+            for held in retracted_holds {
+                self.restore_held_message(&group.parent_agent_id, held)
+                    .await;
+            }
             self.release_group_delivery(group_id);
             self.schedule_completion_group_delivery_retry(group_id.to_string());
             return;
