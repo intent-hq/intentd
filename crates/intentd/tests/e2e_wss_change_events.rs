@@ -382,6 +382,89 @@ async fn workspace_update_emits_workspace_updated_over_wss() {
     );
 }
 
+/// End-to-end: `file-tracking.getAgentLocks` over WSS returns the daemon's
+/// agent-lock snapshot (§5.19), and toggling the workspace auto-commit policy
+/// republishes `changes:agent-locks` (§6.5) so a subscribed client tracks the
+/// lock state without polling.
+#[tokio::test]
+async fn agent_locks_read_and_event_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let _ = &daemon;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Locks", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Hydration read: fresh workspace has no tracked changes, so the snapshot
+    // is empty with the schema-default auto-commit (enabled).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let locks = wss_rpc(
+        &mut rpc,
+        2,
+        "file-tracking.getAgentLocks",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(locks["autoCommitEnabled"], json!(true), "locks: {locks}");
+    assert_eq!(locks["lockedAgentIds"], json!([]));
+    assert_eq!(locks["lockedFilePaths"], json!([]));
+
+    // Missing workspaceId is an invalid-params error, not a fallback.
+    let err = wss_rpc_envelope(&mut rpc, 3, "file-tracking.getAgentLocks", json!({})).await;
+    assert_eq!(err["error"]["code"], json!(-32602), "envelope: {err}");
+
+    // Subscribe, then flip the workspace auto-commit policy: the agent-locks
+    // worker recomputes and publishes the changed (auto-commit off) snapshot.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["changes:agent-locks"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    wss_rpc(
+        &mut rpc,
+        4,
+        "workspace.setAutoCommit",
+        json!({ "workspaceId": ws_id, "enabled": false }),
+    )
+    .await;
+
+    let evt = next_event(&mut sub, &["changes:agent-locks"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        evt["data"],
+        json!({
+            "workspaceId": ws_id,
+            "autoCommitEnabled": false,
+            "lockedAgentIds": [],
+            "lockedFilePaths": [],
+        })
+    );
+
+    // The read agrees with the pushed snapshot.
+    let locks = wss_rpc(
+        &mut rpc,
+        5,
+        "file-tracking.getAgentLocks",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(locks["autoCommitEnabled"], json!(false));
+}
+
 /// End-to-end: `workspace.delete` over WSS publishes `workspace:deleted` with
 /// the minimal `{ workspaceId }` payload (§6.5). The event fires only after
 /// the store row is actually removed.

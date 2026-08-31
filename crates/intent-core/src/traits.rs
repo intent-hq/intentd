@@ -4450,6 +4450,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `file-tracking.getAgentLocks`: the daemon-computed agent-lock snapshot
+    /// (`{ autoCommitEnabled, lockedAgentIds, lockedFilePaths }`) (PROTOCOL
+    /// §5.19). The hydration read for the `changes:agent-locks` event (§6.5).
+    fn file_tracking_get_agent_locks(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_get_agent_locks not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.loadCommits`: commit history with attribution
     /// (`{ commits: CommitWithAttribution[], boundarySha, nextToken }`).
     /// Wire shape details pending docs/protocol/ update (see monorepo Task 3).

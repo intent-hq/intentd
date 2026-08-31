@@ -4724,6 +4724,7 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
         "file-tracking.getChanges",
         "file-tracking.loadCommits",
         "file-tracking.getLineStats",
+        "file-tracking.getAgentLocks",
     ] {
         let msg = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1"}}}}"#
@@ -4735,7 +4736,11 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
 
 #[tokio::test]
 async fn file_tracking_reads_require_workspace_id() {
-    for method in ["file-tracking.getChanges", "file-tracking.getLineStats"] {
+    for method in [
+        "file-tracking.getChanges",
+        "file-tracking.getLineStats",
+        "file-tracking.getAgentLocks",
+    ] {
         let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
         let v = call(&msg).await.unwrap();
         assert_eq!(err_code(&v), -32602);

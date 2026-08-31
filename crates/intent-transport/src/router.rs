@@ -2942,6 +2942,14 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "file-tracking.getAgentLocks" => {
+            let ws = require_ws_note(params)?;
+            let r = api
+                .file_tracking_get_agent_locks(ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "file-tracking.getLineStats" => {
             let ws = require_ws_note(params)?;
             let r = api
