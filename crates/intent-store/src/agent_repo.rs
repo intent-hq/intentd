@@ -2607,6 +2607,16 @@ impl Store {
     /// cascade). Scoped to `workspace_id` (defense-in-depth). Returns whether a
     /// row was removed (`agent.delete`, §5.5).
     ///
+    /// A large history makes the single cascading `DELETE FROM agent_session`
+    /// hold the write lock for the whole sweep (intent-hq/intent#3827), so the
+    /// heavy children are pre-deleted in bounded batches first: payload rows
+    /// (including pre-staged orphans, 0109) then `agent_message` rows, each
+    /// batch its own short write transaction with a yield in between so other
+    /// writers interleave. The final `agent_session` delete then cascades only
+    /// the (small) remainder written concurrently mid-sweep. A crash mid-sweep
+    /// leaves a consistent DB: the session row still exists with a truncated
+    /// log, and a retried delete cascades whatever remains.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
@@ -2615,6 +2625,33 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
     ) -> Result<bool> {
+        // Confirm the session exists under THIS workspace before touching any
+        // children — the pre-delete statements are keyed by agent id alone, so
+        // a mismatched workspace id must remain a no-op exactly like before.
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM agent_session WHERE id = ? AND workspace_id = ?")
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .fetch_optional(self.write_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("delete agent session check failed: {e}")))?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        delete_in_bounded_batches(
+            self.write_pool(),
+            DELETE_PAYLOAD_BATCH_SQL,
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
+        delete_in_bounded_batches(
+            self.write_pool(),
+            DELETE_MESSAGE_BATCH_SQL,
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
         let result = sqlx::query("DELETE FROM agent_session WHERE id = ? AND workspace_id = ?")
             .bind(&id.0)
             .bind(&workspace_id.0)
@@ -2622,6 +2659,52 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
         Ok(result.rows_affected() > 0)
+    }
+}
+
+/// Max child rows removed per statement in the session-delete pre-sweep.
+const DELETE_CASCADE_BATCH: i64 = 500;
+
+/// One batch of a session's payload rows (envelope-owned AND pre-staged
+/// orphans — both carry `agent_id`). Seeks via `idx_agent_message_payload_agent`
+/// (0109); the rowid subquery stands in for `DELETE ... LIMIT`, which the
+/// bundled `SQLite` build does not enable.
+const DELETE_PAYLOAD_BATCH_SQL: &str = "DELETE FROM agent_message_payload WHERE rowid IN \
+     (SELECT rowid FROM agent_message_payload WHERE agent_id = ? LIMIT ?)";
+
+/// One batch of a session's `agent_message` rows. Seeks via the
+/// `UNIQUE(agent_id, seq)` index (0004); the per-row AFTER DELETE triggers
+/// (FTS 0074, payload 0109) keep the side tables aligned.
+const DELETE_MESSAGE_BATCH_SQL: &str = "DELETE FROM agent_message WHERE rowid IN \
+     (SELECT rowid FROM agent_message WHERE agent_id = ? LIMIT ?)";
+
+/// Run `sql` (one bounded `DELETE` batch, binding `agent_id` then `batch`)
+/// until it removes fewer rows than the batch size. Each execution is its own
+/// implicit write transaction, and the yield between batches lets other
+/// writers queued on the pool interleave. Returns the number of non-empty
+/// batches executed.
+async fn delete_in_bounded_batches(
+    pool: &sqlx::SqlitePool,
+    sql: &str,
+    agent_id: &str,
+    batch: i64,
+) -> Result<u64> {
+    let mut batches = 0u64;
+    loop {
+        let removed = sqlx::query(sql)
+            .bind(agent_id)
+            .bind(batch)
+            .execute(pool)
+            .await
+            .map_err(|e| Error::Internal(format!("batched cascade delete failed: {e}")))?
+            .rows_affected();
+        if removed > 0 {
+            batches += 1;
+        }
+        if removed < batch.unsigned_abs() {
+            return Ok(batches);
+        }
+        tokio::task::yield_now().await;
     }
 }
 
