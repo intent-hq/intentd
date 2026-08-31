@@ -370,6 +370,12 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // model flag on the pinned adapter).
         supports_config_option_model: true,
         auth_check_args: Some(&["auth", "status"]),
+        // The auth-error hint must name the real `claude` CLI, not the
+        // adapter `command` the default `{command} login` would produce —
+        // "claude-agent-acp login" is not a runnable command, and
+        // desktop-app-only users need the CLI login step spelled out
+        // (intent-hq/intent#3941).
+        login_command_hint: Some("claude auth login"),
         login_docs_url: Some(
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
         ),
