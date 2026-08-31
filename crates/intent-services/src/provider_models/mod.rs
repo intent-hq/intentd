@@ -380,6 +380,41 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
     }
 }
 
+/// claude-code auth fallback probe (`host.providerAuthStatus`): the same
+/// pinned-adapter ACP probe as [`fetch_claude_code_models`], mapped to auth
+/// semantics by [`claude_code_acp_auth_verdict`]. Consulted only when the
+/// cheap `claude auth status` CLI probe does not confirm login — that CLI
+/// has known false negatives (anthropics/claude-code#76168) while this
+/// probe walks the credential chain Intent's runtime actually uses. The
+/// caller gates on the `claude` CLI being installed; the probe itself runs
+/// the pinned npx adapter
+/// ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
+pub(crate) async fn probe_claude_code_auth() -> Option<bool> {
+    let npx = find_npx()?;
+    let cmd = AcpProbeCommand::npx(npx, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
+    let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "claude-code")).await;
+    claude_code_acp_auth_verdict(outcome)
+}
+
+/// Map a claude-code ACP probe outcome to the auth tri-state (the pure seam
+/// unit tests drive without spawning the adapter): a non-empty model list ⇒
+/// authenticated; the adapter's explicit auth-required RPC error (`-32000
+/// Authentication required` when logged out — intent-hq/intent#3178) ⇒ not
+/// authenticated; anything else (spawn failure, timeout, transport error,
+/// empty catalog) ⇒ unknown. Unlike pi — whose adapter serves only
+/// credentialed models, so an empty list demotes to `Some(false)` — an
+/// empty claude-code catalog is inconclusive and must never harden into a
+/// false "not authenticated".
+fn claude_code_acp_auth_verdict(outcome: Result<Vec<Value>, ProbeError>) -> Option<bool> {
+    match outcome {
+        Ok(models) if !models.is_empty() => Some(true),
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            Some(false)
+        }
+        Ok(_) | Err(_) => None,
+    }
+}
+
 /// opencode: native CLI — run `opencode models` and parse one
 /// `provider/model` per line (parity with the FE `opencode.ipc.ts`, which
 /// routes the same command through `host.exec`).

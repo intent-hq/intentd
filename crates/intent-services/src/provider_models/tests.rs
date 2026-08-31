@@ -1244,6 +1244,42 @@ async fn acp_probe_child_env_removals_reach_child() {
     assert_eq!(recorded, "UNSET");
 }
 
+/// intent-hq/intent#3941: the claude-code ACP auth fallback's outcome →
+/// tri-state mapping (no adapter spawn). Only the adapter's explicit
+/// auth-required RPC error (intent-hq/intent#3178) may demote to a hard
+/// false; an empty or failed probe stays unknown.
+#[test]
+fn claude_code_acp_auth_verdict_mapping() {
+    use super::claude_code_acp_auth_verdict;
+    let rpc = |code: i64, message: &str| {
+        ProbeError::Rpc(intent_acp::JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        })
+    };
+    assert_eq!(
+        claude_code_acp_auth_verdict(Ok(vec![json!({"id": "claude-opus-4"})])),
+        Some(true)
+    );
+    assert_eq!(
+        claude_code_acp_auth_verdict(Err(rpc(-32000, "Authentication required"))),
+        Some(false)
+    );
+    // Inconclusive outcomes must stay unknown — never a hard false.
+    assert_eq!(claude_code_acp_auth_verdict(Ok(Vec::new())), None);
+    assert_eq!(claude_code_acp_auth_verdict(Err(ProbeError::Empty)), None);
+    assert_eq!(claude_code_acp_auth_verdict(Err(ProbeError::Timeout)), None);
+    assert_eq!(
+        claude_code_acp_auth_verdict(Err(ProbeError::Spawn("nope".to_string()))),
+        None
+    );
+    assert_eq!(
+        claude_code_acp_auth_verdict(Err(rpc(-32603, "internal error"))),
+        None
+    );
+}
+
 #[test]
 fn probe_ok_but_zero_models_degrades_with_warning() {
     // A successful handshake that reports zero models must still degrade to
