@@ -196,6 +196,10 @@ fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64, bool) {
             i64::try_from(b).expect("value fits in i64"),
             true,
         ),
+        // Deliberate fallback: the upstream ref exists but the walk failed, so
+        // report the pre-existing (0, 0) counts with `has_upstream: true` —
+        // `unpushedCount` then reads `Some(0)`, preserving the documented
+        // `unpushedCount == ahead` invariant over a degraded count.
         Err(_) => (0, 0, true),
     }
 }
