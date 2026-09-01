@@ -2082,6 +2082,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Build runtime control struct (always, regardless of boot listener state)
     let runtime = Arc::new(WsRuntimeControl {
         api: api.clone(),
+        settings_registry: settings_registry.clone(),
         bus: bus.clone(),
         tls_cert: tls_cert.clone(),
         token_store: token_store.clone(),
@@ -3104,6 +3105,11 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
 /// state guarded by a Mutex so settings.update can start/stop the listener.
 struct WsRuntimeControl {
     api: Arc<dyn WorkspaceApi>,
+    /// Direct access to daemon-local effective settings for listener startup.
+    /// Runtime hooks execute while `settings.update` holds the settings revision
+    /// write gate, so calling back through `WorkspaceApi::settings_get` here
+    /// would deadlock trying to acquire that gate for a read.
+    settings_registry: Arc<intent_services::SettingsRegistry>,
     bus: EventBus,
     tls_cert: Option<intent_transport::TlsCertificate>,
     token_store: Option<Arc<AsyncTokenStore>>,
@@ -3383,23 +3389,17 @@ impl intent_core::ServerControl for DaemonControl {
 
             // Read the persisted port from settings, then resolve against the
             // env seam (see `resolve_ws_listener_port` for the precedence).
-            let settings_port = match runtime
-                .api
-                .settings_get("server.wsApi.port".to_string())
-                .await
-            {
-                Ok(result) => result
-                    .get("value")
-                    .and_then(serde_json::Value::as_f64)
-                    // Settings schema bounds the port to u16 range; the
-                    // float→int cast saturates anyway.
-                    .map(|p| {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let p = p as u16;
-                        p
-                    }),
-                Err(_) => None,
-            };
+            let settings = runtime.settings_registry.snapshot();
+            let settings_port = settings
+                .get("server.wsApi.port")
+                .and_then(|value| value.as_f64())
+                // Settings schema bounds the port to u16 range; the
+                // float→int cast saturates anyway.
+                .map(|p| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let p = p as u16;
+                    p
+                });
             let desired_port = resolve_ws_listener_port(
                 std::env::var("INTENTD_TCP_PORT").ok().as_deref(),
                 settings_port,
@@ -3411,55 +3411,36 @@ impl intent_core::ServerControl for DaemonControl {
             // value changed since boot applies on the next listener start. An
             // invalid value is a hard error naming the setting — never
             // silently bind a different address set than the user configured.
-            let bind_addresses = match runtime
-                .api
-                .settings_get("server.bindAddress".to_string())
-                .await
-            {
-                Ok(result) => match result.get("value") {
-                    Some(raw @ (serde_json::Value::String(_) | serde_json::Value::Array(_))) => {
-                        let parsed: intent_core::settings_file::BindAddress =
-                            serde_json::from_value(raw.clone()).map_err(|_| {
-                                intent_core::Error::InvalidParams(format!(
-                                    "server.bindAddress {raw} is not an IP string or an array of \
+            let bind_addresses = match settings.get("server.bindAddress") {
+                Some(raw @ (serde_json::Value::String(_) | serde_json::Value::Array(_))) => {
+                    let parsed: intent_core::settings_file::BindAddress =
+                        serde_json::from_value(raw.clone()).map_err(|_| {
+                            intent_core::Error::InvalidParams(format!(
+                                "server.bindAddress {raw} is not an IP string or an array of \
                                      IP strings — fix it in config.toml ([server] bindAddress) \
                                      or via settings"
-                                ))
-                            })?;
-                        Some(parsed.resolve().map_err(|msg| {
-                            intent_core::Error::InvalidParams(format!(
-                                "server.bindAddress {raw}: {msg} — fix it in config.toml \
-                                 ([server] bindAddress) or via settings"
                             ))
-                        })?)
-                    }
-                    _ => None,
-                },
-                Err(_) => None,
+                        })?;
+                    Some(parsed.resolve().map_err(|msg| {
+                        intent_core::Error::InvalidParams(format!(
+                            "server.bindAddress {raw}: {msg} — fix it in config.toml \
+                                 ([server] bindAddress) or via settings"
+                        ))
+                    })?)
+                }
+                _ => None,
             }
             .unwrap_or_else(|| runtime.ws_options.bind_addresses.clone());
 
             // Tunnel-only mode (server.tunnel.only): accept tunnel-forwarded
             // traffic only — bind loopback regardless of server.bindAddress,
             // so direct LAN connects are refused while tailcat (a local
-            // process) still reaches the listener. Tunnel-only is a security
-            // posture, so a settings read failure fails CLOSED (loopback
-            // bind) rather than silently serving the wider bindAddress.
-            let tunnel_only = match runtime
-                .api
-                .settings_get("server.tunnel.only".to_string())
-                .await
-            {
-                Ok(v) => v.get("value").and_then(serde_json::Value::as_bool) == Some(true),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "cannot read server.tunnel.only; failing closed — \
-                         WSS listener binding loopback only"
-                    );
-                    true
-                }
-            };
+            // process) still reaches the listener. The registry snapshot is
+            // infallible and includes the schema default when the key is unset.
+            let tunnel_only = settings
+                .get("server.tunnel.only")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
             let bind_addresses = if tunnel_only {
                 let loopback = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
                 if bind_addresses != loopback {
