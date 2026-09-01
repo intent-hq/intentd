@@ -77,6 +77,17 @@ pub(crate) struct CompletionWatch {
     /// requests do not consume or wake this watch, and it may coexist with an
     /// unrelated grouped watch for the same parent/child pair.
     pub completion_only: bool,
+    /// Identity (`completion_report.timestamp`) of the child report whose
+    /// report-time wake was SENT toward this parent (monorepo#4026): stamped
+    /// when the wake is handed off — immediate delivery, queued, or parked
+    /// as a debounce hold. The stamp alone does not prove the parent saw
+    /// it: the terminal completion wake suppresses the `Report:` clause in
+    /// favor of a short already-delivered reference only when this identity
+    /// matches the settling report AND the #1614 retracts removed nothing
+    /// (an undelivered wake is retracted there, failing open to the full
+    /// report). In-memory only (not persisted): after a daemon restart the
+    /// terminal wake fails open to the full report, which is benign.
+    pub delivered_report_ts: Option<String>,
 }
 
 /// Fan-in table for `waitMode: "after_all"` delegation groups. All children a
@@ -267,6 +278,7 @@ impl Services {
             report_delivered: false,
             wake_on_attention: false,
             completion_only: true,
+            delivered_report_ts: None,
         };
         let id = watch.id.clone();
         self.store
@@ -386,6 +398,7 @@ impl Services {
                     report_delivered: false,
                     wake_on_attention,
                     completion_only: false,
+                    delivered_report_ts: None,
                 };
                 guard.subscriptions.push(watch.clone());
                 watch
@@ -708,6 +721,35 @@ impl Services {
             });
         }
         marked
+    }
+
+    /// Stamp `delivered_report_ts` on every UNGROUPED watch `parent_agent_id`
+    /// holds on `child_agent_id` (monorepo#4026). Called when a
+    /// report-to-parent wake is sent toward the parent — immediate delivery,
+    /// queued, or parked as a debounce hold. The stamp records the report
+    /// identity only; actual delivery is proven at settlement by the #1614
+    /// retract gate (retracts removing nothing = the wake left the queue),
+    /// so a retracted held or still-queued wake never suppresses the
+    /// terminal report. Grouped watches are skipped: `after_all` children
+    /// defer their reports to the aggregate wake, which has no per-child
+    /// duplicate to suppress.
+    pub(crate) fn stamp_watch_delivered_report_ts(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+        report_ts: &str,
+    ) {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        for watch in guard.subscriptions.iter_mut().filter(|w| {
+            w.group_id.is_none()
+                && &w.parent_agent_id == parent_agent_id
+                && &w.child_agent_id == child_agent_id
+        }) {
+            watch.delivered_report_ts = Some(report_ts.to_string());
+        }
     }
 
     /// Remove every watch registered by `parent_agent_id`; returns the count
@@ -2238,6 +2280,9 @@ fn persisted_to_completion_watch(p: &PersistedCompletionWatch) -> CompletionWatc
         report_delivered: false,
         wake_on_attention: p.wake_on_attention,
         completion_only: p.completion_only,
+        // In-memory only: after a restart the terminal wake falls back to
+        // rendering the full report (fail-open, monorepo#4026).
+        delivered_report_ts: None,
     }
 }
 

@@ -96,6 +96,13 @@ pub(crate) struct ChildSettlementParams<'a> {
     pub attention: Option<(&'a str, &'a str)>,
     /// Suspected stall (monorepo#1016): `(task_title, task_status)`.
     pub stall: Option<(&'a str, &'a str)>,
+    /// intent-hq/monorepo#4026: the settling report was already delivered to
+    /// this recipient by a report-time wake (same report identity, wake left
+    /// the queue). The terminal completion wake then renders a short
+    /// already-delivered reference instead of repeating the full `Report:`
+    /// clause. Callers that cannot prove prior delivery pass `false`
+    /// (fail-open to the full report); group child lines ignore the field.
+    pub report_already_delivered: bool,
 }
 
 /// One method per system-generated text surface. Implementations own 100% of

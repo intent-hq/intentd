@@ -6014,8 +6014,14 @@ impl Services {
                     // machine-readably (`watchStillArmed: true`,
                     // monorepo#2060, mirroring the hook wakes'
                     // `hookStillActive` flag).
-                    let wake =
-                        format_completion_wake(child_id, event, None, false, child_of_recipient);
+                    let wake = format_completion_wake(
+                        child_id,
+                        event,
+                        None,
+                        false,
+                        child_of_recipient,
+                        false,
+                    );
                     let mut metadata = build_event_notification_metadata(&[event]);
                     metadata["watchStillArmed"] = serde_json::json!(true);
                     if let Err(e) = self
@@ -6175,11 +6181,6 @@ impl Services {
                 );
                 continue;
             }
-            // The terminal wake carries the one-shot retirement contract. Its
-            // stable id makes a crash retry idempotent while the persisted
-            // watch remains armed as the recovery record.
-            let wake =
-                format_completion_wake(child_id, event, stall.as_ref(), true, child_of_recipient);
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
             // Debounce combine (spec Design §4): a pending held report wake
@@ -6220,6 +6221,33 @@ impl Services {
             for entry in retracted_flushed.iter().rev() {
                 merge_held_report_metadata(&mut metadata, entry.message_metadata.as_ref());
             }
+            // monorepo#4026: the terminal wake must not repeat a report the
+            // parent already READ in an earlier report-time wake. "Already
+            // delivered" is proven by three facts together: this watch was
+            // stamped with the report identity when the report wake was
+            // sent (`delivered_report_ts`), the settling completion carries
+            // that SAME identity (`completion_identity` — a child that
+            // reported again since delivery carries a newer timestamp and
+            // fails the match), and the two retracts above removed NOTHING
+            // (a retracted-and-folded wake never reached the parent, so its
+            // report text must still render in full). Suppression swaps the
+            // full `Report:` clause for a short already-delivered reference;
+            // any doubt fails open to the full report.
+            let report_already_delivered = completion_identity.is_some()
+                && watch.delivered_report_ts.as_deref() == completion_identity.as_deref()
+                && retracted_held.is_none()
+                && retracted_flushed.is_empty();
+            // The terminal wake carries the one-shot retirement contract. Its
+            // stable id makes a crash retry idempotent while the persisted
+            // watch remains armed as the recovery record.
+            let wake = format_completion_wake(
+                child_id,
+                event,
+                stall.as_ref(),
+                true,
+                child_of_recipient,
+                report_already_delivered,
+            );
             // Join the child's recorded flipped completions (consumed at
             // this first stamp) into the trigger set alongside its own
             // linked task — a genuine `agent:idle` completion only; failure
@@ -11639,17 +11667,23 @@ pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
 /// settling agent's session `parentAgentId` is the wake's recipient, which
 /// renders the "Child agent" label; a watched non-child (top-level peer,
 /// SUB-1 send target) renders "Watched agent" instead.
+/// `report_already_delivered` — intent-hq/monorepo#4026: `true` only when the
+/// settling completion's report was already delivered to this recipient by a
+/// report-time wake (proven at the call site via the watch's stamped
+/// `delivered_report_ts` + the completion identity + the #1614 retract gate);
+/// the harness then renders a short already-delivered reference instead of
+/// repeating the full `Report:` clause.
 pub(crate) fn format_completion_wake(
     child_id: &AgentId,
     event: &Event,
     stall: Option<&StallSuspicion>,
     watch_retired: bool,
     child_of_recipient: bool,
+    report_already_delivered: bool,
 ) -> String {
-    harness::latest().completion_wake(
-        &child_settlement_params(child_id, event, None, stall, child_of_recipient),
-        watch_retired,
-    )
+    let mut params = child_settlement_params(child_id, event, None, stall, child_of_recipient);
+    params.report_already_delivered = report_already_delivered;
+    harness::latest().completion_wake(&params, watch_retired)
 }
 
 /// The advisory wake for a hook-/PR-monitor-deferred idle: the child is idle
@@ -11781,6 +11815,10 @@ fn child_settlement_params<'a>(
         error: data_str("error"),
         attention,
         stall: stall.map(|s| (s.task_title.as_str(), s.task_status.as_str())),
+        // Only the ungrouped terminal wake ever proves prior delivery
+        // (monorepo#4026); every other settlement surface renders the full
+        // report. [`format_completion_wake`] overrides this per call.
+        report_already_delivered: false,
     }
 }
 

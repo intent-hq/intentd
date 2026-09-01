@@ -535,7 +535,19 @@ impl Harness for V1 {
         let mut msg = format!("[WORKSPACE EVENTS] {relationship} {label} {kind}.");
         let mut report_rendered = false;
         if let Some(report) = params.completion_report {
-            let _ = write!(msg, " Report: {report}");
+            // monorepo#4026: when the caller proved this exact report was
+            // already delivered by a report-time wake, reference it instead
+            // of repeating it verbatim. Counts as a rendered report for the
+            // stall-suffix guard below — the report exists, it is just not
+            // repeated.
+            if params.report_already_delivered {
+                msg.push_str(
+                    " Its completion report was already delivered in a previous message \
+                     (unchanged since).",
+                );
+            } else {
+                let _ = write!(msg, " Report: {report}");
+            }
             report_rendered = true;
         } else if let Some(summary) = params.last_response_summary {
             let _ = write!(msg, " Summary: {summary}");
