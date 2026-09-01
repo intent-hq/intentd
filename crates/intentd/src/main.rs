@@ -1057,9 +1057,15 @@ async fn cmd_git_credential(operation: &str) -> ExitCode {
 /// embeds the bearer token, so it deserves the same treatment as the secrets
 /// file. The helper creates the file fresh (`create_new`) so the restrictive
 /// permissions apply BEFORE the sensitive bytes are written — never exposed
-/// under the umask; any pre-existing file is removed first to preserve
-/// overwrite semantics. The exported image stays visible on Windows (no
-/// hidden attribute) — the user asked for it by path.
+/// under the umask. Any pre-existing file (or symlink) is removed first —
+/// deliberately replacing a symlink with a regular file rather than writing
+/// through it — so overwriting an existing export still works. Two deliberate
+/// deltas from the old truncate flow: a planted symlink can no longer
+/// redirect the token-bearing bytes, and removal needs parent-dir write
+/// permission, so an existing writable file in a read-only directory now
+/// fails instead of being truncated in place (fail-closed in exactly the
+/// shared-directory case the hardening targets). The exported image stays
+/// visible on Windows (no hidden attribute) — the user asked for it by path.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
@@ -5971,6 +5977,45 @@ mod tests {
     #[test]
     fn banner_build_commit_falls_back_to_unknown() {
         assert_eq!(banner_build_commit(None), "unknown");
+    }
+
+    /// Overwrite regression guard: `write_private` uses `create_new`, so
+    /// re-exporting to the same path only works because of the preceding
+    /// `remove_file` — a refactor dropping it would break `pair --png`
+    /// re-runs against an existing file.
+    #[test]
+    fn write_secret_file_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pair.png");
+
+        write_secret_file(&path, b"first").unwrap();
+        write_secret_file(&path, b"second").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "re-exported file should stay 0600");
+        }
+    }
+
+    /// A symlink at the export path is replaced with a regular file — the
+    /// bytes must not be written through to the link target.
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_replaces_symlink_instead_of_writing_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("pair.png");
+        std::fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_secret_file(&link, b"secret").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&link).unwrap(), b"secret");
     }
 
     /// A stand-in "sitter": `sleep` symlinked as `name` (the process name
