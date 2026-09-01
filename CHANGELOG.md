@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1] - 2026-09-01
+
+### 🚀 Features
+
+- *(server)* Tailcat tunnel sidecar (server.tunnel.*) ([#1618](https://github.com/intent-hq/intentd/pull/1618))
+
+
 ## [0.9.0] - 2026-09-01
 
 ### 🚀 Features
