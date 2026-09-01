@@ -706,9 +706,34 @@ fn resolve_binary_path_prefers_newest_nvm_node_version() {
     std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let resolved = resolve_binary_path_with_home("node", &[], home.path());
+    let tool_dirs = path_utils::enriched_tool_dirs_with_home(Some(home.path()));
+    let resolved = resolve_binary_path_with_tool_dirs_and_lookup("node", &[], &tool_dirs, |_| None);
 
     assert_eq!(resolved.as_deref(), Some(binary.as_path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_binary_path_prefers_active_path_node_over_newer_nvm_install() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = unique_temp_dir("nvm-path-precedence-home");
+    let nvm_bin = home.path().join(".nvm/versions/node/v26.8.1/bin");
+    let path_bin = home.path().join("active-node/bin");
+    std::fs::create_dir_all(&nvm_bin).unwrap();
+    std::fs::create_dir_all(&path_bin).unwrap();
+    let installed_node = nvm_bin.join("node");
+    std::fs::write(&installed_node, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&installed_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let active_node = path_bin.join("node");
+    std::fs::write(&active_node, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&active_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let resolved = resolve_binary_path_with_tool_dirs_and_lookup("node", &[], &[nvm_bin], |_| {
+        Some(active_node.clone())
+    });
+
+    assert_eq!(resolved.as_deref(), Some(active_node.as_path()));
 }
 
 #[cfg(unix)]
