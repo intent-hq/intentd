@@ -6173,6 +6173,21 @@ impl Services {
             if let Some(held) = retracted_held.as_ref() {
                 merge_held_report_metadata(&mut metadata, held.message_metadata.as_ref());
             }
+            // Flushed mirror of the held retract above: a report wake that
+            // already exited its debounce hold (or was enqueued directly by
+            // the immediate debounce = 0 path) but is still sitting
+            // undelivered on the parent's queue is equally superseded by the
+            // terminal settlement — retract it and fold its event rows into
+            // THIS wake's metadata. Entries arrive oldest-first; merging in
+            // reverse keeps chronological order ahead of any held entry and
+            // the terminal event. Same failure contract: kept until the
+            // durable send commits, restored on a failed send.
+            let retracted_flushed = self
+                .retract_flushed_report_messages(&watch.parent_agent_id, &child_id.0)
+                .await;
+            for entry in retracted_flushed.iter().rev() {
+                merge_held_report_metadata(&mut metadata, entry.message_metadata.as_ref());
+            }
             // Join the child's recorded flipped completions (consumed at
             // this first stamp) into the trigger set alongside its own
             // linked task — a genuine `agent:idle` completion only; failure
@@ -6227,6 +6242,10 @@ impl Services {
                 // carries the folded report.)
                 if let Some(held) = retracted_held {
                     self.restore_held_message(&watch.parent_agent_id, held)
+                        .await;
+                }
+                for entry in retracted_flushed {
+                    self.restore_flushed_report_message(&watch.parent_agent_id, entry)
                         .await;
                 }
                 ungrouped_delivery_failed = true;
@@ -6576,6 +6595,7 @@ impl Services {
         // metadata; entries are kept until the durable send commits so a
         // failed send restores them for the retry.
         let mut retracted_holds: Vec<crate::agent_ops::QueuedMessage> = Vec::new();
+        let mut retracted_flushed: Vec<crate::agent_ops::QueuedMessage> = Vec::new();
         for child in &group.expected_agent_ids {
             if let Some(held) = self
                 .retract_held_message(
@@ -6588,6 +6608,18 @@ impl Services {
                 merge_held_report_metadata(&mut metadata, held.message_metadata.as_ref());
                 retracted_holds.push(held);
             }
+            // Flushed mirror: a member's report wake that already exited its
+            // debounce hold but is still undelivered on the parent's queue is
+            // equally superseded by the aggregate wake — retract and fold it
+            // too, with the same restore-on-failed-send contract. Each merge
+            // PREPENDS, so folding in reverse keeps the oldest entry first.
+            let flushed = self
+                .retract_flushed_report_messages(&group.parent_agent_id, &child.0)
+                .await;
+            for entry in flushed.iter().rev() {
+                merge_held_report_metadata(&mut metadata, entry.message_metadata.as_ref());
+            }
+            retracted_flushed.extend(flushed);
         }
         if let Err(e) = self
             .deliver_parent_wake_durable(
@@ -6611,6 +6643,10 @@ impl Services {
             // is already durable and carries the folded reports.)
             for held in retracted_holds {
                 self.restore_held_message(&group.parent_agent_id, held)
+                    .await;
+            }
+            for entry in retracted_flushed {
+                self.restore_flushed_report_message(&group.parent_agent_id, entry)
                     .await;
             }
             self.release_group_delivery(group_id);
