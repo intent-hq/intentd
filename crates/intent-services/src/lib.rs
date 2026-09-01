@@ -12819,6 +12819,13 @@ impl Services {
     /// but not rolled back — there is no wire caller to answer and the user's
     /// file edit is authoritative; the daemon keeps running on the new
     /// effective values.
+    ///
+    /// The caller must hold [`Self::settings_revision_gate`]'s write lock
+    /// across both the registry reload and this method. This keeps the adopted
+    /// registry snapshot, allocated revision, and published event atomic with
+    /// respect to `settings.get` and `settings.list` snapshots. The method
+    /// cannot acquire the gate itself because doing so after the caller reloads
+    /// the registry would expose the new values under the previous revision.
     pub async fn apply_external_settings_change(&self, notice: &SettingsChanged) {
         let Some(registry) = self.settings_registry.as_deref() else {
             return;
