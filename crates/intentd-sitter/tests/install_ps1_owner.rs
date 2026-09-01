@@ -156,8 +156,12 @@ fn run_owner_check_with(
 }
 
 /// A `Win32_Process` row for the [`service_stubs`] table: pid, parent pid,
-/// started-at-seconds.
+/// started-at-seconds. A `started_at` of [`NO_CREATION_DATE`] emits the row
+/// with a null `CreationDate`, as CIM reports for some protected processes.
 struct StubProc(u32, u32, i64);
+
+/// Sentinel `started_at` for a [`StubProc`] row whose `CreationDate` is null.
+const NO_CREATION_DATE: i64 = i64::MIN;
 
 /// A running task for the stub scheduler: leaf name, full path, engine pid.
 struct StubTask(&'static str, &'static str, u32);
@@ -207,10 +211,17 @@ function New-Object {
     let rows = procs
         .iter()
         .map(|StubProc(pid, ppid, started_at)| {
-            format!(
-                "    [pscustomobject]@{{ ProcessId = {pid}; ParentProcessId = {ppid}; \
-                 CreationDate = ([datetime]'2026-01-01T00:00:00').AddSeconds({started_at}) }}"
-            )
+            if *started_at == NO_CREATION_DATE {
+                format!(
+                    "    [pscustomobject]@{{ ProcessId = {pid}; ParentProcessId = {ppid}; \
+                     CreationDate = $null }}"
+                )
+            } else {
+                format!(
+                    "    [pscustomobject]@{{ ProcessId = {pid}; ParentProcessId = {ppid}; \
+                     CreationDate = ([datetime]'2026-01-01T00:00:00').AddSeconds({started_at}) }}"
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -795,5 +806,41 @@ fn a_parent_younger_than_its_child_breaks_the_chain_and_forfeits_the_allowance()
     assert!(
         matches!(verdict, Verdict::Refused(_)),
         "ancestry through a reused pid must not unlock the allowance, got {verdict:?}"
+    );
+}
+
+/// A hop with no readable start time is a reuse we cannot rule out: the
+/// walk must break there — uncertainty refuses — rather than skip the
+/// comparison and let the chain reach the engine unguarded.
+#[test]
+fn a_missing_creation_date_breaks_the_chain_and_forfeits_the_allowance() {
+    let Some(pwsh) = pwsh() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let owner = LiveProcess::spawn();
+    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+    // Identical to the sound chain, except the engine row reports no
+    // CreationDate — CIM does that for some protected processes. The
+    // sitter → engine hop can then not be age-checked, so it must break.
+    let engine: u32 = 1_900_000_001;
+    let sitter: u32 = 1_900_000_002;
+    write_sitter_pid_file(&data_dir, &format!("{sitter}\n"));
+    let stubs = service_stubs(
+        "intentd",
+        "\\intentd",
+        engine,
+        &[
+            StubProc(owner.pid(), sitter, 20),
+            StubProc(sitter, engine, 10),
+            StubProc(engine, 4, NO_CREATION_DATE),
+        ],
+    );
+
+    let (verdict, _) =
+        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    assert!(
+        matches!(verdict, Verdict::Refused(_)),
+        "a hop with an unreadable start time must not be walked through, got {verdict:?}"
     );
 }

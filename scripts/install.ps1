@@ -236,7 +236,9 @@ if ($serviceMode -eq 'yes') {
         #      owner's parent chain: Win32_Process ParentProcessId, walked a
         #      bounded number of hops, stopping when a parent started after
         #      its child (that parent pid was reused, so the chain is broken
-        #      there).
+        #      there) - and equally when either hop's CreationDate is
+        #      missing, since a start time we cannot read is a reuse we
+        #      cannot rule out (uncertainty refuses).
         #   3. The walked chain also holds the pid recorded in
         #      <data_dir>\sitter\sitter.pid - the serve-mode sitter's own
         #      pidfile (PidFile in crates/intentd-sitter/src/supervisor.rs),
@@ -333,7 +335,8 @@ if ($serviceMode -eq 'yes') {
                 $parentRow = $null
                 try { $parentRow = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $parentPid" -ErrorAction Stop)[0] } catch { $parentRow = $null }
                 if (-not $parentRow) { break }
-                if ($chainRow.CreationDate -and $parentRow.CreationDate -and ($parentRow.CreationDate -gt $chainRow.CreationDate)) { break }
+                if (-not $chainRow.CreationDate -or -not $parentRow.CreationDate) { break }
+                if ($parentRow.CreationDate -gt $chainRow.CreationDate) { break }
                 $chainPid = $parentPid
                 $chainRow = $parentRow
             }
