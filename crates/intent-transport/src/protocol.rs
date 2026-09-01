@@ -307,8 +307,8 @@
 //! `system.importLegacy` fast-path method is gone from the catalog — callers
 //! now get `-32601` — along with the `intentd import` / `intentd
 //! import-legacy` CLI subcommands and the first-boot auto-import in `serve`.
-//! Method catalog shrinks by one fast-path method — 297 router methods,
-//! 336 total.
+//! Method catalog shrinks by one fast-path method — 298 router methods,
+//! 337 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
