@@ -15789,6 +15789,64 @@ mod file_tracking {
         assert!(msg.contains("gitRootId"), "hint suggests gitRootId: {msg}");
     }
 
+    /// Hint absolute-path guard: `Path::join` with an absolute argument
+    /// discards the base, so an absolute path existing anywhere used to
+    /// "match" every registered root. An absolute path OUTSIDE the root must
+    /// suppress the hint; one INSIDE the root still triggers it.
+    #[tokio::test]
+    async fn agent_commit_primary_miss_hint_handles_absolute_paths() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("root-only.txt"), "in root\n").unwrap();
+
+        // Mixed set: a relative file that exists in the root plus an absolute
+        // path that exists but is outside it — no hint (the old join-based
+        // check matched the absolute path against any root).
+        let outside = repo.dir.canonicalize().unwrap().join("README.md");
+        std::fs::write(&outside, "outside the root\n").unwrap();
+        let err = svc
+            .git_agent_commit(
+                ws.clone(),
+                "misdirected".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec![
+                    "root-only.txt".to_string(),
+                    outside.to_string_lossy().to_string(),
+                ]),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("did not match any files"), "got: {msg}");
+        assert!(!msg.contains("gitRootId"), "no hint expected: {msg}");
+
+        // An absolute path inside the root counts via containment, so the
+        // hint still fires for a mixed relative + in-root-absolute set.
+        let inside = secondary.dir.canonicalize().unwrap().join("root-only.txt");
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "misdirected".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec![
+                    "root-only.txt".to_string(),
+                    inside.to_string_lossy().to_string(),
+                ]),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("did not match any files"), "got: {msg}");
+        assert!(msg.contains(root_id.as_str()), "hint names the id: {msg}");
+        assert!(msg.contains("gitRootId"), "hint suggests gitRootId: {msg}");
+    }
+
     /// Primary-path regression: with `git_root_id: None` an explicit-files
     /// miss that matches NO registered root keeps the bare pathspec error —
     /// no hint is appended.

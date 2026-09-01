@@ -1814,11 +1814,13 @@ impl Services {
     }
 
     /// Find a registered secondary git root that contains every path in
-    /// `files` (relative paths joined to the root; existence-checked on disk).
-    /// Feeds the `git.agentCommit` remediation hint (monorepo#2053): when an
-    /// explicit primary-target commit set matches nothing, a root containing
-    /// the named files is the likely intended target. Best-effort — store or
-    /// filesystem errors just yield `None`.
+    /// `files` (relative paths joined to the root; an absolute path counts
+    /// only when it lies under the root — `Path::join` with an absolute
+    /// argument discards the base, which would match any root; existence is
+    /// checked on disk). Feeds the `git.agentCommit` remediation hint
+    /// (monorepo#2053): when an explicit primary-target commit set matches
+    /// nothing, a root containing the named files is the likely intended
+    /// target. Best-effort — store or filesystem errors just yield `None`.
     async fn find_git_root_containing(
         &self,
         workspace_id: &WorkspaceId,
@@ -1831,7 +1833,14 @@ impl Services {
             .ok()?;
         roots.into_iter().find(|root| {
             let base = std::path::Path::new(&root.path);
-            files.iter().all(|f| base.join(f).exists())
+            files.iter().all(|f| {
+                let p = std::path::Path::new(f);
+                if p.is_absolute() {
+                    p.starts_with(base) && p.exists()
+                } else {
+                    base.join(p).exists()
+                }
+            })
         })
     }
 
