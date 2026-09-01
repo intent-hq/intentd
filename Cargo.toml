@@ -102,6 +102,10 @@ debug = "line-tables-only"
 debug = "line-tables-only"
 [profile.dev.package.intent-transport]
 debug = "line-tables-only"
+[profile.dev.package.intentd]
+debug = "line-tables-only"
+[profile.dev.package.intentd-sitter]
+debug = "line-tables-only"
 
 # Strip debug symbols from all external dependencies
 [profile.dev.package."*"]
