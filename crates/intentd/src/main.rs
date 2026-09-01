@@ -725,33 +725,36 @@ fn listen_selection_changes(
     changes
 }
 
-/// Read a boolean setting's effective value over UDS; `false` when the RPC
-/// fails or the value is not a boolean.
-async fn current_bool_setting(socket: &Path, path: &str) -> bool {
-    let Ok(response) = rpc_call(socket, "settings.get", json!({ "path": path })).await else {
-        return false;
-    };
-    response["result"]["value"].as_bool().unwrap_or(false)
+/// Read a boolean setting's effective value over UDS, propagating RPC
+/// failures so a failed read never masquerades as `false` — a wrong `false`
+/// baseline would corrupt the picker's diff (e.g. a persisted
+/// `server.tunnel.only = true` misread as `false` makes the CLI report state
+/// changes the daemon never applies).
+async fn current_bool_setting(socket: &Path, path: &str) -> anyhow::Result<bool> {
+    let response = rpc_call(socket, "settings.get", json!({ "path": path })).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("settings.get {path} failed: {}", rpc_error_text(error));
+    }
+    Ok(response["result"]["value"].as_bool().unwrap_or(false))
 }
 
-/// Interactive multi-select listen-target picker: this machine's interfaces
-/// plus the explicit all-interfaces option (and any persisted addresses
-/// matching no enumerated entry), then the tailcat tunnel entry —
-/// pre-checked from `current` (the effective `server.bindAddress` set; empty
-/// pre-checks loopback) and `tunnel_enabled`. Selecting ONLY the tunnel
-/// binds loopback and turns on tunnel-only mode; an all-interfaces address
-/// stays exclusive among the addresses. Reads one selection line from
-/// stdin, so a piped run works without a TTY.
-fn prompt_listen_targets(
+/// Default (pre-checked) picker indices for [`prompt_listen_targets`]. In
+/// tunnel-only mode ONLY the tailcat entry is pre-checked — the loopback
+/// bind is an implementation detail of that posture, and pre-checking it
+/// too would make Enter ("keep current selection") resolve to
+/// loopback+tailcat, silently writing `server.tunnel.only = false` and
+/// restarting the listener. Otherwise: the current addresses (loopback when
+/// empty), plus the tailcat entry when the tunnel is enabled. Pure so the
+/// round-trip is unit-testable.
+fn listen_default_indices(
+    choices: &[BindChoice],
     current: &[std::net::IpAddr],
     tunnel_enabled: bool,
-) -> anyhow::Result<ListenSelection> {
-    use std::io::{BufRead, Write};
-    let choices = merge_current_into_bind_choices(
-        build_bind_choices(&intent_transport::collect_bind_interfaces()),
-        current,
-    );
-    let count = choices.len() + 1;
+    tunnel_only: bool,
+) -> Vec<usize> {
+    if tunnel_only {
+        return vec![choices.len()];
+    }
     let mut default_set: Vec<usize> = if current.is_empty() {
         vec![0]
     } else {
@@ -764,6 +767,30 @@ fn prompt_listen_targets(
     if tunnel_enabled {
         default_set.push(choices.len());
     }
+    default_set
+}
+
+/// Interactive multi-select listen-target picker: this machine's interfaces
+/// plus the explicit all-interfaces option (and any persisted addresses
+/// matching no enumerated entry), then the tailcat tunnel entry —
+/// pre-checked per [`listen_default_indices`] (the effective
+/// `server.bindAddress` set and tunnel state; tunnel-only pre-checks the
+/// tailcat entry alone so Enter round-trips to an empty changeset).
+/// Selecting ONLY the tunnel binds loopback and turns on tunnel-only mode;
+/// an all-interfaces address stays exclusive among the addresses. Reads one
+/// selection line from stdin, so a piped run works without a TTY.
+fn prompt_listen_targets(
+    current: &[std::net::IpAddr],
+    tunnel_enabled: bool,
+    tunnel_only: bool,
+) -> anyhow::Result<ListenSelection> {
+    use std::io::{BufRead, Write};
+    let choices = merge_current_into_bind_choices(
+        build_bind_choices(&intent_transport::collect_bind_interfaces()),
+        current,
+    );
+    let count = choices.len() + 1;
+    let default_set = listen_default_indices(&choices, current, tunnel_enabled, tunnel_only);
     eprintln!("Where should the daemon accept connections?");
     for (i, choice) in choices.iter().enumerate() {
         let mark = if default_set.contains(&i) { "x" } else { " " };
@@ -843,11 +870,12 @@ async fn cmd_pair_select_endpoints() -> anyhow::Result<()> {
     if let Some(error) = response.get("error") {
         anyhow::bail!("cannot reach the daemon: {}", rpc_error_text(error));
     }
-    let listener_enabled = current_bool_setting(&config.socket_path, "server.wsApi.enabled").await;
-    let tunnel_enabled = current_bool_setting(&config.socket_path, "server.tunnel.enabled").await;
-    let tunnel_only = current_bool_setting(&config.socket_path, "server.tunnel.only").await;
+    let listener_enabled =
+        current_bool_setting(&config.socket_path, "server.wsApi.enabled").await?;
+    let tunnel_enabled = current_bool_setting(&config.socket_path, "server.tunnel.enabled").await?;
+    let tunnel_only = current_bool_setting(&config.socket_path, "server.tunnel.only").await?;
     let current = current_bind_addresses(&config.socket_path).await;
-    let selection = prompt_listen_targets(&current, tunnel_enabled)?;
+    let selection = prompt_listen_targets(&current, tunnel_enabled, tunnel_only)?;
     let changes = listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only);
     if changes.is_empty() && listener_enabled {
         eprintln!("Selection unchanged — settings not modified.");
@@ -902,10 +930,11 @@ async fn cmd_pair(
             // unchanged selection writes nothing so the stored shapes stay
             // untouched.
             let tunnel_enabled =
-                current_bool_setting(&config.socket_path, "server.tunnel.enabled").await;
-            let tunnel_only = current_bool_setting(&config.socket_path, "server.tunnel.only").await;
+                current_bool_setting(&config.socket_path, "server.tunnel.enabled").await?;
+            let tunnel_only =
+                current_bool_setting(&config.socket_path, "server.tunnel.only").await?;
             let current = current_bind_addresses(&config.socket_path).await;
-            let selection = prompt_listen_targets(&current, tunnel_enabled)?;
+            let selection = prompt_listen_targets(&current, tunnel_enabled, tunnel_only)?;
             listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only)
         };
         enable_wss_listener(&config.socket_path, &changes).await?;
@@ -6054,6 +6083,38 @@ mod tests {
             bind_addresses_value(&two),
             json!(["127.0.0.1", "192.168.1.5"])
         );
+    }
+
+    #[test]
+    fn listen_default_indices_round_trip() {
+        let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: std::net::IpAddr = "192.168.1.5".parse().unwrap();
+        let choices = build_bind_choices(&[
+            ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
+            ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
+        ]);
+        let tc_idx = choices.len();
+
+        // Tunnel-only mode: ONLY the tailcat entry is pre-checked, so
+        // accepting the default round-trips to an empty changeset instead
+        // of writing server.tunnel.only = false.
+        let defaults = listen_default_indices(&choices, &[lo], true, true);
+        assert_eq!(defaults, vec![tc_idx]);
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lo], true, true).is_empty());
+
+        // Tunnel enabled alongside a LAN bind: addresses + tailcat entry;
+        // the default still diffs to no changes.
+        let lan_pos = (0..choices.len())
+            .find(|&i| choices[i].addr == lan)
+            .unwrap();
+        let defaults = listen_default_indices(&choices, &[lan], true, false);
+        assert_eq!(defaults, vec![lan_pos, tc_idx]);
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lan], true, false).is_empty());
+
+        // No persisted addresses, tunnel off: loopback entry only.
+        assert_eq!(listen_default_indices(&choices, &[], false, false), vec![0]);
     }
 
     #[test]
