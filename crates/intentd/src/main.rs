@@ -1052,27 +1052,21 @@ async fn cmd_git_credential(operation: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Write an exported pairing image with owner-only (0600) permissions: the QR
-/// code embeds the bearer token, so it deserves the same treatment as the
-/// secrets file. The file is created/truncated with restrictive permissions
-/// BEFORE the sensitive bytes are written — never exposed under the umask.
+/// Write an exported pairing image with owner-only permissions (0600 on unix,
+/// owner-only DACL on Windows) via [`intent_core::write_private`]: the QR code
+/// embeds the bearer token, so it deserves the same treatment as the secrets
+/// file. The helper creates the file fresh (`create_new`) so the restrictive
+/// permissions apply BEFORE the sensitive bytes are written — never exposed
+/// under the umask; any pre-existing file is removed first to preserve
+/// overwrite semantics. The exported image stays visible on Windows (no
+/// hidden attribute) — the user asked for it by path.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
-    let mut file = options.open(path)?;
-    // If the file pre-existed, `mode` above does not apply; enforce it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(bytes)
+    intent_core::write_private(path, bytes)
 }
 
 /// Migrate a legacy Intent `userData` dir into intentd's `SQLite` store (§9.7).
