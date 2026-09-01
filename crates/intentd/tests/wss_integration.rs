@@ -13111,6 +13111,7 @@ impl SystemControl for WatchHealthControl {
             build_commit: None,
             uptime_seconds: 0,
             local_ips: Vec::new(),
+            tc_address: None,
             hostname: "test".to_string(),
             pretty_hostname: "test".to_string(),
             cpu_percent: 0.0,

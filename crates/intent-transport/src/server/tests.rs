@@ -38,6 +38,7 @@ impl TokenStore for MemoryStore {
 /// Mock pairing info provider for tests.
 struct MockPairingInfo {
     port: Option<u16>,
+    tc_address: Option<String>,
     data_dir: PathBuf,
     token_store: crate::AsyncTokenStore,
 }
@@ -45,10 +46,12 @@ struct MockPairingInfo {
 impl ServerPairingInfo for MockPairingInfo {
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>> {
         let port = self.port;
+        let tc_address = self.tc_address.clone();
         Box::pin(async move {
             PairingSnapshot {
                 port,
                 bind_addresses: None,
+                tc_address,
             }
         })
     }
@@ -103,6 +106,7 @@ async fn handle_pairing_info_local_success() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store,
     });
@@ -131,6 +135,37 @@ async fn handle_pairing_info_local_success() {
             .is_empty(),
         "prettyHostname non-empty"
     );
+    // No tunnel in the snapshot: tcAddress is ABSENT, not null.
+    assert!(result.get("tcAddress").is_none());
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+#[tokio::test]
+async fn handle_pairing_info_includes_tc_address_when_tunnel_up() {
+    use std::env;
+    let tmpdir = env::temp_dir().join(format!(
+        "intentd-test-{}-{}",
+        std::process::id(),
+        "pairing_info_tc"
+    ));
+    std::fs::create_dir_all(&tmpdir).unwrap();
+    let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
+    let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
+        port: Some(5181),
+        tc_address: Some("tc7f2a91.tailcat.net".to_string()),
+        data_dir: tmpdir.clone(),
+        token_store: store,
+    });
+
+    let req = ServerRequest {
+        method: ServerMethod::PairingInfo,
+        id_present: true,
+        id_echo: json!(1),
+    };
+
+    let resp = handle(req, &provider, true).await.unwrap();
+    let parsed: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(parsed["result"]["tcAddress"], "tc7f2a91.tailcat.net");
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
@@ -146,6 +181,7 @@ async fn handle_pairing_info_remote_rejects() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::default()));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store,
     });
@@ -192,6 +228,7 @@ async fn handle_rotate_token_local_success() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("old-token")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store.clone(),
     });
@@ -222,6 +259,7 @@ fn pairing_hosts_specific_bind_advertises_only_that_address() {
         let snapshot = PairingSnapshot {
             port: Some(5181),
             bind_addresses: Some(vec![addr.parse().unwrap()]),
+            tc_address: None,
         };
         assert_eq!(pairing_hosts(&snapshot), vec![addr.to_string()]);
     }
@@ -236,6 +274,7 @@ fn pairing_hosts_multi_bind_advertises_every_address() {
             "192.168.1.23".parse().unwrap(),
             "100.64.0.3".parse().unwrap(),
         ]),
+        tc_address: None,
     };
     assert_eq!(
         pairing_hosts(&snapshot),
@@ -252,10 +291,12 @@ fn pairing_hosts_unspecified_or_unknown_bind_enumerates_local_ips() {
     let unspecified = PairingSnapshot {
         port: Some(5181),
         bind_addresses: Some(vec!["0.0.0.0".parse().unwrap()]),
+        tc_address: None,
     };
     let unknown = PairingSnapshot {
         port: Some(5181),
         bind_addresses: None,
+        tc_address: None,
     };
     assert_eq!(pairing_hosts(&unspecified), collect_local_ips());
     assert_eq!(pairing_hosts(&unknown), collect_local_ips());
@@ -269,6 +310,7 @@ fn pairing_hosts_v6_unspecified_bind_includes_v4_and_specific_v6_stays_exact() {
     let v6_unspecified = PairingSnapshot {
         port: Some(5181),
         bind_addresses: Some(vec!["::".parse().unwrap()]),
+        tc_address: None,
     };
     let hosts = pairing_hosts(&v6_unspecified);
     let v4 = collect_local_ips();
@@ -284,6 +326,7 @@ fn pairing_hosts_v6_unspecified_bind_includes_v4_and_specific_v6_stays_exact() {
     let v6_specific = PairingSnapshot {
         port: Some(5181),
         bind_addresses: Some(vec!["2001:db8::7".parse().unwrap()]),
+        tc_address: None,
     };
     assert_eq!(pairing_hosts(&v6_specific), vec!["2001:db8::7".to_string()]);
 }

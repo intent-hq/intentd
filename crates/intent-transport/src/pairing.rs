@@ -22,7 +22,10 @@ use intent_core::{Error, Result};
 pub(crate) const PAIRING_PAYLOAD_VERSION: u32 = 1;
 
 /// Build the pairing payload URI:
-/// `intent://pair?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&token=<t>`.
+/// `intent://pair?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&token=<t>[&tc=<addr>]`.
+///
+/// The `tc=` parameter is additive (appended only when the tailcat tunnel is
+/// running); clients that don't know it tolerate the unknown query param.
 ///
 /// Query values are percent-encoded defensively. Generated values (dotted-quad
 /// IPv4 hosts, colon-separated hex fingerprints, 64-char hex tokens) pass
@@ -34,17 +37,22 @@ pub(crate) fn build_pairing_uri(
     port: u16,
     fingerprint: &str,
     token: &str,
+    tc_address: Option<&str>,
 ) -> String {
     let hosts = hosts
         .iter()
         .map(|h| encode_query_value(h))
         .collect::<Vec<_>>()
         .join(",");
-    format!(
+    let mut uri = format!(
         "intent://pair?v={PAIRING_PAYLOAD_VERSION}&host={hosts}&port={port}&fp={}&token={}",
         encode_query_value(fingerprint),
         encode_query_value(token)
-    )
+    );
+    if let Some(tc) = tc_address {
+        let _ = write!(uri, "&tc={}", encode_query_value(tc));
+    }
+    uri
 }
 
 /// Percent-encode a query value, passing through unreserved characters
@@ -149,15 +157,30 @@ async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
                 .to_string(),
         ));
     }
-    let uri = build_pairing_uri(&hosts, port, &cert.fingerprint256, &token);
-    Ok(json!({
+    let uri = build_pairing_uri(
+        &hosts,
+        port,
+        &cert.fingerprint256,
+        &token,
+        snapshot.tc_address.as_deref(),
+    );
+    let mut result = json!({
         "uri": uri,
         "hosts": hosts,
         "port": port,
         "fingerprint": cert.fingerprint256,
         "token": token,
         "version": PAIRING_PAYLOAD_VERSION,
-    }))
+    });
+    // Additive tunnel route (presence-detected): omitted when the tunnel is
+    // disabled or down, so older clients are unaffected.
+    if let Some(tc) = &snapshot.tc_address {
+        result
+            .as_object_mut()
+            .expect("get_info_json literal is an object")
+            .insert("tcAddress".into(), tc.clone().into());
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

@@ -55,16 +55,25 @@ fn temp_data_dir() -> PathBuf {
 
 fn spawn_serve(data_dir: &Path) -> Child {
     common::enable_ws_api(data_dir);
-    spawn_serve_inner(data_dir)
+    spawn_serve_inner(data_dir, &[])
 }
 
 /// Spawn without enabling the WSS listener — the daemon serves UDS only, so
 /// `pairing.getInfo` fails with the listener-down error.
 fn spawn_serve_wss_disabled(data_dir: &Path) -> Child {
-    spawn_serve_inner(data_dir)
+    spawn_serve_inner(data_dir, &[])
 }
 
-fn spawn_serve_inner(data_dir: &Path) -> Child {
+/// Spawn with the WSS listener enabled and a fake tailcat sidecar wired in
+/// via the `INTENTD_TAILCAT_BIN` seam, so `server.tunnel.enabled = true` can
+/// report a stable tc address without the real binary.
+fn spawn_serve_with_tailcat(data_dir: &Path, tailcat_bin: &Path) -> Child {
+    common::enable_ws_api(data_dir);
+    let bin = tailcat_bin.to_string_lossy().to_string();
+    spawn_serve_inner(data_dir, &[("INTENTD_TAILCAT_BIN", &bin)])
+}
+
+fn spawn_serve_inner(data_dir: &Path, extra_env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -78,7 +87,39 @@ fn spawn_serve_inner(data_dir: &Path) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     cmd.env("MOCK_ACP_HOST", "localhost:0");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     cmd.spawn().expect("spawn intentd serve")
+}
+
+/// Write an executable fake-tailcat script into `dir`: `genkey` creates the
+/// key file, `serve` prints the JSON address derived from the key file's
+/// content and sleeps (mirrors the seam in `e2e_wss_runtime_control.rs`).
+fn write_fake_tailcat(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-tailcat.sh");
+    let script = r#"#!/bin/sh
+key=""
+for arg in "$@"; do
+  case "$arg" in
+    --key=*) key="${arg#--key=}" ;;
+  esac
+done
+case "$1" in
+  genkey)
+    printf 'key-%s' $$ > "$key"
+    ;;
+  serve)
+    printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
+    sleep 600
+    ;;
+esac
+"#;
+    std::fs::write(&path, script).expect("write fake tailcat");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake tailcat");
+    path
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -333,6 +374,58 @@ async fn pairing_get_info_over_uds() {
         hosts.join(",")
     );
     assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
+
+    // Tunnel disabled (default): tcAddress is ABSENT, not null, and the
+    // exact-URI assertion above already proves there is no tc= param.
+    assert!(result.get("tcAddress").is_none());
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
+    let data_dir = temp_data_dir();
+    // Persist server.tunnel.enabled BEFORE boot so the daemon auto-starts the
+    // (fake) sidecar; enable_ws_api inside the spawn helper appends the
+    // [server.wsApi] section to the same config.
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server.tunnel]\nenabled = true\n",
+    )
+    .expect("seed config.toml with server.tunnel.enabled");
+    let tailcat_bin = write_fake_tailcat(&data_dir);
+    let mut daemon = Daemon {
+        child: spawn_serve_with_tailcat(&data_dir, &tailcat_bin),
+        data_dir: data_dir.clone(),
+    };
+    let (port, fp) = boot(&data_dir).await;
+    let socket = data_dir.join("intentd.sock");
+
+    // pairing.getInfo over UDS carries the tunnel address and appends it to
+    // the URI as the additive tc= param.
+    let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    let result = &response["result"];
+    let tc = result["tcAddress"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tcAddress present: {result}"));
+    assert!(tc.starts_with("tc-"), "fake sidecar address: {tc}");
+    let uri = result["uri"].as_str().unwrap();
+    assert!(
+        uri.ends_with(&format!("&tc={tc}")),
+        "tc= is the additive last URI param: {uri}"
+    );
+
+    // server.pairingInfo over UDS carries the same field.
+    let response = uds_rpc(&socket, 3, "server.pairingInfo", json!({})).await;
+    assert_eq!(response["result"]["tcAddress"].as_str().unwrap(), tc);
+
+    // system.status serves it to remote (WSS) clients too, alongside
+    // localIps, so a connected client can refresh its stored tunnel route.
+    let frame =
+        json!({ "jsonrpc": "2.0", "id": 4, "method": "system.status", "params": {} }).to_string();
+    let status = wss_call(port, client_config(&fp), &frame).await;
+    assert_eq!(status["result"]["tcAddress"].as_str().unwrap(), tc);
 
     daemon.child.kill().ok();
 }

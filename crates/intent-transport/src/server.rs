@@ -37,6 +37,10 @@ pub struct PairingSnapshot {
     /// (`server.bindAddress`; one listener per address), when known — drives
     /// which hosts the pairing payload advertises (`pairing_hosts`).
     pub bind_addresses: Option<Vec<std::net::IpAddr>>,
+    /// The tailcat tunnel's stable `tc...` address (`server.tunnel.*`), when
+    /// the sidecar is running. Rides `server.pairingInfo` / `pairing.getInfo`
+    /// as the additive `tcAddress` field (omitted when `None`).
+    pub tc_address: Option<String>,
 }
 
 /// The two server methods, once classified.
@@ -125,7 +129,7 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let hostname = crate::host_env::local_hostname();
     let pretty_hostname = crate::host_env::pretty_hostname();
 
-    Ok(json!({
+    let mut result = json!({
         "token": token,
         "certFingerprint": cert.fingerprint256,
         "port": snapshot.port,
@@ -133,7 +137,16 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
         "localIps": local_ips,
         "hostname": hostname,
         "prettyHostname": pretty_hostname,
-    }))
+    });
+    // Additive tunnel route (presence-detected): omitted when the tunnel is
+    // disabled or down, so older clients are unaffected.
+    if let Some(tc) = &snapshot.tc_address {
+        result
+            .as_object_mut()
+            .expect("pairing_info_json literal is an object")
+            .insert("tcAddress".into(), tc.clone().into());
+    }
+    Ok(result)
 }
 
 /// Build the `server.rotateToken` result JSON. Returns an error when `INTENTD_AUTH_TOKEN` is set.

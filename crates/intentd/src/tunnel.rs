@@ -153,6 +153,17 @@ impl TunnelSupervisor {
         self.state.lock().await.as_ref().map(|r| r.address.clone())
     }
 
+    /// Current `tc...` address without awaiting: `None` when stopped or when
+    /// the state lock is momentarily held. For synchronous read paths
+    /// (`system.status`) that must not block — mirrors the `try_lock` fallback
+    /// used for port/fingerprint there, self-correcting on the next call.
+    pub fn address_now(&self) -> Option<String> {
+        self.state
+            .try_lock()
+            .ok()
+            .and_then(|s| s.as_ref().map(|r| r.address.clone()))
+    }
+
     /// Generate the persisted key on first use (`tailcat genkey`). The key
     /// derives the stable `tc...` address; `--fixed-region` bakes the DERP
     /// rendezvous region in so restarts land in the same place without

@@ -741,7 +741,7 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
         "pair --select-endpoints should succeed: {stderr}"
     );
     assert!(
-        stderr.contains("Which address(es)"),
+        stderr.contains("Where should the daemon accept connections?"),
         "should show the multi-select picker: {stderr}"
     );
     assert!(
@@ -914,7 +914,7 @@ async fn pair_select_endpoints_fails_when_daemon_down() {
         "select-endpoints requires a running daemon: {stderr}"
     );
     assert!(
-        !stderr.contains("Which address(es)"),
+        !stderr.contains("Where should the daemon accept connections?"),
         "must not show the picker without a daemon: {stderr}"
     );
 
