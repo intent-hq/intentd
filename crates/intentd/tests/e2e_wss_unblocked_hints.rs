@@ -697,7 +697,7 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
     // The flow audits the implementor's IMMEDIATE report wake — disable the
-    // report debounce (default 10s), which would otherwise park that wake and
+    // report debounce (default 30s), which would otherwise park that wake and
     // fold it into the terminal wake.
     let upd = wss_rpc(
         &mut rpc,

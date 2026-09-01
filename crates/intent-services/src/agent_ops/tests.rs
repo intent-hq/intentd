@@ -67,7 +67,7 @@ pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::Se
         .apply(&[
             ("providers.active".into(), json!("auggie")),
             ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
-            // The report-debounce default (10s) would park progress wakes on
+            // The report-debounce default (30s) would park progress wakes on
             // the parent's queue for the whole window; the suites assert the
             // legacy immediate-wake shape, so disable it here. Debounce tests
             // opt back in with an explicit non-zero value.

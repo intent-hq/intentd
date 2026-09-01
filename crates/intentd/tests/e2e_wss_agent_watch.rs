@@ -1850,7 +1850,7 @@ async fn in_turn_progress_is_followed_by_terminal_wake_over_wss() {
     let ws_id = setup.ws_id.clone();
 
     // This scenario audits the IMMEDIATE in-turn progress wake — disable the
-    // report debounce (default 10s), which would otherwise park the wake and
+    // report debounce (default 30s), which would otherwise park the wake and
     // fold it into the terminal wake.
     let upd = wss_rpc(
         &mut setup.rpc,
@@ -2014,7 +2014,7 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
     let ws_id = setup.ws_id.clone();
 
     // The scenario audits the immediate report wake on the spawner — disable
-    // the report debounce (default 10s) so the wake lands as soon as the
+    // the report debounce (default 30s) so the wake lands as soon as the
     // child reports.
     let upd = wss_rpc(
         &mut setup.rpc,
@@ -2299,7 +2299,7 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
     let ws_id = setup.ws_id.clone();
 
     // This scenario audits the IMMEDIATE per-report wake shape — disable the
-    // report debounce (default 10s), which would otherwise park the wakes on
+    // report debounce (default 30s), which would otherwise park the wakes on
     // the parent's queue and fold them into the terminal wake.
     let upd = wss_rpc(
         &mut setup.rpc,
