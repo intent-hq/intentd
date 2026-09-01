@@ -250,6 +250,21 @@ if ($serviceMode -eq 'yes') {
         #      dir, so it ties the chain to the one supervisor of the data
         #      dir being checked. A missing, malformed or stale file is no
         #      witness, hence no allowance.
+        #   4. No other running task reports that same EnginePID, and our
+        #      task is running exactly once. Requirements 2 and 3 tie the
+        #      chain to the *engine* and to the *data dir*, but neither ties
+        #      it to the *task*: the foreign task on a shared engine can
+        #      itself be the one serving this data dir - its sitter wrote
+        #      this dir's sitter.pid, its tree hangs off the same engine, so
+        #      2 and 3 both hold - yet restarting our task would not free
+        #      the dir. Any task whose tree an engine hosts reports that
+        #      engine's pid, so "some other running task reports our
+        #      EnginePID" is exactly "the engine hosts trees a restart of
+        #      our task would not touch": the walked ancestry then proves
+        #      nothing, and the allowance is forfeited. Two running
+        #      instances of our own task are indistinguishable the same way
+        #      (which one's tree does the restart replace?), hence equally
+        #      no allowance.
         # A daemon the task scheduler does not control - a manual `intentd
         # serve`, another task's tree - keeps being refused below, and so
         # does everything when the scheduler cannot be asked at all.
@@ -259,12 +274,27 @@ if ($serviceMode -eq 'yes') {
             $scheduler = New-Object -ComObject 'Schedule.Service'
             $scheduler.Connect()
             # 1 = TASK_ENUM_HIDDEN: include hidden tasks, harmless for ours.
-            foreach ($runningTask in @($scheduler.GetRunningTasks(1))) {
+            $runningTasks = @($scheduler.GetRunningTasks(1))
+            foreach ($runningTask in $runningTasks) {
                 if ($runningTask.Path -eq "\$taskName") {
+                    if ($taskEnginePid -ne 0) {
+                        # A second running instance of our task: requirement 4.
+                        $taskEnginePid = -1
+                        break
+                    }
                     $taskEnginePid = [int]$runningTask.EnginePID
-                    break
                 }
             }
+            if ($taskEnginePid -gt 0) {
+                foreach ($runningTask in $runningTasks) {
+                    if ($runningTask.Path -ne "\$taskName" -and [int]$runningTask.EnginePID -eq $taskEnginePid) {
+                        # A foreign task shares the engine: requirement 4.
+                        $taskEnginePid = 0
+                        break
+                    }
+                }
+            }
+            if ($taskEnginePid -lt 0) { $taskEnginePid = 0 }
         } catch {
             # No task scheduler to ask (or access denied): no allowance.
             $taskEnginePid = 0

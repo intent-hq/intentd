@@ -159,20 +159,26 @@ fn run_owner_check_with(
 /// started-at-seconds.
 struct StubProc(u32, u32, i64);
 
+/// A running task for the stub scheduler: leaf name, full path, engine pid.
+struct StubTask(&'static str, &'static str, u32);
+
 /// PowerShell shims for the Windows-only service queries the upgrade
 /// allowance makes: a `New-Object` answering the `Schedule.Service` COM
-/// lookup with one running task (leaf name `task_name`, full path
-/// `task_path`, engine pid `engine_pid`), a `Get-CimInstance` serving
-/// `Win32_Process` rows from a fixed [`StubProc`] table, and a `Get-Process`
-/// that treats every pid in that table as live (the fake tree's pids do not
-/// run on the test host) while delegating any other pid — notably the real
-/// `LiveProcess` owner — to the genuine cmdlet. Functions shadow cmdlets in
-/// PowerShell, so the extracted block picks these up unmodified — the same
-/// PATH-stub trick `install_sh_startup.rs` plays on systemctl/launchctl.
-fn service_stubs(task_name: &str, task_path: &str, engine_pid: u32, procs: &[StubProc]) -> String {
+/// lookup with a fixed running-task table (see [`StubTask`]), a
+/// `Get-CimInstance` serving `Win32_Process` rows from a fixed [`StubProc`]
+/// table, and a `Get-Process` that treats every pid in that table as live
+/// (the fake tree's pids do not run on the test host) while delegating any
+/// other pid — notably the real `LiveProcess` owner — to the genuine cmdlet.
+/// Functions shadow cmdlets in PowerShell, so the extracted block picks these
+/// up unmodified — the same PATH-stub trick `install_sh_startup.rs` plays on
+/// systemctl/launchctl.
+fn service_stubs_tasks(tasks: &[StubTask], procs: &[StubProc]) -> String {
     const TEMPLATE: &str = r#"
 $StubProcTable = @(
 @ROWS@
+)
+$StubTaskTable = @(
+@TASKS@
 )
 function Get-CimInstance {
     param([string]$ClassName, [string]$Filter, [string]$ErrorAction)
@@ -193,8 +199,8 @@ function New-Object {
     Add-Member -InputObject $service -MemberType ScriptMethod -Name Connect -Value { }
     Add-Member -InputObject $service -MemberType ScriptMethod -Name GetRunningTasks -Value {
         param($flags)
-        @([pscustomobject]@{ Name = '@TASKNAME@'; Path = '@TASKPATH@'; EnginePID = @ENGINEPID@ })
-    }
+        $StubTaskTable
+    }.GetNewClosure()
     return $service
 }
 "#;
@@ -208,11 +214,26 @@ function New-Object {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let task_rows = tasks
+        .iter()
+        .map(|StubTask(name, path, engine_pid)| {
+            format!("    [pscustomobject]@{{ Name = '{name}'; Path = '{path}'; EnginePID = {engine_pid} }}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     TEMPLATE
         .replace("@ROWS@", &rows)
-        .replace("@TASKNAME@", task_name)
-        .replace("@TASKPATH@", task_path)
-        .replace("@ENGINEPID@", &engine_pid.to_string())
+        .replace("@TASKS@", &task_rows)
+}
+
+/// [`service_stubs_tasks`] with a single running task — what most tests need.
+fn service_stubs(
+    task_name: &'static str,
+    task_path: &'static str,
+    engine_pid: u32,
+    procs: &[StubProc],
+) -> String {
+    service_stubs_tasks(&[StubTask(task_name, task_path, engine_pid)], procs)
 }
 
 /// The daemon's own pidfile rule, mirrored from `read_pid`
@@ -555,6 +576,79 @@ fn a_foreign_tasks_daemon_on_a_shared_engine_is_refused() {
     assert!(
         matches!(verdict, Verdict::Refused(_)),
         "a foreign task's daemon on a shared engine must be refused, got {verdict:?}"
+    );
+}
+
+/// The harder shared-engine conflict: the foreign task is itself the one
+/// serving this data dir, so its sitter wrote this dir's sitter.pid and the
+/// owner's chain crosses that pid on the way to the shared engine — the
+/// witness and the ancestry both hold, yet restarting our task would not
+/// free the dir. The scheduler reporting another running task on our
+/// task's engine is what forfeits the allowance.
+#[test]
+fn a_foreign_task_serving_this_data_dir_on_a_shared_engine_is_refused() {
+    let Some(pwsh) = pwsh() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let owner = LiveProcess::spawn();
+    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+    let engine: u32 = 1_900_000_001;
+    let foreign_sitter: u32 = 1_900_000_002;
+    // The foreign supervisor serves this data dir: its pid is the witness.
+    write_sitter_pid_file(&data_dir, &format!("{foreign_sitter}\n"));
+    let stubs = service_stubs_tasks(
+        &[
+            StubTask("intentd", "\\intentd", engine),
+            StubTask("other", "\\other", engine),
+        ],
+        &[
+            StubProc(owner.pid(), foreign_sitter, 20),
+            StubProc(foreign_sitter, engine, 10),
+            StubProc(engine, 4, 0),
+        ],
+    );
+
+    let (verdict, _) =
+        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    assert!(
+        matches!(verdict, Verdict::Refused(_)),
+        "a foreign task serving this data dir on a shared engine must be refused, got {verdict:?}"
+    );
+}
+
+/// Two running instances of our own task are indistinguishable — which
+/// one's tree does the restart replace? — so the allowance is forfeited
+/// even when the single walked chain looks sound.
+#[test]
+fn a_second_running_instance_of_our_task_forfeits_the_allowance() {
+    let Some(pwsh) = pwsh() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let owner = LiveProcess::spawn();
+    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+    let engine: u32 = 1_900_000_001;
+    let other_engine: u32 = 1_900_000_006;
+    let sitter: u32 = 1_900_000_002;
+    write_sitter_pid_file(&data_dir, &format!("{sitter}\n"));
+    let stubs = service_stubs_tasks(
+        &[
+            StubTask("intentd", "\\intentd", engine),
+            StubTask("intentd", "\\intentd", other_engine),
+        ],
+        &[
+            StubProc(owner.pid(), sitter, 20),
+            StubProc(sitter, engine, 10),
+            StubProc(engine, 4, 0),
+        ],
+    );
+
+    let (verdict, _) =
+        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    assert!(
+        matches!(verdict, Verdict::Refused(_)),
+        "two running instances of our task must forfeit the allowance, got {verdict:?}"
     );
 }
 
