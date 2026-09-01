@@ -2348,11 +2348,15 @@ async fn dispatch(
             let message = require_str_param(params, "message")?;
             let files = opt_str_array(params, "files");
             let user_requested = parse_bool(params, "userRequested");
+            // §5.6 extension (monorepo#2053 follow-up): optional `gitRootId`
+            // targets the commit at a registered git root; an unknown/foreign
+            // id is -32602, identical to the six root-scoped reads.
+            let git_root_id = opt_git_root_id(params);
             // The FE/transport path has no agent context, so no attribution
             // trailers are written here (mirrors the reference, which composes
             // attribution at the agent-context MCP layer).
             let r = api
-                .git_agent_commit(ws, message, None, None, files, user_requested)
+                .git_agent_commit(ws, message, None, None, files, user_requested, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({

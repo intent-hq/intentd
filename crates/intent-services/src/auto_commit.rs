@@ -274,6 +274,7 @@ impl Services {
                 linked_note_id.clone(),
                 None,
                 false,
+                None,
             )
             .await
         {

@@ -43,8 +43,9 @@ use intent_core::{
     TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
     TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRootId, WorkspaceId,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRoot,
+    WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
+    WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -1810,6 +1811,28 @@ impl Services {
             return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
         }
         Ok(Some(PathBuf::from(root.path)))
+    }
+
+    /// Find a registered secondary git root that contains every path in
+    /// `files` (relative paths joined to the root; existence-checked on disk).
+    /// Feeds the `git.agentCommit` remediation hint (monorepo#2053): when an
+    /// explicit primary-target commit set matches nothing, a root containing
+    /// the named files is the likely intended target. Best-effort — store or
+    /// filesystem errors just yield `None`.
+    async fn find_git_root_containing(
+        &self,
+        workspace_id: &WorkspaceId,
+        files: &[String],
+    ) -> Option<WorkspaceGitRoot> {
+        let roots = self
+            .store
+            .list_workspace_git_roots(workspace_id)
+            .await
+            .ok()?;
+        roots.into_iter().find(|root| {
+            let base = std::path::Path::new(&root.path);
+            files.iter().all(|f| base.join(f).exists())
+        })
     }
 
     /// Hydrate the in-memory script registry from the persisted definitions
@@ -10666,6 +10689,20 @@ fn git_commit_event(
             "files": files,
         }),
     }
+}
+
+/// Tag a git event payload with the registered secondary root it targeted
+/// (monorepo#2053): inserts an additive `gitRootId` field when `git_root_id`
+/// is present, and leaves the payload byte-identical for primary-root
+/// operations so existing consumers are unaffected.
+fn tag_git_root_id(mut event: NewEvent, git_root_id: Option<&WorkspaceGitRootId>) -> NewEvent {
+    if let (Some(id), Some(obj)) = (git_root_id, event.data.as_object_mut()) {
+        obj.insert(
+            "gitRootId".to_string(),
+            serde_json::Value::String(id.as_str().to_string()),
+        );
+    }
+    event
 }
 
 /// Build a `pr:linked` event for a workspace that just gained a PR link (§7.6).
@@ -23256,6 +23293,7 @@ impl WorkspaceApi for Services {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -23264,6 +23302,7 @@ impl WorkspaceApi for Services {
         linked_note_id: Option<NoteId>,
         files: Option<Vec<String>>,
         user_requested: bool,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<intent_core::GitAgentCommitResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -23277,9 +23316,22 @@ impl WorkspaceApi for Services {
                 .get_workspace(&workspace_id)
                 .await
                 .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
-            let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
-                Error::Internal("Failed to commit: workspace has no worktree".to_string())
-            })?;
+            // With a `git_root_id` the commit targets the registered
+            // secondary root (monorepo#2053); resolution shares
+            // `resolve_git_read_root` so an unknown/foreign id fails with the
+            // identical `Unknown git root: {id}` InvalidParams. `None` keeps
+            // the primary-worktree behavior (and error message) exactly.
+            let worktree = match git_root_id.as_ref() {
+                Some(_) => this
+                    .resolve_git_read_root(&ws, git_root_id.as_ref())
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Internal("Failed to commit: workspace has no worktree".to_string())
+                    })?,
+                None => git_ops::worktree_path(&ws).ok_or_else(|| {
+                    Error::Internal("Failed to commit: workspace has no worktree".to_string())
+                })?,
+            };
             // Commit-set selection (TS parity, monorepo#939): an explicit
             // `files` list is committed as-is; without one, a `userRequested`
             // checkpoint commits only the already-staged paths (plain
@@ -23291,12 +23343,24 @@ impl WorkspaceApi for Services {
             // a stale attribution row never resurrects a committed/reverted
             // file. Without an `agent_id` attribution is impossible, so the
             // commit is refused rather than sweeping the whole worktree.
+            let explicit_files = files.as_deref().is_some_and(|f| !f.is_empty());
             let (to_commit, needs_stage, attribution_filtered) = match files {
                 Some(f) if !f.is_empty() => {
                     git_ops::reject_submodule_internal_files(&worktree, &f)?;
                     (f, true, false)
                 }
                 _ if user_requested => (intent_git::commit::staged_paths(&worktree)?, false, false),
+                _ if git_root_id.is_some() => {
+                    // The file-tracking attribution pipeline only observes the
+                    // primary worktree, so an agent-initiated commit on a
+                    // secondary root cannot be attribution-filtered — require
+                    // an explicit commit set instead of sweeping the root.
+                    return Err(Error::Internal(
+                        "Agent-initiated commit on a registered git root requires an \
+                         explicit `files` list"
+                            .to_string(),
+                    ));
+                }
                 _ => {
                     let Some(agent) = agent_id.as_ref() else {
                         return Err(Error::Internal(
@@ -23367,13 +23431,40 @@ impl WorkspaceApi for Services {
             // into this commit. The `userRequested` staged-only checkpoint
             // commits the index as-is.
             let outcome = if needs_stage {
-                intent_git::commit::commit_paths_with_trailers(
+                match intent_git::commit::commit_paths_with_trailers(
                     &worktree,
                     &message,
                     agent_id.as_ref().map(AgentId::as_str),
                     linked_note_id.as_ref().map(NoteId::as_str),
                     &to_commit,
-                )?
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        // Remediation hint (monorepo#2053): a primary-target
+                        // commit whose explicit `files` match nothing, where
+                        // the paths exist under a registered secondary root,
+                        // was almost certainly aimed at that root — name it
+                        // and suggest `gitRootId` instead of a bare pathspec
+                        // error.
+                        if git_root_id.is_none()
+                            && explicit_files
+                            && format!("{e}").contains("did not match any files")
+                        {
+                            if let Some(root) = this
+                                .find_git_root_containing(&workspace_id, &to_commit)
+                                .await
+                            {
+                                return Err(Error::Internal(format!(
+                                    "{e}. The files exist under the registered git root \
+                                     {path} (id: {id}) — pass gitRootId to commit there.",
+                                    path = root.path,
+                                    id = root.id
+                                )));
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
             } else {
                 intent_git::commit::commit_with_trailers(
                     &worktree,
@@ -23414,15 +23505,27 @@ impl WorkspaceApi for Services {
             // `git:commit` mirrors the reserved `GitOperationEvent` FE shape;
             // `changes:git-status` feeds the FE bridge's `git:status-changed`
             // relay so the UI refreshes without a follow-up `git.status` read.
+            // Both carry an additive `gitRootId` for root-targeted commits
+            // (and the status payload is read from the target root).
             publish_event(
                 bus.as_ref(),
-                git_commit_event(&ws.id, &outcome.hash, &message, &outcome.files),
+                tag_git_root_id(
+                    git_commit_event(&ws.id, &outcome.hash, &message, &outcome.files),
+                    git_root_id.as_ref(),
+                ),
             )
             .await;
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(
+                bus.as_ref(),
+                tag_git_root_id(
+                    changes_git_status_event(&ws.id, &status_json),
+                    git_root_id.as_ref(),
+                ),
+            )
+            .await;
             Ok(intent_core::GitAgentCommitResult {
                 hash: outcome.hash,
                 files: outcome.files,

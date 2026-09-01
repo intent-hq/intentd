@@ -16,10 +16,10 @@
 
 use std::sync::Arc;
 
-use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, WorkspaceApi, WorkspaceGitRootId, WorkspaceId};
 use serde_json::{json, Value};
 
-use super::{map_err, opt_bool, opt_vec_str, req_str};
+use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -63,6 +63,12 @@ async fn commit(
     })?;
     let files = opt_vec_str(args, "files");
     let user_requested = opt_bool(args, "userRequested").unwrap_or(false);
+    // Optional `gitRootId` targets a registered secondary git root
+    // (monorepo#2053); empty/whitespace is treated as absent, matching the
+    // §5.6 reads' `opt_git_root_id` boundary parse.
+    let git_root_id = opt_str(args, "gitRootId")
+        .filter(|s| !s.trim().is_empty())
+        .map(WorkspaceGitRootId::from);
     let r = api
         .git_agent_commit(
             ws.clone(),
@@ -71,6 +77,7 @@ async fn commit(
             None,
             files,
             user_requested,
+            git_root_id,
         )
         .await
         .map_err(map_err)?;

@@ -14306,6 +14306,7 @@ mod pr {
 mod file_tracking {
     use super::*;
     use git2::{Repository, Signature};
+    use intent_core::WorkspaceGitRootId;
     use intent_store::NewTrackedChange;
 
     /// A self-cleaning git repository seeded with one commit.
@@ -14843,6 +14844,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14895,6 +14897,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14942,6 +14945,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -14962,7 +14966,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("dirty.txt"), "dirty\n").unwrap();
 
         let err = svc
-            .git_agent_commit(ws, "msg".to_string(), None, None, None, false)
+            .git_agent_commit(ws, "msg".to_string(), None, None, None, false, None)
             .await
             .unwrap_err();
         assert!(
@@ -14989,6 +14993,7 @@ mod file_tracking {
                 None,
                 Some(vec!["dirty.txt".to_string()]),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -15026,6 +15031,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -15067,6 +15073,7 @@ mod file_tracking {
                 None,
                 Some(vec!["sub/inner.txt".to_string()]),
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -15096,7 +15103,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("unstaged.txt"), "unstaged\n").unwrap();
 
         let r = svc
-            .git_agent_commit(ws, "checkpoint".to_string(), None, None, None, true)
+            .git_agent_commit(ws, "checkpoint".to_string(), None, None, None, true, None)
             .await
             .unwrap();
         assert_eq!(r.files, vec!["staged.txt".to_string()]);
@@ -15145,6 +15152,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -15251,6 +15259,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -15356,6 +15365,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -15396,6 +15406,7 @@ mod file_tracking {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -15409,6 +15420,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -15432,6 +15444,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -15483,6 +15496,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -15503,6 +15517,301 @@ mod file_tracking {
             st.files.is_empty(),
             "worktree clean after the move commit: {st:?}"
         );
+    }
+
+    /// Build a bus-wired service on `repo` plus a second repo registered as a
+    /// secondary git root, returning the registered root's id and path.
+    async fn svc_with_registered_root(
+        repo: &GitRepo,
+    ) -> (TempDb, Services, WorkspaceId, GitRepo, WorkspaceGitRootId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let svc = Services::new(store).with_event_bus(bus);
+        let secondary = init_git_repo();
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().to_string(),
+                AgentId::from("agent-reg"),
+            )
+            .await
+            .unwrap();
+        let root_id = WorkspaceGitRootId(row["id"].as_str().unwrap().to_string());
+        (tmp, svc, ws_id, secondary, root_id)
+    }
+
+    /// `git.agentCommit` with a `gitRootId` and explicit `files` commits in
+    /// the registered secondary root (pathspec-limited, with attribution
+    /// trailers), leaves the primary worktree untouched, and the emitted
+    /// `git:commit` / `changes:git-status` events carry the additive
+    /// `gitRootId` (with status read from the target root).
+    #[tokio::test]
+    async fn agent_commit_targets_registered_root_with_explicit_files() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("root.txt"), "in root\n").unwrap();
+        std::fs::write(repo.dir.join("primary.txt"), "in primary\n").unwrap();
+
+        let r = svc
+            .git_agent_commit(
+                ws.clone(),
+                "root work".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["root.txt".to_string()]),
+                false,
+                Some(root_id.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["root.txt".to_string()]);
+        assert_eq!(r.file_count, 1);
+
+        // The commit landed in the secondary root, not the primary worktree,
+        // and carries the attribution trailer.
+        let history = intent_git::history::history(&secondary.dir, 5).unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert!(history[0].message.contains("root work"));
+        assert_eq!(history[0].agent_id.as_deref(), Some("agent-a"));
+        assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 1);
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        let dirty: Vec<&str> = st.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(dirty.contains(&"primary.txt"), "{dirty:?}");
+
+        // Both events carry the additive `gitRootId`, and the status payload
+        // reflects the (now-clean) target root.
+        let commits = svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].data["gitRootId"], root_id.as_str());
+        let statuses = svc
+            .store()
+            .events_by_type(&ws, "changes:git-status", 10)
+            .await
+            .unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].data["gitRootId"], root_id.as_str());
+        assert_eq!(statuses[0].data["status"]["files"], serde_json::json!([]));
+    }
+
+    /// A `userRequested` `git.agentCommit` with a `gitRootId` and no `files`
+    /// commits the target root's staged index as-is (plain `git commit`
+    /// semantics against the secondary root).
+    #[tokio::test]
+    async fn agent_commit_root_user_requested_commits_staged_index() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("staged.txt"), "staged\n").unwrap();
+        std::fs::write(secondary.dir.join("unstaged.txt"), "unstaged\n").unwrap();
+        let git = git2::Repository::open(&secondary.dir).unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(std::path::Path::new("staged.txt")).unwrap();
+        index.write().unwrap();
+
+        let r = svc
+            .git_agent_commit(
+                ws,
+                "checkpoint".to_string(),
+                None,
+                None,
+                None,
+                true,
+                Some(root_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["staged.txt".to_string()]);
+        let st = intent_git::status::status(&secondary.dir).unwrap();
+        let dirty: Vec<&str> = st.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(dirty.contains(&"unstaged.txt"), "{dirty:?}");
+        assert!(!dirty.contains(&"staged.txt"), "{dirty:?}");
+    }
+
+    /// An agent-initiated (non-`userRequested`) `git.agentCommit` with a
+    /// `gitRootId` but no explicit `files` is refused: the attribution
+    /// pipeline only observes the primary worktree, so a secondary-root
+    /// commit set cannot be attribution-filtered.
+    #[tokio::test]
+    async fn agent_commit_root_without_files_is_rejected() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("root.txt"), "in root\n").unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "sweep attempt".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+                Some(root_id),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("requires an explicit `files` list"),
+            "got: {err}"
+        );
+        assert_eq!(
+            intent_git::history::history(&secondary.dir, 5)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// An unknown `gitRootId` — or one registered to a different workspace —
+    /// fails with the identical `Unknown git root: {id}` `InvalidParams`
+    /// (`resolve_git_read_root` parity; a foreign root is indistinguishable
+    /// from a nonexistent one).
+    #[tokio::test]
+    async fn agent_commit_rejects_unknown_and_foreign_root_ids() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, _secondary, _root_id) = svc_with_registered_root(&repo).await;
+
+        let unknown = WorkspaceGitRootId::new();
+        let err = svc
+            .git_agent_commit(
+                ws.clone(),
+                "msg".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["a.txt".to_string()]),
+                false,
+                Some(unknown.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "expected -32602, got: {err}"
+        );
+        assert!(
+            format!("{err}").ends_with(&format!("Unknown git root: {unknown}")),
+            "got: {err}"
+        );
+
+        // A root registered to ANOTHER workspace fails with the same message.
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        let foreign_repo = init_git_repo();
+        let ts = now_iso();
+        let foreign = intent_core::WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: other_ws,
+            path: foreign_repo.dir.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        svc.store()
+            .upsert_workspace_git_root(&foreign)
+            .await
+            .unwrap();
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "msg".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["a.txt".to_string()]),
+                false,
+                Some(foreign.id.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "expected -32602, got: {err}"
+        );
+        assert!(
+            format!("{err}").ends_with(&format!("Unknown git root: {}", foreign.id)),
+            "got: {err}"
+        );
+    }
+
+    /// Remediation hint (monorepo#2053): a primary-target commit whose
+    /// explicit `files` match nothing, where the paths exist under a
+    /// registered secondary root, errors with the root's path/id and suggests
+    /// passing `gitRootId`.
+    #[tokio::test]
+    async fn agent_commit_primary_miss_hints_at_registered_root() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("root-only.txt"), "in root\n").unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "misdirected".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["root-only.txt".to_string()]),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("did not match any files"), "got: {msg}");
+        assert!(
+            msg.contains(
+                &secondary
+                    .dir
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            ),
+            "hint names the root path, got: {msg}"
+        );
+        assert!(msg.contains(root_id.as_str()), "hint names the id: {msg}");
+        assert!(msg.contains("gitRootId"), "hint suggests gitRootId: {msg}");
+    }
+
+    /// Primary-path regression: with `git_root_id: None` an explicit-files
+    /// miss that matches NO registered root keeps the bare pathspec error —
+    /// no hint is appended.
+    #[tokio::test]
+    async fn agent_commit_primary_miss_without_matching_root_keeps_bare_error() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, _secondary, _root_id) = svc_with_registered_root(&repo).await;
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "misdirected".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["nowhere.txt".to_string()]),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("did not match any files"), "got: {msg}");
+        assert!(!msg.contains("gitRootId"), "no hint expected: {msg}");
     }
 
     /// `git.commits` returns the §5.5 `{ items, nextToken }` envelope of

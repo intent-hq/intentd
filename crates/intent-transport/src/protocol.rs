@@ -314,13 +314,21 @@
 //! import` / `intentd import-legacy` CLI subcommands and the first-boot
 //! auto-import in `serve`. 9.0 already shipped, so the restoration lands as
 //! an additive minor bump rather than a rollback of 9.0. Method catalog
-//! grows by one fast-path method — 298 router methods, 338 total.
+//! grows by one fast-path method — 298 router methods, 338 total. Version
+//! 9.2 adds the optional `gitRootId` param to `git.agentCommit` (additive;
+//! §5.6, monorepo#2053 follow-up): the commit targets the registered
+//! secondary git root instead of the workspace worktree, resolved exactly
+//! like the six root-scoped reads (empty/whitespace-only treated as absent;
+//! unknown/foreign id → `-32602` "Unknown git root: <id>"), and the
+//! resulting `git:commit` / `changes:git-status` events carry an additive
+//! `gitRootId` field. No method-catalog change — 298 router methods, 338
+//! total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.1";
+pub const PROTOCOL_VERSION: &str = "9.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

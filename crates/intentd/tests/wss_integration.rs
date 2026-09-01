@@ -7663,6 +7663,169 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `git.agentCommit` targeted at a registered secondary git root over WSS
+/// (monorepo#2053 follow-up): with `gitRootId` + an explicit `files` list the
+/// commit lands in the nested repo (its HEAD advances, the primary repo is
+/// untouched), the response carries the §5.6 `{ ok, hash, files, fileCount }`
+/// envelope, and an unknown `gitRootId` is `-32602` with the same message as
+/// the root-scoped reads.
+#[tokio::test]
+async fn wss_git_agent_commit_in_registered_root_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed the primary repo with one commit and a nested repo inside it.
+    let repo_dir = test_tempdir("intentd-wssrootcommit-");
+    let repo = repo_dir.path().to_path_buf();
+    let nested = repo.join("vendor/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let git = |dir: &std::path::PathBuf, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    let rev_parse_head = |dir: &std::path::PathBuf| -> String {
+        String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    };
+    for dir in [&repo, &nested] {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git(dir, &["add", "seed.txt"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    }
+
+    // Create a workspace pointing at the primary repo.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS rootCommit WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // Register the nested repo as a git root directly through the store.
+    let ts = now_iso();
+    let root = intent_core::WorkspaceGitRoot {
+        id: intent_core::WorkspaceGitRootId::new(),
+        workspace_id: WorkspaceId::from(ws_id.as_str()),
+        path: nested.to_string_lossy().into_owned(),
+        source: intent_core::WorkspaceGitRootSource::Agent,
+        repo_owner: None,
+        repo_name: None,
+        registered_by_agent_ids: vec![intent_core::AgentId::from("agent-1")],
+        registered_commit_sha: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        pull_requests: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    srv.store
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("register root");
+
+    // Dirty the nested repo, then commit it through the workspace with
+    // `gitRootId` + an explicit `files` list.
+    std::fs::write(nested.join("root-change.txt"), "hi\n").unwrap();
+    let nested_head_before = rev_parse_head(&nested);
+    let primary_head_before = rev_parse_head(&repo);
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.agentCommit","params":{{"workspaceId":"{ws_id}","message":"root commit","files":["root-change.txt"],"gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    // Response envelope shape (§5.6): { ok, hash, files, fileCount }.
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 2);
+    assert_eq!(resp["result"]["ok"], serde_json::json!(true));
+    assert_eq!(
+        resp["result"]["files"],
+        serde_json::json!(["root-change.txt"])
+    );
+    assert_eq!(resp["result"]["fileCount"], serde_json::json!(1));
+    let hash = resp["result"]["hash"].as_str().expect("commit hash");
+
+    // The commit landed in the nested repo: HEAD advanced to the reported
+    // hash with the requested message.
+    let nested_head_after = rev_parse_head(&nested);
+    assert_ne!(
+        nested_head_after, nested_head_before,
+        "nested HEAD advanced"
+    );
+    assert_eq!(nested_head_after, hash, "reported hash is the nested HEAD");
+    let msg = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&nested)
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .expect("git log")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    assert_eq!(msg, "root commit");
+
+    // The primary repo is untouched: HEAD unchanged, nothing staged.
+    assert_eq!(rev_parse_head(&repo), primary_head_before);
+    let staged = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .expect("git diff");
+    assert!(
+        staged.stdout.is_empty(),
+        "primary index untouched: {:?}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+
+    // Unknown gitRootId → -32602 with the same message as the scoped reads,
+    // and no commit lands anywhere.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.agentCommit","params":{{"workspaceId":"{ws_id}","message":"nope","files":["root-change.txt"],"gitRootId":"nope"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+    assert_eq!(rev_parse_head(&nested), nested_head_after);
+    assert_eq!(rev_parse_head(&repo), primary_head_before);
+
+    srv.ws.stop().await;
+}
+
 /// `git.diffs` with the §5.6 `paths` narrowing param over WSS: the daemon
 /// prunes the unstaged walk to exactly the requested workspace-relative files,
 /// the legacy single `path` unions with `paths`, an absolute path under the
