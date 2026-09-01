@@ -2771,7 +2771,7 @@ mod tests {
     }
 
     /// `agents.reportToParentDebounceSeconds` is a TOML-backed number
-    /// (minimum 0 = disabled/immediate wake, no maximum, default 10)
+    /// (minimum 0 = disabled/immediate wake, no maximum, default 30)
     /// registered in `KNOWN_PATHS`, and its catalog default matches the
     /// schema default so the FE never shows a default the daemon does not
     /// use.
@@ -2789,10 +2789,10 @@ mod tests {
                 max: None
             }
         ));
-        assert_eq!(def.default_value, Some(json!(10.0)));
+        assert_eq!(def.default_value, Some(json!(30.0)));
         assert_eq!(
             intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
-            10
+            30
         );
         assert_eq!(
             SettingsFile::default()
