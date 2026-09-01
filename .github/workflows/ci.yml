@@ -409,9 +409,12 @@ jobs:
       # actually execute. GitHub-hosted Ubuntu runners (the burst labels)
       # preinstall pwsh, so this is a no-op there; on tinybox the pinned
       # tarball is unpacked once into a per-slot dir (keyed on $RUNNER_NAME
-      # like the other per-slot dirs, ~200 MiB, reused across runs — per-slot
+      # like the other per-slot dirs, ~180 MiB, reused across runs — per-slot
       # so concurrent first-time installs on the 8 shared slots cannot
       # clobber each other's downloads, the monorepo#1239 failure mode).
+      # The cache probe runs the binary, so an executable-but-broken cache
+      # self-heals by reinstalling, and the whole slot dir is wiped before a
+      # (re)install so a version bump never strands old $version dirs.
       - name: Provision PowerShell (pwsh) if missing
         run: |
           set -euo pipefail
@@ -421,8 +424,10 @@ jobs:
           fi
           version=7.4.6
           sha256=6f6015203c47806c5cc444c19d8ed019695e610fbd948154264bf9ca8e157561
-          dest="$HOME/ci-pwsh/${RUNNER_NAME:-local}/$version"
-          if [ ! -x "$dest/pwsh" ]; then
+          slotdir="$HOME/ci-pwsh/${RUNNER_NAME:-local}"
+          dest="$slotdir/$version"
+          if ! "$dest/pwsh" --version >/dev/null 2>&1; then
+            rm -rf "$slotdir"
             tmp=$(mktemp -d)
             curl -fsSL --retry 3 -o "$tmp/pwsh.tar.gz" \
               "https://github.com/PowerShell/PowerShell/releases/download/v${version}/powershell-${version}-linux-x64.tar.gz"
