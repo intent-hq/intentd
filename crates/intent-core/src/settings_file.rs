@@ -1518,7 +1518,7 @@ idleReapMinutes = 10
 # finishes its turn within the window produces one combined wake instead of
 # two (0 disables the debounce -- immediate wake; read live per call, no
 # restart required).
-reportToParentDebounceSeconds = 10
+reportToParentDebounceSeconds = 30
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
 flushQueuedMessages = "all"

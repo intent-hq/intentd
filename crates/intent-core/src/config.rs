@@ -46,7 +46,7 @@ pub const DEFAULT_MAX_TOP_LEVEL_AGENTS: u32 = 20;
 /// one combined wake instead of two; `0` disables the debounce (legacy
 /// immediate wake). Read live from the settings snapshot at each call — no
 /// restart required.
-pub const DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS: u32 = 10;
+pub const DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS: u32 = 30;
 
 /// Default ephemeral-event retention TTL in hours (`events.streamRetentionHours`,
 /// §10.2); `0` disables the retention/compaction sweep entirely. Defaults to 72h
