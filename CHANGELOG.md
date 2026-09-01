@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.4] - 2026-09-01
+
+### 🐛 Bug Fixes
+
+- Suppress verbatim report repeat in terminal completion wake ([#1635](https://github.com/intent-hq/intentd/pull/1635))
+
+
 ## [0.9.3] - 2026-09-01
 
 ### 🚀 Features

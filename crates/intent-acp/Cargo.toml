@@ -1,6 +1,6 @@
 [package]
 name = "intent-acp"
-version = "0.9.3"
+version = "0.9.4"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,17 +8,17 @@ license.workspace = true
 description = "ACP client, session multiplexing, and agent→BE MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.3" }
+intent-core = { path = "../intent-core", version = "0.9.4" }
 # Best-effort propose-time base-ref validation + repo-default-branch lookup
 # for chief workspace-create proposals (monorepo#761). `intent-git` depends
 # only on `intent-core`, so this edge introduces no dependency cycle.
-intent-git = { path = "../intent-git", version = "0.9.3" }
-intent-providers = { path = "../intent-providers", version = "0.9.3" }
+intent-git = { path = "../intent-git", version = "0.9.4" }
+intent-providers = { path = "../intent-providers", version = "0.9.4" }
 # WSAPI-2: the workspace_api MCP tool runs agent-supplied JavaScript through
 # the QuickJS engine in intent-js. Non-optional so the tool is always wired
 # on the daemon MCP server (the intentd binary's own `js-engine` feature
 # separately gates its `js-eval` CLI subcommand only).
-intent-js = { path = "../intent-js", version = "0.9.3" }
+intent-js = { path = "../intent-js", version = "0.9.4" }
 agent-client-protocol = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -39,7 +39,7 @@ git2 = { workspace = true }
 # Integration tests drive the client-served `terminal/*` handlers against the
 # real unified PTY host. `intent-pty` depends only on `intent-core`, so this
 # dev-only edge introduces no dependency cycle.
-intent-pty = { path = "../intent-pty", version = "0.9.3" }
+intent-pty = { path = "../intent-pty", version = "0.9.4" }
 tempfile = "3"
 # `ws.host.exec` binding tests drive the real exec semantics (spawn, timeout
 # reap, cwd containment) through the `WorkspaceApi::host_exec` seam.
