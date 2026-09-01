@@ -503,13 +503,46 @@ service_main_pid() {
   fi
 }
 
+# Elapsed seconds pid $1 has been running, from `ps -o etime=` (POSIX, so it
+# reads the same on Linux and macOS: [[dd-]hh:]mm:ss). Prints nothing when
+# the pid is gone or the field does not parse — "unknown", which callers
+# must treat as a broken chain, never as zero.
+pid_elapsed() {
+  ps -o etime= -p "$1" 2>/dev/null | awk '
+    NR == 1 {
+      t = $1
+      days = 0
+      if (t ~ /^[0-9]+-/) {
+        days = substr(t, 1, index(t, "-") - 1)
+        t = substr(t, index(t, "-") + 1)
+      }
+      if (t !~ /^[0-9]+:[0-9]+(:[0-9]+)?$/) exit
+      n = split(t, p, ":")
+      s = 0
+      for (i = 1; i <= n; i++) s = s * 60 + p[i]
+      print days * 86400 + s
+    }'
+}
+
 # True when pid $1 is pid $2 itself or a descendant of it. Walks the parent
 # chain via `ps -o ppid=` (POSIX, so it reads the same on Linux and macOS),
 # bounded so a recycled or cyclic ppid chain cannot loop the installer. The
 # walk stops at pid 1 without matching it: everything hangs under init, so
 # reaching it proves nothing about the service.
+#
+# Each hop is guarded against pid reuse: between reading a child's ppid and
+# probing that parent, the parent can exit and an unrelated new process can
+# be handed its pid. A real parent has been running at least as long as its
+# child, so a "parent" younger than its child holds a recycled pid and the
+# chain is broken there — ancestry beyond it proves nothing. Equal elapsed
+# times are allowed (`etime` has 1s granularity, and a fork often lands in
+# its parent's second); the comparison cannot false-refuse a real parent,
+# because the parent's elapsed time is sampled *after* the child's and only
+# grows in between. An elapsed time that cannot be read at all breaks the
+# chain too: no answer is uncertainty, and uncertainty must refuse.
 pid_under() {
   probe="$1"
+  probe_elapsed=$(pid_elapsed "$probe")
   hops=0
   while [ "$hops" -le 32 ]; do
     if [ "$probe" = "$2" ]; then
@@ -519,7 +552,11 @@ pid_under() {
     case "$parent" in
       '' | 0 | 1 | *[!0-9]*) return 1 ;;
     esac
+    parent_elapsed=$(pid_elapsed "$parent")
+    [ -n "$probe_elapsed" ] && [ -n "$parent_elapsed" ] || return 1
+    [ "$parent_elapsed" -ge "$probe_elapsed" ] || return 1
     probe="$parent"
+    probe_elapsed="$parent_elapsed"
     hops=$((hops + 1))
   done
   return 1

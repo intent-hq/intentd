@@ -237,18 +237,19 @@ if ($serviceMode -eq 'yes') {
         #      bounded number of hops, stopping when a parent started after
         #      its child (that parent pid was reused, so the chain is broken
         #      there).
-        #   3. The walked chain also holds a live process whose
-        #      ExecutablePath is the sitter binary this installer manages
-        #      (<install dir>\intentd.exe - the exact image the task action
-        #      runs). EnginePID alone is not enough: it names the Task
-        #      Scheduler engine hosting the task, one engine can host several
-        #      tasks, so "descends from the engine" would also admit a daemon
-        #      some *other* task on a shared engine launched. This pins the
-        #      owner to our own action's process tree. (The sitter's pidfile,
-        #      <data_dir>\sitter\sitter.pid, would be a more direct witness,
-        #      but the sitter writes it on unix only - see PidFile in
-        #      crates/intentd-sitter/src/supervisor.rs - so the image path is
-        #      the witness used here.)
+        #   3. The walked chain also holds the pid recorded in
+        #      <data_dir>\sitter\sitter.pid - the serve-mode sitter's own
+        #      pidfile (PidFile in crates/intentd-sitter/src/supervisor.rs),
+        #      i.e. the supervisor of the daemon serving *this* data dir.
+        #      EnginePID alone is not enough: it names the Task Scheduler
+        #      engine hosting the task, one engine can host several tasks,
+        #      so "descends from the engine" would also admit a daemon some
+        #      *other* task on a shared engine launched - and an image-path
+        #      witness would too, since a foreign task can run this same
+        #      installed intentd.exe. The sitter pidfile is written per data
+        #      dir, so it ties the chain to the one supervisor of the data
+        #      dir being checked. A missing, malformed or stale file is no
+        #      witness, hence no allowance.
         # A daemon the task scheduler does not control - a manual `intentd
         # serve`, another task's tree - keeps being refused below, and so
         # does everything when the scheduler cannot be asked at all.
@@ -268,25 +269,33 @@ if ($serviceMode -eq 'yes') {
             # No task scheduler to ask (or access denied): no allowance.
             $taskEnginePid = 0
         }
-        # Requirement 3's witness, resolved from the environment alone (this
-        # block must stay self-contained) exactly as $installDir is resolved
-        # above. Unresolvable means no witness, hence no allowance.
-        $sitterExe = ''
+        # Requirement 3's witness: the pid in <data_dir>\sitter\sitter.pid,
+        # read exactly as the sitter's own read_live_pid reads it (whole
+        # file, trimmed, parsed as u32) and only counted while that pid is
+        # live. Missing, malformed, stale or dead all mean no witness,
+        # hence no allowance.
+        $sitterPid = 0
         try {
-            $sitterDir = if ($env:INTENTD_INSTALL_DIR) { $env:INTENTD_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'intentd\bin' }
-            $sitterDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($sitterDir)
-            $sitterExe = Join-Path $sitterDir 'intentd.exe'
+            $sitterPidFile = Join-Path (Join-Path $dataDir 'sitter') 'sitter.pid'
+            if (Test-Path $sitterPidFile) {
+                $sitterText = [string](Get-Content $sitterPidFile -Raw -ErrorAction Stop)
+                $sitterParsed = [uint32]0
+                if ([uint32]::TryParse($sitterText.Trim(), [ref]$sitterParsed) -and
+                    $sitterParsed -gt 0 -and $sitterParsed -le [int]::MaxValue) {
+                    if (Get-Process -Id ([int]$sitterParsed) -ErrorAction SilentlyContinue) { $sitterPid = [int]$sitterParsed }
+                }
+            }
         } catch {
-            $sitterExe = ''
+            $sitterPid = 0
         }
         $ownedByOurTask = $false
-        if ($taskEnginePid -gt 0 -and $sitterExe) {
+        if ($taskEnginePid -gt 0 -and $sitterPid -gt 0) {
             $chainHasSitter = $false
             $chainPid = $ownerPid
             $chainRow = $null
             try { $chainRow = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $chainPid" -ErrorAction Stop)[0] } catch { $chainRow = $null }
             for ($hop = 0; $hop -lt 12; $hop++) {
-                if ($chainRow -and $chainRow.ExecutablePath -and ($chainRow.ExecutablePath -eq $sitterExe)) { $chainHasSitter = $true }
+                if ($chainPid -eq $sitterPid) { $chainHasSitter = $true }
                 if ($chainPid -eq $taskEnginePid) { $ownedByOurTask = $chainHasSitter; break }
                 if (-not $chainRow) { break }
                 $parentPid = [int]$chainRow.ParentProcessId

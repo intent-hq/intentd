@@ -118,6 +118,7 @@ fn run_owner_check_full(
             "data_dir_owner_pid",
             "process_path",
             "service_main_pid",
+            "pid_elapsed",
             "pid_under",
             "check_data_dir_not_owned",
         ]),
@@ -799,6 +800,171 @@ fn an_owner_is_still_refused_when_no_service_manager_answers() {
         );
 
         assert_refused(os, &output);
+    }
+}
+
+/// A `ps` standing in front of the real one to fake the parent chain: it
+/// answers `-o ppid=` / `-o etime=` for the pids in `table` and delegates
+/// everything else (notably `pid_is_alive`'s `ps -p`) to the real `ps`, so
+/// only the walk itself is simulated. Each table row is
+/// `(pid, ppid, etime)`; an empty `etime` makes the stub print nothing for
+/// that pid — the "cannot be read" case.
+fn fake_ps_stub(bin: &Path, table: &[(u32, u32, &str)]) {
+    use std::fmt::Write as _;
+    let mut ppid_cases = String::new();
+    let mut etime_cases = String::new();
+    for (pid, ppid, etime) in table {
+        let _ = writeln!(ppid_cases, "    {pid}) echo ' {ppid}' ;;");
+        if etime.is_empty() {
+            let _ = writeln!(etime_cases, "    {pid}) : ;;");
+        } else {
+            let _ = writeln!(etime_cases, "    {pid}) echo ' {etime}' ;;");
+        }
+    }
+    write_executable(
+        &bin.join("ps"),
+        &format!(
+            "mode=real\n\
+             pid=\n\
+             for arg; do\n\
+             case \"$arg\" in\n\
+             ppid=) mode=ppid ;;\n\
+             etime=) mode=etime ;;\n\
+             -o | -p) : ;;\n\
+             *) pid=$arg ;;\n\
+             esac\n\
+             done\n\
+             if [ \"$mode\" = ppid ]; then\n\
+             case \"$pid\" in\n{ppid_cases}\
+             *) exit 1 ;;\n\
+             esac\n\
+             elif [ \"$mode\" = etime ]; then\n\
+             case \"$pid\" in\n{etime_cases}\
+             *) exit 1 ;;\n\
+             esac\n\
+             else\n\
+             exec /bin/ps \"$@\"\n\
+             fi"
+        ),
+    );
+}
+
+/// The pid-reuse guard: a "parent" that started *after* its child holds a
+/// recycled pid — the real parent is gone — so the chain is broken there and
+/// ancestry beyond it must not vouch for the owner, even though the walk
+/// would reach the service's main pid.
+#[test]
+fn a_parent_younger_than_its_child_breaks_the_chain_and_keeps_the_refusal() {
+    for os in ["Linux", "Darwin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let owner = LiveProcess::spawn();
+        write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+        let sitter: u32 = 1_900_000_002;
+        let main_pid: u32 = 1_900_000_001;
+        let stub = service_manager_stub(dir.path(), os, SERVICE_NAME, main_pid);
+        // owner → sitter is sound (parent older), but sitter's recorded
+        // parent — the service's main pid — is younger than the sitter:
+        // that pid was reused, so the match on it must not count.
+        fake_ps_stub(
+            &stub,
+            &[
+                (owner.pid(), sitter, "00:20"),
+                (sitter, main_pid, "01:00"),
+                (main_pid, 1, "00:05"),
+            ],
+        );
+
+        let output = run_owner_check_full(
+            None,
+            os,
+            dir.path(),
+            Some(data_dir.to_str().unwrap()),
+            Some(&stub),
+            Some(SERVICE_NAME),
+        );
+
+        assert_refused(os, &output);
+    }
+}
+
+/// An elapsed time that cannot be read is uncertainty, and uncertainty
+/// refuses: the walk must not step through a pid whose start time is
+/// unknown, because the reuse guard cannot vouch for that hop.
+#[test]
+fn an_unreadable_start_time_breaks_the_chain_and_keeps_the_refusal() {
+    for os in ["Linux", "Darwin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let owner = LiveProcess::spawn();
+        write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+        let sitter: u32 = 1_900_000_002;
+        let main_pid: u32 = 1_900_000_001;
+        let stub = service_manager_stub(dir.path(), os, SERVICE_NAME, main_pid);
+        fake_ps_stub(
+            &stub,
+            &[
+                (owner.pid(), sitter, "00:20"),
+                (sitter, main_pid, ""),
+                (main_pid, 1, "01:00"),
+            ],
+        );
+
+        let output = run_owner_check_full(
+            None,
+            os,
+            dir.path(),
+            Some(data_dir.to_str().unwrap()),
+            Some(&stub),
+            Some(SERVICE_NAME),
+        );
+
+        assert_refused(os, &output);
+    }
+}
+
+/// The guard's control case: the same faked chain with sound, non-decreasing
+/// ages up to the service's main pid keeps the allowance — including a
+/// day-formatted `etime` (`dd-hh:mm:ss`) and an equal-age hop (1s granularity
+/// puts a fork in its parent's second).
+#[test]
+fn a_chain_with_sound_start_times_still_lets_the_install_proceed() {
+    for os in ["Linux", "Darwin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let owner = LiveProcess::spawn();
+        write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+        let sitter: u32 = 1_900_000_002;
+        let main_pid: u32 = 1_900_000_001;
+        let stub = service_manager_stub(dir.path(), os, SERVICE_NAME, main_pid);
+        fake_ps_stub(
+            &stub,
+            &[
+                (owner.pid(), sitter, "00:20"),
+                (sitter, main_pid, "00:20"),
+                (main_pid, 1, "2-03:00:00"),
+            ],
+        );
+
+        let output = run_owner_check_full(
+            None,
+            os,
+            dir.path(),
+            Some(data_dir.to_str().unwrap()),
+            Some(&stub),
+            Some(SERVICE_NAME),
+        );
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{os}: a sound chain must keep the upgrade allowance; stderr: {}",
+            stderr_of(&output)
+        );
+        assert!(stdout_of(&output).contains("PROCEEDED"), "{os}");
     }
 }
 
