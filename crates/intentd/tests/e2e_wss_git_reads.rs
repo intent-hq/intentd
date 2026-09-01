@@ -1,7 +1,7 @@
 //! WSS end-to-end for the read-side `git.*` extensions added in
 //! docs/protocol/methods/git.md §5.6: `git.numstat`, `git.branchDiff`, `git.getRemoteUrl`,
 //! and `git.getConfig` (STAB-10a), plus the `git.status` file-list cap
-//! (monorepo#3635).
+//! (monorepo#3635) and upstream-tracking fields (monorepo#4058).
 //! Drives a real pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via
 //! config) and asserts the response envelope shape from docs/protocol/methods/git.md §5.6 plus the
 //! `-32602` error envelope for the validation paths.
@@ -642,6 +642,63 @@ async fn git_status_files_capped_over_wss() {
     // The tracked change leads the list — never pushed out by untracked noise.
     assert_eq!(files[0]["path"], json!("tracked.txt"));
     assert_eq!(files[0]["status"], json!("M"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// `git.status` upstream tracking (monorepo#4058): a never-pushed workspace
+/// branch reports the additive `hasUpstream: false` with `unpushedCount`
+/// omitted; once `refs/remotes/origin/<branch>` exists, `hasUpstream: true`
+/// and `unpushedCount` carries the `upstream..HEAD` count (= `ahead`).
+#[tokio::test]
+async fn git_status_upstream_fields_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("root-status-upstream");
+    let (daemon, port, cfg) = boot(&root).await;
+    let repo = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Read E2E — status upstream").await;
+
+    // The workspace's feature branch was never pushed: no upstream ref, so
+    // `hasUpstream: false` and `unpushedCount` absent (not `0`).
+    let resp = wss_rpc(&mut ws, 3, "git.status", json!({ "workspaceId": ws_id })).await;
+    assert!(resp.get("error").is_none(), "status no upstream: {resp}");
+    let result = &resp["result"];
+    assert_eq!(result["hasUpstream"], json!(false), "{result:?}");
+    assert!(result.get("unpushedCount").is_none(), "{result:?}");
+    assert_eq!(result["ahead"], json!(0));
+    let branch = result["branch"].as_str().expect("branch").to_string();
+    assert!(!branch.is_empty(), "{result:?}");
+
+    // Materialise the upstream ref at HEAD (a local stand-in for a push),
+    // then commit one change past it → ahead 1, unpushed 1.
+    run_git(
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{branch}"),
+            "HEAD",
+        ],
+        &wt,
+    );
+    std::fs::write(wt.join("tracked.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    run_git(&["add", "tracked.txt"], &wt);
+    run_git(&["commit", "-q", "-m", "past upstream"], &wt);
+
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "git.status",
+        json!({ "workspaceId": ws_id, "forceRefresh": true }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "status with upstream: {resp}");
+    let result = &resp["result"];
+    assert_eq!(result["hasUpstream"], json!(true), "{result:?}");
+    assert_eq!(result["unpushedCount"], json!(1), "{result:?}");
+    assert_eq!(result["ahead"], json!(1));
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);

@@ -874,6 +874,8 @@ impl WorkspaceApi for FakeApi {
                     has_untracked_files: false,
                     files_truncated: false,
                     total_files: None,
+                    has_upstream: false,
+                    unpushed_count: None,
                 });
             }
             if force_refresh {
@@ -887,6 +889,8 @@ impl WorkspaceApi for FakeApi {
                     has_untracked_files: false,
                     files_truncated: false,
                     total_files: None,
+                    has_upstream: false,
+                    unpushed_count: None,
                 });
             }
             if workspace_id.as_str() == "empty" {
@@ -900,6 +904,8 @@ impl WorkspaceApi for FakeApi {
                     has_untracked_files: false,
                     files_truncated: false,
                     total_files: None,
+                    has_upstream: false,
+                    unpushed_count: None,
                 });
             }
             Ok(GitStatus {
@@ -919,6 +925,8 @@ impl WorkspaceApi for FakeApi {
                 has_untracked_files: false,
                 files_truncated: false,
                 total_files: None,
+                has_upstream: true,
+                unpushed_count: Some(1),
             })
         })
     }
