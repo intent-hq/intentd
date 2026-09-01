@@ -1376,3 +1376,162 @@ async fn runtime_bind_address_list_applies_and_validates() {
         "listener must survive rejected bindAddress writes: {sub2}"
     );
 }
+
+/// Write an executable fake-tailcat script into `dir`: `genkey` creates the
+/// key file, `serve` prints the JSON address derived from the key file's
+/// content and sleeps (mirrors the unit-test seam in src/tunnel.rs).
+fn write_fake_tailcat(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-tailcat.sh");
+    let script = r#"#!/bin/sh
+key=""
+for arg in "$@"; do
+  case "$arg" in
+    --key=*) key="${arg#--key=}" ;;
+  esac
+done
+case "$1" in
+  genkey)
+    printf 'key-%s' $$ > "$key"
+    ;;
+  serve)
+    printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
+    sleep 600
+    ;;
+esac
+"#;
+    std::fs::write(&path, script).expect("write fake tailcat");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake tailcat");
+    path
+}
+
+/// server.tunnel.* settings over the real TLS/WSS path (per
+/// packages/intentd/AGENTS.md): enable the tunnel via settings.update over an
+/// authenticated WSS connection (fake tailcat sidecar via the
+/// `INTENTD_TAILCAT_BIN` seam), read it back over WSS, change derpUrl while
+/// the sidecar runs, and prove the tunnel-only TCP self-termination guard
+/// fires for a WSS caller and rolls the setting back.
+#[tokio::test]
+async fn tunnel_settings_over_wss() {
+    let data_dir = temp_data_dir();
+    let tailcat = write_fake_tailcat(&data_dir);
+    let tailcat_s = tailcat.to_string_lossy().to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_TAILCAT_BIN", &tailcat_s),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set"),
+    )
+    .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg.clone()).await;
+
+    // Enable the tunnel over the real WSS path. The hook errors when the
+    // sidecar fails to report an address, so a success response proves the
+    // supervised fake tailcat started and reported its stable tc address.
+    let enable = wss_rpc(
+        &mut ws,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.enabled", "value": true }] }),
+    )
+    .await;
+    assert!(
+        enable.get("error").is_none(),
+        "settings.update server.tunnel.enabled over WSS should succeed: {enable}"
+    );
+    let got = wss_rpc(
+        &mut ws,
+        2,
+        "settings.get",
+        json!({ "path": "server.tunnel.enabled" }),
+    )
+    .await;
+    assert_eq!(got["result"]["value"], json!(true), "{got}");
+
+    // derpUrl change over WSS: persists and restarts the running sidecar
+    // (an error would surface here if the restart failed).
+    let derp = wss_rpc(
+        &mut ws,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.derpUrl", "value": "https://derp.example.com/map.json" }] }),
+    )
+    .await;
+    assert!(
+        derp.get("error").is_none(),
+        "settings.update server.tunnel.derpUrl over WSS should succeed: {derp}"
+    );
+    let got = wss_rpc(
+        &mut ws,
+        4,
+        "settings.get",
+        json!({ "path": "server.tunnel.derpUrl" }),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["value"],
+        json!("https://derp.example.com/map.json"),
+        "{got}"
+    );
+
+    // The tunnel-only self-termination guard fires for a direct TCP (WSS)
+    // caller and the setting rolls back.
+    let only = wss_rpc(
+        &mut ws,
+        5,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.only", "value": true }] }),
+    )
+    .await;
+    let err = only
+        .get("error")
+        .unwrap_or_else(|| panic!("tunnel-only from a WSS caller must be refused: {only}"))
+        .to_string();
+    assert!(err.contains("server.tunnel.only"), "{only}");
+    let got = wss_rpc(
+        &mut ws,
+        6,
+        "settings.get",
+        json!({ "path": "server.tunnel.only" }),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["value"],
+        json!(false),
+        "must not flip on: {got}"
+    );
+
+    // Disabling the tunnel over WSS is allowed (only the listener disable and
+    // tunnel-only enable are TCP-guarded).
+    let disable = wss_rpc(
+        &mut ws,
+        7,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.enabled", "value": false }] }),
+    )
+    .await;
+    assert!(
+        disable.get("error").is_none(),
+        "settings.update server.tunnel.enabled=false over WSS should succeed: {disable}"
+    );
+}

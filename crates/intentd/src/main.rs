@@ -3290,11 +3290,24 @@ impl intent_core::ServerControl for DaemonControl {
             // Tunnel-only mode (server.tunnel.only): accept tunnel-forwarded
             // traffic only — bind loopback regardless of server.bindAddress,
             // so direct LAN connects are refused while tailcat (a local
-            // process) still reaches the listener.
-            let tunnel_only = matches!(
-                runtime.api.settings_get("server.tunnel.only".to_string()).await,
-                Ok(v) if v.get("value").and_then(serde_json::Value::as_bool) == Some(true)
-            );
+            // process) still reaches the listener. Tunnel-only is a security
+            // posture, so a settings read failure fails CLOSED (loopback
+            // bind) rather than silently serving the wider bindAddress.
+            let tunnel_only = match runtime
+                .api
+                .settings_get("server.tunnel.only".to_string())
+                .await
+            {
+                Ok(v) => v.get("value").and_then(serde_json::Value::as_bool) == Some(true),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cannot read server.tunnel.only; failing closed — \
+                         WSS listener binding loopback only"
+                    );
+                    true
+                }
+            };
             let bind_addresses = if tunnel_only {
                 let loopback = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
                 if bind_addresses != loopback {

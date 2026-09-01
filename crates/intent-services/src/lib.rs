@@ -12428,6 +12428,13 @@ impl Services {
             (hook_priority(path_a), path_a).cmp(&(hook_priority(path_b), path_b))
         });
 
+        // When the batch itself carries server.tunnel.enabled, its own hook
+        // (priority 20) decides the tunnel's fate — the wsApi.enabled arm must
+        // not auto-restart it from the persisted value first.
+        let batch_has_tunnel_enabled = sorted_changes
+            .iter()
+            .any(|c| c.get("path").and_then(|v| v.as_str()) == Some("server.tunnel.enabled"));
+
         for change in sorted_changes {
             if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
                 match path {
@@ -12462,6 +12469,25 @@ impl Services {
                                     "server.wsApi.port → {}: restarted WSS listener",
                                     port
                                 );
+                                // The tunnel forwards to the WSS port, so a
+                                // running sidecar must restart to pick up the
+                                // new port (start re-reads ws_listener_port).
+                                if control.tunnel_address().await.is_some() {
+                                    tracing::info!(
+                                        "server.wsApi.port changed: restarting tailcat tunnel \
+                                         on the new port"
+                                    );
+                                    control.stop_tunnel().await;
+                                    control.start_tunnel().await.map_err(|e| {
+                                        tracing::error!(
+                                            error = ?e,
+                                            "server.wsApi.port: failed to restart tailcat tunnel"
+                                        );
+                                        Error::Internal(format!(
+                                            "failed to restart tailcat tunnel on port {port}: {e}"
+                                        ))
+                                    })?;
+                                }
                             } else {
                                 // Listener is not running: persisting the value is enough
                                 tracing::info!(
@@ -12538,6 +12564,38 @@ impl Services {
                                     port,
                                     "server.wsApi.enabled → true: started WSS listener"
                                 );
+                                // Disabling the listener also stopped the tunnel
+                                // (below) without touching the persisted
+                                // server.tunnel.enabled, so re-enabling the
+                                // listener brings the tunnel back too (skipped
+                                // when the batch carries its own tunnel toggle
+                                // — that hook decides). Non-fatal like the boot
+                                // auto-start: the setting stays true, toggle
+                                // OFF→ON to retry.
+                                let tunnel_enabled = !batch_has_tunnel_enabled
+                                    && matches!(
+                                        self.settings_service()
+                                            .get("server.tunnel.enabled")
+                                            .await,
+                                        Ok(v) if v.get("value")
+                                            .and_then(serde_json::Value::as_bool)
+                                            == Some(true)
+                                    );
+                                if tunnel_enabled && control.tunnel_address().await.is_none() {
+                                    match control.start_tunnel().await {
+                                        Ok(address) => tracing::info!(
+                                            address = %address,
+                                            "server.wsApi.enabled → true: restarted tailcat \
+                                             tunnel (persisted server.tunnel.enabled=true)"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            error = ?e,
+                                            "server.wsApi.enabled → true: failed to restart \
+                                             tailcat tunnel (persisted server.tunnel.enabled=true); \
+                                             toggle it OFF→ON to retry"
+                                        ),
+                                    }
+                                }
                             } else {
                                 // Guard: refuse to stop the listener from a TCP connection
                                 if control.is_tcp_connection() {
@@ -12911,6 +12969,27 @@ impl WorkspaceApi for Services {
             // injected key.
             let mut changes = changes;
             self.reresolve_default_model_on_provider_switch(&mut changes);
+            // Pre-flight self-termination guard: enabling server.tunnel.only
+            // from a direct TCP (WSS) connection would rebind the listener to
+            // loopback and drop the caller's own connection. Reject before
+            // anything persists so no rollback (and no listener restart that
+            // would sever the caller) is ever needed; the in-hook guard
+            // remains as a backstop for other invocation paths.
+            if let (Some(control), Some(entries)) = (self.server_control.get(), changes.as_array())
+            {
+                if control.is_tcp_connection()
+                    && entries.iter().any(|e| {
+                        e.get("path").and_then(|v| v.as_str()) == Some("server.tunnel.only")
+                            && e.get("value").and_then(serde_json::Value::as_bool) == Some(true)
+                    })
+                {
+                    return Err(Error::InvalidParams(
+                        "cannot enable server.tunnel.only from a TCP connection \
+                         (loopback rebind would self-terminate)"
+                            .to_string(),
+                    ));
+                }
+            }
             // Capture old values for ALL settings in the batch so we can rollback on hook failure.
             // Registry holds the TOML-backed keys; store holds the remaining non-sensitive
             // settings; secrets holds sensitive ones (§9.8).
@@ -12991,11 +13070,12 @@ impl WorkspaceApi for Services {
                 // when server.wsApi.enabled changes, restart it when
                 // server.wsApi.port changes while running.
                 if let Some(control) = self.server_control.get() {
-                    // Remember whether the listener was up before the hooks so a
-                    // failed batch (e.g. a restart-on-new-value hook that stopped
-                    // the listener and then failed to start it) can put it back
-                    // up after the persistence rollback.
+                    // Remember whether the listener/tunnel were up before the
+                    // hooks so a failed batch (e.g. a restart-on-new-value hook
+                    // that stopped one of them and then failed to start it) can
+                    // put them back up after the persistence rollback.
                     let listener_was_running = control.ws_listener_port().await.is_some();
+                    let tunnel_was_running = control.tunnel_address().await.is_some();
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                         // Rollback: restore old values for ALL settings in the batch.
                         // Log rollback failures but don't let them mask the original hook error.
@@ -13111,6 +13191,25 @@ impl WorkspaceApi for Services {
                                 Err(restart_err) => tracing::error!(
                                     error = ?restart_err,
                                     "settings.update rollback: failed to restart WSS listener on prior settings"
+                                ),
+                            }
+                        }
+
+                        // Same for the tunnel: a restart-on-new-value hook
+                        // (derpUrl / port) stops the sidecar before starting
+                        // it, so a start failure (e.g. a bad new DERP URL)
+                        // leaves it down. The persisted values are rolled back
+                        // by now and start re-reads them, so bring the sidecar
+                        // back up if it was running when the batch began.
+                        if tunnel_was_running && control.tunnel_address().await.is_none() {
+                            match control.start_tunnel().await {
+                                Ok(address) => tracing::info!(
+                                    address = %address,
+                                    "settings.update rollback: restarted tailcat tunnel on prior settings"
+                                ),
+                                Err(restart_err) => tracing::error!(
+                                    error = ?restart_err,
+                                    "settings.update rollback: failed to restart tailcat tunnel on prior settings"
                                 ),
                             }
                         }

@@ -104,7 +104,7 @@ impl TunnelSupervisor {
         if let Some(running) = state.as_ref() {
             return Ok(running.address.clone());
         }
-        self.ensure_key().await?;
+        self.ensure_key(derp_url.as_deref()).await?;
         let (child, address) = spawn_and_read_address(
             &self.bin,
             &self.key_path,
@@ -156,8 +156,9 @@ impl TunnelSupervisor {
     /// Generate the persisted key on first use (`tailcat genkey`). The key
     /// derives the stable `tc...` address; `--fixed-region` bakes the DERP
     /// rendezvous region in so restarts land in the same place without
-    /// re-probing.
-    async fn ensure_key(&self) -> Result<()> {
+    /// re-probing. `derp_url` (when set) must be passed here too so region
+    /// discovery uses the configured DERP map, not tailcat's default one.
+    async fn ensure_key(&self, derp_url: Option<&str>) -> Result<()> {
         if self.key_path.exists() {
             return Ok(());
         }
@@ -169,11 +170,7 @@ impl TunnelSupervisor {
                 ))
             })?;
         }
-        let output = Command::new(&self.bin)
-            .arg("genkey")
-            .arg(format!("--key={}", self.key_path.display()))
-            .arg("--fixed-region")
-            .stdin(Stdio::null())
+        let output = genkey_command(&self.bin, &self.key_path, derp_url)
             .output()
             .await
             .map_err(|e| {
@@ -194,6 +191,20 @@ impl TunnelSupervisor {
     }
 }
 
+/// Build the `tailcat genkey` command: persisted key path, optional custom
+/// DERP map URL (so `--fixed-region` discovery probes the configured map,
+/// not the default one), fixed region baked into the key.
+fn genkey_command(bin: &Path, key_path: &Path, derp_url: Option<&str>) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("genkey")
+        .arg(format!("--key={}", key_path.display()));
+    if let Some(url) = derp_url.filter(|u| !u.is_empty()) {
+        cmd.arg(format!("--derpmap-url={url}"));
+    }
+    cmd.arg("--fixed-region").stdin(Stdio::null());
+    cmd
+}
+
 /// Build the `tailcat serve` command: JSON address output, the persisted key,
 /// forwarding to the WSS port only. `derp_url` (when set) overrides the DERP
 /// map URL used to resolve the relay region (self-hosted relay support).
@@ -208,7 +219,7 @@ fn serve_command(bin: &Path, key_path: &Path, ws_port: u16, derp_url: Option<&st
     cmd.arg(ws_port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     cmd
 }
@@ -226,6 +237,20 @@ async fn spawn_and_read_address(
     let mut child = serve_command(bin, key_path, ws_port, derp_url)
         .spawn()
         .map_err(|e| Error::Internal(format!("cannot spawn tailcat ({}): {e}", bin.display())))?;
+    // Drain stderr into the daemon log so crash-loop causes (bad DERP map,
+    // key parse failure, network errors) are diagnosable, and the child never
+    // blocks on a full pipe.
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim();
+                if !line.is_empty() {
+                    tracing::debug!(target: "tailcat", "{line}");
+                }
+            }
+        });
+    }
     let stdout = child
         .stdout
         .take()
