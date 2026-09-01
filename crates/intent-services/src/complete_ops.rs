@@ -318,6 +318,7 @@ impl Services {
             cwd.as_deref(),
             &full_prompt,
             timeout,
+            "One-shot completion",
         )
         .await?;
         let text = clean_agent_message(&stdout);
@@ -785,7 +786,14 @@ rl.on('line', (line) => {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("timed out after 200ms"),
+            err.to_string()
+                .contains("One-shot completion timed out after 200ms"),
+            "got {err:?}"
+        );
+        // monorepo#4032: completeOnce timeouts (auto-commit generation rides
+        // this op) must not masquerade as prompt-enhancement failures.
+        assert!(
+            !err.to_string().contains("Prompt enhancement"),
             "got {err:?}"
         );
     }
