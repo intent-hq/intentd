@@ -7330,6 +7330,12 @@ impl Services {
                     &caller.0,
                 )
                 .await;
+                // monorepo#4026: stamp the report identity now; whether the
+                // held wake actually reached the parent is proven at
+                // settlement by the #1614 retract gate (a retracted hold
+                // renders the full report, a flushed-and-drained one is
+                // suppressed as already delivered).
+                self.stamp_watch_delivered_report_ts(&parent, &caller, &saved_at);
             } else {
                 // Deliver the wake in the parent's HOME workspace: for a
                 // cross-workspace (chief) parent this differs from the child's;
@@ -7352,6 +7358,13 @@ impl Services {
                         child = %caller.0,
                         "failed to deliver reportToParent progress wake to parent"
                     );
+                } else {
+                    // monorepo#4026: remember which report identity this wake
+                    // carried so the terminal completion wake can suppress a
+                    // verbatim repeat. Whether the wake actually LEFT the
+                    // parent's queue is proven at settlement by the #1614
+                    // retract gate (retracts removing nothing = delivered).
+                    self.stamp_watch_delivered_report_ts(&parent, &caller, &saved_at);
                 }
             }
         }

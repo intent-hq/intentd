@@ -9634,6 +9634,113 @@ async fn report_to_parent_progress_keeps_watch_armed_until_terminal_wake() {
     assert!(svc.find_watches_for_child(&child).is_empty());
 }
 
+/// monorepo#4026 case 1: the report-time wake was DELIVERED to the parent and
+/// the child settled with that SAME report — the terminal wake references the
+/// earlier delivery instead of repeating the full `Report:` clause verbatim.
+#[tokio::test]
+async fn terminal_wake_suppresses_already_delivered_report() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    let report = "shipped it";
+    svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
+        .await
+        .expect("report");
+    // The report-time wake delivered the full report text.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains(&format!("Report: {report}")));
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "report": report }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let wake = session.messages.last().expect("terminal wake");
+    let wake_text = serde_json::to_string(&wake.content).expect("serialize content");
+    assert!(
+        wake_text.contains("already delivered in a previous message"),
+        "terminal wake must reference the earlier delivery: {wake_text}"
+    );
+    assert!(
+        !wake_text.contains(&format!("Report: {report}")),
+        "terminal wake must not repeat the delivered report verbatim: {wake_text}"
+    );
+}
+
+/// monorepo#4026 case 2: the child reported AGAIN after the delivered wake
+/// (stamped identity is stale) — the terminal wake fails open and renders the
+/// full report.
+#[tokio::test]
+async fn terminal_wake_renders_full_report_when_identity_stale() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let report = "shipped it";
+    svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
+        .await
+        .expect("report");
+    // Simulate a delivered wake for an OLDER report than the one the child
+    // settles with: overwrite the stamp with a stale identity.
+    svc.stamp_watch_delivered_report_ts(&parent, &child, "2000-01-01T00:00:00Z");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "report": report }),
+    ))
+    .await;
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let wake = session.messages.last().expect("terminal wake");
+    let wake_text = serde_json::to_string(&wake.content).expect("serialize content");
+    assert!(
+        wake_text.contains(&format!("Report: {report}")),
+        "stale delivered identity must fail open to the full report: {wake_text}"
+    );
+    assert!(
+        !wake_text.contains("already delivered in a previous message"),
+        "no already-delivered reference on identity mismatch: {wake_text}"
+    );
+}
+
 /// With a non-zero `agents.reportToParentDebounceSeconds`, a progress report
 /// parks the wake as a held entry on the parent's queue instead of delivering
 /// it, and a repeat report from the same child upserts that entry in place.

@@ -368,14 +368,14 @@ fn golden_completion_wake_variants() {
     // Bare idle completion, watch retained (grouped-failure path shape).
     let ev = completion_event(AGENT_IDLE, &child, json!({}));
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, false, true),
+        crate::format_completion_wake(&child, &ev, None, false, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) completed."
     );
     // Non-child watched agent (intent-hq/monorepo#3906): the same wake for a
     // watcher that is NOT the agent's delegation parent renders "Watched
     // agent".
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, false, false),
+        crate::format_completion_wake(&child, &ev, None, false, false, false),
         "[WORKSPACE EVENTS] Watched agent Builder (agent-c1) completed."
     );
     // Report + retired watch note.
@@ -385,15 +385,25 @@ fn golden_completion_wake_variants() {
         json!({ "agentName": "Builder", "completionReport": "All done." }),
     );
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, true, true),
+        crate::format_completion_wake(&child, &ev, None, true, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) completed. Report: All done. \
          NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
          retired. Call ws.agent.watch(\"agent-c1\") again to be woken at its next completion."
     );
     // Non-child, watch retired: relationship label flips, suffix unchanged.
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, true, false),
+        crate::format_completion_wake(&child, &ev, None, true, false, false),
         "[WORKSPACE EVENTS] Watched agent Builder (agent-c1) completed. Report: All done. \
+         NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
+         retired. Call ws.agent.watch(\"agent-c1\") again to be woken at its next completion."
+    );
+    // Report already delivered by a report-time wake (monorepo#4026): the
+    // full Report: clause collapses to a short reference; the retirement
+    // suffix is unaffected.
+    assert_eq!(
+        crate::format_completion_wake(&child, &ev, None, true, true, true),
+        "[WORKSPACE EVENTS] Child agent Builder (agent-c1) completed. Its completion \
+         report was already delivered in a previous message (unchanged since). \
          NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
          retired. Call ws.agent.watch(\"agent-c1\") again to be woken at its next completion."
     );
@@ -404,14 +414,14 @@ fn golden_completion_wake_variants() {
         json!({ "lastResponseSummary": "was compiling", "error": "exit 1" }),
     );
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, false, true),
+        crate::format_completion_wake(&child, &ev, None, false, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) failed. Summary: was compiling \
          Error: exit 1"
     );
     // Deleted: no re-arm pointer.
     let ev = completion_event(AGENT_DELETED, &child, json!({}));
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, true, true),
+        crate::format_completion_wake(&child, &ev, None, true, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) was deleted. NOTE: this wake \
          consumed your one-shot watch on this agent — the watch is now retired. The agent \
          was deleted, so it cannot be re-watched."
@@ -420,7 +430,7 @@ fn golden_completion_wake_variants() {
     // cannot be re-watched or woken again.
     let ev = completion_event(AGENT_RETIRED, &child, json!({}));
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, true, true),
+        crate::format_completion_wake(&child, &ev, None, true, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) retired. NOTE: this wake \
          consumed your one-shot watch on this agent — the watch is now retired. The agent \
          retired and cannot be re-watched or woken again."
@@ -432,7 +442,7 @@ fn golden_completion_wake_variants() {
     };
     let ev = completion_event(AGENT_IDLE, &child, json!({}));
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, Some(&stall), false, true),
+        crate::format_completion_wake(&child, &ev, Some(&stall), false, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) completed. No completion report \
          and assigned task \"Port frobnicator\" is still in_progress — the agent may have \
          stalled rather than finished (monorepo#1016). Consider ws.agent.wakeOrCreate to \
