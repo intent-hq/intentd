@@ -302,13 +302,19 @@
 //! `system.requestUpdate` performs, evaluated signal-free at read time — so
 //! a client can gate its update affordance without probing
 //! `system.requestUpdate`; always `false` on platforms without unix signals.
-//! No method-catalog change — 297 router methods, 337 total.
+//! No method-catalog change — 297 router methods, 337 total. Version 9.0
+//! removes the legacy workspace importer (breaking; §5.7): the
+//! `system.importLegacy` fast-path method is gone from the catalog — callers
+//! now get `-32601` — along with the `intentd import` / `intentd
+//! import-legacy` CLI subcommands and the first-boot auto-import in `serve`.
+//! Method catalog shrinks by one fast-path method — 298 router methods,
+//! 337 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "8.8";
+pub const PROTOCOL_VERSION: &str = "9.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
