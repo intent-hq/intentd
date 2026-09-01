@@ -389,9 +389,24 @@ mod imp {
         Ok(())
     }
 
+    /// Restrict a directory this call just created; on failure the (empty)
+    /// directory is removed again so a retry cannot find it via the
+    /// `AlreadyExists` branch and skip the DACL hardening.
+    fn restrict_created_dir(dir: &Path) -> io::Result<()> {
+        restrict_to_owner(dir, true).inspect_err(|_| {
+            let _ = std::fs::remove_dir(dir);
+        })
+    }
+
     pub(super) fn create_dir_private(dir: &Path) -> io::Result<()> {
+        // `create_dir_all` treats the empty path (e.g. the parent of a bare
+        // relative file name) as success; mirror that, since `create_dir("")`
+        // fails.
+        if dir.as_os_str().is_empty() {
+            return Ok(());
+        }
         match std::fs::create_dir(dir) {
-            Ok(()) => restrict_to_owner(dir, true),
+            Ok(()) => restrict_created_dir(dir),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let Some(parent) = dir.parent() else {
@@ -399,7 +414,7 @@ mod imp {
                 };
                 create_dir_private(parent)?;
                 match std::fs::create_dir(dir) {
-                    Ok(()) => restrict_to_owner(dir, true),
+                    Ok(()) => restrict_created_dir(dir),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
                     Err(e) => Err(e),
                 }
@@ -648,5 +663,13 @@ mod tests {
         // owner-locked destination.
         store.store("a", "2").unwrap();
         assert_eq!(store.load("a").unwrap(), Some("2".to_string()));
+    }
+
+    /// A bare relative backing path (e.g. `secrets.json`) has parent `""`;
+    /// creating that must succeed, mirroring `create_dir_all`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_empty_dir_path_is_ok() {
+        imp::create_dir_private(Path::new("")).unwrap();
     }
 }
