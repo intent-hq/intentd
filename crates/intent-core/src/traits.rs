@@ -4603,7 +4603,7 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `settings.get`: one setting as `{ path, value, definition }`; the value is
+    /// `settings.get`: one setting as `{ path, value, definition, origin?, revision }`; the value is
     /// redacted when sensitive; unknown path → `-32602` (PROTOCOL §5.12).
     fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = path;

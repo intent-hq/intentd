@@ -395,8 +395,9 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     // §5.12 settings.get result carries the full definition.
     assert_eq!(get["result"]["definition"]["path"], json!("git.autoCommit"));
     assert_eq!(get["result"]["definition"]["type"], json!("boolean"));
+    assert_eq!(get["result"]["revision"], json!(0));
 
-    // settings.update over WSS → §5.12 result { applied: [{ path, value }] }.
+    // settings.update over WSS → §5.12 result with post-commit origin.
     let update = wss_rpc(
         &mut rpc,
         11,
@@ -407,18 +408,25 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     assert_eq!(update["jsonrpc"], json!("2.0"));
     assert_eq!(update["id"], json!(11));
     assert_eq!(
-        update["result"],
-        json!({ "applied": [{ "path": "git.autoCommit", "value": false }] }),
+        update["result"]["applied"],
+        json!([{ "path": "git.autoCommit", "value": false, "origin": "file" }]),
         "settings.update result shape per §5.12: {update}"
     );
+    let update_revision = update["result"]["revision"]
+        .as_u64()
+        .expect("settings.update revision");
 
     // §6.5: settings:changed with data.changes = applied pairs.
     let ev = next_settings_event(&mut sub).await;
     assert_eq!(ev["method"], json!("events.event"));
     assert_eq!(
         ev["params"]["event"]["data"]["changes"],
-        json!([{ "path": "git.autoCommit", "value": false }]),
+        json!([{ "path": "git.autoCommit", "value": false, "origin": "file" }]),
         "{ev}"
+    );
+    assert_eq!(
+        ev["params"]["event"]["data"]["revision"],
+        json!(update_revision)
     );
 
     // The daemon rewrote config.toml on disk: new value present, user comment
@@ -493,13 +501,16 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
         &format!("[workspace]\nbranchPrefix = \"after/\"\n\n{ws_api_block}"),
     );
     let ev = next_settings_event(&mut sub).await;
+    assert!(
+        ev["params"]["event"]["data"]["revision"].as_u64().unwrap() > 0,
+        "live reload must carry a daemon revision: {ev}"
+    );
     let changes = ev["params"]["event"]["data"]["changes"]
         .as_array()
         .expect("changes array");
     assert!(
-        changes
-            .iter()
-            .any(|c| c == &json!({ "path": "workspace.branchPrefix", "value": "after/" })),
+        changes.iter().any(|c| c
+            == &json!({ "path": "workspace.branchPrefix", "value": "after/", "origin": "file" })),
         "live-reload event must carry the edited key: {ev}"
     );
     let get = wss_rpc(
@@ -549,7 +560,7 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
     assert!(
         changes
             .iter()
-            .any(|c| c == &json!({ "path": "workspace.branchPrefix", "value": "recovered/" })),
+            .any(|c| c == &json!({ "path": "workspace.branchPrefix", "value": "recovered/", "origin": "file" })),
         "recovery event must carry the edited key: {ev}"
     );
     let get = wss_rpc(
@@ -636,7 +647,11 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
         json!({ "changes": [{ "path": "backgroundAgents.defaultModel", "value": "auggie:opus" }] }),
     )
     .await;
-    assert_eq!(update["result"], json!({ "applied": [] }), "{update}");
+    assert_eq!(update["result"]["applied"], json!([]), "{update}");
+    assert_eq!(
+        update["result"]["revision"], list["result"]["revision"],
+        "retired-only updates must not advance the revision: {update}"
+    );
     let get = wss_rpc(
         &mut rpc,
         15,

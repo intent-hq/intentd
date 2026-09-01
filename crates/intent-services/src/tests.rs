@@ -234,6 +234,45 @@ async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     (tmp, services, ws, id)
 }
 
+#[tokio::test]
+async fn settings_revision_gate_orders_mutation_before_snapshot() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store);
+    let gate = services.settings_revision_gate();
+    let held = gate.write().await;
+
+    let update_services = services.clone();
+    let update = tokio::spawn(async move {
+        update_services
+            .settings_update(serde_json::json!([
+                { "path": "git.autoCommit", "value": false }
+            ]))
+            .await
+            .expect("settings.update")
+    });
+    tokio::task::yield_now().await;
+
+    let list_services = services.clone();
+    let list =
+        tokio::spawn(async move { list_services.settings_list().await.expect("settings.list") });
+    assert!(!update.is_finished());
+    assert!(!list.is_finished());
+
+    drop(held);
+    let updated = update.await.expect("update task");
+    let snapshot = list.await.expect("list task");
+    assert_eq!(updated["revision"], serde_json::json!(1));
+    assert_eq!(snapshot["revision"], updated["revision"]);
+    let auto_commit = snapshot["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|entry| entry["path"] == "git.autoCommit")
+        .expect("git.autoCommit");
+    assert_eq!(auto_commit["value"], serde_json::json!(false));
+}
+
 /// `workspace.list` / `workspace.get` populate the iOS card aggregates
 /// (`taskStats` / `agentSummary` / `diffSummary`) computed from the workspace's
 /// real notes, agents, and git state, with the nested wire shape iOS decodes.
@@ -32995,8 +33034,8 @@ mod provider_switch_reresolves_default_model {
     }
 
     /// A same-provider rewrite of `providers.active` is NOT a switch — the
-    /// configured model is left alone (also the loop guard: replaying the
-    /// applied batch appends nothing).
+    /// configured model is left alone and the no-op neither reports an
+    /// applied change nor advances the settings revision.
     #[tokio::test]
     async fn same_provider_rewrite_is_a_noop() {
         let (_tmp, svc) = setup().await;
@@ -33008,7 +33047,8 @@ mod provider_switch_reresolves_default_model {
 
         let result = switch_to(&svc, "auggie").await;
         let applied = result["applied"].as_array().expect("applied array");
-        assert_eq!(applied.len(), 1, "{result}");
+        assert!(applied.is_empty(), "{result}");
+        assert_eq!(result["revision"], serde_json::json!(0), "{result}");
         assert_eq!(
             setting(&svc, "model.default"),
             Some(serde_json::json!("auggie:fable-5"))

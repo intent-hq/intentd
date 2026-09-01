@@ -683,6 +683,7 @@ async fn provider_switch_reresolves_default_model_over_wss() {
     assert_success_envelope(&resp, 5);
     let applied = resp["result"]["applied"].as_array().expect("applied array");
     assert_eq!(applied.len(), 2, "{resp}");
+    assert!(applied.iter().all(|change| change["origin"] == "file"));
     assert_eq!(applied[1]["path"], json!("model.default"), "{resp}");
     assert_eq!(applied[1]["value"], json!(""), "{resp}");
     let changes = next_settings_changed(&mut sub).await;
@@ -735,6 +736,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
 
     // settings.list — both keys advertised with their definitions + defaults.
     let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_eq!(list["result"]["revision"], json!(0));
     let settings = list["result"]["settings"]
         .as_array()
         .expect("settings array");
@@ -755,6 +757,29 @@ async fn workspace_api_settings_round_trip_over_wss() {
     assert_eq!(toon["value"], json!(true));
     assert_eq!(toon["origin"], json!("default"));
 
+    // Persisting the effective default changes only its origin. The applied
+    // delta must still converge a cached definition without a follow-up list.
+    let resp = wss_rpc(
+        &mut ws,
+        20,
+        "settings.update",
+        json!({ "changes": [{"path": "workspaceApi.toonOutput", "value": true}] }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["applied"][0],
+        json!({"path": "workspaceApi.toonOutput", "value": true, "origin": "file"})
+    );
+    let resp = wss_rpc(
+        &mut ws,
+        21,
+        "settings.reset",
+        json!({"path": "workspaceApi.toonOutput"}),
+    )
+    .await;
+    assert_eq!(resp["result"]["value"], json!(true));
+    assert_eq!(resp["result"]["origin"], json!("default"));
+
     // Update both → applied, get reads back with `file` origin.
     let resp = wss_rpc(
         &mut ws,
@@ -767,6 +792,10 @@ async fn workspace_api_settings_round_trip_over_wss() {
     )
     .await;
     assert!(resp.get("error").is_none(), "update errored: {resp}");
+    let update_revision = resp["result"]["revision"]
+        .as_u64()
+        .expect("settings.update revision");
+    assert!(update_revision > 0);
     let applied = resp["result"]["applied"].as_array().expect("applied array");
     assert_eq!(applied.len(), 2, "{resp}");
     let resp = wss_rpc(
@@ -780,6 +809,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
     // `wire_value`), matching the numeric shape of the catalog defaults.
     assert_eq!(resp["result"]["value"], json!(250_000.0));
     assert_eq!(resp["result"]["origin"], json!("file"));
+    assert_eq!(resp["result"]["revision"], json!(update_revision));
     let resp = wss_rpc(
         &mut ws,
         4,
@@ -821,6 +851,11 @@ async fn workspace_api_settings_round_trip_over_wss() {
     )
     .await;
     assert_eq!(resp["result"]["value"], json!(100_000.0));
+    assert_eq!(resp["result"]["origin"], json!("default"));
+    assert!(
+        resp["result"]["revision"].as_u64().unwrap() > update_revision,
+        "settings.reset must advance the revision: {resp}"
+    );
     let resp = wss_rpc(
         &mut ws,
         8,

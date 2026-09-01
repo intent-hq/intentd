@@ -67,6 +67,16 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
 
+async fn assert_no_frame(reader: &mut BufReader<OwnedReadHalf>) {
+    let mut line = String::new();
+    assert!(
+        timeout(Duration::from_millis(100), reader.read_line(&mut line))
+            .await
+            .is_err(),
+        "unexpected event frame: {line}"
+    );
+}
+
 /// Issue one JSON-RPC request and return the FULL response (incl. any `error`).
 async fn call(
     write_half: &mut (impl AsyncWriteExt + Unpin),
@@ -153,6 +163,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
 
     // settings.list — defaults + a redacted sensitive value (unset → null).
     let list = rpc(&mut w, &mut r, 1, "settings.list", json!({})).await;
+    assert_eq!(list["revision"], json!(0));
     assert_eq!(entry(&list, "git.autoCommit")["value"], json!(true));
     assert_eq!(entry(&list, "git.autoCommit")["type"], "boolean");
     let token = entry(&list, "sourceControl.github.token");
@@ -174,6 +185,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     .await;
     assert_eq!(got["value"], json!(true));
     assert_eq!(got["definition"]["type"], "boolean");
+    assert_eq!(got["revision"], json!(0));
 
     // Validation → -32602, nothing applied (atomic batch).
     for bad in [
@@ -218,6 +230,12 @@ async fn settings_round_trip_redaction_validation_and_event() {
         json!(true),
         "nothing applied on a failed batch"
     );
+    let after_rejection = rpc(&mut w, &mut r, 50, "settings.list", json!({})).await;
+    assert_eq!(
+        after_rejection["revision"],
+        json!(0),
+        "rejected atomic batches must not advance the revision"
+    );
 
     // Subscribe (no workspace scope → matches the global settings event).
     let (sub_read, mut sw) = connect_retry(&socket).await.into_split();
@@ -234,6 +252,31 @@ async fn settings_round_trip_redaction_validation_and_event() {
     let _ = read_json(&mut sr).await;
     wait_for_subscriber_count(&bus, 1).await;
 
+    // Identical effective DB writes and already-absent resets are no-ops:
+    // they return the current revision and publish nothing.
+    let unchanged = rpc(
+        &mut w,
+        &mut r,
+        51,
+        "settings.update",
+        json!({ "changes": [{ "path": "git.autoCommit", "value": true }] }),
+    )
+    .await;
+    assert_eq!(unchanged["applied"], json!([]));
+    assert_eq!(unchanged["revision"], json!(0));
+    assert_no_frame(&mut sr).await;
+    let unchanged = rpc(
+        &mut w,
+        &mut r,
+        52,
+        "settings.reset",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(unchanged["value"], json!(true));
+    assert_eq!(unchanged["revision"], json!(0));
+    assert_no_frame(&mut sr).await;
+
     // settings.update (non-secret) → applied + settings:changed (redacted).
     let applied = rpc(
         &mut w,
@@ -245,9 +288,14 @@ async fn settings_round_trip_redaction_validation_and_event() {
     .await;
     assert_eq!(applied["applied"][0]["path"], "git.autoCommit");
     assert_eq!(applied["applied"][0]["value"], json!(false));
+    assert_eq!(applied["revision"], json!(1));
     let ev = read_json(&mut sr).await;
     assert_eq!(ev["method"], "events.event");
     assert_eq!(ev["params"]["event"]["type"], "settings:changed");
+    assert_eq!(
+        ev["params"]["event"]["data"]["revision"],
+        applied["revision"]
+    );
     assert_eq!(
         ev["params"]["event"]["data"]["changes"][0],
         json!({ "path": "git.autoCommit", "value": false })
@@ -261,6 +309,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     )
     .await;
     assert_eq!(got["value"], json!(false));
+    assert_eq!(got["revision"], applied["revision"]);
 
     // settings.update (sensitive) → the secret is persisted to the keychain but
     // NEVER echoed: applied value + event are redacted, get/list stay redacted.
@@ -322,9 +371,12 @@ async fn settings_round_trip_redaction_validation_and_event() {
         json!({ "path": "git.autoCommit" }),
     )
     .await;
-    assert_eq!(reset, json!({ "path": "git.autoCommit", "value": true }));
+    assert_eq!(reset["path"], json!("git.autoCommit"));
+    assert_eq!(reset["value"], json!(true));
+    assert!(reset["revision"].as_u64().unwrap() > applied["revision"].as_u64().unwrap());
     let ev = read_json(&mut sr).await;
     assert_eq!(ev["params"]["event"]["type"], "settings:changed");
+    assert_eq!(ev["params"]["event"]["data"]["revision"], reset["revision"]);
     assert_eq!(
         ev["params"]["event"]["data"]["changes"][0],
         json!({ "path": "git.autoCommit", "value": true })
@@ -353,7 +405,9 @@ async fn settings_round_trip_redaction_validation_and_event() {
         json!({ "path": "linear.token" }),
     )
     .await;
-    assert_eq!(reset, json!({ "path": "linear.token", "value": null }));
+    assert_eq!(reset["path"], json!("linear.token"));
+    assert_eq!(reset["value"], Value::Null);
+    assert!(reset["revision"].is_number());
     let ev = read_json(&mut sr).await;
     assert_eq!(ev["params"]["event"]["type"], "settings:changed");
     assert_eq!(
