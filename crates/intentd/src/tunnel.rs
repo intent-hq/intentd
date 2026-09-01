@@ -69,9 +69,12 @@ pub struct TunnelSupervisor {
 }
 
 /// Live sidecar state: the stable address plus handles to stop the
-/// supervision task (which owns the child).
+/// supervision task (which owns the child). `up` is cleared by the
+/// supervision task while the child is down (crash → restart/backoff loop)
+/// so the address accessors stop advertising a route nothing is serving.
 struct Running {
     address: String,
+    up: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_tx: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -114,6 +117,7 @@ impl TunnelSupervisor {
         )
         .await?;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let task = tokio::spawn(supervise(
             self.bin.clone(),
             self.key_path.clone(),
@@ -123,9 +127,11 @@ impl TunnelSupervisor {
             address.clone(),
             child,
             stop_rx,
+            std::sync::Arc::clone(&up),
         ));
         *state = Some(Running {
             address: address.clone(),
+            up,
             stop_tx,
             task,
         });
@@ -148,20 +154,29 @@ impl TunnelSupervisor {
         }
     }
 
-    /// Current `tc...` address, or `None` when stopped.
+    /// Current `tc...` address, or `None` when stopped or while the child is
+    /// down in the restart/backoff loop — the surfaces that advertise the
+    /// address (pairing/status) must not hand out a route nothing serves.
     pub async fn address(&self) -> Option<String> {
-        self.state.lock().await.as_ref().map(|r| r.address.clone())
+        self.state
+            .lock()
+            .await
+            .as_ref()
+            .filter(|r| r.up.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|r| r.address.clone())
     }
 
-    /// Current `tc...` address without awaiting: `None` when stopped or when
-    /// the state lock is momentarily held. For synchronous read paths
-    /// (`system.status`) that must not block — mirrors the `try_lock` fallback
-    /// used for port/fingerprint there, self-correcting on the next call.
+    /// Current `tc...` address without awaiting: `None` when stopped, down
+    /// (restart/backoff), or when the state lock is momentarily held. For
+    /// synchronous read paths (`system.status`) that must not block — mirrors
+    /// the `try_lock` fallback used for port/fingerprint there,
+    /// self-correcting on the next call.
     pub fn address_now(&self) -> Option<String> {
-        self.state
-            .try_lock()
-            .ok()
-            .and_then(|s| s.as_ref().map(|r| r.address.clone()))
+        self.state.try_lock().ok().and_then(|s| {
+            s.as_ref()
+                .filter(|r| r.up.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|r| r.address.clone())
+        })
     }
 
     /// Generate the persisted key on first use (`tailcat genkey`). The key
@@ -323,6 +338,7 @@ async fn supervise(
     expected_address: String,
     mut child: Child,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    up: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut backoff = RESTART_BACKOFF_INITIAL;
     loop {
@@ -333,6 +349,10 @@ async fn supervise(
                 if *stop_rx.borrow() {
                     return;
                 }
+                // Stop advertising the address while nothing serves it —
+                // pairing/status surfaces omit tcAddress until the restart
+                // below succeeds.
+                up.store(false, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
                     status = ?status.ok(),
                     "tailcat tunnel sidecar exited unexpectedly; restarting"
@@ -377,6 +397,7 @@ async fn supervise(
                              (key file replaced?); clients hold a stale address"
                         );
                     }
+                    up.store(true, std::sync::atomic::Ordering::Relaxed);
                     break new_child;
                 }
                 Err(e) => {
@@ -439,6 +460,65 @@ esac
         let sup2 = TunnelSupervisor::new(bin, dir.path());
         assert_eq!(sup2.start(5181, None).await.unwrap(), addr);
         sup2.stop().await;
+    }
+
+    #[tokio::test]
+    async fn address_is_absent_while_child_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-tailcat.sh");
+        // First serve run prints the address and waits for the exit marker,
+        // then dies; later runs never print, so the restart loop keeps
+        // failing (short address timeout) and the address must stay absent.
+        let script = r#"#!/bin/sh
+key=""
+for arg in "$@"; do
+  case "$arg" in
+    --key=*) key="${arg#--key=}" ;;
+  esac
+done
+dir=$(dirname "$key")
+case "$1" in
+  genkey)
+    printf 'k' > "$key"
+    ;;
+  serve)
+    n=$(cat "$dir/runs" 2>/dev/null || echo 0)
+    n=$((n+1))
+    echo "$n" > "$dir/runs"
+    if [ "$n" -eq 1 ]; then
+      printf '{"listenAddr":"tcTest"}\n'
+      while [ ! -f "$dir/exit-now" ]; do sleep 0.1; done
+      exit 1
+    fi
+    sleep 600
+    ;;
+esac
+"#;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sup =
+            TunnelSupervisor::new(path, dir.path()).with_address_timeout(Duration::from_secs(2));
+
+        let addr = sup.start(5181, None).await.unwrap();
+        assert_eq!(addr, "tcTest");
+        assert_eq!(sup.address().await.as_deref(), Some("tcTest"));
+
+        // Kill the child; the supervisor must stop advertising the address
+        // while the restart/backoff loop has nothing serving it.
+        std::fs::write(dir.path().join("exit-now"), b"").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if sup.address().await.is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "address still advertised after child exit"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(sup.address_now(), None);
+        sup.stop().await;
     }
 
     #[tokio::test]
