@@ -10162,6 +10162,119 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
     assert!(types.contains(&AGENT_IDLE));
 }
 
+/// The immediate (debounce = 0) path: the report wake never enters a hold —
+/// it is enqueued directly by the busy-parent fallback (here: an active
+/// question hold), so the queued entry carries NO `child_agent_id` stamp and
+/// only its `event_notification` metadata identifies it. Settlement must
+/// still retract it and fold the report into the single terminal wake —
+/// this pins the metadata-based matching that a stamp-based matcher would
+/// miss.
+#[tokio::test]
+async fn debounce_zero_report_wake_retracted_at_settlement() {
+    let (_t, svc, ws) = setup().await;
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("agents.reportToParentDebounceSeconds".into(), json!(0))])
+        .expect("set debounce");
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    // Arm a question hold on the parent so the immediate wake takes the
+    // enqueue branch of `deliver_parent_wake_with_id` instead of appending.
+    let question = svc
+        .store()
+        .append_agent_message(&parent, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append held question");
+    assert!(
+        svc.record_pending_questions_marker(&ws, &parent, &question.id)
+            .await,
+        "real question row must arm the hold"
+    );
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    let report = "immediate progress";
+    svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
+        .await
+        .expect("report");
+    let parked = svc.queue_snapshot(&parent);
+    assert_eq!(
+        parked.len(),
+        1,
+        "immediate wake parked by the question hold: {parked:?}"
+    );
+    assert!(
+        parked[0]["holdKind"].is_null() && parked[0]["childAgentId"].is_null(),
+        "debounce=0 entry has neither hold nor child stamp: {parked:?}"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline,
+        "immediate wake was parked, not appended"
+    );
+
+    // Release the hold (dismissal does not drain the queue on the
+    // store-only test path), then settle the child: the parked entry is
+    // retracted and folded into the single terminal wake.
+    svc.agent_dismiss_questions_op(ws.clone(), parent.clone(), question.id)
+        .await
+        .expect("dismiss questions");
+    let before_settlement = parent_message_count(&svc, &parent).await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "report": report }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        before_settlement + 1,
+        "exactly ONE terminal wake"
+    );
+    assert!(
+        svc.queue_snapshot(&parent).is_empty(),
+        "stamp-less immediate report wake retracted at settlement"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let wake = session.messages.last().expect("terminal wake");
+    let wake_text = serde_json::to_string(&wake.content).expect("serialize content");
+    assert_eq!(
+        wake_text.matches(&format!("Report: {report}")).count(),
+        1,
+        "terminal wake renders the report exactly once: {wake_text}"
+    );
+    let metadata = wake.metadata.as_ref().expect("wake metadata");
+    let events = metadata["events"].as_array().expect("events array");
+    assert_eq!(metadata["eventCount"], json!(events.len()));
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["type"].as_str().expect("event type"))
+        .collect();
+    assert_eq!(
+        types[0], "agent:reportToParent",
+        "folded report event ordered before the terminal event: {types:?}"
+    );
+    assert!(types.contains(&AGENT_IDLE));
+}
+
 /// Grouped mirror: a report wake that FLUSHED out of its debounce hold while
 /// the group was sealed-but-unfired (the child still running) is retracted
 /// when the `after_all` group settles — the report folds into the aggregate
