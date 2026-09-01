@@ -1934,7 +1934,7 @@ impl<'a> SettingsService<'a> {
 
     /// The wire `origin` for a TOML-backed key (`default` | `file` | `flag`),
     /// or `None` for secrets / SQLite-backed keys (no origin on the wire).
-    fn origin_for(&self, path: &str) -> Option<&'static str> {
+    pub(crate) fn origin_for(&self, path: &str) -> Option<&'static str> {
         self.registry_for(path)
             .and_then(|reg| reg.origin(path))
             .map(|o| o.as_str())
@@ -2053,7 +2053,7 @@ impl<'a> SettingsService<'a> {
     /// the already-applied registry batch is compensated (prior values
     /// restored, config.toml rewritten back) so an error return never leaves
     /// a durable file change without a `settings:changed` event. Returns the
-    /// **redacted** applied `{ path, value }` pairs for the response +
+    /// **redacted** applied `{ path, value, origin? }` pairs for the response +
     /// `settings:changed` payload.
     pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
         let entries = changes
@@ -2147,7 +2147,12 @@ impl<'a> SettingsService<'a> {
                 }
             };
             match persisted {
-                Ok(entry) => applied.push(entry),
+                Ok(mut entry) => {
+                    if let Some(origin) = self.origin_for(def.path) {
+                        entry["origin"] = json!(origin);
+                    }
+                    applied.push(entry);
+                }
                 Err(e) => {
                     // Compensate the registry batch: without this, the TOML
                     // subset would stay applied on disk while the caller sees
@@ -2172,7 +2177,7 @@ impl<'a> SettingsService<'a> {
 
     /// `settings.reset` → restore the default (remove the key from
     /// `config.toml` for TOML-backed keys / delete the persisted or secret
-    /// value otherwise) and return the **redacted** `{ path, value }`;
+    /// value otherwise) and return the **redacted** `{ path, value, origin? }`;
     /// unknown path → `-32602`, flag-pinned key → `-32602`.
     pub(crate) async fn reset(&self, path: &str) -> Result<Value> {
         let def = find_definition(path)
@@ -2185,7 +2190,11 @@ impl<'a> SettingsService<'a> {
             self.store.delete_setting(def.path).await?;
         }
         let value = self.current_value(&def).await;
-        Ok(json!({ "path": def.path, "value": value }))
+        let mut result = json!({ "path": def.path, "value": value });
+        if let Some(origin) = self.origin_for(def.path) {
+            result["origin"] = json!(origin);
+        }
+        Ok(result)
     }
 }
 

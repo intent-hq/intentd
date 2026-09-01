@@ -175,6 +175,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     .await;
     assert_eq!(got["value"], json!(true));
     assert_eq!(got["definition"]["type"], "boolean");
+    assert_eq!(got["revision"], json!(0));
 
     // Validation → -32602, nothing applied (atomic batch).
     for bad in [
@@ -273,6 +274,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     )
     .await;
     assert_eq!(got["value"], json!(false));
+    assert_eq!(got["revision"], applied["revision"]);
 
     // settings.update (sensitive) → the secret is persisted to the keychain but
     // NEVER echoed: applied value + event are redacted, get/list stay redacted.

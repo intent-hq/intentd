@@ -395,8 +395,9 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     // §5.12 settings.get result carries the full definition.
     assert_eq!(get["result"]["definition"]["path"], json!("git.autoCommit"));
     assert_eq!(get["result"]["definition"]["type"], json!("boolean"));
+    assert_eq!(get["result"]["revision"], json!(0));
 
-    // settings.update over WSS → §5.12 result { applied: [{ path, value }] }.
+    // settings.update over WSS → §5.12 result with post-commit origin.
     let update = wss_rpc(
         &mut rpc,
         11,
@@ -408,7 +409,7 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     assert_eq!(update["id"], json!(11));
     assert_eq!(
         update["result"]["applied"],
-        json!([{ "path": "git.autoCommit", "value": false }]),
+        json!([{ "path": "git.autoCommit", "value": false, "origin": "file" }]),
         "settings.update result shape per §5.12: {update}"
     );
     let update_revision = update["result"]["revision"]
@@ -420,7 +421,7 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     assert_eq!(ev["method"], json!("events.event"));
     assert_eq!(
         ev["params"]["event"]["data"]["changes"],
-        json!([{ "path": "git.autoCommit", "value": false }]),
+        json!([{ "path": "git.autoCommit", "value": false, "origin": "file" }]),
         "{ev}"
     );
     assert_eq!(
@@ -508,9 +509,8 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
         .as_array()
         .expect("changes array");
     assert!(
-        changes
-            .iter()
-            .any(|c| c == &json!({ "path": "workspace.branchPrefix", "value": "after/" })),
+        changes.iter().any(|c| c
+            == &json!({ "path": "workspace.branchPrefix", "value": "after/", "origin": "file" })),
         "live-reload event must carry the edited key: {ev}"
     );
     let get = wss_rpc(
@@ -560,7 +560,7 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
     assert!(
         changes
             .iter()
-            .any(|c| c == &json!({ "path": "workspace.branchPrefix", "value": "recovered/" })),
+            .any(|c| c == &json!({ "path": "workspace.branchPrefix", "value": "recovered/", "origin": "file" })),
         "recovery event must carry the edited key: {ev}"
     );
     let get = wss_rpc(

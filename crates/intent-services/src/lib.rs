@@ -10300,7 +10300,7 @@ fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAtten
 }
 
 /// Build a `settings:changed` event with the self-sufficient payload
-/// `{ changes: [{ path, value }] }` carrying the **redacted** applied pairs
+/// `{ changes: [{ path, value, origin? }] }` carrying the **redacted** applied pairs
 /// (PROTOCOL §6.5 / §9.8). Settings are global, so the event carries the empty
 /// workspace id; subscribers that omit a `workspaceId` filter still receive it.
 fn settings_changed_event(changes: &[serde_json::Value], revision: u64) -> NewEvent {
@@ -12839,7 +12839,11 @@ impl Services {
                     Some(def) => settings::wire_value(&def, raw),
                     None => raw,
                 };
-                serde_json::json!({ "path": path, "value": value })
+                let mut change = serde_json::json!({ "path": path, "value": value });
+                if let Some(origin) = self.settings_service().origin_for(path) {
+                    change["origin"] = serde_json::json!(origin);
+                }
+                change
             })
             .collect();
         if let Some(control) = self.server_control.get() {
@@ -13062,7 +13066,12 @@ impl WorkspaceApi for Services {
     }
 
     fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.settings_service().get(&path).await })
+        Box::pin(async move {
+            let _revision_guard = self.settings_revision_gate.read().await;
+            let mut result = self.settings_service().get(&path).await?;
+            result["revision"] = serde_json::json!(self.settings_revision.load(Ordering::SeqCst));
+            Ok(result)
+        })
     }
 
     fn settings_update(
