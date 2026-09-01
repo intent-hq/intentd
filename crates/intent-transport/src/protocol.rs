@@ -308,13 +308,19 @@
 //! now get `-32601` — along with the `intentd import` / `intentd
 //! import-legacy` CLI subcommands and the first-boot auto-import in `serve`.
 //! Method catalog shrinks by one fast-path method — 298 router methods,
-//! 337 total.
+//! 337 total. Version 9.1 restores the legacy workspace importer (additive;
+//! §5.7): the `system.importLegacy` UDS-only fast-path method is back in the
+//! catalog exactly as before the 9.0 removal, along with the `intentd
+//! import` / `intentd import-legacy` CLI subcommands and the first-boot
+//! auto-import in `serve`. 9.0 already shipped, so the restoration lands as
+//! an additive minor bump rather than a rollback of 9.0. Method catalog
+//! grows by one fast-path method — 298 router methods, 338 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.0";
+pub const PROTOCOL_VERSION: &str = "9.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
