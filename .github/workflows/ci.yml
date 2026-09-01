@@ -402,6 +402,47 @@ jobs:
         run: |
           cargo test -p intent-core --lib capture_login_shell_path_with_fake_shell
           cargo test -p intentd --test wss_integration wss_note_save_asset_round_trip
+      # The install.ps1 guard tests (intentd-sitter's install_ps1_owner.rs)
+      # execute the shipped PowerShell and self-skip when `pwsh` is absent —
+      # which let the suite "pass" in ~0.014s without running a single block
+      # (intent-hq/monorepo#4054). Provision pwsh 7.x here so the tests
+      # actually execute. GitHub-hosted Ubuntu runners (the burst labels)
+      # preinstall pwsh, so this is a no-op there; on tinybox the pinned
+      # tarball is unpacked once into a per-slot dir (keyed on $RUNNER_NAME
+      # like the other per-slot dirs, ~200 MiB, reused across runs — per-slot
+      # so concurrent first-time installs on the 8 shared slots cannot
+      # clobber each other's downloads, the monorepo#1239 failure mode).
+      - name: Provision PowerShell (pwsh) if missing
+        run: |
+          set -euo pipefail
+          if command -v pwsh >/dev/null 2>&1; then
+            echo "pwsh already on PATH: $(command -v pwsh) ($(pwsh --version))"
+            exit 0
+          fi
+          version=7.4.6
+          sha256=6f6015203c47806c5cc444c19d8ed019695e610fbd948154264bf9ca8e157561
+          dest="$HOME/ci-pwsh/${RUNNER_NAME:-local}/$version"
+          if [ ! -x "$dest/pwsh" ]; then
+            tmp=$(mktemp -d)
+            curl -fsSL --retry 3 -o "$tmp/pwsh.tar.gz" \
+              "https://github.com/PowerShell/PowerShell/releases/download/v${version}/powershell-${version}-linux-x64.tar.gz"
+            echo "$sha256  $tmp/pwsh.tar.gz" | sha256sum -c -
+            mkdir -p "$dest"
+            tar -xzf "$tmp/pwsh.tar.gz" -C "$dest"
+            chmod +x "$dest/pwsh"
+            rm -rf "$tmp"
+          fi
+          echo "$dest" >> "$GITHUB_PATH"
+          "$dest/pwsh" --version
+      # INTENTD_CI_EXPECT_PWSH makes a missing pwsh FAIL these tests instead
+      # of skipping (see install_ps1_owner.rs), so a broken provisioning step
+      # above can never quietly turn this suite back into a no-op. The suite
+      # runs here rather than relying on coverage-all, where a pwsh-less
+      # runner would skip it silently.
+      - name: Installer guard tests (install_ps1_owner)
+        env:
+          INTENTD_CI_EXPECT_PWSH: 1
+        run: cargo test -p intentd-sitter --test install_ps1_owner
 
   # Release-PR fast path (intent-hq/monorepo#1374): release-plz PRs change
   # only version strings + changelog, so the compiled code is identical to

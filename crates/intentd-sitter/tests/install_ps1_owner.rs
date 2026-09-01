@@ -14,7 +14,9 @@
 //! anywhere `pwsh` is installed — they were developed against pwsh 7.4.6 on
 //! macOS. They are skipped where it is not, so they are a supplement to
 //! reviewing install.ps1, not a substitute: a run without `pwsh` proves
-//! nothing. Everything in install.ps1 that needs Windows itself — Scheduled
+//! nothing. CI therefore provisions pwsh and sets `INTENTD_CI_EXPECT_PWSH`,
+//! under which a missing PowerShell fails the suite instead of skipping it
+//! (see `pwsh()`). Everything in install.ps1 that needs Windows itself — Scheduled
 //! Task registration, and the startup wait that polls the task's log — remains
 //! unexercised by any test and can still regress silently.
 
@@ -56,6 +58,13 @@ fn ps_region(name: &str) -> String {
 /// PowerShell, if this machine has it. Absent on stock macOS and on most Linux
 /// hosts, hence the skips; `pwsh` is the cross-platform build, `powershell` the
 /// Windows-only one.
+///
+/// In CI the skip is a trap: a lane that lost its PowerShell keeps "passing"
+/// in milliseconds without executing a single block (intent-hq/monorepo#4054).
+/// The CI step that provisions pwsh sets `INTENTD_CI_EXPECT_PWSH=1`, and under
+/// that marker a missing PowerShell panics instead of skipping, so a broken
+/// provisioning step fails the suite loudly. Local runs without the marker
+/// keep today's skip.
 fn pwsh() -> Option<PathBuf> {
     for name in ["pwsh", "powershell"] {
         let Ok(output) = Command::new("sh")
@@ -73,6 +82,12 @@ fn pwsh() -> Option<PathBuf> {
             return Some(PathBuf::from(path));
         }
     }
+    assert!(
+        std::env::var_os("INTENTD_CI_EXPECT_PWSH").is_none_or(|v| v.is_empty()),
+        "INTENTD_CI_EXPECT_PWSH is set but neither `pwsh` nor `powershell` is on PATH — \
+         CI promised to provision PowerShell before running these tests, so a skip here \
+         would silently drop the install.ps1 guard coverage; fix the provisioning step"
+    );
     None
 }
 
