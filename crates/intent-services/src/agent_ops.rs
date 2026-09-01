@@ -12555,6 +12555,136 @@ impl Services {
         self.publish_queue_updated(agent_id).await;
     }
 
+    /// `true` when a queued entry is an undelivered `agent.reportToParent`
+    /// progress wake from `child_agent_id`: every event row of its
+    /// `event_notification` metadata is an `agent:reportToParent` event whose
+    /// `data.agentId` is the child. Matching on metadata rather than the
+    /// `child_agent_id` hold stamp also identifies the immediate
+    /// (debounce = 0) wake path, which enqueues via the generic busy-parent
+    /// fallback without the stamp. The all-rows guard keeps combined wakes
+    /// (report + terminal events) out of the match.
+    fn is_undelivered_report_wake(entry: &QueuedMessage, child_agent_id: &str) -> bool {
+        let Some(events) = entry
+            .message_metadata
+            .as_ref()
+            .and_then(|m| m.get("events"))
+            .and_then(|e| e.as_array())
+        else {
+            return false;
+        };
+        !events.is_empty()
+            && events.iter().all(|e| {
+                e.get("type").and_then(|t| t.as_str()) == Some("agent:reportToParent")
+                    && e.get("data")
+                        .and_then(|d| d.get("agentId"))
+                        .and_then(|a| a.as_str())
+                        == Some(child_agent_id)
+            })
+    }
+
+    /// Retract (remove) every report wake from `child_agent_id` that already
+    /// FLUSHED out of its debounce hold (or was enqueued directly by the
+    /// immediate debounce = 0 path) but is still sitting undelivered on the
+    /// parent's queue — the flushed mirror of
+    /// [`Services::retract_held_message`]: the terminal settlement supersedes
+    /// these wakes just the same, so the caller folds their metadata into the
+    /// combined wake instead of letting them drain as stale standalone report
+    /// wakes beside it. Held entries are excluded (they are the
+    /// `(child_agent_id, hold_kind)` key's domain), as are entries under
+    /// edit. Returns the removed entries in queue order — oldest first — so
+    /// the caller can fold them chronologically and restore them verbatim on
+    /// a failed send; empty when nothing matched.
+    ///
+    /// Crash window (shared with [`Services::retract_held_message`]): the
+    /// shrunken queue persists before the combined wake commits, so a crash
+    /// in between drops the queued metadata row. Bounded loss by design: the
+    /// report CONTENT is persisted on the child's session
+    /// (`completion_report`), and boot reconciliation replays the settlement
+    /// whose wake text renders that persisted report — only the
+    /// machine-readable `agent:reportToParent` metadata row of the lost
+    /// entry is not re-folded. Retracting only after the wake commits would
+    /// trade this for the worse inverse: a crash after the commit but before
+    /// the retract leaves the stale report wake to drain beside the durable
+    /// terminal wake — the exact duplicate this retract exists to prevent.
+    pub(crate) async fn retract_flushed_report_messages(
+        &self,
+        agent_id: &AgentId,
+        child_agent_id: &str,
+    ) -> Vec<QueuedMessage> {
+        let removed: Vec<QueuedMessage> = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            guard.get_mut(agent_id).map_or_else(Vec::new, |queue| {
+                let mut removed = Vec::new();
+                let mut idx = 0;
+                while idx < queue.len() {
+                    let m = &queue[idx];
+                    if m.hold_kind.is_none()
+                        && !m.editing
+                        && Self::is_undelivered_report_wake(m, child_agent_id)
+                    {
+                        removed.push(queue.remove(idx));
+                    } else {
+                        idx += 1;
+                    }
+                }
+                removed
+            })
+        };
+        if removed.is_empty() {
+            return removed;
+        }
+        for entry in &removed {
+            // A just-flushed entry has no timer left, but cancel defensively:
+            // retract can race a stale sleeper still waiting on the lock.
+            self.cancel_hold_release_timer(&entry.id);
+        }
+        self.publish_queue_updated(agent_id).await;
+        removed
+    }
+
+    /// Restore a retracted FLUSHED report wake after the combined wake it was
+    /// folded into failed to commit — the flushed mirror of
+    /// [`Services::restore_held_message`]: re-insert the entry verbatim (same
+    /// id, no hold marker, ready-to-send) and persist/publish, so the
+    /// stable-id retry can retract and fold it again instead of losing the
+    /// report event. Unlike the held restore (a held entry drains by its own
+    /// timer, so tail placement is fine), a flushed entry is ready-to-send:
+    /// it re-enters at its FIFO position by `queued_at` among the normal
+    /// (non-interrupt) entries, so entries queued after it are not delivered
+    /// ahead of it if the parent drains before the retry re-retracts. No
+    /// release timer is armed — the entry's hold already expired. No-op when
+    /// an entry with the same id is already back on the queue (a concurrent
+    /// restore path won the race).
+    pub(crate) async fn restore_flushed_report_message(
+        &self,
+        agent_id: &AgentId,
+        entry: QueuedMessage,
+    ) {
+        let restored = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let queue = guard.entry(agent_id.clone()).or_default();
+            if queue.iter().any(|m| m.id == entry.id) {
+                false
+            } else {
+                let idx = queue
+                    .iter()
+                    .position(|m| !m.interrupt_priority && m.queued_at > entry.queued_at)
+                    .unwrap_or(queue.len());
+                queue.insert(idx, entry);
+                true
+            }
+        };
+        if restored {
+            self.publish_queue_updated(agent_id).await;
+        }
+    }
+
     /// Arm (or re-arm) the per-entry release timer for a held queue entry: a
     /// spawned sleeper that fires at `hold_until` and flushes the hold via
     /// [`Services::flush_expired_hold`]. A missing/unparseable/past deadline
