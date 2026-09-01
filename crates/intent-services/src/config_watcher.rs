@@ -135,7 +135,11 @@ impl ConfigWatcher {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the config path has no parent directory or file name, or if the file watcher cannot be created or registered.
-    pub fn start<F, Fut>(registry: Arc<SettingsRegistry>, on_change: F) -> Result<Self>
+    pub fn start<F, Fut>(
+        registry: Arc<SettingsRegistry>,
+        revision_gate: Arc<tokio::sync::RwLock<()>>,
+        on_change: F,
+    ) -> Result<Self>
     where
         F: Fn(SettingsChanged) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -184,7 +188,7 @@ impl ConfigWatcher {
         watcher
             .watch(&dir, RecursiveMode::NonRecursive)
             .map_err(|e| Error::Internal(format!("config.toml watch on {}: {e}", dir.display())))?;
-        let task = tokio::spawn(watch_loop(registry, raw_rx, on_change));
+        let task = tokio::spawn(watch_loop(registry, revision_gate, raw_rx, on_change));
         Ok(Self {
             _watcher: watcher,
             task,
@@ -196,6 +200,7 @@ impl ConfigWatcher {
 /// once per burst. Returns when the watcher (and its channel sender) drops.
 async fn watch_loop<F, Fut>(
     registry: Arc<SettingsRegistry>,
+    revision_gate: Arc<tokio::sync::RwLock<()>>,
     mut raw_rx: mpsc::UnboundedReceiver<()>,
     on_change: F,
 ) where
@@ -211,6 +216,7 @@ async fn watch_loop<F, Fut>(
             },
             () = sleep_until(deadline), if deadline.is_some() => {
                 deadline = None;
+                let _revision_guard = revision_gate.write().await;
                 if let ReloadOutcome::Applied(notice) = process_config_change(&registry) {
                     on_change(notice).await;
                 }
@@ -377,12 +383,16 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (dir, reg) = temp_registry(Some("[git]\nautoCommit = true\n"));
         let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
-        let _watcher = ConfigWatcher::start(reg.clone(), move |notice| {
-            let tx = tx.clone();
-            async move {
-                let _ = tx.send(notice);
-            }
-        })
+        let _watcher = ConfigWatcher::start(
+            reg.clone(),
+            Arc::new(tokio::sync::RwLock::new(())),
+            move |notice| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(notice);
+                }
+            },
+        )
         .expect("start watcher");
         // Give the OS watch a moment to establish before mutating the dir.
         tokio::time::sleep(Duration::from_millis(250)).await;

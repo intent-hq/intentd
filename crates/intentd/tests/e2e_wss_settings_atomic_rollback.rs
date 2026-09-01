@@ -735,6 +735,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
 
     // settings.list — both keys advertised with their definitions + defaults.
     let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_eq!(list["result"]["revision"], json!(0));
     let settings = list["result"]["settings"]
         .as_array()
         .expect("settings array");
@@ -767,6 +768,10 @@ async fn workspace_api_settings_round_trip_over_wss() {
     )
     .await;
     assert!(resp.get("error").is_none(), "update errored: {resp}");
+    let update_revision = resp["result"]["revision"]
+        .as_u64()
+        .expect("settings.update revision");
+    assert!(update_revision > 0);
     let applied = resp["result"]["applied"].as_array().expect("applied array");
     assert_eq!(applied.len(), 2, "{resp}");
     let resp = wss_rpc(
@@ -821,6 +826,10 @@ async fn workspace_api_settings_round_trip_over_wss() {
     )
     .await;
     assert_eq!(resp["result"]["value"], json!(100_000.0));
+    assert!(
+        resp["result"]["revision"].as_u64().unwrap() > update_revision,
+        "settings.reset must advance the revision: {resp}"
+    );
     let resp = wss_rpc(
         &mut ws,
         8,

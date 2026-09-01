@@ -407,10 +407,13 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     assert_eq!(update["jsonrpc"], json!("2.0"));
     assert_eq!(update["id"], json!(11));
     assert_eq!(
-        update["result"],
-        json!({ "applied": [{ "path": "git.autoCommit", "value": false }] }),
+        update["result"]["applied"],
+        json!([{ "path": "git.autoCommit", "value": false }]),
         "settings.update result shape per §5.12: {update}"
     );
+    let update_revision = update["result"]["revision"]
+        .as_u64()
+        .expect("settings.update revision");
 
     // §6.5: settings:changed with data.changes = applied pairs.
     let ev = next_settings_event(&mut sub).await;
@@ -419,6 +422,10 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
         ev["params"]["event"]["data"]["changes"],
         json!([{ "path": "git.autoCommit", "value": false }]),
         "{ev}"
+    );
+    assert_eq!(
+        ev["params"]["event"]["data"]["revision"],
+        json!(update_revision)
     );
 
     // The daemon rewrote config.toml on disk: new value present, user comment
@@ -493,6 +500,10 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
         &format!("[workspace]\nbranchPrefix = \"after/\"\n\n{ws_api_block}"),
     );
     let ev = next_settings_event(&mut sub).await;
+    assert!(
+        ev["params"]["event"]["data"]["revision"].as_u64().unwrap() > 0,
+        "live reload must carry a daemon revision: {ev}"
+    );
     let changes = ev["params"]["event"]["data"]["changes"]
         .as_array()
         .expect("changes array");
@@ -636,7 +647,11 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
         json!({ "changes": [{ "path": "backgroundAgents.defaultModel", "value": "auggie:opus" }] }),
     )
     .await;
-    assert_eq!(update["result"], json!({ "applied": [] }), "{update}");
+    assert_eq!(update["result"]["applied"], json!([]), "{update}");
+    assert_eq!(
+        update["result"]["revision"], list["result"]["revision"],
+        "retired-only updates must not advance the revision: {update}"
+    );
     let get = wss_rpc(
         &mut rpc,
         15,

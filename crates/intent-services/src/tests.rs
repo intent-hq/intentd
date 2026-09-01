@@ -234,6 +234,45 @@ async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     (tmp, services, ws, id)
 }
 
+#[tokio::test]
+async fn settings_revision_gate_orders_mutation_before_snapshot() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store);
+    let gate = services.settings_revision_gate();
+    let held = gate.write().await;
+
+    let update_services = services.clone();
+    let update = tokio::spawn(async move {
+        update_services
+            .settings_update(serde_json::json!([
+                { "path": "git.autoCommit", "value": false }
+            ]))
+            .await
+            .expect("settings.update")
+    });
+    tokio::task::yield_now().await;
+
+    let list_services = services.clone();
+    let list =
+        tokio::spawn(async move { list_services.settings_list().await.expect("settings.list") });
+    assert!(!update.is_finished());
+    assert!(!list.is_finished());
+
+    drop(held);
+    let updated = update.await.expect("update task");
+    let snapshot = list.await.expect("list task");
+    assert_eq!(updated["revision"], serde_json::json!(1));
+    assert_eq!(snapshot["revision"], updated["revision"]);
+    let auto_commit = snapshot["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|entry| entry["path"] == "git.autoCommit")
+        .expect("git.autoCommit");
+    assert_eq!(auto_commit["value"], serde_json::json!(false));
+}
+
 /// `workspace.list` / `workspace.get` populate the iOS card aggregates
 /// (`taskStats` / `agentSummary` / `diffSummary`) computed from the workspace's
 /// real notes, agents, and git state, with the nested wire shape iOS decodes.

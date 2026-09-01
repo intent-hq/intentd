@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine as _;
@@ -552,6 +553,13 @@ pub struct Services {
     /// SQLite-only behavior for read-only/unit-test wiring. Shared across
     /// clones so every handle reads/writes the same file + snapshot.
     settings_registry: Option<Arc<SettingsRegistry>>,
+    /// Daemon-lifetime monotonic revision for the global settings surface.
+    /// Incremented only after a mutation has committed successfully, then
+    /// copied into both its response and `settings:changed` event.
+    settings_revision: Arc<AtomicU64>,
+    /// Orders settings snapshots against every mutation from persistence
+    /// through revision allocation and event publication.
+    settings_revision_gate: Arc<tokio::sync::RwLock<()>>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -979,6 +987,8 @@ impl Services {
                 intent_core::FileSecretStore::new(),
             ))),
             settings_registry: None,
+            settings_revision: Arc::new(AtomicU64::new(0)),
+            settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub: Arc::new(McpHub::new()),
@@ -1542,6 +1552,13 @@ impl Services {
             &self.secrets,
             self.settings_registry.as_deref(),
         )
+    }
+
+    /// Shared ordering boundary used by the config watcher so its registry
+    /// reload is serialized with wire mutations and `settings.list`.
+    #[must_use]
+    pub fn settings_revision_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.settings_revision_gate)
     }
 
     /// Effective `voice.workspaceVocabulary.maxTerms` cap (PROTOCOL §5.12,
@@ -10286,7 +10303,7 @@ fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAtten
 /// `{ changes: [{ path, value }] }` carrying the **redacted** applied pairs
 /// (PROTOCOL §6.5 / §9.8). Settings are global, so the event carries the empty
 /// workspace id; subscribers that omit a `workspaceId` filter still receive it.
-fn settings_changed_event(changes: &[serde_json::Value]) -> NewEvent {
+fn settings_changed_event(changes: &[serde_json::Value], revision: u64) -> NewEvent {
     NewEvent {
         workspace_id: WorkspaceId::from_string(String::new()),
         timestamp: now_iso(),
@@ -10296,7 +10313,7 @@ fn settings_changed_event(changes: &[serde_json::Value]) -> NewEvent {
         correlation_id: None,
         parent_event_id: None,
         metadata: None,
-        data: serde_json::json!({ "changes": changes }),
+        data: serde_json::json!({ "changes": changes, "revision": revision }),
     }
 }
 
@@ -12834,7 +12851,12 @@ impl Services {
                 );
             }
         }
-        publish_event(self.event_bus.as_ref(), settings_changed_event(&applied)).await;
+        let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        publish_event(
+            self.event_bus.as_ref(),
+            settings_changed_event(&applied, revision),
+        )
+        .await;
     }
 
     /// Default-provider settings self-heal (monorepo#3044). When no default
@@ -13031,7 +13053,12 @@ impl Services {
 
 impl WorkspaceApi for Services {
     fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.settings_service().list().await })
+        Box::pin(async move {
+            let _revision_guard = self.settings_revision_gate.read().await;
+            let mut result = self.settings_service().list().await?;
+            result["revision"] = serde_json::json!(self.settings_revision.load(Ordering::SeqCst));
+            Ok(result)
+        })
     }
 
     fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -13050,6 +13077,7 @@ impl WorkspaceApi for Services {
                 Db,
                 Registry,
             }
+            let _revision_guard = self.settings_revision_gate.write().await;
             // A default-provider switch re-resolves `model.default` for the
             // new provider (monorepo#3177). Appended BEFORE the old-value
             // snapshot below so a hook-failure rollback also restores the
@@ -13311,24 +13339,33 @@ impl WorkspaceApi for Services {
                         return Err(e);
                     }
                 }
+                let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
                 publish_event(
                     self.event_bus.as_ref(),
-                    settings_changed_event(&applied.clone()),
+                    settings_changed_event(&applied, revision),
                 )
                 .await;
+                return Ok(serde_json::json!({ "applied": applied, "revision": revision }));
             }
-            Ok(serde_json::json!({ "applied": applied }))
+            Ok(serde_json::json!({
+                "applied": applied,
+                "revision": self.settings_revision.load(Ordering::SeqCst),
+            }))
         })
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            let _revision_guard = self.settings_revision_gate.write().await;
             let result = self.settings_service().reset(&path).await?;
+            let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
             publish_event(
                 self.event_bus.as_ref(),
-                settings_changed_event(std::slice::from_ref(&result)),
+                settings_changed_event(std::slice::from_ref(&result), revision),
             )
             .await;
+            let mut result = result;
+            result["revision"] = serde_json::json!(revision);
             Ok(result)
         })
     }
@@ -13440,6 +13477,7 @@ impl WorkspaceApi for Services {
         enabled: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            let _revision_guard = self.settings_revision_gate.write().await;
             let path = ft_worktree(&self.store, &workspace_id).await;
             let (rules, changed) = rules::RulesService::new(&self.store)
                 .update(
@@ -13450,7 +13488,12 @@ impl WorkspaceApi for Services {
                     path.as_deref(),
                 )
                 .await?;
-            publish_event(self.event_bus.as_ref(), settings_changed_event(&[changed])).await;
+            let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+            publish_event(
+                self.event_bus.as_ref(),
+                settings_changed_event(&[changed], revision),
+            )
+            .await;
             Ok(rules)
         })
     }

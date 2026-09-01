@@ -4553,10 +4553,14 @@ fn spawn_config_watcher_init(
         // It stays inside the runtime context, so the watcher's own
         // `tokio::spawn` of its debounce loop keeps working.
         let started = tokio::task::block_in_place(|| {
-            intent_services::ConfigWatcher::start(registry, move |notice| {
-                let services = watcher_services.clone();
-                async move { services.apply_external_settings_change(&notice).await }
-            })
+            intent_services::ConfigWatcher::start(
+                registry,
+                watcher_services.settings_revision_gate(),
+                move |notice| {
+                    let services = watcher_services.clone();
+                    async move { services.apply_external_settings_change(&notice).await }
+                },
+            )
         });
         let watcher = match started {
             Ok(watcher) => watcher,
