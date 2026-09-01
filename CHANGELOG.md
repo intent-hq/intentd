@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.2] - 2026-09-01
+
+### 🚀 Features
+
+- *(core)* Harden secrets.json with owner-only DACL and hidden attribute on Windows ([#1624](https://github.com/intent-hq/intentd/pull/1624))
+- *(core)* Rename default secrets file to ~/intent/.secrets.json with one-time legacy migration ([#1632](https://github.com/intent-hq/intentd/pull/1632))
+- *(git)* Expose hasUpstream + unpushedCount on git.status ([#1622](https://github.com/intent-hq/intentd/pull/1622))
+- Restore legacy workspace importer (revert #1616) ([#1626](https://github.com/intent-hq/intentd/pull/1626))
+- *(server)* Expose tcAddress in pairing/system.status + pair listen-target picker ([#1623](https://github.com/intent-hq/intentd/pull/1623))
+
+### 🐛 Bug Fixes
+
+- *(services)* Decouple auto-commit generation timeouts from prompt enhancement ([#1627](https://github.com/intent-hq/intentd/pull/1627))
+
+### 🔧 Refactor
+
+- *(intentd)* Reuse intent-core write_private for exported pairing images ([#1628](https://github.com/intent-hq/intentd/pull/1628))
+
+
 ## [0.9.1] - 2026-09-01
 
 ### 🚀 Features
