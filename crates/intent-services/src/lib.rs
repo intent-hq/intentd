@@ -12392,6 +12392,8 @@ impl Services {
     /// **Ordering rule**: Hooks are applied in dependency-aware, deterministic order:
     /// - Value-setting keys (server.wsApi.port, server.locality) apply FIRST (priority 0).
     /// - server.wsApi.enabled applies SECOND (priority 10) — starts/stops the WSS listener.
+    /// - server.tunnel.enabled applies THIRD (priority 20) — the tunnel requires the
+    ///   listener up, so a batch enabling both starts the listener first.
     /// - Within the same priority tier, keys are processed in lexicographic order.
     /// - Single-key updates have zero behavior change.
     /// - This ensures batches like {server.wsApi.port=NEW, server.wsApi.enabled=true}
@@ -12406,6 +12408,10 @@ impl Services {
             match path {
                 // Listener enable/disable applies after value-setting keys
                 "server.wsApi.enabled" => 10,
+                // Tunnel enable/disable applies after the listener toggle so a
+                // batch {server.wsApi.enabled=true, server.tunnel.enabled=true}
+                // starts the listener first (the tunnel requires it up).
+                "server.tunnel.enabled" => 20,
                 // Value-setting keys (port, locality) apply first
                 _ if path.starts_with("server.") => 0,
                 // Non-server keys (no hooks, sorted lexicographically within this tier)
@@ -12539,11 +12545,99 @@ impl Services {
                                         "cannot disable server.wsApi.enabled from a TCP connection (would self-terminate)".to_string()
                                     ));
                                 }
+                                // The tunnel forwards to the listener; stop it too.
+                                if control.tunnel_address().await.is_some() {
+                                    control.stop_tunnel().await;
+                                    tracing::info!(
+                                        "server.wsApi.enabled → false: stopped tailcat tunnel \
+                                         (forwards to the WSS listener)"
+                                    );
+                                }
                                 control.stop_ws_listener().await;
                                 tracing::info!(
                                     "server.wsApi.enabled → false: stopped WSS listener"
                                 );
                             }
+                        }
+                    }
+                    "server.tunnel.enabled" => {
+                        if let Some(enabled) =
+                            change.get("value").and_then(serde_json::Value::as_bool)
+                        {
+                            if enabled {
+                                let address = control.start_tunnel().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        "server.tunnel.enabled → true: failed to start tailcat tunnel"
+                                    );
+                                    Error::Internal(format!(
+                                        "failed to start tailcat tunnel: {e}"
+                                    ))
+                                })?;
+                                tracing::info!(
+                                    address = %address,
+                                    "server.tunnel.enabled → true: started tailcat tunnel"
+                                );
+                            } else {
+                                control.stop_tunnel().await;
+                                tracing::info!(
+                                    "server.tunnel.enabled → false: stopped tailcat tunnel"
+                                );
+                            }
+                        }
+                    }
+                    "server.tunnel.derpUrl" => {
+                        // Applies to the sidecar's next start: restart it when
+                        // running so the new relay takes effect now.
+                        if control.tunnel_address().await.is_some() {
+                            tracing::info!(
+                                "server.tunnel.derpUrl changed: restarting tailcat tunnel"
+                            );
+                            control.stop_tunnel().await;
+                            control.start_tunnel().await.map_err(|e| {
+                                tracing::error!(
+                                    error = ?e,
+                                    "server.tunnel.derpUrl: failed to restart tailcat tunnel"
+                                );
+                                Error::Internal(format!("failed to restart tailcat tunnel: {e}"))
+                            })?;
+                        } else {
+                            tracing::info!(
+                                "server.tunnel.derpUrl changed: persisted (tunnel not running)"
+                            );
+                        }
+                    }
+                    "server.tunnel.only" => {
+                        // The bind set is computed inside start_ws_listener from
+                        // the persisted value, so restart the listener when
+                        // running (mirrors the server.bindAddress hook). Guard:
+                        // turning tunnel-only ON from a direct TCP connection
+                        // would drop the caller's own connection (loopback
+                        // rebind), so refuse like the wsApi.enabled=false arm.
+                        if control.ws_listener_port().await.is_some() {
+                            if change.get("value").and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                                && control.is_tcp_connection()
+                            {
+                                return Err(Error::InvalidParams(
+                                    "cannot enable server.tunnel.only from a TCP connection \
+                                     (loopback rebind would self-terminate)"
+                                        .to_string(),
+                                ));
+                            }
+                            tracing::info!("server.tunnel.only changed: restarting WSS listener");
+                            control.stop_ws_listener().await;
+                            control.start_ws_listener().await.map_err(|e| {
+                                tracing::error!(
+                                    error = ?e,
+                                    "server.tunnel.only: failed to restart WSS listener"
+                                );
+                                Error::Internal(format!("failed to restart WSS listener: {e}"))
+                            })?;
+                        } else {
+                            tracing::info!(
+                                "server.tunnel.only changed: persisted (listener not running)"
+                            );
                         }
                     }
                     _ => {}

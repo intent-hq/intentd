@@ -1104,6 +1104,30 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             false,
         ),
         boolean(
+            "server.tunnel.enabled",
+            "Tunnel enabled",
+            "Run the bundled tailcat sidecar forwarding tunnel traffic to the local WSS \
+             port (requires the WSS listener to be enabled)",
+            "server",
+            false,
+        ),
+        string(
+            "server.tunnel.derpUrl",
+            "Tunnel DERP URL",
+            "Optional self-hosted DERP relay URL for the tailcat tunnel; empty uses \
+             tailcat's default relay",
+            "server",
+            None,
+        ),
+        boolean(
+            "server.tunnel.only",
+            "Tunnel only",
+            "Accept tunnel-forwarded traffic only: the WSS listener binds loopback, \
+             refusing direct LAN connections",
+            "server",
+            false,
+        ),
+        boolean(
             "server.tls.enabled",
             "TLS enabled",
             "Enable TLS for the TCP listener",

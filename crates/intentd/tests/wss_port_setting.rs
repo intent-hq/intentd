@@ -24,9 +24,17 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 /// Mock `ServerControl` that captures port from `start_ws_listener` calls
+/// and tracks tailcat tunnel start/stop for the `server.tunnel.*` hooks.
+#[derive(Default)]
 struct MockPortServerControl {
     should_fail: bool,
     requested_port: Arc<tokio::sync::Mutex<Option<u16>>>,
+    /// Simulated running listener port (`ws_listener_port`); the tunnel hook
+    /// requires the listener up.
+    listener_port: Option<u16>,
+    tunnel_should_fail: bool,
+    tunnel_running: Arc<tokio::sync::Mutex<bool>>,
+    tunnel_starts: Arc<tokio::sync::Mutex<u32>>,
 }
 
 impl ServerControl for MockPortServerControl {
@@ -58,11 +66,45 @@ impl ServerControl for MockPortServerControl {
     fn ws_listener_port(
         &self,
     ) -> Pin<Box<dyn std::future::Future<Output = Option<u16>> + Send + '_>> {
-        Box::pin(async { None })
+        let port = self.listener_port;
+        Box::pin(async move { port })
     }
 
     fn is_tcp_connection(&self) -> bool {
         false
+    }
+
+    fn start_tunnel(
+        &self,
+    ) -> Pin<Box<dyn std::future::Future<Output = CoreResult<String>> + Send + '_>> {
+        let should_fail = self.tunnel_should_fail;
+        let running = self.tunnel_running.clone();
+        let starts = self.tunnel_starts.clone();
+        Box::pin(async move {
+            if should_fail {
+                Err(intent_core::Error::Internal(
+                    "tailcat exited before reporting its address".to_string(),
+                ))
+            } else {
+                *running.lock().await = true;
+                *starts.lock().await += 1;
+                Ok("tcTESTADDRESS".to_string())
+            }
+        })
+    }
+
+    fn stop_tunnel(&self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let running = self.tunnel_running.clone();
+        Box::pin(async move {
+            *running.lock().await = false;
+        })
+    }
+
+    fn tunnel_address(
+        &self,
+    ) -> Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>> {
+        let running = self.tunnel_running.clone();
+        Box::pin(async move { running.lock().await.then(|| "tcTESTADDRESS".to_string()) })
     }
 }
 
@@ -236,6 +278,7 @@ async fn port_change_restarts_listener() {
     let mock_control = Arc::new(MockPortServerControl {
         should_fail: false,
         requested_port: requested_port.clone(),
+        ..Default::default()
     });
     services.attach_server_control(mock_control);
 
@@ -300,6 +343,7 @@ async fn port_bind_failure_friendly_error() {
     let mock_control = Arc::new(MockPortServerControl {
         should_fail: true,
         requested_port: requested_port.clone(),
+        ..Default::default()
     });
     services.attach_server_control(mock_control);
 
@@ -358,6 +402,232 @@ async fn port_bind_failure_friendly_error() {
     assert!(
         error_msg.contains("already in use") || error_msg.contains("failed to start WSS listener"),
         "error data should mention bind failure, got: {error_msg}"
+    );
+
+    shutdown_tx.send(()).ok();
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+/// Spin up a UDS server with the given mock control; returns the RPC halves
+/// plus the shutdown handle and socket path for cleanup.
+async fn setup_uds(
+    mock_control: Arc<MockPortServerControl>,
+    tag: &str,
+) -> (
+    impl AsyncWriteExt + Unpin,
+    BufReader<OwnedReadHalf>,
+    oneshot::Sender<()>,
+    PathBuf,
+) {
+    let tmpdb = TempDb::new();
+    let store = Store::open(&tmpdb.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
+    let services = Services::new(store.clone())
+        .with_event_bus(bus.clone())
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(ws_root.path().to_path_buf());
+    services.attach_server_control(mock_control);
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+
+    let socket_path = std::env::temp_dir().join(format!("{tag}-{}.sock", Uuid::new_v4().simple()));
+    let socket_path_clone = socket_path.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        serve_uds(api, bus, &socket_path_clone, None, async {
+            shutdown_rx.await.ok();
+        })
+        .await
+        .unwrap();
+        // TempDb/ws_root live as long as the server task.
+        drop(tmpdb);
+        drop(ws_root);
+    });
+
+    let stream = connect_retry(&socket_path).await;
+    let (r, w) = stream.into_split();
+    (w, BufReader::new(r), shutdown_tx, socket_path)
+}
+
+/// server.tunnel.enabled toggles the tunnel through `ServerControl` and
+/// persists; disabling stops it.
+#[tokio::test]
+async fn tunnel_enabled_toggles_sidecar() {
+    let tunnel_running = Arc::new(tokio::sync::Mutex::new(false));
+    let mock_control = Arc::new(MockPortServerControl {
+        listener_port: Some(5181),
+        tunnel_running: tunnel_running.clone(),
+        ..Default::default()
+    });
+    let (mut w, mut reader, shutdown_tx, socket_path) = setup_uds(mock_control, "tunnel-t").await;
+
+    rpc(
+        &mut w,
+        &mut reader,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.enabled", "value": true }] }),
+    )
+    .await;
+    assert!(*tunnel_running.lock().await, "tunnel should be running");
+
+    let got = rpc(
+        &mut w,
+        &mut reader,
+        2,
+        "settings.get",
+        json!({ "path": "server.tunnel.enabled" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(true));
+
+    rpc(
+        &mut w,
+        &mut reader,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.enabled", "value": false }] }),
+    )
+    .await;
+    assert!(!*tunnel_running.lock().await, "tunnel should be stopped");
+
+    shutdown_tx.send(()).ok();
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+/// A tunnel start failure surfaces as a friendly settings.update error and
+/// the setting does not flip on.
+#[tokio::test]
+async fn tunnel_start_failure_friendly_error() {
+    let mock_control = Arc::new(MockPortServerControl {
+        listener_port: Some(5181),
+        tunnel_should_fail: true,
+        ..Default::default()
+    });
+    let (mut w, mut reader, shutdown_tx, socket_path) = setup_uds(mock_control, "tunnel-e").await;
+
+    let resp = call(
+        &mut w,
+        &mut reader,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.enabled", "value": true }] }),
+    )
+    .await;
+    assert!(resp.get("error").is_some(), "expected error, got: {resp}");
+    let error_msg = resp["error"]["data"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("failed to start tailcat tunnel"),
+        "error data should mention tunnel start failure, got: {error_msg}"
+    );
+
+    let got = rpc(
+        &mut w,
+        &mut reader,
+        2,
+        "settings.get",
+        json!({ "path": "server.tunnel.enabled" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(false), "setting must not flip on");
+
+    shutdown_tx.send(()).ok();
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+/// Changing server.tunnel.derpUrl while the tunnel runs restarts the sidecar;
+/// while stopped it only persists.
+#[tokio::test]
+async fn tunnel_derp_url_restarts_running_sidecar() {
+    let tunnel_running = Arc::new(tokio::sync::Mutex::new(false));
+    let tunnel_starts = Arc::new(tokio::sync::Mutex::new(0));
+    let mock_control = Arc::new(MockPortServerControl {
+        listener_port: Some(5181),
+        tunnel_running: tunnel_running.clone(),
+        tunnel_starts: tunnel_starts.clone(),
+        ..Default::default()
+    });
+    let (mut w, mut reader, shutdown_tx, socket_path) = setup_uds(mock_control, "tunnel-d").await;
+
+    // While stopped: persists only, no start.
+    rpc(
+        &mut w,
+        &mut reader,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.derpUrl", "value": "https://derp.example.com/map.json" }] }),
+    )
+    .await;
+    assert_eq!(*tunnel_starts.lock().await, 0);
+
+    // Start the tunnel, then change derpUrl → stop + start (2 total starts).
+    rpc(
+        &mut w,
+        &mut reader,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.enabled", "value": true }] }),
+    )
+    .await;
+    assert_eq!(*tunnel_starts.lock().await, 1);
+    rpc(
+        &mut w,
+        &mut reader,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.tunnel.derpUrl", "value": "https://derp2.example.com/map.json" }] }),
+    )
+    .await;
+    assert_eq!(
+        *tunnel_starts.lock().await,
+        2,
+        "derpUrl change should restart"
+    );
+    assert!(
+        *tunnel_running.lock().await,
+        "tunnel should still be running"
+    );
+
+    shutdown_tx.send(()).ok();
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+/// Disabling server.wsApi.enabled stops a running tunnel too (it forwards to
+/// the listener).
+#[tokio::test]
+async fn ws_disable_stops_running_tunnel() {
+    let tunnel_running = Arc::new(tokio::sync::Mutex::new(false));
+    let mock_control = Arc::new(MockPortServerControl {
+        listener_port: Some(5181),
+        tunnel_running: tunnel_running.clone(),
+        ..Default::default()
+    });
+    let (mut w, mut reader, shutdown_tx, socket_path) = setup_uds(mock_control, "tunnel-w").await;
+
+    rpc(
+        &mut w,
+        &mut reader,
+        1,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "server.wsApi.enabled", "value": true },
+            { "path": "server.tunnel.enabled", "value": true }
+        ] }),
+    )
+    .await;
+    assert!(*tunnel_running.lock().await, "tunnel should be running");
+
+    rpc(
+        &mut w,
+        &mut reader,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.wsApi.enabled", "value": false }] }),
+    )
+    .await;
+    assert!(
+        !*tunnel_running.lock().await,
+        "disabling the listener should stop the tunnel"
     );
 
     shutdown_tx.send(()).ok();

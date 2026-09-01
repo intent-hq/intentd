@@ -34,6 +34,13 @@ tag-namespace = "v"
 github-releases-repo = "intent-hq/intentd"
 # Whether to install an updater program
 install-updater = false
+# Bundle the tailcat tunnel sidecar next to the daemon binary: the archive
+# carries libexec/tailcat (staged per-target by the "Stage tailcat sidecar
+# binary" step in dist-build-setup.yml) plus libexec/tailcat.LICENSE
+# (committed; BSD-3-Clause text for the non-crate binary, which cargo-deny
+# does not cover). The daemon resolves the sidecar at
+# <exe-dir>/libexec/tailcat (see crates/intentd/src/tunnel.rs).
+include = ["packaging/libexec"]
 # Post-announce: publish/update the alpha.json channel manifest
 post-announce-jobs = ["./publish-channel-manifest"]
 # The reusable publish-channel-manifest.yml job requests
