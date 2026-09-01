@@ -7751,6 +7751,43 @@ async fn wss_git_agent_commit_in_registered_root_round_trip() {
     let nested_head_before = rev_parse_head(&nested);
     let primary_head_before = rev_parse_head(&repo);
 
+    // Subscribe on a persistent connection FIRST so the commit's `git:commit`
+    // and `changes:git-status` notifications (§6.5) are delivered to this
+    // client and their additive `gitRootId` can be asserted on the wire.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"events.subscribe","params":{{"eventTypes":["git:commit","changes:git-status"],"workspaceId":"{ws_id}"}}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .expect("send subscribe");
+    let sub_resp = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["id"] == 10 {
+                        return v;
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("subscribe response timed out");
+    assert!(
+        sub_resp["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub_resp}"
+    );
+
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -7779,6 +7816,50 @@ async fn wss_git_agent_commit_in_registered_root_round_trip() {
         "nested HEAD advanced"
     );
     assert_eq!(nested_head_after, hash, "reported hash is the nested HEAD");
+
+    // The subscriber sees both notifications, each carrying the additive
+    // `gitRootId`, and the status payload is read from the target root (the
+    // nested repo is clean after the commit).
+    let mut commit_evt = None;
+    let mut status_evt = None;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while commit_evt.is_none() || status_evt.is_none() {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event" {
+                        match v["params"]["event"]["type"].as_str() {
+                            Some("git:commit") => commit_evt = Some(v["params"]["event"].clone()),
+                            Some("changes:git-status") => {
+                                status_evt = Some(v["params"]["event"].clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for git:commit / changes:git-status");
+    let commit_evt = commit_evt.expect("git:commit event");
+    let status_evt = status_evt.expect("changes:git-status event");
+    assert_eq!(commit_evt["workspaceId"], ws_id.as_str());
+    assert_eq!(commit_evt["data"]["gitRootId"], root.id.as_str());
+    assert_eq!(commit_evt["data"]["commit"], hash);
+    assert_eq!(commit_evt["data"]["message"], "root commit");
+    assert_eq!(
+        commit_evt["data"]["files"],
+        serde_json::json!(["root-change.txt"])
+    );
+    assert_eq!(status_evt["workspaceId"], ws_id.as_str());
+    assert_eq!(status_evt["data"]["gitRootId"], root.id.as_str());
+    assert_eq!(status_evt["data"]["status"]["files"], serde_json::json!([]));
     let msg = String::from_utf8(
         std::process::Command::new("git")
             .current_dir(&nested)

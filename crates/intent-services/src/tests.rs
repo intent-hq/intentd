@@ -15750,6 +15750,41 @@ mod file_tracking {
         );
     }
 
+    /// Param validation precedes the auto-commit gate: with auto-commit
+    /// disabled and `userRequested: false`, an unknown `gitRootId` still
+    /// fails with the documented `Unknown git root: {id}` `InvalidParams`
+    /// (`-32602`) rather than the auto-commit `-32603` rejection.
+    #[tokio::test]
+    async fn agent_commit_unknown_root_precedes_auto_commit_gate() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, _secondary, _root_id) = svc_with_registered_root(&repo).await;
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+
+        let unknown = WorkspaceGitRootId::new();
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "msg".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["a.txt".to_string()]),
+                false,
+                Some(unknown.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "expected -32602, got: {err}"
+        );
+        assert!(
+            format!("{err}").ends_with(&format!("Unknown git root: {unknown}")),
+            "got: {err}"
+        );
+    }
+
     /// Remediation hint (monorepo#2053): a primary-target commit whose
     /// explicit `files` match nothing, where the paths exist under a
     /// registered secondary root, errors with the root's path/id and suggests

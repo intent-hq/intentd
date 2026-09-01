@@ -23317,29 +23317,44 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let this = self.clone();
         Box::pin(async move {
-            // userRequested bypasses the auto-commit gate (TS parity); the
-            // gate reads the per-workspace resolution (override → global).
             let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
-            git_ops::assert_agent_commit_allowed(auto_commit_enabled, user_requested)?;
-            let ws = store
-                .get_workspace(&workspace_id)
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
             // With a `git_root_id` the commit targets the registered
             // secondary root (monorepo#2053); resolution shares
             // `resolve_git_read_root` so an unknown/foreign id fails with the
-            // identical `Unknown git root: {id}` InvalidParams. `None` keeps
-            // the primary-worktree behavior (and error message) exactly.
-            let worktree = match git_root_id.as_ref() {
-                Some(_) => this
+            // identical `Unknown git root: {id}` InvalidParams. Param
+            // validation precedes the auto-commit gate below, so a bad id is
+            // `-32602` (the §5.6 documented contract) even when the gate
+            // would also reject. `None` keeps the primary-worktree behavior
+            // (gate first, then worktree lookup — and its error message)
+            // exactly.
+            let mut resolved = None;
+            if git_root_id.is_some() {
+                let ws = store
+                    .get_workspace(&workspace_id)
+                    .await
+                    .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
+                let worktree = this
                     .resolve_git_read_root(&ws, git_root_id.as_ref())
                     .await?
                     .ok_or_else(|| {
                         Error::Internal("Failed to commit: workspace has no worktree".to_string())
-                    })?,
-                None => git_ops::worktree_path(&ws).ok_or_else(|| {
+                    })?;
+                resolved = Some((ws, worktree));
+            }
+            // userRequested bypasses the auto-commit gate (TS parity); the
+            // gate reads the per-workspace resolution (override → global).
+            git_ops::assert_agent_commit_allowed(auto_commit_enabled, user_requested)?;
+            let (ws, worktree) = if let Some(pair) = resolved {
+                pair
+            } else {
+                let ws = store
+                    .get_workspace(&workspace_id)
+                    .await
+                    .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
+                let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                     Error::Internal("Failed to commit: workspace has no worktree".to_string())
-                })?,
+                })?;
+                (ws, worktree)
             };
             // Commit-set selection (TS parity, monorepo#939): an explicit
             // `files` list is committed as-is; without one, a `userRequested`
