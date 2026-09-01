@@ -37,6 +37,7 @@ impl FakeControl {
                 build_commit: Some("0123456789abcdef".to_string()),
                 uptime_seconds: 123,
                 local_ips: vec!["192.168.1.10".to_string(), "10.0.0.5".to_string()],
+                tc_address: Some("tc7f2a91.tailcat.net".to_string()),
                 hostname: "studio.local".to_string(),
                 pretty_hostname: "Clement's Mac Studio".to_string(),
                 cpu_percent: 12.5,
@@ -159,6 +160,7 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["memoryBytes"], 104_857_600u64);
     assert_eq!(local["fingerprint"], "AB:CD");
     assert_eq!(local["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
+    assert_eq!(local["tcAddress"], "tc7f2a91.tailcat.net");
     assert_eq!(local["hostname"], "studio.local");
     assert_eq!(local["prettyHostname"], "Clement's Mac Studio");
     assert_eq!(local["protocolVersion"], crate::protocol::PROTOCOL_VERSION);
@@ -176,6 +178,7 @@ fn status_json_local_vs_remote_locality() {
     // The routing fields are served to remote callers too — that is the point:
     // an authenticated WSS client refreshes its host list from system.status.
     assert_eq!(remote["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
+    assert_eq!(remote["tcAddress"], "tc7f2a91.tailcat.net");
     assert_eq!(remote["hostname"], "studio.local");
     assert_eq!(remote["prettyHostname"], "Clement's Mac Studio");
 }
@@ -198,6 +201,7 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         build_commit: None,
         uptime_seconds: 456,
         local_ips: Vec::new(),
+        tc_address: None,
         hostname: "intent".to_string(),
         pretty_hostname: "intent".to_string(),
         cpu_percent: 0.0,
@@ -241,6 +245,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert!(!obj.contains_key("workspacesDiskTotalBytes"));
     // Watcher registry not started yet ⇒ fileWatch is ABSENT, not null.
     assert!(!obj.contains_key("fileWatch"));
+    // Tunnel disabled/down ⇒ tcAddress is ABSENT (presence-detected), not null.
+    assert!(!obj.contains_key("tcAddress"));
     // Unsupervised daemon ⇒ updateSupported is PRESENT and false — a plain
     // boolean, never absent or null.
     assert_eq!(v["updateSupported"], false);

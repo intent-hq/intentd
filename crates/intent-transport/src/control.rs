@@ -63,6 +63,11 @@ pub struct SystemStatus {
     /// `server.pairingInfo` — `collect_local_ips`), so an authenticated remote
     /// client can discover alternative routes to the daemon.
     pub local_ips: Vec<String>,
+    /// The tailcat tunnel's stable `tc...` address (`server.tunnel.*`), when
+    /// the sidecar is running — served alongside `localIps` so connected
+    /// clients can refresh their stored tunnel route from `system.status`
+    /// alone. Presence-detected on the wire: omitted when `None`, never null.
+    pub tc_address: Option<String>,
     /// Local OS hostname (same source as `server.pairingInfo`).
     pub hostname: String,
     /// OS "pretty" device name (macOS Computer Name), falling back to the
@@ -321,6 +326,9 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         },
     });
     let obj = v.as_object_mut().expect("status_json literal is an object");
+    if let Some(tc) = &status.tc_address {
+        obj.insert("tcAddress".into(), tc.clone().into());
+    }
     if let Some(build_commit) = &status.build_commit {
         obj.insert("buildCommit".into(), build_commit.clone().into());
     }
