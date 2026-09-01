@@ -35,6 +35,12 @@ fn extract_available_models(payload: &Value) -> Option<&Vec<Value>> {
         .get("update")
         .or_else(|| payload.get("sessionUpdate"))
         .unwrap_or(payload);
+    extract_standard_available_models(update).or_else(|| extract_config_options_models(update))
+}
+
+/// Extract the first populated standard ACP model-catalog shape, excluding
+/// the `configOptions` fallback used by [`extract_available_models`].
+fn extract_standard_available_models(update: &Value) -> Option<&Vec<Value>> {
     let models = update.get("models");
     // Emptiness is filtered per branch so an empty array in one shape (e.g. a
     // transitional adapter emitting `availableModels: []` alongside a
@@ -57,7 +63,6 @@ fn extract_available_models(payload: &Value) -> Option<&Vec<Value>> {
                 .filter(non_empty)
         })
         .or_else(|| models.and_then(Value::as_array).filter(non_empty))
-        .or_else(|| extract_config_options_models(update))
 }
 
 /// Extract the model rows from a `configOptions` payload: the select option
@@ -277,6 +282,54 @@ struct CodexModelGroup {
     inferred_levels: Vec<String>,
 }
 
+fn collect_codex_model_groups(
+    candidates: &[Value],
+    infer_variant_effort: bool,
+) -> Vec<CodexModelGroup> {
+    let mut groups: Vec<CodexModelGroup> = Vec::new();
+    for entry in candidates {
+        let Some((raw_id, raw_name, description)) = entry_fields(entry) else {
+            continue;
+        };
+        let (name, name_effort) = strip_parenthesized_effort(&raw_name);
+        let (id, id_effort) = strip_codex_id_effort(&raw_id, name_effort);
+        let inferred_effort = infer_variant_effort
+            .then_some(id_effort.or(name_effort))
+            .flatten();
+        let name = if name == raw_name && raw_name == raw_id && id != raw_id {
+            id.clone()
+        } else {
+            name
+        };
+
+        let index = groups
+            .iter()
+            .position(|group| group.id.eq_ignore_ascii_case(&id));
+        let group = if let Some(index) = index {
+            &mut groups[index]
+        } else {
+            groups.push(CodexModelGroup {
+                id,
+                name,
+                description: None,
+                adapter_levels: Vec::new(),
+                inferred_levels: Vec::new(),
+            });
+            groups.last_mut().expect("just pushed")
+        };
+        if inferred_effort.is_none() && group.description.is_none() {
+            group.description = description;
+        }
+        if let Some(levels) = entry_effort_levels(entry) {
+            push_unique(&mut group.adapter_levels, levels);
+        }
+        if let Some(effort) = inferred_effort {
+            push_unique(&mut group.inferred_levels, [effort.to_string()]);
+        }
+    }
+    groups
+}
+
 /// Parse an ACP payload (session/new result or session-update notification)
 /// into wire rows for `provider`. Used by claude-code, pi, and droid. Models
 /// carry per-model effort metadata when present, else levels from the session's
@@ -401,46 +454,26 @@ fn resolve_default_row(rows: &mut Vec<Value>, current_value: Option<&str>) {
 /// grouped into one base row. Adapter-advertised levels are merged with levels
 /// inferred from variant ids/names.
 pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
-    let Some(candidates) = extract_available_models(payload) else {
+    let update = payload
+        .get("update")
+        .or_else(|| payload.get("sessionUpdate"))
+        .unwrap_or(payload);
+    let standard_candidates = extract_standard_available_models(update);
+    let config_candidates = extract_config_options_models(update);
+    let Some(candidates) = standard_candidates.or(config_candidates) else {
         return Vec::new();
     };
-    let mut groups: Vec<CodexModelGroup> = Vec::new();
-    for entry in candidates {
-        let Some((raw_id, raw_name, description)) = entry_fields(entry) else {
-            continue;
-        };
-        let (name, name_effort) = strip_parenthesized_effort(&raw_name);
-        let (id, id_effort) = strip_codex_id_effort(&raw_id, name_effort);
-        let inferred_effort = id_effort.or(name_effort);
-        let name = if name == raw_name && raw_name == raw_id && id != raw_id {
-            id.clone()
-        } else {
-            name
-        };
-
-        let index = groups
-            .iter()
-            .position(|group| group.id.eq_ignore_ascii_case(&id));
-        let group = if let Some(index) = index {
-            &mut groups[index]
-        } else {
-            groups.push(CodexModelGroup {
-                id,
-                name,
-                description: None,
-                adapter_levels: Vec::new(),
-                inferred_levels: Vec::new(),
-            });
-            groups.last_mut().expect("just pushed")
-        };
-        if inferred_effort.is_none() && group.description.is_none() {
-            group.description = description;
-        }
-        if let Some(levels) = entry_effort_levels(entry) {
-            push_unique(&mut group.adapter_levels, levels);
-        }
-        if let Some(effort) = inferred_effort {
-            push_unique(&mut group.inferred_levels, [effort.to_string()]);
+    let mut groups = collect_codex_model_groups(candidates, true);
+    if standard_candidates.is_some() {
+        if let Some(config_candidates) = config_candidates {
+            for group in collect_codex_model_groups(config_candidates, false) {
+                if !groups
+                    .iter()
+                    .any(|standard| standard.id.eq_ignore_ascii_case(&group.id))
+                {
+                    groups.push(group);
+                }
+            }
         }
     }
 

@@ -806,6 +806,42 @@ fn parse_codex_config_options_bare_id_has_no_effort_levels() {
 }
 
 #[test]
+fn parse_codex_models_merge_standard_and_configured_catalogs() {
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-5.6-sol", "name": "GPT-5.6-Sol",
+              "description": "Standard catalog metadata",
+              "supportedEffortLevels": ["medium"] },
+            { "modelId": "gpt-5.6-sol[high]", "name": "GPT-5.6-Sol" },
+            { "modelId": "gpt-5.5", "name": "GPT-5.5" }
+        ] },
+        "configOptions": [
+            { "id": "model", "options": [
+                { "value": "GPT-5.6-SOL/max", "name": "Configured duplicate",
+                  "description": "Must not replace standard metadata" },
+                { "value": "gpt-5.7-pro[ultra]", "name": "GPT-5.7 Pro (ultra)",
+                  "description": "Configured only" },
+                { "value": "gpt-5.4", "name": "GPT-5.4" }
+            ] }
+        ]
+    });
+
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(
+        rows,
+        vec![
+            json!({ "id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "provider": "codex",
+                    "description": "Standard catalog metadata",
+                    "effortLevels": ["medium", "high"] }),
+            json!({ "id": "gpt-5.5", "name": "GPT-5.5", "provider": "codex" }),
+            json!({ "id": "gpt-5.7-pro", "name": "GPT-5.7 Pro", "provider": "codex",
+                    "description": "Configured only" }),
+            json!({ "id": "gpt-5.4", "name": "GPT-5.4", "provider": "codex" }),
+        ]
+    );
+}
+
+#[test]
 fn parse_opencode_models_one_provider_model_per_line() {
     let stdout = "\
 INFO loading providers
