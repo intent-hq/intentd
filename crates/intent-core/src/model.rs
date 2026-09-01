@@ -3878,6 +3878,13 @@ pub struct FileStatus {
 /// (`hasUncommittedChanges`, `hasUntrackedFiles`) always reflect the full
 /// scan, never the truncated list.
 ///
+/// Upstream tracking (monorepo#4058): `hasUpstream` says whether
+/// `refs/remotes/origin/<branch>` exists, so clients can distinguish an
+/// even-with-upstream branch from a never-pushed one (both report
+/// `ahead: 0`); `unpushedCount` is the `upstream..HEAD` commit count
+/// (exactly `ahead` when the upstream exists), omitted from the wire when
+/// there is no upstream to count against.
+///
 /// The bools mirror the wire contract 1:1 (each an independent flag on the
 /// `git.status` result), so folding them into enums would diverge the model
 /// from the protocol shape.
@@ -3900,6 +3907,16 @@ pub struct GitStatus {
     /// alongside `filesTruncated: true`; omitted on an untruncated result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_files: Option<usize>,
+    /// Whether the branch's upstream ref (`refs/remotes/origin/<branch>`)
+    /// exists (monorepo#4058). `false` on detached/unborn HEAD and for the
+    /// empty non-repo fallback.
+    #[serde(default)]
+    pub has_upstream: bool,
+    /// Commits ahead of the upstream (`upstream..HEAD`; equals `ahead`).
+    /// Present only alongside `hasUpstream: true`; omitted when there is no
+    /// upstream to count against (monorepo#4058).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpushed_count: Option<i64>,
 }
 
 /// `git.getBranches` result (`{ branches, remoteBranches, currentBranch,

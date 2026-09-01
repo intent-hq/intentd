@@ -73,6 +73,8 @@ pub fn cap_status_files(status: &GitStatus) -> GitStatus {
         has_untracked_files: status.has_untracked_files,
         files_truncated: true,
         total_files: Some(total),
+        has_upstream: status.has_upstream,
+        unpushed_count: status.unpushed_count,
     }
 }
 
@@ -90,6 +92,8 @@ pub fn empty_status() -> GitStatus {
         has_untracked_files: false,
         files_truncated: false,
         total_files: None,
+        has_upstream: false,
+        unpushed_count: None,
     }
 }
 
@@ -102,7 +106,7 @@ pub fn status(worktree_path: &Path) -> Result<GitStatus> {
     let started = Instant::now();
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let branch = current_branch(&repo);
-    let (ahead, behind) = ahead_behind(&repo, &branch);
+    let (ahead, behind, has_upstream) = ahead_behind(&repo, &branch);
     // The canonical definition (per the `GitStatus.diverged` doc): both ahead
     // and behind the upstream.
     let diverged = ahead > 0 && behind > 0;
@@ -129,6 +133,11 @@ pub fn status(worktree_path: &Path) -> Result<GitStatus> {
         has_untracked_files,
         files_truncated: false,
         total_files: None,
+        has_upstream,
+        // `upstream..HEAD` is exactly the `ahead` count when the upstream
+        // exists; without one there is nothing to count against
+        // (monorepo#4058).
+        unpushed_count: has_upstream.then_some(ahead),
     })
 }
 
@@ -163,13 +172,15 @@ pub fn current_branch_at(worktree_path: &Path) -> Option<String> {
 }
 
 /// Ahead/behind counts vs `origin/<branch>`, defaulting to `(0, 0)` when there
-/// is no upstream (the `git rev-list … || 0\t0` fallback).
-fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64) {
+/// is no upstream (the `git rev-list … || 0\t0` fallback). The third element
+/// reports whether the upstream ref exists (monorepo#4058), so callers can
+/// distinguish "even with upstream" from "no upstream at all" — both `(0, 0)`.
+fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64, bool) {
     if branch.is_empty() {
-        return (0, 0);
+        return (0, 0, false);
     }
     let Some(local) = repo.head().ok().and_then(|h| h.target()) else {
-        return (0, 0);
+        return (0, 0, false);
     };
     let upstream_ref = format!("refs/remotes/origin/{branch}");
     let Some(upstream) = repo
@@ -177,14 +188,15 @@ fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64) {
         .ok()
         .and_then(|r| r.target())
     else {
-        return (0, 0);
+        return (0, 0, false);
     };
     match repo.graph_ahead_behind(local, upstream) {
         Ok((a, b)) => (
             i64::try_from(a).expect("value fits in i64"),
             i64::try_from(b).expect("value fits in i64"),
+            true,
         ),
-        Err(_) => (0, 0),
+        Err(_) => (0, 0, true),
     }
 }
 
@@ -398,6 +410,100 @@ mod tests {
         assert_eq!(st.ahead, 0);
         assert_eq!(st.behind, 0);
         assert!(!st.diverged);
+    }
+
+    /// Point `refs/remotes/origin/<branch>` at the current HEAD commit — a
+    /// local stand-in for a pushed branch (no network).
+    fn set_origin_ref(worktree: &std::path::Path, branch: &str) {
+        let repo = git2::Repository::open(worktree).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.reference(&format!("refs/remotes/origin/{branch}"), head, true, "test")
+            .unwrap();
+    }
+
+    /// With an upstream at HEAD the branch is even: `hasUpstream: true` and
+    /// `unpushedCount: 0` (monorepo#4058) — distinguishable from the
+    /// no-upstream case below despite identical ahead/behind.
+    #[test]
+    fn upstream_even_reports_zero_unpushed() {
+        let dir = init_repo("status-upstream-even");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let branch = status(dir.path()).unwrap().branch;
+        set_origin_ref(dir.path(), &branch);
+        let st = status(dir.path()).unwrap();
+        assert!(st.has_upstream);
+        assert_eq!(st.ahead, 0);
+        assert_eq!(st.unpushed_count, Some(0));
+    }
+
+    /// Commits past the upstream surface as both `ahead` and
+    /// `unpushedCount` (the `upstream..HEAD` count).
+    #[test]
+    fn upstream_ahead_reports_unpushed_count() {
+        let dir = init_repo("status-upstream-ahead");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let branch = status(dir.path()).unwrap().branch;
+        set_origin_ref(dir.path(), &branch);
+        commit_file(dir.path(), "b.txt", "y\n");
+        let st = status(dir.path()).unwrap();
+        assert!(st.has_upstream);
+        assert_eq!(st.ahead, 1);
+        assert_eq!(st.unpushed_count, Some(1));
+    }
+
+    /// A never-pushed branch (no `refs/remotes/origin/<branch>`) reports
+    /// `hasUpstream: false` with `unpushedCount` omitted — no longer
+    /// indistinguishable from an even branch (monorepo#4058).
+    #[test]
+    fn missing_upstream_reports_no_upstream() {
+        let dir = init_repo("status-upstream-missing");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let st = status(dir.path()).unwrap();
+        assert!(!st.has_upstream);
+        assert_eq!(st.ahead, 0);
+        assert_eq!(st.unpushed_count, None);
+    }
+
+    /// Detached HEAD: no branch, so no upstream to compare against.
+    #[test]
+    fn detached_head_reports_no_upstream() {
+        let dir = init_repo("status-upstream-detached");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(head).unwrap();
+        let st = status(dir.path()).unwrap();
+        assert!(st.branch.is_empty());
+        assert!(!st.has_upstream);
+        assert_eq!(st.unpushed_count, None);
+    }
+
+    /// Unborn HEAD (fresh `git init`, no commit): the unborn branch name is
+    /// reported but there is no local commit, hence no upstream comparison.
+    #[test]
+    fn unborn_head_reports_no_upstream() {
+        let dir = init_repo("status-upstream-unborn");
+        let st = status(dir.path()).unwrap();
+        assert!(!st.has_upstream);
+        assert_eq!(st.unpushed_count, None);
+    }
+
+    /// Wire additivity (monorepo#4058): `hasUpstream` is a plain
+    /// always-present boolean, while `unpushedCount` is omitted without an
+    /// upstream and present (even at 0) with one.
+    #[test]
+    fn upstream_fields_wire_shape() {
+        let dir = init_repo("status-upstream-wire");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let v = serde_json::to_value(status(dir.path()).unwrap()).unwrap();
+        assert_eq!(v["hasUpstream"], serde_json::json!(false));
+        assert!(v.get("unpushedCount").is_none());
+
+        let branch = v["branch"].as_str().unwrap();
+        set_origin_ref(dir.path(), branch);
+        let v = serde_json::to_value(status(dir.path()).unwrap()).unwrap();
+        assert_eq!(v["hasUpstream"], serde_json::json!(true));
+        assert_eq!(v["unpushedCount"], serde_json::json!(0));
     }
 
     /// A submodule pin change carries `mode: "160000"` plus the old/new pin
