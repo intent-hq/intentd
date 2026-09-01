@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.3] - 2026-09-01
+
+### 🚀 Features
+
+- *(git)* Commit in registered secondary git roots via gitRootId ([#1631](https://github.com/intent-hq/intentd/pull/1631))
+
+
 ## [0.9.2] - 2026-09-01
 
 ### 🚀 Features
