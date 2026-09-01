@@ -30,4 +30,28 @@ pub trait ServerControl: Send + Sync {
     /// against stopping the listener while the settings.update caller is on it.
     /// Always returns `false` for UDS connections.
     fn is_tcp_connection(&self) -> bool;
+
+    /// Start the tailcat tunnel sidecar if not already running. Requires the
+    /// WSS listener to be up (returns an error otherwise). Returns the stable
+    /// `tc...` address once tailcat reports it. Idempotent: if already
+    /// running, returns the current address. Default: unsupported error, so
+    /// implementations without a tunnel (test mocks) need no override.
+    fn start_tunnel(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> {
+        Box::pin(async {
+            Err(crate::Error::Internal(
+                "tunnel is not supported by this server".to_string(),
+            ))
+        })
+    }
+
+    /// Stop the tailcat tunnel sidecar (kill the child process). Idempotent:
+    /// if not running, does nothing.
+    fn stop_tunnel(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
+    /// Current `tc...` address, or `None` when the tunnel is stopped.
+    fn tunnel_address(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+        Box::pin(async { None })
+    }
 }

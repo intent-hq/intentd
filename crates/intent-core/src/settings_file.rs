@@ -361,6 +361,8 @@ pub struct ServerSettings {
     pub max_outstanding_rpcs: u32,
     /// `[server.wsApi]` — WSS API listener runtime toggle.
     pub ws_api: WsApiSettings,
+    /// `[server.tunnel]` — tailcat tunnel sidecar (`server.tunnel.*`).
+    pub tunnel: TunnelSettings,
     /// `[server.tls]` — TLS for the TCP listener.
     pub tls: TlsSettings,
     /// `[server.auth]` — bearer-token auth on TCP.
@@ -376,6 +378,7 @@ impl Default for ServerSettings {
             origin_allow_list: None,
             max_outstanding_rpcs: DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
             ws_api: WsApiSettings::default(),
+            tunnel: TunnelSettings::default(),
             tls: TlsSettings::default(),
             auth: AuthSettings::default(),
         }
@@ -399,6 +402,24 @@ impl Default for WsApiSettings {
             port: 5181,
         }
     }
+}
+
+/// `[server.tunnel]` — tailcat tunnel sidecar (`server.tunnel.*`). When
+/// enabled and the WSS listener is up, the daemon supervises a bundled
+/// `tailcat` process that forwards tunnel traffic to the local WSS port,
+/// giving the daemon a stable `tc...` address across restarts (the tailcat
+/// key is persisted in the data dir).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct TunnelSettings {
+    /// `server.tunnel.enabled` — run the tailcat tunnel sidecar.
+    pub enabled: bool,
+    /// `server.tunnel.derpUrl` — optional self-hosted DERP relay URL; empty
+    /// means tailcat's default relay.
+    pub derp_url: Option<String>,
+    /// `server.tunnel.only` — accept tunnel-forwarded traffic only: the WSS
+    /// listener binds loopback, refusing direct LAN connections.
+    pub only: bool,
 }
 
 /// `[server.tls]` — TLS toggle (`server.tls.*`).
@@ -1376,6 +1397,17 @@ maxOutstandingRpcs = 256
 enabled = false
 # WSS API port -- TCP port for the WSS listener (1024-65535).
 port = 5181
+
+[server.tunnel]
+# Tunnel enabled -- run the bundled tailcat sidecar forwarding tunnel traffic
+# to the local WSS port (requires the WSS listener to be enabled).
+enabled = false
+# DERP URL -- optional self-hosted DERP relay URL; unset uses tailcat's
+# default relay.
+# derpUrl = "https://derp.example.com"
+# Tunnel only -- accept tunnel-forwarded traffic only: the WSS listener binds
+# loopback, refusing direct LAN connections.
+only = false
 
 [server.tls]
 # TLS enabled -- enable TLS for the TCP listener.

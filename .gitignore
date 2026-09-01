@@ -1,2 +1,4 @@
 /target
 lcov.info
+/packaging/libexec/tailcat
+/packaging/libexec/tailcat.exe

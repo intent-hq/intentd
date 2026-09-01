@@ -33,6 +33,7 @@ mod client;
 mod git_credential;
 mod rpc_profile;
 mod suspend;
+mod tunnel;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -1667,6 +1668,20 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             "server.bindAddress is invalid ({msg}); binding loopback (127.0.0.1)"
         ),
     }
+    // Tunnel-only mode (server.tunnel.only): the listener accepts
+    // tunnel-forwarded traffic only, so bind loopback regardless of
+    // server.bindAddress. The runtime start path (`start_ws_listener`)
+    // applies the same override from the persisted setting.
+    if boot_settings.effective.server.tunnel.only {
+        let loopback = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+        if ws_options.bind_addresses != loopback {
+            tracing::info!(
+                "server.tunnel.only=true: WSS listener binding loopback only \
+                 (server.bindAddress ignored while tunnel-only is on)"
+            );
+            ws_options.bind_addresses = loopback;
+        }
+    }
     // Loud upgrade-path warning (monorepo#2900): the old config template wrote
     // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
     // file-origin wide bind that predates the loopback default. When that wide
@@ -1789,6 +1804,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         watch_health,
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
+        tunnel: Arc::new(tunnel::TunnelSupervisor::new(
+            tunnel::resolve_tailcat_bin(),
+            &config.data_dir.join("tunnel"),
+        )),
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -1901,6 +1920,28 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         }
     }
 
+    // Boot-time tailcat tunnel auto-start when the effective
+    // server.tunnel.enabled is true. Requires the WSS listener up (checked by
+    // start_tunnel); a start failure at boot is non-fatal — setting stays
+    // true, warning logged, toggle OFF→ON to retry.
+    if boot_settings.effective.server.tunnel.enabled {
+        match intent_core::ServerControl::start_tunnel(control.as_ref()).await {
+            Ok(address) => {
+                tracing::info!(
+                    address = %address,
+                    "tailcat tunnel auto-started at boot (persisted server.tunnel.enabled=true)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to auto-start tailcat tunnel at boot (persisted enabled=true); \
+                     setting remains true, toggle OFF→ON to retry"
+                );
+            }
+        }
+    }
+
     // Build pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
     // Only built when there's a token store (secure mode); `None` in insecure mode.
     // Available to UDS clients even when TCP is disabled (they can still call the RPCs).
@@ -1997,11 +2038,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     )
     .await?;
 
-    // Clean shutdown: stop the WSS listener (graceful close + port release),
-    // stop the PR refresh loop, then kill every spawned agent child and clear
-    // the registry (§6.8 teardown). Idle reaping during the run is the M5
-    // `reap_idle` hook. Stop via ServerControl so we stop the runtime listener
+    // Clean shutdown: stop the tailcat tunnel sidecar (kill the child), stop
+    // the WSS listener (graceful close + port release), stop the PR refresh
+    // loop, then kill every spawned agent child and clear the registry (§6.8
+    // teardown). Idle reaping during the run is the M5 `reap_idle` hook. Stop
+    // via ServerControl so we stop the runtime listener
     // (ws_runtime.state.ws_server), not the stale boot-time ws_server variable.
+    intent_core::ServerControl::stop_tunnel(control.as_ref()).await;
     control.stop_ws_listener().await;
     pr_refresh.abort();
     pr_monitor_loop.abort();
@@ -2107,6 +2150,9 @@ struct DaemonControl {
     /// `<data_dir>/sitter/sitter.pid` — the supervising sitter's pidfile,
     /// read by `system.requestUpdate` to find the process to SIGUSR1.
     sitter_pid_path: PathBuf,
+    /// Tailcat tunnel sidecar supervisor (`server.tunnel.*`). Always present
+    /// so the runtime toggle works whether or not the tunnel was boot-started.
+    tunnel: Arc<tunnel::TunnelSupervisor>,
 }
 
 /// Latest own-process resource sample for `system.status`, written by the
@@ -2958,6 +3004,40 @@ impl intent_core::ServerControl for DaemonControl {
             }
             .unwrap_or_else(|| runtime.ws_options.bind_addresses.clone());
 
+            // Tunnel-only mode (server.tunnel.only): accept tunnel-forwarded
+            // traffic only — bind loopback regardless of server.bindAddress,
+            // so direct LAN connects are refused while tailcat (a local
+            // process) still reaches the listener. Tunnel-only is a security
+            // posture, so a settings read failure fails CLOSED (loopback
+            // bind) rather than silently serving the wider bindAddress.
+            let tunnel_only = match runtime
+                .api
+                .settings_get("server.tunnel.only".to_string())
+                .await
+            {
+                Ok(v) => v.get("value").and_then(serde_json::Value::as_bool) == Some(true),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cannot read server.tunnel.only; failing closed — \
+                         WSS listener binding loopback only"
+                    );
+                    true
+                }
+            };
+            let bind_addresses = if tunnel_only {
+                let loopback = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+                if bind_addresses != loopback {
+                    tracing::info!(
+                        "server.tunnel.only=true: WSS listener binding loopback only \
+                         (server.bindAddress ignored while tunnel-only is on)"
+                    );
+                }
+                loopback
+            } else {
+                bind_addresses
+            };
+
             // Clone ws_options and override the port + bind address set
             let mut ws_options = runtime.ws_options.clone();
             ws_options.base_port = desired_port;
@@ -3083,6 +3163,39 @@ impl intent_core::ServerControl for DaemonControl {
         // Returns true for TCP (WSS) connections, false for UDS or when called
         // outside a request context.
         intent_transport::is_tcp_connection()
+    }
+
+    fn start_tunnel(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<String>> + Send + '_>>
+    {
+        Box::pin(async move {
+            // The tunnel forwards to the WSS port, so the listener must be up
+            // (clear, actionable error otherwise — the settings hook surfaces it).
+            let Some(port) = self.ws_listener_port().await else {
+                return Err(intent_core::Error::InvalidParams(
+                    "tunnel requires the WSS listener: enable server.wsApi.enabled first"
+                        .to_string(),
+                ));
+            };
+            // Optional self-hosted DERP relay (server.tunnel.derpUrl).
+            let derp_url = self
+                .settings_registry
+                .get("server.tunnel.derpUrl")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .filter(|s| !s.is_empty());
+            self.tunnel.start(port, derp_url).await
+        })
+    }
+
+    fn stop_tunnel(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { self.tunnel.stop().await })
+    }
+
+    fn tunnel_address(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>> {
+        Box::pin(async move { self.tunnel.address().await })
     }
 }
 
