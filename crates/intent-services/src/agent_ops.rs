@@ -12594,6 +12594,18 @@ impl Services {
     /// edit. Returns the removed entries in queue order — oldest first — so
     /// the caller can fold them chronologically and restore them verbatim on
     /// a failed send; empty when nothing matched.
+    ///
+    /// Crash window (shared with [`Services::retract_held_message`]): the
+    /// shrunken queue persists before the combined wake commits, so a crash
+    /// in between drops the queued metadata row. Bounded loss by design: the
+    /// report CONTENT is persisted on the child's session
+    /// (`completion_report`), and boot reconciliation replays the settlement
+    /// whose wake text renders that persisted report — only the
+    /// machine-readable `agent:reportToParent` metadata row of the lost
+    /// entry is not re-folded. Retracting only after the wake commits would
+    /// trade this for the worse inverse: a crash after the commit but before
+    /// the retract leaves the stale report wake to drain beside the durable
+    /// terminal wake — the exact duplicate this retract exists to prevent.
     pub(crate) async fn retract_flushed_report_messages(
         &self,
         agent_id: &AgentId,
@@ -12638,9 +12650,14 @@ impl Services {
     /// [`Services::restore_held_message`]: re-insert the entry verbatim (same
     /// id, no hold marker, ready-to-send) and persist/publish, so the
     /// stable-id retry can retract and fold it again instead of losing the
-    /// report event. No release timer is armed — the entry's hold already
-    /// expired. No-op when an entry with the same id is already back on the
-    /// queue (a concurrent restore path won the race).
+    /// report event. Unlike the held restore (a held entry drains by its own
+    /// timer, so tail placement is fine), a flushed entry is ready-to-send:
+    /// it re-enters at its FIFO position by `queued_at` among the normal
+    /// (non-interrupt) entries, so entries queued after it are not delivered
+    /// ahead of it if the parent drains before the retry re-retracts. No
+    /// release timer is armed — the entry's hold already expired. No-op when
+    /// an entry with the same id is already back on the queue (a concurrent
+    /// restore path won the race).
     pub(crate) async fn restore_flushed_report_message(
         &self,
         agent_id: &AgentId,
@@ -12655,7 +12672,11 @@ impl Services {
             if queue.iter().any(|m| m.id == entry.id) {
                 false
             } else {
-                queue.push(entry);
+                let idx = queue
+                    .iter()
+                    .position(|m| !m.interrupt_priority && m.queued_at > entry.queued_at)
+                    .unwrap_or(queue.len());
+                queue.insert(idx, entry);
                 true
             }
         };

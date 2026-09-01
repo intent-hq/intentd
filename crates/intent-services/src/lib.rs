@@ -6611,15 +6611,20 @@ impl Services {
             // Flushed mirror: a member's report wake that already exited its
             // debounce hold but is still undelivered on the parent's queue is
             // equally superseded by the aggregate wake — retract and fold it
-            // too, with the same restore-on-failed-send contract. Each merge
-            // PREPENDS, so folding in reverse keeps the oldest entry first.
-            let flushed = self
-                .retract_flushed_report_messages(&group.parent_agent_id, &child.0)
-                .await;
-            for entry in flushed.iter().rev() {
-                merge_held_report_metadata(&mut metadata, entry.message_metadata.as_ref());
-            }
-            retracted_flushed.extend(flushed);
+            // too, with the same restore-on-failed-send contract.
+            retracted_flushed.extend(
+                self.retract_flushed_report_messages(&group.parent_agent_id, &child.0)
+                    .await,
+            );
+        }
+        // Fold AFTER collecting across all members, sorted by enqueue time —
+        // the per-member retract order is enrollment order, not queue order,
+        // and each merge PREPENDS, so a reverse pass over the sorted set is
+        // what keeps the aggregate metadata chronological (oldest report
+        // first, terminal events last).
+        retracted_flushed.sort_by(|a, b| a.queued_at.cmp(&b.queued_at));
+        for entry in retracted_flushed.iter().rev() {
+            merge_held_report_metadata(&mut metadata, entry.message_metadata.as_ref());
         }
         if let Err(e) = self
             .deliver_parent_wake_durable(

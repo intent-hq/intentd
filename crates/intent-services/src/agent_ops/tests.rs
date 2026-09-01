@@ -10067,6 +10067,18 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
         .await
         .expect("report");
     let flushed_id = wait_for_report_hold_flush(&svc, &parent).await;
+    // A LATER unrelated entry behind the flushed report: the restore must
+    // re-insert at the report's FIFO position, not the queue tail, so this
+    // entry is never delivered ahead of the report.
+    svc.enqueue_message(
+        &parent,
+        "later follow-up".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
 
     // Settlement with the durable send failing: the retraction must be
     // rolled back so the retry can fold the report again.
@@ -10088,10 +10100,14 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
     let restored = svc.queue_snapshot(&parent);
     assert_eq!(
         restored.len(),
-        1,
-        "flushed entry restored after send failure"
+        2,
+        "flushed entry restored after send failure: {restored:?}"
     );
-    assert_eq!(restored[0]["id"], json!(flushed_id));
+    assert_eq!(
+        restored[0]["id"],
+        json!(flushed_id),
+        "restored entry re-enters at its FIFO position, ahead of the later entry: {restored:?}"
+    );
     assert!(
         restored[0]["holdKind"].is_null(),
         "restored entry keeps its flushed (no-hold) shape: {restored:?}"
@@ -10115,9 +10131,16 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
     })
     .await
     .expect("retry delivers the combined wake");
-    assert!(
-        svc.queue_snapshot(&parent).is_empty(),
-        "retry re-retracted the restored entry"
+    let remaining = svc.queue_snapshot(&parent);
+    assert_eq!(
+        remaining.len(),
+        1,
+        "retry re-retracted only the restored report entry: {remaining:?}"
+    );
+    assert_eq!(
+        remaining[0]["content"],
+        json!("later follow-up"),
+        "the unrelated entry is untouched: {remaining:?}"
     );
     let session = svc
         .store()
