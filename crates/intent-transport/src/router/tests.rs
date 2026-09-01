@@ -1281,6 +1281,7 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -1289,12 +1290,22 @@ impl WorkspaceApi for FakeApi {
         _linked_note_id: Option<NoteId>,
         files: Option<Vec<String>>,
         _user_requested: bool,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
         Box::pin(async move {
+            // Mirrors the services-level resolution: an unknown/foreign id
+            // fails exactly like the six §5.6 root-scoped reads.
+            let hash = match &git_root_id {
+                Some(id) if id.as_str() == "root-1" => "root-def456",
+                Some(id) => {
+                    return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
+                }
+                None => "def456",
+            };
             let files = files.unwrap_or_else(|| vec!["src/a.ts".to_string()]);
             let file_count = i64::try_from(files.len()).expect("value fits in i64");
             Ok(GitAgentCommitResult {
-                hash: "def456".to_string(),
+                hash: hash.to_string(),
                 files,
                 file_count,
             })
@@ -4692,6 +4703,51 @@ async fn git_agent_commit_missing_message_is_minus_32602() {
         v["error"]["message"],
         serde_json::json!("Missing required parameter: message")
     );
+}
+
+#[tokio::test]
+async fn git_agent_commit_with_git_root_id_targets_root() {
+    // §5.6 extension (monorepo#2053 follow-up): `gitRootId` targets the
+    // commit at the registered root instead of the workspace worktree.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.agentCommit","params":{"workspaceId":"ws-1","message":"msg","files":["a.ts"],"gitRootId":"root-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["hash"], serde_json::json!("root-def456"));
+    assert_eq!(v["result"]["files"], serde_json::json!(["a.ts"]));
+    assert_eq!(v["result"]["fileCount"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn git_agent_commit_unknown_git_root_id_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.agentCommit","params":{"workspaceId":"ws-1","message":"msg","gitRootId":"nope"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    // Identical message to the six gitRootId-scoped reads (§5.6): the
+    // domain error maps through `domain_to_rpc`, which prefixes
+    // `invalid params:` exactly like the `git.status` arm above.
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+}
+
+#[tokio::test]
+async fn git_agent_commit_empty_git_root_id_is_treated_as_absent() {
+    // §5.6: an empty/whitespace-only `gitRootId` reads as absent — the
+    // primary-worktree behavior, not an unknown-root error.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.agentCommit","params":{"workspaceId":"ws-1","message":"msg","files":["a.ts"],"gitRootId":"  "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["hash"], serde_json::json!("def456"));
 }
 
 #[tokio::test]

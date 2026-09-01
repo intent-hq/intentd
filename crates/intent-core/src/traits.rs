@@ -3250,6 +3250,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// §5.6). When `agent_id` (and optionally `linked_note_id`) are present, the
     /// commit body carries `Agent-Id:` / `Linked-Note-Id:` attribution trailers;
     /// the FE/transport path passes `None` for both (no agent context).
+    ///
+    /// With `git_root_id` the commit targets the registered secondary git
+    /// root instead of the workspace worktree (monorepo#2053): an unknown id
+    /// — or one registered to a different workspace — is `InvalidParams`
+    /// (`-32602`). `None` preserves the primary-worktree behavior exactly.
+    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -3258,6 +3264,7 @@ pub trait WorkspaceApi: Send + Sync {
         linked_note_id: Option<NoteId>,
         files: Option<Vec<String>>,
         user_requested: bool,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
         let _ = (
             workspace_id,
@@ -3266,6 +3273,7 @@ pub trait WorkspaceApi: Send + Sync {
             linked_note_id,
             files,
             user_requested,
+            git_root_id,
         );
         Box::pin(async {
             Err(Error::Internal(

@@ -1854,6 +1854,7 @@ mod mcp_tests {
             Box::pin(async { Ok(Vec::new()) })
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn git_agent_commit(
             &self,
             _workspace_id: WorkspaceId,
@@ -1862,6 +1863,7 @@ mod mcp_tests {
             linked_note_id: Option<NoteId>,
             _files: Option<Vec<String>>,
             _user_requested: bool,
+            _git_root_id: Option<intent_core::WorkspaceGitRootId>,
         ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
             self.committed.lock().unwrap().push((
                 message,
