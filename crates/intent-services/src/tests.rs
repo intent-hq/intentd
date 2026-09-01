@@ -33034,8 +33034,8 @@ mod provider_switch_reresolves_default_model {
     }
 
     /// A same-provider rewrite of `providers.active` is NOT a switch — the
-    /// configured model is left alone (also the loop guard: replaying the
-    /// applied batch appends nothing).
+    /// configured model is left alone and the no-op neither reports an
+    /// applied change nor advances the settings revision.
     #[tokio::test]
     async fn same_provider_rewrite_is_a_noop() {
         let (_tmp, svc) = setup().await;
@@ -33047,7 +33047,8 @@ mod provider_switch_reresolves_default_model {
 
         let result = switch_to(&svc, "auggie").await;
         let applied = result["applied"].as_array().expect("applied array");
-        assert_eq!(applied.len(), 1, "{result}");
+        assert!(applied.is_empty(), "{result}");
+        assert_eq!(result["revision"], serde_json::json!(0), "{result}");
         assert_eq!(
             setting(&svc, "model.default"),
             Some(serde_json::json!("auggie:fable-5"))
