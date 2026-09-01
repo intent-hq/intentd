@@ -89,8 +89,22 @@ enum Verdict {
 /// script orders them, so a relative override reaches the check the same way it
 /// does in a real run.
 fn run_owner_check(pwsh: &Path, cwd: &Path, data_dir: &str) -> Verdict {
+    run_owner_check_with(pwsh, cwd, data_dir, "", &[]).0
+}
+
+/// Like [`run_owner_check`], with a stub prelude prepended to the driver (see
+/// [`service_stubs`]) and extra environment variables set. Also returns the
+/// driver's stdout, so a test can assert on the allowance's info line.
+fn run_owner_check_with(
+    pwsh: &Path,
+    cwd: &Path,
+    data_dir: &str,
+    stubs: &str,
+    envs: &[(&str, &str)],
+) -> (Verdict, String) {
     let script = format!(
         "$ErrorActionPreference = 'Stop'\n\
+         {stubs}\n\
          {resolve}\n\
          try {{\n\
          {check}\n\
@@ -106,15 +120,19 @@ fn run_owner_check(pwsh: &Path, cwd: &Path, data_dir: &str) -> Verdict {
     let script_path = dir.path().join("driver.ps1");
     fs::write(&script_path, script).unwrap();
 
-    let output: Output = Command::new(pwsh)
+    let mut command = Command::new(pwsh);
+    command
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-File")
         .arg(&script_path)
         .current_dir(cwd)
-        .env("INTENTD_DATA_DIR", data_dir)
-        .output()
-        .unwrap();
+        .env_remove("INTENTD_SERVICE_NAME")
+        .env("INTENTD_DATA_DIR", data_dir);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output: Output = command.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -125,14 +143,62 @@ fn run_owner_check(pwsh: &Path, cwd: &Path, data_dir: &str) -> Verdict {
     // The refusal is many lines long (it lists the ways out), so everything
     // after the marker is the message.
     if let Some(at) = stdout.find("REFUSED\n") {
-        Verdict::Refused(stdout[at + "REFUSED\n".len()..].to_string())
+        let message = stdout[at + "REFUSED\n".len()..].to_string();
+        (Verdict::Refused(message), stdout)
     } else {
         assert!(
             stdout.contains("PROCEEDED"),
             "the driver reached neither verdict\nstdout: {stdout}\nstderr: {stderr}"
         );
-        Verdict::Proceeded
+        (Verdict::Proceeded, stdout)
     }
+}
+
+/// PowerShell shims for the Windows-only service queries the upgrade
+/// allowance makes: a `New-Object` answering the `Schedule.Service` COM
+/// lookup with one running task (`task_name`, engine pid `engine_pid`), and a
+/// `Get-CimInstance` serving `Win32_Process` rows from a fixed table of
+/// `(pid, parent pid, started-at-seconds)`. Functions shadow cmdlets in
+/// PowerShell, so the extracted block picks these up unmodified — the same
+/// PATH-stub trick `install_sh_startup.rs` plays on systemctl/launchctl.
+fn service_stubs(task_name: &str, engine_pid: u32, procs: &[(u32, u32, i64)]) -> String {
+    const TEMPLATE: &str = r#"
+$StubProcTable = @(
+@ROWS@
+)
+function Get-CimInstance {
+    param([string]$ClassName, [string]$Filter, [string]$ErrorAction)
+    if ($ClassName -ne 'Win32_Process') { throw "stub Get-CimInstance: unexpected class '$ClassName'" }
+    if ($Filter -notmatch '^ProcessId = ([0-9]+)$') { throw "stub Get-CimInstance: unexpected filter '$Filter'" }
+    $wanted = [int64]$Matches[1]
+    foreach ($row in $StubProcTable) { if ([int64]$row.ProcessId -eq $wanted) { return $row } }
+}
+function New-Object {
+    param([string]$ComObject)
+    if ($ComObject -ne 'Schedule.Service') { throw "stub New-Object: unexpected COM class '$ComObject'" }
+    $service = [pscustomobject]@{}
+    Add-Member -InputObject $service -MemberType ScriptMethod -Name Connect -Value { }
+    Add-Member -InputObject $service -MemberType ScriptMethod -Name GetRunningTasks -Value {
+        param($flags)
+        @([pscustomobject]@{ Name = '@TASKNAME@'; Path = '\@TASKNAME@'; EnginePID = @ENGINEPID@ })
+    }
+    return $service
+}
+"#;
+    let rows = procs
+        .iter()
+        .map(|(pid, ppid, started_at)| {
+            format!(
+                "    [pscustomobject]@{{ ProcessId = {pid}; ParentProcessId = {ppid}; \
+                 CreationDate = ([datetime]'2026-01-01T00:00:00').AddSeconds({started_at}) }}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    TEMPLATE
+        .replace("@ROWS@", &rows)
+        .replace("@TASKNAME@", task_name)
+        .replace("@ENGINEPID@", &engine_pid.to_string())
 }
 
 /// The daemon's own pidfile rule, mirrored from `read_pid`
@@ -182,6 +248,9 @@ fn dead_pid() -> u32 {
     pid
 }
 
+/// No service stubs here, so the block's `Schedule.Service` COM lookup fails
+/// (as it does on any host where the scheduler cannot be asked) — which
+/// doubles as the guard that an unreachable scheduler grants no allowance.
 #[test]
 fn a_live_owner_refuses_the_install_naming_the_pid_and_the_data_dir() {
     let Some(pwsh) = pwsh() else { return };
@@ -300,5 +369,158 @@ fn a_relative_data_dir_is_anchored_to_the_installers_working_directory() {
         run_owner_check(&pwsh, &elsewhere, "./data"),
         Verdict::Proceeded,
         "an unrelated ./data must not block the install"
+    );
+}
+
+/// The upgrade allowance: an owner inside the running "intentd" task's
+/// process tree does not block a re-run — the installer restarts that very
+/// task onto the new binary. The scheduler stub reports the task's engine
+/// pid; the CIM table gives the tree the engine spawned: engine (cmd) →
+/// sitter → daemon (the pidfile owner, the only real process).
+#[test]
+fn an_owner_under_our_running_task_lets_the_install_proceed() {
+    let Some(pwsh) = pwsh() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let owner = LiveProcess::spawn();
+    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+    let engine: u32 = 1_900_000_001;
+    let sitter: u32 = 1_900_000_002;
+    let stubs = service_stubs(
+        "intentd",
+        engine,
+        &[
+            (owner.pid(), sitter, 20),
+            (sitter, engine, 10),
+            (engine, 4, 0),
+        ],
+    );
+
+    let (verdict, stdout) =
+        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    assert_eq!(
+        verdict,
+        Verdict::Proceeded,
+        "an owner under our own running task must not refuse the re-install"
+    );
+    assert!(
+        stdout.contains("belongs to the 'intentd' scheduled task"),
+        "the allowance must say why it proceeded: {stdout}"
+    );
+}
+
+/// The task the allowance matches is the one this installer manages: the
+/// default name or the `INTENTD_SERVICE_NAME` override — never whatever task
+/// happens to be running.
+#[test]
+fn the_allowance_follows_the_service_name_override() {
+    let Some(pwsh) = pwsh() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let owner = LiveProcess::spawn();
+    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+    let engine: u32 = 1_900_000_001;
+    let table = [(owner.pid(), engine, 10), (engine, 4, 0)];
+    let stubs = service_stubs("intentd-test", engine, &table);
+
+    // The override names the running task: allowed.
+    let (verdict, stdout) = run_owner_check_with(
+        &pwsh,
+        dir.path(),
+        data_dir.to_str().unwrap(),
+        &stubs,
+        &[("INTENTD_SERVICE_NAME", "intentd-test")],
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Proceeded,
+        "the allowance must honor INTENTD_SERVICE_NAME"
+    );
+    assert!(
+        stdout.contains("belongs to the 'intentd-test' scheduled task"),
+        "the info line must name the overridden task: {stdout}"
+    );
+
+    // Without the override the installer manages 'intentd', so the running
+    // 'intentd-test' tree is somebody else's daemon: refused.
+    let (verdict, _) =
+        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    assert!(
+        matches!(verdict, Verdict::Refused(_)),
+        "a same-tree owner under a differently-named task must still refuse, got {verdict:?}"
+    );
+}
+
+/// An owner the running task does not contain — a manual `intentd serve`,
+/// some unrelated tree — keeps today's refusal, options list included, even
+/// though a same-named task is running.
+#[test]
+fn an_owner_outside_the_tasks_process_tree_is_still_refused() {
+    let Some(pwsh) = pwsh() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let owner = LiveProcess::spawn();
+    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+    // The owner's chain tops out at an unrelated shell; the task's engine pid
+    // is nowhere on it.
+    let shell: u32 = 1_900_000_003;
+    let stubs = service_stubs(
+        "intentd",
+        1_900_000_001,
+        &[(owner.pid(), shell, 20), (shell, 4, 0)],
+    );
+
+    let (verdict, _) =
+        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    let Verdict::Refused(message) = verdict else {
+        panic!("an owner outside the task's tree must abort the install, got {verdict:?}");
+    };
+    assert!(
+        message.contains("already running and owns the data dir"),
+        "{message}"
+    );
+    for hint in [
+        "intentd status",
+        "INTENTD_DATA_DIR",
+        "INTENTD_INSTALL_SERVICE",
+    ] {
+        assert!(message.contains(hint), "missing {hint:?} in: {message}");
+    }
+}
+
+/// The pid-reuse guard: a parent that started *after* its child holds a
+/// recycled pid, so the chain is broken there — the walk must stop and
+/// forfeit the allowance rather than trust ancestry through it.
+#[test]
+fn a_parent_younger_than_its_child_breaks_the_chain_and_forfeits_the_allowance() {
+    let Some(pwsh) = pwsh() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let owner = LiveProcess::spawn();
+    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+    // owner → sitter is sound, but sitter's recorded parent (the engine pid)
+    // started long after the sitter: that pid was reused, the real parent is
+    // gone, so the engine match beyond the break must not count.
+    let engine: u32 = 1_900_000_001;
+    let sitter: u32 = 1_900_000_002;
+    let stubs = service_stubs(
+        "intentd",
+        engine,
+        &[
+            (owner.pid(), sitter, 20),
+            (sitter, engine, 10),
+            (engine, 4, 500),
+        ],
+    );
+
+    let (verdict, _) =
+        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    assert!(
+        matches!(verdict, Verdict::Refused(_)),
+        "ancestry through a reused pid must not unlock the allowance, got {verdict:?}"
     );
 }

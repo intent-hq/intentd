@@ -27,8 +27,10 @@
 #
 # Task setup is refused up front when a daemon is already running and owns the
 # data dir the task would serve: a daemon locks its data dir for its whole
-# lifetime, so a second one on the same dir can only crash-loop. Nothing is
-# registered in that case.
+# lifetime, so a second one on the same dir can only crash-loop. One exception:
+# a daemon running under the "intentd" task itself does not block a re-run -
+# that is an upgrade, and the task is re-registered and restarted onto the new
+# binary. Any other owner refuses the setup and nothing is registered.
 #
 # $env:INTENTD_SERVICE_NAME overrides the task name (testing).
 param(
@@ -216,20 +218,73 @@ if ($serviceMode -eq 'yes') {
         $ownerPid = 0
     }
     if ($ownerPid -gt 0) {
-        # Best-effort image path, so the refusal names the program instead of a
-        # bare number (Get-Process cannot read Path for some processes).
-        $ownerPath = ''
-        try { $ownerPath = (Get-Process -Id $ownerPid -ErrorAction Stop).Path } catch { $ownerPath = '' }
-        $ownerDesc = if ($ownerPath) { "pid $ownerPid ($ownerPath)" } else { "pid $ownerPid" }
-        throw ("install.ps1: an intentd daemon is already running and owns the data dir this task would use:`n" +
-            "  data dir: $dataDir`n" +
-            "  owner:    $ownerDesc`n" +
-            "A daemon locks its data dir for as long as it runs, so a second task on the same dir cannot start - it would only crash-loop. Nothing has been registered.`n" +
-            "Pick one:`n" +
-            "  * keep the daemon that is already running - it serves this data dir now: intentd status`n" +
-            "  * stop it first (quit the app that started it, or stop its task), then re-run this installer`n" +
-            "  * give this task its own data dir: `$env:INTENTD_DATA_DIR = `"`$env:LOCALAPPDATA\intentd\service-data`"`n" +
-            "  * install just the binary, with no task: re-run with `$env:INTENTD_INSTALL_SERVICE = '0'")
+        # One owner is not foreign: the daemon of the very task this installer
+        # manages ('intentd', or $env:INTENTD_SERVICE_NAME). Re-running the
+        # installer then is an upgrade - the registration below stops that
+        # exact task and restarts it onto the new binary - so it proceeds
+        # instead of refusing (the same allowance install.sh makes for its
+        # systemd unit / launchd label).
+        # The owner counts as ours only when the task has a running instance
+        # and that instance's engine process is on the owner's parent chain:
+        # Win32_Process ParentProcessId, walked a bounded number of hops,
+        # stopping when a parent started after its child (that parent pid was
+        # reused, so the chain is broken there). A daemon the task scheduler
+        # does not control - a manual `intentd serve`, another task's tree -
+        # keeps being refused below, and so does everything when the scheduler
+        # cannot be asked at all.
+        $taskName = if ($env:INTENTD_SERVICE_NAME) { $env:INTENTD_SERVICE_NAME } else { 'intentd' }
+        $taskEnginePid = 0
+        try {
+            $scheduler = New-Object -ComObject 'Schedule.Service'
+            $scheduler.Connect()
+            # 1 = TASK_ENUM_HIDDEN: include hidden tasks, harmless for ours.
+            foreach ($runningTask in @($scheduler.GetRunningTasks(1))) {
+                if ($runningTask.Path -eq "\$taskName" -or $runningTask.Name -eq $taskName) {
+                    $taskEnginePid = [int]$runningTask.EnginePID
+                    break
+                }
+            }
+        } catch {
+            # No task scheduler to ask (or access denied): no allowance.
+            $taskEnginePid = 0
+        }
+        $ownedByOurTask = $false
+        if ($taskEnginePid -gt 0) {
+            $chainPid = $ownerPid
+            $chainRow = $null
+            try { $chainRow = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $chainPid" -ErrorAction Stop)[0] } catch { $chainRow = $null }
+            for ($hop = 0; $hop -lt 12; $hop++) {
+                if ($chainPid -eq $taskEnginePid) { $ownedByOurTask = $true; break }
+                if (-not $chainRow) { break }
+                $parentPid = [int]$chainRow.ParentProcessId
+                if ($parentPid -le 0) { break }
+                $parentRow = $null
+                try { $parentRow = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $parentPid" -ErrorAction Stop)[0] } catch { $parentRow = $null }
+                if (-not $parentRow) { break }
+                if ($chainRow.CreationDate -and $parentRow.CreationDate -and ($parentRow.CreationDate -gt $chainRow.CreationDate)) { break }
+                $chainPid = $parentPid
+                $chainRow = $parentRow
+            }
+        }
+        if ($ownedByOurTask) {
+            Write-Host "install.ps1: the running daemon (pid $ownerPid) belongs to the '$taskName' scheduled task - it will be restarted onto the new binary"
+        } else {
+            # Best-effort image path, so the refusal names the program instead
+            # of a bare number (Get-Process cannot read Path for some
+            # processes).
+            $ownerPath = ''
+            try { $ownerPath = (Get-Process -Id $ownerPid -ErrorAction Stop).Path } catch { $ownerPath = '' }
+            $ownerDesc = if ($ownerPath) { "pid $ownerPid ($ownerPath)" } else { "pid $ownerPid" }
+            throw ("install.ps1: an intentd daemon is already running and owns the data dir this task would use:`n" +
+                "  data dir: $dataDir`n" +
+                "  owner:    $ownerDesc`n" +
+                "A daemon locks its data dir for as long as it runs, so a second task on the same dir cannot start - it would only crash-loop. Nothing has been registered.`n" +
+                "Pick one:`n" +
+                "  * keep the daemon that is already running - it serves this data dir now: intentd status`n" +
+                "  * stop it first (quit the app that started it, or stop its task), then re-run this installer`n" +
+                "  * give this task its own data dir: `$env:INTENTD_DATA_DIR = `"`$env:LOCALAPPDATA\intentd\service-data`"`n" +
+                "  * install just the binary, with no task: re-run with `$env:INTENTD_INSTALL_SERVICE = '0'")
+        }
     }
     # <<< END data-dir-owner-check
     # Auto-resume choice: parameter beats the env var beats the prompt (both
