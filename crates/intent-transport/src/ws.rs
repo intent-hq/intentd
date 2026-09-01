@@ -697,7 +697,7 @@ impl WsInner {
                         // The `system.*` control surface IS wired here (the
                         // composition root shares `Some(control)` with the UDS
                         // listener); UDS-only methods (`system.shutdown`,
-                        // `system.gitCredential`) reject remote callers with -32001.
+                        // `system.importLegacy`) reject remote callers with -32001.
                         // `host.status` IS answered here, with the resolved WSS
                         // locality (remote unless overridden, §5.14).
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
