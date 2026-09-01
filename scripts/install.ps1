@@ -224,14 +224,34 @@ if ($serviceMode -eq 'yes') {
         # exact task and restarts it onto the new binary - so it proceeds
         # instead of refusing (the same allowance install.sh makes for its
         # systemd unit / launchd label).
-        # The owner counts as ours only when the task has a running instance
-        # and that instance's engine process is on the owner's parent chain:
-        # Win32_Process ParentProcessId, walked a bounded number of hops,
-        # stopping when a parent started after its child (that parent pid was
-        # reused, so the chain is broken there). A daemon the task scheduler
-        # does not control - a manual `intentd serve`, another task's tree -
-        # keeps being refused below, and so does everything when the scheduler
-        # cannot be asked at all.
+        # The owner counts as ours only when ALL of these hold; any query
+        # error or uncertainty along the way falls through to the refusal
+        # below, never to the allowance:
+        #   1. A running task's full Path is exactly "\<task name>".
+        #      Register-ScheduledTask -TaskName always lands the task in the
+        #      root folder, so that path identifies the task this installer
+        #      manages - never IRunningTask.Name, which is only the leaf name
+        #      and which a foreign \other\<name> task shares.
+        #   2. That task's engine process (IRunningTask.EnginePID) is on the
+        #      owner's parent chain: Win32_Process ParentProcessId, walked a
+        #      bounded number of hops, stopping when a parent started after
+        #      its child (that parent pid was reused, so the chain is broken
+        #      there).
+        #   3. The walked chain also holds a live process whose
+        #      ExecutablePath is the sitter binary this installer manages
+        #      (<install dir>\intentd.exe - the exact image the task action
+        #      runs). EnginePID alone is not enough: it names the Task
+        #      Scheduler engine hosting the task, one engine can host several
+        #      tasks, so "descends from the engine" would also admit a daemon
+        #      some *other* task on a shared engine launched. This pins the
+        #      owner to our own action's process tree. (The sitter's pidfile,
+        #      <data_dir>\sitter\sitter.pid, would be a more direct witness,
+        #      but the sitter writes it on unix only - see PidFile in
+        #      crates/intentd-sitter/src/supervisor.rs - so the image path is
+        #      the witness used here.)
+        # A daemon the task scheduler does not control - a manual `intentd
+        # serve`, another task's tree - keeps being refused below, and so
+        # does everything when the scheduler cannot be asked at all.
         $taskName = if ($env:INTENTD_SERVICE_NAME) { $env:INTENTD_SERVICE_NAME } else { 'intentd' }
         $taskEnginePid = 0
         try {
@@ -239,7 +259,7 @@ if ($serviceMode -eq 'yes') {
             $scheduler.Connect()
             # 1 = TASK_ENUM_HIDDEN: include hidden tasks, harmless for ours.
             foreach ($runningTask in @($scheduler.GetRunningTasks(1))) {
-                if ($runningTask.Path -eq "\$taskName" -or $runningTask.Name -eq $taskName) {
+                if ($runningTask.Path -eq "\$taskName") {
                     $taskEnginePid = [int]$runningTask.EnginePID
                     break
                 }
@@ -248,13 +268,26 @@ if ($serviceMode -eq 'yes') {
             # No task scheduler to ask (or access denied): no allowance.
             $taskEnginePid = 0
         }
+        # Requirement 3's witness, resolved from the environment alone (this
+        # block must stay self-contained) exactly as $installDir is resolved
+        # above. Unresolvable means no witness, hence no allowance.
+        $sitterExe = ''
+        try {
+            $sitterDir = if ($env:INTENTD_INSTALL_DIR) { $env:INTENTD_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'intentd\bin' }
+            $sitterDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($sitterDir)
+            $sitterExe = Join-Path $sitterDir 'intentd.exe'
+        } catch {
+            $sitterExe = ''
+        }
         $ownedByOurTask = $false
-        if ($taskEnginePid -gt 0) {
+        if ($taskEnginePid -gt 0 -and $sitterExe) {
+            $chainHasSitter = $false
             $chainPid = $ownerPid
             $chainRow = $null
             try { $chainRow = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $chainPid" -ErrorAction Stop)[0] } catch { $chainRow = $null }
             for ($hop = 0; $hop -lt 12; $hop++) {
-                if ($chainPid -eq $taskEnginePid) { $ownedByOurTask = $true; break }
+                if ($chainRow -and $chainRow.ExecutablePath -and ($chainRow.ExecutablePath -eq $sitterExe)) { $chainHasSitter = $true }
+                if ($chainPid -eq $taskEnginePid) { $ownedByOurTask = $chainHasSitter; break }
                 if (-not $chainRow) { break }
                 $parentPid = [int]$chainRow.ParentProcessId
                 if ($parentPid -le 0) { break }

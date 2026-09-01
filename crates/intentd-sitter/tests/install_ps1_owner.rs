@@ -128,6 +128,7 @@ fn run_owner_check_with(
         .arg(&script_path)
         .current_dir(cwd)
         .env_remove("INTENTD_SERVICE_NAME")
+        .env_remove("INTENTD_INSTALL_DIR")
         .env("INTENTD_DATA_DIR", data_dir);
     for (key, value) in envs {
         command.env(key, value);
@@ -154,14 +155,21 @@ fn run_owner_check_with(
     }
 }
 
+/// A `Win32_Process` row for the [`service_stubs`] table: pid, parent pid,
+/// started-at-seconds, and the process's `ExecutablePath` (empty for a
+/// process whose image path cannot be read, as `Win32_Process` reports for
+/// some).
+struct StubProc(u32, u32, i64, String);
+
 /// PowerShell shims for the Windows-only service queries the upgrade
 /// allowance makes: a `New-Object` answering the `Schedule.Service` COM
-/// lookup with one running task (`task_name`, engine pid `engine_pid`), and a
-/// `Get-CimInstance` serving `Win32_Process` rows from a fixed table of
-/// `(pid, parent pid, started-at-seconds)`. Functions shadow cmdlets in
-/// PowerShell, so the extracted block picks these up unmodified — the same
-/// PATH-stub trick `install_sh_startup.rs` plays on systemctl/launchctl.
-fn service_stubs(task_name: &str, engine_pid: u32, procs: &[(u32, u32, i64)]) -> String {
+/// lookup with one running task (leaf name `task_name`, full path
+/// `task_path`, engine pid `engine_pid`), and a `Get-CimInstance` serving
+/// `Win32_Process` rows from a fixed [`StubProc`] table. Functions shadow
+/// cmdlets in PowerShell, so the extracted block picks these up unmodified —
+/// the same PATH-stub trick `install_sh_startup.rs` plays on
+/// systemctl/launchctl.
+fn service_stubs(task_name: &str, task_path: &str, engine_pid: u32, procs: &[StubProc]) -> String {
     const TEMPLATE: &str = r#"
 $StubProcTable = @(
 @ROWS@
@@ -180,17 +188,18 @@ function New-Object {
     Add-Member -InputObject $service -MemberType ScriptMethod -Name Connect -Value { }
     Add-Member -InputObject $service -MemberType ScriptMethod -Name GetRunningTasks -Value {
         param($flags)
-        @([pscustomobject]@{ Name = '@TASKNAME@'; Path = '\@TASKNAME@'; EnginePID = @ENGINEPID@ })
+        @([pscustomobject]@{ Name = '@TASKNAME@'; Path = '@TASKPATH@'; EnginePID = @ENGINEPID@ })
     }
     return $service
 }
 "#;
     let rows = procs
         .iter()
-        .map(|(pid, ppid, started_at)| {
+        .map(|StubProc(pid, ppid, started_at, exe)| {
             format!(
                 "    [pscustomobject]@{{ ProcessId = {pid}; ParentProcessId = {ppid}; \
-                 CreationDate = ([datetime]'2026-01-01T00:00:00').AddSeconds({started_at}) }}"
+                 CreationDate = ([datetime]'2026-01-01T00:00:00').AddSeconds({started_at}); \
+                 ExecutablePath = '{exe}' }}"
             )
         })
         .collect::<Vec<_>>()
@@ -198,6 +207,7 @@ function New-Object {
     TEMPLATE
         .replace("@ROWS@", &rows)
         .replace("@TASKNAME@", task_name)
+        .replace("@TASKPATH@", task_path)
         .replace("@ENGINEPID@", &engine_pid.to_string())
 }
 
@@ -372,16 +382,30 @@ fn a_relative_data_dir_is_anchored_to_the_installers_working_directory() {
     );
 }
 
+/// The install dir the allowance's sitter-binary witness resolves from
+/// `INTENTD_INSTALL_DIR`, and the sitter image path under it — the
+/// `ExecutablePath` a stub row must carry to count as our sitter.
+fn sitter_install(dir: &Path) -> (String, String) {
+    let install_dir = dir.join("bin");
+    let exe = install_dir.join("intentd.exe");
+    (
+        install_dir.to_str().unwrap().to_string(),
+        exe.to_str().unwrap().to_string(),
+    )
+}
+
 /// The upgrade allowance: an owner inside the running "intentd" task's
 /// process tree does not block a re-run — the installer restarts that very
 /// task onto the new binary. The scheduler stub reports the task's engine
 /// pid; the CIM table gives the tree the engine spawned: engine (cmd) →
-/// sitter → daemon (the pidfile owner, the only real process).
+/// sitter (running the installed sitter image) → daemon (the pidfile owner,
+/// the only real process).
 #[test]
 fn an_owner_under_our_running_task_lets_the_install_proceed() {
     let Some(pwsh) = pwsh() else { return };
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
+    let (install_dir, sitter_exe) = sitter_install(dir.path());
     let owner = LiveProcess::spawn();
     write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
 
@@ -389,16 +413,22 @@ fn an_owner_under_our_running_task_lets_the_install_proceed() {
     let sitter: u32 = 1_900_000_002;
     let stubs = service_stubs(
         "intentd",
+        "\\intentd",
         engine,
         &[
-            (owner.pid(), sitter, 20),
-            (sitter, engine, 10),
-            (engine, 4, 0),
+            StubProc(owner.pid(), sitter, 20, String::new()),
+            StubProc(sitter, engine, 10, sitter_exe),
+            StubProc(engine, 4, 0, String::new()),
         ],
     );
 
-    let (verdict, stdout) =
-        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    let (verdict, stdout) = run_owner_check_with(
+        &pwsh,
+        dir.path(),
+        data_dir.to_str().unwrap(),
+        &stubs,
+        &[("INTENTD_INSTALL_DIR", &install_dir)],
+    );
     assert_eq!(
         verdict,
         Verdict::Proceeded,
@@ -418,12 +448,18 @@ fn the_allowance_follows_the_service_name_override() {
     let Some(pwsh) = pwsh() else { return };
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
+    let (install_dir, sitter_exe) = sitter_install(dir.path());
     let owner = LiveProcess::spawn();
     write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
 
     let engine: u32 = 1_900_000_001;
-    let table = [(owner.pid(), engine, 10), (engine, 4, 0)];
-    let stubs = service_stubs("intentd-test", engine, &table);
+    let sitter: u32 = 1_900_000_002;
+    let table = [
+        StubProc(owner.pid(), sitter, 20, String::new()),
+        StubProc(sitter, engine, 10, sitter_exe),
+        StubProc(engine, 4, 0, String::new()),
+    ];
+    let stubs = service_stubs("intentd-test", "\\intentd-test", engine, &table);
 
     // The override names the running task: allowed.
     let (verdict, stdout) = run_owner_check_with(
@@ -431,7 +467,10 @@ fn the_allowance_follows_the_service_name_override() {
         dir.path(),
         data_dir.to_str().unwrap(),
         &stubs,
-        &[("INTENTD_SERVICE_NAME", "intentd-test")],
+        &[
+            ("INTENTD_SERVICE_NAME", "intentd-test"),
+            ("INTENTD_INSTALL_DIR", &install_dir),
+        ],
     );
     assert_eq!(
         verdict,
@@ -445,11 +484,103 @@ fn the_allowance_follows_the_service_name_override() {
 
     // Without the override the installer manages 'intentd', so the running
     // 'intentd-test' tree is somebody else's daemon: refused.
-    let (verdict, _) =
-        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    let (verdict, _) = run_owner_check_with(
+        &pwsh,
+        dir.path(),
+        data_dir.to_str().unwrap(),
+        &stubs,
+        &[("INTENTD_INSTALL_DIR", &install_dir)],
+    );
     assert!(
         matches!(verdict, Verdict::Refused(_)),
         "a same-tree owner under a differently-named task must still refuse, got {verdict:?}"
+    );
+}
+
+/// A running task that matches only by leaf name is not ours: the installer
+/// registers and restarts the root `\<name>` task, so a `\other\<name>` task
+/// — same `IRunningTask.Name`, different `Path` — must not unlock the
+/// allowance even when the owner sits under its tree with a matching sitter
+/// image.
+#[test]
+fn a_running_task_matching_only_by_leaf_name_is_refused() {
+    let Some(pwsh) = pwsh() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let (install_dir, sitter_exe) = sitter_install(dir.path());
+    let owner = LiveProcess::spawn();
+    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+    let engine: u32 = 1_900_000_001;
+    let sitter: u32 = 1_900_000_002;
+    let stubs = service_stubs(
+        "intentd",
+        "\\other\\intentd",
+        engine,
+        &[
+            StubProc(owner.pid(), sitter, 20, String::new()),
+            StubProc(sitter, engine, 10, sitter_exe),
+            StubProc(engine, 4, 0, String::new()),
+        ],
+    );
+
+    let (verdict, _) = run_owner_check_with(
+        &pwsh,
+        dir.path(),
+        data_dir.to_str().unwrap(),
+        &stubs,
+        &[("INTENTD_INSTALL_DIR", &install_dir)],
+    );
+    assert!(
+        matches!(verdict, Verdict::Refused(_)),
+        "a task matching only by leaf name must not unlock the allowance, got {verdict:?}"
+    );
+}
+
+/// A shared Task Scheduler engine must not vouch for a foreign tree: the
+/// owner descends from our task's `EnginePID`, but through a *different*
+/// task's sitter (an image that is not the one this installer manages), so
+/// the allowance is forfeited — `EnginePID` ancestry alone proves only
+/// "some task on this engine", not ours.
+#[test]
+fn a_foreign_tasks_daemon_on_a_shared_engine_is_refused() {
+    let Some(pwsh) = pwsh() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let (install_dir, _) = sitter_install(dir.path());
+    let foreign_exe = dir
+        .path()
+        .join("elsewhere")
+        .join("intentd.exe")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let owner = LiveProcess::spawn();
+    write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+
+    let engine: u32 = 1_900_000_001;
+    let foreign_sitter: u32 = 1_900_000_002;
+    let stubs = service_stubs(
+        "intentd",
+        "\\intentd",
+        engine,
+        &[
+            StubProc(owner.pid(), foreign_sitter, 20, String::new()),
+            StubProc(foreign_sitter, engine, 10, foreign_exe),
+            StubProc(engine, 4, 0, String::new()),
+        ],
+    );
+
+    let (verdict, _) = run_owner_check_with(
+        &pwsh,
+        dir.path(),
+        data_dir.to_str().unwrap(),
+        &stubs,
+        &[("INTENTD_INSTALL_DIR", &install_dir)],
+    );
+    assert!(
+        matches!(verdict, Verdict::Refused(_)),
+        "a foreign task's daemon on a shared engine must be refused, got {verdict:?}"
     );
 }
 
@@ -461,6 +592,7 @@ fn an_owner_outside_the_tasks_process_tree_is_still_refused() {
     let Some(pwsh) = pwsh() else { return };
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
+    let (install_dir, _) = sitter_install(dir.path());
     let owner = LiveProcess::spawn();
     write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
 
@@ -469,12 +601,21 @@ fn an_owner_outside_the_tasks_process_tree_is_still_refused() {
     let shell: u32 = 1_900_000_003;
     let stubs = service_stubs(
         "intentd",
+        "\\intentd",
         1_900_000_001,
-        &[(owner.pid(), shell, 20), (shell, 4, 0)],
+        &[
+            StubProc(owner.pid(), shell, 20, String::new()),
+            StubProc(shell, 4, 0, String::new()),
+        ],
     );
 
-    let (verdict, _) =
-        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    let (verdict, _) = run_owner_check_with(
+        &pwsh,
+        dir.path(),
+        data_dir.to_str().unwrap(),
+        &stubs,
+        &[("INTENTD_INSTALL_DIR", &install_dir)],
+    );
     let Verdict::Refused(message) = verdict else {
         panic!("an owner outside the task's tree must abort the install, got {verdict:?}");
     };
@@ -493,12 +634,14 @@ fn an_owner_outside_the_tasks_process_tree_is_still_refused() {
 
 /// The pid-reuse guard: a parent that started *after* its child holds a
 /// recycled pid, so the chain is broken there — the walk must stop and
-/// forfeit the allowance rather than trust ancestry through it.
+/// forfeit the allowance rather than trust ancestry through it, even with
+/// the sitter image already sighted below the break.
 #[test]
 fn a_parent_younger_than_its_child_breaks_the_chain_and_forfeits_the_allowance() {
     let Some(pwsh) = pwsh() else { return };
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
+    let (install_dir, sitter_exe) = sitter_install(dir.path());
     let owner = LiveProcess::spawn();
     write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
 
@@ -509,16 +652,22 @@ fn a_parent_younger_than_its_child_breaks_the_chain_and_forfeits_the_allowance()
     let sitter: u32 = 1_900_000_002;
     let stubs = service_stubs(
         "intentd",
+        "\\intentd",
         engine,
         &[
-            (owner.pid(), sitter, 20),
-            (sitter, engine, 10),
-            (engine, 4, 500),
+            StubProc(owner.pid(), sitter, 20, String::new()),
+            StubProc(sitter, engine, 10, sitter_exe),
+            StubProc(engine, 4, 500, String::new()),
         ],
     );
 
-    let (verdict, _) =
-        run_owner_check_with(&pwsh, dir.path(), data_dir.to_str().unwrap(), &stubs, &[]);
+    let (verdict, _) = run_owner_check_with(
+        &pwsh,
+        dir.path(),
+        data_dir.to_str().unwrap(),
+        &stubs,
+        &[("INTENTD_INSTALL_DIR", &install_dir)],
+    );
     assert!(
         matches!(verdict, Verdict::Refused(_)),
         "ancestry through a reused pid must not unlock the allowance, got {verdict:?}"
