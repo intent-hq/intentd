@@ -695,7 +695,9 @@ async fn debounced_report_combined_with_completion_wake_over_wss() {
 
 /// Debounce disabled (`agents.reportToParentDebounceSeconds` = 0): the legacy
 /// immediate report wake still delivers on its own — nothing is parked — and
-/// the child's settlement follows as a SECOND, separate completion wake.
+/// the child's settlement follows as a SECOND, separate completion wake whose
+/// text references the already-delivered report instead of repeating it
+/// verbatim (monorepo#4026).
 #[tokio::test]
 async fn immediate_report_wake_when_debounce_disabled_over_wss() {
     const SPAWN_GO: &str = "REPDEB2_SPAWN_GO";
@@ -711,7 +713,13 @@ async fn immediate_report_wake_when_debounce_disabled_over_wss() {
          {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
     );
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    // `firstTurnDelayMs` holds the child's first turn open for 3s AFTER its
+    // report tool call runs, pinning a deterministic window in which the
+    // immediate progress wake is drained into a parent turn BEFORE the child
+    // settles — so the terminal wake's already-delivered suppression
+    // (monorepo#4026) is exercised, not raced.
     let behavior = json!({
+        "firstTurnDelayMs": 3000,
         "rules": [
             { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "parent acknowledged wake" },
             {
@@ -818,5 +826,19 @@ async fn immediate_report_wake_when_debounce_disabled_over_wss() {
     assert!(
         terminal.contains("\"watchStillArmed\":false"),
         "terminal wake metadata tags watchStillArmed=false: {terminal}"
+    );
+    // monorepo#4026: the progress wake above was already drained into a
+    // parent turn, so the terminal wake TEXT references the earlier delivery
+    // instead of repeating the identical report verbatim. Only the text is
+    // suppressed — the folded event metadata still carries the report.
+    let terminal_row: Value = serde_json::from_str(terminal).expect("terminal wake row json");
+    let terminal_text = blocks_text(&terminal_row);
+    assert!(
+        terminal_text.contains("already delivered in a previous message"),
+        "terminal wake text references the already-delivered report: {terminal_text}"
+    );
+    assert!(
+        !terminal_text.contains(REPORT),
+        "terminal wake text does not repeat the delivered report verbatim: {terminal_text}"
     );
 }
