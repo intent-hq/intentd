@@ -255,19 +255,22 @@ pub fn read_live_pid(path: &Path) -> Option<nix::unistd::Pid> {
 /// Pidfile guard: writes the sitter's own pid on creation and removes the
 /// file on drop — but only when it still holds this process's pid, so a
 /// later serve sitter's entry (last writer wins) is never deleted by an
-/// earlier one exiting. Serve mode only — `intentd restart` reads it to
-/// find the supervising sitter.
-#[cfg(unix)]
+/// earlier one exiting. Serve mode only. On unix `intentd restart` reads it
+/// to find the supervising sitter; on Windows `install.ps1` reads it as the
+/// ownership witness tying the running daemon's process tree to the data
+/// dir being re-installed over.
 struct PidFile {
     path: std::path::PathBuf,
 }
 
-#[cfg(unix)]
 impl PidFile {
     fn create(path: &Path) -> Option<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // Liveness probing is unix-only (`kill(pid, 0)` via nix); windows
+        // just overwrites — last writer wins either way.
+        #[cfg(unix)]
         if let Some(pid) = read_live_pid(path) {
             eprintln!(
                 "intentd-sitter: pidfile {} already names live pid {pid}; another \
@@ -292,7 +295,6 @@ impl PidFile {
     }
 }
 
-#[cfg(unix)]
 impl Drop for PidFile {
     fn drop(&mut self) {
         // Only remove the file when it still holds our pid: another serve
@@ -453,12 +455,12 @@ impl Supervisor {
                 return 1;
             }
         };
-        // `intentd restart` finds the serve sitter through this pidfile;
+        // `intentd restart` finds the serve sitter through this pidfile
+        // (and on Windows install.ps1 reads it as the ownership witness);
         // written only after the signal handlers are installed so a reader
         // can never SIGHUP a sitter that would still die to it. Removed on
         // drop (any return path); a hard kill leaves a stale file, which
         // readers detect via a liveness probe.
-        #[cfg(unix)]
         let _pidfile = if supervised {
             PidFile::create(&self.paths.pid_path)
         } else {
@@ -1366,7 +1368,6 @@ mod tests {
         assert_eq!(read_live_pid(&path), None, "stale pid must read as absent");
     }
 
-    #[cfg(unix)]
     #[test]
     fn pidfile_guard_writes_own_pid_and_removes_on_drop() {
         let dir = tempfile::tempdir().unwrap();
@@ -1380,7 +1381,6 @@ mod tests {
         assert!(!path.exists(), "pidfile must be removed on drop");
     }
 
-    #[cfg(unix)]
     #[test]
     fn pidfile_guard_drop_leaves_another_sitters_pid_alone() {
         let dir = tempfile::tempdir().unwrap();

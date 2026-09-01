@@ -52,7 +52,8 @@ pub struct SitterPaths {
     /// `<sitter_dir>/config.toml` — user-editable channel pin.
     pub config_path: PathBuf,
     /// `<sitter_dir>/sitter.pid` — pid of the serve-mode sitter while it
-    /// runs (`intentd restart` reads it to find the supervisor).
+    /// runs (`intentd restart` reads it to find the supervisor; on Windows
+    /// `install.ps1` reads it as the upgrade-allowance ownership witness).
     pub pid_path: PathBuf,
 }
 
