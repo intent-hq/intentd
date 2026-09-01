@@ -13366,13 +13366,18 @@ impl WorkspaceApi for Services {
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let _revision_guard = self.settings_revision_gate.write().await;
-            let result = self.settings_service().reset(&path).await?;
-            let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-            publish_event(
-                self.event_bus.as_ref(),
-                settings_changed_event(std::slice::from_ref(&result), revision),
-            )
-            .await;
+            let (result, changed) = self.settings_service().reset_with_change(&path).await?;
+            let revision = if changed {
+                let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+                publish_event(
+                    self.event_bus.as_ref(),
+                    settings_changed_event(std::slice::from_ref(&result), revision),
+                )
+                .await;
+                revision
+            } else {
+                self.settings_revision.load(Ordering::SeqCst)
+            };
             let mut result = result;
             result["revision"] = serde_json::json!(revision);
             Ok(result)

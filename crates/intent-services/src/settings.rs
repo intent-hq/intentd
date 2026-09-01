@@ -2091,6 +2091,39 @@ impl<'a> SettingsService<'a> {
             planned.push((def, value));
         }
 
+        // Keep validated entries only when persisting them would change the
+        // observable setting state. For TOML-backed keys, origin is part of
+        // that state: writing an effective default while the key is absent is
+        // a real default -> file transition, while rewriting the same file
+        // value is a no-op. Flag-pinned entries remain in the plan so the
+        // registry preserves its read-only rejection semantics.
+        let mut mutations = Vec::with_capacity(planned.len());
+        for (def, value) in planned {
+            let unchanged = if def.sensitive {
+                let desired = match &value {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
+            } else if let Some(reg) = self.registry_for(def.path) {
+                match reg.origin(def.path) {
+                    Some(SettingOrigin::File) => reg
+                        .get(def.path)
+                        .is_some_and(|current| current == registry_value(&def, &value)),
+                    Some(SettingOrigin::Flag | SettingOrigin::Default) | None => false,
+                }
+            } else {
+                match self.store.get_setting(def.path).await? {
+                    Some(raw) => serde_json::from_str::<Value>(&raw).ok().as_ref() == Some(&value),
+                    None => def.default_value.clone().unwrap_or(Value::Null) == value,
+                }
+            };
+            if !unchanged {
+                mutations.push((def, value));
+            }
+        }
+        let planned = mutations;
+
         // Apply the TOML-backed subset first, as one atomic registry batch:
         // unknown/pinned keys and typed-schema violations reject here with
         // `-32602` before ANY store (secret, DB, file) has been touched.
@@ -2179,22 +2212,40 @@ impl<'a> SettingsService<'a> {
     /// `config.toml` for TOML-backed keys / delete the persisted or secret
     /// value otherwise) and return the **redacted** `{ path, value, origin? }`;
     /// unknown path → `-32602`, flag-pinned key → `-32602`.
+    #[cfg(test)]
     pub(crate) async fn reset(&self, path: &str) -> Result<Value> {
+        self.reset_with_change(path).await.map(|(result, _)| result)
+    }
+
+    pub(crate) async fn reset_with_change(&self, path: &str) -> Result<(Value, bool)> {
         let def = find_definition(path)
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
-        if def.sensitive {
-            self.secrets.delete(def.path).await?;
+        let changed = if def.sensitive {
+            if self.secrets.load(def.path).await?.is_none() {
+                false
+            } else {
+                self.secrets.delete(def.path).await?;
+                true
+            }
         } else if let Some(reg) = self.registry_for(def.path) {
-            reg.apply(&[(def.path.to_string(), Value::Null)])?;
-        } else {
+            if matches!(reg.origin(def.path), Some(SettingOrigin::Default)) {
+                false
+            } else {
+                reg.apply(&[(def.path.to_string(), Value::Null)])?;
+                true
+            }
+        } else if self.store.get_setting(def.path).await?.is_some() {
             self.store.delete_setting(def.path).await?;
-        }
+            true
+        } else {
+            false
+        };
         let value = self.current_value(&def).await;
         let mut result = json!({ "path": def.path, "value": value });
         if let Some(origin) = self.origin_for(def.path) {
             result["origin"] = json!(origin);
         }
-        Ok(result)
+        Ok((result, changed))
     }
 }
 

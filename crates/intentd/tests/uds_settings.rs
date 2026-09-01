@@ -67,6 +67,16 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
 
+async fn assert_no_frame(reader: &mut BufReader<OwnedReadHalf>) {
+    let mut line = String::new();
+    assert!(
+        timeout(Duration::from_millis(100), reader.read_line(&mut line))
+            .await
+            .is_err(),
+        "unexpected event frame: {line}"
+    );
+}
+
 /// Issue one JSON-RPC request and return the FULL response (incl. any `error`).
 async fn call(
     write_half: &mut (impl AsyncWriteExt + Unpin),
@@ -241,6 +251,31 @@ async fn settings_round_trip_redaction_validation_and_event() {
     .await;
     let _ = read_json(&mut sr).await;
     wait_for_subscriber_count(&bus, 1).await;
+
+    // Identical effective DB writes and already-absent resets are no-ops:
+    // they return the current revision and publish nothing.
+    let unchanged = rpc(
+        &mut w,
+        &mut r,
+        51,
+        "settings.update",
+        json!({ "changes": [{ "path": "git.autoCommit", "value": true }] }),
+    )
+    .await;
+    assert_eq!(unchanged["applied"], json!([]));
+    assert_eq!(unchanged["revision"], json!(0));
+    assert_no_frame(&mut sr).await;
+    let unchanged = rpc(
+        &mut w,
+        &mut r,
+        52,
+        "settings.reset",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(unchanged["value"], json!(true));
+    assert_eq!(unchanged["revision"], json!(0));
+    assert_no_frame(&mut sr).await;
 
     // settings.update (non-secret) → applied + settings:changed (redacted).
     let applied = rpc(
