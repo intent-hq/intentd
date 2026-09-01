@@ -3,7 +3,7 @@
 //! Tokens are resolved per `sourceControl.github.tokenSource`:
 //!
 //! 1. `explicit` — stored in the file-backed secrets store
-//!    ([`intent_core::FileSecretStore`], `~/intent/secrets.json`) under
+//!    ([`intent_core::FileSecretStore`], `~/intent/.secrets.json`) under
 //!    account `sourceControl.github.token` (never in plaintext config or logs).
 //! 2. `env` — `GITHUB_TOKEN` / `GH_TOKEN`.
 //! 3. `gh-cli` — `gh auth token` (shell out to the GitHub CLI). The binary is

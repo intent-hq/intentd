@@ -539,7 +539,7 @@ pub struct Services {
     wake_archived_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
-    /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
+    /// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`); tests inject
     /// an in-memory store so they never touch the real secrets file.
     /// Wrapped in an [`AsyncSecretStore`](settings::AsyncSecretStore) so every
     /// backing call runs on the blocking pool with a bounded timeout + single-

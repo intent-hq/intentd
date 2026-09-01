@@ -9,7 +9,7 @@
 //! table (`intent-store`). Sensitive values (`mcp.servers`,
 //! `server.auth.token`, `sourceControl.github.token`, `linear.token`,
 //! `accounts.sentry.token`) live in the file-backed secrets
-//! store (`~/intent/secrets.json`, via [`intent_core::FileSecretStore`])
+//! store (`~/intent/.secrets.json`, via [`intent_core::FileSecretStore`])
 //! behind the [`SecretStore`] seam and are **never** returned in plaintext
 //! over the wire — list/get redact them to presence/placeholder only, and
 //! `server.auth.token` is read-only. `workspace.sshKeyPath` is a plain
@@ -91,7 +91,7 @@ pub trait SecretStore: Send + Sync {
 }
 
 /// File-backed production default: delegate to the shared
-/// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`), whose accounts
+/// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`), whose accounts
 /// are the sensitive setting paths (account = setting path).
 impl SecretStore for intent_core::FileSecretStore {
     fn load(&self, account: &str) -> Result<Option<String>> {
