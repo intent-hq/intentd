@@ -11,7 +11,6 @@ use super::*;
 struct FakeControl {
     status: SystemStatus,
     shutdown_called: AtomicBool,
-    import_force: std::sync::Mutex<Option<bool>>,
     credential: Option<(String, String)>,
     credential_pid: std::sync::Mutex<Option<Option<u64>>>,
     update_error: Option<String>,
@@ -58,7 +57,6 @@ impl FakeControl {
                 update_supported: true,
             },
             shutdown_called: AtomicBool::new(false),
-            import_force: std::sync::Mutex::new(None),
             credential: None,
             credential_pid: std::sync::Mutex::new(None),
             update_error: None,
@@ -95,20 +93,6 @@ impl SystemControl for FakeControl {
             None => Ok(()),
         }
     }
-    fn import_legacy(
-        &self,
-        force: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
-        Box::pin(async move {
-            *self.import_force.lock().unwrap() = Some(force);
-            Ok(json!({
-                "imported": 1, "updated": 0, "skipped": 0,
-                "notes": 2, "comments": 3, "agents": 4, "assets": 5,
-                "skipSummary": [], "compatibilityFailures": false,
-                "markerWritten": true
-            }))
-        })
-    }
     fn git_credential(
         &self,
         client_pid: Option<u64>,
@@ -124,9 +108,6 @@ impl SystemControl for FakeControl {
 fn classify_only_matches_system_methods() {
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.status" })).is_some());
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.shutdown" })).is_some());
-    assert!(
-        classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.importLegacy" })).is_some()
-    );
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.gitCredential" })).is_some()
     );
@@ -436,55 +417,6 @@ async fn request_update_notification_fires_without_response() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "system.requestUpdate" })).unwrap();
     assert!(handle(req, &control, true, true).await.is_none());
     assert!(control.update_called.load(Ordering::SeqCst));
-}
-
-#[tokio::test]
-async fn import_legacy_defaults_force_and_returns_counts() {
-    let control = FakeControl::new();
-    let req = classify(&json!({
-        "jsonrpc": "2.0", "id": 11, "method": "system.importLegacy", "params": {}
-    }))
-    .unwrap();
-    let frame = handle(req, &control, true, true).await.unwrap();
-    let parsed: Value = serde_json::from_str(&frame).unwrap();
-    assert_eq!(parsed["result"]["imported"], 1);
-    assert_eq!(parsed["result"]["notes"], 2);
-    assert_eq!(parsed["result"]["compatibilityFailures"], false);
-    assert_eq!(parsed["result"]["markerWritten"], true);
-    assert_eq!(*control.import_force.lock().unwrap(), Some(false));
-}
-
-#[tokio::test]
-async fn import_legacy_rejects_invalid_force_and_remote_transport() {
-    let control = FakeControl::new();
-    let invalid = classify(&json!({
-        "jsonrpc": "2.0", "id": 12, "method": "system.importLegacy",
-        "params": { "force": "yes" }
-    }))
-    .unwrap();
-    let parsed: Value =
-        serde_json::from_str(&handle(invalid, &control, true, true).await.unwrap()).unwrap();
-    assert_eq!(parsed["error"]["code"], -32602);
-    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
-
-    let positional = classify(&json!({
-        "jsonrpc": "2.0", "id": 13, "method": "system.importLegacy", "params": []
-    }))
-    .unwrap();
-    let parsed: Value =
-        serde_json::from_str(&handle(positional, &control, true, true).await.unwrap()).unwrap();
-    assert_eq!(parsed["error"]["code"], -32602);
-    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
-
-    let remote = classify(&json!({
-        "jsonrpc": "2.0", "id": 14, "method": "system.importLegacy",
-        "params": { "force": true }
-    }))
-    .unwrap();
-    let parsed: Value =
-        serde_json::from_str(&handle(remote, &control, false, false).await.unwrap()).unwrap();
-    assert_eq!(parsed["error"]["code"], -32001);
-    assert_eq!(*control.import_force.lock().unwrap(), None);
 }
 
 #[tokio::test]
