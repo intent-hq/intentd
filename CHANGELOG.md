@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-09-01
+
+### 🚀 Features
+
+- *(agents)* Raise reportToParentDebounceSeconds default to 30 s ([#1613](https://github.com/intent-hq/intentd/pull/1613))
+
+### 🐛 Bug Fixes
+
+- Retract flushed-but-undelivered report wakes at settlement ([#1614](https://github.com/intent-hq/intentd/pull/1614))
+
+### 🔧 Refactor
+
+- [**breaking**] Remove legacy workspace importer ([#1616](https://github.com/intent-hq/intentd/pull/1616))
+
+
 ## [0.8.32] - 2026-09-01
 
 ### ⚙️ Miscellaneous Tasks
