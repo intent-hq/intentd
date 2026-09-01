@@ -773,7 +773,16 @@ async fn generation_timeout_falls_back_to_subject() {
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "agent-t1").await;
     let event = idle_event(&ws_id, "agent-t1", "end_turn");
+    let started = std::time::Instant::now();
     svc.handle_agent_idle_auto_commit(&event).await;
+    // monorepo#4032: a stalled CLI must be cut off at the auto-commit budget
+    // (250 ms here) — not any interactive-enhancement default — and still
+    // yield a non-error commit. Generous slack for slow CI.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "auto-commit was not bounded by its own budget: {:?}",
+        started.elapsed()
+    );
     let (_a, _l, message) = last_commit_trailers(&repo.dir);
     // Fell back to the agent name.
     assert!(message.starts_with("Timeout Agent"), "got: {message}");

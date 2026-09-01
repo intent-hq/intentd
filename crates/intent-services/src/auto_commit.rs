@@ -40,6 +40,13 @@ const AGENTS_MD_CAP_BYTES: usize = 8 * 1024;
 const RECENT_COMMITS_LIMIT: usize = 10;
 /// Generation timeout (~30 s) — acceptable latency on idle before falling
 /// back. Tests compress it via [`crate::Services::with_auto_commit_timeout_ms`].
+///
+/// This is auto-commit's OWN budget, passed as `agent.completeOnce`'s
+/// `timeoutMs` (§5.32) — generation never runs through the interactive
+/// prompt-enhancement RPC or its budget, and a timeout here degrades to the
+/// deterministic [`Services::build_auto_commit_subject`] fallback rather than
+/// failing the commit (monorepo#4032). Must stay within §5.32's 120 s
+/// `timeoutMs` cap, which the op silently applies.
 const GENERATION_TIMEOUT_MS: u64 = 30_000;
 
 /// Cap on the raw LLM output logged (at debug level) when parsing fails.

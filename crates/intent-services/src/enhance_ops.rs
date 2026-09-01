@@ -187,13 +187,18 @@ pub(crate) fn clean_agent_message(content: &str) -> String {
 /// collect stdout under a hard timeout. `kill_on_drop` (plus a unix
 /// process-group SIGKILL on timeout) keeps a hung CLI from outliving the
 /// request. Shared with `agent.completeOnce` (§5.32) so both one-shot RPCs
-/// use the same reap-on-failure discipline.
+/// use the same reap-on-failure discipline. `timeout_op` labels the timeout
+/// error with the caller's operation ("<op> timed out after <n>ms") so
+/// background completions — e.g. auto-commit message generation, which runs
+/// on its own budget — no longer masquerade as prompt-enhancement timeouts
+/// (monorepo#4032).
 pub(crate) async fn run_auggie_print(
     bin: &Path,
     model: Option<&str>,
     cwd: Option<&Path>,
     prompt: &str,
     timeout_ms: u64,
+    timeout_op: &str,
 ) -> Result<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("--print")
@@ -249,7 +254,7 @@ pub(crate) async fn run_auggie_print(
             #[cfg(not(unix))]
             let _ = pid;
             Err(Error::Internal(format!(
-                "Prompt enhancement timed out after {timeout_ms}ms"
+                "{timeout_op} timed out after {timeout_ms}ms"
             )))
         }
     }
@@ -323,6 +328,7 @@ impl Services {
             cwd.as_deref(),
             &full_prompt,
             timeout,
+            "Prompt enhancement",
         )
         .await?;
         let cleaned = clean_agent_message(&stdout);
@@ -541,8 +547,12 @@ mod tests {
             .agent_enhance_prompt_op("improve me".into(), "enhance".into(), None, None, Some(200))
             .await
             .unwrap_err();
+        // Pins the exact interactive-enhancement wording: the shared runner's
+        // timeout label is per-operation (monorepo#4032), and §5.31 keeps its
+        // historical message.
         assert!(
-            err.to_string().contains("timed out after 200ms"),
+            err.to_string()
+                .contains("Prompt enhancement timed out after 200ms"),
             "got {err:?}"
         );
     }
