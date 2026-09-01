@@ -238,7 +238,6 @@ async fn interrupted_agents_persisted_across_restart() {
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
         .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
@@ -337,7 +336,6 @@ async fn interrupted_agents_persisted_across_restart() {
     let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd2.arg("serve")
         .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
@@ -390,7 +388,6 @@ async fn interrupted_agents_persisted_across_restart() {
     let mut cmd3 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd3.arg("serve")
         .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
@@ -480,7 +477,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
         .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
@@ -596,7 +592,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd2.arg("serve")
         .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())

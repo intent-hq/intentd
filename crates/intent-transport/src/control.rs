@@ -1,9 +1,9 @@
 //! System control fast-path: `system.status`, `system.shutdown`,
-//! `system.importLegacy` (§5.7), `system.gitCredential` (monorepo#884), and
+//! `system.gitCredential` (monorepo#884), and
 //! `system.requestUpdate` (§5.7).
 //!
-//! These control methods surface live daemon state, request graceful shutdown,
-//! and run legacy import. They sit above the domain [`WorkspaceApi`] router because
+//! These control methods surface live daemon state and request graceful
+//! shutdown. They sit above the domain [`WorkspaceApi`] router because
 //! the data they expose (bound port, connected clients, active agents, the TLS
 //! fingerprint) and the action they take (tear down the listener) are
 //! transport/process concerns, not domain operations. The composition root
@@ -184,11 +184,6 @@ pub trait SystemControl: Send + Sync {
     /// sitter-supervised (or signaling is unsupported on this platform);
     /// the handler maps it to `-32603`.
     fn request_update(&self) -> Result<(), String>;
-    /// Import legacy workspaces into the daemon's live store.
-    fn import_legacy(
-        &self,
-        force: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>;
     /// Resolve the daemon-managed GitHub credential for the git-credential
     /// helper (monorepo#884): `Some((username, password))` when the
     /// `exposeGitCredentialToChildren` setting is on and a usable token
@@ -205,9 +200,6 @@ pub(crate) enum SystemMethod {
     Status,
     Shutdown,
     RequestUpdate,
-    ImportLegacy {
-        force: Result<bool, ()>,
-    },
     GitCredential {
         pid: Option<u64>,
         protocol: Option<String>,
@@ -242,18 +234,6 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
         "system.status" => SystemMethod::Status,
         "system.shutdown" => SystemMethod::Shutdown,
         "system.requestUpdate" => SystemMethod::RequestUpdate,
-        "system.importLegacy" => {
-            let force = match obj.get("params") {
-                None | Some(Value::Null) => Ok(false),
-                Some(Value::Object(params)) => match params.get("force") {
-                    None | Some(Value::Null) => Ok(false),
-                    Some(Value::Bool(force)) => Ok(*force),
-                    Some(_) => Err(()),
-                },
-                Some(_) => Err(()),
-            };
-            SystemMethod::ImportLegacy { force }
-        }
         "system.gitCredential" => {
             // Lenient pid extraction: it is audit-only metadata, so a missing
             // or non-numeric value degrades to `None` rather than erroring.
@@ -370,7 +350,7 @@ pub(crate) fn git_credential_scope_ok(protocol: Option<&str>, host: Option<&str>
 
 /// Handle a classified `system.*` request: build the response frame (or `None`
 /// for a notification, which gets no reply). `system.shutdown` triggers the
-/// graceful teardown before acknowledging; like `system.importLegacy` and
+/// graceful teardown before acknowledging; like
 /// `system.gitCredential` it is UDS-only, so remote (TCP/WSS) callers get
 /// -32001 and remote shutdown notifications are ignored. `system.gitCredential`
 /// returns `{ credential: { username, password } }` when a credential is
@@ -399,17 +379,6 @@ pub(crate) async fn handle(
         SystemMethod::RequestUpdate => control
             .request_update()
             .map(|()| json!({ "ok": true }))
-            .map_err(|message| (-32603, message)),
-        SystemMethod::ImportLegacy { .. } if !is_uds => Err((
-            -32001,
-            "system.importLegacy is available over UDS only".to_string(),
-        )),
-        SystemMethod::ImportLegacy { force: Err(()) } => {
-            Err((-32602, "force must be a boolean".to_string()))
-        }
-        SystemMethod::ImportLegacy { force: Ok(force) } => control
-            .import_legacy(force)
-            .await
             .map_err(|message| (-32603, message)),
         SystemMethod::GitCredential { .. } if !is_uds => Err((
             -32001,
