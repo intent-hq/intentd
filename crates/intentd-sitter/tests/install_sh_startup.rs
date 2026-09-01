@@ -85,8 +85,26 @@ fn run_owner_check(os: &str, home: &Path, data_dir: Option<&Path>) -> Output {
 /// `INTENTD_DATA_DIR` given verbatim — so a relative override can be pointed at
 /// the dir the installer was run from.
 fn run_owner_check_in(cwd: Option<&Path>, os: &str, home: &Path, data_dir: Option<&str>) -> Output {
+    run_owner_check_full(cwd, os, home, data_dir, None, None)
+}
+
+/// The full driver: optionally a stub bin dir prepended to PATH (so a fake
+/// `systemctl` / `launchctl` stands in for the service manager) and an
+/// `INTENTD_SERVICE_NAME`. Without an explicit name the unit is given one no
+/// host can be running a service under, so the verdicts stay about the
+/// pidfile: a box that really runs an intentd user service (dogfooding, CI)
+/// must not turn a refusal case into an upgrade.
+fn run_owner_check_full(
+    cwd: Option<&Path>,
+    os: &str,
+    home: &Path,
+    data_dir: Option<&str>,
+    stub_bin: Option<&Path>,
+    service_name: Option<&str>,
+) -> Output {
     let driver = format!(
         "set -eu\n\
+         info() {{ printf '%s\\n' \"install.sh: $*\"; }}\n\
          fail() {{ printf '%s\\n' \"install.sh: error: $*\" >&2; exit 1; }}\n\
          os={os}\n\
          install_dir=/opt/intentd/bin\n\
@@ -99,6 +117,8 @@ fn run_owner_check_in(cwd: Option<&Path>, os: &str, home: &Path, data_dir: Optio
             "pid_is_alive",
             "data_dir_owner_pid",
             "process_path",
+            "service_main_pid",
+            "pid_under",
             "check_data_dir_not_owned",
         ]),
     );
@@ -108,6 +128,21 @@ fn run_owner_check_in(cwd: Option<&Path>, os: &str, home: &Path, data_dir: Optio
         .env("HOME", home)
         .env_remove("XDG_DATA_HOME")
         .env_remove("INTENTD_DATA_DIR");
+    let unit = service_name.map_or_else(
+        || format!("intentd-owner-check-test-{}", std::process::id()),
+        str::to_owned,
+    );
+    cmd.env("INTENTD_SERVICE_NAME", unit);
+    if let Some(stub) = stub_bin {
+        cmd.env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stub.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    }
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
@@ -568,6 +603,202 @@ fn the_unit_and_the_plist_carry_the_resolved_data_dir() {
                  value would resolve elsewhere once the service starts: {line}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Part 1b — upgrading over the running sitter service
+// ---------------------------------------------------------------------------
+
+/// The unit name / launchd label the upgrade tests install under.
+const SERVICE_NAME: &str = "intentd-under-test";
+
+/// A stub `systemctl` / `launchctl` on PATH reporting `main_pid` as the main
+/// pid of `service_name` — the answer the service manager gives when the
+/// service this installer would (re)register is the one running. Anything
+/// else asked of it reads as "not running", so the stub also pins that the
+/// shipped code queries the right unit name / label.
+fn service_manager_stub(dir: &Path, os: &str, service_name: &str, main_pid: u32) -> PathBuf {
+    let bin = dir.join("stub-bin");
+    fs::create_dir_all(&bin).unwrap();
+    if os == "Darwin" {
+        write_executable(
+            &bin.join("launchctl"),
+            &format!(
+                "[ \"$1\" = print ] || exit 1\n\
+                 [ \"$2\" = \"gui/$(id -u)/{service_name}\" ] || exit 1\n\
+                 printf '\\tstate = running\\n\\tpid = {main_pid}\\n'"
+            ),
+        );
+    } else {
+        write_executable(
+            &bin.join("systemctl"),
+            &format!(
+                "for arg; do unit=$arg; done\n\
+                 [ \"$unit\" = \"{service_name}.service\" ] || {{ echo 0; exit 0; }}\n\
+                 echo {main_pid}"
+            ),
+        );
+    }
+    bin
+}
+
+/// A stub where no service manager answers at all: both commands exist but
+/// fail, as `systemctl --user` does without a user manager session.
+fn unreachable_service_manager_stub(dir: &Path) -> PathBuf {
+    let bin = dir.join("stub-bin-unreachable");
+    fs::create_dir_all(&bin).unwrap();
+    write_executable(&bin.join("systemctl"), "exit 1");
+    write_executable(&bin.join("launchctl"), "exit 1");
+    bin
+}
+
+/// Refusal assertions shared by the "still refused" cases below: same exit,
+/// same message, no PROCEEDED — the exemption must not soften the refusal.
+fn assert_refused(os: &str, output: &Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{os}: the install must still be refused; stderr: {}",
+        stderr_of(output)
+    );
+    assert!(!stdout_of(output).contains("PROCEEDED"), "{os}");
+    assert!(
+        stderr_of(output).contains("already running and owns the data dir"),
+        "{os}: the refusal message must be unchanged, got: {}",
+        stderr_of(output)
+    );
+}
+
+/// Re-running the installer over its own running service is an upgrade, not a
+/// conflict: an owner that *is* the main pid of the service this installer
+/// would (re)register lets the check proceed — `setup_service_*` restarts
+/// that very service onto the new binary.
+#[test]
+fn an_owner_that_is_the_services_main_pid_lets_the_install_proceed() {
+    for os in ["Linux", "Darwin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let owner = LiveProcess::spawn();
+        write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+        let stub = service_manager_stub(dir.path(), os, SERVICE_NAME, owner.pid());
+
+        let output = run_owner_check_full(
+            None,
+            os,
+            dir.path(),
+            Some(data_dir.to_str().unwrap()),
+            Some(&stub),
+            Some(SERVICE_NAME),
+        );
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{os}: an owner run by the same-named service must not block the upgrade; stderr: {}",
+            stderr_of(&output)
+        );
+        let stdout = stdout_of(&output);
+        assert!(stdout.contains("PROCEEDED"), "{os}: {stdout}");
+        assert!(
+            stdout.contains("will be restarted onto the new binary"),
+            "{os}: the proceed must say the service is being upgraded, got: {stdout}"
+        );
+        assert!(
+            stdout.contains(SERVICE_NAME),
+            "{os}: the info line must name the service, got: {stdout}"
+        );
+    }
+}
+
+/// The owner is usually not the main pid itself: the service runs the sitter,
+/// which spawns the daemon that writes the pidfile. A descendant of the main
+/// pid is still the same service's process tree. (The spawned owner is a
+/// child of this test process, so reporting the test process as the service's
+/// main pid makes the owner a genuine descendant.)
+#[test]
+fn an_owner_descended_from_the_services_main_pid_lets_the_install_proceed() {
+    for os in ["Linux", "Darwin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let owner = LiveProcess::spawn();
+        write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+        let stub = service_manager_stub(dir.path(), os, SERVICE_NAME, std::process::id());
+
+        let output = run_owner_check_full(
+            None,
+            os,
+            dir.path(),
+            Some(data_dir.to_str().unwrap()),
+            Some(&stub),
+            Some(SERVICE_NAME),
+        );
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{os}: a descendant of the service's main pid is the service's own daemon; stderr: {}",
+            stderr_of(&output)
+        );
+        let stdout = stdout_of(&output);
+        assert!(stdout.contains("PROCEEDED"), "{os}: {stdout}");
+        assert!(
+            stdout.contains("will be restarted onto the new binary"),
+            "{os}: {stdout}"
+        );
+    }
+}
+
+/// A live owner outside the service's process tree keeps the refusal: the
+/// service manager running *something* under this name is not enough — the
+/// owner itself must hang under it. This is what keeps a manual
+/// `intentd serve` (same pidfile, no service above it) refused.
+#[test]
+fn an_owner_outside_the_services_tree_is_still_refused() {
+    for os in ["Linux", "Darwin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let owner = LiveProcess::spawn();
+        // A sibling process: live, but never in the owner's parent chain.
+        let unrelated = LiveProcess::spawn();
+        write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+        let stub = service_manager_stub(dir.path(), os, SERVICE_NAME, unrelated.pid());
+
+        let output = run_owner_check_full(
+            None,
+            os,
+            dir.path(),
+            Some(data_dir.to_str().unwrap()),
+            Some(&stub),
+            Some(SERVICE_NAME),
+        );
+
+        assert_refused(os, &output);
+    }
+}
+
+/// No reachable service manager — a manual `intentd serve` on a box with no
+/// user manager session, say — leaves nothing to vouch for the owner, so the
+/// refusal stands.
+#[test]
+fn an_owner_is_still_refused_when_no_service_manager_answers() {
+    for os in ["Linux", "Darwin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let owner = LiveProcess::spawn();
+        write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
+        let stub = unreachable_service_manager_stub(dir.path());
+
+        let output = run_owner_check_full(
+            None,
+            os,
+            dir.path(),
+            Some(data_dir.to_str().unwrap()),
+            Some(&stub),
+            Some(SERVICE_NAME),
+        );
+
+        assert_refused(os, &output);
     }
 }
 

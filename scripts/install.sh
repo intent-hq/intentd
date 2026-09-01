@@ -50,7 +50,10 @@
 # Service setup is refused up front when a daemon is already running and owns
 # the data dir the service would serve: a daemon locks its data dir for its
 # whole lifetime, so a second one on the same dir can only crash-loop. Nothing
-# is registered in that case — see check_data_dir_not_owned.
+# is registered in that case — see check_data_dir_not_owned. The one owner
+# that does not refuse is the daemon run by the same-named service this
+# installer is about to (re)register: setup_service_* restarts that very
+# service onto the new binary, so proceeding is an upgrade, not a conflict.
 #
 # INTENTD_SERVICE_NAME overrides the unit name / launchd label (testing).
 # INTENTD_DATA_DIR, when set, is baked into the unit/plist so the service
@@ -477,6 +480,51 @@ process_path() {
   fi
 }
 
+# Main pid of the service this installer is about to (re)register — the unit
+# name / launchd label INTENTD_SERVICE_NAME picks, or its default — as the
+# service manager itself reports it. Empty when the manager is unreachable,
+# the service is not registered, or it has no running main process. Linux:
+# systemd's MainPID (an unknown or stopped unit reports 0, which reads as
+# "none" here). macOS: the `pid = N` line of `launchctl print` for the label
+# in this user's gui domain. Never fatal.
+service_main_pid() {
+  if [ "$os" = "Darwin" ]; then
+    command -v launchctl >/dev/null 2>&1 || return 0
+    launchctl print "gui/$(id -u)/${INTENTD_SERVICE_NAME:-com.intenthq.intentd}" 2>/dev/null |
+      sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*$/\1/p' | head -n 1
+  else
+    command -v systemctl >/dev/null 2>&1 || return 0
+    main_pid=$(systemctl --user show --property=MainPID --value "${INTENTD_SERVICE_NAME:-intentd}.service" 2>/dev/null) || return 0
+    main_pid=$(printf '%s' "$main_pid" | tr -d '[:space:]')
+    case "$main_pid" in
+      '' | 0 | *[!0-9]*) return 0 ;;
+    esac
+    printf '%s' "$main_pid"
+  fi
+}
+
+# True when pid $1 is pid $2 itself or a descendant of it. Walks the parent
+# chain via `ps -o ppid=` (POSIX, so it reads the same on Linux and macOS),
+# bounded so a recycled or cyclic ppid chain cannot loop the installer. The
+# walk stops at pid 1 without matching it: everything hangs under init, so
+# reaching it proves nothing about the service.
+pid_under() {
+  probe="$1"
+  hops=0
+  while [ "$hops" -le 32 ]; do
+    if [ "$probe" = "$2" ]; then
+      return 0
+    fi
+    parent=$(ps -o ppid= -p "$probe" 2>/dev/null | tr -d '[:space:]') || parent=""
+    case "$parent" in
+      '' | 0 | 1 | *[!0-9]*) return 1 ;;
+    esac
+    probe="$parent"
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
 # Refuse to register a service against a data dir a live daemon already owns.
 #
 # The daemon holds an exclusive lock on its data dir for as long as it runs and
@@ -485,13 +533,32 @@ process_path() {
 # anything — it crash-loops until the sitter gives up, while the daemon it is
 # fighting is usually the one the user wants to keep.
 #
+# One owner is exempt: the daemon run by the very service this installer is
+# about to (re)register. setup_service_* restarts that service onto the new
+# binary, so proceeding is an upgrade of it, not a second service fighting it
+# over the lock. Decisive is that the service manager controls the owner's
+# process tree — the owner is the service's main pid (the sitter) or hangs
+# under it (the daemon it spawned). A manual `intentd serve` writes the same
+# pidfile but hangs under no such service, so it is still refused.
+#
 # Decidable instantly and without guessing: either a live process holds the dir
-# or it does not. Callers run this before anything about a service is written,
-# so a refusal leaves no unit, plist or enabled service behind.
+# or it does not, and either the service manager reports it or it does not.
+# Callers run this before anything about a service is written, so a refusal
+# leaves no unit, plist or enabled service behind.
 check_data_dir_not_owned() {
   data_dir=$(resolve_data_dir)
   owner_pid=$(data_dir_owner_pid "$data_dir")
   [ -n "$owner_pid" ] || return 0
+  service_pid=$(service_main_pid)
+  if [ -n "$service_pid" ] && pid_under "$owner_pid" "$service_pid"; then
+    if [ "$os" = "Darwin" ]; then
+      service_desc=${INTENTD_SERVICE_NAME:-com.intenthq.intentd}
+    else
+      service_desc=${INTENTD_SERVICE_NAME:-intentd}
+    fi
+    info "the running daemon (pid $owner_pid) belongs to the $service_desc service — it will be restarted onto the new binary"
+    return 0
+  fi
   owner_path=$(process_path "$owner_pid")
   owner_desc="pid $owner_pid"
   [ -z "$owner_path" ] || owner_desc="pid $owner_pid ($owner_path)"
