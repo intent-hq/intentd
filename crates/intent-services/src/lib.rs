@@ -605,6 +605,19 @@ pub struct Services {
     /// reads through it; this set is empty there. Shared across clones so a
     /// `set_test_busy` on one handle is visible to every other handle.
     test_busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents whose pending attention request (`ws.agent.requestDiscussion` /
+    /// `ws.agent.reportBlocker`) was raised MID-TURN, so its user-facing
+    /// surfacing (`agent:attention-requested`, the `agent:updated` attention
+    /// fields, the transcript notice, and the displayStatus promotion) is
+    /// parked until the agent goes idle. The turn-end choke points
+    /// (`run_prompt_turn` settlement, harness-wake idle, interrupt, terminal
+    /// failure) flush via [`Services::flush_deferred_attention`]; the
+    /// turn-begin clear (`clear_attention_request_if_present`) retires an
+    /// entry whose request was dismissed before idle. In-memory only (a
+    /// daemon restart loses the marker — the persisted session fields then
+    /// surface through the ordinary list/get reads). Shared across clones so
+    /// the raising op and the turn worker observe the same set.
+    deferred_attention: Arc<Mutex<HashSet<AgentId>>>,
     /// Per-note debouncers for `attribute_lines` recomputes (PROTOCOL §5.2.1,
     /// FE parity with `LineAttributionService.scheduleComputation`). Every
     /// content-changing `note.*` mutation schedules a delayed recompute
@@ -989,6 +1002,7 @@ impl Services {
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
+            deferred_attention: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
@@ -2990,6 +3004,38 @@ impl Services {
             } else {
                 set.remove(agent_id);
             }
+        }
+    }
+
+    /// Park the user-facing surfacing of `agent_id`'s pending attention
+    /// request until the agent goes idle (see the [`Self::deferred_attention`]
+    /// registry docs). Set by `agent_request_attention_op` for a mid-turn
+    /// raise; consumed by [`Self::flush_deferred_attention`].
+    pub(crate) fn mark_deferred_attention(&self, agent_id: &AgentId) {
+        if let Ok(mut set) = self.deferred_attention.lock() {
+            set.insert(agent_id.clone());
+        }
+    }
+
+    /// Consume `agent_id`'s deferred-attention marker. Returns `true` when a
+    /// marker was present (the caller owes the surfacing), `false` when there
+    /// was nothing parked. Also the retire path: the turn-begin clear and the
+    /// delete teardown drop the marker through this without surfacing.
+    pub(crate) fn take_deferred_attention(&self, agent_id: &AgentId) -> bool {
+        match self.deferred_attention.lock() {
+            Ok(mut set) => set.remove(agent_id),
+            Err(_) => false,
+        }
+    }
+
+    /// Whether `agent_id`'s pending attention request is parked awaiting the
+    /// idle flush — the [`workspace_status`] derivation skips such sessions so
+    /// `displayStatus` stays `in_progress` until the request actually
+    /// surfaces.
+    pub(crate) fn attention_surfacing_deferred(&self, agent_id: &AgentId) -> bool {
+        match self.deferred_attention.lock() {
+            Ok(set) => set.contains(agent_id),
+            Err(_) => false,
         }
     }
 

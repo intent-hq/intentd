@@ -4065,6 +4065,9 @@ impl Services {
         self.clear_turn_silent_tail(&agent_id);
         self.clear_truncation_redrives(&agent_id);
         self.take_truncation_redrive(&agent_id);
+        // A parked mid-turn attention raise dies with the agent — dropped on
+        // the same terms as the other per-agent in-memory registries.
+        self.take_deferred_attention(&agent_id);
         // Context-occupancy registry (intent-hq/intent#3797): in-memory,
         // keyed by agent — dropped on the same terms.
         self.clear_context_usage(&agent_id);
@@ -7465,18 +7468,24 @@ impl Services {
     /// delegated or not, with or without a linked task:
     /// 1. persists the pending attention request (kind/reason/timestamp) on
     ///    the caller's session (cleared when the agent next receives a
-    ///    message) and emits `agent:updated`;
-    /// 2. appends a system-role transcript notice with
-    ///    `meta.kind = "discussion-request"` / `"blocker-report"` (emits
-    ///    `agent:message`) so the conversation renders a distinct card that
-    ///    survives rehydration;
-    /// 3. emits the self-sufficient `agent:attention-requested` event
+    ///    message);
+    /// 2. surfaces the request to the user via
+    ///    [`Self::surface_attention_request`] — the `agent:updated` attention
+    ///    fields, the system-role transcript notice
+    ///    (`meta.kind = "discussion-request"` / `"blocker-report"`), the
+    ///    self-sufficient `agent:attention-requested` event
     ///    `{ workspaceId, agentId, agentName, kind, reason, parentAgentId? }`
     ///    (FE sticky toast; `parentAgentId` is present only for delegated
-    ///    callers — omitted entirely, never `null`, when there is no parent);
-    /// 4. transitions the linked task to `discussion_needed` / `blocked`
+    ///    callers — omitted entirely, never `null`, when there is no parent),
+    ///    and the displayStatus promotion. A raise from INSIDE a live turn is
+    ///    NOT surfaced here: it is parked on the deferred-attention registry
+    ///    and flushed at the raising agent's next turn end
+    ///    ([`Services::flush_deferred_attention`]), so mid-turn raises do not
+    ///    interleave the notice with the turn's own output and the workspace
+    ///    stays `in_progress` until the agent is actually idle;
+    /// 3. transitions the linked task to `discussion_needed` / `blocked`
     ///    (terminal statuses untouched; no linked task = skip);
-    /// 5. wakes a delegated caller's parent with a kind-flavored message —
+    /// 4. wakes a delegated caller's parent with a kind-flavored message —
     ///    delivered IMMEDIATELY even when the child is in an undelivered
     ///    `after_all` delegation group (mirroring the STAB-160 immediate
     ///    grouped-failure wake: an attention request is an alert the parent
@@ -7539,47 +7548,10 @@ impl Services {
         self.store
             .set_attention_request(&workspace_id, &caller, &kind, &reason, &saved_at)
             .await?;
-        self.publish_agent_mutation_event(
-            &workspace_id,
-            &caller,
-            intent_core::events::AGENT_UPDATED,
-            json!({
-                "agentId": caller.0,
-                "attentionRequestKind": kind,
-                "attentionRequestTimestamp": saved_at,
-            }),
-        )
-        .await;
-        // 2. Persist the transcript notice (system role + structured
-        // meta.kind, the InterruptionNotice shape) and emit agent:message.
-        // Best-effort: the session fields above are the durable contract.
-        let notice_content = json!([{
-            "type": "text",
-            "text": reason,
-            "meta": { "kind": meta_kind }
-        }]);
-        match self
-            .store
-            .append_agent_message(&caller, "system", &notice_content, &saved_at)
-            .await
-        {
-            Ok(message) => {
-                self.invalidate_agent_list_cache(&workspace_id);
-                self.publish_agent_message_events(&workspace_id, &caller, &message, None)
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    agent = %caller.0,
-                    error = %e,
-                    "request_attention: failed to append transcript notice"
-                );
-            }
-        }
-        // 3. Self-sufficient toast-driving event. `parentAgentId` rides along
-        // for delegated callers so subscribers can attribute the request to
-        // the delegation tree without a follow-up `agent.get`; OMITTED
-        // entirely (never `null`) for parentless agents.
+        // The attention payload rides both the surfacing events and the
+        // (always-immediate) parent/watcher wakes below. `parentAgentId` is
+        // present only for delegated callers — OMITTED entirely (never
+        // `null`) when there is no parent.
         let mut attention_data = json!({
             "workspaceId": workspace_id.0,
             "agentId": caller.0,
@@ -7590,20 +7562,31 @@ impl Services {
         if let Some(parent) = &parent {
             attention_data["parentAgentId"] = json!(parent.0);
         }
-        self.publish_agent_mutation_event(
-            &workspace_id,
-            &caller,
-            intent_core::events::AGENT_ATTENTION_REQUESTED,
-            attention_data.clone(),
-        )
-        .await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.schedule_last_activity_event(workspace_id.clone());
-        // A pending attention request on a top-level agent promotes the
-        // derived displayStatus to needs_attention (§6.5 step 0):
-        // recompute-and-compare (child/background raises stay silent — the
-        // derivation ignores them and the dedup cache suppresses the no-op).
-        self.maybe_emit_display_status_changed(&workspace_id).await;
+        // 2+3. User-facing surfacing (the `agent:updated` attention fields,
+        // the transcript notice, `agent:attention-requested`, and the
+        // displayStatus promotion). A raise from INSIDE a live turn — the
+        // normal tool-call path — is parked on the deferred registry and
+        // flushed by the turn-end choke points once the agent goes idle, so
+        // the notice lands after the turn's own output and the workspace
+        // stays `in_progress` while the agent is still working. A raise with
+        // no in-flight turn (empty-wake recovery, FE-less edge paths)
+        // surfaces immediately as before. Everything below this branch
+        // (linked-task transition, parent wake, watcher fan-out) stays
+        // immediate either way — backend coordination must not wait for the
+        // child's turn to end.
+        if self.agent_is_busy(caller.clone()) {
+            self.mark_deferred_attention(&caller);
+        } else {
+            self.surface_attention_request(
+                &workspace_id,
+                &caller,
+                meta_kind,
+                &reason,
+                &saved_at,
+                &attention_data,
+            )
+            .await;
+        }
         // 4. Linked-task transition (no linked task = skip).
         if let Some(note_id) = task_note_id {
             self.transition_linked_task_status(
@@ -7739,6 +7722,154 @@ impl Services {
             "reason": reason,
             "savedAt": saved_at,
         }))
+    }
+
+    /// The user-facing surfacing of a pending attention request — the piece
+    /// of [`Self::agent_request_attention_op`] that is deferred to turn end
+    /// for mid-turn raises:
+    /// - `agent:updated` with the attention fields;
+    /// - the system-role transcript notice with
+    ///   `meta.kind = "discussion-request"` / `"blocker-report"` (emits
+    ///   `agent:message`) so the conversation renders a distinct card that
+    ///   survives rehydration — best-effort, the session fields are the
+    ///   durable contract;
+    /// - the self-sufficient `agent:attention-requested` event (FE sticky
+    ///   toast);
+    /// - the debounced lastActivity schedule and the displayStatus
+    ///   recompute (a pending request on a top-level agent promotes the
+    ///   derived displayStatus to `needs_attention`, §6.5 step 0;
+    ///   child/background raises stay silent — the derivation ignores them
+    ///   and the dedup cache suppresses the no-op).
+    ///
+    /// Callers: the immediate arm of `agent_request_attention_op` (no
+    /// in-flight turn) and [`Services::flush_deferred_attention`] (turn-end
+    /// flush of a mid-turn raise).
+    pub(crate) async fn surface_attention_request(
+        &self,
+        workspace_id: &WorkspaceId,
+        caller: &AgentId,
+        meta_kind: &str,
+        reason: &str,
+        saved_at: &str,
+        attention_data: &Value,
+    ) {
+        let kind = attention_data
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.publish_agent_mutation_event(
+            workspace_id,
+            caller,
+            intent_core::events::AGENT_UPDATED,
+            json!({
+                "agentId": caller.0,
+                "attentionRequestKind": kind,
+                "attentionRequestTimestamp": saved_at,
+            }),
+        )
+        .await;
+        let notice_content = json!([{
+            "type": "text",
+            "text": reason,
+            "meta": { "kind": meta_kind }
+        }]);
+        match self
+            .store
+            .append_agent_message(caller, "system", &notice_content, saved_at)
+            .await
+        {
+            Ok(message) => {
+                self.invalidate_agent_list_cache(workspace_id);
+                self.publish_agent_message_events(workspace_id, caller, &message, None)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %caller.0,
+                    error = %e,
+                    "request_attention: failed to append transcript notice"
+                );
+            }
+        }
+        self.publish_agent_mutation_event(
+            workspace_id,
+            caller,
+            intent_core::events::AGENT_ATTENTION_REQUESTED,
+            attention_data.clone(),
+        )
+        .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
+        self.maybe_emit_display_status_changed(workspace_id).await;
+    }
+
+    /// Turn-end flush of a mid-turn attention raise: if `agent_id` holds a
+    /// deferred-attention marker AND the persisted request is still pending
+    /// (not cleared by a mid-turn user delivery), rebuild the surfacing
+    /// payload from the session fields and run
+    /// [`Self::surface_attention_request`]. Called from every turn
+    /// termination choke point — the prompt-turn settlement (clean idle and
+    /// terminal error), the harness-wake idle, and the interrupt path — so
+    /// the request surfaces at the FIRST idle after the raise regardless of
+    /// how the turn ended. Consuming the marker up front makes the flush
+    /// idempotent across racing choke points; a marker whose request was
+    /// already cleared retires silently. Best-effort: a session read failure
+    /// only logs (the persisted fields still surface through ordinary
+    /// list/get reads).
+    pub(crate) async fn flush_deferred_attention(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) {
+        if !self.take_deferred_attention(agent_id) {
+            return;
+        }
+        let session = match self.store.get_agent_session(agent_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "deferred attention flush: failed to load session"
+                );
+                return;
+            }
+        };
+        let (Some(kind), Some(reason)) = (
+            session.attention_request_kind.clone(),
+            session.attention_request_reason.clone(),
+        ) else {
+            // Cleared before idle (user-origin delivery mid-turn) — nothing
+            // to surface.
+            return;
+        };
+        let saved_at = session
+            .attention_request_timestamp
+            .clone()
+            .unwrap_or_else(now_iso);
+        let meta_kind = match kind.as_str() {
+            "discussion" => "discussion-request",
+            _ => "blocker-report",
+        };
+        let mut attention_data = json!({
+            "workspaceId": workspace_id.0,
+            "agentId": agent_id.0,
+            "agentName": session.name.clone(),
+            "kind": kind,
+            "reason": reason,
+        });
+        if let Some(parent) = &session.parent_agent_id {
+            attention_data["parentAgentId"] = json!(parent.0);
+        }
+        self.surface_attention_request(
+            workspace_id,
+            agent_id,
+            meta_kind,
+            &reason,
+            &saved_at,
+            &attention_data,
+        )
+        .await;
     }
 
     /// `agent.delegate`: create a session and (best-effort) assign it to the

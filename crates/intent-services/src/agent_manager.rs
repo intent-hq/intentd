@@ -4431,6 +4431,16 @@ impl AgentManager {
                     interrupted_block_count,
                     "interrupted",
                 );
+                // A user interrupt ends the turn — surface an attention
+                // request the aborted turn raised mid-flight before the idle
+                // emit (same ordering as the settlement idle in
+                // `run_prompt_turn`). An interrupt-with-message
+                // (`suppress_idle_emit`) skips this: the follow-up delivery
+                // clears the pending request at turn begin, retiring the
+                // deferred marker without surfacing.
+                self.services
+                    .flush_deferred_attention(agent_id, &workspace_id)
+                    .await;
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "interrupted",
@@ -4970,6 +4980,10 @@ impl AgentManager {
             .await
         {
             Ok(true) => {
+                // A request cleared before its idle flush retires the parked
+                // surfacing outright — the turn-end flush must not resurrect
+                // a request the user's own delivery just dismissed.
+                self.services.take_deferred_attention(agent_id);
                 self.services
                     .publish_agent_mutation_event(
                         workspace_id,
@@ -11320,6 +11334,13 @@ async fn handle_terminal_turn_failure(
         Some(precomputed) if precomputed.error_text == error_text => precomputed,
         _ => persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await,
     };
+    // A terminal failure ends the turn — surface an attention request the
+    // failed turn raised mid-flight before the failed pair reaches the bus
+    // (the streaming path already flushed in its own `agent:failed` arm; the
+    // flush's consumed marker makes this second call a no-op there).
+    mgr.services
+        .flush_deferred_attention(agent_id, workspace_id)
+        .await;
     if !turn_failure_events_already_emitted(error) {
         publish_terminal_failure_events(
             mgr,

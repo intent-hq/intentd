@@ -23087,6 +23087,284 @@ async fn attention_requested_event_omits_parent_agent_id_for_non_delegated() {
     );
 }
 
+/// A mid-turn raise (agent busy) DEFERS the user-facing surfacing: the store
+/// fields persist immediately, but no `agent:attention-requested`, no
+/// `agent:updated` attention fields, and no transcript notice appear until
+/// the turn-end flush. The flush then surfaces all three.
+#[tokio::test]
+async fn request_attention_mid_turn_defers_surfacing_until_flush() {
+    for (kind, meta_kind) in [
+        ("discussion", "discussion-request"),
+        ("blocker", "blocker-report"),
+    ] {
+        let (_t, svc, ws, bus) = setup_with_bus().await;
+        let agent = create_agent(&svc, &ws, "Busy").await;
+        svc.set_test_busy(&agent, true);
+
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![
+                AGENT_ATTENTION_REQUESTED.to_string(),
+                AGENT_UPDATED.to_string(),
+                AGENT_MESSAGE.to_string(),
+            ],
+            ..Default::default()
+        });
+        let r = svc
+            .agent_request_attention_op(
+                ws.clone(),
+                kind.into(),
+                "need input mid-turn".into(),
+                Some(agent.clone()),
+            )
+            .await
+            .expect("request attention");
+        assert_eq!(r["ok"], json!(true), "op reports success ({kind})");
+
+        // Store persistence is immediate…
+        let session = svc.store().get_agent_session(&agent).await.expect("sess");
+        assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
+        // …but nothing user-facing surfaces mid-turn: no events, no notice.
+        assert!(
+            timeout(Duration::from_millis(300), sub.recv())
+                .await
+                .is_err(),
+            "no surfacing events while the turn is in flight ({kind})"
+        );
+        assert!(
+            !session.messages.iter().any(|m| m.role == "system"),
+            "no transcript notice mid-turn ({kind})"
+        );
+
+        // Turn ends → the flush surfaces the parked request.
+        svc.set_test_busy(&agent, false);
+        svc.flush_deferred_attention(&agent, &ws).await;
+        let mut events = Vec::new();
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+            events.extend(batch);
+        }
+        let attention = events
+            .iter()
+            .find(|e| e.event_type == AGENT_ATTENTION_REQUESTED)
+            .expect("attention event at flush");
+        assert_eq!(attention.data["agentId"].as_str(), Some(agent.0.as_str()));
+        assert_eq!(attention.data["kind"], json!(kind));
+        assert_eq!(attention.data["reason"], json!("need input mid-turn"));
+        assert!(
+            attention.data.get("parentAgentId").is_none(),
+            "parentless raise omits parentAgentId at flush time"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == AGENT_UPDATED
+                    && e.data["attentionRequestKind"] == json!(kind)),
+            "agent:updated attention fields emit at flush: {events:?}"
+        );
+        let session = svc.store().get_agent_session(&agent).await.expect("sess");
+        let notice = session
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("transcript notice appended at flush");
+        assert_eq!(
+            notice.content[0]["meta"]["kind"],
+            json!(meta_kind),
+            "notice meta.kind matches at flush ({kind})"
+        );
+
+        // The flush consumed the marker — a second flush is a no-op.
+        svc.flush_deferred_attention(&agent, &ws).await;
+        assert!(
+            timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .is_err(),
+            "second flush surfaces nothing ({kind})"
+        );
+    }
+}
+
+/// A request cleared before the idle flush (user-origin delivery mid-turn
+/// retires the marker via `take_deferred_attention`) surfaces nothing: the
+/// flush finds no marker, and even a stale marker with cleared session
+/// fields retires silently.
+#[tokio::test]
+async fn request_attention_cleared_before_idle_flushes_nothing() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent = create_agent(&svc, &ws, "Dismissed").await;
+    svc.set_test_busy(&agent, true);
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "answered mid-turn".into(),
+        Some(agent.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    // Mid-turn user delivery clears the persisted request and retires the
+    // parked surfacing (the turn-begin clear path calls both).
+    svc.store()
+        .clear_attention_request(&ws, &agent, &now_iso())
+        .await
+        .expect("clear");
+    assert!(
+        svc.take_deferred_attention(&agent),
+        "marker was parked and is retired by the clear"
+    );
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![
+            AGENT_ATTENTION_REQUESTED.to_string(),
+            AGENT_MESSAGE.to_string(),
+        ],
+        ..Default::default()
+    });
+    svc.set_test_busy(&agent, false);
+    svc.flush_deferred_attention(&agent, &ws).await;
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "cleared-before-idle raise surfaces nothing"
+    );
+    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    assert!(
+        !session.messages.iter().any(|m| m.role == "system"),
+        "no transcript notice for a dismissed raise"
+    );
+
+    // Defense in depth: a marker that somehow survives a cleared request
+    // still surfaces nothing (the flush re-checks the session fields).
+    svc.mark_deferred_attention(&agent);
+    svc.flush_deferred_attention(&agent, &ws).await;
+    assert!(
+        timeout(Duration::from_millis(200), sub.recv())
+            .await
+            .is_err(),
+        "stale marker over cleared fields retires silently"
+    );
+}
+
+/// An idle raise (no in-flight turn) surfaces immediately — the pre-deferral
+/// behavior is preserved for FE-less edge paths like the empty-wake
+/// recovery.
+#[tokio::test]
+async fn request_attention_idle_agent_surfaces_immediately() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent = create_agent(&svc, &ws, "Idle").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_ATTENTION_REQUESTED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "stuck at once".into(),
+        Some(agent.clone()),
+    )
+    .await
+    .expect("request attention");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("immediate surfacing for an idle raise")
+        .expect("open");
+    assert_eq!(batch[0].data["kind"], json!("blocker"));
+    assert!(
+        !svc.take_deferred_attention(&agent),
+        "no deferred marker for an idle raise"
+    );
+}
+
+/// The deferred flush rebuilds `parentAgentId` from the session for a
+/// delegated child, matching the immediate arm's payload contract.
+#[tokio::test]
+async fn deferred_attention_flush_carries_parent_agent_id() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    svc.set_test_busy(&child, true);
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "need input".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_ATTENTION_REQUESTED.to_string()],
+        ..Default::default()
+    });
+    svc.set_test_busy(&child, false);
+    svc.flush_deferred_attention(&child, &ws).await;
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("flush surfaces")
+        .expect("open");
+    assert_eq!(
+        batch[0].data["parentAgentId"].as_str(),
+        Some(parent.0.as_str()),
+        "flush payload carries the parent id: {:?}",
+        batch[0].data
+    );
+}
+
+/// `workspace_attention_signals` skips a pending request whose surfacing is
+/// parked on the deferred registry: the workspace does not promote to
+/// `needs_attention`/`blocked` mid-turn, and flips at the flush (marker
+/// consumed) — for both kinds.
+#[tokio::test]
+async fn attention_signals_skip_deferred_pending_request_until_flush() {
+    for (kind, blocked, needs_attention) in [("discussion", false, true), ("blocker", true, false)]
+    {
+        let (_t, svc, ws) = setup().await;
+        let agent = create_agent(&svc, &ws, "Busy").await;
+        svc.set_test_busy(&agent, true);
+        svc.agent_request_attention_op(
+            ws.clone(),
+            kind.into(),
+            "mid-turn raise".into(),
+            Some(agent.clone()),
+        )
+        .await
+        .expect("request attention");
+
+        let signals = svc
+            .workspace_attention_signals(&ws, intent_core::WorkspaceAttention::None, None)
+            .await;
+        assert!(
+            !signals.blocked && !signals.needs_attention,
+            "deferred pending request must not promote mid-turn ({kind})"
+        );
+
+        // Turn end: the flush consumes the marker; the recompute now counts
+        // the (still-pending) request.
+        svc.set_test_busy(&agent, false);
+        svc.flush_deferred_attention(&agent, &ws).await;
+        let signals = svc
+            .workspace_attention_signals(&ws, intent_core::WorkspaceAttention::None, None)
+            .await;
+        assert_eq!(signals.blocked, blocked, "post-flush blocked ({kind})");
+        assert_eq!(
+            signals.needs_attention, needs_attention,
+            "post-flush needs_attention ({kind})"
+        );
+    }
+}
+
 /// `agent:failed` for a delegated child is enriched centrally (in
 /// `publish_agent_event`) with the child's `parentAgentId`, covering every
 /// terminal-failure emit site.
