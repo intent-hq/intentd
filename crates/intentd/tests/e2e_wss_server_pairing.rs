@@ -461,31 +461,6 @@ async fn server_rotate_token_over_wss_rejects() {
 }
 
 #[tokio::test]
-async fn system_import_legacy_over_wss_rejects() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
-        child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
-    };
-    let (port, fp) = boot(&data_dir).await;
-    let frame = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "system.importLegacy",
-        "params": { "force": false }
-    })
-    .to_string();
-    let response = wss_call(port, client_config(&fp), &frame).await;
-
-    assert_eq!(response["jsonrpc"], "2.0", "{response}");
-    assert_eq!(response["id"], 1, "{response}");
-    assert_eq!(response["error"]["code"], -32001, "{response}");
-    assert!(response["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("UDS only"));
-    daemon.child.kill().ok();
-}
-
-#[tokio::test]
 async fn system_git_credential_over_wss_rejects() {
     let data_dir = temp_data_dir();
     let mut daemon = Daemon {

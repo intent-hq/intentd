@@ -76,7 +76,6 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
