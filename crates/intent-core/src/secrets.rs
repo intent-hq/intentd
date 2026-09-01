@@ -1,10 +1,18 @@
-//! File-backed secret persistence (`~/intent/secrets.json`).
+//! File-backed secret persistence (`~/intent/.secrets.json`).
 //!
 //! [`FileSecretStore`] is the single shared backend for all intentd secrets:
 //! a flat JSON object mapping account name → secret string, stored by default
-//! at `~/intent/secrets.json` (resolved from `HOME`, falling back to
+//! at `~/intent/.secrets.json` (resolved from `HOME`, falling back to
 //! `USERPROFILE` on Windows) and overridable via the
 //! [`INTENTD_SECRETS_FILE`](SECRETS_FILE_ENV) environment variable.
+//!
+//! **Legacy migration.** The default file used to be the non-dotted
+//! `~/intent/secrets.json`. [`FileSecretStore::new`] migrates it once: when
+//! the store targets the default path, `.secrets.json` does not exist, and
+//! the legacy file does, the legacy file is renamed in place. When both
+//! exist, `.secrets.json` wins and the legacy file is left untouched (a
+//! warning is logged). Stores built via [`FileSecretStore::with_path`] or an
+//! [`INTENTD_SECRETS_FILE`](SECRETS_FILE_ENV) override never migrate.
 //!
 //! Semantics mirror the `SecretStore` trait in `intent-services` (which this
 //! leaf crate must not depend on): `load` returns `None` for unset **or
@@ -35,15 +43,61 @@ use crate::error::{Error, Result};
 /// Environment variable that overrides the default secrets-file path.
 pub(crate) const SECRETS_FILE_ENV: &str = "INTENTD_SECRETS_FILE";
 
+/// File name of the pre-dotfile default secrets file, migrated to
+/// `.secrets.json` by [`FileSecretStore::new`] (see the module docs).
+const LEGACY_SECRETS_FILE_NAME: &str = "secrets.json";
+
 /// Resolve the secrets-file path: [`SECRETS_FILE_ENV`] when set and non-empty,
-/// otherwise `~/intent/secrets.json` (`HOME`, falling back to `USERPROFILE`).
+/// otherwise `~/intent/.secrets.json` (`HOME`, falling back to `USERPROFILE`).
 pub(crate) fn default_secrets_path() -> PathBuf {
     if let Some(p) = std::env::var_os(SECRETS_FILE_ENV) {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
-    home_dir().join("intent").join("secrets.json")
+    home_dir().join("intent").join(".secrets.json")
+}
+
+/// Whether [`SECRETS_FILE_ENV`] is set and non-empty (i.e. the default path
+/// is overridden and legacy migration must not run).
+fn env_override_active() -> bool {
+    std::env::var_os(SECRETS_FILE_ENV).is_some_and(|p| !p.is_empty())
+}
+
+/// One-time migration of the legacy default secrets file: when `path` (the
+/// dotfile) does not exist but the sibling `secrets.json` does, rename the
+/// legacy file onto `path`. When both exist, `path` wins and the legacy file
+/// is left untouched (warning logged). Failures are non-fatal: a warning is
+/// logged and the store proceeds against `path` as-is.
+fn migrate_legacy_default(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let legacy = parent.join(LEGACY_SECRETS_FILE_NAME);
+    if !legacy.exists() {
+        return;
+    }
+    if path.exists() {
+        tracing::warn!(
+            legacy = %legacy.display(),
+            path = %path.display(),
+            "both legacy and dotfile secrets files exist; using the dotfile and leaving the legacy file untouched"
+        );
+        return;
+    }
+    match std::fs::rename(&legacy, path) {
+        Ok(()) => {
+            tracing::info!(from = %legacy.display(), to = %path.display(), "migrated legacy secrets file");
+        }
+        Err(e) => {
+            tracing::warn!(
+                from = %legacy.display(),
+                to = %path.display(),
+                error = %e,
+                "failed to migrate legacy secrets file; proceeding without it"
+            );
+        }
+    }
 }
 
 fn home_dir() -> PathBuf {
@@ -66,14 +120,20 @@ impl Default for FileSecretStore {
 }
 
 impl FileSecretStore {
-    /// Store backed by the default path ([`default_secrets_path`]).
+    /// Store backed by the default path ([`default_secrets_path`]), running
+    /// the one-time legacy `secrets.json` → `.secrets.json` migration when
+    /// the path is the true default (no env override; see the module docs).
     #[must_use]
     pub fn new() -> Self {
-        Self::with_path(default_secrets_path())
+        let path = default_secrets_path();
+        if !env_override_active() {
+            migrate_legacy_default(&path);
+        }
+        Self::with_path(path)
     }
 
     /// Store backed by an explicit path (tests use this so they never touch
-    /// the real `~/intent/secrets.json`).
+    /// the real `~/intent/.secrets.json`). Never migrates the legacy file.
     pub fn with_path(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
@@ -179,7 +239,7 @@ impl FileSecretStore {
             .map_err(|e| Error::Internal(format!("failed to serialize secrets: {e}")))?;
 
         let tmp = parent.join(format!(
-            ".secrets.json.tmp-{}-{}",
+            ".secrets.tmp-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -463,7 +523,7 @@ mod tests {
     use super::*;
 
     /// Unique temp dir under the system temp dir, removed on drop; keeps every
-    /// test away from the real `~/intent/secrets.json`.
+    /// test away from the real `~/intent/.secrets.json`.
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -475,7 +535,7 @@ mod tests {
         }
 
         fn store(&self) -> FileSecretStore {
-            FileSecretStore::with_path(self.0.join("secrets.json"))
+            FileSecretStore::with_path(self.0.join(".secrets.json"))
         }
     }
 
@@ -565,7 +625,54 @@ mod tests {
         assert_eq!(resolved, override_path);
 
         let fallback = default_secrets_path();
-        assert!(fallback.ends_with(Path::new("intent").join("secrets.json")));
+        assert!(fallback.ends_with(Path::new("intent").join(".secrets.json")));
+    }
+
+    #[test]
+    fn migrate_renames_legacy_default_file() {
+        let tmp = TempDir::new();
+        let legacy = tmp.0.join(LEGACY_SECRETS_FILE_NAME);
+        let dotfile = tmp.0.join(".secrets.json");
+        std::fs::write(&legacy, r#"{"a":"legacy"}"#).unwrap();
+        migrate_legacy_default(&dotfile);
+        assert!(!legacy.exists(), "legacy file must be renamed away");
+        let store = FileSecretStore::with_path(&dotfile);
+        assert_eq!(store.load("a").unwrap(), Some("legacy".to_string()));
+    }
+
+    #[test]
+    fn migrate_is_noop_when_no_legacy_file() {
+        let tmp = TempDir::new();
+        let dotfile = tmp.0.join(".secrets.json");
+        migrate_legacy_default(&dotfile);
+        assert!(!dotfile.exists(), "migration must not create the dotfile");
+    }
+
+    #[test]
+    fn migrate_prefers_dotfile_when_both_exist() {
+        let tmp = TempDir::new();
+        let legacy = tmp.0.join(LEGACY_SECRETS_FILE_NAME);
+        let dotfile = tmp.0.join(".secrets.json");
+        std::fs::write(&legacy, r#"{"a":"legacy"}"#).unwrap();
+        std::fs::write(&dotfile, r#"{"a":"dotfile"}"#).unwrap();
+        migrate_legacy_default(&dotfile);
+        assert!(legacy.exists(), "legacy file must be left untouched");
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            r#"{"a":"legacy"}"#
+        );
+        let store = FileSecretStore::with_path(&dotfile);
+        assert_eq!(store.load("a").unwrap(), Some("dotfile".to_string()));
+    }
+
+    #[test]
+    fn with_path_never_migrates() {
+        let tmp = TempDir::new();
+        let legacy = tmp.0.join(LEGACY_SECRETS_FILE_NAME);
+        std::fs::write(&legacy, r#"{"a":"legacy"}"#).unwrap();
+        let store = FileSecretStore::with_path(tmp.0.join(".secrets.json"));
+        assert_eq!(store.load("a").unwrap(), None);
+        assert!(legacy.exists(), "explicit-path stores must not migrate");
     }
 
     #[cfg(unix)]

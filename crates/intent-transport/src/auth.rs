@@ -3,7 +3,7 @@
 //! Ports `src/main/websocket-auth.ts` and `isAllowedWebSocketApiOrigin`
 //! (`src/main/websocket-api-server.ts`). The bearer token is 32 random bytes
 //! hex-encoded (64 chars) and persisted in the shared file-backed secrets
-//! store ([`intent_core::FileSecretStore`], `~/intent/secrets.json`) under
+//! store ([`intent_core::FileSecretStore`], `~/intent/.secrets.json`) under
 //! account `server.auth.token` (sensitive — never logged, never returned in
 //! plaintext over the wire). [`validate_token`] is length-checked first then
 //! compared in constant time. The HTTP-upgrade wiring that *uses* these
@@ -60,7 +60,7 @@ pub trait TokenStore: Send + Sync {
 }
 
 /// File-backed [`TokenStore`] (the production default): delegates to the
-/// shared [`intent_core::FileSecretStore`] (`~/intent/secrets.json`) under
+/// shared [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`) under
 /// account `server.auth.token` — the same entry `settings.*` redacts.
 #[derive(Debug, Default, Clone)]
 pub struct FileTokenStore {

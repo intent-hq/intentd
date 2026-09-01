@@ -12,7 +12,7 @@
 //! Deliberately excluded from this schema:
 //! - **Secrets** (`mcp.servers`, `server.auth.token`, `sourceControl.github.
 //!   token`, `linear.token`, `accounts.sentry.token`) — they
-//!   live in `secrets.json` ([`crate::FileSecretStore`]) and must never
+//!   live in `.secrets.json` ([`crate::FileSecretStore`]) and must never
 //!   appear in `config.toml`.
 //! - **Machine-state blobs** (`workspace.changeHistory`,
 //!   `workspaceInitializer.state`, `hardwareConsole.state`, `repos.known`,
@@ -168,7 +168,7 @@ impl Default for GitSettings {
 }
 
 /// `[mcp]` — MCP server lifecycle knobs (`mcp.*`). The server catalog itself
-/// (`mcp.servers`) is a secret and lives in `secrets.json`.
+/// (`mcp.servers`) is a secret and lives in `.secrets.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct McpSettings {
@@ -341,7 +341,7 @@ impl std::fmt::Display for BindAddress {
 }
 
 /// `[server]` — transport/listener config (`server.*`). The bearer token
-/// (`server.auth.token`) is a secret and lives in `secrets.json`.
+/// (`server.auth.token`) is a secret and lives in `.secrets.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServerSettings {
@@ -445,7 +445,7 @@ impl Default for AuthSettings {
 }
 
 /// `[sourceControl]` — forge integration (`sourceControl.*`). The GitHub PAT
-/// (`sourceControl.github.token`) is a secret and lives in `secrets.json`.
+/// (`sourceControl.github.token`) is a secret and lives in `.secrets.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SourceControlSettings {
@@ -511,7 +511,7 @@ pub enum GithubTokenSource {
 }
 
 /// `[accounts]` — external account config (`accounts.*`). The Sentry API
-/// token (`accounts.sentry.token`) is a secret and lives in `secrets.json`.
+/// token (`accounts.sentry.token`) is a secret and lives in `.secrets.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AccountsSettings {
@@ -530,7 +530,7 @@ pub struct SentrySettings {
 
 /// `[voice]` — speech-to-text (`voice.*`). The provider API keys
 /// (`voice.elevenlabs.apiKey`, `voice.openai.apiKey`) are secrets and live in
-/// `secrets.json`.
+/// `.secrets.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct VoiceSettings {
@@ -556,7 +556,7 @@ pub enum VoiceProvider {
 }
 
 /// `[voice.openai]` — `OpenAI` speech-to-text tuning (`voice.openai.*`,
-/// non-secret; the API key is a secret in `secrets.json`).
+/// non-secret; the API key is a secret in `.secrets.json`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct VoiceOpenAiSettings {
@@ -1306,7 +1306,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret
 #
 # Strictly parsed: unknown keys, wrong types, and out-of-range values are
 # startup errors. Secrets (API tokens, MCP server configs) never live here --
-# they belong in secrets.json next to this file.
+# they belong in .secrets.json next to this file.
 
 [providers]
 # Active provider -- default agent provider.
@@ -1415,7 +1415,7 @@ enabled = false
 
 [server.auth]
 # Auth enabled -- require a bearer token on TCP. The bearer token itself is a
-# secret and lives in secrets.json.
+# secret and lives in .secrets.json.
 enabled = true
 
 [sourceControl]
@@ -1443,7 +1443,7 @@ exposeGitCredentialToChildren = true
 
 [voice]
 # Voice provider -- active speech-to-text provider: "elevenlabs" or "openai".
-# The API keys are secrets and live in secrets.json (voice.elevenlabs.apiKey /
+# The API keys are secrets and live in .secrets.json (voice.elevenlabs.apiKey /
 # voice.openai.apiKey).
 provider = "elevenlabs"
 # Voice language -- default transcription language hint (ISO-639-1 code)

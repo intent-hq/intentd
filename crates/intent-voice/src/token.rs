@@ -3,7 +3,7 @@
 //! Keys are resolved secrets-store-first, then environment:
 //!
 //! 1. File-backed secrets store ([`intent_core::FileSecretStore`],
-//!    `~/intent/secrets.json`) under the sensitive setting path as account
+//!    `~/intent/.secrets.json`) under the sensitive setting path as account
 //!    (`voice.elevenlabs.apiKey` / `voice.openai.apiKey`).
 //! 2. Environment fallback: `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`.
 //!

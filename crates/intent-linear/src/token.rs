@@ -3,7 +3,7 @@
 //! The key is resolved per `linear.tokenSource`:
 //!
 //! 1. `explicit` — stored in the file-backed secrets store
-//!    ([`intent_core::FileSecretStore`], `~/intent/secrets.json`) under
+//!    ([`intent_core::FileSecretStore`], `~/intent/.secrets.json`) under
 //!    account `linear.token` (never in plaintext config or logs).
 //! 2. `env` — `LINEAR_API_KEY`.
 //!

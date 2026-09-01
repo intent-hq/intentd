@@ -4,7 +4,7 @@
 //! resolved together as [`Credentials`]. Resolution honours `sentry.tokenSource`:
 //!
 //! 1. `explicit` — read the file-backed secrets store
-//!    ([`intent_core::FileSecretStore`], `~/intent/secrets.json`) under
+//!    ([`intent_core::FileSecretStore`], `~/intent/.secrets.json`) under
 //!    accounts `sentry.token` + `sentry.org`.
 //! 2. `env` — read `SENTRY_API_TOKEN` + `SENTRY_ORG`.
 //!
