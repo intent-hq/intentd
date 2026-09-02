@@ -8,7 +8,9 @@ use std::sync::Arc;
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
     now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, NoteCreate, NoteUpdateInput,
-    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource, WorkspaceId,
+    WorkspaceStatus,
 };
 use std::time::Duration;
 
@@ -35504,6 +35506,212 @@ async fn agent_snapshot_counts_pending_questions() {
     assert!(
         !v.as_object().unwrap().contains_key("numQuestionsAsked"),
         "dismissed questions must not count: {v}"
+    );
+}
+
+// ---- ws.agent.snapshot `prs` (tracked open PRs grouped by state) ----
+
+fn tracked_pr(
+    number: u64,
+    status: PullRequestStatus,
+    mergeable: Option<bool>,
+    mergeable_state: Option<&str>,
+    is_draft: Option<bool>,
+) -> PullRequestInfo {
+    let ts = now_iso();
+    PullRequestInfo {
+        id: format!("PR_{number}"),
+        number,
+        url: format!("https://github.com/o/r/pull/{number}"),
+        title: format!("pr {number}"),
+        status,
+        created_at: ts.clone(),
+        updated_at: ts,
+        base_ref: None,
+        head_ref: None,
+        head_sha: None,
+        author: None,
+        mergeable,
+        mergeable_state: mergeable_state.map(str::to_string),
+        is_draft,
+    }
+}
+
+fn tracked_git_root(
+    ws: &WorkspaceId,
+    path: &str,
+    owner: Option<&str>,
+    name: Option<&str>,
+    prs: Vec<PullRequestInfo>,
+) -> WorkspaceGitRoot {
+    let ts = now_iso();
+    WorkspaceGitRoot {
+        id: WorkspaceGitRootId::new(),
+        workspace_id: ws.clone(),
+        path: path.to_string(),
+        source: WorkspaceGitRootSource::Agent,
+        repo_owner: owner.map(str::to_string),
+        repo_name: name.map(str::to_string),
+        registered_by_agent_ids: vec![],
+        registered_commit_sha: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        pull_requests: Some(prs),
+        created_at: ts.clone(),
+        updated_at: ts,
+    }
+}
+
+/// Workspace-pool PRs group `draft` > `blocked` > `mergeable` > `unknown`
+/// from persisted fields only, merged/closed PRs never appear, and a
+/// non-empty `prs` alone makes an otherwise-trivial snapshot inject.
+#[tokio::test]
+async fn agent_snapshot_groups_tracked_open_prs_and_forces_injection() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Watcher").await;
+
+    let mut row = svc.store().get_workspace(&ws).await.expect("workspace");
+    row.repository_owner = Some("o".into());
+    row.repository_name = Some("r".into());
+    row.pull_requests = Some(vec![
+        // Draft wins over a clean mergeable_state.
+        tracked_pr(
+            1,
+            PullRequestStatus::Open,
+            Some(true),
+            Some("clean"),
+            Some(true),
+        ),
+        tracked_pr(2, PullRequestStatus::Draft, None, None, None),
+        // A blocked-family mergeable_state wins over mergeable=true.
+        tracked_pr(3, PullRequestStatus::Open, Some(true), Some("dirty"), None),
+        tracked_pr(4, PullRequestStatus::Open, Some(false), None, None),
+        tracked_pr(5, PullRequestStatus::Open, Some(true), None, None),
+        tracked_pr(6, PullRequestStatus::Open, None, Some("unstable"), None),
+        tracked_pr(7, PullRequestStatus::Open, None, None, None),
+        tracked_pr(8, PullRequestStatus::Merged, None, None, None),
+        tracked_pr(9, PullRequestStatus::Closed, None, None, None),
+    ]);
+    svc.store().update_workspace(&row).await.expect("update ws");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["prs"],
+        json!({
+            "draft": ["o/r#1", "o/r#2"],
+            "blocked": ["o/r#3", "o/r#4"],
+            "mergeable": ["o/r#5", "o/r#6"],
+            "unknown": ["o/r#7"],
+        }),
+        "grouped open PRs: {v}"
+    );
+
+    let line = svc
+        .agent_state_snapshot_line(&agent)
+        .await
+        .expect("open tracked PRs alone force the injection line");
+    assert!(line.contains("\"prs\":{"), "prs rides the line: {line}");
+}
+
+/// Root pools merge behind the workspace pool: a `(repo, number)` duplicate
+/// defers to the workspace's entry (here merged, so the PR is excluded
+/// entirely), a distinct repo contributes its own labels, and a root
+/// without `repo_owner`/`repo_name` is skipped.
+#[tokio::test]
+async fn agent_snapshot_prs_dedups_by_repo_number_with_workspace_priority() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Watcher").await;
+
+    let mut row = svc.store().get_workspace(&ws).await.expect("workspace");
+    row.repository_owner = Some("o".into());
+    row.repository_name = Some("r".into());
+    row.pull_requests = Some(vec![tracked_pr(
+        1,
+        PullRequestStatus::Merged,
+        None,
+        None,
+        None,
+    )]);
+    svc.store().update_workspace(&row).await.expect("update ws");
+
+    for root in [
+        tracked_git_root(
+            &ws,
+            "/roots/same-repo",
+            Some("o"),
+            Some("r"),
+            vec![
+                tracked_pr(1, PullRequestStatus::Open, Some(true), Some("clean"), None),
+                tracked_pr(2, PullRequestStatus::Open, Some(true), Some("clean"), None),
+            ],
+        ),
+        tracked_git_root(
+            &ws,
+            "/roots/other-repo",
+            Some("o2"),
+            Some("r2"),
+            vec![tracked_pr(1, PullRequestStatus::Open, None, None, None)],
+        ),
+        tracked_git_root(
+            &ws,
+            "/roots/no-identity",
+            None,
+            None,
+            vec![tracked_pr(3, PullRequestStatus::Open, None, None, None)],
+        ),
+    ] {
+        svc.store()
+            .upsert_workspace_git_root(&root)
+            .await
+            .expect("upsert root");
+    }
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["prs"],
+        json!({
+            "mergeable": ["o/r#2"],
+            "unknown": ["o2/r2#1"],
+        }),
+        "workspace pool wins the (repo, number) dedup and identity-less roots are skipped: {v}"
+    );
+}
+
+/// A workspace whose tracked PRs are all merged/closed omits `prs` entirely
+/// and stays trivial — no injection line fires.
+#[tokio::test]
+async fn agent_snapshot_omits_prs_when_no_open_tracked_pr() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Watcher").await;
+
+    let mut row = svc.store().get_workspace(&ws).await.expect("workspace");
+    row.repository_owner = Some("o".into());
+    row.repository_name = Some("r".into());
+    row.pull_requests = Some(vec![
+        tracked_pr(1, PullRequestStatus::Merged, None, None, None),
+        tracked_pr(2, PullRequestStatus::Closed, None, None, None),
+    ]);
+    svc.store().update_workspace(&row).await.expect("update ws");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("prs"),
+        "merged/closed-only pools omit prs: {v}"
+    );
+    assert_eq!(
+        svc.agent_state_snapshot_line(&agent).await,
+        None,
+        "no open tracked PR keeps the snapshot trivial"
     );
 }
 

@@ -2047,6 +2047,12 @@ fn golden_snapshot_full_field_serialization() {
             "intent-hq/intentd#7".to_string(),
             "intent-hq/monorepo#8 (changes pending)".to_string(),
         ],
+        prs: Some(crate::agent_ops::AgentSnapshotPrs {
+            draft: vec!["o/r#1".to_string()],
+            blocked: vec!["o/r#2".to_string()],
+            mergeable: vec!["o/r#3".to_string()],
+            unknown: vec!["o/r#4".to_string()],
+        }),
         pending_attention: Some("blocker".to_string()),
     };
     assert_eq!(
@@ -2055,6 +2061,9 @@ fn golden_snapshot_full_field_serialization() {
          \"queuedMessages\":3,\"eventSubscriptions\":4,\"activeSubAgents\":5,\
          \"unsettledSubAgents\":6,\"runningSubAgents\":6,\"numQuestionsAsked\":7,\
          \"prMonitors\":[\"intent-hq/intentd#7\",\
-         \"intent-hq/monorepo#8 (changes pending)\"],\"pendingAttention\":\"blocker\"}"
+         \"intent-hq/monorepo#8 (changes pending)\"],\
+         \"prs\":{\"draft\":[\"o/r#1\"],\"blocked\":[\"o/r#2\"],\
+         \"mergeable\":[\"o/r#3\"],\"unknown\":[\"o/r#4\"]},\
+         \"pendingAttention\":\"blocker\"}"
     );
 }
