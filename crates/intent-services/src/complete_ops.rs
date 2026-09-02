@@ -68,8 +68,10 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
 /// dropped only when the effective provider's own cached catalog affirmatively
 /// disproves ownership, so a cold start still passes it through.
 ///
-/// Every drop falls to the next rung rather than erroring: a `-32602` here
-/// would reject a model the caller never sent.
+/// Every drop is PER RUNG and falls to the next one rather than erroring or
+/// skipping the chain: a dropped type override still tries
+/// `quickActions.defaultModel`, and only when every rung drops does the CLI
+/// default apply — a `-32602` here would reject a model the caller never sent.
 ///
 /// This chain is scoped to one-shot quick actions only — agent sessions,
 /// delegated ones included, keep the background-agnostic creation-time chain
@@ -81,43 +83,45 @@ fn resolve_quick_action_model(
     effective_provider: &str,
 ) -> Option<String> {
     let quick = &settings.quick_actions;
-    let configured = quick_action_type
+    let vet = |configured: &str| -> Option<String> {
+        let owned_bare = if configured.contains(':') {
+            None
+        } else {
+            crate::agent_ops::ensure_bare_model_matches_provider(
+                "agent.completeOnce",
+                catalog,
+                effective_provider,
+                configured,
+            )
+            .ok()
+            .map(|()| configured.to_string())
+        };
+        if owned_bare.is_none() {
+            tracing::warn!(
+                model = configured,
+                provider = effective_provider,
+                "configured quick-action model does not belong to the effective \
+                 provider; falling back to the next rung"
+            );
+        }
+        owned_bare
+    };
+    quick_action_type
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .and_then(|t| quick.type_overrides.get(t))
         .map(String::as_str)
         .map(str::trim)
         .filter(|m| !m.is_empty())
+        .and_then(vet)
         .or_else(|| {
             quick
                 .default_model
                 .as_deref()
                 .map(str::trim)
                 .filter(|m| !m.is_empty())
-        })?;
-
-    let owned_bare = if configured.contains(':') {
-        None
-    } else {
-        crate::agent_ops::ensure_bare_model_matches_provider(
-            "agent.completeOnce",
-            catalog,
-            effective_provider,
-            configured,
-        )
-        .ok()
-        .map(|()| configured.to_string())
-    };
-
-    if owned_bare.is_none() {
-        tracing::warn!(
-            model = configured,
-            provider = effective_provider,
-            "configured quick-action model does not belong to the effective \
-             provider; falling back to the CLI default"
-        );
-    }
-    owned_bare
+                .and_then(vet)
+        })
 }
 
 /// Pick the one-shot launch for `provider`, mirroring the model probe's
@@ -990,6 +994,27 @@ rl.on('line', (line) => {
                 "{legacy} must fall through to the CLI default"
             );
         }
+    }
+
+    #[test]
+    fn quick_action_dropped_override_falls_to_default_model() {
+        // A drop is per rung: a legacy compound type override still falls
+        // through to a valid quickActions.defaultModel — the documented
+        // override → default → CLI-default chain — rather than skipping
+        // straight to the CLI default.
+        let catalog = empty_catalog();
+        let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "auggie:haiku")]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
+            Some("sonnet4.5".to_string()),
+            "a dropped override must fall to the default-model rung"
+        );
+        // Both rungs compound ⇒ CLI default.
+        let settings = quick_action_settings(Some("codex:gpt-5"), &[("commit", "auggie:haiku")]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
+            None
+        );
     }
 
     #[test]

@@ -1098,7 +1098,9 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// is unset or fails validation — no provider carries a hardcoded default
 /// designation, and there is no positional last resort (monorepo#3044):
 /// resolution that falls through entirely fails loudly at the caller.
-/// The deprecated `providers.active` is deliberately NOT consulted.
+/// The deprecated `providers.active` is deliberately NOT consulted — the
+/// boot migration ([`crate::settings::migrate_active_provider_setting`])
+/// carries a legacy value into `model.defaultProvider` once at startup.
 pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {

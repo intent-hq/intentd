@@ -32863,6 +32863,43 @@ mod default_provider_self_heal {
         );
     }
 
+    /// PR #1648 review: a nonblank-but-unregistered `model.defaultProvider`
+    /// (e.g. a typo) with `model.default` unset must not have the heal
+    /// persist the DISCOVERED provider's catalog model — that provider is
+    /// not going to be the effective one, and the stale model would survive
+    /// the user's eventual correction. The model rung runs only when the
+    /// provider key is healed in the same sweep.
+    #[tokio::test]
+    async fn typo_provider_with_unset_model_heals_nothing() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("model.defaultProvider".into(), serde_json::json!("typo"))])
+            .expect("seed typo provider");
+        svc.models_catalog.store_for_test(
+            "auggie",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
+            vec![serde_json::json!({ "id": "sonnet5", "isDefault": true })],
+        );
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], false, "{result}");
+        assert_eq!(result["reason"], "values-already-set", "{result}");
+        assert_eq!(
+            setting(&svc, "model.defaultProvider"),
+            Some(serde_json::json!("typo")),
+            "no-overwrite rule keeps the raw provider value"
+        );
+        assert_eq!(
+            setting(&svc, "model.default"),
+            None,
+            "the discovered provider's model must not be persisted"
+        );
+    }
+
     /// The first INSTALLED provider wins in the order discovery reported,
     /// skipping ids the registry doesn't know.
     #[tokio::test]

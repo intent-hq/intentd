@@ -151,9 +151,9 @@ pub use config_watcher::ConfigWatcher;
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
-    max_concurrent_adapters, max_concurrent_agents, migrate_default_vocabulary,
-    migrate_quick_action_settings, report_to_parent_debounce_seconds, InMemorySecretStore,
-    SecretStore,
+    max_concurrent_adapters, max_concurrent_agents, migrate_active_provider_setting,
+    migrate_default_vocabulary, migrate_quick_action_settings, report_to_parent_debounce_seconds,
+    InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
@@ -13002,10 +13002,19 @@ impl Services {
     /// that model as a bare `model.default`. Per-key no-overwrite guard: a
     /// key with ANY existing raw value (even an unregistered one) is never
     /// written; with a derivable default the whole heal is a no-op, making
-    /// it idempotent across restarts and repeated discovery calls. Writes go
+    /// it idempotent across restarts and repeated discovery calls. The model
+    /// rung additionally runs only when the provider key is healed in the
+    /// same sweep — an unset `model.default` behind a nonblank-but-
+    /// unregistered `model.defaultProvider` stays unset rather than taking
+    /// the discovered provider's model while that provider is not the
+    /// effective one. Writes go
     /// through the same `settings.update` path clients use, so
     /// `settings:changed` is emitted and every store/hook rule applies. The
     /// model rung is cache-only ([`ModelCatalogCache`]) — never a probe.
+    ///
+    /// Legacy `providers.active` needs no rung here: the boot migration
+    /// ([`settings::migrate_active_provider_setting`]) carries it into
+    /// `model.defaultProvider` before discovery ever runs this heal.
     ///
     /// # Errors
     ///
@@ -13027,20 +13036,27 @@ impl Services {
             return Ok(serde_json::json!({ "healed": false, "reason": "no-installed-provider" }));
         };
         let mut changes = Vec::new();
-        if settings
+        let provider_key_healed = settings
             .model
             .default_provider
             .as_deref()
-            .is_none_or(|v| v.trim().is_empty())
-        {
+            .is_none_or(|v| v.trim().is_empty());
+        if provider_key_healed {
             changes.push(serde_json::json!({ "path": "model.defaultProvider", "value": provider }));
         }
         let mut healed_model = None;
-        if settings
-            .model
-            .default
-            .as_deref()
-            .is_none_or(|v| v.trim().is_empty())
+        // The model rung only runs when THIS heal is also setting the
+        // provider key: with a nonblank-but-unregistered
+        // `model.defaultProvider` (e.g. a typo) the discovered provider is
+        // not going to be the effective one, so persisting its catalog model
+        // would strand a foreign `model.default` behind the user's
+        // eventual correction.
+        if provider_key_healed
+            && settings
+                .model
+                .default
+                .as_deref()
+                .is_none_or(|v| v.trim().is_empty())
         {
             if let Some(m) = self.models_catalog.cached_default_or_first_model(provider) {
                 // Legacy catalog row ids may be compound (`provider:model`);
@@ -13060,8 +13076,10 @@ impl Services {
             }
         }
         if changes.is_empty() {
-            // Both keys hold raw values that just don't resolve to a
-            // registered provider — never overwrite them (no-overwrite rule).
+            // The provider key holds a raw value that just doesn't resolve
+            // to a registered provider — never overwrite it (no-overwrite
+            // rule), and never persist a model for a provider that isn't
+            // going to be the effective one.
             return Ok(serde_json::json!({ "healed": false, "reason": "values-already-set" }));
         }
         self.settings_update(serde_json::Value::Array(changes))
