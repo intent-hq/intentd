@@ -56,6 +56,7 @@ pub(crate) const PRELUDE: &str = r"
             const args = o !== null && typeof o === 'object' ? { ...o } : { includeCompleted: o };
             return host({ method: 'agent.list', args });
         },
+        listSpecialists: () => host({ method: 'agent.listSpecialists', args: {} }),
         status: (agentId) => host({ method: 'agent.status', args: { agentId } }),
         getQueue: (agentId) => host({ method: 'agent.getQueue', args: { agentId } }),
         removeQueuedMessage: (agentId, messageId) =>
@@ -131,6 +132,7 @@ pub(crate) async fn dispatch(
         "watch" => watch(api, ws, caller, args).await,
         "unwatch" => unwatch(api, ws, caller, args).await,
         "list" => list(api, ws, args).await,
+        "listSpecialists" => list_specialists(api, ws).await,
         "status" => status(api, ws, args).await,
         "getQueue" => get_queue(api, ws, args).await,
         "removeQueuedMessage" => remove_queued_message(api, ws, caller, args).await,
@@ -921,6 +923,99 @@ async fn list(
         .filter(|r| filter.retains(r.status, r.parent_agent_id.as_ref().map(AgentId::as_str)))
         .collect();
     serde_json::to_value(rows).map_err(|e| e.to_string())
+}
+
+/// `ws.agent.listSpecialists`: the current specialist catalog projected to a
+/// compact dispatch-oriented shape — prompt bodies are deliberately dropped
+/// (the purpose is model/specialist selection, not prompt inspection). The
+/// loader runs at call time with the workspace's path so the project tier
+/// (`.intent/specialists/`) applies. The dispatch variant of the list
+/// resolves the `resolvedProvider`/`resolvedModel` preview per-specialist —
+/// each row against the provider a no-`model` delegate of that specialist
+/// would actually spawn on (its own pin first, else the settings default) —
+/// matching the session-start specialist hints.
+async fn list_specialists(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
+    // Best-effort workspace path: a workspace without a checkout (e.g. chief)
+    // simply gets no project tier.
+    let workspace_path = api
+        .get_workspace(ws.clone())
+        .await
+        .ok()
+        .and_then(|w| w.effective_path().map(String::from));
+    let result = api
+        .specialist_list_dispatch(workspace_path)
+        .await
+        .map_err(map_err)?;
+    let specialists = result
+        .get("specialists")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "specialist.list returned invalid shape".to_string())?;
+    Ok(Value::Array(
+        specialists.iter().map(project_specialist_row).collect(),
+    ))
+}
+
+/// Project one resolved `SpecialistDef` into the compact
+/// `ws.agent.listSpecialists` row: `{ id, name, description, hidden?,
+/// aliases?, defaultModel?, modelOptions }`. `defaultModel` pairs the
+/// loader's `resolvedProvider`/`resolvedModel` preview fields (what a
+/// no-`model` delegate would pin) and is omitted when the loader omitted
+/// them — resolution yielding the provider CLI default. `modelOptions`
+/// entries keep the loader's normalized `{ model, hint, reasoningEffort? }`
+/// shape, dropping an empty `hint`.
+fn project_specialist_row(def: &Value) -> Value {
+    let mut row = serde_json::Map::new();
+    for key in ["id", "name", "description"] {
+        row.insert(
+            key.to_string(),
+            def.get(key)
+                .cloned()
+                .unwrap_or(Value::String(String::new())),
+        );
+    }
+    if def.get("hidden").and_then(Value::as_bool) == Some(true) {
+        row.insert("hidden".to_string(), json!(true));
+    }
+    if let Some(aliases) = def.get("aliases").and_then(Value::as_array) {
+        if !aliases.is_empty() {
+            row.insert("aliases".to_string(), Value::Array(aliases.clone()));
+        }
+    }
+    if let (Some(provider), Some(model)) = (
+        def.get("resolvedProvider").and_then(Value::as_str),
+        def.get("resolvedModel").and_then(Value::as_str),
+    ) {
+        row.insert(
+            "defaultModel".to_string(),
+            json!({ "provider": provider, "model": model }),
+        );
+    }
+    let options: Vec<Value> = def
+        .get("modelOptions")
+        .and_then(Value::as_array)
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|opt| {
+                    let model = opt.get("model").and_then(Value::as_str)?;
+                    let mut out = serde_json::Map::new();
+                    out.insert("model".to_string(), json!(model));
+                    if let Some(hint) = opt
+                        .get("hint")
+                        .and_then(Value::as_str)
+                        .filter(|h| !h.is_empty())
+                    {
+                        out.insert("hint".to_string(), json!(hint));
+                    }
+                    if let Some(effort) = opt.get("reasoningEffort").and_then(Value::as_str) {
+                        out.insert("reasoningEffort".to_string(), json!(effort));
+                    }
+                    Some(Value::Object(out))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    row.insert("modelOptions".to_string(), Value::Array(options));
+    Value::Object(row)
 }
 
 /// Soft-retire inertness on the agent-facing read surface: resolve the
@@ -1917,5 +2012,180 @@ mod tests {
             })),
             None
         );
+    }
+
+    mod list_specialists {
+        use super::super::*;
+        use intent_core::{
+            BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+
+        /// `WorkspaceApi` fake: `get_workspace` serves a row with a worktree
+        /// path (so the binding forwards it as the project-tier root) and
+        /// `specialist_list_dispatch` records the received path and returns
+        /// resolved defs in the wire `SpecialistDef` shape — prompt bodies
+        /// included, so the projection's dropping of them is actually
+        /// exercised.
+        struct FakeApi {
+            received_path: std::sync::Mutex<Option<String>>,
+        }
+
+        impl WorkspaceApi for FakeApi {
+            fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+                Box::pin(async move {
+                    Ok(Workspace {
+                        id,
+                        title: "Agent".to_string(),
+                        branch: "main".to_string(),
+                        base_ref: None,
+                        base_commit_sha: None,
+                        status: WorkspaceStatus::Active,
+                        status_message: None,
+                        status_image_asset_id: None,
+                        activity: WorkspaceActivity::Idle,
+                        attention: WorkspaceAttention::None,
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        updated_at: "2026-01-01T00:00:00Z".to_string(),
+                        last_activity: None,
+                        tags: vec![],
+                        path: None,
+                        repository_path: None,
+                        repository_owner: None,
+                        repository_name: None,
+                        worktree_path: Some("/tmp/ws-root".to_string()),
+                        scope: None,
+                        skip_worktree: false,
+                        setup_script: None,
+                        is_remote: false,
+                        default_model: None,
+                        pr_number: None,
+                        pr_url: None,
+                        pr_status: None,
+                        active_pull_request: None,
+                        pull_requests: None,
+                        context_links: None,
+                        archived: false,
+                        archived_at: None,
+                        task_stats: None,
+                        agent_summary: None,
+                        diff_summary: None,
+                        token_usage: None,
+                        cow_supported: None,
+                        display_status: None,
+                        waiting: false,
+                        checkout_mode: None,
+                        disk_usage: None,
+                        pending_delete_at: None,
+                    })
+                })
+            }
+
+            fn specialist_list_dispatch(
+                &self,
+                workspace_path: Option<String>,
+            ) -> BoxFuture<'_, Result<Value>> {
+                *self.received_path.lock().unwrap() = workspace_path;
+                Box::pin(async move {
+                    Ok(json!({
+                        "specialists": [
+                            {
+                                "id": "implementor",
+                                "name": "Implementor",
+                                "description": "Implements tasks",
+                                "prompt": "You are an implementor",
+                                "behaviorPrompt": "You are an implementor",
+                                "source": "bundled",
+                                "isCustomized": false,
+                                "aliases": ["builder"],
+                                "resolvedProvider": "claude",
+                                "resolvedModel": "sonnet-4.5",
+                                "modelOptions": [
+                                    { "model": "opencode:kimi-k3", "hint": "cheap" },
+                                    { "model": "claude:opus", "hint": "", "reasoningEffort": "high" }
+                                ]
+                            },
+                            {
+                                "id": "scout",
+                                "name": "Scout",
+                                "description": "Recon",
+                                "prompt": "You scout",
+                                "behaviorPrompt": "You scout",
+                                "source": "bundled",
+                                "isCustomized": false,
+                                "hidden": true
+                            }
+                        ]
+                    }))
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn projects_compact_rows_without_prompt_bodies() {
+            let fake = Arc::new(FakeApi {
+                received_path: std::sync::Mutex::new(None),
+            });
+            let api: Arc<dyn WorkspaceApi> = fake.clone();
+            let ws = WorkspaceId::from_string("ws-1");
+            let out = dispatch(&api, &ws, None, "listSpecialists", &json!({}))
+                .await
+                .unwrap();
+            // The workspace's effective path reached the loader (project tier).
+            assert_eq!(
+                *fake.received_path.lock().unwrap(),
+                Some("/tmp/ws-root".to_string())
+            );
+            let rows = out.as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+
+            let imp = &rows[0];
+            assert_eq!(imp["id"], json!("implementor"));
+            assert_eq!(imp["name"], json!("Implementor"));
+            assert_eq!(imp["description"], json!("Implements tasks"));
+            assert_eq!(
+                imp["defaultModel"],
+                json!({ "provider": "claude", "model": "sonnet-4.5" })
+            );
+            assert_eq!(imp["aliases"], json!(["builder"]));
+            assert_eq!(
+                imp["modelOptions"],
+                json!([
+                    { "model": "opencode:kimi-k3", "hint": "cheap" },
+                    { "model": "claude:opus", "reasoningEffort": "high" }
+                ])
+            );
+            // Prompt bodies and loader internals never reach the row.
+            for key in [
+                "prompt",
+                "behaviorPrompt",
+                "source",
+                "isCustomized",
+                "resolvedProvider",
+                "resolvedModel",
+                "hidden",
+            ] {
+                assert!(imp.get(key).is_none(), "{key} must be omitted");
+            }
+
+            let scout = &rows[1];
+            assert_eq!(scout["hidden"], json!(true));
+            // No resolved preview fields → defaultModel omitted; no
+            // modelOptions → empty array; no aliases → omitted.
+            assert!(scout.get("defaultModel").is_none());
+            assert!(scout.get("aliases").is_none());
+            assert_eq!(scout["modelOptions"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn unknown_method_is_rejected() {
+            let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi {
+                received_path: std::sync::Mutex::new(None),
+            });
+            let ws = WorkspaceId::from_string("ws-1");
+            let err = dispatch(&api, &ws, None, "listSpecialistsX", &json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(err, "host: unknown method `agent.listSpecialistsX`");
+        }
     }
 }

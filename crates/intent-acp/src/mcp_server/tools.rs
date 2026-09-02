@@ -229,6 +229,8 @@ API:
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: false`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that CONSUMES the one-shot watch: re-arm `ws.agent.watch` if you still want its genuine completion — the re-armed watch stays silent through further monitoring idles in the SAME waiting period and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
+  ws.agent.listSpecialists() → [specialists]  // Specialist catalog with model dispatch hints; prompt bodies omitted. The live counterpart to the session-start specialist hints; each row is `{ id, name, description, hidden?, aliases?, defaultModel?, modelOptions }`.
+    `defaultModel` is `{ provider, model }` (what a no-`model` delegate would pin; omitted when resolution yields the provider default); `modelOptions` is `[{ model, hint?, reasoningEffort? }]`.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars).
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries. Check it for an entry with your `fromAgentId` before sending again — the single-pending-message rule on `ws.agent.send` refuses a second send while one is pending.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected. This is the remediation when `ws.agent.send` / `ws.agent.sendToTask` refuse a second send under the single-pending-message rule: remove the pending entry, then re-send ONE combined message.
@@ -475,6 +477,8 @@ API:
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: false`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that CONSUMES the one-shot watch: re-arm `ws.agent.watch` if you still want its genuine completion — the re-armed watch stays silent through further monitoring idles in the SAME waiting period and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
+  ws.agent.listSpecialists() → [specialists]  // Specialist catalog with model dispatch hints; prompt bodies omitted. The live counterpart to the session-start specialist hints; each row is `{ id, name, description, hidden?, aliases?, defaultModel?, modelOptions }`.
+    `defaultModel` is `{ provider, model }` (what a no-`model` delegate would pin; omitted when resolution yields the provider default); `modelOptions` is `[{ model, hint?, reasoningEffort? }]`.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
   ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
@@ -1675,6 +1679,24 @@ mod tests {
         }
     }
 
+    // `ws.agent.listSpecialists` is un-gated (all workspaces, all agents):
+    // both static variants advertise it and `ws.help("agent")` serves the
+    // line for chief and non-chief bridges alike.
+    #[test]
+    fn list_specialists_is_documented_in_both_variants_and_help() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert!(desc.contains("ws.agent.listSpecialists()"));
+        }
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let help = help_namespace(is_chief, &features, false, "agent").unwrap();
+            assert!(
+                help.contains("ws.agent.listSpecialists()"),
+                "ws.help(\"agent\") (is_chief={is_chief}) must include listSpecialists"
+            );
+        }
+    }
+
     // The compact description is a pure derivation of the full assembly: the
     // text before the index header is byte-identical, the index entries are
     // byte-identical, only the header line differs (it points at the system
@@ -1943,15 +1965,15 @@ mod tests {
     }
 
     // Size budget for the system-prompt copy: the all-defaults non-chief
-    // rendering (the common case for truncating providers) stays under 21k
+    // rendering (the common case for truncating providers) stays under 21.5k
     // chars — roughly half the ~40k full text.
     #[test]
     fn condensed_description_size_budget() {
         let condensed =
             condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
         assert!(
-            condensed.len() < 21_000,
-            "condensed all-on description is {} bytes, over the 21k budget",
+            condensed.len() < 21_500,
+            "condensed all-on description is {} bytes, over the 21.5k budget",
             condensed.len()
         );
     }

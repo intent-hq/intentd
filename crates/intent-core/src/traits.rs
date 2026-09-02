@@ -4826,6 +4826,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.listSpecialists` (the `ws.agent.listSpecialists` MCP binding):
+    /// the same resolved catalog as [`Self::specialist_list`], but the
+    /// `resolvedModel`/`resolvedProvider` preview fields are computed
+    /// per-specialist — each row against the provider a no-`model`
+    /// `agent.delegate` of that specialist would actually spawn on (its own
+    /// frontmatter `codingAgent`/compound-`model` pin first, else the
+    /// settings-derived default) — instead of one shared caller/settings
+    /// provider context. Matches the session-start specialist hints.
+    fn specialist_list_dispatch(
+        &self,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_list_dispatch not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `specialist.get` → `{ specialist: SpecialistDef }`, the resolved view;
     /// unknown id → `-32602` (PROTOCOL §5.11). An optional `provider` supplies
     /// the resolution context for the additive `resolvedModel`/
