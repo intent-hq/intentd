@@ -3643,15 +3643,28 @@ impl Services {
         } else {
             None
         };
-        let (mut resolved_model, mut model_source) = match model {
-            // Step 1: explicit model from the client (user picked it).
-            Some(m) => (Some(m), DefaultModelSource::Explicit),
-            None => resolve_agent_default_model_with_source(
-                self,
-                specialist.as_deref(),
-                spec_wp.as_deref(),
-                provider.as_deref(),
-            ),
+        // Step 1: explicit model from the client (user picked it); otherwise
+        // default-model resolution walks the specialist tier directories —
+        // blocking pool (monorepo#4148).
+        let (mut resolved_model, mut model_source) = if let Some(m) = model {
+            (Some(m), DefaultModelSource::Explicit)
+        } else {
+            let services = self.clone();
+            let specialist = specialist.clone();
+            let spec_wp = spec_wp.clone();
+            let provider = provider.clone();
+            tokio::task::spawn_blocking(move || {
+                resolve_agent_default_model_with_source(
+                    &services,
+                    specialist.as_deref(),
+                    spec_wp.as_deref(),
+                    provider.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("agent.create model resolution task failed: {e}"))
+            })?
         };
 
         // Validate the explicit provider before persisting anything: an
@@ -3753,13 +3766,25 @@ impl Services {
         let reasoning_effort = if reasoning_effort_decided {
             reasoning_effort
         } else {
-            resolve_delegate_reasoning_effort(
-                self,
-                None,
-                specialist.as_deref(),
-                resolved_model.as_deref(),
-                spec_wp.as_deref(),
-            )
+            // Effort resolution re-reads specialist frontmatter — blocking
+            // pool (monorepo#4148).
+            let services = self.clone();
+            let specialist = specialist.clone();
+            let resolved_model = resolved_model.clone();
+            let spec_wp = spec_wp.clone();
+            tokio::task::spawn_blocking(move || {
+                resolve_delegate_reasoning_effort(
+                    &services,
+                    None,
+                    specialist.as_deref(),
+                    resolved_model.as_deref(),
+                    spec_wp.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("agent.create effort resolution task failed: {e}"))
+            })?
         };
         // Validate the requested level (PROTOCOL §5.5) against the *resolved*
         // model's cached `effortLevels`, with the same probe-free,
@@ -8191,47 +8216,69 @@ impl Services {
         // resolution failure (or only fail inside `agent_create_op` after the
         // resolution rungs silently skipped the specialist tiers). Runs
         // before any side effect, so a rejection leaves no orphaned child.
-        if let Some(spec_id) = input.specialist.as_deref() {
-            self.specialists_service()
-                .canonical_id_or_err(spec_id, workspace_path.as_deref())?;
-        }
-        let delegate_provider = if let Some(provider_param) = input.provider.as_deref() {
-            ensure_known_provider("agent.delegate", provider_param)?;
-            ensure_provider_available(
-                "agent.delegate",
-                provider_param,
-                &self.effective_settings().providers,
-            )?;
-            Some(provider_param.to_string())
-        } else if input.model.is_none() {
-            resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
-        } else {
-            None
-        };
-        // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
-        // effort > specialist frontmatter > unset, validated against the
-        // cached catalog's `effortLevels` for the effective model. The
-        // effective model must be the one `agent_create_op` will actually
-        // pin — the explicit `model`, else the full default-model resolution
-        // (specialist frontmatter pin, then the settings chain) — so a
-        // specialist whose `modelOptions` entry keys on the settings default
-        // model still gets its option effort selected. Runs BEFORE the child
-        // is created so a `-32602` rejection is side-effect free.
-        let effective_model = input.model.clone().or_else(|| {
-            resolve_agent_default_model(
-                self,
-                input.specialist.as_deref(),
-                workspace_path.as_deref(),
-                delegate_provider.as_deref(),
-            )
-        });
-        let reasoning_effort = resolve_delegate_reasoning_effort(
-            self,
-            input.reasoning_effort.as_deref(),
-            input.specialist.as_deref(),
-            effective_model.as_deref(),
-            workspace_path.as_deref(),
-        );
+        // The whole resolution cluster below — specialist canonicalization,
+        // provider guard, default-model and effort resolution — re-reads the
+        // specialist tier directories, so it runs on the blocking pool
+        // (monorepo#4148).
+        let services = self.clone();
+        let specialist_param = input.specialist.clone();
+        let provider_param_in = input.provider.clone();
+        let model_param = input.model.clone();
+        let effort_param = input.reasoning_effort.clone();
+        let ws_path = workspace_path.clone();
+        let (delegate_provider, effective_model, reasoning_effort) = tokio::task::spawn_blocking(
+            move || -> Result<(Option<String>, Option<String>, Option<String>)> {
+                if let Some(spec_id) = specialist_param.as_deref() {
+                    services
+                        .specialists_service()
+                        .canonical_id_or_err(spec_id, ws_path.as_deref())?;
+                }
+                let delegate_provider = if let Some(provider_param) = provider_param_in.as_deref() {
+                    ensure_known_provider("agent.delegate", provider_param)?;
+                    ensure_provider_available(
+                        "agent.delegate",
+                        provider_param,
+                        &services.effective_settings().providers,
+                    )?;
+                    Some(provider_param.to_string())
+                } else if model_param.is_none() {
+                    resolve_delegate_provider(
+                        &services,
+                        specialist_param.as_deref(),
+                        ws_path.as_deref(),
+                    )?
+                } else {
+                    None
+                };
+                // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
+                // effort > specialist frontmatter > unset, validated against the
+                // cached catalog's `effortLevels` for the effective model. The
+                // effective model must be the one `agent_create_op` will actually
+                // pin — the explicit `model`, else the full default-model resolution
+                // (specialist frontmatter pin, then the settings chain) — so a
+                // specialist whose `modelOptions` entry keys on the settings default
+                // model still gets its option effort selected. Runs BEFORE the child
+                // is created so a `-32602` rejection is side-effect free.
+                let effective_model = model_param.clone().or_else(|| {
+                    resolve_agent_default_model(
+                        &services,
+                        specialist_param.as_deref(),
+                        ws_path.as_deref(),
+                        delegate_provider.as_deref(),
+                    )
+                });
+                let reasoning_effort = resolve_delegate_reasoning_effort(
+                    &services,
+                    effort_param.as_deref(),
+                    specialist_param.as_deref(),
+                    effective_model.as_deref(),
+                    ws_path.as_deref(),
+                );
+                Ok((delegate_provider, effective_model, reasoning_effort))
+            },
+        )
+        .await
+        .map_err(|e| Error::Internal(format!("agent.delegate resolution task failed: {e}")))??;
         // A blank resolved value is an explicit clear (see
         // `resolve_delegate_reasoning_effort`); only a real level is validated.
         if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
@@ -11765,24 +11812,41 @@ impl Services {
         // full default-model resolution (specialist pin, then the settings
         // chain) so a `modelOptions` entry keyed on the settings default
         // model is still matched.
-        let effort_model = model.clone().or_else(|| {
-            resolve_agent_default_model(
-                self,
-                specialist.as_deref(),
-                workspace_path.as_deref(),
-                provider.as_deref(),
-            )
-        });
-        let reasoning_effort = resolve_delegate_reasoning_effort(
-            self,
-            input
+        // Same tier-walking resolvers as `agent.delegate` — blocking pool
+        // (monorepo#4148).
+        let (effort_model, reasoning_effort) = {
+            let services = self.clone();
+            let model = model.clone();
+            let specialist = specialist.clone();
+            let workspace_path = workspace_path.clone();
+            let provider = provider.clone();
+            let effort_param = input
                 .reasoning_effort
-                .as_deref()
-                .or(create_opts.reasoning_effort.as_deref()),
-            specialist.as_deref(),
-            effort_model.as_deref(),
-            workspace_path.as_deref(),
-        );
+                .clone()
+                .or_else(|| create_opts.reasoning_effort.clone());
+            tokio::task::spawn_blocking(move || {
+                let effort_model = model.or_else(|| {
+                    resolve_agent_default_model(
+                        &services,
+                        specialist.as_deref(),
+                        workspace_path.as_deref(),
+                        provider.as_deref(),
+                    )
+                });
+                let reasoning_effort = resolve_delegate_reasoning_effort(
+                    &services,
+                    effort_param.as_deref(),
+                    specialist.as_deref(),
+                    effort_model.as_deref(),
+                    workspace_path.as_deref(),
+                );
+                (effort_model, reasoning_effort)
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("agent.wakeOrCreate resolution task failed: {e}"))
+            })?
+        };
         // A blank resolved value is an explicit clear (see
         // `resolve_delegate_reasoning_effort`); only a real level is validated.
         if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
