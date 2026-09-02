@@ -3608,7 +3608,8 @@ mod tests {
             "the model prefix outranks the file's own codingAgent"
         );
         // Without a codingAgent of its own the prefix still lands there.
-        let content = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opencode:kimi-k3\"\n---\n\nbody";
+        let content =
+            "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opencode:kimi-k3\"\n---\n\nbody";
         let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
         assert_eq!(def["model"], "kimi-k3");
         assert_eq!(def["codingAgent"], "opencode");
@@ -3619,7 +3620,8 @@ mod tests {
         assert_eq!(def["codingAgent"], "claude");
         // An unusable compound (empty prefix or rest) reads as omitted.
         for bad in ["\":kimi-k3\"", "\"opencode:\"", "\" : \""] {
-            let content = format!("---\nname: \"Z\"\ndescription: \"d\"\nmodel: {bad}\n---\n\nbody");
+            let content =
+                format!("---\nname: \"Z\"\ndescription: \"d\"\nmodel: {bad}\n---\n\nbody");
             let def = build_def("z", &content, "user", Path::new("/tmp/z.md"));
             assert!(
                 def.get("model").is_none(),
@@ -3627,8 +3629,7 @@ mod tests {
             );
         }
         // Omitted-after-split behaves like any omitted key: it inherits.
-        let bundled =
-            "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opus4.5\"\n---\n\nbody";
+        let bundled = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opus4.5\"\n---\n\nbody";
         let base = build_def("z", bundled, "bundled", Path::new("/tmp/z.md"));
         let user_file = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \":broken\"\n---\n\nbody";
         let folded =

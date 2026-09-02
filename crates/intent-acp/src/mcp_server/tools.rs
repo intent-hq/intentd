@@ -1196,9 +1196,10 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
             None => "default: provider default".to_string(),
         }];
         entries.extend(spec.options.iter().map(|o| {
+            use std::fmt::Write as _;
             let mut entry = format!("`{}`", flat(&o.model));
             if !o.provider.is_empty() {
-                entry.push_str(&format!(" on {}", flat(&o.provider)));
+                let _ = write!(entry, " on {}", flat(&o.provider));
             }
             let mut paren: Vec<String> = Vec::new();
             if !o.hint.is_empty() {
@@ -1208,7 +1209,7 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
                 paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
             }
             if !paren.is_empty() {
-                entry.push_str(&format!(" ({})", paren.join("; ")));
+                let _ = write!(entry, " ({})", paren.join("; "));
             }
             entry
         }));

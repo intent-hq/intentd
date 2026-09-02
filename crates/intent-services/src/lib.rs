@@ -8436,10 +8436,7 @@ fn decorate_specialist_resolved(
         obj.insert("resolvedModel".into(), serde_json::json!(model));
         obj.insert("resolvedProvider".into(), serde_json::json!(provider));
         if let Some(effort) = effort {
-            obj.insert(
-                "resolvedReasoningEffort".into(),
-                serde_json::json!(effort),
-            );
+            obj.insert("resolvedReasoningEffort".into(), serde_json::json!(effort));
         }
     }
 }
