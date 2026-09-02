@@ -458,6 +458,25 @@ fn cache() -> &'static AuthStatusCache {
     CACHE.get_or_init(AuthStatusCache::new)
 }
 
+/// Read-only view of one provider's *fresh* cached auth verdict:
+/// `Some(false)` only when a still-fresh cache entry holds an explicit
+/// not-authenticated probe outcome; `Some(true)` for a fresh authenticated
+/// outcome; `None` when the cache entry is absent, expired, or holds an
+/// inconclusive (unknown) outcome. Never triggers a probe — callers gating
+/// on it (the agent create/delegate auth gate in [`crate::agent_ops`]) must
+/// stay permissive on `None`.
+pub(crate) fn cached_auth_verdict(provider_id: &str) -> Option<bool> {
+    cache().fresh(provider_id).flatten()
+}
+
+/// Test seam: plant a verdict in the process-wide auth cache so gate tests
+/// are deterministic without spawning probes. Seed `None` to restore the
+/// permissive cached-unknown state.
+#[cfg(test)]
+pub(crate) fn seed_auth_verdict_for_tests(provider_id: &'static str, value: Option<bool>) {
+    cache().store(provider_id, value);
+}
+
 /// Resolve one provider's auth status through the cache: non-forced reads
 /// within TTL serve the cached outcome without touching the filesystem;
 /// otherwise the binary is resolved and the probe runs single-flighted

@@ -775,12 +775,56 @@ fn ensure_provider_available(
     providers: &intent_core::settings_file::ProvidersSettings,
 ) -> Result<()> {
     ensure_provider_enabled(method, provider_id, providers.enabled.as_ref())?;
+    ensure_provider_authenticated(
+        method,
+        provider_id,
+        crate::provider_auth::cached_auth_verdict(provider_id),
+    )?;
     let availability = intent_providers::provider_availability_for(provider_id, &|key| {
         providers.paths.get(key).cloned()
     });
     ensure_provider_runnable(method, provider_id, availability, &|| {
         intent_providers::find_npx().is_some()
     })
+}
+
+/// Reject a provider whose cached auth verdict is explicitly `false` — the
+/// daemon's last probe observed "not logged in" — with an actionable
+/// `-32602` naming the CLI login remedy, before any session row is
+/// persisted or adapter spawned. Rides the same create/delegate seam as the
+/// disabled-provider gate (monorepo#3178): without it, a hard-false
+/// provider passes every front door and the agent dies on its first turn
+/// with a raw `-32000 Authentication required` from the adapter.
+///
+/// Gates ONLY on a hard `false`: an absent, expired, or inconclusive
+/// (unknown) verdict stays permissive — inconclusive probes must never
+/// block creates — and no probe runs here; the verdict is whatever the
+/// `host.providerAuthStatus` cache last stored
+/// ([`crate::provider_auth::cached_auth_verdict`]). The remedy names the
+/// catalog login hint ([`intent_providers::login_command`]); for
+/// claude-code it also spells out the desktop-app caveat — a Claude
+/// desktop-app sign-in does not carry over to the CLI credential chain
+/// (intent-hq/intent#3941), the exact trap that produced dead agents.
+fn ensure_provider_authenticated(
+    method: &str,
+    provider_id: &str,
+    auth_verdict: Option<bool>,
+) -> Result<()> {
+    if auth_verdict != Some(false) {
+        return Ok(());
+    }
+    let display = intent_providers::provider_config(provider_id).display_name;
+    let login_cmd = intent_providers::login_command(provider_id);
+    let caveat = if provider_id == "claude-code" {
+        " Note: signing into the Claude desktop app does not carry over to the CLI — run \
+         \"claude\" in a terminal, then \"/login\"."
+    } else {
+        ""
+    };
+    Err(Error::InvalidParams(format!(
+        "{method}: provider \"{provider_id}\" ({display}) is not authenticated — run \
+         \"{login_cmd}\" in a terminal, then retry.{caveat}"
+    )))
 }
 
 /// The runnability half of [`ensure_provider_available`], with the npx probe
@@ -3564,7 +3608,11 @@ impl Services {
         // `provider` cannot smuggle in a disabled compound-model provider —
         // spawn would run the prefix, so the prefix is what gets gated. This
         // one gate covers every create seam (`agent.create`,
-        // `agent.wakeOrCreate`, and delegate's child creation).
+        // `agent.wakeOrCreate`, and delegate's child creation). The
+        // hard-false auth-verdict gate (`ensure_provider_authenticated`)
+        // rides the same seam: a provider the daemon already observed as
+        // not-logged-in must fail fast with the login remedy instead of
+        // persisting a session that dies auth-required on its first turn.
         // Installed-ness stays delegate-only (`ensure_provider_available`):
         // direct creates on a known, enabled-but-uninstalled provider keep
         // their existing spawn-time failure mode.
@@ -3577,6 +3625,11 @@ impl Services {
                 "agent.create",
                 &p,
                 self.effective_settings().providers.enabled.as_ref(),
+            )?;
+            ensure_provider_authenticated(
+                "agent.create",
+                &p,
+                crate::provider_auth::cached_auth_verdict(&p),
             )?;
         }
         // Also validate the resolved model's compound prefix unconditionally:

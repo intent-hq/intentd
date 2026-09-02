@@ -1076,3 +1076,194 @@ async fn create_disabled_provider_rejected_with_not_enabled() {
     .await
     .expect("re-enabled provider creates normally");
 }
+
+// ── Hard-false auth-verdict gate ─────────────────────────────────────────────
+
+/// Restores the seeded auth verdict to cached-unknown (permissive) on drop,
+/// so a panicking test cannot leave a hard-false verdict in the process-wide
+/// cache (60s TTL) for other tests to trip over. The seeding tests hold the
+/// crate-wide [`EnvGuard`] lock, which already serializes them against every
+/// other mock-delegating test.
+struct AuthSeedReset(&'static str);
+impl Drop for AuthSeedReset {
+    fn drop(&mut self) {
+        crate::provider_auth::seed_auth_verdict_for_tests(self.0, None);
+    }
+}
+
+/// The auth gate rejects ONLY a hard-false verdict: `true` and unknown both
+/// pass (inconclusive probes must never block creates). The claude-code
+/// rejection names the catalog login hint AND the desktop-app caveat — a
+/// Claude desktop-app sign-in does not carry over to the CLI credential
+/// chain, so the message must spell out the CLI login steps.
+#[test]
+fn auth_gate_rejects_hard_false_and_names_remedy() {
+    super::ensure_provider_authenticated("agent.delegate", "claude-code", Some(true))
+        .expect("authenticated verdict passes");
+    super::ensure_provider_authenticated("agent.delegate", "claude-code", None)
+        .expect("unknown verdict stays permissive");
+
+    let err = super::ensure_provider_authenticated("agent.delegate", "claude-code", Some(false))
+        .expect_err("hard-false verdict must be rejected");
+    let intent_core::Error::InvalidParams(m) = &err else {
+        panic!("user-facing InvalidParams (not Internal, which is masked): {err:?}");
+    };
+    assert!(
+        m.contains("claude-code") && m.contains("Anthropic Claude Code"),
+        "names the provider: {m}"
+    );
+    assert!(
+        m.contains("claude auth login"),
+        "names the catalog loginCommandHint: {m}"
+    );
+    assert!(
+        m.contains("Claude desktop app") && m.contains("does not carry over"),
+        "desktop-app caveat: {m}"
+    );
+    assert!(
+        m.contains("\"claude\"") && m.contains("\"/login\""),
+        "spells out the CLI login steps: {m}"
+    );
+}
+
+/// Every other provider's rejection carries its own catalog login hint
+/// (`login_command_hint`, else the `{command} login` fallback) — and never
+/// the claude-only desktop-app caveat.
+#[test]
+fn auth_gate_names_each_providers_catalog_login_hint() {
+    for (id, hint) in [
+        ("auggie", "auggie login"),
+        ("grok", "grok login"),
+        // No catalog hint: falls back to `{command} login`.
+        ("opencode", "opencode login"),
+    ] {
+        let err = super::ensure_provider_authenticated("agent.delegate", id, Some(false))
+            .expect_err("hard-false verdict must be rejected");
+        let intent_core::Error::InvalidParams(m) = &err else {
+            panic!("user-facing InvalidParams: {err:?}");
+        };
+        assert!(m.contains(hint), "catalog login hint for {id}: {m}");
+        assert!(
+            !m.contains("desktop app"),
+            "desktop-app caveat is claude-code-only: {m}"
+        );
+    }
+}
+
+/// End to end through `agent.delegate`: a hard-false cached auth verdict on
+/// the resolved provider fails fast with the actionable `-32602` — before
+/// any session row is persisted — and flipping the cache back to unknown
+/// lets the same delegate proceed.
+#[tokio::test]
+async fn delegate_hard_false_auth_verdict_rejected_before_session_row() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    let _reset = AuthSeedReset("mock");
+    set(&svc, "providers.active", json!("mock"));
+    crate::provider_auth::seed_auth_verdict_for_tests("mock", Some(false));
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("hard-false auth verdict must fail fast at delegate");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m)
+            if m.contains("not authenticated") && m.contains("Mock (E2E)")),
+        "actionable not-authenticated rejection: {err:?}"
+    );
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+
+    // Unknown verdict (inconclusive probe) proceeds.
+    crate::provider_auth::seed_auth_verdict_for_tests("mock", None);
+    svc.agent_delegate_op(
+        ws.clone(),
+        AgentDelegateInput {
+            agent_instructions: Some("do the thing".into()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("unknown verdict stays permissive");
+}
+
+/// End to end through `agent.create` (the shared seam `agent.wakeOrCreate`
+/// and delegate's child creation also funnel through): a hard-false cached
+/// auth verdict — explicit provider param or settings-derived default — is
+/// rejected before any session row is persisted; a `true` verdict proceeds.
+#[tokio::test]
+async fn create_hard_false_auth_verdict_rejected() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    let _reset = AuthSeedReset("mock");
+    crate::provider_auth::seed_auth_verdict_for_tests("mock", Some(false));
+
+    // Explicit provider on the create payload.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("mock".into()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Blocked".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("hard-false explicit provider must fail fast");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("not authenticated")),
+        "actionable not-authenticated rejection: {err:?}"
+    );
+
+    // Settings-derived default provider.
+    set(&svc, "providers.active", json!("mock"));
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Blocked2".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect_err("hard-false derived default must fail fast");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("not authenticated")),
+        "actionable not-authenticated rejection: {err:?}"
+    );
+
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+
+    // A logged-in verdict creates normally.
+    crate::provider_auth::seed_auth_verdict_for_tests("mock", Some(true));
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK".into()),
+        None,
+        None,
+        None,
+        None,
+        false,
+        intent_core::AgentCreateExtra::default(),
+    )
+    .await
+    .expect("authenticated provider creates normally");
+}

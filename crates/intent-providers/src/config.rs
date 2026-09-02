@@ -659,15 +659,26 @@ pub(crate) fn always_enabled_providers() -> Vec<&'static ProviderConfig> {
         .collect()
 }
 
-/// Build the user-facing authentication-required message for a provider,
-/// including the login command hint (`login_command_hint`, else
-/// `{command} login`). Port of `getProviderAuthErrorMessage`.
-pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
+/// The CLI login command for a provider: its catalog `login_command_hint`
+/// when set, else the generic `{command} login` fallback. Single source for
+/// every auth-remedy message ([`auth_error_message`] and the daemon's
+/// create/delegate auth gate).
+#[must_use]
+pub fn login_command(provider_id: &str) -> String {
     let config = provider_config(provider_id);
-    let login_cmd = config.login_command_hint.map_or_else(
+    config.login_command_hint.map_or_else(
         || format!("{} login", config.command),
         std::string::ToString::to_string,
-    );
+    )
+}
+
+/// Build the user-facing authentication-required message for a provider,
+/// including the login command hint ([`login_command`]). Port of
+/// `getProviderAuthErrorMessage`.
+#[must_use]
+pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
+    let config = provider_config(provider_id);
+    let login_cmd = login_command(provider_id);
 
     if is_remote {
         format!(
