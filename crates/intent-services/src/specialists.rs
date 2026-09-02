@@ -781,6 +781,31 @@ fn effective_hidden(def: &Value) -> bool {
     def.get("hidden").and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Lenient read normalization of a legacy compound frontmatter `model`
+/// scalar (PROTOCOL §5.11): `model: "provider:model"` splits into the bare
+/// `model` plus a `codingAgent` set to the prefix — the prefix WINS over any
+/// `codingAgent` the same file declares, preserving the spawn precedence
+/// compound ids had (the model prefix outranked the provider column). A
+/// compound with an empty prefix or empty rest is unusable and reads as an
+/// omitted key (which inherits). Wire writes of compound `model` values are
+/// rejected up front (`reject_compound_model`), so this only ever fires for
+/// pre-triple on-disk files.
+fn split_compound_model_scalar(fm: &mut Map<String, Value>) {
+    let Some(raw) = fm.get("model").and_then(Value::as_str) else {
+        return;
+    };
+    let Some((prefix, rest)) = raw.split_once(':') else {
+        return;
+    };
+    if prefix.trim().is_empty() || rest.trim().is_empty() {
+        fm.remove("model");
+        return;
+    }
+    let (prefix, rest) = (prefix.to_string(), rest.to_string());
+    fm.insert("model".into(), json!(rest));
+    fm.insert("codingAgent".into(), json!(prefix));
+}
+
 /// Build a wire `SpecialistDef` from one file's `content`. `source` is the
 /// winning tier; `path` is the resolved file (omitted for `bundled`,
 /// PROTOCOL §5.11). `prompt` is the markdown body; the optional frontmatter
@@ -815,7 +840,8 @@ fn build_def_inheriting(
     path: &Path,
     inherited: Option<&Value>,
 ) -> Value {
-    let (fm, body) = parse_frontmatter(content);
+    let (mut fm, body) = parse_frontmatter(content);
+    split_compound_model_scalar(&mut fm);
     let name = fm
         .get("name")
         .and_then(Value::as_str)
@@ -1420,21 +1446,32 @@ impl SpecialistsService {
     }
 
     /// Resolve the `reasoningEffort` declared by the specialist's
-    /// [`MODEL_OPTIONS_KEY`] entry whose `model` equals `model` (PROTOCOL
-    /// §5.11) — the model-option rung of the delegation effort resolution.
+    /// [`MODEL_OPTIONS_KEY`] entry matching the `{ provider, model }` pair
+    /// (PROTOCOL §5.11) — the model-option rung of the delegation effort
+    /// resolution. `model` matches the entry's bare `model`; an entry that
+    /// declares a `provider` additionally requires it to equal the effective
+    /// `provider` (so two providers offering the same bare model id resolve
+    /// their own efforts), while an entry without one matches any provider.
     /// Returns `None` when the specialist is unknown, declares no matching
     /// option, or the matching option carries no effort.
     pub(crate) fn resolve_model_option_effort(
         &self,
         id: &str,
         workspace_path: Option<&Path>,
+        provider: Option<&str>,
         model: &str,
     ) -> Option<String> {
         self.resolve(id, workspace_path).and_then(|def| {
             def.get(MODEL_OPTIONS_KEY)
                 .and_then(Value::as_array)?
                 .iter()
-                .find(|o| o.get("model").and_then(Value::as_str) == Some(model))
+                .find(|o| {
+                    o.get("model").and_then(Value::as_str) == Some(model)
+                        && match o.get("provider").and_then(Value::as_str) {
+                            None => true,
+                            Some(op) => provider == Some(op),
+                        }
+                })
                 .and_then(|o| o.get("reasoningEffort"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
@@ -3217,19 +3254,21 @@ mod tests {
     fn model_options_round_trip_losslessly() {
         // A wire spec's modelOptions list is written as a single-line
         // JSON-array frontmatter scalar and parses back byte-identical.
+        // A legacy compound `model` splits into the explicit triple on the
+        // first normalization and stays stable from then on.
         let spec = json!({
             "name": "Zeta",
             "description": "d",
             "modelOptions": [
                 { "model": "opencode:kimi-k3", "hint": "cheap & fast" },
-                { "model": "opus4.5", "hint": "smart, \"expensive\"" }
+                { "provider": "auggie", "model": "opus4.5", "hint": "smart, \"expensive\"" }
             ],
             "prompt": "body"
         });
         let rendered = render_file("zeta", &spec);
         assert!(
             rendered.contains(
-                r#"modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap & fast"},{"model":"opus4.5","hint":"smart, \"expensive\""}]"#
+                r#"modelOptions: [{"provider":"opencode","model":"kimi-k3","hint":"cheap & fast"},{"provider":"auggie","model":"opus4.5","hint":"smart, \"expensive\""}]"#
             ),
             "single-line JSON-array scalar is written: {rendered}"
         );
@@ -3237,8 +3276,8 @@ mod tests {
         assert_eq!(
             def["modelOptions"],
             json!([
-                { "model": "opencode:kimi-k3", "hint": "cheap & fast" },
-                { "model": "opus4.5", "hint": "smart, \"expensive\"" }
+                { "provider": "opencode", "model": "kimi-k3", "hint": "cheap & fast" },
+                { "provider": "auggie", "model": "opus4.5", "hint": "smart, \"expensive\"" }
             ]),
             "parse→write→parse round-trips losslessly"
         );
@@ -3395,8 +3434,9 @@ mod tests {
         let got = svc.get("zeta", None).unwrap();
         assert_eq!(
             got["specialist"]["modelOptions"],
-            json!([{ "model": "opencode:kimi-k3", "hint": "cheap" }]),
-            "a non-empty list overrides wholesale, never merges"
+            json!([{ "provider": "opencode", "model": "kimi-k3", "hint": "cheap" }]),
+            "a non-empty list overrides wholesale, never merges \
+             (a legacy compound model splits into the triple on read)"
         );
 
         // Non-empty but all-unusable → inherit, not clear.

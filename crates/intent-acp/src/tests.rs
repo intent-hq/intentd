@@ -6264,9 +6264,10 @@ mod workspace_api_tool_tests {
             .with_agent_features(no_hooks_features())
             .with_specialist_model_options(vec![SpecialistModelOptions {
                 specialist: "implementor".to_string(),
-                default_model: Some("auggie:claude-opus-5".to_string()),
+                default_model: Some("claude-opus-5".to_string()),
                 options: vec![SpecialistModelOption {
-                    model: "opencode:kimi-k3".to_string(),
+                    provider: "opencode".to_string(),
+                    model: "kimi-k3".to_string(),
                     hint: "cheap".to_string(),
                     reasoning_effort: String::new(),
                 }],
@@ -6277,9 +6278,7 @@ mod workspace_api_tool_tests {
             .unwrap();
         let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
         assert!(
-            desc.contains(
-                "implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"
-            ),
+            desc.contains("implementor: default `claude-opus-5`, `kimi-k3` on opencode (cheap)"),
             "delegate docs must list the specialist's default model and options"
         );
         assert!(

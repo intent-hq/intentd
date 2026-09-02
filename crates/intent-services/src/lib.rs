@@ -1422,6 +1422,11 @@ impl Services {
                     .iter()
                     .filter_map(|o| {
                         Some(intent_acp::SpecialistModelOption {
+                            provider: o
+                                .get("provider")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
                             model: o.get("model").and_then(Value::as_str)?.to_string(),
                             hint: o
                                 .get("hint")
@@ -8380,7 +8385,11 @@ fn specialist_preview_provider(
 /// steps 2–5 — a preview has no client-picked model, so step 1 never applies)
 /// so the preview matches what a no-model create would actually pin. Both
 /// fields are omitted when resolution yields the provider CLI default
-/// (clients render "Provider default").
+/// (clients render "Provider default"). A decorated def additionally carries
+/// `resolvedReasoningEffort` when the specialist rungs of the delegate effort
+/// resolution decide one for the resolved pair — the `modelOptions` entry
+/// matching `{ provider, model }`, else the `reasoningEffort` frontmatter
+/// scalar — i.e. the effort a no-`reasoningEffort` delegate would apply.
 ///
 /// `provider` is the caller/settings context from
 /// [`specialist_preview_provider`]; `None` (no `provider` param, no
@@ -8419,9 +8428,19 @@ fn decorate_specialist_resolved(
     else {
         return;
     };
+    let specialists_svc = services.specialists_service();
+    let effort = specialists_svc
+        .resolve_model_option_effort(&id, workspace_path, Some(provider), &model)
+        .or_else(|| specialists_svc.resolve_reasoning_effort(&id, workspace_path));
     if let Some(obj) = def.as_object_mut() {
         obj.insert("resolvedModel".into(), serde_json::json!(model));
         obj.insert("resolvedProvider".into(), serde_json::json!(provider));
+        if let Some(effort) = effort {
+            obj.insert(
+                "resolvedReasoningEffort".into(),
+                serde_json::json!(effort),
+            );
+        }
     }
 }
 
