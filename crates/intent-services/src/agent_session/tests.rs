@@ -6296,7 +6296,8 @@ async fn open_session_resolves_and_persists_effective_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13");
-    session.model = Some("claude-code:default".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("default".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6309,7 +6310,7 @@ async fn open_session_resolves_and_persists_effective_model() {
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(
         stored.model.as_deref(),
-        Some("claude-code:default"),
+        Some("default"),
         "placeholder model untouched — never rewritten to a display name"
     );
     let (_, resolved, _, _) = bus
@@ -6333,7 +6334,8 @@ async fn open_session_never_overwrites_explicit_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13-explicit");
-    session.model = Some("claude-code:sonnet".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("sonnet".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6346,7 +6348,7 @@ async fn open_session_never_overwrites_explicit_model() {
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(
         stored.model.as_deref(),
-        Some("claude-code:sonnet"),
+        Some("sonnet"),
         "explicit model untouched"
     );
     let (_, resolved, _, _) = bus
@@ -6361,7 +6363,7 @@ async fn open_session_never_overwrites_explicit_model() {
     );
 }
 
-/// D14: a bracketed explicit pick (`claude-code:claude-fable-5[1m]`) resolves
+/// D14: a bracketed explicit pick (`claude-fable-5[1m]`) resolves
 /// its display identity ("Fable 5") from the matching option entry — the
 /// version-less name "Fable" is skipped for the version-bearing description —
 /// while the raw stored id keeps driving provider configuration.
@@ -6370,7 +6372,8 @@ async fn open_session_resolves_explicit_bracketed_pick_display_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d14-fable");
-    session.model = Some("claude-code:claude-fable-5[1m]".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("claude-fable-5[1m]".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6383,7 +6386,7 @@ async fn open_session_resolves_explicit_bracketed_pick_display_model() {
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(
         stored.model.as_deref(),
-        Some("claude-code:claude-fable-5[1m]"),
+        Some("claude-fable-5[1m]"),
         "raw explicit id untouched — still drives provider configuration"
     );
     let (_, resolved, _, _) = bus
@@ -6403,7 +6406,8 @@ async fn open_session_unmatched_explicit_pick_clears_previous_resolution() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d14-unmatched");
-    session.model = Some("claude-code:claude-haiku-4-5".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("claude-haiku-4-5".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6414,7 +6418,7 @@ async fn open_session_unmatched_explicit_pick_clears_previous_resolution() {
         .set_agent_session_resolved_model(
             &ws,
             &session.id,
-            Some("claude-code:claude-haiku-4-5"),
+            Some("claude-haiku-4-5"),
             Some("Haiku 4.5"),
         )
         .await
@@ -6430,7 +6434,7 @@ async fn open_session_unmatched_explicit_pick_clears_previous_resolution() {
         .get_agent_session_token_usage(&ws, &session.id)
         .await
         .expect("read resolved model");
-    assert_eq!(model.as_deref(), Some("claude-code:claude-haiku-4-5"));
+    assert_eq!(model.as_deref(), Some("claude-haiku-4-5"));
     assert_eq!(resolved, None, "stale resolution overwritten by None");
 }
 
@@ -6470,7 +6474,8 @@ async fn open_session_without_config_options_keeps_placeholder() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13-none");
-    session.model = Some("claude-code:default".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("default".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
@@ -6481,7 +6486,7 @@ async fn open_session_without_config_options_keeps_placeholder() {
         .await
         .expect("open session");
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
-    assert_eq!(stored.model.as_deref(), Some("claude-code:default"));
+    assert_eq!(stored.model.as_deref(), Some("default"));
     let (_, resolved, _, _) = bus
         .store()
         .get_agent_session_token_usage(&ws, &session.id)
@@ -6499,19 +6504,15 @@ async fn open_session_placeholder_unresolvable_clears_stale_resolution() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13-stale");
-    session.model = Some("claude-code:default".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("default".to_string());
     bus.store()
         .insert_agent_session(&session)
         .await
         .expect("insert");
     let landed = bus
         .store()
-        .set_agent_session_resolved_model(
-            &ws,
-            &session.id,
-            Some("claude-code:default"),
-            Some("Opus 4.8"),
-        )
+        .set_agent_session_resolved_model(&ws, &session.id, Some("default"), Some("Opus 4.8"))
         .await
         .expect("seed stale resolution");
     assert!(landed);
@@ -6525,7 +6526,7 @@ async fn open_session_placeholder_unresolvable_clears_stale_resolution() {
         .get_agent_session_token_usage(&ws, &session.id)
         .await
         .expect("read resolved model");
-    assert_eq!(model.as_deref(), Some("claude-code:default"));
+    assert_eq!(model.as_deref(), Some("default"));
     assert_eq!(resolved, None, "stale resolution overwritten by None");
 }
 
@@ -6536,7 +6537,8 @@ async fn resume_session_resolves_and_persists_effective_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d13-resume");
-    session.model = Some("claude-code:default".to_string());
+    session.provider = Some("claude-code".to_string());
+    session.model = Some("default".to_string());
     session.acp_session_id = Some(ACP_SID.to_string());
     bus.store()
         .insert_agent_session(&session)
@@ -6549,7 +6551,7 @@ async fn resume_session_resolves_and_persists_effective_model() {
         .expect("resume")
         .expect("resume yields opened session");
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
-    assert_eq!(stored.model.as_deref(), Some("claude-code:default"));
+    assert_eq!(stored.model.as_deref(), Some("default"));
     let (_, resolved, _, _) = bus
         .store()
         .get_agent_session_token_usage(&ws, &session.id)

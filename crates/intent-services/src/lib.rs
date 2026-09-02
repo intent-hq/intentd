@@ -151,9 +151,9 @@ pub use config_watcher::ConfigWatcher;
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
-    max_concurrent_adapters, max_concurrent_agents, migrate_default_vocabulary,
-    migrate_quick_action_settings, report_to_parent_debounce_seconds, InMemorySecretStore,
-    SecretStore,
+    max_concurrent_adapters, max_concurrent_agents, migrate_active_provider_setting,
+    migrate_default_vocabulary, migrate_quick_action_settings, report_to_parent_debounce_seconds,
+    InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
@@ -1396,8 +1396,8 @@ impl Services {
     /// resolves (mirroring [`agent_ops::resolve_delegate_provider`], the
     /// provider `agent.delegate` itself spawns on) — not a single
     /// settings-derived provider shared across every specialist, so a
-    /// specialist pinned to another provider (frontmatter `codingAgent` or a
-    /// compound `model` prefix) still shows the default it actually pins.
+    /// specialist pinned to another provider (frontmatter `codingAgent`)
+    /// still shows the default it actually pins.
     /// Specialists without options (the default) are omitted; resolution
     /// failure yields an empty list — spawning never fails on this.
     pub(crate) fn specialist_model_options(
@@ -8348,10 +8348,9 @@ pub(crate) fn reject_compound_model(param: &str, value: &str) -> Result<()> {
 /// Resolve the specialist preview provider context (`specialist.get`/`.list`
 /// optional `provider` param): a supplied id must be a registered provider
 /// (unknown → `-32602` via `InvalidParams`); absent/empty defaults to the
-/// settings-derived default provider (provider of `model.default`, else
-/// `providers.active`). `None` when neither is set (monorepo#3044: no
-/// positional last resort) — the preview decoration is skipped and clients
-/// render "Provider default".
+/// settings-derived default provider (`model.defaultProvider`). `None` when
+/// neither is set (monorepo#3044: no positional last resort) — the preview
+/// decoration is skipped and clients render "Provider default".
 fn specialist_preview_provider(
     services: &Services,
     provider: Option<String>,
@@ -12998,15 +12997,24 @@ impl Services {
     /// provider is derivable from settings
     /// ([`agent_session::derived_default_provider`] returns `None`) and
     /// discovery reported at least one installed registered provider,
-    /// persist the first one (registry order) as `providers.active`, plus —
-    /// when its cached model catalog names a default (or any) model — that
-    /// model as a compound `model.default`. Per-key no-overwrite guard: a
+    /// persist the first one (registry order) as `model.defaultProvider`,
+    /// plus — when its cached model catalog names a default (or any) model —
+    /// that model as a bare `model.default`. Per-key no-overwrite guard: a
     /// key with ANY existing raw value (even an unregistered one) is never
     /// written; with a derivable default the whole heal is a no-op, making
-    /// it idempotent across restarts and repeated discovery calls. Writes go
+    /// it idempotent across restarts and repeated discovery calls. The model
+    /// rung additionally runs only when the provider key is healed in the
+    /// same sweep — an unset `model.default` behind a nonblank-but-
+    /// unregistered `model.defaultProvider` stays unset rather than taking
+    /// the discovered provider's model while that provider is not the
+    /// effective one. Writes go
     /// through the same `settings.update` path clients use, so
     /// `settings:changed` is emitted and every store/hook rule applies. The
     /// model rung is cache-only ([`ModelCatalogCache`]) — never a probe.
+    ///
+    /// Legacy `providers.active` needs no rung here: the boot migration
+    /// ([`settings::migrate_active_provider_setting`]) carries it into
+    /// `model.defaultProvider` before discovery ever runs this heal.
     ///
     /// # Errors
     ///
@@ -13028,41 +13036,50 @@ impl Services {
             return Ok(serde_json::json!({ "healed": false, "reason": "no-installed-provider" }));
         };
         let mut changes = Vec::new();
-        if settings
-            .providers
-            .active
+        let provider_key_healed = settings
+            .model
+            .default_provider
             .as_deref()
-            .is_none_or(|v| v.trim().is_empty())
-        {
-            changes.push(serde_json::json!({ "path": "providers.active", "value": provider }));
+            .is_none_or(|v| v.trim().is_empty());
+        if provider_key_healed {
+            changes.push(serde_json::json!({ "path": "model.defaultProvider", "value": provider }));
         }
         let mut healed_model = None;
-        if settings
-            .model
-            .default
-            .as_deref()
-            .is_none_or(|v| v.trim().is_empty())
+        // The model rung only runs when THIS heal is also setting the
+        // provider key: with a nonblank-but-unregistered
+        // `model.defaultProvider` (e.g. a typo) the discovered provider is
+        // not going to be the effective one, so persisting its catalog model
+        // would strand a foreign `model.default` behind the user's
+        // eventual correction.
+        if provider_key_healed
+            && settings
+                .model
+                .default
+                .as_deref()
+                .is_none_or(|v| v.trim().is_empty())
         {
             if let Some(m) = self.models_catalog.cached_default_or_first_model(provider) {
-                // Catalog row ids may already be compound (`provider:model`),
-                // but only a prefix naming the owning provider is trusted — a
+                // Legacy catalog row ids may be compound (`provider:model`);
+                // only a prefix naming the owning provider is trusted — a
                 // foreign-prefixed row is not an ownership claim
-                // (monorepo#607) and persisting it would let its prefix
-                // override the just-healed `providers.active`.
-                let compound = match m.split_once(':') {
-                    Some((prefix, _)) if prefix == provider => Some(m),
+                // (monorepo#607). The persisted value is always the BARE id
+                // (`session.model`/settings never carry compound ids).
+                let bare = match m.split_once(':') {
+                    Some((prefix, bare)) if prefix == provider => Some(bare.to_string()),
                     Some(_) => None,
-                    None => Some(format!("{provider}:{m}")),
+                    None => Some(m),
                 };
-                if let Some(compound) = compound {
-                    changes.push(serde_json::json!({ "path": "model.default", "value": compound }));
-                    healed_model = Some(compound);
+                if let Some(bare) = bare.filter(|m| !m.is_empty()) {
+                    changes.push(serde_json::json!({ "path": "model.default", "value": bare }));
+                    healed_model = Some(bare);
                 }
             }
         }
         if changes.is_empty() {
-            // Both keys hold raw values that just don't resolve to a
-            // registered provider — never overwrite them (no-overwrite rule).
+            // The provider key holds a raw value that just doesn't resolve
+            // to a registered provider — never overwrite it (no-overwrite
+            // rule), and never persist a model for a provider that isn't
+            // going to be the effective one.
             return Ok(serde_json::json!({ "healed": false, "reason": "values-already-set" }));
         }
         self.settings_update(serde_json::Value::Array(changes))
@@ -13081,17 +13098,17 @@ impl Services {
 
     /// Default-model re-resolution on a default-provider switch
     /// (monorepo#3177). When a `settings.update` batch writes
-    /// `providers.active` to a registered provider that differs from the
-    /// currently derived default provider
+    /// `model.defaultProvider` to a registered provider that differs from
+    /// the currently derived default provider
     /// ([`agent_session::derived_default_provider`]) — an actual switch, not
     /// a first-time set-up rewrite of the same provider — the stored
-    /// `model.default` would otherwise go stale: its compound prefix takes
-    /// precedence over `providers.active`, so the old provider's model keeps
-    /// shadowing the switch entirely. Append a re-resolved `model.default`
+    /// `model.default` would otherwise go stale: it names the OLD provider's
+    /// model, so every default-model resolution would feed the new provider
+    /// a foreign model id. Append a re-resolved `model.default`
     /// to the batch so it applies atomically with the provider change:
     /// the new provider's cached catalog default-or-first model
     /// ([`ModelCatalogCache::cached_default_or_first_model`], cache-only —
-    /// never a probe) as a compound id, else — when a model is currently
+    /// never a probe) as a bare id, else — when a model is currently
     /// stored — a blank value clearing it (the next call that needs a
     /// default then fails loudly, monorepo#3044, instead of silently
     /// running on a foreign model). An explicit `model.default` entry
@@ -13121,14 +13138,14 @@ impl Services {
             return;
         }
         // Last write wins within a batch, mirroring apply order: the LAST
-        // `providers.active` entry is taken unconditionally — a non-string
-        // value there means no side effect (the batch will fail schema
-        // validation downstream anyway), never a fall-back to an earlier
-        // entry.
+        // `model.defaultProvider` entry is taken unconditionally — a
+        // non-string value there means no side effect (the batch will fail
+        // schema validation downstream anyway), never a fall-back to an
+        // earlier entry.
         let Some(provider) = entries
             .iter()
             .rev()
-            .find(|e| path_of(e) == "providers.active")
+            .find(|e| path_of(e) == "model.defaultProvider")
             .and_then(|e| e.get("value").and_then(|v| v.as_str()))
             .map(str::trim)
             .filter(|id| intent_providers::find_provider(id).is_some())
@@ -13139,9 +13156,8 @@ impl Services {
         let settings = self.effective_settings();
         // Only an actual switch qualifies: no derivable provider means
         // first-time setup (e.g. the heal path), and the provider that
-        // already rules (via a self-prefixed `model.default` or
-        // `providers.active`) makes the batch a same-provider rewrite —
-        // neither may disturb a configured model.
+        // already rules (via `model.defaultProvider`) makes the batch a
+        // same-provider rewrite — neither may disturb a configured model.
         match agent_session::derived_default_provider(&settings) {
             None => return,
             Some(current) if current == provider => return,
@@ -13151,26 +13167,28 @@ impl Services {
             .models_catalog
             .cached_default_or_first_model(&provider)
             .and_then(|m| match m.split_once(':') {
-                // Catalog row ids may already be compound, but only a prefix
+                // Legacy catalog row ids may be compound, but only a prefix
                 // naming the owning provider is trusted — a foreign-prefixed
-                // row is not an ownership claim (monorepo#607).
-                Some((prefix, _)) if prefix == provider => Some(m),
+                // row is not an ownership claim (monorepo#607). The persisted
+                // value is always the BARE id.
+                Some((prefix, bare)) if prefix == provider => Some(bare.to_string()),
                 Some(_) => None,
-                None => Some(format!("{provider}:{m}")),
-            });
+                None => Some(m),
+            })
+            .filter(|m| !m.is_empty());
         let model_currently_set = settings
             .model
             .default
             .as_deref()
             .is_some_and(|v| !v.trim().is_empty());
         match resolved {
-            Some(compound) => {
+            Some(bare) => {
                 tracing::info!(
                     provider,
-                    model = compound,
+                    model = bare,
                     "default-provider switch: re-resolved model.default from the cached catalog"
                 );
-                entries.push(serde_json::json!({ "path": "model.default", "value": compound }));
+                entries.push(serde_json::json!({ "path": "model.default", "value": bare }));
             }
             None if model_currently_set => {
                 tracing::info!(

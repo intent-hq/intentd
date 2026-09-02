@@ -61,19 +61,17 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
 ///
 /// The result is provider-guarded and returned BARE — the settings value is
 /// user-authored and easily outlives a provider switch, so the CLI must never
-/// be fed a foreign model id. A compound `{provider}:{model}` id is dropped
-/// with a warn log unless its prefix names the effective provider, and the
-/// prefix is stripped from an owned one because the one-shot launch takes a
-/// raw model id. A value whose prefix is not a registered provider id
-/// (including a malformed `:model`) counts as foreign and is dropped too —
-/// `derived_default_provider`'s `contains(':')` convention already reserves the
-/// colon for compound ids. A bare id reuses `agent.create`'s asymmetric
+/// be fed a foreign model id. A legacy compound `{provider}:{model}` value
+/// (colon-bearing, pre-wire-rejection) is dropped with a warn log — settings
+/// values are bare ids now. A bare id reuses `agent.create`'s asymmetric
 /// cached-catalog evidence rule ([`ensure_bare_model_matches_provider`]): it is
 /// dropped only when the effective provider's own cached catalog affirmatively
 /// disproves ownership, so a cold start still passes it through.
 ///
-/// Every drop falls to the next rung rather than erroring: a `-32602` here
-/// would reject a model the caller never sent.
+/// Every drop is PER RUNG and falls to the next one rather than erroring or
+/// skipping the chain: a dropped type override still tries
+/// `quickActions.defaultModel`, and only when every rung drops does the CLI
+/// default apply — a `-32602` here would reject a model the caller never sent.
 ///
 /// This chain is scoped to one-shot quick actions only — agent sessions,
 /// delegated ones included, keep the background-agnostic creation-time chain
@@ -85,46 +83,45 @@ fn resolve_quick_action_model(
     effective_provider: &str,
 ) -> Option<String> {
     let quick = &settings.quick_actions;
-    let configured = quick_action_type
+    let vet = |configured: &str| -> Option<String> {
+        let owned_bare = if configured.contains(':') {
+            None
+        } else {
+            crate::agent_ops::ensure_bare_model_matches_provider(
+                "agent.completeOnce",
+                catalog,
+                effective_provider,
+                configured,
+            )
+            .ok()
+            .map(|()| configured.to_string())
+        };
+        if owned_bare.is_none() {
+            tracing::warn!(
+                model = configured,
+                provider = effective_provider,
+                "configured quick-action model does not belong to the effective \
+                 provider; falling back to the next rung"
+            );
+        }
+        owned_bare
+    };
+    quick_action_type
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .and_then(|t| quick.type_overrides.get(t))
         .map(String::as_str)
         .map(str::trim)
         .filter(|m| !m.is_empty())
+        .and_then(vet)
         .or_else(|| {
             quick
                 .default_model
                 .as_deref()
                 .map(str::trim)
                 .filter(|m| !m.is_empty())
-        })?;
-
-    let owned_bare = if configured.contains(':') {
-        let (prefix, bare) = intent_providers::parse_compound_model_id(configured);
-        (intent_providers::find_provider(&prefix).map(|p| p.id) == Some(effective_provider)
-            && !bare.is_empty())
-        .then_some(bare)
-    } else {
-        crate::agent_ops::ensure_bare_model_matches_provider(
-            "agent.completeOnce",
-            catalog,
-            effective_provider,
-            configured,
-        )
-        .ok()
-        .map(|()| configured.to_string())
-    };
-
-    if owned_bare.is_none() {
-        tracing::warn!(
-            model = configured,
-            provider = effective_provider,
-            "configured quick-action model does not belong to the effective \
-             provider; falling back to the CLI default"
-        );
-    }
-    owned_bare
+                .and_then(vet)
+        })
 }
 
 /// Pick the one-shot launch for `provider`, mirroring the model probe's
@@ -202,8 +199,8 @@ impl Services {
     /// under `text`. The router pre-validates `prompt` is non-empty and
     /// `timeout_ms` is positive.
     ///
-    /// Routed on the settings-derived effective provider (provider of
-    /// `model.default`, else `providers.active`): auggie keeps the existing
+    /// Routed on the settings-derived effective provider
+    /// (`model.defaultProvider`): auggie keeps the existing
     /// CLI path, claude-code / codex / pi run an ephemeral ACP session, and
     /// anything else returns `{ available: false, reason }`. Unset/undecidable
     /// settings resolve the gate CLOSED: falling through to the first
@@ -443,7 +440,7 @@ mod tests {
         }
     }
 
-    /// Services with a fake CLI and `providers.active = "auggie"` so the
+    /// Services with a fake CLI and `model.defaultProvider = "auggie"` so the
     /// provider gate is open: unset settings resolve the gate CLOSED
     /// (see `complete_once_unavailable_when_settings_unset`), so op-level
     /// tests must opt in to an auggie-active registry to reach the CLI.
@@ -455,8 +452,11 @@ mod tests {
                 .expect("load registry"),
         );
         registry
-            .apply(&[("providers.active".to_string(), serde_json::json!("auggie"))])
-            .expect("set providers.active");
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("auggie"),
+            )])
+            .expect("set model.defaultProvider");
         let services = Services::new(store)
             .with_auggie_bin(bin)
             .with_settings_registry(registry);
@@ -493,7 +493,7 @@ mod tests {
         // functionally reinstate the removed hardcoded default (coordinator
         // ruling; matches FE #759 where unset resolves disabled). No registry
         // wired → schema defaults → both `model.default` and
-        // `providers.active` unset.
+        // `model.defaultProvider` unset.
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let services =
@@ -585,7 +585,7 @@ rl.on('line', (line) => {{
         // against the mock adapter with no provider install.
         let (_dir, bin) = fake_acp_adapter("ok", "🤖\nslug-from-acp");
         let (_tmp, services) = services_with_settings(&[
-            ("providers.active", serde_json::json!("codex")),
+            ("model.defaultProvider", serde_json::json!("codex")),
             (
                 "providers.paths",
                 serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -607,7 +607,8 @@ rl.on('line', (line) => {{
         // opencode has no one-shot route: a typed unavailable result, never an
         // internal error.
         let (_tmp, services) =
-            services_with_settings(&[("providers.active", serde_json::json!("opencode"))]).await;
+            services_with_settings(&[("model.defaultProvider", serde_json::json!("opencode"))])
+                .await;
         let v = services
             .agent_complete_once_op("hi".into(), None, None, None, None, None)
             .await
@@ -631,7 +632,8 @@ rl.on('line', (line) => {{
         // `wss_agent_complete_once_unavailable_when_adapter_unresolvable`
         // e2e, which self-skips wherever npx is installed.
         let (_tmp, services) =
-            services_with_settings(&[("providers.active", serde_json::json!("claude-code"))]).await;
+            services_with_settings(&[("model.defaultProvider", serde_json::json!("claude-code"))])
+                .await;
         let services = services.with_one_shot_npx(None);
         let v = services
             .agent_complete_once_op("hi".into(), None, None, None, None, None)
@@ -691,7 +693,7 @@ rl.on('line', (line) => {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let (_tmp, services) = services_with_settings(&[
-            ("providers.active", serde_json::json!("codex")),
+            ("model.defaultProvider", serde_json::json!("codex")),
             (
                 "providers.paths",
                 serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -829,8 +831,8 @@ rl.on('line', (line) => {
         );
         // Keep the provider gate open (unset settings resolve it closed).
         registry
-            .apply(&[("providers.active".to_string(), json!("auggie"))])
-            .expect("set providers.active");
+            .apply(&[("model.defaultProvider".to_string(), json!("auggie"))])
+            .expect("set model.defaultProvider");
 
         // Case 1: context.auggiePath set and valid → use it exclusively
         registry
@@ -973,31 +975,46 @@ rl.on('line', (line) => {
     }
 
     #[test]
-    fn quick_action_model_is_provider_guarded_and_returned_bare() {
-        // An owned compound id loses its `{provider}:` prefix — the one-shot
-        // launch takes a raw model id — and one owned by another provider is
-        // dropped rather than fed to the resolved provider's CLI. A prefix
-        // that is not a registered provider id (including a malformed
-        // `:model`) counts as foreign: the colon is reserved for compound ids.
+    fn quick_action_model_drops_legacy_compound_values() {
+        // Settings values are bare model ids now: ANY colon-bearing legacy
+        // compound value — owned, foreign, or malformed alike — is dropped
+        // with a warn log rather than fed to the CLI.
         let catalog = empty_catalog();
-        let owned = quick_action_settings(Some("auggie:sonnet4.5"), &[]);
-        assert_eq!(
-            resolve_quick_action_model(&owned, &catalog, None, "auggie"),
-            Some("sonnet4.5".to_string())
-        );
-        let foreign = quick_action_settings(Some("codex:gpt-5"), &[]);
-        assert_eq!(
-            resolve_quick_action_model(&foreign, &catalog, None, "auggie"),
-            None
-        );
-        for malformed in [":sonnet4.5", "not-a-provider:sonnet4.5", "auggie:"] {
-            let settings = quick_action_settings(Some(malformed), &[]);
+        for legacy in [
+            "auggie:sonnet4.5",
+            "codex:gpt-5",
+            ":sonnet4.5",
+            "not-a-provider:sonnet4.5",
+            "auggie:",
+        ] {
+            let settings = quick_action_settings(Some(legacy), &[]);
             assert_eq!(
                 resolve_quick_action_model(&settings, &catalog, None, "auggie"),
                 None,
-                "{malformed} must fall through to the CLI default"
+                "{legacy} must fall through to the CLI default"
             );
         }
+    }
+
+    #[test]
+    fn quick_action_dropped_override_falls_to_default_model() {
+        // A drop is per rung: a legacy compound type override still falls
+        // through to a valid quickActions.defaultModel — the documented
+        // override → default → CLI-default chain — rather than skipping
+        // straight to the CLI default.
+        let catalog = empty_catalog();
+        let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "auggie:haiku")]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
+            Some("sonnet4.5".to_string()),
+            "a dropped override must fall to the default-model rung"
+        );
+        // Both rungs compound ⇒ CLI default.
+        let settings = quick_action_settings(Some("codex:gpt-5"), &[("commit", "auggie:haiku")]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
+            None
+        );
     }
 
     #[test]
@@ -1056,7 +1073,10 @@ rl.on('line', (line) => {
             .expect("load registry");
         registry
             .apply(&[
-                ("providers.active".to_string(), serde_json::json!("auggie")),
+                (
+                    "model.defaultProvider".to_string(),
+                    serde_json::json!("auggie"),
+                ),
                 (
                     "quickActions.defaultModel".to_string(),
                     serde_json::json!("sonnet4.5"),
@@ -1117,7 +1137,10 @@ rl.on('line', (line) => {
             .expect("load registry");
         registry
             .apply(&[
-                ("providers.active".to_string(), serde_json::json!("auggie")),
+                (
+                    "model.defaultProvider".to_string(),
+                    serde_json::json!("auggie"),
+                ),
                 (
                     "quickActions.providerSettings".to_string(),
                     serde_json::json!({ "auggie": { "defaultModel": "from-provider-settings" } }),

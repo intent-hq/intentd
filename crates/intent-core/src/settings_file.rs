@@ -93,8 +93,14 @@ pub struct ProvidersSettings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ModelSettings {
-    /// `model.default` — fallback model for new agents.
+    /// `model.default` — fallback model for new agents (a bare model id;
+    /// pair with `model.defaultProvider`).
     pub default: Option<String>,
+    /// `model.defaultProvider` — the provider leg of the default-model
+    /// triple: the provider new agents run on when none is requested
+    /// explicitly. A blank value reads as unset.
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub default_provider: Option<String>,
     /// `model.providerDefaults` — default model per provider.
     pub provider_defaults: BTreeMap<String, String>,
     /// `model.defaultReasoningEffort` — fallback reasoning effort for new
@@ -1317,8 +1323,12 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret
 paths = {}
 
 [model]
-# Default model -- fallback model for new agents.
+# Default model -- fallback model for new agents (a bare model id; pair with
+# defaultProvider).
 # default = "claude-sonnet-4-5"
+# Default provider -- the provider leg of the default-model triple: the
+# provider new agents run on when none is requested explicitly.
+# defaultProvider = "claude-code"
 # Provider default models -- default model per provider.
 providerDefaults = {}
 # Default reasoning effort -- fallback reasoning effort for new agents; the
@@ -1653,6 +1663,7 @@ mod tests {
         assert_eq!(d.providers.enabled, None);
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
+        assert_eq!(d.model.default_provider, None);
         assert_eq!(d.model.default_reasoning_effort, None);
         assert!(d.quick_actions.provider_settings.is_empty());
         assert!(!d.workspace.cow_isolation);
@@ -2263,6 +2274,29 @@ mod tests {
         ] {
             let parsed = SettingsFile::parse_str(text).expect("parse");
             assert_eq!(parsed.model.default_reasoning_effort, None, "{text}");
+        }
+    }
+
+    #[test]
+    fn model_default_provider_parses_as_an_optional_string() {
+        let parsed =
+            SettingsFile::parse_str("[model]\ndefault = \"m0\"\ndefaultProvider = \"codex\"\n")
+                .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("m0"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("codex"));
+
+        // Absent from `[model]` leaves it unset.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"m0\"\n").expect("parse");
+        assert_eq!(parsed.model.default_provider, None);
+
+        // A blank value reads as unset, so no consumer ever observes an
+        // explicit empty provider.
+        for text in [
+            "[model]\ndefaultProvider = \"\"\n",
+            "[model]\ndefaultProvider = \"   \"\n",
+        ] {
+            let parsed = SettingsFile::parse_str(text).expect("parse");
+            assert_eq!(parsed.model.default_provider, None, "{text}");
         }
     }
 

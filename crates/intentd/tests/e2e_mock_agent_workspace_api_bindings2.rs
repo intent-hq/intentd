@@ -500,7 +500,7 @@ async fn agent_bindings_list_specialists() {
     std::fs::create_dir_all(ws_root.join(".intent/specialists")).expect("mkdir specialists");
     std::fs::write(
         ws_root.join(".intent/specialists/e2e-pinned.md"),
-        "---\nname: \"E2E Pinned\"\ndescription: \"Project-tier pinned specialist\"\nmodel: \"codex:test-model\"\n---\n\nYou are a project-tier e2e specialist.\n",
+        "---\nname: \"E2E Pinned\"\ndescription: \"Project-tier pinned specialist\"\ncodingAgent: \"codex\"\nmodel: \"test-model\"\n---\n\nYou are a project-tier e2e specialist.\n",
     )
     .expect("write project specialist");
 
@@ -638,8 +638,8 @@ async fn agent_bindings_list_specialists() {
     assert_eq!(pinned["name"], "E2E Pinned");
     assert_eq!(
         pinned["defaultModel"],
-        serde_json::json!({ "provider": "codex", "model": "codex:test-model" }),
-        "compound-model pin resolved per-specialist, not via the settings default"
+        serde_json::json!({ "provider": "codex", "model": "test-model" }),
+        "codingAgent pin resolved per-specialist, not via the settings default"
     );
 
     manager.shutdown().await;

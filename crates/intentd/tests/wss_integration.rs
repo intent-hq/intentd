@@ -985,7 +985,7 @@ async fn wss_oversized_message_terminates_connection() {
 #[tokio::test]
 async fn wss_agent_create_rejects_client_supplied_agent_id() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1113,7 +1113,7 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
 #[tokio::test]
 async fn wss_agent_lite_omits_initial_message() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1241,7 +1241,7 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
     }
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1484,7 +1484,7 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     }
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1805,7 +1805,7 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
 async fn wss_agent_list_caps_previews_get_serves_full() {
     const BUDGET: usize = intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES;
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2182,7 +2182,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
 #[tokio::test]
 async fn wss_agent_send_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2258,7 +2258,7 @@ async fn wss_agent_send_message_rejects_unknown_agent() {
 #[tokio::test]
 async fn wss_agent_queue_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2335,7 +2335,7 @@ async fn wss_agent_queue_message_rejects_unknown_agent() {
 #[tokio::test]
 async fn wss_agent_diagnostics_reports_queue_snapshots() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2440,7 +2440,7 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
             .expect("load settings registry"),
     );
     registry
-        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
     let services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
@@ -2575,7 +2575,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
             .expect("load settings registry"),
     );
     registry
-        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
     let services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
@@ -2670,7 +2670,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
 #[tokio::test]
 async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3243,7 +3243,7 @@ async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
 #[tokio::test]
 async fn wss_agent_create_widened_params_round_trip() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3367,7 +3367,7 @@ async fn wss_agent_mark_seen_round_trip() {
         }
     }
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3579,7 +3579,7 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
         .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
     }
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3724,7 +3724,7 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
 #[tokio::test]
 async fn wss_agent_session_shape_rpcs_round_trip() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3999,7 +3999,7 @@ async fn wss_agent_reasoning_effort_round_trip() {
 #[tokio::test]
 async fn wss_agent_delegate_persists_reasoning_effort() {
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     // Hermeticity (monorepo#3162): point discovery at a deterministic
     // executable so the delegate availability check passes without a real
     // auggie on the test host.
@@ -4088,7 +4088,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
         Some(dir.path().to_path_buf()),
     )
     .await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -4186,7 +4186,8 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
         Some(dir.path().to_path_buf()),
     )
     .await;
-    srv.set_setting("model.default", serde_json::json!("auggie:fable-5"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("fable-5"));
     srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let created_ws = wss_call(
         srv.port,
@@ -4205,7 +4206,7 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
     let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_eq!(
         created["result"]["agent"]["model"],
-        Value::from("auggie:fable-5"),
+        Value::from("fable-5"),
         "settings default model pinned: {created}"
     );
     assert_eq!(
@@ -4301,7 +4302,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
         Some(dir.path().to_path_buf()),
     )
     .await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let created_ws = wss_call(
         srv.port,
@@ -4335,7 +4336,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
     );
 
     // A configured settings default outranks the catalog rung.
-    srv.set_setting("model.default", serde_json::json!("auggie:fable-5"));
+    srv.set_setting("model.default", serde_json::json!("fable-5"));
     let frame = format!(
         r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Settings wins"}}}}"#
     );
@@ -4344,7 +4345,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
     assert_eq!(created["id"], 3);
     assert_eq!(
         created["result"]["agent"]["model"],
-        Value::from("auggie:fable-5"),
+        Value::from("fable-5"),
         "the settings chain outranks the catalog default: {created}"
     );
 
@@ -5726,7 +5727,7 @@ async fn wss_agent_enhance_prompt_round_trip() {
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
     // Provider-neutrality: set auggie as active provider (these operations are auggie-specific).
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
 
     let resp = wss_call(
         srv.port,
@@ -5769,7 +5770,7 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
         "printf '🤖\\n<augment-enhanced-prompt>never runs</augment-enhanced-prompt>\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("claude-code"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5791,8 +5792,8 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
 #[cfg(unix)]
 #[tokio::test]
 async fn wss_agent_enhance_prompt_unavailable_when_settings_unset() {
-    // Gate closed on unset settings: with neither `model.default` nor
-    // `providers.active` configured, the derived default is undecidable and
+    // Gate closed on unset settings: with `model.defaultProvider` not
+    // configured, the derived default is undecidable and
     // the gate must resolve CLOSED — falling through to the first registered
     // provider would always be auggie and functionally reinstate the removed
     // hardcoded default (coordinator ruling; matches FE #759 where unset
@@ -5822,21 +5823,22 @@ async fn wss_agent_enhance_prompt_unavailable_when_settings_unset() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
-    // Gate precedence: the effective provider derives from the `model.default`
-    // compound prefix FIRST, then `providers.active`. Both directions:
-    // a non-auggie prefix closes the gate even with auggie active, and an
-    // auggie prefix opens it even with a non-auggie active provider. An
-    // unknown prefix is not trusted — it falls through to `providers.active`.
+async fn wss_agent_enhance_prompt_gate_follows_model_default_provider() {
+    // Gate precedence: the effective provider derives from
+    // `model.defaultProvider` alone — `model.default` is a bare model id and
+    // never carries a provider. Both directions: a non-auggie default
+    // provider closes the gate regardless of `model.default`, and an auggie
+    // one opens it. An unknown default provider is not trusted → closed.
     let (_auggie_dir, bin) = fake_auggie_script(
         "prefix-enhance",
         "printf '🤖\\n<augment-enhanced-prompt>Enhanced: via prefix</augment-enhanced-prompt>\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
 
-    // Direction 1: claude-code prefix outranks auggie active → gate closes.
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
-    srv.set_setting("model.default", serde_json::json!("claude-code:sonnet4.5"));
+    // Direction 1: claude-code default provider → gate closes; the
+    // `model.default` value is irrelevant to provider derivation.
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
+    srv.set_setting("model.default", serde_json::json!("sonnet4.5"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5850,12 +5852,11 @@ async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
             "available": false,
             "reason": "enhance-prompt requires auggie as the effective default provider"
         }),
-        "non-auggie model.default prefix outranks auggie providers.active"
+        "non-auggie model.defaultProvider closes the gate"
     );
 
-    // Direction 2: auggie prefix outranks claude-code active → gate passes.
-    srv.set_setting("providers.active", serde_json::json!("claude-code"));
-    srv.set_setting("model.default", serde_json::json!("auggie:sonnet4.5"));
+    // Direction 2: auggie default provider → gate passes.
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5865,12 +5866,11 @@ async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
     assert_eq!(resp["id"], 38);
     assert_eq!(
         resp["result"]["enhanced"], "Enhanced: via prefix",
-        "auggie model.default prefix outranks non-auggie providers.active"
+        "auggie model.defaultProvider opens the gate"
     );
 
-    // Unknown prefix: falls through to providers.active (auggie) → gate passes.
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
-    srv.set_setting("model.default", serde_json::json!("typo:foo"));
+    // An unknown model.defaultProvider is not trusted → gate closes.
+    srv.set_setting("model.defaultProvider", serde_json::json!("typo"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5879,8 +5879,9 @@ async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
     .await;
     assert_eq!(resp["id"], 39);
     assert_eq!(
-        resp["result"]["enhanced"], "Enhanced: via prefix",
-        "unknown model.default prefix falls through to providers.active"
+        resp["result"]["available"],
+        serde_json::json!(false),
+        "unknown model.defaultProvider closes the gate"
     );
     srv.ws.stop().await;
 }
@@ -5892,7 +5893,7 @@ async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
     // the documented -32603 parse failure (§5.31).
     let (_auggie_dir, bin) = fake_auggie_script("notags", "printf '🤖\\nno tags here\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5917,7 +5918,7 @@ async fn wss_agent_enhance_prompt_cli_missing_is_internal_error() {
         Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
     )
     .await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5971,7 +5972,7 @@ async fn wss_agent_complete_once_round_trip() {
         "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\nfix-login-flow\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
 
     let resp = wss_call(
         srv.port,
@@ -6023,7 +6024,7 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
     let (_adapter_dir, bin) =
         fake_acp_adapter_script("complete", r#"{"response":"🤖\nfix-login-flow"}"#);
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
     srv.set_setting(
         "providers.paths",
         serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -6058,7 +6059,7 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
     std::fs::write(&bin, "#!/bin/sh\nexit 9\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
     srv.set_setting(
         "providers.paths",
         serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -6128,7 +6129,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
         n
     };
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
     srv.set_setting(
         "providers.paths",
         serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -6248,7 +6249,7 @@ async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
         return;
     }
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6274,7 +6275,7 @@ async fn wss_agent_complete_once_unavailable_when_provider_has_no_one_shot() {
     // `{ available: false, reason }` result instead of an error.
     let (_auggie_dir, bin) = fake_auggie_script("gated-complete", "printf '🤖\\nnever-runs\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("opencode"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("opencode"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6319,16 +6320,17 @@ async fn wss_agent_complete_once_unavailable_when_settings_unset() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
-    // Gate precedence mirror of the enhance-prompt test: `model.default`
-    // compound prefix outranks `providers.active` in both directions.
+async fn wss_agent_complete_once_gate_follows_model_default_provider() {
+    // Gate precedence mirror of the enhance-prompt test: the effective
+    // provider derives from `model.defaultProvider` alone — `model.default`
+    // is a bare model id and never carries a provider.
     let (_auggie_dir, bin) = fake_auggie_script("prefix-complete", "printf '🤖\\nvia-prefix\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
 
-    // Direction 1: an opencode prefix (no one-shot route) outranks auggie
-    // active → the auggie CLI path is not taken.
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
-    srv.set_setting("model.default", serde_json::json!("opencode:some-model"));
+    // Direction 1: an opencode default provider (no one-shot route) → the
+    // auggie CLI path is not taken, regardless of `model.default`.
+    srv.set_setting("model.defaultProvider", serde_json::json!("opencode"));
+    srv.set_setting("model.default", serde_json::json!("some-model"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6342,12 +6344,13 @@ async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
             "available": false,
             "reason": "completeOnce is not supported for the effective default provider: opencode"
         }),
-        "non-auggie model.default prefix outranks auggie providers.active"
+        "non-auggie model.defaultProvider routes away from the auggie CLI"
     );
 
-    // Direction 2: auggie prefix outranks a non-auggie active provider.
-    srv.set_setting("providers.active", serde_json::json!("opencode"));
-    srv.set_setting("model.default", serde_json::json!("auggie:sonnet4.5"));
+    // Direction 2: an auggie default provider takes the CLI path. The
+    // configured foreign bare model is dropped by the ownership guard, so
+    // the CLI runs on its own default.
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6357,7 +6360,7 @@ async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
     assert_eq!(resp["id"], 46);
     assert_eq!(
         resp["result"]["text"], "via-prefix",
-        "auggie model.default prefix outranks non-auggie providers.active"
+        "auggie model.defaultProvider takes the CLI path"
     );
     srv.ws.stop().await;
 }
@@ -6373,7 +6376,7 @@ async fn wss_agent_complete_once_resolves_quick_action_settings() {
     // observable in the `{ text }` envelope.
     let (_auggie_dir, bin) = fake_auggie_script("quick-actions", "printf '🤖\\n%s\\n' \"$*\"");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     srv.set_setting("quickActions.defaultModel", serde_json::json!("sonnet4.5"));
     srv.set_setting(
         "quickActions.typeOverrides",
@@ -6428,7 +6431,7 @@ async fn wss_agent_complete_once_cli_missing_is_internal_error() {
         Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
     )
     .await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6449,7 +6452,7 @@ async fn wss_agent_complete_once_timeout_reaps_and_errors() {
     // failure, no session/agent state is leaked.
     let (_auggie_dir, bin) = fake_auggie_script("complete-slow", "sleep 30");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -9725,7 +9728,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -10371,7 +10374,7 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -10588,7 +10591,7 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -10719,7 +10722,7 @@ async fn wss_agent_get_message_block_serves_full_block() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -10885,7 +10888,7 @@ async fn wss_extracted_payload_round_trip_slim_and_full() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -11040,7 +11043,7 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),

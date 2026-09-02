@@ -598,9 +598,8 @@ pub fn find_provider(provider_id: &str) -> Option<&'static ProviderConfig> {
 }
 
 /// The first registered provider — a neutral positional last resort used
-/// ONLY when no settings-derived default (provider of `model.default`, else
-/// `providers.active`) is reachable. No provider carries a privileged
-/// default designation.
+/// ONLY when no settings-derived default (`model.defaultProvider`) is
+/// reachable. No provider carries a privileged default designation.
 pub(crate) fn first_provider_config() -> &'static ProviderConfig {
     ACP_PROVIDERS
         .first()

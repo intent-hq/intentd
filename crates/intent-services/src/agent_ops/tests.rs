@@ -59,7 +59,7 @@ impl Drop for TempDb {
 /// A settings registry (backed by a config file next to the temp db, removed
 /// by [`TempDb`]'s drop) seeding a configured default provider: since
 /// monorepo#3044 there is no positional fallback, so ops that resolve a
-/// provider need `providers.active` set. The `providers.paths` override
+/// provider need `model.defaultProvider` set. The `providers.paths` override
 /// points auggie at a deterministic executable so availability checks
 /// (`agent.delegate`) pass without the real binary on the test host.
 pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::SettingsRegistry> {
@@ -67,7 +67,7 @@ pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::Se
     let registry = Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
     registry
         .apply(&[
-            ("providers.active".into(), json!("auggie")),
+            ("model.defaultProvider".into(), json!("auggie")),
             ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
             // The report-debounce default (30s) would park progress wakes on
             // the parent's queue for the whole window; the suites assert the
@@ -4727,16 +4727,20 @@ async fn strict_ask_registration_is_durable_before_in_memory_visibility() {
 }
 
 async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("auggie".into()),
+        ..Default::default()
+    };
     let created = svc
         .agent_create_op(
             ws.clone(),
             Some(name.to_string()),
-            Some("auggie:sonnet4.5".into()),
+            Some("sonnet4.5".into()),
             None,
             None,
             None,
             false,
-            AgentCreateExtra::default(),
+            extra,
         )
         .await
         .expect("create");
@@ -4756,7 +4760,7 @@ async fn create_then_list_and_get_projects_agent_lite() {
 
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(got.id, id);
-    assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
+    assert_eq!(got.model.as_deref(), Some("sonnet4.5"));
 }
 
 /// monorepo#940: `sessionCorrupted` is derived on emit over the persisted
@@ -7353,13 +7357,13 @@ async fn rename_and_set_model_persist() {
         .await
         .expect("rename");
     assert_eq!(r["name"], "New");
-    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
+    svc.agent_set_model_op(id.clone(), "opus4.7".into(), None)
         .await
         .expect("setModel");
     let got = svc.agent_get_op(id, None).await.expect("get");
     assert_eq!(got.name, "New");
     assert!(got.name_explicitly_set);
-    assert_eq!(got.model.as_deref(), Some("auggie:opus4.7"));
+    assert_eq!(got.model.as_deref(), Some("opus4.7"));
 }
 
 /// `agent.setModel` clears any persisted resolved display model (D14): the
@@ -7368,23 +7372,10 @@ async fn rename_and_set_model_persist() {
 #[tokio::test]
 async fn set_model_clears_resolved_display_model() {
     let (_t, svc, ws) = setup().await;
-    let created = svc
-        .agent_create_op(
-            ws.clone(),
-            Some("D14".into()),
-            Some("auggie:sonnet4.5".into()),
-            None,
-            None,
-            None,
-            false,
-            AgentCreateExtra::default(),
-        )
-        .await
-        .expect("create");
-    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let id = create_agent(&svc, &ws, "D14").await;
     let landed = svc
         .store()
-        .set_agent_session_resolved_model(&ws, &id, Some("auggie:sonnet4.5"), Some("Sonnet 4.5"))
+        .set_agent_session_resolved_model(&ws, &id, Some("sonnet4.5"), Some("Sonnet 4.5"))
         .await
         .expect("seed resolved model");
     assert!(landed);
@@ -7394,7 +7385,7 @@ async fn set_model_clears_resolved_display_model() {
         .await
         .expect("read");
     assert_eq!(resolved.as_deref(), Some("Sonnet 4.5"));
-    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
+    svc.agent_set_model_op(id.clone(), "opus4.7".into(), None)
         .await
         .expect("setModel");
     let (model, resolved, _, _) = svc
@@ -7402,48 +7393,34 @@ async fn set_model_clears_resolved_display_model() {
         .get_agent_session_token_usage(&ws, &id)
         .await
         .expect("read after");
-    assert_eq!(model.as_deref(), Some("auggie:opus4.7"));
+    assert_eq!(model.as_deref(), Some("opus4.7"));
     assert_eq!(resolved, None, "stale resolution cleared by setModel");
 }
 
-/// `agent.setModel` reconciles session.provider when the new model is a
-/// compound id whose provider differs from the current session provider.
-/// This ensures cross-provider model switches spawn the new provider's binary.
+/// `agent.setModel` reconciles session.provider when an explicit providerId
+/// names a different provider than the current session provider. This
+/// ensures cross-provider model switches spawn the new provider's binary.
 #[tokio::test]
 async fn set_model_reconciles_provider_on_cross_provider_switch() {
     let (_t, svc, ws) = setup().await;
-    // Create an agent with an explicit auggie provider.
-    let created = svc
-        .agent_create_op(
-            ws.clone(),
-            Some("Switch".into()),
-            Some("auggie:sonnet4.5".into()),
-            None,
-            None,
-            None,
-            false,
-            AgentCreateExtra::default(),
-        )
-        .await
-        .expect("create");
-    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-    // Initial state: auggie provider, auggie model.
+    let id = create_agent(&svc, &ws, "Switch").await;
+    // Initial state: auggie provider.
     let session = svc.agent_get_session_op(id.clone()).await.expect("get");
-    // Provider is inferred from the compound model on creation.
     assert_eq!(session.provider.as_deref(), Some("auggie"));
-    // Set a compound model for a different provider.
-    svc.agent_set_model_op(id.clone(), "opencode:opencode-go/kimi-k3".into(), None)
-        .await
-        .expect("setModel");
-    // session.provider should now match the compound prefix.
+    // Switch to another provider's model via the explicit providerId param.
+    svc.agent_set_model_op(
+        id.clone(),
+        "opencode-go/kimi-k3".into(),
+        Some("opencode".into()),
+    )
+    .await
+    .expect("setModel");
+    // session.provider should now match the explicit providerId.
     let session = svc
         .agent_get_session_op(id.clone())
         .await
         .expect("get after");
-    assert_eq!(
-        session.model.as_deref(),
-        Some("opencode:opencode-go/kimi-k3")
-    );
+    assert_eq!(session.model.as_deref(), Some("opencode-go/kimi-k3"));
     assert_eq!(session.provider.as_deref(), Some("opencode"));
 }
 
@@ -7454,32 +7431,20 @@ async fn set_model_reconciles_provider_on_cross_provider_switch() {
 #[tokio::test]
 async fn set_model_reconciles_provider_after_first_real_use() {
     let (_t, svc, ws) = setup().await;
-    let created = svc
-        .agent_create_op(
-            ws.clone(),
-            Some("SwitchLate".into()),
-            Some("auggie:sonnet4.5".into()),
-            None,
-            None,
-            None,
-            false,
-            AgentCreateExtra::default(),
-        )
-        .await
-        .expect("create");
-    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let id = create_agent(&svc, &ws, "SwitchLate").await;
     svc.store()
         .set_acp_session_id(&ws, &id, "acp-first-use")
         .await
         .expect("persist first-use acp session id");
-    svc.agent_set_model_op(id.clone(), "opencode:opencode-go/kimi-k3".into(), None)
-        .await
-        .expect("cross-provider setModel after first use");
+    svc.agent_set_model_op(
+        id.clone(),
+        "opencode-go/kimi-k3".into(),
+        Some("opencode".into()),
+    )
+    .await
+    .expect("cross-provider setModel after first use");
     let session = svc.agent_get_session_op(id).await.expect("get after");
-    assert_eq!(
-        session.model.as_deref(),
-        Some("opencode:opencode-go/kimi-k3")
-    );
+    assert_eq!(session.model.as_deref(), Some("opencode-go/kimi-k3"));
     assert_eq!(session.provider.as_deref(), Some("opencode"));
     assert_eq!(
         session.acp_session_id.as_deref(),
@@ -7488,15 +7453,14 @@ async fn set_model_reconciles_provider_after_first_real_use() {
     );
 }
 
-/// `agent.setModel` leaves session.provider unchanged when the new model is
-/// a bare id (no `:` prefix) or a compound id for the same provider.
+/// `agent.setModel` leaves session.provider unchanged when no explicit
+/// providerId is supplied.
 #[tokio::test]
-async fn set_model_preserves_provider_for_bare_or_same_provider() {
+async fn set_model_preserves_provider_without_provider_id() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Same").await;
     let session = svc.agent_get_session_op(id.clone()).await.expect("get");
     let orig_provider = session.provider.clone();
-    // Bare model → provider unchanged.
     svc.agent_set_model_op(id.clone(), "opus4.7".into(), None)
         .await
         .expect("setModel bare");
@@ -7505,24 +7469,13 @@ async fn set_model_preserves_provider_for_bare_or_same_provider() {
         .await
         .expect("get after bare");
     assert_eq!(session.provider, orig_provider);
-    // Same-provider compound → provider unchanged (or set to match if None).
-    svc.agent_set_model_op(id.clone(), "auggie:sonnet4.5".into(), None)
-        .await
-        .expect("setModel same provider");
-    let session = svc
-        .agent_get_session_op(id.clone())
-        .await
-        .expect("get after same");
-    assert_eq!(session.provider.as_deref(), Some("auggie"));
 }
 
-/// `agent.create` hard-fails (-32602 `InvalidParams`) when the resolved provider
-/// is unknown — explicit `provider` param or a compound-prefix derivation —
-/// and persists no session row.
+/// `agent.create` hard-fails (-32602 `InvalidParams`) when the explicit
+/// `provider` param is unknown, and persists no session row.
 #[tokio::test]
 async fn create_rejects_unknown_provider() {
     let (_t, svc, ws) = setup().await;
-    // Explicit unknown provider param.
     let extra = intent_core::AgentCreateExtra {
         provider: Some("nonexistent".into()),
         ..Default::default()
@@ -7546,52 +7499,6 @@ async fn create_rejects_unknown_provider() {
             .contains("agent.create: unknown provider: nonexistent"),
         "unexpected err: {err}"
     );
-    // Unknown compound-prefix derivation.
-    let err = svc
-        .agent_create_op(
-            ws.clone(),
-            Some("Bad2".into()),
-            Some("nonexistent:foo".into()),
-            None,
-            None,
-            None,
-            false,
-            AgentCreateExtra::default(),
-        )
-        .await
-        .expect_err("unknown compound-prefix provider must be rejected");
-    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
-    assert!(
-        err.to_string()
-            .contains("agent.create: unknown provider: nonexistent"),
-        "unexpected err: {err}"
-    );
-    // Explicit VALID provider + unknown compound model prefix: the spawn path
-    // gives the model prefix precedence over session.provider, so this must be
-    // rejected too (regression for PR #378 review).
-    let extra = intent_core::AgentCreateExtra {
-        provider: Some("auggie".into()),
-        ..Default::default()
-    };
-    let err = svc
-        .agent_create_op(
-            ws.clone(),
-            Some("Bad3".into()),
-            Some("nonexistent:foo".into()),
-            None,
-            None,
-            None,
-            false,
-            extra,
-        )
-        .await
-        .expect_err("valid provider must not smuggle an unknown-prefixed model");
-    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
-    assert!(
-        err.to_string()
-            .contains("agent.create: unknown provider: nonexistent"),
-        "unexpected err: {err}"
-    );
     // No rejection persisted a session row.
     let agents = svc.agent_list_op(ws.clone()).await.expect("list");
     assert!(agents.is_empty(), "no session row persisted: {agents:?}");
@@ -7607,16 +7514,19 @@ async fn create_rejects_unknown_provider() {
 #[tokio::test]
 async fn create_records_session_started_usage_stats() {
     let (_t, svc, ws) = setup().await;
-    // Explicit (compound) model → one tick under the normalized display name.
+    // Explicit model → one tick under the normalized display name.
     svc.agent_create_op(
         ws.clone(),
         Some("WithModel".into()),
-        Some("auggie:claude-opus-4-8".into()),
+        Some("claude-opus-4-8".into()),
         None,
         None,
         None,
         false,
-        AgentCreateExtra::default(),
+        intent_core::AgentCreateExtra {
+            provider: Some("auggie".into()),
+            ..Default::default()
+        },
     )
     .await
     .expect("create with model");
@@ -7649,8 +7559,8 @@ async fn create_records_session_started_usage_stats() {
     assert_eq!(sessions_for("Opus 4.8"), 1);
     assert_eq!(sessions_for(intent_providers::first_provider_id()), 1);
     assert_eq!(sessions_for("unknown"), 0);
-    // Both ticks carry the resolved provider id — the compound prefix for the
-    // explicit model, the default provider for the no-model create.
+    // Both ticks carry the resolved provider id — the explicit provider for
+    // the explicit-model create, the default provider for the no-model one.
     let provider_for = |model: &str| -> Vec<&str> {
         rows.iter()
             .filter(|r| r.model == model)
@@ -7676,7 +7586,7 @@ async fn create_records_session_started_usage_stats() {
     );
 }
 
-/// `agent.setModel` rejects an unknown compound-prefix provider with -32602
+/// `agent.setModel` rejects an unknown explicit providerId with -32602
 /// `InvalidParams` and leaves session.model / session.provider untouched.
 #[tokio::test]
 async fn set_model_rejects_unknown_provider() {
@@ -7684,9 +7594,9 @@ async fn set_model_rejects_unknown_provider() {
     let id = create_agent(&svc, &ws, "Guard").await;
     let before = svc.agent_get_session_op(id.clone()).await.expect("get");
     let err = svc
-        .agent_set_model_op(id.clone(), "nonexistent:foo".into(), None)
+        .agent_set_model_op(id.clone(), "foo".into(), Some("nonexistent".into()))
         .await
-        .expect_err("unknown compound-prefix provider must be rejected");
+        .expect_err("unknown explicit providerId must be rejected");
     assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
     assert!(
         err.to_string()
@@ -8292,53 +8202,6 @@ async fn set_model_rejects_unknown_explicit_provider_id() {
         after.provider, before.provider,
         "provider must be unchanged"
     );
-}
-
-/// `agent.setModel` rejects a compound `modelId` whose prefix conflicts with
-/// the explicit `providerId` (-32602, no mutation), and accepts one that
-/// agrees with it.
-#[tokio::test]
-async fn set_model_compound_id_vs_explicit_provider_id() {
-    let (_t, svc, ws) = setup().await;
-    let id = create_agent(&svc, &ws, "CompoundPid").await;
-    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
-    // Conflict: compound prefix names a different provider than providerId.
-    let err = svc
-        .agent_set_model_op(
-            id.clone(),
-            "opencode:opencode-go/kimi-k3".into(),
-            Some("auggie".into()),
-        )
-        .await
-        .expect_err("conflicting providerId must be rejected");
-    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
-    assert!(
-        err.to_string().contains(
-            "agent.setModel: modelId opencode:opencode-go/kimi-k3 names provider \
-             opencode but providerId is auggie"
-        ),
-        "unexpected err: {err}"
-    );
-    let after = svc.agent_get_session_op(id.clone()).await.expect("get");
-    assert_eq!(after.model, before.model, "model must be unchanged");
-    assert_eq!(
-        after.provider, before.provider,
-        "provider must be unchanged"
-    );
-    // Agreement: same provider in both — succeeds and reconciles.
-    svc.agent_set_model_op(
-        id.clone(),
-        "opencode:opencode-go/kimi-k3".into(),
-        Some("opencode".into()),
-    )
-    .await
-    .expect("agreeing providerId");
-    let session = svc.agent_get_session_op(id).await.expect("get after");
-    assert_eq!(
-        session.model.as_deref(),
-        Some("opencode:opencode-go/kimi-k3")
-    );
-    assert_eq!(session.provider.as_deref(), Some("opencode"));
 }
 
 #[tokio::test]

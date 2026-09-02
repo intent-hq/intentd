@@ -2005,11 +2005,12 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.setModel`: change an agent's model (PROTOCOL §5.5).
-    /// `provider_id` optionally names the intended provider explicitly
-    /// (additive param): absent keeps the historical behavior; present it
-    /// must be a registered provider, must agree with a compound
-    /// `model_id`'s prefix, and owns the validation of a bare `model_id`
-    /// (session.provider is reconciled to it on success).
+    /// `model_id` is a bare model id (compound `provider:model` ids reject
+    /// `-32602` at the wire boundary). `provider_id` optionally names the
+    /// intended provider explicitly (additive param): absent keeps the
+    /// historical behavior; present it must be a registered provider and
+    /// owns the validation of the model id (session.provider is reconciled
+    /// to it on success).
     fn agent_set_model(
         &self,
         workspace_id: WorkspaceId,
@@ -4653,8 +4654,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// the providers discovery reported as installed. When no default
     /// provider is derivable from settings and at least one installed
     /// provider exists, the implementation persists the first installed
-    /// provider as `providers.active` (and, when a cached model catalog
-    /// exists for it, its default model as a compound `model.default`).
+    /// provider as `model.defaultProvider` (and, when a cached model catalog
+    /// exists for it, its default model as a bare `model.default`).
     /// Idempotent, and never overwrites an existing settings value. Returns
     /// `{ healed: boolean, ... }`. Default: no-op (read-only wirings).
     fn settings_heal_default_provider(
@@ -4837,7 +4838,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `resolvedModel`/`resolvedProvider` preview fields are computed
     /// per-specialist — each row against the provider a no-`model`
     /// `agent.delegate` of that specialist would actually spawn on (its own
-    /// frontmatter `codingAgent`/compound-`model` pin first, else the
+    /// frontmatter `codingAgent` pin first, else the
     /// settings-derived default) — instead of one shared caller/settings
     /// provider context. Matches the session-start specialist hints.
     fn specialist_list_dispatch(

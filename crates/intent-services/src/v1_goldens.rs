@@ -118,7 +118,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     let registry = Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
     registry
         .apply(&[
-            ("providers.active".into(), json!("auggie")),
+            ("model.defaultProvider".into(), json!("auggie")),
             ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
             // Goldens assert the legacy immediate report wake — disable the
             // default 30s report debounce.

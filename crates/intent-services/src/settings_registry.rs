@@ -49,6 +49,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "providers.enabled",
     "providers.paths",
     "model.default",
+    "model.defaultProvider",
     "model.providerDefaults",
     "model.defaultReasoningEffort",
     "quickActions.defaultModel",
