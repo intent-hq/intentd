@@ -156,7 +156,7 @@ jobs:
           if [[ "$EVENT_NAME" == "push" ]]; then
             first_line=${HEAD_COMMIT_MSG%%$'\n'*}
             case "$first_line" in
-              "chore: release v"* | "chore(intentd): release v"*)
+              "chore: release" | "chore: release v"* | "chore(intentd): release v"* | "chore(intentd-sitter): release v"*)
                 echo "Push is the release squash-merge itself ($first_line); nothing to chain into."
                 exit 0
                 ;;
@@ -236,9 +236,15 @@ jobs:
 
           while :; do
             # Identify the open release-plz Release PR: head branch
-            # `release-plz-*` and a release title in either pr_name form
-            # this repo has produced (see release-plz.yml's concurrency
-            # comment). Branch name and title alone are attacker-controlled
+            # `release-plz-*` and a release title in any pr_name form the
+            # default template can produce (see release-plz.yml's
+            # concurrency comment): `chore: release vX.Y.Z` (all released
+            # packages share one version), bare `chore: release`
+            # ({{ version }} is unset when released packages have different
+            # versions, e.g. a mixed intentd + intentd-sitter cycle), and
+            # `chore(<package>): release vX.Y.Z` (single-package release,
+            # e.g. a sitter-only cycle).
+            # Branch name and title alone are attacker-controlled
             # (a fork PR can use both), so the candidate is also required to
             # come from a branch in THIS repository (no fork heads), and its
             # author is verified below against the release-plz PAT identity.
@@ -250,8 +256,10 @@ jobs:
               --json number,title,headRefName,isDraft,labels,isCrossRepository,author \
               --jq '[.[] | select((.isCrossRepository == false)
                     and (.headRefName | startswith("release-plz-"))
-                    and ((.title | startswith("chore: release v"))
-                      or (.title | startswith("chore(intentd): release v"))))]'); then
+                    and ((.title == "chore: release")
+                      or (.title | startswith("chore: release v"))
+                      or (.title | startswith("chore(intentd): release v"))
+                      or (.title | startswith("chore(intentd-sitter): release v"))))]'); then
               transient "gh pr list failed (transient API error?)"
               sleep 30; continue
             fi

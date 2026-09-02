@@ -35,11 +35,14 @@ on:
 # `release_always = false`, `release-plz release` only pushes the tag when
 # the *latest* commit is a Release-PR merge, so if a queued merge-commit run
 # were superseded by an ordinary push, the newer run would silently skip the
-# tag. Merge commits are detected by the Release PR's squash title: both
-# release-plz pr_name forms this repo has produced — `chore: release vX.Y.Z`
-# (multi-package version_group cycles, v0.2.10+) and `chore(intentd):
-# release vX.Y.Z` (single-package cycles, v0.2.2–v0.2.9). A false positive
-# only costs coalescing; a false negative would reopen the dropped-tag bug.
+# tag. Merge commits are detected by the Release PR's squash title, in any
+# form release-plz's default pr_name template can produce: `chore: release`
+# with or without a version — the version is omitted when the released
+# packages have different versions, e.g. a mixed intentd + intentd-sitter
+# cycle — and `chore(<package>): release vX.Y.Z` for single-package cycles
+# (intentd: v0.2.2–v0.2.9; intentd-sitter for sitter-only cycles). A false
+# positive only costs coalescing; a false negative would reopen the
+# dropped-tag bug.
 # Two Release-PR merges can't coalesce with each other in practice: the
 # next Release PR only exists after the previous merge's release-pr job has
 # run.
@@ -48,7 +51,7 @@ on:
 # mid-flight on a Release-PR merge commit must never be cancelled between
 # computing the next version and pushing the tag.
 concurrency:
-  group: "release-plz-${{ github.ref }}-${{ (startsWith(github.event.head_commit.message, 'chore: release') || startsWith(github.event.head_commit.message, 'chore(intentd): release')) && 'release-merge' || 'push' }}"
+  group: "release-plz-${{ github.ref }}-${{ (startsWith(github.event.head_commit.message, 'chore: release') || startsWith(github.event.head_commit.message, 'chore(intentd): release') || startsWith(github.event.head_commit.message, 'chore(intentd-sitter): release')) && 'release-merge' || 'push' }}"
   cancel-in-progress: false
 
 jobs:
