@@ -44,9 +44,11 @@ changelog_path = "./CHANGELOG.md"
 # library crates change the shipped binary, so they must show up here
 # (monorepo#889 — e.g. intentd#592 touched only intent-git/intent-services
 # and was missing from the v0.2.9 changelog). intentd-sitter is included too so
-# sitter/installer work is visible in release notes (monorepo#4093 — e.g.
-# intentd#1619 touched only intentd-sitter + scripts/ and was missing from the
-# v0.9.2 changelog).
+# sitter work is visible in release notes (monorepo#4093 — e.g. intentd#1619
+# touched only intentd-sitter + scripts/ and was missing from the v0.9.2
+# changelog). Residual gap: commits touching ONLY the repo-root
+# scripts/install.{sh,ps1} are still invisible — see the caveat on the
+# intentd-sitter [[package]] entry below.
 changelog_include = [
     "intent-acp",
     "intent-context",
