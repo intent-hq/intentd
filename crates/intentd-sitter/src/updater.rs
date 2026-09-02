@@ -459,6 +459,9 @@ impl Updater {
         if let Some(src_dir) = src_bin.parent() {
             stage_sibling_payload(src_dir, &staging)?;
         }
+        // Sync the staging dir's own entries (binary + payload) so the whole
+        // tree is durable before the rename makes it selectable.
+        sync_dir(&staging)?;
 
         let final_dir = self.paths.versions_dir.join(version);
         if final_dir.exists() {
@@ -587,9 +590,12 @@ fn find_daemon_binary(root: &Path) -> Option<PathBuf> {
 /// to the binary (e.g. `libexec/tailcat` and its LICENSE) — from the
 /// extracted directory into the staging dir, preserving layout. `fs::copy`
 /// carries permission bits, so exec bits survive; every copied file is
-/// fsync'd like the binary. Archives without any sibling payload (older
-/// releases) copy nothing — never an error.
+/// fsync'd like the binary, and every created directory is fsync'd after it
+/// is fully populated so its entries are durable before the staging dir is
+/// renamed into place. Archives without any sibling payload (older releases)
+/// copy nothing — never an error.
 fn stage_sibling_payload(src_dir: &Path, staging: &Path) -> io::Result<()> {
+    let mut created_dirs = Vec::new();
     let mut stack = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
         for entry in fs::read_dir(src_dir.join(&rel))? {
@@ -600,7 +606,9 @@ fn stage_sibling_payload(src_dir: &Path, staging: &Path) -> io::Result<()> {
             }
             let rel_child = rel.join(entry.file_name());
             if entry.file_type()?.is_dir() {
-                fs::create_dir_all(staging.join(&rel_child))?;
+                let dest = staging.join(&rel_child);
+                fs::create_dir_all(&dest)?;
+                created_dirs.push(dest);
                 stack.push(rel_child);
             } else {
                 let dest = staging.join(&rel_child);
@@ -609,7 +617,25 @@ fn stage_sibling_payload(src_dir: &Path, staging: &Path) -> io::Result<()> {
             }
         }
     }
+    // Sync deepest-first so every child's entries are durable before its
+    // parent's entry for it is.
+    for dir in created_dirs.iter().rev() {
+        sync_dir(dir)?;
+    }
     Ok(())
+}
+
+/// Fsync a directory so its entries survive a power loss. On non-Unix
+/// platforms directories cannot be opened for syncing; a failure to open is
+/// ignored there while sync errors on an opened handle still propagate.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    match fs::File::open(dir) {
+        Ok(handle) => handle.sync_all(),
+        #[cfg(unix)]
+        Err(err) => Err(err),
+        #[cfg(not(unix))]
+        Err(_) => Ok(()),
+    }
 }
 
 #[cfg(test)]
