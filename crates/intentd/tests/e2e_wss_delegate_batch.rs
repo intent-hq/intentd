@@ -385,7 +385,7 @@ async fn batch_delegate_request_response_shape_over_wss() {
         json!({
             "workspaceId": ws_id,
             "tasks": [t1, t2, t3],
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -472,7 +472,7 @@ async fn batch_delegate_request_response_shape_over_wss() {
         json!({
             "workspaceId": ws_id,
             "tasks": [t1, t2, t3],
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -511,19 +511,19 @@ async fn batch_delegate_request_response_shape_over_wss() {
     for (id, params) in [
         (
             50,
-            json!({ "workspaceId": ws_id, "tasks": [t3], "greedy": true, "model": "mock:default" }),
+            json!({ "workspaceId": ws_id, "tasks": [t3], "greedy": true, "model": "default", "provider": "mock" }),
         ),
         (
             51,
-            json!({ "workspaceId": ws_id, "tasks": [t3], "greedy": false, "model": "mock:default" }),
+            json!({ "workspaceId": ws_id, "tasks": [t3], "greedy": false, "model": "default", "provider": "mock" }),
         ),
         (
             52,
-            json!({ "workspaceId": ws_id, "tasks": [t3], "greedy": null, "model": "mock:default" }),
+            json!({ "workspaceId": ws_id, "tasks": [t3], "greedy": null, "model": "default", "provider": "mock" }),
         ),
         (
             53,
-            json!({ "workspaceId": ws_id, "taskNoteId": t3, "greedy": true, "model": "mock:default" }),
+            json!({ "workspaceId": ws_id, "taskNoteId": t3, "greedy": true, "model": "default", "provider": "mock" }),
         ),
     ] {
         let err = wss_rpc_raw(&mut ws, id, "agent.delegate", params).await;
@@ -544,7 +544,7 @@ async fn batch_delegate_request_response_shape_over_wss() {
         "agent.delegate",
         json!({
             "workspaceId": ws_id,
-            "tasks": [{ "taskNoteId": t3, "model": "mock:default", "reasoningEffort": "low" }],
+            "tasks": [{ "taskNoteId": t3, "model": "default", "provider": "mock", "reasoningEffort": "low" }],
         }),
     )
     .await;
@@ -567,9 +567,9 @@ async fn batch_delegate_request_response_shape_over_wss() {
             "workspaceId": ws_id,
             "tasks": [
                 t4,
-                { "taskNoteId": t5, "model": "mock:override", "reasoningEffort": "high" },
+                { "taskNoteId": t5, "model": "override", "provider": "mock", "reasoningEffort": "high" },
             ],
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -597,7 +597,7 @@ async fn batch_delegate_request_response_shape_over_wss() {
     .await;
     assert_eq!(
         plain_agent["agent"]["model"],
-        json!("mock:default"),
+        json!("default"),
         "bare entry inherits the top-level default: {plain_agent}"
     );
     assert!(
@@ -613,7 +613,7 @@ async fn batch_delegate_request_response_shape_over_wss() {
     .await;
     assert_eq!(
         custom_agent["agent"]["model"],
-        json!("mock:override"),
+        json!("override"),
         "object entry's model override wins: {custom_agent}"
     );
     assert_eq!(
@@ -659,7 +659,7 @@ async fn batch_delegate_request_response_shape_over_wss() {
         json!({
             "workspaceId": ws_id,
             "tasks": [s1, u1],
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -701,7 +701,7 @@ async fn zero_started_after_all_batch_delivers_advisory_wake_over_wss() {
          await ws.task.markAsTask(b.id, 'not_started', {}); \
          const h = await ws.note.create('ZH', 'held body'); \
          await ws.task.markAsTask(h.id, 'not_started', { dependsOn: [b.id] }); \
-         return await ws.agent.delegate({ tasks: [h.id], waitMode: 'after_all', model: 'mock:default' });";
+         return await ws.agent.delegate({ tasks: [h.id], waitMode: 'after_all', model: 'default', provider: 'mock' });";
     let behavior = json!({
         "rules": [
             {
@@ -774,7 +774,7 @@ async fn zero_started_after_all_batch_delivers_advisory_wake_over_wss() {
         &mut rpc,
         20,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]

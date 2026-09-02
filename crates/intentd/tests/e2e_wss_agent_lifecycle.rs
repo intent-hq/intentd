@@ -440,7 +440,7 @@ async fn mock_agent_full_turn_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -675,7 +675,7 @@ async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-FINISH", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-FINISH", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -827,7 +827,7 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Stalled", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Stalled", "model": "default", "provider": "mock" }),
     )
     .await;
     let stalled_id = stalled["agent"]["id"]
@@ -838,7 +838,7 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Quick", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Quick", "model": "default", "provider": "mock" }),
     )
     .await;
     let quick_id = quick["agent"]["id"].as_str().expect("quick id").to_string();
@@ -1031,7 +1031,7 @@ async fn mid_turn_stall_and_resume_status_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Staller", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Staller", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1216,7 +1216,7 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Tooler", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Tooler", "model": "default", "provider": "mock" }),
     )
     .await;
     let tool_id = created["agent"]["id"]
@@ -1227,7 +1227,7 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Control", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Control", "model": "default", "provider": "mock" }),
     )
     .await;
     let control_id = created["agent"]["id"]
@@ -1389,7 +1389,7 @@ async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-SessionMCP", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-SessionMCP", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1510,7 +1510,7 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-Status", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-Status", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1641,7 +1641,7 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "WSS-Status-BG",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
             "isBackground": true,
         }),
     )
@@ -1735,7 +1735,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -2045,7 +2045,7 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-Overlay", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-Overlay", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -2274,7 +2274,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -2509,7 +2509,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -2677,7 +2677,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -2905,7 +2905,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Idle", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Idle", "model": "default", "provider": "mock" }),
     )
     .await;
     let idle_id = idle["agent"]["id"].as_str().expect("idle id").to_string();
@@ -2915,7 +2915,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Busy", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Busy", "model": "default", "provider": "mock" }),
     )
     .await;
     let busy_id = busy["agent"]["id"].as_str().expect("busy id").to_string();
@@ -3105,7 +3105,7 @@ async fn agent_diagnostics_reports_subtree_memory_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Unspawned", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Unspawned", "model": "default", "provider": "mock" }),
     )
     .await;
     let idle_id = idle["agent"]["id"].as_str().expect("idle id").to_string();
@@ -3115,7 +3115,7 @@ async fn agent_diagnostics_reports_subtree_memory_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Spawned", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Spawned", "model": "default", "provider": "mock" }),
     )
     .await;
     let busy_id = busy["agent"]["id"].as_str().expect("busy id").to_string();
@@ -3229,7 +3229,7 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
     // Post-WSAPI-8: replace discrete `delegate_task` with the unified
     // `workspace_api` tool routing through `ws.agent.delegate`.
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_MARK),
     );
     let behavior = json!({
@@ -3285,7 +3285,7 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -3437,7 +3437,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
             "workspaceId": ws_id,
             "agentInstructions": "do the delegated work",
             "taskText": task_text,
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -3556,11 +3556,11 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
     let report_a_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_A));
     let report_b_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_B));
     let delegate_a_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'default', provider: 'mock' }});",
         json!(CHILD_A),
     );
     let delegate_b_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'default', provider: 'mock' }});",
         json!(CHILD_B),
     );
     // One behavior, prompt-matched rules: children (matched by their delegated
@@ -3649,7 +3649,7 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -3879,7 +3879,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         json!(REPORT),
     );
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(note_id),
         json!(CHILD_TAG),
     );
@@ -3962,7 +3962,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SUB2 Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "SUB2 Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -4249,7 +4249,7 @@ async fn attention_request_discussion_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": note_id,
             "agentInstructions": format!("{CHILD_MARKER} raise a discussion request"),
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -4642,7 +4642,7 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "FG-Attn", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "FG-Attn", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -4873,7 +4873,7 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": note_id,
             "agentInstructions": format!("{BLOCKER_MARKER} report an environment blocker"),
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -4968,7 +4968,7 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
         &mut rpc,
         20,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Taskless", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Taskless", "model": "default", "provider": "mock" }),
     )
     .await;
     let taskless_id = created["agent"]["id"]
@@ -5073,11 +5073,11 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
         json!(REASON)
     );
     let delegate_attn_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(format!("{CHILD_ATTN} raise a discussion request")),
     );
     let delegate_die_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(format!("{CHILD_DIE} this child dies mid-prompt")),
     );
     let behavior = json!({
@@ -5156,7 +5156,7 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "ParentId-Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "ParentId-Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -6279,7 +6279,7 @@ async fn subscription_filter_branches_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-Filter", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-Filter", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -6398,7 +6398,7 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-Disc", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-Disc", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -6566,7 +6566,7 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QDrain", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QDrain", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -6701,7 +6701,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "StabFour", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "StabFour", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -6883,7 +6883,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QMeta", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QMeta", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -7070,7 +7070,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SubThresh", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "SubThresh", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -7284,7 +7284,7 @@ async fn user_app_message_id_round_trips_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "AppIds", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "AppIds", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -7403,7 +7403,7 @@ async fn remove_queued_message_is_idempotent_over_wss() {
         &mut rpc,
         1,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QIdempotent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QIdempotent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -7487,7 +7487,7 @@ async fn send_queued_message_now_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QSendNow", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QSendNow", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -7708,7 +7708,7 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QMixed", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QMixed", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -7960,7 +7960,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
             "initialAgent": {
                 "prompt": "build the initial feature",
                 "name": "Initial agent",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
                 "specialist": "implementor",
             },
         }),
@@ -8088,7 +8088,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
         &mut rpc,
         16,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Sibling", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Sibling", "model": "default", "provider": "mock" }),
     )
     .await;
     let sibling_id = sibling["agent"]["id"]
@@ -8131,7 +8131,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
             "idempotencyKey": "wss-create-idem-1",
             "initialAgent": {
                 "prompt": "some other prompt",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
@@ -8466,7 +8466,7 @@ async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": note_id,
             "contextMessage": "kickoff",
-            "create": { "model": "mock:default" },
+            "create": { "model": "default", "provider": "mock" },
         }),
     )
     .await;
@@ -8633,7 +8633,7 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Coordinator", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Coordinator", "model": "default", "provider": "mock" }),
     )
     .await;
     let coordinator_id = coordinator["agent"]["id"]
@@ -8644,7 +8644,7 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Target", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Target", "model": "default", "provider": "mock" }),
     )
     .await;
     let target_id = target["agent"]["id"]
@@ -8784,8 +8784,8 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
 
     // The parent delegates two after_all children, sends follow-ups to each.
     let delegate_js = format!(
-        "const a = await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default', waitMode: 'after_all' }}); \
-         const b = await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default', waitMode: 'after_all' }}); \
+        "const a = await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock', waitMode: 'after_all' }}); \
+         const b = await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock', waitMode: 'after_all' }}); \
          return {{ a, b }};",
         json!(CHILD_A_TAG),
         json!(CHILD_B_TAG),
@@ -8857,7 +8857,7 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SUB1 Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "SUB1 Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -9092,7 +9092,7 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SP-1 WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "SP-1 WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -9235,7 +9235,7 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
             "branch": "feat/initial-agent-no-prompt-e2e",
             "initialAgent": {
                 "name": "Coordinator",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
                 "specialist": "implementor",
             },
         }),
@@ -9338,7 +9338,7 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
             "title": "Specialist-name WS",
             "branch": "feat/initial-agent-specialist-name-e2e",
             "initialAgent": {
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
                 "specialist": "spec-writer",
             },
         }),
@@ -9385,7 +9385,7 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     // Child behavior: first turn reports back, second turn acknowledges.
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_TAG),
     );
     let behavior = json!({
@@ -9455,7 +9455,7 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Clear Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Clear Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -9608,7 +9608,7 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     let ws_id = seed_workspace_only(&data_dir).await;
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_TAG),
     );
     // Prompt-matched rules; the STALE_MSG rule comes FIRST so the redriven
@@ -9686,7 +9686,7 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Stale Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Stale Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -9951,7 +9951,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "QueueTest", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "QueueTest", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -10098,7 +10098,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
             "workspaceId": &ws_id,
             "taskNoteId": &note_id,
             "contextMessage": "wake test",
-            "create": { "model": "mock:default" },
+            "create": { "model": "default", "provider": "mock" },
         }),
     )
     .await;
@@ -10234,7 +10234,7 @@ async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -10441,7 +10441,7 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -10555,7 +10555,7 @@ async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss()
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "PreToken", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "PreToken", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -10711,7 +10711,7 @@ async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_w
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "StopRedeliver", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "StopRedeliver", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -10948,7 +10948,7 @@ async fn image_reference_block_resolves_to_acp_image_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "ImgRef", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "ImgRef", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -11084,7 +11084,7 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "STAB124", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "STAB124", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -11237,7 +11237,7 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "STAB133", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "STAB133", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -11387,7 +11387,7 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "TargetB", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "TargetB", "model": "default", "provider": "mock" }),
     )
     .await;
     let target_id = target["agent"]["id"].as_str().unwrap().to_string();
@@ -11395,7 +11395,7 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "default", "provider": "mock" }),
     )
     .await;
     let sender_id = sender["agent"]["id"].as_str().unwrap().to_string();
@@ -11551,9 +11551,9 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     // create kickoff, and a create kickoff with explicit messageMetadata.
     let ops_code = format!(
         "const st = await ws.agent.sendToTask({note}, 'task hello'); \
-         const auto = await ws.agent.create('ChildAuto', 'kickoff hello', {{ model: 'mock:default' }}); \
+         const auto = await ws.agent.create('ChildAuto', 'kickoff hello', {{ model: 'default', provider: 'mock' }}); \
          const explicit = await ws.agent.create('ChildExplicit', 'kickoff explicit', \
-             {{ model: 'mock:default', messageMetadata: {{ type: 'custom_tag', note: 'explicit wins' }} }}); \
+             {{ model: 'default', provider: 'mock', messageMetadata: {{ type: 'custom_tag', note: 'explicit wins' }} }}); \
          return {{ st, auto, explicit }};",
         note = json!(note_id),
     );
@@ -11608,7 +11608,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "TaskTarget", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "TaskTarget", "model": "default", "provider": "mock" }),
     )
     .await;
     let target_id = target["agent"]["id"].as_str().unwrap().to_string();
@@ -11616,7 +11616,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "default", "provider": "mock" }),
     )
     .await;
     let sender_id = sender["agent"]["id"].as_str().unwrap().to_string();
@@ -11831,7 +11831,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     // the tool results so the suppression (no `subscriptionId`) is asserted
     // from the transcript.
     let spawn_code = "return await ws.agent.create('ChildC', 'please MESSAGE_PARENT now', \
-                      { model: 'mock:default' });";
+                      { model: 'default', provider: 'mock' });";
     let send_code = "const agents = await ws.agent.list(true); \
                      const target = agents.find(a => a.name === 'Coordinator'); \
                      return await ws.agent.send(target.id, 'child says hi');";
@@ -11922,7 +11922,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "Coordinator", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "Coordinator", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"].as_str().unwrap().to_string();
@@ -12176,7 +12176,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         &mut rpc,
         15,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "Bystander", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "Bystander", "model": "default", "provider": "mock" }),
     )
     .await;
     let bystander_id = bystander["agent"]["id"].as_str().unwrap().to_string();
@@ -12320,7 +12320,7 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Edit", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Edit", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -12524,7 +12524,7 @@ async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Busy", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Busy", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -12698,7 +12698,7 @@ async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Guard", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Guard", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -12857,7 +12857,7 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Interruptee", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Interruptee", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13065,7 +13065,7 @@ async fn proposal_resource_standalone_block_over_chat_subscribe() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Proposer", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Proposer", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13264,7 +13264,7 @@ async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Collapser", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Collapser", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13481,7 +13481,7 @@ async fn token_usage_captured_at_turn_end_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Usage", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Usage", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13631,7 +13631,7 @@ async fn usage_update_cost_captured_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Cost", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Cost", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13652,7 +13652,7 @@ async fn usage_update_cost_captured_over_wss() {
     assert_eq!(usage1["totals"]["cost"]["amount"], 0.5, "event: {ev1}");
     assert_eq!(usage1["totals"]["cost"]["currency"], "USD");
     assert_eq!(usage1["byAgentId"][&agent_id]["cost"]["amount"], 0.5);
-    assert_eq!(usage1["byModel"]["mock:default"]["cost"]["amount"], 0.5);
+    assert_eq!(usage1["byModel"]["default"]["cost"]["amount"], 0.5);
 
     // Turn 2 — cumulative per ACP session, so 1.25 REPLACES 0.5 (not 1.75).
     let sent2 = wss_rpc(
@@ -13826,7 +13826,7 @@ async fn grok_meta_usage_bill_captured_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "GrokBill", "model": "grok:grok-code-1" }),
+        json!({ "workspaceId": ws_id, "name": "GrokBill", "model": "grok-code-1", "provider": "grok" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13982,7 +13982,7 @@ async fn status_only_tool_update_preserves_richer_title_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Titler", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Titler", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -14234,7 +14234,7 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QueueDrainDelta", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QueueDrainDelta", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -14411,7 +14411,7 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "DirectSendDelta", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "DirectSendDelta", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -14629,7 +14629,7 @@ async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Tooler", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Tooler", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -14750,7 +14750,7 @@ async fn thinking_blocks_stream_and_persist_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Thinker", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Thinker", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -14959,7 +14959,7 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Reap", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Reap", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -15133,7 +15133,7 @@ async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Wedged", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Wedged", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -15328,7 +15328,7 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "ZombieFence", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "ZombieFence", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

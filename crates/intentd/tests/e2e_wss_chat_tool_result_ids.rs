@@ -517,7 +517,7 @@ async fn drive_turn(
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": name, "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

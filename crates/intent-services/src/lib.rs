@@ -8330,6 +8330,21 @@ fn nonempty_owned(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
 }
 
+/// Wire-boundary guard (PROTOCOL §5.5): a `model` param must be a **bare**
+/// model id — compound `provider:model` ids are rejected with `-32602`
+/// (`InvalidParams`) before any side effect. `param` names the offending wire
+/// param in the error. Internal resolution is untouched: this guards only the
+/// wire entry points, never the `_op` internals.
+pub(crate) fn reject_compound_model(param: &str, value: &str) -> Result<()> {
+    if value.contains(':') {
+        return Err(Error::InvalidParams(format!(
+            "{param} must be a bare model id without ':' (got \"{value}\"); \
+             pass the provider separately alongside the bare model"
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve the specialist preview provider context (`specialist.get`/`.list`
 /// optional `provider` param): a supplied id must be a registered provider
 /// (unknown → `-32602` via `InvalidParams`); absent/empty defaults to the
@@ -15306,6 +15321,15 @@ impl WorkspaceApi for Services {
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
+        if let Some(model) = input
+            .initial_agent
+            .as_ref()
+            .and_then(|a| a.model.as_deref())
+        {
+            if let Err(e) = reject_compound_model("initialAgent.model", model) {
+                return Box::pin(async move { Err(e) });
+            }
+        }
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
@@ -24263,6 +24287,18 @@ impl WorkspaceApi for Services {
         parent_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(model) = input.model.as_deref() {
+                reject_compound_model("model", model)?;
+            }
+            if let Some(tasks) = input.tasks.as_ref() {
+                for (i, entry) in tasks.iter().enumerate() {
+                    if let intent_core::BatchTaskEntry::Options(opts) = entry {
+                        if let Some(model) = opts.model.as_deref() {
+                            reject_compound_model(&format!("tasks[{i}].model"), model)?;
+                        }
+                    }
+                }
+            }
             self.agent_delegate_op(workspace_id, input, parent_agent_id)
                 .await
         })
@@ -24475,6 +24511,9 @@ impl WorkspaceApi for Services {
         extra: intent_core::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(model) = model.as_deref() {
+                reject_compound_model("model", model)?;
+            }
             let ws_scope = workspace_id.0.clone();
             // Harness-owned commits: sessions created while the workspace's
             // effective auto-commit is off opt out of the idle subscriber, so
@@ -24712,6 +24751,9 @@ impl WorkspaceApi for Services {
         model: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(model) = model.as_deref() {
+                reject_compound_model("model", model)?;
+            }
             // Attachment-reference validation (PROTOCOL §5.5), same seam as
             // agent.sendMessage — before any state change.
             crate::agent_ops::validate_file_blocks(
@@ -24867,6 +24909,7 @@ impl WorkspaceApi for Services {
         provider_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            reject_compound_model("modelId", &model_id)?;
             self.agent_set_model_op(agent_id, model_id, provider_id)
                 .await
         })
@@ -24926,6 +24969,9 @@ impl WorkspaceApi for Services {
         timeout_ms: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(model) = model.as_deref() {
+                reject_compound_model("model", model)?;
+            }
             self.agent_enhance_prompt_op(prompt, mode, model, workspace_id, timeout_ms)
                 .await
         })
@@ -24941,6 +24987,9 @@ impl WorkspaceApi for Services {
         timeout_ms: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(model) = model.as_deref() {
+                reject_compound_model("model", model)?;
+            }
             self.agent_complete_once_op(
                 prompt,
                 system_prompt,
@@ -25076,6 +25125,12 @@ impl WorkspaceApi for Services {
         input: intent_core::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(model) = input.model.as_deref() {
+                reject_compound_model("model", model)?;
+            }
+            if let Some(model) = input.create.as_ref().and_then(|c| c.model.as_deref()) {
+                reject_compound_model("create.model", model)?;
+            }
             self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, input)
                 .await
         })

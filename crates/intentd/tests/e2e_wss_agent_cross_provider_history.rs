@@ -425,7 +425,7 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
         json!({
             "workspaceId": ws_id,
             "name": "XProv",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -449,7 +449,7 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
         &mut rpc,
         12,
         "agent.setModel",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "modelId": "grok:grok-4-fast" }),
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "modelId": "grok-4-fast", "providerId": "grok" }),
     )
     .await;
     assert_eq!(set["success"], true, "setModel ok: {set}");
@@ -475,7 +475,7 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
     .await;
     assert_eq!(
         got["agent"]["model"].as_str(),
-        Some("grok:grok-4-fast"),
+        Some("grok-4-fast"),
         "agent.get shows the cross-provider model: {got}"
     );
 
@@ -591,7 +591,12 @@ struct LoadSessionHarness {
     session_log: PathBuf,
 }
 
-async fn load_session_harness(script: &str, tag: &str, model: &str) -> LoadSessionHarness {
+async fn load_session_harness(
+    script: &str,
+    tag: &str,
+    model: &str,
+    provider: &str,
+) -> LoadSessionHarness {
     let data_dir = temp_data_dir();
     let wrapper = write_provider_wrapper(&data_dir, script);
     seed_grok_path_override(&data_dir, &wrapper);
@@ -659,7 +664,7 @@ async fn load_session_harness(script: &str, tag: &str, model: &str) -> LoadSessi
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": tag, "model": model }),
+        json!({ "workspaceId": ws_id, "name": tag, "model": model, "provider": provider }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -703,13 +708,13 @@ async fn cross_provider_switch_skips_foreign_session_load() {
     let Some(script) = gate("WSS cross-provider loadSession E2E") else {
         return;
     };
-    let mut h = load_session_harness(&script, "XLS", "mock:default").await;
+    let mut h = load_session_harness(&script, "XLS", "default", "mock").await;
 
     let set = wss_rpc(
         &mut h.rpc,
         12,
         "agent.setModel",
-        json!({ "workspaceId": h.ws_id, "agentId": h.agent_id, "modelId": "grok:grok-4-fast" }),
+        json!({ "workspaceId": h.ws_id, "agentId": h.agent_id, "modelId": "grok-4-fast", "providerId": "grok" }),
     )
     .await;
     assert_eq!(set["success"], true, "setModel ok: {set}");
@@ -771,13 +776,13 @@ async fn same_provider_model_switch_resumes_via_session_load() {
     let Some(script) = gate("WSS same-provider loadSession E2E") else {
         return;
     };
-    let mut h = load_session_harness(&script, "SLS", "grok:grok-4-fast").await;
+    let mut h = load_session_harness(&script, "SLS", "grok-4-fast", "grok").await;
 
     let set = wss_rpc(
         &mut h.rpc,
         12,
         "agent.setModel",
-        json!({ "workspaceId": h.ws_id, "agentId": h.agent_id, "modelId": "grok:grok-3" }),
+        json!({ "workspaceId": h.ws_id, "agentId": h.agent_id, "modelId": "grok-3", "providerId": "grok" }),
     )
     .await;
     assert_eq!(set["success"], true, "setModel ok: {set}");
@@ -833,13 +838,13 @@ async fn switch_and_revert_before_send_keeps_original_session() {
     let Some(script) = gate("WSS switch-revert loadSession E2E") else {
         return;
     };
-    let mut h = load_session_harness(&script, "RLS", "mock:default").await;
+    let mut h = load_session_harness(&script, "RLS", "default", "mock").await;
 
     let set = wss_rpc(
         &mut h.rpc,
         12,
         "agent.setModel",
-        json!({ "workspaceId": h.ws_id, "agentId": h.agent_id, "modelId": "grok:grok-4-fast" }),
+        json!({ "workspaceId": h.ws_id, "agentId": h.agent_id, "modelId": "grok-4-fast", "providerId": "grok" }),
     )
     .await;
     assert_eq!(set["success"], true, "setModel ok: {set}");
@@ -847,7 +852,7 @@ async fn switch_and_revert_before_send_keeps_original_session() {
         &mut h.rpc,
         13,
         "agent.setModel",
-        json!({ "workspaceId": h.ws_id, "agentId": h.agent_id, "modelId": "mock:default" }),
+        json!({ "workspaceId": h.ws_id, "agentId": h.agent_id, "modelId": "default", "providerId": "mock" }),
     )
     .await;
     assert_eq!(revert["success"], true, "revert setModel ok: {revert}");

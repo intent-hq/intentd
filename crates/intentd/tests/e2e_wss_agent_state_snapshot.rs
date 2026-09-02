@@ -503,7 +503,7 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
             "initialAgent": {
                 "prompt": format!("first turn {SUBSCRIBE_MARKER}"),
                 "name": "Snapshot Agent",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
@@ -571,7 +571,7 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
         &mut rpc,
         14,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Gated Agent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Gated Agent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent2 = created2["result"]["agent"]["id"]
@@ -735,7 +735,7 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
     // turn in flight, then verify all three child counters over WSS. The legacy
     // field remains the unsettled alias.
     let create_code = format!(
-        "return await ws.agent.create('Snapshot Child', '{CHILD_COUNTER_MARKER}', {{ model: 'mock:default' }})"
+        "return await ws.agent.create('Snapshot Child', '{CHILD_COUNTER_MARKER}', {{ model: 'default', provider: 'mock' }})"
     );
     let (create_err, create_text) = bridge.call_js(&create_code).await;
     assert!(!create_err, "child creation must succeed: {create_text}");
@@ -781,7 +781,7 @@ async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
     // parent-bridge poll below observes the in-flight child deterministically.
     let spawn_js = format!(
         "const r = await ws.agent.create('SnapChild', '{CHILD_MARKER} do the work', \
-         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
     );
     let behavior = json!({
         "rules": [
@@ -860,7 +860,7 @@ async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
             "initialAgent": {
                 "prompt": "plain first turn",
                 "name": "SnapParent",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
@@ -1018,7 +1018,7 @@ async fn snapshot_prs_groups_tracked_open_prs_over_wss() {
             "initialAgent": {
                 "prompt": "plain first turn",
                 "name": "PrsAgent",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )

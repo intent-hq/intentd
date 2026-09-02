@@ -662,7 +662,8 @@ async fn wake_or_create_created_new_subscribes_caller_over_wss() {
 /// `intent-services` unit tests) per the repo's e2e requirement. No ACP turn
 /// is driven — the child's persisted `metadata.initialMessage` carries the
 /// preamble bytes at delegate time — but the daemon needs the mock env gate
-/// satisfied so `agent.delegate`'s availability gate accepts `mock:default`.
+/// satisfied so `agent.delegate`'s availability gate accepts the mock
+/// provider's `default` model.
 #[tokio::test]
 async fn delegate_with_task_note_id_appends_preamble_over_wss() {
     const TITLE: &str = "TASK-C preamble task";
@@ -682,7 +683,7 @@ async fn delegate_with_task_note_id_appends_preamble_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": task_note_id,
             "agentInstructions": "do the delegated body",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -750,7 +751,7 @@ async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": task_note_id,
             "agentInstructions": "do the delegated body",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -837,7 +838,7 @@ async fn delegate_with_skip_auto_commit_stays_status_neutral_over_wss() {
             "taskNoteId": task_note_id,
             "agentInstructions": "do the delegated body",
             "skipAutoCommit": true,
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -902,7 +903,7 @@ async fn occupancy_guard_delegate_and_assign_agent_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": task_note_id,
             "agentInstructions": "start the work",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -919,7 +920,7 @@ async fn occupancy_guard_delegate_and_assign_agent_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": task_note_id,
             "agentInstructions": "double delegate",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -947,7 +948,7 @@ async fn occupancy_guard_delegate_and_assign_agent_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": task_note_id,
             "agentInstructions": "intentional second agent",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
             "force": true,
         }),
     )
@@ -1070,7 +1071,8 @@ async fn parked_messages_survive_wake_or_create_replacement() {
             "workspaceId": ws_id,
             "taskNoteId": task_note_id,
             "contextMessage": "kickoff",
-            "model": "mock:default",
+            "model": "default",
+            "create": { "provider": "mock" },
         }),
     )
     .await;
@@ -1156,7 +1158,8 @@ async fn parked_messages_survive_wake_or_create_replacement() {
             "workspaceId": ws_id,
             "taskNoteId": task_note_id,
             "contextMessage": "replacement kickoff",
-            "model": "mock:default",
+            "model": "default",
+            "create": { "provider": "mock" },
         }),
     )
     .await;

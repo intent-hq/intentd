@@ -393,7 +393,7 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-AUTO-UNARCHIVE", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-AUTO-UNARCHIVE", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -763,7 +763,7 @@ async fn user_send_flushes_parked_archive_notices_in_one_combined_turn() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-COMBINED-FLUSH", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-COMBINED-FLUSH", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

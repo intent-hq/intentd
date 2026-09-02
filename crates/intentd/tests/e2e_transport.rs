@@ -593,7 +593,7 @@ async fn e2e_idle_session_reaping() {
         &socket,
         2,
         "agent.create",
-        json!({ "workspaceId": ws.0, "name": "reap", "model": "mock:default" }),
+        json!({ "workspaceId": ws.0, "name": "reap", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["result"]["agent"]["id"]

@@ -364,7 +364,7 @@ async fn create_agent(rpc: &mut TlsWs, id: i64, ws_id: &str, name: &str) -> Stri
         rpc,
         id,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": name, "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock" }),
     )
     .await;
     created["agent"]["id"]
@@ -546,7 +546,7 @@ async fn debounced_report_combined_with_completion_wake_over_wss() {
 
     let spawn_js = format!(
         "const r = await ws.agent.create('DebounceChild', '{CHILD_GO} do your work', \
-         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
     );
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     // Wake-ack rule FIRST (wake turns must never re-run a marker rule off
@@ -710,7 +710,7 @@ async fn immediate_report_wake_when_debounce_disabled_over_wss() {
 
     let spawn_js = format!(
         "const r = await ws.agent.create('ZeroChild', '{CHILD_GO} do your work', \
-         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
     );
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     // `firstTurnDelayMs` holds the child's first turn open for 3s AFTER its

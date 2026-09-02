@@ -432,7 +432,7 @@ async fn rtk_prompt_injection_over_wss() {
             "initialAgent": {
                 "prompt": "run the build",
                 "name": "Test Agent (RTK on)",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
@@ -515,7 +515,7 @@ async fn rtk_prompt_injection_over_wss() {
             "initialAgent": {
                 "prompt": "run the build",
                 "name": "Test Agent (RTK off)",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )

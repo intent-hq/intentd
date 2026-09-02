@@ -503,7 +503,10 @@ fn normalize_model_option_entry(entry: &Value) -> Option<Value> {
 /// objects with a non-empty string `model`, a string `hint` (defaulting to
 /// `""` when absent), and — when present — a string `reasoningEffort`.
 /// Returns the normalized entries in input order (`None` when the key is
-/// absent — the inherit-on-omit case); any invalid shape → `-32602`.
+/// absent — the inherit-on-omit case); any invalid shape → `-32602`. Compound
+/// `provider:model` ids are NOT rejected here — legacy defs re-render through
+/// this path ([`render_file`]) and must stay lossless; the wire-boundary
+/// colon guard lives in [`reject_compound_model_options_spec`].
 fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
     let Some(value) = value else { return Ok(None) };
     let Some(arr) = value.as_array() else {
@@ -542,6 +545,23 @@ fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value
         out.push(normalized);
     }
     Ok(Some(out))
+}
+
+/// Wire-boundary colon guard for `specialist.create`/`edit` specs (PROTOCOL
+/// §5.5): every `modelOptions` entry's `model` must be a **bare** model id —
+/// compound `provider:model` ids reject with `-32602` naming the offending
+/// entry. Kept separate from [`validate_model_options_spec`] so legacy defs
+/// carrying compound entries still re-render losslessly.
+fn reject_compound_model_options_spec(value: Option<&Value>) -> Result<()> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (i, entry) in entries.iter().enumerate() {
+        if let Some(model) = entry.get("model").and_then(Value::as_str) {
+            crate::reject_compound_model(&format!("modelOptions[{i}].model"), model)?;
+        }
+    }
+    Ok(())
 }
 
 /// Leniently parse a frontmatter `modelOptions` scalar (the single-line
@@ -1588,7 +1608,11 @@ impl SpecialistsService {
         if !spec.is_object() {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
+        if let Some(model) = spec.get("model").and_then(Value::as_str) {
+            crate::reject_compound_model("model", model)?;
+        }
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
+        reject_compound_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
         validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
         validate_aliases_spec(spec.get(ALIASES_KEY))?;
         validate_role_spec(spec.get("role"))?;
@@ -1626,7 +1650,11 @@ impl SpecialistsService {
         if !spec.is_object() {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
+        if let Some(model) = spec.get("model").and_then(Value::as_str) {
+            crate::reject_compound_model("model", model)?;
+        }
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
+        reject_compound_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
         validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
         validate_aliases_spec(spec.get(ALIASES_KEY))?;
         validate_role_spec(spec.get("role"))?;
@@ -3402,6 +3430,11 @@ mod tests {
             json!({ "name": "Z", "description": "d", "modelOptions": [{ "model": 42 }] }),
             json!({ "name": "Z", "description": "d",
                 "modelOptions": [{ "model": "opus4.5", "hint": 42 }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opencode:kimi-k3", "hint": "cheap" }] }),
+            json!({ "name": "Z", "description": "d", "modelOptions": [{ "model": ":kimi-k3" }] }),
+            json!({ "name": "Z", "description": "d", "model": "opencode:kimi-k3" }),
+            json!({ "name": "Z", "description": "d", "model": ":kimi-k3" }),
         ];
         for spec in &invalid_specs {
             let err = svc.create("zeta", spec, Some("user"), None).unwrap_err();
@@ -3424,6 +3457,61 @@ mod tests {
                 "edit rejects {spec} with InvalidParams, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn create_and_edit_reject_compound_model_ids() {
+        // Wire-boundary compound-model rejection (PROTOCOL §5.5): the `model`
+        // scalar and every `modelOptions` entry must be BARE model ids —
+        // compound `provider:model` → -32602 naming the offending param;
+        // bare ids stay accepted.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let compound_scalar = json!({
+            "name": "Z", "description": "d", "model": "opencode:kimi-k3", "prompt": "body"
+        });
+        match svc
+            .create("zeta", &compound_scalar, Some("user"), None)
+            .unwrap_err()
+        {
+            Error::InvalidParams(msg) => {
+                assert!(msg.contains("model"), "names the param: {msg}");
+                assert!(msg.contains("bare model id"), "explains the fix: {msg}");
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        let compound_option = json!({
+            "name": "Z", "description": "d", "prompt": "body",
+            "modelOptions": [
+                { "model": "opus4.5", "hint": "ok" },
+                { "model": "opencode:kimi-k3", "hint": "cheap" }
+            ]
+        });
+        match svc
+            .create("zeta", &compound_option, Some("user"), None)
+            .unwrap_err()
+        {
+            Error::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("modelOptions[1].model"),
+                    "names the offending entry: {msg}"
+                );
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        assert!(
+            !user.path.join("zeta.md").exists(),
+            "nothing is written on a rejected create"
+        );
+        let bare = json!({
+            "name": "Z", "description": "d", "model": "opus4.5",
+            "modelOptions": [{ "model": "kimi-k3", "hint": "cheap" }], "prompt": "body"
+        });
+        svc.create("zeta", &bare, Some("user"), None)
+            .expect("bare model ids accepted on create");
+        svc.edit("zeta", &bare, "user", None)
+            .expect("bare model ids accepted on edit");
     }
 
     #[test]

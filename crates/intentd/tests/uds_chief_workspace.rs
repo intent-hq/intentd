@@ -117,7 +117,7 @@ async fn chief_workspace_over_uds() {
     let resp = send(
         &config.socket_path,
         &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{CHIEF_WORKSPACE_ID}","name":"Chief Assistant","model":"mock:default"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{CHIEF_WORKSPACE_ID}","name":"Chief Assistant","model":"default","provider":"mock"}}}}"#
         ),
     )
     .await;

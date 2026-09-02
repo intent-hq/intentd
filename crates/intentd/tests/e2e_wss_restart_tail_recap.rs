@@ -405,7 +405,7 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         &socket,
         1,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Tail Agent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Tail Agent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["result"]["agent"]["id"]

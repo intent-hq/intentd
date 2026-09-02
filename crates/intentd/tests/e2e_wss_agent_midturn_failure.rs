@@ -376,7 +376,7 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-MIDTURN", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-MIDTURN", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -704,7 +704,7 @@ async fn stderr_hint_settles_past_pipe_holding_descendant_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-STDERR-HOLD", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-STDERR-HOLD", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -837,7 +837,7 @@ async fn agent_retry_with_empty_queue_clears_to_idle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-EMPTY", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-EMPTY", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1074,7 +1074,7 @@ async fn agent_dead_while_idle_respawns_transparently_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-DEAD-IDLE", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-DEAD-IDLE", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1299,7 +1299,7 @@ async fn agent_pre_token_transport_failure_redrives_silently_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-SILENT-REDRIVE", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-SILENT-REDRIVE", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

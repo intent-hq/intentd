@@ -376,7 +376,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         json!({
             "workspaceId": ws_id,
             "name": "Test Agent",
-            "model": "mock:default"
+            "model": "default", "provider": "mock"
         }),
     )
     .await;
@@ -555,7 +555,7 @@ async fn setting_on_resumes_without_resume_all_flag() {
         json!({
             "workspaceId": ws_id,
             "name": "Test Agent",
-            "model": "mock:default"
+            "model": "default", "provider": "mock"
         }),
     )
     .await;

@@ -397,7 +397,7 @@ async fn create_agent(rpc: &mut TlsWs, ws_id: &str, name: &str) -> String {
     let created = wss_rpc(
         rpc,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": name, "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock" }),
     )
     .await;
     created["agent"]["id"]
@@ -871,7 +871,7 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": note_id,
             "agentInstructions": format!("{BLOCK_MARKER} report the blocker"),
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;

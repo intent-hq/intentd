@@ -386,7 +386,7 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
         json!({
             "workspaceId": ws_id,
             "name": "Queue Order Agent",
-            "model": "mock:default"
+            "model": "default", "provider": "mock"
         }),
     )
     .await;

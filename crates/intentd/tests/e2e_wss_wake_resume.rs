@@ -389,7 +389,7 @@ async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-WAKE", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-WAKE", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

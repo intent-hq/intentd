@@ -398,7 +398,7 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
     .expect("seed config.toml with agentFeatures.taskGraph");
 
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_TASK_NOTE_ID),
         json!(CHILD_MARK),
     );
@@ -474,7 +474,7 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -593,7 +593,7 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     .expect("seed config.toml with agentFeatures.taskGraph");
 
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_TASK_NOTE_ID),
         json!(VF_IMPLEMENTOR_MARK),
     );
@@ -607,7 +607,7 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     );
     // The verifier is a plain child with NO linked task note.
     let spawn_js = format!(
-        "return await ws.agent.create('Verifier', {}, {{ model: 'mock:default' }});",
+        "return await ws.agent.create('Verifier', {}, {{ model: 'default', provider: 'mock' }});",
         json!(VF_VERIFIER_MARK),
     );
     // The verifier flips the IMPLEMENTOR's task complete — an OTHER-task
@@ -716,7 +716,7 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]

@@ -537,8 +537,9 @@ async fn delegate_explicit_provider_param_over_wss() {
         "explicit provider param persisted on the delegated session: {get_result}"
     );
 
-    // Contradiction: compound model naming a different provider than the
-    // param rejects with -32602 naming both sides, before any side effect.
+    // Compound model id → the wire-boundary -32602 (PROTOCOL §5.5): compound
+    // `provider:model` ids reject before any side effect, regardless of the
+    // provider param.
     let contradiction = wss_rpc_raw(
         &mut ws,
         50,
@@ -553,16 +554,16 @@ async fn delegate_explicit_provider_param_over_wss() {
     .await;
     let error = contradiction
         .get("error")
-        .unwrap_or_else(|| panic!("contradicting provider/model must fail: {contradiction}"));
+        .unwrap_or_else(|| panic!("compound model must fail: {contradiction}"));
     assert_eq!(
         error["code"].as_i64(),
         Some(-32602),
-        "contradiction rejects with InvalidParams: {error}"
+        "compound model rejects with InvalidParams: {error}"
     );
     let message = error["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("codex") && message.contains("mock"),
-        "error names both the model's provider and the param: {message}"
+        message.contains("model must be a bare model id"),
+        "error tells the caller to pass a bare model id: {message}"
     );
 
     // Unknown provider id rejects with -32602 naming the known providers.

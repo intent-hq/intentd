@@ -476,7 +476,7 @@ async fn poisoned_session_retry_recreates_instead_of_resuming_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-POISONED", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-POISONED", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

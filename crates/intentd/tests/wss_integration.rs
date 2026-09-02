@@ -2700,7 +2700,8 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
         "error must name the unknown provider: {rejected}"
     );
 
-    // Unknown compound model prefix → the same -32602.
+    // Compound model id → -32602 at the wire boundary (PROTOCOL §5.5:
+    // compound `provider:model` ids are rejected before any side effect).
     let frame = format!(
         r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad2","model":"nonexistent:foo"}}}}"#
     );
@@ -2708,18 +2709,18 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     assert_eq!(
         rejected["error"]["code"].as_i64(),
         Some(-32602),
-        "unknown compound-prefix provider must be -32602: {rejected}"
+        "compound model id must be -32602: {rejected}"
     );
     assert!(
         rejected["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("agent.create: unknown provider: nonexistent"),
-        "error must name the unknown provider: {rejected}"
+            .contains("model must be a bare model id"),
+        "error must tell the caller to pass a bare model id: {rejected}"
     );
 
-    // Explicit VALID provider + unknown compound model prefix → also -32602
-    // (the spawn path gives the model prefix precedence over session.provider).
+    // Explicit VALID provider + compound model → the same wire-boundary
+    // -32602 (compound ids reject regardless of the provider param).
     let frame = format!(
         r#"{{"jsonrpc":"2.0","id":8,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad3","provider":"auggie","model":"nonexistent:foo"}}}}"#
     );
@@ -2727,14 +2728,14 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     assert_eq!(
         rejected["error"]["code"].as_i64(),
         Some(-32602),
-        "valid provider + unknown model prefix must be -32602: {rejected}"
+        "valid provider + compound model must be -32602: {rejected}"
     );
     assert!(
         rejected["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("agent.create: unknown provider: nonexistent"),
-        "error must name the unknown provider: {rejected}"
+            .contains("model must be a bare model id"),
+        "error must tell the caller to pass a bare model id: {rejected}"
     );
 
     // No rejection persisted a session row.
@@ -2759,7 +2760,7 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
         .to_string();
     let model_before = created["result"]["agent"]["model"].clone();
 
-    // …and agent.setModel rejects an unknown compound prefix the same way.
+    // …and agent.setModel rejects a compound modelId the same way.
     let set_frame = format!(
         r#"{{"jsonrpc":"2.0","id":6,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"nonexistent:foo"}}}}"#
     );
@@ -2767,14 +2768,14 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     assert_eq!(
         rejected["error"]["code"].as_i64(),
         Some(-32602),
-        "setModel with unknown compound-prefix provider must be -32602: {rejected}"
+        "setModel with a compound modelId must be -32602: {rejected}"
     );
     assert!(
         rejected["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("agent.setModel: unknown provider: nonexistent"),
-        "error must name the unknown provider: {rejected}"
+            .contains("modelId must be a bare model id"),
+        "error must name modelId and tell the caller to pass a bare model id: {rejected}"
     );
 
     // The rejected setModel left the session untouched.
@@ -2891,10 +2892,10 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
         "unknown-to-all bare id must pass: {created}"
     );
 
-    // An auggie session (compound-prefix derived provider) rejects a bare
+    // An auggie session (explicit provider param) rejects a bare
     // grok-claimed model via agent.setModel with the same envelope shape…
     let frame = format!(
-        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Auggie","model":"auggie:sonnet4.5"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Auggie","model":"sonnet4.5","provider":"auggie"}}}}"#
     );
     let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     let agent_id = created["result"]["agent"]["id"]
@@ -2927,7 +2928,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
     assert_eq!(
         got["result"]["agent"]["model"],
-        Value::from("auggie:sonnet4.5"),
+        Value::from("sonnet4.5"),
         "model must be unchanged after the rejected setModel: {got}"
     );
 
@@ -2992,7 +2993,7 @@ async fn wss_agent_set_model_provider_id_param() {
         .expect("workspace id")
         .to_string();
     let frame = format!(
-        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Pid","model":"auggie:sonnet4.5"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Pid","model":"sonnet4.5","provider":"auggie"}}}}"#
     );
     let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_envelope(&created, 2);
@@ -3038,7 +3039,8 @@ async fn wss_agent_set_model_provider_id_param() {
         "error must name the unknown provider: {rejected}"
     );
 
-    // Compound modelId whose prefix conflicts with providerId → -32602.
+    // Compound modelId → -32602 at the wire boundary (PROTOCOL §5.5:
+    // compound `provider:model` ids are rejected regardless of providerId).
     let frame = format!(
         r#"{{"jsonrpc":"2.0","id":5,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"auggie:sonnet4.5","providerId":"grok"}}}}"#
     );
@@ -3047,14 +3049,14 @@ async fn wss_agent_set_model_provider_id_param() {
     assert_eq!(
         rejected["error"]["code"].as_i64(),
         Some(-32602),
-        "conflicting providerId must be -32602: {rejected}"
+        "compound modelId must be -32602: {rejected}"
     );
     assert!(
         rejected["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("names provider auggie but providerId is grok"),
-        "error must name both providers: {rejected}"
+            .contains("modelId must be a bare model id"),
+        "error must name modelId and tell the caller to pass a bare model id: {rejected}"
     );
 
     // A present non-string providerId is malformed — -32602 at the router
@@ -3085,7 +3087,7 @@ async fn wss_agent_set_model_provider_id_param() {
     assert_envelope(&got, 7);
     assert_eq!(
         got["result"]["agent"]["model"],
-        Value::from("auggie:sonnet4.5"),
+        Value::from("sonnet4.5"),
         "model must be unchanged after the rejections: {got}"
     );
     assert_eq!(
@@ -3260,7 +3262,7 @@ async fn wss_agent_create_widened_params_round_trip() {
     let params = format!(
         concat!(
             r#"{{"workspaceId":"{ws}","name":"WSS Wide","#,
-            r#""model":"auggie:sonnet4.5","specialistId":"implementor","#,
+            r#""model":"sonnet4.5","provider":"auggie","specialistId":"implementor","#,
             r#""provider":"auggie","agentType":"task-loop","#,
             r#""metadata":{{"tag":"unit"}},"workspacePath":"/tmp/wid","#,
             r#""workspaceContext":{{"selection":"note:1"}},"isBackground":true}}"#
@@ -3284,7 +3286,7 @@ async fn wss_agent_create_widened_params_round_trip() {
     // Return shape is the full `AgentLite` projection — a superset of the
     // pre-widening `{id, name}` snippet. Assert the persisted fields land.
     assert_eq!(created["name"].as_str(), Some("WSS Wide"));
-    assert_eq!(created["model"].as_str(), Some("auggie:sonnet4.5"));
+    assert_eq!(created["model"].as_str(), Some("sonnet4.5"));
     assert_eq!(created["provider"].as_str(), Some("auggie"));
     assert_eq!(created["workspaceId"].as_str(), Some(ws_id.as_str()));
     assert_eq!(created["metadata"]["specialist"], "implementor");
@@ -3908,7 +3910,7 @@ async fn wss_agent_reasoning_effort_round_trip() {
         vec![
             // 1) create with reasoningEffort — echoed on the AgentLite result.
             format!(
-                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Effort","model":"codex:gpt-5.3-codex","reasoningEffort":"xhigh"}}}}"#
+                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Effort","model":"gpt-5.3-codex","provider":"codex","reasoningEffort":"xhigh"}}}}"#
             ),
         ],
     )
@@ -4213,7 +4215,7 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
     );
 
     let frame = format!(
-        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Explicit model","model":"auggie:fable-5"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Explicit model","model":"fable-5","provider":"auggie"}}}}"#
     );
     let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert!(

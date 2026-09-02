@@ -356,7 +356,7 @@ const NUDGE_MARK: &str = "Automatic redrive (monorepo#2863)";
 
 fn delegate_js() -> String {
     format!(
-        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(TASK_NOTE_ID),
         json!(CHILD_MARK),
     )
@@ -455,7 +455,7 @@ async fn truncated_turn_redriven_and_no_premature_wake_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -656,7 +656,7 @@ async fn redrive_cap_exhaustion_falls_through_to_annotated_idle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]

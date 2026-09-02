@@ -406,7 +406,7 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-FLUSH", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-FLUSH", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
