@@ -1028,7 +1028,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "mcp",
         ),
         // --- Group A: user notifications --------------------------------------
-        // Ports the FE `notificationSettings` electron-store bag (four fields
+        // Ports the FE `notificationSettings` electron-store bag (fields
         // surfaced individually via the FE app-settings schema `notifications.*`
         // paths) so the daemon owns the persisted notification user prefs and
         // the legacy `settings` electron-store can retire (§9.8 group A).
@@ -1045,6 +1045,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Whether notification sounds are enabled",
             "notifications",
             true,
+        ),
+        string(
+            "notifications.soundPath",
+            "Custom notification sound",
+            "Desktop-client-local sound path; empty uses the built-in sound",
+            "notifications",
+            Some(""),
         ),
         boolean(
             "notifications.soundOnlyWhenUnfocused",
@@ -2430,29 +2437,30 @@ mod tests {
         }
     }
 
-    /// Ports the FE `notificationSettings` electron-store bag as four
+    /// Ports the FE `notificationSettings` electron-store bag as
     /// individually-addressable, non-secret catalog entries under the
     /// `notifications` category. `notifications.volume` carries a documented
     /// `0.0..=1.0` clamp so out-of-range writes surface as `-32602`.
     #[test]
     fn notifications_catalog_entries_match_fe_shape() {
-        for (path, expect_bool, default) in [
-            ("notifications.enabled", true, json!(true)),
-            ("notifications.soundEnabled", true, json!(true)),
-            ("notifications.soundOnlyWhenUnfocused", true, json!(true)),
-            ("notifications.volume", false, json!(0.5)),
+        for (path, expected_type, default) in [
+            ("notifications.enabled", "boolean", json!(true)),
+            ("notifications.soundEnabled", "boolean", json!(true)),
+            ("notifications.soundPath", "string", json!("")),
+            (
+                "notifications.soundOnlyWhenUnfocused",
+                "boolean",
+                json!(true),
+            ),
+            ("notifications.volume", "number", json!(0.5)),
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
             assert!(!def.read_only, "{path} must not be read-only");
             assert_eq!(def.category, "notifications");
             assert_eq!(def.default_value.as_ref(), Some(&default));
-            if expect_bool {
-                assert!(
-                    matches!(def.ty, SettingType::Boolean),
-                    "{path} must be Boolean"
-                );
-            } else {
+            assert_eq!(def.ty.wire_name(), expected_type, "{path}");
+            if expected_type == "number" {
                 assert!(
                     matches!(
                         def.ty,

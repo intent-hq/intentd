@@ -66,6 +66,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "mcp.disabledServers",
     "notifications.enabled",
     "notifications.soundEnabled",
+    "notifications.soundPath",
     "notifications.soundOnlyWhenUnfocused",
     "notifications.volume",
     "rtk.enabled",
@@ -965,6 +966,10 @@ mod tests {
             ("git.autoCommit", json!("yes")),
             ("server.wsApi.port", json!(80)),
             ("notifications.volume", json!(2.0)),
+            ("notifications.soundPath", json!(true)),
+            ("notifications.soundPath", json!(42)),
+            ("notifications.soundPath", json!([])),
+            ("notifications.soundPath", json!({})),
             ("logging.level", json!("verbose")),
             ("agents.maxConcurrent", json!(500)),
         ] {
@@ -990,6 +995,10 @@ mod tests {
             ),
             ("mcp.disabledServers".to_string(), json!(["linear"])),
             ("notifications.volume".to_string(), json!(0.25)),
+            (
+                "notifications.soundPath".to_string(),
+                json!("/desktop-only/My sounds/通知.mp3"),
+            ),
         ])
         .expect("apply");
 
@@ -1002,6 +1011,10 @@ mod tests {
         );
         assert_eq!(reloaded.get("mcp.disabledServers"), Some(json!(["linear"])));
         assert_eq!(reloaded.get("notifications.volume"), Some(json!(0.25)));
+        assert_eq!(
+            reloaded.get("notifications.soundPath"),
+            Some(json!("/desktop-only/My sounds/通知.mp3"))
+        );
         assert_eq!(reloaded.origin("git.autoCommit"), Some(SettingOrigin::File));
     }
 
@@ -1090,6 +1103,53 @@ mod tests {
         assert_eq!(reg.get("server.wsApi.port"), Some(json!(7000)));
         assert_eq!(reg.get("server.wsApi.enabled"), Some(json!(true)));
         assert!(rx.has_changed().expect("sender alive"));
+    }
+
+    #[test]
+    fn notification_sound_path_defaults_reloads_and_resets() {
+        let legacy = "[notifications]\nenabled = false\nsoundEnabled = true\nsoundOnlyWhenUnfocused = false\nvolume = 0.25\n";
+        let (_dir, path) = temp_config(Some(legacy));
+        let reg = SettingsRegistry::load(&path).expect("load legacy config");
+        let key = "notifications.soundPath";
+        assert_eq!(reg.get(key), Some(json!("")));
+        assert_eq!(reg.origin(key), Some(SettingOrigin::Default));
+
+        let text = format!("{legacy}soundPath = '/desktop-only/custom.mp3'\n");
+        let notice = reg.reload(&text).expect("reload client-local path");
+        assert_eq!(notice.changed, BTreeSet::from([key.to_string()]));
+        assert_eq!(reg.get(key), Some(json!("/desktop-only/custom.mp3")));
+        assert_eq!(reg.origin(key), Some(SettingOrigin::File));
+
+        for invalid in ["true", "42", "[]", "{}"] {
+            let err = reg
+                .reload(&format!("{legacy}soundPath = {invalid}\n"))
+                .unwrap_err();
+            assert!(err.to_string().contains(key), "{err}");
+            assert_eq!(reg.get(key), Some(json!("/desktop-only/custom.mp3")));
+        }
+
+        let notice = reg.reload(legacy).expect("reload removed key");
+        assert!(notice.changed.contains(key));
+        assert_eq!(reg.get(key), Some(json!("")));
+        assert_eq!(reg.origin(key), Some(SettingOrigin::Default));
+
+        reg.apply(&set(key, json!("/desktop-only/custom.mp3")))
+            .expect("apply");
+        reg.apply(&set(key, Value::Null)).expect("reset");
+        let reloaded = SettingsRegistry::load(&path).expect("reload reset file");
+        assert_eq!(reloaded.get(key), Some(json!("")));
+        assert_eq!(reloaded.origin(key), Some(SettingOrigin::Default));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("soundPath"));
+        assert!(!reloaded.snapshot().effective.notifications.enabled);
+        assert!(
+            !reloaded
+                .snapshot()
+                .effective
+                .notifications
+                .sound_only_when_unfocused
+        );
     }
 
     #[test]

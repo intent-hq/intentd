@@ -457,6 +457,100 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     assert_eq!(get["result"]["origin"], json!("file"), "{get}");
 }
 
+/// Client-local notification sound paths use the existing TOML lifecycle:
+/// absent defaults, string-only updates, persistence, clearing and reset.
+#[tokio::test]
+async fn notification_sound_path_round_trips_and_resets_over_wss() {
+    let data_dir = temp_data_dir();
+    let config_path = data_dir.join("config.toml");
+    std::fs::write(&config_path, "[notifications]\nsoundEnabled = false\n")
+        .expect("seed legacy notification config");
+    let (_daemon, mut rpc, mut sub) = boot_with_wss(&data_dir).await;
+    let path = "notifications.soundPath";
+    let custom = "/desktop-only/My sounds/通知.mp3";
+
+    let get = wss_rpc(&mut rpc, 10, "settings.get", json!({ "path": path })).await;
+    assert_eq!(get["jsonrpc"], "2.0");
+    assert_eq!(get["id"], 10);
+    assert_eq!(get["result"]["path"], path);
+    assert_eq!(get["result"]["value"], "");
+    assert_eq!(get["result"]["origin"], "default");
+    assert_eq!(get["result"]["definition"]["type"], "string");
+    assert_eq!(get["result"]["definition"]["defaultValue"], "");
+    let initial_revision = get["result"]["revision"].clone();
+    let original = std::fs::read_to_string(&config_path).unwrap();
+
+    for invalid in [json!(true), json!(42), json!([]), json!({}), Value::Null] {
+        let update = wss_rpc(
+            &mut rpc,
+            11,
+            "settings.update",
+            json!({ "changes": [
+                { "path": "notifications.soundEnabled", "value": true },
+                { "path": path, "value": invalid }
+            ] }),
+        )
+        .await;
+        assert_eq!(update["jsonrpc"], "2.0");
+        assert_eq!(update["id"], 11);
+        assert_eq!(update["error"]["code"], -32602, "{update}");
+    }
+    let get = wss_rpc(&mut rpc, 12, "settings.get", json!({ "path": path })).await;
+    assert_eq!(get["result"]["value"], "");
+    assert_eq!(get["result"]["revision"], initial_revision);
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+
+    for value in [custom, "", custom] {
+        let update = wss_rpc(
+            &mut rpc,
+            13,
+            "settings.update",
+            json!({ "changes": [{ "path": path, "value": value }] }),
+        )
+        .await;
+        assert_eq!(update["jsonrpc"], "2.0");
+        assert_eq!(update["id"], 13);
+        let applied = json!([{ "path": path, "value": value, "origin": "file" }]);
+        assert_eq!(update["result"]["applied"], applied);
+        let event = next_settings_event(&mut sub).await;
+        assert_eq!(event["params"]["event"]["data"]["changes"], applied);
+        assert_eq!(
+            event["params"]["event"]["data"]["revision"],
+            update["result"]["revision"]
+        );
+        let get = wss_rpc(&mut rpc, 14, "settings.get", json!({ "path": path })).await;
+        assert_eq!(get["result"]["value"], value);
+        assert_eq!(get["result"]["origin"], "file");
+        let saved = intent_core::settings_file::SettingsFile::load_or_init(&config_path)
+            .expect("load persisted config");
+        assert_eq!(saved.notifications.sound_path, value);
+        assert!(!saved.notifications.sound_enabled);
+    }
+
+    let reset = wss_rpc(&mut rpc, 15, "settings.reset", json!({ "path": path })).await;
+    assert_eq!(reset["jsonrpc"], "2.0");
+    assert_eq!(reset["id"], 15);
+    assert_eq!(reset["result"]["path"], path);
+    assert_eq!(reset["result"]["value"], "");
+    assert_eq!(reset["result"]["origin"], "default");
+    let event = next_settings_event(&mut sub).await;
+    assert_eq!(
+        event["params"]["event"]["data"]["changes"],
+        json!([{ "path": path, "value": "", "origin": "default" }])
+    );
+    assert_eq!(
+        event["params"]["event"]["data"]["revision"],
+        reset["result"]["revision"]
+    );
+    assert!(!std::fs::read_to_string(&config_path)
+        .unwrap()
+        .contains("soundPath"));
+    let saved = intent_core::settings_file::SettingsFile::load_or_init(&config_path)
+        .expect("load reset config");
+    assert!(saved.notifications.sound_path.is_empty());
+    assert!(!saved.notifications.sound_enabled);
+}
+
 /// §9.8 scenarios 2 + 3: an external editor-style edit of config.toml
 /// live-reloads (settings:changed over WSS + settings.get reflects it), an
 /// invalid edit (syntax error, then unknown key) keeps last-good values with

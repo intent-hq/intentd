@@ -195,6 +195,9 @@ pub struct NotificationsSettings {
     pub enabled: bool,
     /// `notifications.soundEnabled` — whether notification sounds are enabled.
     pub sound_enabled: bool,
+    /// `notifications.soundPath` — desktop-client-local audio path; empty uses
+    /// the built-in sound. The daemon stores it without accessing the file.
+    pub sound_path: String,
     /// `notifications.soundOnlyWhenUnfocused` — only play sounds when the app
     /// is unfocused.
     pub sound_only_when_unfocused: bool,
@@ -208,6 +211,7 @@ impl Default for NotificationsSettings {
         Self {
             enabled: true,
             sound_enabled: true,
+            sound_path: String::new(),
             sound_only_when_unfocused: true,
             volume: 0.5,
         }
@@ -1366,6 +1370,9 @@ disabledServers = []
 enabled = true
 # Notification sounds -- whether notification sounds are enabled.
 soundEnabled = true
+# Custom sound path -- resolved on the desktop client, not the daemon host.
+# Empty uses the built-in sound.
+soundPath = ""
 # Sound only when unfocused -- only play notification sounds when the app is
 # unfocused.
 soundOnlyWhenUnfocused = true
@@ -1661,6 +1668,7 @@ mod tests {
         assert!(d.mcp.disabled_servers.is_empty());
         assert!(d.notifications.enabled);
         assert!(d.notifications.sound_enabled);
+        assert!(d.notifications.sound_path.is_empty());
         assert!(d.notifications.sound_only_when_unfocused);
         assert_eq!(d.notifications.volume, 0.5);
         assert!(!d.rtk.enabled);
