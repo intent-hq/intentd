@@ -61,6 +61,14 @@ pub(crate) const RETIRED_BACKGROUND_AGENT_PATHS: &[&str] = &[
     "backgroundAgents.providerSettings",
 ];
 
+/// The deprecated legacy default-provider path. Unlike the retired paths
+/// above it keeps a (read-only) catalog entry during the deprecation window,
+/// so `settings.get`/`settings.list` stay answerable — but writes via
+/// `settings.update` are tolerated-and-ignored so a client can never recreate
+/// the key after [`migrate_active_provider_setting`] removed it from
+/// `config.toml`.
+pub(crate) const DEPRECATED_ACTIVE_PROVIDER_PATH: &str = "providers.active";
+
 /// Settings path of the user-editable transcription vocabulary (§5.12).
 pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
 
@@ -929,16 +937,23 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         None,
     );
     specialists_dir.read_only = true;
+    // Deprecated: kept in the catalog so `settings.get`/`settings.list` stay
+    // answerable during the deprecation window, but read-only so no write path
+    // can recreate the key after [`migrate_active_provider_setting`] removed
+    // it from config.toml (`settings.update` tolerates-and-ignores it before
+    // the read-only rejection would fire, so old clients never fail a batch).
+    let mut providers_active = string(
+        "providers.active",
+        "Active provider (deprecated)",
+        "Deprecated: superseded by model.defaultProvider (carried over and removed from \
+         config.toml once at startup; never consulted; read-only on the wire)",
+        "providers",
+        None,
+    );
+    providers_active.read_only = true;
     vec![
         // --- Group A: providers / agents -----------------------------------
-        string(
-            "providers.active",
-            "Active provider (deprecated)",
-            "Deprecated: superseded by model.defaultProvider (carried over and removed from \
-             config.toml once at startup; never consulted)",
-            "providers",
-            None,
-        ),
+        providers_active,
         object(
             "providers.enabled",
             "Enabled providers",
@@ -2201,8 +2216,13 @@ impl<'a> SettingsService<'a> {
             // monorepo#1729 compatibility: pre-rename clients still write the
             // `backgroundAgents.*` paths. Same tolerate-and-ignore treatment —
             // the renamed `quickActions.*` keys are the only writable surface.
+            // The deprecated `providers.active` gets the same treatment so a
+            // write can never recreate the key `migrate_active_provider_setting`
+            // removed from config.toml (its catalog entry is read-only, but a
+            // hard rejection would fail whole batches from old clients).
             if path == RETIRED_WORKSPACE_OVERRIDES_PATH
                 || RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
+                || path == DEPRECATED_ACTIVE_PROVIDER_PATH
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
@@ -4404,6 +4424,74 @@ mod tests {
             "a file without the legacy key is never rewritten"
         );
         let _ = std::fs::remove_file(&config_path3);
+    }
+
+    /// The deprecated `providers.active` cannot be recreated through the
+    /// settings API after the boot migration removed it: the catalog entry is
+    /// read-only, and `settings.update` tolerates-and-ignores writes to it
+    /// (nothing validated, persisted, echoed, or published) so an old client's
+    /// batch never fails wholesale — mirroring the retired-path treatment.
+    #[tokio::test]
+    async fn active_provider_update_is_tolerated_and_ignored() {
+        let def = find_definition(DEPRECATED_ACTIVE_PROVIDER_PATH)
+            .expect("providers.active must stay in the catalog during deprecation");
+        assert!(
+            def.read_only,
+            "providers.active must be read-only so no write path recreates it"
+        );
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-actwrite-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-actwrite-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // A lone legacy write is ignored: nothing applied, nothing persisted.
+        let applied = svc
+            .update(&json!([
+                { "path": "providers.active", "value": "codex" },
+            ]))
+            .await
+            .expect("legacy providers.active write must be tolerated");
+        assert_eq!(applied, Vec::<Value>::new());
+        assert_eq!(
+            registry.origin("providers.active"),
+            Some(SettingOrigin::Default),
+            "the ignored write must not resurrect the key"
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("active"), "{text}");
+
+        // A batch mixing the legacy path with a live one still applies the
+        // live entry instead of failing wholesale.
+        let applied = svc
+            .update(&json!([
+                { "path": "providers.active", "value": "codex" },
+                { "path": "model.defaultProvider", "value": "codex" },
+            ]))
+            .await
+            .expect("mixed batch must apply its live entry");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["path"], "model.defaultProvider");
+        assert_eq!(registry.get("model.defaultProvider"), Some(json!("codex")));
+
+        // The catalog entry keeps get/reset answerable during deprecation.
+        let got = svc.get("providers.active").await.expect("get");
+        assert_eq!(got["origin"], json!("default"));
+        svc.reset("providers.active").await.expect("reset");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// `settings.update` rejects compound `provider:model` values on the
