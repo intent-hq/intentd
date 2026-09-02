@@ -5341,6 +5341,112 @@ impl Services {
         }
     }
 
+    /// Permanent-failure probe for a failed parent wake (monorepo#4183): a
+    /// RETIRED watcher can never consume a wake (the soft-retire inertness
+    /// gate rejects every delivery until `agent.restore`), and an
+    /// UNKNOWN/DELETED watcher — no session row at all — can never consume
+    /// one either. Both make retrying a permanent-failure loop, not
+    /// recovery. Returns the terminal reason, or `None` when the parent is
+    /// live or the probe hit a transient store error (fail open: the normal
+    /// retry path runs).
+    async fn wake_target_permanently_gone(&self, parent: &AgentId) -> Option<&'static str> {
+        match self.store.get_agent_session_retired_at(parent).await {
+            Ok(Some(_)) => Some("retired"),
+            Err(intent_store::Error::NotFound(_)) => Some("unknown/deleted"),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// Wholesale sweep of a permanently gone parent's subscription state
+    /// (monorepo#4183): every outgoing completion watch
+    /// (`remove_all_for_parent`) and every delegation group
+    /// (`remove_groups_for_parent`), memory + persisted rows, mirroring the
+    /// `retire_one_session` sweep this backstop exists to backstop. Sweeping
+    /// wholesale — instead of dropping only the watch whose delivery failed
+    /// — keeps one consistent contract (gone parent ⇒ no outgoing watches,
+    /// no groups): a grouped watch dropped alone would leave its child in
+    /// the group's `expected_agent_ids` and strand the group forever, and
+    /// sibling watches would each have to fail-and-drop individually. Ends
+    /// with a `waiting` recompute since watches feed
+    /// `workspace_has_waiting_agent_subscriptions`.
+    async fn sweep_gone_parent_subscriptions(
+        &self,
+        parent: &AgentId,
+        parent_ws: &WorkspaceId,
+        reason: &'static str,
+    ) {
+        let watches = self.remove_all_for_parent(parent);
+        let groups = self.remove_groups_for_parent(parent);
+        tracing::warn!(
+            parent = %parent.0,
+            watches,
+            groups,
+            reason,
+            "swept watches + delegation groups — parent can never consume a wake; no retry"
+        );
+        self.maybe_emit_waiting_changed(parent_ws).await;
+    }
+
+    /// Terminal-failure classification for a failed parent wake
+    /// (monorepo#4183): when the failed delivery's target is permanently
+    /// gone (retired or unknown/deleted), sweep ALL of the parent's watches
+    /// and groups (see [`Services::sweep_gone_parent_subscriptions`]) and
+    /// return `true` so the caller skips the retry scheduling; a restored
+    /// agent re-arms with `ws.agent.watch` if it still cares. Fails open: a
+    /// store read error (or a live parent) returns `false` and the normal
+    /// retry path runs. This is a backstop — `agent.retire` drops the
+    /// retiree's own watches up front — covering watches that raced the
+    /// retire sweep or predate the fix in persisted form.
+    async fn drop_watch_if_parent_gone(
+        &self,
+        watch: &agent_subscriptions::CompletionWatch,
+        child_id: &AgentId,
+    ) -> bool {
+        let Some(reason) = self
+            .wake_target_permanently_gone(&watch.parent_agent_id)
+            .await
+        else {
+            return false;
+        };
+        tracing::warn!(
+            parent = %watch.parent_agent_id.0,
+            child = %child_id.0,
+            watch = %watch.id,
+            reason,
+            "failed wake target is permanently gone; dropping its subscriptions"
+        );
+        self.sweep_gone_parent_subscriptions(
+            &watch.parent_agent_id,
+            &watch.parent_workspace_id,
+            reason,
+        )
+        .await;
+        true
+    }
+
+    /// Grouped mirror of [`Services::drop_watch_if_parent_gone`] for the
+    /// aggregated `after_all` wake path (monorepo#4183): a failed group wake
+    /// whose parent is permanently gone (retired or unknown/deleted — e.g. a
+    /// deleted agent whose delegation group survived in the DB and
+    /// rehydrated after restart) is terminal. The parent's groups and
+    /// watches are swept from memory AND their persisted rows deleted, so
+    /// neither the live retry task nor a future restart can resume the
+    /// permanent-failure loop. Fails open on store read errors.
+    async fn drop_group_if_parent_gone(
+        &self,
+        group: &agent_subscriptions::DelegationGroup,
+    ) -> bool {
+        let Some(reason) = self
+            .wake_target_permanently_gone(&group.parent_agent_id)
+            .await
+        else {
+            return false;
+        };
+        self.sweep_gone_parent_subscriptions(&group.parent_agent_id, &group.workspace_id, reason)
+            .await;
+        true
+    }
+
     /// Retry failed durable terminal wakes for `child_id` until its
     /// ungrouped watches retire or a pass completes without a delivery
     /// failure. Retry ownership is coalesced per child
@@ -5369,7 +5475,10 @@ impl Services {
 
         let services = self.clone();
         tokio::spawn(async move {
-            let mut backoff = std::time::Duration::from_millis(100);
+            // 500ms initial (monorepo#4183): the old 100ms start burst three
+            // attempts inside the first second on every transient failure;
+            // wakes are not latency-critical enough to justify that.
+            let mut backoff = std::time::Duration::from_millis(500);
             let max_backoff = std::time::Duration::from_secs(5);
             loop {
                 tokio::time::sleep(backoff).await;
@@ -5423,7 +5532,10 @@ impl Services {
 
         let services = self.clone();
         tokio::spawn(async move {
-            let mut backoff = std::time::Duration::from_millis(100);
+            // 500ms initial backoff, aligned with the per-child retry task
+            // (monorepo#4183): wakes are not latency-critical enough to
+            // justify bursting attempts inside the first second.
+            let mut backoff = std::time::Duration::from_millis(500);
             let max_backoff = std::time::Duration::from_secs(5);
             loop {
                 tokio::time::sleep(backoff).await;
@@ -6388,6 +6500,25 @@ impl Services {
                 )
                 .await
             {
+                // Permanently gone watcher (retired or unknown/deleted) =
+                // terminal (monorepo#4183): drop the watch instead of
+                // scheduling a retry that would fail forever. The retracted
+                // report entries ARE restored first — retirement keeps the
+                // queue for a later `agent.restore` ("restore may drain it
+                // later"), so consuming them here would silently lose the
+                // reports; for an unknown/deleted parent the restore is a
+                // no-op against a queue nobody will ever drain.
+                if self.drop_watch_if_parent_gone(&watch, child_id).await {
+                    if let Some(held) = retracted_held {
+                        self.restore_held_message(&watch.parent_agent_id, held)
+                            .await;
+                    }
+                    for entry in retracted_flushed {
+                        self.restore_flushed_report_message(&watch.parent_agent_id, entry)
+                            .await;
+                    }
+                    continue;
+                }
                 tracing::warn!(
                     error = %e,
                     parent = %watch.parent_agent_id.0,
@@ -6630,6 +6761,14 @@ impl Services {
             )
             .await
         {
+            // Permanently gone watcher (retired or unknown/deleted) =
+            // terminal (monorepo#4183): drop the watch instead of scheduling
+            // the retry loop that would fail forever. Applies to grouped
+            // watches too — group settlement toward a gone parent is equally
+            // undeliverable, so the group is dropped with the watch.
+            if self.drop_watch_if_parent_gone(watch, child_id).await {
+                return false;
+            }
             tracing::warn!(
                 error = %e,
                 parent = %watch.parent_agent_id.0,
@@ -6796,6 +6935,27 @@ impl Services {
             )
             .await
         {
+            // Permanently gone parent (retired or unknown/deleted) =
+            // terminal (monorepo#4183): drop the group + grouped watches
+            // (memory + persisted rows) instead of scheduling the retry
+            // loop — covers persisted groups that rehydrate after a daemon
+            // restart with a parent that no longer exists. The retracted
+            // holds ARE restored first — retirement keeps the queue for a
+            // later `agent.restore`, so consuming them here would lose the
+            // reports; for an unknown/deleted parent the restore is a no-op
+            // against a queue nobody will drain.
+            if self.drop_group_if_parent_gone(&group).await {
+                for held in retracted_holds {
+                    self.restore_held_message(&group.parent_agent_id, held)
+                        .await;
+                }
+                for entry in retracted_flushed {
+                    self.restore_flushed_report_message(&group.parent_agent_id, entry)
+                        .await;
+                }
+                self.release_group_delivery(group_id);
+                return;
+            }
             tracing::warn!(
                 error = %e,
                 parent = %group.parent_agent_id.0,

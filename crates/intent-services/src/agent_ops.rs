@@ -4561,6 +4561,16 @@ impl Services {
         // the condition still matters.
         self.cancel_agent_hooks(&session.id).await;
         self.cancel_agent_pr_monitors(&session.id).await;
+        // Drop the retiring agent's OWN outgoing completion watches and
+        // delegation groups (monorepo#4183): a retired watcher can never
+        // consume a wake — every delivery attempt fails on the soft-retire
+        // inertness gate, so a watch left armed feeds the completion
+        // delivery retry loop with permanent failures forever. Mirrors the
+        // delete cascade and `agent.cancelSubscriptions` remove-all sweep.
+        // `agent.restore` does NOT resurrect them (same contract as hooks /
+        // PR monitors above) — the agent re-watches if it still cares.
+        self.remove_all_for_parent(&session.id);
+        self.remove_groups_for_parent(&session.id);
         let mut data = json!({
             "agentId": session.id.0,
             "agentName": session.name,
@@ -4589,6 +4599,14 @@ impl Services {
         // the row): recompute-and-compare (§6.5 step 0).
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
+        // The watch/group sweep above may have removed the workspace's last
+        // waiting reason (watches feed
+        // `workspace_has_waiting_agent_subscriptions`); the hook/PR-monitor
+        // sweeps recompute internally but run BEFORE the watch sweep, so
+        // their recompute still saw the live watches. One anchor suffices:
+        // cross-workspace watches only exist for chief parents, and the
+        // recompute early-returns for chief.
+        self.maybe_emit_waiting_changed(&session.workspace_id).await;
         Ok(Some(now))
     }
 
