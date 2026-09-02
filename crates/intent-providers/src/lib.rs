@@ -52,11 +52,10 @@ pub use discover::{
 };
 #[cfg(test)]
 pub(crate) use models::{
-    create_compound_model_id, fuzzy_match_model_in_pool, is_model_valid_for_provider,
-    parse_codex_reasoning_effort, parse_grok_initialize_models,
+    fuzzy_match_model_in_pool, parse_codex_reasoning_effort, parse_grok_initialize_models,
     parse_grok_initialize_response_from_stdout, resolve_preferred_model,
 };
-pub use models::{parse_compound_model_id, parse_grok_models_command_output, GrokModel};
+pub use models::{parse_grok_models_command_output, GrokModel};
 pub use version_gate::{
     auggie_cli_gate, auggie_gate_reason, pi_cli_gate, pi_gate_reason, PiCliGate, PiCliProbe,
 };

@@ -672,7 +672,7 @@ fn find_spec<'a>(list: &'a Value, id: &str) -> &'a Value {
 async fn specialist_resolution_preview() {
     // monorepo#3044: the preview's "default provider" context derives from
     // settings only (no positional fallback), so pin auggie explicitly.
-    let h = start_with_settings("[providers]\nactive = \"auggie\"\n").await;
+    let h = start_with_settings("[model]\ndefaultProvider = \"auggie\"\n").await;
     // Pinned frontmatter model — bare ids are provider-agnostic while no
     // cached catalog disproves ownership (cold caches in this harness).
     write_specialist_frontmatter(&h.user_dir, "pinner", "model: \"opus4.5\"");
@@ -784,19 +784,14 @@ async fn specialist_resolution_preview() {
 }
 
 /// monorepo#3044 follow-up: with NO settings-derived default provider and no
-/// `provider` param, a specialist whose own frontmatter pins a provider (a
-/// compound `model` prefix, or `codingAgent` + bare `model`) must still
-/// preview the concrete provider/model `agent.delegate` would pin — not
+/// `provider` param, a specialist whose own frontmatter pins a provider
+/// (`codingAgent`, optionally with a bare `model`) must still preview the
+/// concrete provider/model `agent.delegate` would pin — not
 /// "Provider default". A specialist with no pin of its own stays
 /// undecorated.
 #[tokio::test]
 async fn specialist_preview_uses_own_pin_without_global_default() {
     let h = start().await;
-    write_specialist_frontmatter(
-        &h.user_dir,
-        "compound-pin",
-        "model: \"codex:gpt-5.3-codex\"",
-    );
     write_specialist_frontmatter(
         &h.user_dir,
         "agent-pin",
@@ -808,10 +803,6 @@ async fn specialist_preview_uses_own_pin_without_global_default() {
     let mut r = BufReader::new(read);
 
     let list = ok(&mut w, &mut r, 1, "specialist.list", json!({})).await;
-    // Compound model prefix names the provider the delegate would spawn on.
-    let compound = find_spec(&list, "compound-pin");
-    assert_eq!(compound["resolvedModel"], "codex:gpt-5.3-codex");
-    assert_eq!(compound["resolvedProvider"], "codex");
     // Frontmatter codingAgent pins the provider; the bare model rides it
     // (cold caches — absence of ownership evidence passes).
     let agent_pin = find_spec(&list, "agent-pin");
@@ -828,11 +819,11 @@ async fn specialist_preview_uses_own_pin_without_global_default() {
         &mut r,
         2,
         "specialist.get",
-        json!({ "id": "compound-pin" }),
+        json!({ "id": "agent-pin" }),
     )
     .await;
-    assert_eq!(got["specialist"]["resolvedModel"], "codex:gpt-5.3-codex");
-    assert_eq!(got["specialist"]["resolvedProvider"], "codex");
+    assert_eq!(got["specialist"]["resolvedModel"], "grok-4");
+    assert_eq!(got["specialist"]["resolvedProvider"], "grok");
 
     // An explicit provider param still wins over the specialist's own pin.
     let got = ok(
@@ -851,7 +842,7 @@ async fn specialist_preview_uses_own_pin_without_global_default() {
 #[tokio::test]
 async fn specialist_resolution_preview_inherits_settings() {
     let h = start_with_settings(
-        "[providers]\nactive = \"auggie\"\n\n[model]\ndefault = \"sonnet4.5\"\n\n[model.providerDefaults]\ncodex = \"gpt-5.3-codex/high\"\n",
+        "[model]\ndefaultProvider = \"auggie\"\ndefault = \"sonnet4.5\"\n\n[model.providerDefaults]\ncodex = \"gpt-5.3-codex/high\"\n",
     )
     .await;
     // No frontmatter model config → settings chain decides.

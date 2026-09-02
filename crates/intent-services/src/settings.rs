@@ -916,7 +916,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         string(
             "model.default",
             "Default model",
-            "Fallback model for new agents",
+            "Fallback model for new agents (a bare model id; pair with model.defaultProvider)",
+            "providers",
+            None,
+        ),
+        string(
+            "model.defaultProvider",
+            "Default provider",
+            "Provider new agents run on when none is requested explicitly (blank means unset)",
             "providers",
             None,
         ),

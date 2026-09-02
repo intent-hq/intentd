@@ -1759,7 +1759,7 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
 /// WSS e2e for the default-provider self-heal (monorepo#3044): calling
 /// `host.providerDiscovery` on a daemon with UNSET default settings and a
 /// provider forced installed (via a `providers.paths` override, as in the
-/// override test above) must persist `providers.active` through the
+/// override test above) must persist `model.defaultProvider` through the
 /// transport → `WorkspaceApi::settings_heal_default_provider` seam — the
 /// only production trigger — observable via `settings.get` on the same
 /// connection. `model.default` stays unset (cold catalog cache), and a
@@ -1815,12 +1815,12 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
         &mut ws,
         1,
         "settings.get",
-        json!({ "path": "providers.active" }),
+        json!({ "path": "model.defaultProvider" }),
     )
     .await;
     assert!(
         before["value"].is_null(),
-        "providers.active must start unset: {before}"
+        "model.defaultProvider must start unset: {before}"
     );
 
     // Discovery reports installed providers → the daemon self-heals.
@@ -1841,15 +1841,15 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
         &mut ws,
         3,
         "settings.get",
-        json!({ "path": "providers.active" }),
+        json!({ "path": "model.defaultProvider" }),
     )
     .await;
     let active = healed["value"]
         .as_str()
-        .unwrap_or_else(|| panic!("providers.active must be healed to a string: {healed}"));
+        .unwrap_or_else(|| panic!("model.defaultProvider must be healed to a string: {healed}"));
     assert!(
         installed.contains(&active),
-        "healed providers.active ({active}) must be one of the installed providers: {healed}"
+        "healed model.defaultProvider ({active}) must be one of the installed providers: {healed}"
     );
     assert_eq!(healed["origin"], json!("file"), "{healed}");
 
@@ -1859,7 +1859,7 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
         &mut ws,
         5,
         "settings.get",
-        json!({ "path": "providers.active" }),
+        json!({ "path": "model.defaultProvider" }),
     )
     .await;
     assert_eq!(

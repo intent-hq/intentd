@@ -1,39 +1,12 @@
 //! Model id helpers (§6.9).
 //!
-//! Ports the model helpers from `provider-config.ts`: compound model ids and
-//! fuzzy resolution against dynamic model pools. Grok's dynamic-model parsers
-//! (`grok models` stdout and the ACP `initialize` response) are ported from
-//! `grok-acp-probe.ts`.
+//! Model ids are BARE strings — the provider is a separate field everywhere
+//! (the legacy compound `{provider}:{model}` form is rejected at the wire).
+//! This module holds fuzzy resolution against dynamic model pools and Grok's
+//! dynamic-model parsers (`grok models` stdout and the ACP `initialize`
+//! response), ported from `grok-acp-probe.ts`.
 
 use serde_json::Value;
-
-use crate::config::first_provider_id;
-
-/// Parse a compound model id `{provider}:{model}` into its parts. A bare id
-/// (no `:`) is attributed to the first registered provider — a neutral
-/// positional last resort; callers that can derive a settings-based default
-/// should pre-filter on `:` and never rely on this attribution. Port of
-/// `parseCompoundModelId`.
-#[must_use]
-pub fn parse_compound_model_id(compound: &str) -> (String, String) {
-    match compound.split_once(':') {
-        Some((provider, model)) => (provider.to_string(), model.to_string()),
-        None => (first_provider_id().to_string(), compound.to_string()),
-    }
-}
-
-/// Create a compound model id from provider + model. Port of `createCompoundModelId`.
-#[cfg(test)]
-pub(crate) fn create_compound_model_id(provider_id: &str, model_id: &str) -> String {
-    format!("{provider_id}:{model_id}")
-}
-
-/// Whether a model (bare or compound) targets `target_provider_id`. Port of
-/// `isModelValidForProvider`.
-#[cfg(test)]
-pub(crate) fn is_model_valid_for_provider(model: &str, target_provider_id: &str) -> bool {
-    parse_compound_model_id(model).0 == target_provider_id
-}
 
 /// Normalize a model id for fuzzy comparison: lowercase, strip a leading
 /// `claude-` brand prefix, and drop all non-alphanumeric characters.

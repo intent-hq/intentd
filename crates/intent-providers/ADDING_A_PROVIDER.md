@@ -31,7 +31,7 @@ Add an entry to `ACP_PROVIDERS` in `crates/intent-providers/src/config.rs`, star
 needs. Fields that matter most:
 
 - **`id`** — stable identifier (`auggie`, `opencode`, …). Keys everything: settings
-  (`providers.paths`), compound model ids, per-provider match arms.
+  (`providers.paths`), session `provider` fields, per-provider match arms.
 - **`command` / `base_args`** — the CLI and its ACP-mode args (e.g. opencode: `["acp"]`,
   droid: `["exec", "--output-format", "acp"]`, grok: `["agent", "stdio"]`).
 - **`runtime`** (`ProviderRuntime`) — `Node`, `Electron`, or `Native`. Anything V8-backed
@@ -205,15 +205,15 @@ certainly needs new normalization arms:
   `get_tool_denylist_for_agent_type`) filters workspace tools by agent type; it covers
   MCP tools only, never provider-native ones.
 - **V8 heap cap** — set `runtime` correctly (§1); this *is* the policy knob.
-- **Model ids** — models are stored as compound `provider:model` ids
-  (`parse_compound_model_id` / `create_compound_model_id`,
-  `crates/intent-providers/src/models.rs`); the bare part feeds `model_flag` /
-  `session/set_model`, and the prefix feeds provider resolution (`resolve_provider_id`,
-  `crates/intent-services/src/agent_session.rs`: compound prefix → session `provider`
-  field → settings-derived default → first registered provider). Model discovery is
-  fully dynamic (`models.list` sources, `crates/intent-services/src/model_catalog.rs`);
-  there is no static tier catalog. Fuzzy model matching against a dynamic pool goes
-  through `resolve_preferred_model`. codex additionally splits reasoning effort from
+- **Model ids** — models are stored as BARE ids; the provider is a separate field
+  everywhere (compound `provider:model` ids are rejected at the wire). The model id
+  feeds `model_flag` / `session/set_model`, and provider resolution
+  (`resolve_provider_id`, `crates/intent-services/src/agent_session.rs`) is
+  session `provider` field → settings-derived default (`model.defaultProvider`).
+  Model discovery is fully dynamic (`models.list` sources,
+  `crates/intent-services/src/model_catalog.rs`); there is no static tier catalog.
+  Fuzzy model matching against a dynamic pool goes through
+  `resolve_preferred_model`. codex additionally splits reasoning effort from
   the model id (`parse_codex_reasoning_effort`).
 
 ## 7. Tests and gates

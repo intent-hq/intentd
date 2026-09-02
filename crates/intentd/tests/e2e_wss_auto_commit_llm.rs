@@ -351,12 +351,12 @@ async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) ->
     };
     store.insert_workspace(&ws).await.expect("insert workspace");
     // Seed context.auggiePath via config.toml (TOML-backed setting) so the
-    // daemon's settings registry picks it up on boot. providers.active must
+    // daemon's settings registry picks it up on boot. model.defaultProvider must
     // be set too: unset provider settings resolve the completeOnce gate
     // CLOSED, which would skip LLM generation entirely.
     if let Some(bin) = auggie_bin {
         let toml = format!(
-            "[context]\nauggiePath = {:?}\n\n[providers]\nactive = \"auggie\"\n",
+            "[context]\nauggiePath = {:?}\n\n[model]\ndefaultProvider = \"auggie\"\n",
             bin.to_string_lossy()
         );
         std::fs::write(data_dir.join("config.toml"), toml).expect("write config.toml");
