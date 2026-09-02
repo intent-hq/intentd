@@ -234,6 +234,7 @@ impl Services {
         if let Err(e) = self.store.upsert_completion_watch(&persisted).await {
             tracing::warn!("completion_watch upsert failed {id}: {e}");
         }
+        self.delete_watch_row_if_swept(&id).await;
         Ok(id)
     }
 
@@ -322,7 +323,37 @@ impl Services {
         if let Err(e) = self.store.upsert_completion_watch(&persisted).await {
             tracing::warn!("completion_watch upsert failed {id}: {e}");
         }
+        self.delete_watch_row_if_swept(&id).await;
         Ok(id)
+    }
+
+    /// Close the write-through registration race (monorepo#4183): the two
+    /// insert-then-upsert variants above make the watch memory-visible
+    /// BEFORE the persisted row lands, so a concurrent parent sweep
+    /// (retire/delete cascade) can remove the in-memory watch and its rows
+    /// between the insert and the upsert — the late upsert then resurrects
+    /// an orphan row that rehydrates on restart. After the upsert commits,
+    /// re-check membership and best-effort delete the row when the watch is
+    /// already gone. (The strict variant persists before memory-visibility
+    /// and does not need this.)
+    async fn delete_watch_row_if_swept(&self, watch_id: &str) {
+        let still_present = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .any(|s| s.id == watch_id);
+        if still_present {
+            return;
+        }
+        tracing::info!(
+            watch = %watch_id,
+            "watch swept during registration upsert; deleting resurrected row"
+        );
+        if let Err(e) = self.store.delete_completion_watch(watch_id).await {
+            tracing::warn!("completion_watch post-sweep delete failed {watch_id}: {e}");
+        }
     }
 
     /// Shared body of the two registration variants: run the scope gate,
@@ -1390,12 +1421,22 @@ impl Services {
             // Prune when either endpoint is gone: no wake could fire (child
             // deleted watches are handled by reconciliation below instead,
             // since a deleted child IS a completion signal for the parent).
-            let parent_alive = self.agent_is_live(&p.parent_agent_id).await;
+            // A RETIRED parent is equally gone (monorepo#4183): the
+            // soft-retire inertness gate rejects every wake, so rehydrating
+            // its watch only feeds the delivery-retry loop; `agent.restore`
+            // does not resurrect watches, matching the retire sweep.
+            let parent_alive = self.agent_is_live(&p.parent_agent_id).await
+                && !matches!(
+                    self.store
+                        .get_agent_session_retired_at(&p.parent_agent_id)
+                        .await,
+                    Ok(Some(_))
+                );
             if !parent_alive {
                 tracing::info!(
                     watch = %p.id,
                     parent = %p.parent_agent_id.0,
-                    "pruning persisted completion watch — parent agent gone"
+                    "pruning persisted completion watch — parent agent gone or retired"
                 );
                 let _ = self.store.delete_completion_watch(&p.id).await;
                 continue;
@@ -1717,6 +1758,36 @@ impl Services {
         workspace_id: &WorkspaceId,
     ) -> Result<usize> {
         let persisted = self.store.list_undelivered_groups(workspace_id).await?;
+        // Prune groups whose parent is permanently gone (deleted/missing or
+        // retired) BEFORE loading them (monorepo#4183): an aggregated wake
+        // toward such a parent can never be delivered, so rehydrating the
+        // group only feeds the delivery-retry loop from persisted state
+        // after every restart. Delete the row so it stays pruned. The
+        // liveness probe fails open — a transient store error keeps the
+        // group (the delivery-path backstop catches it later).
+        let mut survivors = Vec::with_capacity(persisted.len());
+        for p in persisted {
+            let parent_gone = !self.agent_is_live(&p.parent_agent_id).await
+                || matches!(
+                    self.store
+                        .get_agent_session_retired_at(&p.parent_agent_id)
+                        .await,
+                    Ok(Some(_)) | Err(intent_store::Error::NotFound(_))
+                );
+            if parent_gone {
+                tracing::info!(
+                    group = %p.group_id,
+                    parent = %p.parent_agent_id.0,
+                    "pruning persisted delegation group — parent agent gone or retired"
+                );
+                if let Err(e) = self.store.delete_delegation_group(&p.group_id).await {
+                    tracing::warn!("delegation_group delete failed {}: {e}", p.group_id);
+                }
+                continue;
+            }
+            survivors.push(p);
+        }
+        let persisted = survivors;
         let (loaded, groups_to_reconcile) = {
             let mut guard = self
                 .agent_subscriptions

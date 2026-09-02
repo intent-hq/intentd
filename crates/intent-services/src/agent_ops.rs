@@ -4599,6 +4599,14 @@ impl Services {
         // the row): recompute-and-compare (§6.5 step 0).
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
+        // The watch/group sweep above may have removed the workspace's last
+        // waiting reason (watches feed
+        // `workspace_has_waiting_agent_subscriptions`); the hook/PR-monitor
+        // sweeps recompute internally but run BEFORE the watch sweep, so
+        // their recompute still saw the live watches. One anchor suffices:
+        // cross-workspace watches only exist for chief parents, and the
+        // recompute early-returns for chief.
+        self.maybe_emit_waiting_changed(&session.workspace_id).await;
         Ok(Some(now))
     }
 
