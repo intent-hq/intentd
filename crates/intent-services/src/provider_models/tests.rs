@@ -1283,7 +1283,10 @@ async fn acp_probe_child_env_removals_reach_child() {
 /// intent-hq/intent#3941: the claude-code ACP auth fallback's outcome →
 /// tri-state mapping (no adapter spawn). Only the adapter's explicit
 /// auth-required RPC error (intent-hq/intent#3178) may demote to a hard
-/// false; an empty or failed probe stays unknown.
+/// false; everything else stays unknown — including a NON-EMPTY model
+/// list, because claude-agent-acp serves its catalog uncredentialed (the
+/// auth error only fires at prompt time), so a model list alone is never
+/// proof of auth.
 #[test]
 fn claude_code_acp_auth_verdict_mapping() {
     use super::claude_code_acp_auth_verdict;
@@ -1294,9 +1297,11 @@ fn claude_code_acp_auth_verdict_mapping() {
             data: None,
         })
     };
+    // Regression: a non-empty model list must NOT harden into Some(true) —
+    // the adapter returns the full catalog even when logged out.
     assert_eq!(
         claude_code_acp_auth_verdict(Ok(vec![json!({"id": "claude-opus-4"})])),
-        Some(true)
+        None
     );
     assert_eq!(
         claude_code_acp_auth_verdict(Err(rpc(-32000, "Authentication required"))),

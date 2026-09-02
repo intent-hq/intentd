@@ -13,10 +13,11 @@
 //!   CLI with its registry `auth_check_args` (exit 0 ⇒ authenticated, no
 //!   adapter spawn); any non-confirming CLI outcome falls back to an ACP
 //!   probe via the pinned claude-agent-acp npx adapter — `claude auth
-//!   status` has known false negatives (anthropics/claude-code#76168) while
-//!   the adapter walks the credential chain Intent's runtime actually uses:
-//!   non-empty model list ⇒ `true`; explicit auth-required error ⇒ `false`;
-//!   else unknown.
+//!   status` has known false negatives (anthropics/claude-code#76168). The
+//!   fallback can only demote or stay unknown: explicit auth-required error
+//!   ⇒ `false`; anything else — including a served model catalog, which the
+//!   adapter returns without credentials — ⇒ unknown. Only the CLI probe
+//!   can confirm `true` ([`crate::provider_models`]).
 //! - **codex** — the real `codex` CLI with `login status` (same exit-code
 //!   semantics; the codex-acp adapter is never spawned here).
 //! - **opencode** — `opencode models`: non-zero exit ⇒ `false`; `true` iff at
@@ -305,9 +306,12 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
 /// pinned claude-agent-acp adapter probe — because `claude auth status` is
 /// known to report logged-out even when a working CLI credential exists
 /// (interactive `/login` sessions, account switches —
-/// anthropics/claude-code#76168), while the adapter walks the credential
-/// chain Intent's runtime actually uses. The fallback is injected so the
-/// mapping is unit-testable without spawning real CLIs.
+/// anthropics/claude-code#76168). The fallback can only demote to
+/// `Some(false)` (the adapter's explicit auth-required error) or stay
+/// unknown — never confirm `Some(true)`, because the adapter serves its
+/// model catalog without credentials and there is no cheap auth-exercising
+/// handshake step. The fallback is injected so the mapping is unit-testable
+/// without spawning real CLIs.
 async fn claude_code_auth_verdict<F, Fut>(cli: CliAuthProbe, acp_fallback: F) -> Option<bool>
 where
     F: FnOnce() -> Fut,

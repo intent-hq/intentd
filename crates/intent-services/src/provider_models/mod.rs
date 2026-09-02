@@ -384,10 +384,12 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
 /// pinned-adapter ACP probe as [`fetch_claude_code_models`], mapped to auth
 /// semantics by [`claude_code_acp_auth_verdict`]. Consulted only when the
 /// cheap `claude auth status` CLI probe does not confirm login — that CLI
-/// has known false negatives (anthropics/claude-code#76168) while this
-/// probe walks the credential chain Intent's runtime actually uses. The
-/// caller gates on the `claude` CLI being installed; the probe itself runs
-/// the pinned npx adapter
+/// has known false negatives (anthropics/claude-code#76168). The fallback
+/// can only demote to `Some(false)` (explicit auth-required error) or stay
+/// unknown — it can never confirm `Some(true)`, because the adapter serves
+/// its model catalog without credentials (see
+/// [`claude_code_acp_auth_verdict`]). The caller gates on the `claude` CLI
+/// being installed; the probe itself runs the pinned npx adapter
 /// ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
 pub(crate) async fn probe_claude_code_auth() -> Option<bool> {
     let npx = find_npx()?;
@@ -397,21 +399,26 @@ pub(crate) async fn probe_claude_code_auth() -> Option<bool> {
 }
 
 /// Map a claude-code ACP probe outcome to the auth tri-state (the pure seam
-/// unit tests drive without spawning the adapter): a non-empty model list ⇒
-/// authenticated; the adapter's explicit auth-required RPC error (`-32000
-/// Authentication required` when logged out — intent-hq/intent#3178) ⇒ not
-/// authenticated; anything else (spawn failure, timeout, transport error,
-/// empty catalog) ⇒ unknown. Unlike pi — whose adapter serves only
-/// credentialed models, so an empty list demotes to `Some(false)` — an
-/// empty claude-code catalog is inconclusive and must never harden into a
-/// false "not authenticated".
+/// unit tests drive without spawning the adapter). Only the adapter's
+/// explicit auth-required RPC error (`-32000 Authentication required` —
+/// intent-hq/intent#3178) is conclusive, demoting to `Some(false)`.
+/// Everything else — INCLUDING a non-empty model list — stays unknown:
+/// claude-agent-acp serves its model catalog uncredentialed (verified
+/// empirically against v0.66.0 with a scratch HOME — `initialize` and
+/// `session/new` succeed and return the full catalog in config options
+/// while logged out, with `authMethods` empty either way; the auth error
+/// only fires at `session/prompt` time, which a probe cannot afford to
+/// send), so a served catalog proves the adapter spawned, not that the
+/// user is logged in. Unlike pi — whose adapter serves only credentialed
+/// models, so a non-empty list confirms `Some(true)` and an empty list
+/// demotes to `Some(false)` — neither claude-code list shape is
+/// conclusive.
 fn claude_code_acp_auth_verdict(outcome: Result<Vec<Value>, ProbeError>) -> Option<bool> {
     match outcome {
-        Ok(models) if !models.is_empty() => Some(true),
         Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
             Some(false)
         }
-        Ok(_) | Err(_) => None,
+        _ => None,
     }
 }
 
