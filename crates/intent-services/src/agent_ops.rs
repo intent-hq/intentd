@@ -254,18 +254,36 @@ impl AgentSnapshotPrs {
 }
 
 /// Group tracked PR pools into the snapshot's `prs` object. `pools` yields
-/// `(owner, name, prs)` per repo — the workspace pool first, so its entry
-/// wins the `(repo, number)` dedup over a git-root duplicate of the same PR
-/// even when the workspace entry is merged/closed: the merged entry consumes
-/// the `(repo, number)` key, suppressing a stale open duplicate from a git
-/// root, so the PR is excluded entirely (fresher workspace data wins).
-/// Returns `None` when no open PR survives (the field is then omitted).
+/// `(owner, name, prs)` per repo; a pool with a blank (empty/whitespace)
+/// owner or name is skipped entirely — no meaningful label can be formed —
+/// matching the identity-less-root skip upstream. A merged/closed entry in
+/// ANY pool suppresses that `(repo, number)` entirely: the freshest terminal
+/// state wins over a stale open duplicate regardless of which pool carries
+/// it. Among surviving open duplicates the workspace pool (yielded first)
+/// wins the grouping. Returns `None` when no open PR survives (the field is
+/// then omitted).
 fn grouped_open_prs<'a>(
     pools: impl IntoIterator<Item = (&'a str, &'a str, &'a [PullRequestInfo])>,
 ) -> Option<AgentSnapshotPrs> {
-    let mut groups = AgentSnapshotPrs::default();
+    let pools: Vec<(&str, &str, &[PullRequestInfo])> = pools
+        .into_iter()
+        .filter(|(owner, name, _)| !owner.trim().is_empty() && !name.trim().is_empty())
+        .collect();
+    // Seed the seen-set with every merged/closed key so a terminal state in
+    // any pool suppresses stale open duplicates of the same PR.
     let mut seen: HashSet<(&str, &str, u64)> = HashSet::new();
-    for (owner, name, prs) in pools {
+    for &(owner, name, prs) in &pools {
+        for pr in prs {
+            if matches!(
+                pr.status,
+                PullRequestStatus::Merged | PullRequestStatus::Closed
+            ) {
+                seen.insert((owner, name, pr.number));
+            }
+        }
+    }
+    let mut groups = AgentSnapshotPrs::default();
+    for &(owner, name, prs) in &pools {
         for pr in prs {
             if !seen.insert((owner, name, pr.number)) {
                 continue;
@@ -10415,8 +10433,9 @@ impl Services {
     /// by state (see [`AgentSnapshotPrs`]), read from persisted columns only
     /// — the workspace row's `pull_requests` under its
     /// `repository_owner`/`repository_name`, plus each registered git root's
-    /// `pull_requests` under its `repo_owner`/`repo_name` (a root without
-    /// repo identity is skipped: no label can be formed). No forge calls and
+    /// `pull_requests` under its `repo_owner`/`repo_name` (a pool whose repo
+    /// identity is missing or blank is skipped: no label can be formed). No
+    /// forge calls and
     /// no per-PR statements (RPC cost contract); best-effort — a store
     /// failure reads as `None` so a snapshot build never fails on it.
     async fn tracked_open_prs_grouped(

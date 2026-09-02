@@ -35619,10 +35619,10 @@ async fn agent_snapshot_groups_tracked_open_prs_and_forces_injection() {
     assert!(line.contains("\"prs\":{"), "prs rides the line: {line}");
 }
 
-/// Root pools merge behind the workspace pool: a `(repo, number)` duplicate
-/// defers to the workspace's entry (here merged, so the PR is excluded
-/// entirely), a distinct repo contributes its own labels, and a root
-/// without `repo_owner`/`repo_name` is skipped.
+/// Root pools merge behind the workspace pool: the workspace's merged entry
+/// suppresses a stale open `(repo, number)` duplicate from a git root (the
+/// PR is excluded entirely), a distinct repo contributes its own labels,
+/// and a root without `repo_owner`/`repo_name` is skipped.
 #[tokio::test]
 async fn agent_snapshot_prs_dedups_by_repo_number_with_workspace_priority() {
     let (_t, svc, ws) = setup().await;
@@ -35683,6 +35683,132 @@ async fn agent_snapshot_prs_dedups_by_repo_number_with_workspace_priority() {
             "unknown": ["o2/r2#1"],
         }),
         "workspace pool wins the (repo, number) dedup and identity-less roots are skipped: {v}"
+    );
+}
+
+/// A merged/closed entry in ANY pool suppresses that `(repo, number)`
+/// entirely: a stale open workspace entry is dropped when a git-root pool
+/// already persisted the same PR as merged, while among surviving open
+/// duplicates the workspace entry still wins the grouping. When every open
+/// entry is suppressed, `prs` is omitted and the snapshot stays trivial.
+#[tokio::test]
+async fn agent_snapshot_prs_terminal_state_anywhere_suppresses_stale_open_duplicate() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Watcher").await;
+
+    let mut row = svc.store().get_workspace(&ws).await.expect("workspace");
+    row.repository_owner = Some("o".into());
+    row.repository_name = Some("r".into());
+    row.pull_requests = Some(vec![
+        // Stale open entry; the root pool below knows this PR merged.
+        tracked_pr(1, PullRequestStatus::Open, Some(true), Some("clean"), None),
+        // Open duplicate of the root's #2 — the workspace grouping wins.
+        tracked_pr(2, PullRequestStatus::Open, Some(true), Some("clean"), None),
+    ]);
+    svc.store().update_workspace(&row).await.expect("update ws");
+
+    let root = tracked_git_root(
+        &ws,
+        "/roots/same-repo",
+        Some("o"),
+        Some("r"),
+        vec![
+            tracked_pr(1, PullRequestStatus::Merged, None, None, None),
+            tracked_pr(2, PullRequestStatus::Open, Some(true), Some("dirty"), None),
+        ],
+    );
+    svc.store()
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("upsert root");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["prs"],
+        json!({ "mergeable": ["o/r#2"] }),
+        "root-pool merged state suppresses the stale open workspace #1; \
+         workspace grouping wins for the open duplicate #2: {v}"
+    );
+
+    // With #2 merged in the root pool too (PR fields updated in place),
+    // nothing survives: `prs` is omitted and no injection line fires.
+    let mut root = root;
+    root.pull_requests = Some(vec![
+        tracked_pr(1, PullRequestStatus::Merged, None, None, None),
+        tracked_pr(2, PullRequestStatus::Merged, None, None, None),
+    ]);
+    svc.store()
+        .update_workspace_git_root_pr(&root)
+        .await
+        .expect("update root pr fields");
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("prs"),
+        "all-suppressed pools omit prs: {v}"
+    );
+    assert_eq!(
+        svc.agent_state_snapshot_line(&agent).await,
+        None,
+        "all-suppressed pools keep the snapshot trivial"
+    );
+}
+
+/// A pool with a blank (empty/whitespace) repo owner or name is skipped the
+/// same as a missing one — no malformed labels like `/r#1` — while pools
+/// with a real identity still contribute.
+#[tokio::test]
+async fn agent_snapshot_prs_skips_blank_repo_identity_pools() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Watcher").await;
+
+    let mut row = svc.store().get_workspace(&ws).await.expect("workspace");
+    row.repository_owner = Some(String::new());
+    row.repository_name = Some("r".into());
+    row.pull_requests = Some(vec![tracked_pr(
+        1,
+        PullRequestStatus::Open,
+        None,
+        None,
+        None,
+    )]);
+    svc.store().update_workspace(&row).await.expect("update ws");
+
+    for root in [
+        tracked_git_root(
+            &ws,
+            "/roots/blank-name",
+            Some("o"),
+            Some("  "),
+            vec![tracked_pr(2, PullRequestStatus::Open, None, None, None)],
+        ),
+        tracked_git_root(
+            &ws,
+            "/roots/real-identity",
+            Some("o2"),
+            Some("r2"),
+            vec![tracked_pr(5, PullRequestStatus::Open, None, None, None)],
+        ),
+    ] {
+        svc.store()
+            .upsert_workspace_git_root(&root)
+            .await
+            .expect("upsert root");
+    }
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["prs"],
+        json!({ "unknown": ["o2/r2#5"] }),
+        "blank-identity pools are skipped, real ones contribute: {v}"
     );
 }
 
