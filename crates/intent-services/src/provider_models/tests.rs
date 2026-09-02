@@ -1307,6 +1307,11 @@ fn claude_code_acp_auth_verdict_mapping() {
         claude_code_acp_auth_verdict(Err(rpc(-32000, "Authentication required"))),
         Some(false)
     );
+    // is_auth_required_error also matches on a bare 401 code, message aside.
+    assert_eq!(
+        claude_code_acp_auth_verdict(Err(rpc(401, "nope"))),
+        Some(false)
+    );
     // Inconclusive outcomes must stay unknown — never a hard false.
     assert_eq!(claude_code_acp_auth_verdict(Ok(Vec::new())), None);
     assert_eq!(claude_code_acp_auth_verdict(Err(ProbeError::Empty)), None);

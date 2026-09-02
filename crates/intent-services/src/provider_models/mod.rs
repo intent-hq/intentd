@@ -412,7 +412,10 @@ pub(crate) async fn probe_claude_code_auth() -> Option<bool> {
 /// user is logged in. Unlike pi — whose adapter serves only credentialed
 /// models, so a non-empty list confirms `Some(true)` and an empty list
 /// demotes to `Some(false)` — neither claude-code list shape is
-/// conclusive.
+/// conclusive. On the current pin the demotion arm is expected to be a
+/// no-op signal-wise (the auth error never fires during the probe's
+/// initialize + session/new handshake); it is kept as a hedge for other
+/// adapter versions and credential-failure shapes.
 fn claude_code_acp_auth_verdict(outcome: Result<Vec<Value>, ProbeError>) -> Option<bool> {
     match outcome {
         Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
