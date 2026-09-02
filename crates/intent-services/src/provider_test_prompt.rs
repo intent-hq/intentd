@@ -111,17 +111,43 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         .get(provider.primary_binary_provider_id())
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
-    let resolved_bin = (provider.npx_only_package.is_none())
-        .then(|| {
-            intent_providers::find_provider_binary(
-                provider.primary_binary_provider_id(),
-                provider.command,
-                explicit_path.as_deref(),
-            )
+    let resolved_bin = if provider.npx_only_package.is_some() {
+        None
+    } else if provider_id == "auggie" {
+        // auggie rides the version-gated candidate walk real ACP spawns use
+        // (monorepo#1045): probe `--version` down the candidate list and pick
+        // the first one new enough — a stale PATH/override hit must not fail
+        // the probe when a compatible install exists later in the order. The
+        // caller already merged `context.auggiePath` over
+        // `providers.paths["auggie"]`. Blocking (≤3s per candidate).
+        let explicit = explicit_path.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::auggie_cli::select_auggie_for_spawn(explicit.as_deref())
         })
-        .flatten();
+        .await
+        {
+            Ok(Ok(path)) => Some(path),
+            Ok(Err(e)) => return Ok(failure("not-installed", format!("auggie: {e}"))),
+            Err(e) => {
+                return Ok(failure(
+                    "error",
+                    format!("auggie version probe task failed: {e}"),
+                ))
+            }
+        }
+    } else {
+        intent_providers::find_provider_binary(
+            provider.primary_binary_provider_id(),
+            provider.command,
+            explicit_path.as_deref(),
+        )
+    };
+    // An npx launch runs a Node child whatever the provider's declared
+    // runtime — thread the signal into the env builder (STAB-50 heap cap).
+    let via_npx = provider.npx_only_package.is_some() || resolved_bin.is_none();
     let npx = intent_providers::find_npx();
-    let Some(cmd) = crate::complete_ops::one_shot_launch(provider, resolved_bin, npx, model) else {
+    let Some(mut cmd) = crate::complete_ops::one_shot_launch(provider, resolved_bin, npx, model)
+    else {
         return Ok(failure(
             "not-installed",
             format!(
@@ -130,6 +156,16 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
             ),
         ));
     };
+    // Provider env parity with real ACP spawns: `one_shot_launch` only builds
+    // argv, but some providers need their spawn env to launch at all —
+    // cortex's `ELECTRON_RUN_AS_NODE`, opencode's `OPENCODE_CONFIG_CONTENT`,
+    // the Node heap cap. No rules file, MCP block, or unsloth endpoint: the
+    // probe wants the barest viable session.
+    for (key, value) in
+        intent_providers::build_provider_env_for_spawn(provider, model, None, None, None, via_npx)
+    {
+        cmd = cmd.env(key, value);
+    }
     // codex loads MCP servers from its inherited CODEX_HOME regardless of the
     // empty ACP `mcpServers` list; the probe child gets the same isolated
     // throwaway home the one-shot completion path uses — a test prompt must
