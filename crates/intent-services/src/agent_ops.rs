@@ -3512,9 +3512,21 @@ impl Services {
                     .await
                     .ok()
                     .and_then(|w| crate::git_ops::worktree_path(&w));
+                // Canonicalization walks the specialist tier directories —
+                // blocking pool (monorepo#4148).
+                let services = self.clone();
                 Some(
-                    self.specialists_service()
-                        .canonical_id_or_err(&spec_id, wp.as_deref())?,
+                    tokio::task::spawn_blocking(move || {
+                        services
+                            .specialists_service()
+                            .canonical_id_or_err(&spec_id, wp.as_deref())
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!(
+                            "agent.create specialist resolution task failed: {e}"
+                        ))
+                    })??,
                 )
             }
             None => None,
@@ -3539,8 +3551,19 @@ impl Services {
                     .await
                     .ok()
                     .and_then(|w| crate::git_ops::worktree_path(&w));
-                self.specialists_service()
-                    .resolve_display_name(spec_id, wp.as_deref())
+                // Display-name resolution walks the specialist tiers —
+                // blocking pool (monorepo#4148); a JoinError degrades to the
+                // generic name fallback, never failing the create.
+                let services = self.clone();
+                let spec_id = spec_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    services
+                        .specialists_service()
+                        .resolve_display_name(&spec_id, wp.as_deref())
+                })
+                .await
+                .ok()
+                .flatten()
             }
             _ => None,
         };
@@ -3822,10 +3845,26 @@ impl Services {
         // never fails the create; a non-object caller `metadata` is left
         // untouched.
         if let Some(spec_id) = specialist.as_deref() {
-            if let Some((body, spec_name, reminder)) = self
-                .specialists_service()
-                .resolve_prompt_injection(spec_id, spec_wp.as_deref())
-            {
+            // Both snapshot resolutions below walk the specialist tier
+            // directories — blocking pool (monorepo#4148).
+            let services = self.clone();
+            let spec_id_owned = spec_id.to_string();
+            let wp = spec_wp.clone();
+            let (injection, frozen_is_orchestrator) = tokio::task::spawn_blocking(move || {
+                (
+                    services
+                        .specialists_service()
+                        .resolve_prompt_injection(&spec_id_owned, wp.as_deref()),
+                    services
+                        .specialists_service()
+                        .resolve_is_orchestrator(&spec_id_owned, wp.as_deref()),
+                )
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("agent.create specialist snapshot task failed: {e}"))
+            })?;
+            if let Some((body, spec_name, reminder)) = injection {
                 let meta_value =
                     metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
                 if let Some(obj) = meta_value.as_object_mut() {
@@ -3863,9 +3902,7 @@ impl Services {
             // did not resolve above (the fail-closed name fallback decides)
             // — and always overwrites any caller-supplied value, so the
             // frozen readers never consume caller input as a trusted role.
-            let frozen_is_orchestrator = self
-                .specialists_service()
-                .resolve_is_orchestrator(spec_id, spec_wp.as_deref());
+            // (Resolved in the blocking task above.)
             let meta_value = metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
             if let Some(obj) = meta_value.as_object_mut() {
                 obj.insert(
@@ -4762,17 +4799,29 @@ impl Services {
                             .await
                             .ok()
                             .and_then(|w| crate::git_ops::worktree_path(&w));
-                        let canonical = self
-                            .specialists_service()
-                            .canonical_id_or_err(&spec_id, wp.as_deref())?;
-                        // Refresh the frozen orchestrator-role snapshot
-                        // (`specialistIsOrchestrator`, written at create)
-                        // for the NEW specialist so the session-open
-                        // denylist decision tracks the identity change
-                        // instead of the stale creation-time role.
-                        let is_orchestrator = self
-                            .specialists_service()
-                            .resolve_is_orchestrator(&canonical, wp.as_deref());
+                        // Canonicalization + the refreshed orchestrator-role
+                        // snapshot (`specialistIsOrchestrator`, written at
+                        // create, re-resolved here so the session-open
+                        // denylist decision tracks the identity change) both
+                        // walk the specialist tiers — blocking pool
+                        // (monorepo#4148).
+                        let services = self.clone();
+                        let (canonical, is_orchestrator) =
+                            tokio::task::spawn_blocking(move || -> Result<(String, bool)> {
+                                let canonical = services
+                                    .specialists_service()
+                                    .canonical_id_or_err(&spec_id, wp.as_deref())?;
+                                let is_orchestrator = services
+                                    .specialists_service()
+                                    .resolve_is_orchestrator(&canonical, wp.as_deref());
+                                Ok((canonical, is_orchestrator))
+                            })
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!(
+                                    "agent.update specialist resolution task failed: {e}"
+                                ))
+                            })??;
                         let meta = session
                             .metadata
                             .get_or_insert_with(|| json!(serde_json::Map::new()));
@@ -8778,8 +8827,22 @@ impl Services {
                 .await
                 .ok()
                 .and_then(|w| crate::git_ops::worktree_path(&w));
-            self.specialists_service()
-                .canonical_id_or_err(spec_id, workspace_path.as_deref())?;
+            // Validation walks the specialist tier directories — blocking
+            // pool (monorepo#4148).
+            let services = self.clone();
+            let spec_id = spec_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                services
+                    .specialists_service()
+                    .canonical_id_or_err(&spec_id, workspace_path.as_deref())
+                    .map(|_| ())
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "agent.delegate batch specialist validation task failed: {e}"
+                ))
+            })??;
         }
         // Depth + watch-scope guards up front (the same checks the
         // single-task path runs before any side-effectful work) so a
@@ -11751,8 +11814,23 @@ impl Services {
         // `-32602`), and BEFORE the stale-assignment purge so a rejected
         // wake leaves task state untouched.
         if let Some(spec_id) = create_opts.specialist.as_deref() {
-            self.specialists_service()
-                .canonical_id_or_err(spec_id, workspace_path.as_deref())?;
+            // Validation walks the specialist tier directories — blocking
+            // pool (monorepo#4148).
+            let services = self.clone();
+            let spec_id = spec_id.to_string();
+            let wp = workspace_path.clone();
+            tokio::task::spawn_blocking(move || {
+                services
+                    .specialists_service()
+                    .canonical_id_or_err(&spec_id, wp.as_deref())
+                    .map(|_| ())
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "agent.wakeOrCreate specialist validation task failed: {e}"
+                ))
+            })??;
         }
 
         // Purge stale (NotFound / soft-deleted) assignments first so the
@@ -11778,14 +11856,26 @@ impl Services {
         // `create.specialist`, never to legacy stored state. Dropping means
         // the `.or()` below falls through to the (already-validated)
         // `create.specialist` when one was supplied, else no specialist.
-        let inherited_specialist = inheritance_source
+        let inherited_specialist = match inheritance_source
             .as_ref()
             .and_then(|s| s.specialist.clone())
-            .filter(|spec_id| {
-                let known = self
-                    .specialists_service()
-                    .canonical_id(spec_id, workspace_path.as_deref())
-                    .is_some();
+        {
+            Some(spec_id) => {
+                // The resolvability probe walks the specialist tiers —
+                // blocking pool (monorepo#4148); a JoinError counts as
+                // unresolved (the warn + fallback below), never failing the
+                // wake.
+                let services = self.clone();
+                let wp = workspace_path.clone();
+                let sid = spec_id.clone();
+                let known = tokio::task::spawn_blocking(move || {
+                    services
+                        .specialists_service()
+                        .canonical_id(&sid, wp.as_deref())
+                        .is_some()
+                })
+                .await
+                .unwrap_or(false);
                 if !known {
                     tracing::warn!(
                         specialist = %spec_id,
@@ -11793,8 +11883,10 @@ impl Services {
                         "agent.wakeOrCreate: dropping inherited specialist that no longer resolves; falling back to create.specialist"
                     );
                 }
-                known
-            });
+                known.then_some(spec_id)
+            }
+            None => None,
+        };
         let specialist = inherited_specialist.or(create_opts.specialist.clone());
         let model = input
             .model

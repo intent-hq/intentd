@@ -1469,7 +1469,13 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
-        self.specialist_model_options(wp.as_deref())
+        // The options walk lists the full specialist catalog — blocking pool
+        // (monorepo#4148); a JoinError degrades to no options, matching the
+        // "spawning never fails on this" doctrine above.
+        let services = self.clone();
+        tokio::task::spawn_blocking(move || services.specialist_model_options(wp.as_deref()))
+            .await
+            .unwrap_or_default()
     }
 
     /// Non-empty trimmed string at `key` in a session's raw metadata JSON —
