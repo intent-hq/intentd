@@ -465,61 +465,101 @@ fn validate_icon_spec(value: Option<&Value>) -> Result<()> {
 }
 
 /// Frontmatter/wire key for the ordered list of delegation model options —
-/// `{ model, hint, reasoningEffort? }` entries a delegating agent can pick
-/// from (PROTOCOL §5.11).
+/// `{ provider?, model, hint, reasoningEffort? }` triples a delegating agent
+/// can pick from (PROTOCOL §5.11). `model` is a BARE model id; an omitted
+/// `provider` means the specialist's own provider (`codingAgent`, else the
+/// settings-derived default).
 /// Encoded in frontmatter as a **single-line JSON-array scalar** (e.g.
-/// `modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap"}]`) so it fits
-/// the line-based parser and round-trips losslessly. Resolution follows the
-/// same inherit-on-omit fold as [`INHERITED_CONFIG_KEYS`]: an omitted key
-/// inherits the lower tiers' effective list, an explicit `[]` clears it, and
-/// a non-empty list overrides it wholesale (entries never merge across tiers).
+/// `modelOptions: [{"provider":"opencode","model":"kimi-k3","hint":"cheap"}]`)
+/// so it fits the line-based parser and round-trips losslessly. Resolution
+/// follows the same inherit-on-omit fold as [`INHERITED_CONFIG_KEYS`]: an
+/// omitted key inherits the lower tiers' effective list, an explicit `[]`
+/// clears it, and a non-empty list overrides it wholesale (entries never
+/// merge across tiers).
 const MODEL_OPTIONS_KEY: &str = "modelOptions";
 
-/// Normalize one `modelOptions` entry to its documented fields, or `None` when
-/// the entry is unusable: `model` must be a non-empty (non-whitespace) string;
-/// `hint` is carried when it is a string and defaults to `""` otherwise;
-/// `reasoningEffort` is carried only when it is a non-empty string (the
-/// per-option effort level, PROTOCOL §5.11) and omitted otherwise.
+/// Normalize one `modelOptions` entry to its documented triple fields, or
+/// `None` when the entry is unusable: `model` must be a non-empty
+/// (non-whitespace) string; `provider` is carried when it is a non-empty
+/// string; `hint` is carried when it is a string and defaults to `""`
+/// otherwise; `reasoningEffort` is carried only when it is a non-empty string
+/// (the per-option effort level, PROTOCOL §5.11) and omitted otherwise.
+///
+/// Legacy compound `model` ids split on read: `provider:model` becomes the
+/// explicit `provider` plus the bare `model`, the prefix winning over an
+/// entry-level `provider` field (mirroring the spawn precedence compound ids
+/// had, where the model prefix outranked the provider column). A compound id
+/// with an empty prefix or an empty rest is unusable.
 fn normalize_model_option_entry(entry: &Value) -> Option<Value> {
     let obj = entry.as_object()?;
-    let model = obj
+    let raw_model = obj
         .get("model")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())?;
+    let (provider, model) = match raw_model.split_once(':') {
+        Some((prefix, rest)) => {
+            if prefix.trim().is_empty() || rest.trim().is_empty() {
+                return None;
+            }
+            (Some(prefix.to_string()), rest.to_string())
+        }
+        None => (
+            obj.get("provider")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+            raw_model.to_string(),
+        ),
+    };
     let hint = obj.get("hint").and_then(Value::as_str).unwrap_or("");
-    let mut out = json!({ "model": model, "hint": hint });
+    let mut out = Map::new();
+    if let Some(provider) = provider {
+        out.insert("provider".into(), json!(provider));
+    }
+    out.insert("model".into(), json!(model));
+    out.insert("hint".into(), json!(hint));
     if let Some(effort) = obj
         .get("reasoningEffort")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
     {
-        out["reasoningEffort"] = json!(effort);
+        out.insert("reasoningEffort".into(), json!(effort));
     }
-    Some(out)
+    Some(Value::Object(out))
 }
 
 /// Strictly validate a wire `modelOptions` value (`specialist.create`/`edit`
-/// specs): must be a JSON array of `{ model, hint?, reasoningEffort? }`
-/// objects with a non-empty string `model`, a string `hint` (defaulting to
-/// `""` when absent), and — when present — a string `reasoningEffort`.
+/// specs): must be a JSON array of `{ provider?, model, hint?, reasoningEffort? }`
+/// objects with a non-empty string `model`, an optional non-empty string
+/// `provider`, a string `hint` (defaulting to `""` when absent), and — when
+/// present — a string `reasoningEffort`.
 /// Returns the normalized entries in input order (`None` when the key is
 /// absent — the inherit-on-omit case); any invalid shape → `-32602`. Compound
 /// `provider:model` ids are NOT rejected here — legacy defs re-render through
-/// this path ([`render_file`]) and must stay lossless; the wire-boundary
-/// colon guard lives in [`reject_compound_model_options_spec`].
+/// this path ([`render_file`]) and split into the explicit triple; the
+/// wire-boundary colon guard lives in [`reject_compound_model_options_spec`].
 fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
     let Some(value) = value else { return Ok(None) };
     let Some(arr) = value.as_array() else {
         return Err(Error::InvalidParams(
-            "modelOptions must be an array of { model, hint } objects".to_string(),
+            "modelOptions must be an array of { provider?, model, hint } objects".to_string(),
         ));
     };
     let mut out = Vec::with_capacity(arr.len());
     for entry in arr {
         if !entry.is_object() {
             return Err(Error::InvalidParams(
-                "modelOptions entries must be { model, hint } objects".to_string(),
+                "modelOptions entries must be { provider?, model, hint } objects".to_string(),
             ));
+        }
+        match entry.get("provider") {
+            None => {}
+            Some(Value::String(s)) if !s.trim().is_empty() => {}
+            Some(_) => {
+                return Err(Error::InvalidParams(
+                    "modelOptions entry provider must be a non-empty string".to_string(),
+                ));
+            }
         }
         match entry.get("hint") {
             None | Some(Value::String(_)) => {}
