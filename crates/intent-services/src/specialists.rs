@@ -486,10 +486,13 @@ const MODEL_OPTIONS_KEY: &str = "modelOptions";
 /// (the per-option effort level, PROTOCOL §5.11) and omitted otherwise.
 ///
 /// Legacy compound `model` ids split on read: `provider:model` becomes the
-/// explicit `provider` plus the bare `model`, the prefix winning over an
-/// entry-level `provider` field (mirroring the spawn precedence compound ids
-/// had, where the model prefix outranked the provider column). A compound id
-/// with an empty prefix or an empty rest is unusable.
+/// explicit `provider` plus the bare `model` (both halves trimmed), the
+/// prefix winning over an entry-level `provider` field (mirroring the spawn
+/// precedence compound ids had, where the model prefix outranked the provider
+/// column). A compound id with an empty prefix or an empty rest is unusable.
+/// The re-split on every read is safe because bare model ids never contain a
+/// colon — `reject_compound_model` enforces that invariant on every wire
+/// write, so a persisted triple's `model` can never re-split.
 fn normalize_model_option_entry(entry: &Value) -> Option<Value> {
     let obj = entry.as_object()?;
     let raw_model = obj
@@ -501,7 +504,7 @@ fn normalize_model_option_entry(entry: &Value) -> Option<Value> {
             if prefix.trim().is_empty() || rest.trim().is_empty() {
                 return None;
             }
-            (Some(prefix.to_string()), rest.to_string())
+            (Some(prefix.trim().to_string()), rest.trim().to_string())
         }
         None => (
             obj.get("provider")
@@ -789,7 +792,8 @@ fn effective_hidden(def: &Value) -> bool {
 /// compound with an empty prefix or empty rest is unusable and reads as an
 /// omitted key (which inherits). Wire writes of compound `model` values are
 /// rejected up front (`reject_compound_model`), so this only ever fires for
-/// pre-triple on-disk files.
+/// pre-triple on-disk files — a bare model id never contains a colon, which
+/// is what makes the re-split on every read idempotent.
 fn split_compound_model_scalar(fm: &mut Map<String, Value>) {
     let Some(raw) = fm.get("model").and_then(Value::as_str) else {
         return;
@@ -801,7 +805,7 @@ fn split_compound_model_scalar(fm: &mut Map<String, Value>) {
         fm.remove("model");
         return;
     }
-    let (prefix, rest) = (prefix.to_string(), rest.to_string());
+    let (prefix, rest) = (prefix.trim().to_string(), rest.trim().to_string());
     fm.insert("model".into(), json!(rest));
     fm.insert("codingAgent".into(), json!(prefix));
 }
@@ -3511,6 +3515,12 @@ mod tests {
             json!({ "name": "Z", "description": "d",
                 "modelOptions": [{ "model": "opus4.5", "hint": 42 }] }),
             json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "provider": 42 }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "provider": "" }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "provider": "   " }] }),
+            json!({ "name": "Z", "description": "d",
                 "modelOptions": [{ "model": "opencode:kimi-k3", "hint": "cheap" }] }),
             json!({ "name": "Z", "description": "d", "modelOptions": [{ "model": ":kimi-k3" }] }),
             json!({ "name": "Z", "description": "d", "model": "opencode:kimi-k3" }),
@@ -3537,6 +3547,20 @@ mod tests {
                 "edit rejects {spec} with InvalidParams, got {err:?}"
             );
         }
+        // Positive case: a valid explicit `{provider, model}` triple persists
+        // through the wire edit path and reads back normalized.
+        let paired = json!({
+            "name": "Z", "description": "d", "prompt": "body",
+            "modelOptions": [{ "provider": "opencode", "model": "kimi-k3", "hint": "cheap" }]
+        });
+        let edited = svc.edit("zeta", &paired, "user", None).unwrap();
+        let expected = json!([{ "provider": "opencode", "model": "kimi-k3", "hint": "cheap" }]);
+        assert_eq!(edited["specialist"]["modelOptions"], expected);
+        assert_eq!(
+            svc.get("zeta", None).unwrap()["specialist"]["modelOptions"],
+            expected,
+            "the provider-pinned entry round-trips through the wire write path"
+        );
     }
 
     #[test]

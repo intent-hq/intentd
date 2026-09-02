@@ -437,13 +437,8 @@ async fn delegate_model_option_effort_matches_the_effective_provider() {
     write_specialist(
         spec_dir.path(),
         "paired",
-        "modelOptions:\n\
-         \x20 - provider: \"other\"\n\
-         \x20   model: \"fable-5\"\n\
-         \x20   reasoningEffort: \"high\"\n\
-         \x20 - provider: \"mock\"\n\
-         \x20   model: \"fable-5\"\n\
-         \x20   reasoningEffort: \"low\"\n",
+        "modelOptions: [{\"provider\":\"other\",\"model\":\"fable-5\",\"reasoningEffort\":\"high\"},\
+         {\"provider\":\"mock\",\"model\":\"fable-5\",\"reasoningEffort\":\"low\"}]\n",
     );
 
     let resp = svc
@@ -464,6 +459,47 @@ async fn delegate_model_option_effort_matches_the_effective_provider() {
         effort_of(&svc, id).await.as_deref(),
         Some("low"),
         "the option pinned to the effective provider wins over one sharing the bare model id"
+    );
+}
+
+/// Explicit `model` + no `provider` (spawn doctrine corner): the child spawns
+/// on the settings-derived default — the specialist's `codingAgent` never
+/// participates in that spawn chain — so the pair match must key on the
+/// settings default too, not on `codingAgent`.
+#[tokio::test]
+async fn delegate_explicit_model_pair_match_ignores_the_specialist_coding_agent() {
+    let (_t, svc, ws, spec_dir, _cfg) = setup().await;
+    seed_catalog(&svc);
+    let _env = mock_provider_env();
+    // Settings default provider is `auggie` (seeded in setup); the specialist
+    // pins `codingAgent: mock` and carries one option per provider.
+    write_specialist(
+        spec_dir.path(),
+        "pinned",
+        "codingAgent: \"mock\"\n\
+         modelOptions: [{\"provider\":\"mock\",\"model\":\"fable-5\",\"reasoningEffort\":\"high\"},\
+         {\"provider\":\"auggie\",\"model\":\"fable-5\",\"reasoningEffort\":\"low\"}]\n",
+    );
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("pinned".into()),
+                model: Some("fable-5".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let id = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert_eq!(
+        effort_of(&svc, id).await.as_deref(),
+        Some("low"),
+        "the pair match keys on the settings-derived default the child actually spawns on, \
+         not the specialist's codingAgent"
     );
 }
 

@@ -8325,16 +8325,14 @@ impl Services {
                 });
                 // The model-option rung matches on the effective `{ provider,
                 // model }` pair. With an explicit `model` param the provider
-                // was left `None` above (spawn-time resolution decides);
-                // mirror that resolution with the tolerant preview so the
-                // pair match still sees the provider the spawn will actually
-                // use.
+                // was left `None` above, and `agent_create_op` then persists
+                // the settings-derived default (`resolve_provider_id`:
+                // provider field → settings default — the specialist's
+                // `codingAgent` never participates there); mirror exactly
+                // that so the pair match sees the provider the spawn will
+                // actually use.
                 let effective_provider = delegate_provider.clone().or_else(|| {
-                    resolve_delegate_provider_preview(
-                        &services,
-                        specialist_param.as_deref(),
-                        ws_path.as_deref(),
-                    )
+                    crate::agent_session::derived_default_provider(&services.effective_settings())
                 });
                 let reasoning_effort = resolve_delegate_reasoning_effort(
                     &services,
@@ -11946,16 +11944,12 @@ impl Services {
                         provider.as_deref(),
                     )
                 });
-                // Same effective-provider rule as `agent.delegate`: mirror
-                // the spawn provider resolution (tolerant preview) when no
-                // explicit provider was supplied, so the model-option effort
-                // matches on the pair.
+                // Same effective-provider rule as `agent.delegate`: without
+                // an explicit `create.provider`, `agent_create_op` persists
+                // the settings-derived default, so the model-option pair
+                // match keys on that same provider.
                 let effective_provider = provider.clone().or_else(|| {
-                    resolve_delegate_provider_preview(
-                        &services,
-                        specialist.as_deref(),
-                        workspace_path.as_deref(),
-                    )
+                    crate::agent_session::derived_default_provider(&services.effective_settings())
                 });
                 let reasoning_effort = resolve_delegate_reasoning_effort(
                     &services,
