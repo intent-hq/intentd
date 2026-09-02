@@ -8577,3 +8577,39 @@ fn prompt_auth_required_turn_error_matches_mapped_shape() {
         assert!(!super::prompt_auth_required_turn_error(&err), "{err:?}");
     }
 }
+
+/// The auth-required `session/load` mapping is recognized by
+/// `load_auth_required_error` so `AgentManager::start_session` propagates the
+/// actionable login error instead of falling through to recreate (PR #1650
+/// review): the composed message (`"session/load: "` + the shared login
+/// message) must start with `LOAD_AUTH_REQUIRED_PREFIX` for every demotable
+/// provider, and only that `InvalidParams` shape classifies.
+#[test]
+fn load_auth_required_error_matches_mapped_shape() {
+    use intent_core::Error;
+    for id in ["auggie", "claude-code", "codex", "opencode", "droid", "pi"] {
+        let msg = format!(
+            "session/load: {}",
+            crate::provider_auth::not_authenticated_message(id)
+        );
+        assert!(
+            msg.starts_with(super::LOAD_AUTH_REQUIRED_PREFIX),
+            "{id}: {msg}"
+        );
+        assert!(
+            super::load_auth_required_error(&Error::InvalidParams(msg)),
+            "{id}"
+        );
+    }
+    // Ordinary load failures (the Internal wrapper) and other InvalidParams
+    // shapes never classify — start_session still falls through to recreate.
+    for err in [
+        Error::Internal("session/load failed: transport closed".into()),
+        Error::InvalidParams(format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message("pi")
+        )),
+    ] {
+        assert!(!super::load_auth_required_error(&err), "{err:?}");
+    }
+}

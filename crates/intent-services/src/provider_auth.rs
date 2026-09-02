@@ -1031,21 +1031,27 @@ mod tests {
     /// alias-backed demotion is not a silent no-op (PR #1650 review).
     #[test]
     fn demote_auth_verdict_hardens_probe_provider_and_canonicalizes_aliases() {
-        let id = AUTH_PROBE_PROVIDERS[0];
-        let prior = cache().fresh(id);
-        demote_auth_verdict(id);
-        assert_eq!(cached_auth_verdict(id), Some(false), "{id}");
-        cache().store(id, prior.flatten());
+        // "pi": a provider no other test seeds, so mutating the
+        // process-global cache here cannot race a parallel test that
+        // consults the create/delegate gate for a real default provider.
+        let prior = cache().fresh("pi");
+        demote_auth_verdict("pi");
+        assert_eq!(cached_auth_verdict("pi"), Some(false));
+        cache().store("pi", prior.flatten());
 
-        // Alias ids resolve to the catalog fallback (the first registered
-        // provider) for both the demotion write and the gate read.
+        // Alias/unknown ids resolve to the catalog fallback provider (the
+        // one an alias-backed create actually spawns) for both the demotion
+        // write and the gate read; known ids map to themselves. Pinned on
+        // `auth_cache_key` directly — `demote_auth_verdict` and
+        // `cached_auth_verdict` are one-line compositions over it, and
+        // demoting the real fallback here would plant a hard `false` that
+        // parallel tests could observe through the gate.
         let fallback = intent_providers::provider_config("acp").id;
-        assert_eq!(fallback, AUTH_PROBE_PROVIDERS[0]);
-        let prior = cache().fresh(fallback);
-        demote_auth_verdict("acp");
-        assert_eq!(cached_auth_verdict("acp"), Some(false));
-        assert_eq!(cached_auth_verdict(fallback), Some(false));
-        cache().store(fallback, prior.flatten());
+        for alias in ["acp", "augment", "default", "not-a-provider"] {
+            assert_eq!(auth_cache_key(alias), fallback, "{alias}");
+        }
+        assert_eq!(auth_cache_key("pi"), "pi");
+        assert_eq!(auth_cache_key("claude-code"), "claude-code");
     }
 
     /// A probe already in flight when a runtime demotion lands must not
@@ -1054,21 +1060,21 @@ mod tests {
     /// #1650 review). A probe with an unmoved epoch still stores normally.
     #[test]
     fn stale_probe_outcome_cannot_overwrite_runtime_demotion() {
-        let id = AUTH_PROBE_PROVIDERS[0];
-        let prior = cache().fresh(id);
+        // "pi" for parallel-test hygiene — see the demotion test above.
+        let prior = cache().fresh("pi");
 
         // Probe captured its epoch, then a demotion landed mid-flight.
-        let epoch = cache().demotion_epoch(id);
-        cache().demote(id);
-        cache().store_probe(id, Some(true), epoch);
-        assert_eq!(cached_auth_verdict(id), Some(false), "stale probe stored");
+        let epoch = cache().demotion_epoch("pi");
+        cache().demote("pi");
+        cache().store_probe("pi", Some(true), epoch);
+        assert_eq!(cached_auth_verdict("pi"), Some(false), "stale probe stored");
 
         // A fresh probe (epoch captured after the demotion) stores normally.
-        let epoch = cache().demotion_epoch(id);
-        cache().store_probe(id, Some(true), epoch);
-        assert_eq!(cached_auth_verdict(id), Some(true));
+        let epoch = cache().demotion_epoch("pi");
+        cache().store_probe("pi", Some(true), epoch);
+        assert_eq!(cached_auth_verdict("pi"), Some(true));
 
-        cache().store(id, prior.flatten());
+        cache().store("pi", prior.flatten());
     }
 
     /// The shared login message names the provider, carries the catalog

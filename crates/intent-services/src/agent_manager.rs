@@ -3216,6 +3216,14 @@ impl AgentManager {
                 return Ok(opened.session_id);
             }
             Ok(None) => {}
+            // Auth-required resume failure (intent-hq/intent#3941): the
+            // provider said it is not logged in — propagate the actionable
+            // login error instead of recreating. For claude-code the
+            // recreate's `session/new` can succeed while logged out, which
+            // would defer the failure to an opaque first-prompt error.
+            Err(e) if crate::agent_session::load_auth_required_error(&e) => {
+                return Err(e);
+            }
             // `session/load` was attempted but failed → fall through to recreate.
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "session/load failed; recreating");

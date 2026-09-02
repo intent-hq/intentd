@@ -167,6 +167,21 @@ pub(crate) fn prompt_auth_required_turn_error(err: &Error) -> bool {
     matches!(err, Error::InvalidParams(msg) if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX))
 }
 
+/// Prefix of the auth-required `session/load` mapping
+/// ([`map_acp_session_error`] with context `session/load`); same composition
+/// contract as [`PROMPT_AUTH_REQUIRED_PREFIX`].
+pub(crate) const LOAD_AUTH_REQUIRED_PREFIX: &str = "session/load: provider \"";
+
+/// Whether a resume failure is the auth-required `session/load` mapping.
+/// `AgentManager::start_session` propagates such a failure instead of
+/// falling through to recreate (PR #1650 review): the provider just said it
+/// is not logged in, and for claude-code the recreate's `session/new` can
+/// succeed while logged out — deferring the actionable login error to a
+/// later opaque prompt failure.
+pub(crate) fn load_auth_required_error(err: &Error) -> bool {
+    matches!(err, Error::InvalidParams(msg) if msg.starts_with(LOAD_AUTH_REQUIRED_PREFIX))
+}
+
 /// Debounce before the self-healing resume that [`enroll_suspend_interrupted_turn`]
 /// fires directly (independent of the host-wake broadcast). It must outlast the
 /// turn worker's post-enrollment teardown (`kill_child_only` + `end_turn`) so the
@@ -1179,6 +1194,18 @@ pub(crate) fn no_default_provider_error(context: &str) -> Error {
 /// no usable auth method); adapters that reject later calls surface it as a
 /// JSON-RPC error instead, classified by the same code/message heuristic as
 /// the model-list auth probe ([`crate::provider_models::is_auth_required_error`]).
+///
+/// Deliberately classifies on `rpc.message` ONLY — not the rendered error
+/// with its bounded `data` like the transient classifiers
+/// (`is_transient_upstream_disconnect` / `is_transient_provider_fetch_failure`).
+/// `data` carries arbitrary provider JSON that can mention "unauthorized" /
+/// "401" in unrelated contexts (tool output, upstream body echoes), and a
+/// false positive here is expensive: it demotes the cached auth verdict and
+/// blocks create/delegate spawns for the cache TTL. A false negative (auth
+/// text riding only in `data`, e.g. the monorepo#3007 bridge shape) degrades
+/// gracefully to today's opaque `Internal` error — the transient classifiers
+/// keep their broader match because their retry/fail-fast outcome is cheap
+/// to get wrong in comparison.
 fn is_acp_auth_required(e: &AcpError) -> bool {
     match e {
         AcpError::Auth(_) => true,
