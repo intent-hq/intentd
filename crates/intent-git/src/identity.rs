@@ -26,9 +26,23 @@ pub const GIT_IDENTITY_ENV_VARS: [&str; 4] = [
 /// (the repo is discovered upward, matching git's own resolution from a
 /// subdirectory). Returns an empty vec — export nothing — when `cwd` is
 /// absent, not inside a repository, or the repository resolves no identity.
-/// Never fails or blocks a spawn.
+/// A variable already set in the daemon's own process environment is never
+/// emitted: the child inherits it untouched, so a user-specified process
+/// identity keeps git's env-over-config precedence. Never fails or blocks a
+/// spawn.
 #[must_use]
 pub fn commit_identity_env(cwd: Option<&Path>) -> Vec<(String, String)> {
+    commit_identity_env_with(cwd, |key| std::env::var_os(key).is_some())
+}
+
+/// Seam behind [`commit_identity_env`]: `inherited` reports whether the
+/// spawning process's own environment already carries `key` (the child
+/// inherits such a variable, so it is skipped here rather than overridden —
+/// gap-filling only, per key).
+pub fn commit_identity_env_with(
+    cwd: Option<&Path>,
+    inherited: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
     let Some(cwd) = cwd else {
         return Vec::new();
     };
@@ -39,6 +53,9 @@ pub fn commit_identity_env(cwd: Option<&Path>) -> Vec<(String, String)> {
         return Vec::new();
     };
     identity_pairs(sig.name().ok(), sig.email().ok())
+        .into_iter()
+        .filter(|(key, _)| !inherited(key))
+        .collect()
 }
 
 /// Pure pairing seam: both a non-empty name AND email are required (git
@@ -108,6 +125,31 @@ mod tests {
         assert!(identity_pairs(Some("Name"), None).is_empty());
         assert!(identity_pairs(Some(""), Some("a@b.c")).is_empty());
         assert!(identity_pairs(Some("Name"), Some("")).is_empty());
+    }
+
+    /// A `GIT_*` identity var already set in the daemon's own environment is
+    /// never emitted (per key): the child inherits it, preserving git's
+    /// env-over-config precedence for a user-specified process identity.
+    #[test]
+    fn daemon_env_identity_vars_are_never_overridden() {
+        let repo = init_repo("identity-inherited");
+        let pairs = commit_identity_env_with(Some(repo.path()), |key| key == "GIT_AUTHOR_NAME");
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL"
+            ],
+            "the inherited key is skipped, the rest still fill gaps"
+        );
+
+        let all = commit_identity_env_with(Some(repo.path()), |_| true);
+        assert!(
+            all.is_empty(),
+            "fully user-specified identity: emit nothing"
+        );
     }
 
     /// Functional round-trip (#4142 definition of done): a `git commit` made

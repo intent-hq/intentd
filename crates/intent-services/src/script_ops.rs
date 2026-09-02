@@ -1325,8 +1325,9 @@ impl ScriptManager {
 /// enhanced PATH (essential system dirs + homebrew + node/version-manager dirs),
 /// the commit-identity `GIT_*` vars resolved from `cwd`'s repository (so a
 /// `git commit` in the script uses the user's real identity —
-/// intent-hq/intent#4142; nothing is exported when no identity resolves),
-/// then the script's own `env` last so it can override. The enhanced PATH keeps
+/// intent-hq/intent#4142; nothing is exported when no identity resolves, and
+/// a var already in the daemon's own env is inherited untouched), then the
+/// script's own `env` last so it can override. The enhanced PATH keeps
 /// git/node resolvable even when the daemon inherited a sparse Finder/launchd
 /// PATH or the login-shell init is degraded.
 fn spawn_env_overlay(

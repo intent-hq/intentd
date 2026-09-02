@@ -2764,6 +2764,7 @@ impl AgentManager {
                 self.services.pty(),
                 self.services.settings_registry(),
                 opts.provider.terminal_requires_shell,
+                Some(cwd.clone()),
             ));
         let handler = Arc::new(
             ClientRequestHandler::new(
@@ -8881,9 +8882,10 @@ fn inject_git_credential_env(
 /// config chain `git.commit` uses (intent-hq/intent#4142), so a `git commit`
 /// run by the agent (or any shell it spawns that inherits the provider env)
 /// carries the user's real identity even when the worktree has no local
-/// `user.*` config. No identity resolved ⇒ no changes; pre-existing caller
-/// keys are never clobbered. Identity is not a secret, so this is not gated
-/// on `exposeGitCredentialToChildren`.
+/// `user.*` config. No identity resolved ⇒ no changes; a var already in the
+/// daemon's own env is inherited untouched, and pre-existing caller keys are
+/// never clobbered. Identity is not a secret, so this is not gated on
+/// `exposeGitCredentialToChildren`.
 fn inject_git_identity_env(extra_env: &mut BTreeMap<String, String>, cwd: Option<&Path>) {
     for (key, value) in intent_git::identity::commit_identity_env(cwd) {
         extra_env.entry(key).or_insert(value);

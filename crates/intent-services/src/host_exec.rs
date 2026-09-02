@@ -391,7 +391,8 @@ fn build_command_with_captured(
     cmd.env("PATH", enhanced_path(None));
     // Commit-identity `GIT_*` vars resolved from the exec's cwd repository
     // (intent-hq/intent#4142) — same config chain `git.commit` uses; nothing
-    // is set when no identity resolves, and the caller's `env` (below) wins.
+    // is set when no identity resolves, a var already in the daemon's own env
+    // is inherited untouched, and the caller's `env` (below) wins.
     for (k, v) in intent_git::identity::commit_identity_env(cwd_resolved) {
         cmd.env(k, v);
     }
