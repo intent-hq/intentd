@@ -199,6 +199,7 @@ async fn create(
     let extra = AgentCreateExtra {
         metadata: Some(Value::Object(metadata)),
         is_background: Some(is_background),
+        provider: opt_str(args, "provider"),
         reasoning_effort: opt_str(args, "reasoningEffort"),
         ..AgentCreateExtra::default()
     };

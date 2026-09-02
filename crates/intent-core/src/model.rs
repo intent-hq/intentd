@@ -3679,13 +3679,14 @@ pub struct AgentDelegateInput {
     pub task_text: Option<String>,
     pub agent_instructions: Option<String>,
     pub specialist: Option<String>,
+    /// Bare model id for the delegated child (PROTOCOL §5.5). Compound
+    /// `provider:model` ids are rejected on the wire with `-32602` before
+    /// any side effect — pass [`Self::provider`] alongside the bare id.
     pub model: Option<String>,
     /// Explicit ACP provider for the delegated child (PROTOCOL §5.5).
     /// Disambiguates models that exist under multiple providers. Wins over
-    /// every derived resolution rung (compound-`model` prefix, specialist
-    /// frontmatter, settings default); must name a known, available
-    /// provider, and a compound `model` naming a DIFFERENT provider is a
-    /// contradiction — both reject with `-32602` before any side effect.
+    /// every derived resolution rung (specialist frontmatter, settings
+    /// default); must name a known, available provider.
     pub provider: Option<String>,
     /// Reasoning-effort level for the delegated child (PROTOCOL §5.5/§5.11).
     /// Wins over the chosen model option's `reasoningEffort` and the
@@ -3764,6 +3765,8 @@ pub struct BatchTaskOptions {
     pub task_note_id: NoteId,
     #[serde(default)]
     pub specialist: Option<String>,
+    /// Bare model id — compound `provider:model` ids reject with `-32602`
+    /// on the wire (PROTOCOL §5.5); pass `provider` alongside the bare id.
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -3789,6 +3792,8 @@ pub struct AgentWakeCreateOptions {
     pub specialist: Option<String>,
     pub provider: Option<String>,
     pub agent_type: Option<String>,
+    /// Bare model id — compound `provider:model` ids reject with `-32602`
+    /// on the wire (PROTOCOL §5.5); pass `provider` alongside the bare id.
     pub model: Option<String>,
     /// Reasoning-effort level for the created child (PROTOCOL §5.5/§5.11),
     /// used only on the create branch. Overridden by the wake-level
@@ -3810,6 +3815,8 @@ pub struct AgentWakeCreateOptions {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentWakeOrCreateInput {
+    /// Wake-branch model override: a bare model id — compound
+    /// `provider:model` ids reject with `-32602` on the wire (PROTOCOL §5.5).
     pub model: Option<String>,
     /// Reasoning-effort override for the create branch (PROTOCOL §5.5/§5.11);
     /// wins over `create.reasoningEffort` and the specialist frontmatter.
