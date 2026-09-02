@@ -2791,6 +2791,132 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     srv.ws.stop().await;
 }
 
+/// Legacy compound rows serialize SPLIT over the real WSS transport
+/// (migration 0113 + the read backstop): a row seeded directly in the DB
+/// with a compound `provider:model` id — as an older daemon could have
+/// persisted it — comes back from `agent.get` and `agent.list` with the
+/// bare model and the prefix-won provider; no wire payload ever carries a
+/// colon-compound model id. An effort-lookalike bare id (`opus[1m]`) passes
+/// through untouched.
+#[tokio::test]
+async fn wss_agent_reads_serialize_legacy_compound_rows_split() {
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Compound Split"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Seed the legacy rows straight into the store — the wire hard-rejects
+    // compound ids (-32602), so only a pre-0113 daemon could have written
+    // them. Bypassing the RPC layer is the point: prove the READ path splits.
+    let create_agent = |name: &str, id: i64| {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"{name}"}}}}"#
+        );
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        async move {
+            let created = wss_call(port, cfg, &frame).await;
+            created["result"]["agent"]["id"]
+                .as_str()
+                .expect("agent id")
+                .to_string()
+        }
+    };
+    let compound_id = create_agent("Legacy", 2).await;
+    let bare_id = create_agent("Bare", 3).await;
+    sqlx::query("UPDATE agent_session SET model = 'anthropic:claude-opus-4', provider = 'stale' WHERE id = ?")
+        .bind(&compound_id)
+        .execute(srv.store.write_pool())
+        .await
+        .expect("seed compound row");
+    sqlx::query(
+        "UPDATE agent_session SET model = 'opus[1m]', provider = 'claude-code' WHERE id = ?",
+    )
+    .bind(&bare_id)
+    .execute(srv.store.write_pool())
+    .await
+    .expect("seed effort-lookalike row");
+
+    // agent.get: the compound row serializes split — prefix wins provider.
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{compound_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["agent"]["model"],
+        Value::from("claude-opus-4"),
+        "agent.get must serialize the split model: {got}"
+    );
+    assert_eq!(
+        got["result"]["agent"]["provider"],
+        Value::from("anthropic"),
+        "agent.get must serialize the prefix-won provider: {got}"
+    );
+
+    // agent.list: same split on the summary projection, and the
+    // effort-lookalike bare id passes through untouched.
+    let listed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let agents = listed["result"]["agents"].as_array().expect("agents");
+    let by_id = |id: &str| {
+        agents
+            .iter()
+            .find(|a| a["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("agent {id} in list: {listed}"))
+    };
+    let compound = by_id(&compound_id);
+    assert_eq!(
+        compound["model"],
+        Value::from("claude-opus-4"),
+        "agent.list must serialize the split model: {listed}"
+    );
+    assert_eq!(
+        compound["provider"],
+        Value::from("anthropic"),
+        "agent.list must serialize the prefix-won provider: {listed}"
+    );
+    let bare = by_id(&bare_id);
+    assert_eq!(
+        bare["model"],
+        Value::from("opus[1m]"),
+        "effort-lookalike bare id must pass through untouched: {listed}"
+    );
+    assert_eq!(
+        bare["provider"],
+        Value::from("claude-code"),
+        "bare id must not disturb the provider: {listed}"
+    );
+
+    // No wire payload carries a compound id.
+    for agent in agents {
+        let model = agent["model"].as_str().unwrap_or_default();
+        assert!(
+            !model.contains(':'),
+            "no listed agent may serve a compound model id: {listed}"
+        );
+    }
+
+    srv.ws.stop().await;
+}
+
 /// Regression for monorepo#607 over the real WSS wire: a bare model id whose
 /// ownership by the requested provider is disproven by cached catalogs
 /// (seeded through the persisted models-cache file) is rejected with the

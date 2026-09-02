@@ -220,7 +220,9 @@ pub(crate) async fn fetch_agent_usage_rows(
     let mut result = Vec::new();
     for session_row in session_rows {
         let agent_id: String = session_row.get("id");
-        let model: Option<String> = session_row.get("model");
+        // Read backstop (0113): never leak a legacy compound id into the
+        // usage rollup's model key.
+        let (model, _) = normalize_compound_model(session_row.get("model"), None);
         // Best-effort decode (mirrors the content parse below): a malformed
         // snapshot degrades to None so the tally falls back to message sums.
         let snapshot: Option<TokenUsageTotals> = session_row
@@ -1409,12 +1411,21 @@ impl Store {
         expected_model: Option<&str>,
         resolved: Option<&str>,
     ) -> Result<bool> {
+        // The CAS compares against the NORMALIZED stored model (0113 read
+        // backstop, same split rule as `normalize_compound_model`): callers
+        // hold the model surfaced by reads — always split — so a legacy
+        // compound row must still match. Colon-free ids are untouched by the
+        // expression (`ltrim(x, ':')` only strips LEADING colons).
+        const NORMALIZED_MODEL_SQL: &str = "CASE \
+             WHEN instr(ltrim(model, ':'), ':') > 0 \
+             THEN nullif(substr(ltrim(model, ':'), instr(ltrim(model, ':'), ':') + 1), '') \
+             ELSE nullif(ltrim(model, ':'), '') END";
         let res = match expected_model {
             Some(expected) => {
-                sqlx::query(
+                sqlx::query(&format!(
                     "UPDATE agent_session SET resolved_model=? \
-                     WHERE id=? AND workspace_id=? AND model=?",
-                )
+                     WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} = ?"
+                ))
                 .bind(resolved)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
@@ -1423,10 +1434,10 @@ impl Store {
                 .await
             }
             None => {
-                sqlx::query(
+                sqlx::query(&format!(
                     "UPDATE agent_session SET resolved_model=? \
-                     WHERE id=? AND workspace_id=? AND model IS NULL",
-                )
+                     WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} IS NULL"
+                ))
                 .bind(resolved)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
@@ -1491,10 +1502,11 @@ impl Store {
         let Some(row) = row else {
             return Err(Error::NotFound(format!("agent session {id}")));
         };
-        Ok((
+        let (model, provider) = normalize_compound_model(
             row.get::<Option<String>, _>("last_turn_model"),
             row.get::<Option<String>, _>("last_turn_provider"),
-        ))
+        );
+        Ok((model, provider))
     }
 
     /// Persist the model/provider identity the CURRENT turn runs under
@@ -1569,9 +1581,14 @@ impl Store {
         let Some(row) = row else {
             return Err(Error::NotFound(format!("agent session {id}")));
         };
-        let model = row.get::<Option<String>, _>("model");
+        // Read backstop (0113): a legacy compound model id must not select
+        // the stale provider's token-accounting semantics or leak into the
+        // stats model key. `resolved_model` is a display label, untouched.
+        let (model, provider) = normalize_compound_model(
+            row.get::<Option<String>, _>("model"),
+            row.get::<Option<String>, _>("provider"),
+        );
         let resolved_model = row.get::<Option<String>, _>("resolved_model");
-        let provider = row.get::<Option<String>, _>("provider");
         let snapshot = row
             .get::<Option<String>, _>("token_usage")
             .map(|json| {
@@ -1649,11 +1666,12 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
-        // Lightweight invariant check: read only workspace_id, provider,
-        // acp_session_id (finding F3: no message fetch). Workspace mismatch →
-        // NotFound, provider immutable, acp_session_id write-once (§9.5).
+        // Lightweight invariant check: read only workspace_id, model,
+        // provider, acp_session_id (finding F3: no message fetch). Workspace
+        // mismatch → NotFound, provider immutable, acp_session_id write-once
+        // (§9.5).
         let row = sqlx::query(
-            "SELECT workspace_id, provider, acp_session_id FROM agent_session WHERE id = ?",
+            "SELECT workspace_id, model, provider, acp_session_id FROM agent_session WHERE id = ?",
         )
         .bind(&s.id.0)
         .fetch_optional(self.read_pool())
@@ -1665,7 +1683,14 @@ impl Store {
         if current_workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
-        let current_provider = row.get::<Option<String>, _>("provider");
+        // Compare against the NORMALIZED stored identity (0113 read
+        // backstop): a caller that read-modify-updates a legacy compound row
+        // holds the split provider, and that round trip must not trip the
+        // immutability guard.
+        let (_, current_provider) = normalize_compound_model(
+            row.get::<Option<String>, _>("model"),
+            row.get::<Option<String>, _>("provider"),
+        );
         let current_acp_session_id = row.get::<Option<String>, _>("acp_session_id");
         // Provider is immutable only after first real use (once acp_session_id
         // is set). This allows cross-provider model switches before the first
@@ -2783,6 +2808,7 @@ fn map_session_row_with_heavy_cols(
         ),
         _ => None,
     };
+    let (model, provider) = normalize_compound_model(col(row, "model")?, col(row, "provider")?);
     Ok(AgentSession {
         id: AgentId(col(row, "id")?),
         workspace_id: WorkspaceId(col(row, "workspace_id")?),
@@ -2791,10 +2817,10 @@ fn map_session_row_with_heavy_cols(
         acp_session_id: col(row, "acp_session_id")?,
         name: col(row, "name")?,
         name_explicitly_set: col::<i64>(row, "name_explicitly_set")? != 0,
-        model: col(row, "model")?,
+        model,
         reasoning_effort: col(row, "reasoning_effort")?,
         effort_levels: effort_levels_from_db(col(row, "effort_levels")?)?,
-        provider: col(row, "provider")?,
+        provider,
         specialist: col(row, "specialist")?,
         status: enum_from_db::<AgentStatus>(&col::<String>(row, "status")?)?,
         is_active: col::<i64>(row, "is_active")? != 0,
@@ -2833,6 +2859,42 @@ fn map_session_row_with_heavy_cols(
         sandbox_path: col(row, "sandbox_path")?,
         sandbox_branch: col(row, "sandbox_branch")?,
     })
+}
+
+/// Lenient read-time backstop for legacy compound `provider:model` ids
+/// (migration 0113's split, applied on read so a row the migration has not
+/// touched — e.g. one written by an older daemon after this build's
+/// migrations ran — still never surfaces a compound id). Split on the FIRST
+/// ':' with the old prefix-wins precedence: a non-empty prefix overwrites
+/// `provider`, the remainder becomes the model. Malformed leading colons
+/// carry no provider information and are stripped; an empty remainder
+/// normalizes to `None`. Colon-free ids (incl. effort-lookalikes such as
+/// `opus[1m]`) pass through untouched. Read-only: nothing is written back.
+///
+/// Non-idempotence caveat: a theoretical MULTI-colon id (`a:b:c`) is not a
+/// fixed point of this split — migration 0113 stores it as
+/// (provider `a`, model `b:c`), and this backstop then re-splits the stored
+/// model to (provider `b`, model `c`), discarding the migrated provider. No
+/// real model id contains a ':' (the wire rejects compound ids), so this is
+/// accepted rather than special-cased.
+fn normalize_compound_model(
+    model: Option<String>,
+    provider: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let Some(raw) = model else {
+        return (None, provider);
+    };
+    if !raw.contains(':') {
+        return (Some(raw), provider);
+    }
+    let trimmed = raw.trim_start_matches(':');
+    if let Some((prefix, rest)) = trimmed.split_once(':') {
+        let model = (!rest.is_empty()).then(|| rest.to_string());
+        (model, Some(prefix.to_string()))
+    } else {
+        let model = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        (model, provider)
+    }
 }
 
 /// Encode `agent_session.metadata` for persistence: `None` → SQL `NULL`,
@@ -6772,11 +6834,13 @@ mod tests {
                 "gpt-5.3-codex",
                 Some("high"),
             ),
-            // codex compound prefix evidence → split.
+            // codex compound prefix evidence → split. 0080 leaves the raw
+            // column at `codex:gpt-5.3-codex`; the 0113 read backstop then
+            // strips the compound prefix on read.
             (
                 "codex:gpt-5.3-codex/xhigh",
                 None,
-                "codex:gpt-5.3-codex",
+                "gpt-5.3-codex",
                 Some("xhigh"),
             ),
             // known effort-variant base evidence → split.
@@ -6838,6 +6902,413 @@ mod tests {
                 "reasoning_effort after 0080 for legacy {model}"
             );
         }
+    }
+
+    /// [`normalize_compound_model`] splits on the first ':' with prefix-wins
+    /// precedence, strips malformed leading colons without touching the
+    /// provider, normalizes empty remainders to `None`, and passes colon-free
+    /// ids through untouched.
+    #[test]
+    fn normalize_compound_model_splits_leniently() {
+        // (model, provider) → (expected model, expected provider)
+        type Case<'a> = (
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+        );
+        let cases: Vec<Case> = vec![
+            (None, Some("anthropic"), None, Some("anthropic")),
+            (Some("claude-opus-4"), None, Some("claude-opus-4"), None),
+            // Effort-lookalike bare id: no colon → untouched.
+            (
+                Some("opus[1m]"),
+                Some("claude-code"),
+                Some("opus[1m]"),
+                Some("claude-code"),
+            ),
+            // Compound: prefix overwrites the provider.
+            (
+                Some("codex:gpt-5.3-codex"),
+                Some("stale"),
+                Some("gpt-5.3-codex"),
+                Some("codex"),
+            ),
+            (
+                Some("anthropic:claude-opus-4"),
+                None,
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+            // First-colon split: the remainder keeps its colons.
+            (Some("a:b:c"), None, Some("b:c"), Some("a")),
+            // Malformed leading colon(s): no provider information.
+            (
+                Some(":claude-opus-4"),
+                Some("anthropic"),
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+            (Some("::"), Some("anthropic"), None, Some("anthropic")),
+            // Empty remainder → None.
+            (Some("anthropic:"), None, None, Some("anthropic")),
+        ];
+        for (model, provider, expected_model, expected_provider) in cases {
+            let (got_model, got_provider) =
+                normalize_compound_model(model.map(str::to_string), provider.map(str::to_string));
+            assert_eq!(
+                (got_model.as_deref(), got_provider.as_deref()),
+                (expected_model, expected_provider),
+                "normalize({model:?}, {provider:?})"
+            );
+        }
+    }
+
+    /// Migration 0113 splits compound `provider:model` ids in `model` (and
+    /// the `last_turn_model` pair) on the first ':' — prefix overwrites the
+    /// provider, remainder becomes the model — strips malformed leading-colon
+    /// ids without touching the provider, and leaves `reasoning_effort`,
+    /// `resolved_model`, and colon-free ids untouched. Asserted against the
+    /// raw columns so the read backstop cannot mask the migration.
+    #[tokio::test]
+    async fn migration_0113_splits_compound_session_model_ids() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        // (model, provider) → (expected model, expected provider) raw columns.
+        type Case<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+        let tmp = TempDb::new("test-agent-repo");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-0113".to_string());
+        let mk_id = || AgentId(format!("agent-{}", Uuid::new_v4()));
+        let cases: Vec<Case> = vec![
+            // Compound, no stored provider → prefix fills it.
+            (
+                "anthropic:claude-opus-4",
+                None,
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+            // Compound with a stale provider → prefix wins.
+            (
+                "codex:gpt-5.3-codex",
+                Some("stale"),
+                Some("gpt-5.3-codex"),
+                Some("codex"),
+            ),
+            // Malformed leading colon: stripped, provider untouched.
+            (
+                ":claude-opus-4",
+                Some("anthropic"),
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+            // Empty remainder → NULL model.
+            ("anthropic:", None, None, Some("anthropic")),
+            // Effort-lookalike bare id: no colon → untouched.
+            (
+                "opus[1m]",
+                Some("claude-code"),
+                Some("opus[1m]"),
+                Some("claude-code"),
+            ),
+            // Bare id → untouched.
+            (
+                "claude-opus-4",
+                Some("anthropic"),
+                Some("claude-opus-4"),
+                Some("anthropic"),
+            ),
+        ];
+        let ids: Vec<AgentId> = cases.iter().map(|_| mk_id()).collect();
+        {
+            let store = Store::open(&tmp).await.expect("create test store");
+            store
+                .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+                .await
+                .expect("insert workspace");
+            for (id, (model, provider, _, _)) in ids.iter().zip(&cases) {
+                let mut session = baseline_test_session(id, &ws_id, &ts, None);
+                session.model = Some(model.to_string());
+                session.provider = provider.map(str::to_string);
+                store.insert_agent_session(&session).await.expect("insert");
+            }
+            // Seed the columns insert doesn't cover on the first row: a
+            // compound last-turn pair (split), an effort (untouched — 0113
+            // never writes reasoning_effort), and a colon-bearing display
+            // identity (untouched — resolved_model is excluded).
+            sqlx::query(
+                "UPDATE agent_session SET last_turn_model = 'codex:gpt-5.3-codex', \
+                 last_turn_provider = 'stale', reasoning_effort = 'high', \
+                 resolved_model = 'Display: Opus' WHERE id = ?",
+            )
+            .bind(&ids[0].0)
+            .execute(store.write_pool())
+            .await
+            .expect("seed aux columns");
+            // Rewind the ledger so the reopen re-runs 0113 against these
+            // rows (same pattern as the 0080 test; 0113 is pure UPDATE, so
+            // there is no DDL to rewind).
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 113")
+                .execute(store.write_pool())
+                .await
+                .expect("forget 0113");
+            store.close().await;
+        }
+
+        let store = Store::open(&tmp).await.expect("reopen applies 0113");
+        for (id, (model, _, expected_model, expected_provider)) in ids.iter().zip(&cases) {
+            let row = sqlx::query("SELECT model, provider FROM agent_session WHERE id = ?")
+                .bind(&id.0)
+                .fetch_one(store.write_pool())
+                .await
+                .expect("raw row");
+            assert_eq!(
+                row.get::<Option<String>, _>("model").as_deref(),
+                *expected_model,
+                "raw model after 0113 for legacy {model}"
+            );
+            assert_eq!(
+                row.get::<Option<String>, _>("provider").as_deref(),
+                *expected_provider,
+                "raw provider after 0113 for legacy {model}"
+            );
+        }
+        let row = sqlx::query(
+            "SELECT last_turn_model, last_turn_provider, reasoning_effort, resolved_model \
+             FROM agent_session WHERE id = ?",
+        )
+        .bind(&ids[0].0)
+        .fetch_one(store.write_pool())
+        .await
+        .expect("raw aux row");
+        assert_eq!(
+            row.get::<Option<String>, _>("last_turn_model").as_deref(),
+            Some("gpt-5.3-codex"),
+            "last_turn_model split by 0113"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("last_turn_provider")
+                .as_deref(),
+            Some("codex"),
+            "last_turn_provider overwritten by the prefix"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("reasoning_effort").as_deref(),
+            Some("high"),
+            "0113 must not touch reasoning_effort"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("resolved_model").as_deref(),
+            Some("Display: Opus"),
+            "0113 must not touch resolved_model"
+        );
+    }
+
+    /// The read backstop splits a compound id a row the migration never saw
+    /// (e.g. written by an older daemon after this build's migrations ran):
+    /// session hydration and the last-turn getter never return a compound id.
+    #[tokio::test]
+    async fn read_backstop_normalizes_compound_model_ids() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-backstop".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.model = Some("anthropic:claude-opus-4".to_string());
+        session.provider = Some("stale".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Full-row hydration (0113 already ran on the empty table, so only
+        // the backstop can split this row).
+        let read = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(read.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(read.provider.as_deref(), Some("anthropic"));
+
+        // Summary hydration goes through the same mapping.
+        let listed = store
+            .list_agent_sessions(&ws_id)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|s| s.id == agent_id)
+            .expect("listed session");
+        assert_eq!(listed.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(listed.provider.as_deref(), Some("anthropic"));
+
+        // The last-turn getter applies the same backstop.
+        store
+            .set_agent_session_last_turn_model(
+                &ws_id,
+                &agent_id,
+                Some("codex:gpt-5.3-codex"),
+                "stale",
+            )
+            .await
+            .expect("seed last turn");
+        let (last_model, last_provider) = store
+            .get_agent_session_last_turn_model(&ws_id, &agent_id)
+            .await
+            .expect("get last turn");
+        assert_eq!(last_model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(last_provider.as_deref(), Some("codex"));
+    }
+
+    /// The 0113 read backstop also covers the token-usage reads: neither
+    /// `get_agent_session_token_usage` nor the workspace usage rollup
+    /// (`get_workspace_agent_usage_data`) surfaces a compound id — the stats
+    /// model/provider keys are computed from the split pair.
+    #[tokio::test]
+    async fn read_backstop_normalizes_usage_reads() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-usage-backstop".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.model = Some("anthropic:claude-opus-4".to_string());
+        session.provider = Some("stale".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let (model, _resolved, provider, _snapshot) = store
+            .get_agent_session_token_usage(&ws_id, &agent_id)
+            .await
+            .expect("token usage read");
+        assert_eq!(model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(provider.as_deref(), Some("anthropic"));
+
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage rollup");
+        let (_, rollup_model, _, _, _) = rows
+            .into_iter()
+            .find(|(id, _, _, _, _)| *id == agent_id.0)
+            .expect("rollup row");
+        assert_eq!(rollup_model.as_deref(), Some("claude-opus-4"));
+    }
+
+    /// `update_agent_session`'s provider-immutability guard compares against
+    /// the NORMALIZED stored identity: a read-modify-update round trip on a
+    /// legacy compound row (whose reads surface the split provider) must not
+    /// trip "provider is immutable", while an actual provider change still
+    /// does.
+    #[tokio::test]
+    async fn update_session_immutability_guard_normalizes_compound_rows() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-guard-backstop".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-1"));
+        session.model = Some("anthropic:claude-opus-4".to_string());
+        session.provider = Some("stale".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Round trip: reads surface the split identity; persisting it back
+        // must pass the guard even though the raw row is still compound.
+        let mut read = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(read.provider.as_deref(), Some("anthropic"));
+        read.name = "Renamed".to_string();
+        store
+            .update_agent_session(&ws_id, &read)
+            .await
+            .expect("round-trip update must not trip the immutability guard");
+
+        // An actual provider change is still rejected.
+        read.provider = Some("codex".to_string());
+        let err = store
+            .update_agent_session(&ws_id, &read)
+            .await
+            .expect_err("provider change past first use");
+        assert!(matches!(err, Error::Internal(_)));
+    }
+
+    /// The `set_agent_session_resolved_model` CAS matches the NORMALIZED
+    /// stored model: a caller that read a legacy compound row holds the split
+    /// model, and its guarded write must land; a genuine mismatch still
+    /// fails.
+    #[tokio::test]
+    async fn resolved_model_cas_normalizes_compound_rows() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-cas-backstop".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.model = Some("anthropic:claude-opus-4".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Mismatch still fails (and the raw compound form is NOT a valid
+        // expected_model — callers only ever hold split reads).
+        let landed = store
+            .set_agent_session_resolved_model(&ws_id, &agent_id, Some("sonnet"), Some("Sonnet"))
+            .await
+            .expect("guarded write");
+        assert!(!landed, "mismatched expected_model must not land");
+
+        // The split model read back from the row matches the compound column.
+        let landed = store
+            .set_agent_session_resolved_model(
+                &ws_id,
+                &agent_id,
+                Some("claude-opus-4"),
+                Some("Opus 4"),
+            )
+            .await
+            .expect("guarded write");
+        assert!(landed, "normalized expected_model must match compound row");
+        let (_, resolved, _, _) = store
+            .get_agent_session_token_usage(&ws_id, &agent_id)
+            .await
+            .expect("read");
+        assert_eq!(resolved.as_deref(), Some("Opus 4"));
+
+        // A compound id that normalizes to an empty model matches None.
+        let null_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut null_session = baseline_test_session(&null_id, &ws_id, &ts, None);
+        null_session.model = Some("anthropic:".to_string());
+        store
+            .insert_agent_session(&null_session)
+            .await
+            .expect("insert");
+        let landed = store
+            .set_agent_session_resolved_model(&ws_id, &null_id, None, Some("Opus 4.8"))
+            .await
+            .expect("guarded write on empty-remainder model");
+        assert!(
+            landed,
+            "empty remainder normalizes to NULL and matches None"
+        );
     }
 
     /// Hydration-skip matrix (monorepo#738): `get_workspace_agent_usage_data`
@@ -7779,8 +8250,9 @@ mod tests {
             .await
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+        // The read backstop splits the seeded compound id on read.
         let unchanged = store.get_agent_session(&agent_id).await.expect("get");
-        assert_eq!(unchanged.model.as_deref(), Some("mock:default"));
+        assert_eq!(unchanged.model.as_deref(), Some("default"));
         assert_eq!(unchanged.provider.as_deref(), Some("mock"));
 
         // Cross-provider switch AFTER first real use (acp_session_id set).
@@ -7796,7 +8268,7 @@ mod tests {
             .await
             .expect("intentional cross-provider switch");
         let after = store.get_agent_session(&agent_id).await.expect("get after");
-        assert_eq!(after.model.as_deref(), Some("grok:grok-4-fast"));
+        assert_eq!(after.model.as_deref(), Some("grok-4-fast"));
         assert_eq!(after.provider.as_deref(), Some("grok"));
         assert_eq!(after.updated_at, updated_at);
         assert_eq!(
@@ -7865,12 +8337,14 @@ mod tests {
             .expect("persist system prompt");
         let after = store.get_agent_session(&agent_id).await.expect("get after");
         assert_eq!(after.system_prompt.as_deref(), Some("assembled prompt"));
+        // The read backstop splits the compound id; the prefix wins over the
+        // stored provider column.
         assert_eq!(
             after.model.as_deref(),
-            Some("auggie:haiku"),
+            Some("haiku"),
             "concurrent setModel must not be reverted by the prompt persist"
         );
-        assert_eq!(after.provider.as_deref(), Some("mock"));
+        assert_eq!(after.provider.as_deref(), Some("auggie"));
         assert_eq!(after.updated_at, switched_at, "updated_at untouched");
         assert_eq!(after.acp_session_id.as_deref(), Some("acp-live"));
     }

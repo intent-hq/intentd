@@ -24555,9 +24555,11 @@ async fn agent_update_model_change_clears_resolved_model() {
         .await
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    // The CAS expects the model as surfaced by reads: the 0113 backstop
+    // splits the legacy compound row, so callers hold the bare id.
     let landed = svc
         .store()
-        .set_agent_session_resolved_model(&ws, &id, Some("auggie:sonnet4.5"), Some("Sonnet 4.5"))
+        .set_agent_session_resolved_model(&ws, &id, Some("sonnet4.5"), Some("Sonnet 4.5"))
         .await
         .expect("seed resolved model");
     assert!(landed);
@@ -24582,7 +24584,7 @@ async fn agent_update_model_change_clears_resolved_model() {
         .get_agent_session_token_usage(&ws, &id)
         .await
         .expect("read");
-    assert_eq!(model.as_deref(), Some("auggie:opus4.7"));
+    assert_eq!(model.as_deref(), Some("opus4.7"), "read backstop splits");
     assert_eq!(resolved, None, "model change must clear stale resolution");
 }
 
@@ -36417,7 +36419,9 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
         .await
         .expect("plain session");
     assert_eq!(plain_session.specialist.as_deref(), Some("implementor"));
-    assert_eq!(plain_session.model.as_deref(), Some("mock:default"));
+    // Compound input ids are split on read: bare model + provider column.
+    assert_eq!(plain_session.model.as_deref(), Some("default"));
+    assert_eq!(plain_session.provider.as_deref(), Some("mock"));
     assert!(plain_session.reasoning_effort.is_none());
 
     // …and the object entry's overrides won, field by field.
@@ -36427,7 +36431,8 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
         .await
         .expect("custom session");
     assert_eq!(custom_session.specialist.as_deref(), Some("verifier"));
-    assert_eq!(custom_session.model.as_deref(), Some("mock:override"));
+    assert_eq!(custom_session.model.as_deref(), Some("override"));
+    assert_eq!(custom_session.provider.as_deref(), Some("mock"));
     assert_eq!(custom_session.reasoning_effort.as_deref(), Some("high"));
 }
 

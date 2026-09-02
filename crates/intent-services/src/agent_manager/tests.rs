@@ -5687,10 +5687,12 @@ async fn build_turn_prompt_naming_instruction_uses_opencode_tool_name() {
     );
 }
 
-/// `session.provider` rules the nudge spelling regardless of the model id
-/// (same precedence as `resolve_spawn`): a legacy compound model row on an
-/// auggie-flagged session still gets the auggie tool name — model strings
-/// never participate in provider resolution.
+/// A legacy compound model row is normalized before the nudge is built: the
+/// store's read backstop splits `opencode:kimi-k3` on read and the compound
+/// prefix overwrites the stale provider column (prefix-wins, matching
+/// migration 0113), so the session surfaces as provider `opencode` + bare
+/// model `kimi-k3` and the nudge uses the opencode tool spelling — the
+/// `build_turn_prompt` logic itself never sees a compound model string.
 #[tokio::test]
 async fn build_turn_prompt_naming_instruction_ignores_model_string() {
     let (_tmp, mgr) = manager().await;
@@ -5726,8 +5728,12 @@ async fn build_turn_prompt_naming_instruction_ignores_model_string() {
         .unwrap()
         .to_string();
     assert!(
-        text.contains("`set_workspace_title_workspace-mcp`"),
-        "session.provider rules; the model string never overrides it: {text:?}"
+        text.contains("`workspace-mcp_set_workspace_title`"),
+        "compound prefix wins on read; the nudge uses the opencode spelling: {text:?}"
+    );
+    assert!(
+        !text.contains("set_workspace_title_workspace-mcp"),
+        "the stale auggie provider column must not drive the spelling: {text:?}"
     );
 }
 

@@ -102,7 +102,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112
+            110, 111, 112, 113
         ]
     );
     assert_eq!(
@@ -113,7 +113,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112
+            110, 111, 112, 113
         ]
     );
 }
@@ -3867,9 +3867,10 @@ async fn agent_session_status_only_lookup() {
 }
 
 /// `set_agent_session_resolved_model` (D13/D14) guard: the write lands only
-/// while `model` still equals `expected_model` (`None` matches NULL) — a
-/// mismatch (concurrent `agent.setModel`) returns `false` and leaves
-/// `resolved_model` untouched.
+/// while the NORMALIZED `model` still equals `expected_model` (`None`
+/// matches NULL) — callers hold the model surfaced by reads, which the 0113
+/// backstop always splits — and a mismatch (concurrent `agent.setModel`)
+/// returns `false` and leaves `resolved_model` untouched.
 /// `clear_agent_session_resolved_model` is idempotent (already-NULL column
 /// and absent row are both no-ops).
 #[tokio::test]
@@ -3891,12 +3892,7 @@ async fn agent_session_resolved_model_guard_and_clear() {
 
     // Guard failure: expected_model no longer matches → false, no write.
     let landed = store
-        .set_agent_session_resolved_model(
-            &ws,
-            &agent_id,
-            Some("claude-code:sonnet"),
-            Some("Sonnet 5"),
-        )
+        .set_agent_session_resolved_model(&ws, &agent_id, Some("sonnet"), Some("Sonnet 5"))
         .await
         .expect("guarded write");
     assert!(!landed, "mismatched expected_model must not land");
@@ -3913,12 +3909,13 @@ async fn agent_session_resolved_model_guard_and_clear() {
         .expect("guarded write");
     assert!(!landed, "None expected_model must not match a set model");
 
-    // Guard success: matching expected_model lands the resolution.
+    // Guard success: the split model (what a read of this legacy compound
+    // row surfaces) lands the resolution.
     let landed = store
         .set_agent_session_resolved_model(
             &ws,
             &agent_id,
-            Some("claude-code:claude-fable-5[1m]"),
+            Some("claude-fable-5[1m]"),
             Some("Fable 5"),
         )
         .await
@@ -3932,12 +3929,7 @@ async fn agent_session_resolved_model_guard_and_clear() {
 
     // A None resolution overwrites (clears) via the same guarded write.
     let landed = store
-        .set_agent_session_resolved_model(
-            &ws,
-            &agent_id,
-            Some("claude-code:claude-fable-5[1m]"),
-            None,
-        )
+        .set_agent_session_resolved_model(&ws, &agent_id, Some("claude-fable-5[1m]"), None)
         .await
         .expect("guarded clear");
     assert!(landed);
