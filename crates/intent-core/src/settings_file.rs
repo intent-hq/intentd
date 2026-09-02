@@ -1081,6 +1081,11 @@ impl SettingsFile {
                 Error::InvalidInput(format!("invalid config.toml at `{key_path}`: {detail}"))
             }
         })?;
+        // Normalize BEFORE validating so semantic checks (present and
+        // future) always observe split values — the same shape every
+        // downstream consumer sees.
+        let mut file = file;
+        file.normalize_legacy_compounds();
         file.validate()?;
         Ok(file)
     }
@@ -1126,8 +1131,60 @@ impl SettingsFile {
                     Error::InvalidInput(format!("invalid config.toml at `{key_path}`: {detail}"))
                 }
             })?;
+        // Normalize before validating — see `parse_str`.
+        let mut file = file;
+        file.normalize_legacy_compounds();
         file.validate()?;
         Ok((file, legacy))
+    }
+
+    /// Normalize legacy compound `provider:model` values on read (the
+    /// settings model triple): user-authored TOML that predates the bare-id
+    /// wire contract is split, never rejected.
+    ///
+    /// - A compound `model.default` splits at the first `:`: the prefix
+    ///   fills `model.defaultProvider` when that key is unset (an explicit
+    ///   split-form value always wins), the remainder becomes the bare
+    ///   `model.default`. Blank halves read as unset.
+    /// - A `model.providerDefaults` entry whose value carries its own map
+    ///   key as the prefix (`codex = "codex:gpt-5"`) is stripped to the bare
+    ///   id, with both halves trimmed exactly like `model.default`; a blank
+    ///   remainder (`codex = "codex:"`) reads as unset (the entry is
+    ///   removed). A foreign prefix is left as-is — the read-side ownership
+    ///   guards drop it per use, exactly like any other foreign model id.
+    ///
+    /// Runs in both parse entry points BEFORE `validate()`, so semantic
+    /// validation and every layer built on a parsed file (registry
+    /// snapshots, effective JSON, consumers) observe only split values; a
+    /// legacy file behaves identically to its split form. The on-disk TOML
+    /// is deliberately NOT rewritten.
+    fn normalize_legacy_compounds(&mut self) {
+        if let Some((provider, model)) = self
+            .model
+            .default
+            .as_deref()
+            .and_then(|raw| raw.split_once(':'))
+        {
+            let provider = provider.trim();
+            let model = model.trim();
+            if self.model.default_provider.is_none() && !provider.is_empty() {
+                self.model.default_provider = Some(provider.to_string());
+            }
+            self.model.default = (!model.is_empty()).then(|| model.to_string());
+        }
+        for (provider, value) in &mut self.model.provider_defaults {
+            if let Some(rest) = value
+                .trim()
+                .strip_prefix(provider.as_str())
+                .map(str::trim_start)
+                .and_then(|r| r.strip_prefix(':'))
+            {
+                *value = rest.trim().to_string();
+            }
+        }
+        // A stripped-to-blank remainder reads as unset, mirroring
+        // `model.default = "codex:"`.
+        self.model.provider_defaults.retain(|_, v| !v.is_empty());
     }
 
     /// Range/semantic checks the type system cannot express. Errors name the
@@ -2298,6 +2355,114 @@ mod tests {
             let parsed = SettingsFile::parse_str(text).expect("parse");
             assert_eq!(parsed.model.default_provider, None, "{text}");
         }
+    }
+
+    #[test]
+    fn legacy_compound_model_default_splits_into_the_triple() {
+        // A legacy compound `model.default` normalizes on read into the
+        // split (defaultProvider, default) form — never rejected — so a
+        // legacy file behaves identically to the split form.
+        let parsed =
+            SettingsFile::parse_str("[model]\ndefault = \"codex:gpt-5\"\n").expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("codex"));
+        let split =
+            SettingsFile::parse_str("[model]\ndefault = \"gpt-5\"\ndefaultProvider = \"codex\"\n")
+                .expect("parse");
+        assert_eq!(parsed, split, "legacy and split forms must be identical");
+
+        // An explicit defaultProvider wins over the compound prefix; the
+        // model half is still stripped bare.
+        let parsed = SettingsFile::parse_str(
+            "[model]\ndefault = \"codex:gpt-5\"\ndefaultProvider = \"auggie\"\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("auggie"));
+
+        // Only the FIRST colon splits; the rest stays in the model id.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"pi:org:m1\"\n").expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("org:m1"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("pi"));
+
+        // Blank halves read as unset — nothing is invented.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"codex:\"\n").expect("parse");
+        assert_eq!(parsed.model.default, None);
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("codex"));
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \":gpt-5\"\n").expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.model.default_provider, None);
+
+        // The tolerant legacy-path parse normalizes identically.
+        let (file, _) = SettingsFile::parse_str_with_legacy(
+            "[model]\ndefault = \"codex:gpt-5\"\nworkspaceOverrides = { ws1 = \"m1\" }\n",
+        )
+        .expect("tolerant parse");
+        assert_eq!(file.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(file.model.default_provider.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn legacy_compound_provider_defaults_strip_their_own_prefix() {
+        // A providerDefaults value prefixed with its own map key strips to
+        // the bare id; a foreign prefix is left as-is for the read-side
+        // ownership guards to drop per use.
+        let parsed = SettingsFile::parse_str(
+            "[model]\nproviderDefaults = { codex = \"codex:gpt-5\", auggie = \"codex:gpt-5\", pi = \"m2\" }\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed
+                .model
+                .provider_defaults
+                .get("codex")
+                .map(String::as_str),
+            Some("gpt-5"),
+            "own-prefix compound strips to the bare id"
+        );
+        assert_eq!(
+            parsed
+                .model
+                .provider_defaults
+                .get("auggie")
+                .map(String::as_str),
+            Some("codex:gpt-5"),
+            "a foreign prefix is left untouched"
+        );
+        assert_eq!(
+            parsed.model.provider_defaults.get("pi").map(String::as_str),
+            Some("m2"),
+            "bare values pass through"
+        );
+
+        // Both halves are trimmed exactly like `model.default`: padding
+        // around the value, the prefix, or the remainder never defeats the
+        // own-prefix strip.
+        let parsed = SettingsFile::parse_str(
+            "[model]\nproviderDefaults = { codex = \" codex : gpt-5 \" }\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed
+                .model
+                .provider_defaults
+                .get("codex")
+                .map(String::as_str),
+            Some("gpt-5"),
+            "padded own-prefix compound still strips and trims"
+        );
+
+        // An own-prefix with a blank remainder reads as unset — the entry is
+        // removed, mirroring `model.default = \"codex:\"`.
+        let parsed = SettingsFile::parse_str(
+            "[model]\nproviderDefaults = { codex = \"codex:\", pi = \"pi:  \" }\n",
+        )
+        .expect("parse");
+        assert!(
+            parsed.model.provider_defaults.is_empty(),
+            "blank remainders read as unset, got {:?}",
+            parsed.model.provider_defaults
+        );
     }
 
     #[test]

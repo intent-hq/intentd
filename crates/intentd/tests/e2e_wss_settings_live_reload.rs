@@ -665,3 +665,76 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
         "an ignored retired write must not change the renamed key: {get}"
     );
 }
+
+/// The settings model triple over the wire: a user-authored config carrying
+/// a legacy compound `model.default` (and an own-prefixed
+/// `model.providerDefaults` entry) reads back over WSS as the split triple —
+/// bare `model.default`, split-off `model.defaultProvider`, both with
+/// `origin: file` — while the on-disk file stays untouched at load. The wire
+/// keeps rejecting compound writes (`settings.update` is bare-id only), so
+/// normalization is strictly read-side.
+#[tokio::test]
+async fn legacy_compound_model_default_reads_back_as_the_split_triple_over_wss() {
+    let data_dir = temp_data_dir();
+    let config_path = data_dir.join("config.toml");
+    let seed =
+        "[model]\ndefault = \"codex:gpt-5\"\nproviderDefaults = { codex = \"codex:gpt-5-mini\" }\n";
+    std::fs::write(&config_path, seed).expect("seed legacy config.toml");
+
+    let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
+
+    // The compound reads back split: bare model + split-off provider, both
+    // reporting file origin (the value came from the user's file, not a
+    // schema default — origin badges must not mislabel it).
+    let get = wss_rpc(
+        &mut rpc,
+        10,
+        "settings.get",
+        json!({ "path": "model.default" }),
+    )
+    .await;
+    assert_eq!(get["result"]["value"], json!("gpt-5"), "{get}");
+    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+    let get = wss_rpc(
+        &mut rpc,
+        11,
+        "settings.get",
+        json!({ "path": "model.defaultProvider" }),
+    )
+    .await;
+    assert_eq!(get["result"]["value"], json!("codex"), "{get}");
+    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+
+    // The own-prefixed providerDefaults entry reads back bare.
+    let get = wss_rpc(
+        &mut rpc,
+        12,
+        "settings.get",
+        json!({ "path": "model.providerDefaults" }),
+    )
+    .await;
+    assert_eq!(
+        get["result"]["value"],
+        json!({ "codex": "gpt-5-mini" }),
+        "{get}"
+    );
+
+    // Normalization is read-side only: the user's model section is untouched
+    // at load (the harness boot appends `[server.wsApi]`, so compare the
+    // seeded lines, not the whole file).
+    let text = std::fs::read_to_string(&config_path).expect("read config.toml");
+    assert!(
+        text.starts_with(seed),
+        "normalization must not rewrite the user's model section: {text}"
+    );
+
+    // …and the wire still hard-rejects compound writes.
+    let update = wss_rpc(
+        &mut rpc,
+        13,
+        "settings.update",
+        json!({ "changes": [{ "path": "model.default", "value": "codex:gpt-5" }] }),
+    )
+    .await;
+    assert_eq!(update["error"]["code"], json!(-32602), "{update}");
+}
