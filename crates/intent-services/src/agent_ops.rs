@@ -18,9 +18,9 @@ use intent_core::events::{
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ConversationProjection, Error, Event, EventActor, NoteId, Result, SessionStats, TaskStatus,
-    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED,
-    PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
+    ConversationProjection, Error, Event, EventActor, NoteId, PullRequestInfo, PullRequestStatus,
+    Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -190,10 +190,114 @@ pub(crate) struct AgentSnapshot {
     /// byte-identical for agents that never use the feature.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) pr_monitors: Vec<String>,
+    /// Tracked open PRs (not merged/closed) as `"<owner>/<name>#<number>"`
+    /// labels grouped by state, from the workspace repo plus registered git
+    /// roots. Omitted when the workspace tracks no open PR, so prompts stay
+    /// byte-identical for workspaces without PRs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prs: Option<AgentSnapshotPrs>,
     /// `"blocker"` / `"discussion"` when this agent has raised an attention
     /// request that is still unresolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pending_attention: Option<String>,
+}
+
+/// The snapshot's `prs` object: tracked open PRs grouped by state, built
+/// from persisted columns only (the workspace row's discovered
+/// `pull_requests` plus each registered git root's) — no forge calls, no
+/// per-PR statements. Group precedence per PR: `draft` > `blocked` >
+/// `mergeable` > `unknown`; empty groups are omitted from the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct AgentSnapshotPrs {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) draft: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) blocked: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) mergeable: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unknown: Vec<String>,
+}
+
+impl AgentSnapshotPrs {
+    fn is_empty(&self) -> bool {
+        self.draft.is_empty()
+            && self.blocked.is_empty()
+            && self.mergeable.is_empty()
+            && self.unknown.is_empty()
+    }
+
+    /// The group vec `pr` belongs to, or `None` when the PR is merged or
+    /// closed (excluded from the snapshot entirely).
+    fn group_for(&mut self, pr: &PullRequestInfo) -> Option<&mut Vec<String>> {
+        if matches!(
+            pr.status,
+            PullRequestStatus::Merged | PullRequestStatus::Closed
+        ) {
+            return None;
+        }
+        let state = pr.mergeable_state.as_deref();
+        if pr.is_draft == Some(true)
+            || pr.status == PullRequestStatus::Draft
+            || state == Some("draft")
+        {
+            return Some(&mut self.draft);
+        }
+        if matches!(state, Some("blocked" | "dirty" | "behind")) || pr.mergeable == Some(false) {
+            return Some(&mut self.blocked);
+        }
+        if matches!(state, Some("clean" | "unstable" | "has_hooks")) || pr.mergeable == Some(true) {
+            return Some(&mut self.mergeable);
+        }
+        Some(&mut self.unknown)
+    }
+}
+
+/// Group tracked PR pools into the snapshot's `prs` object. `pools` yields
+/// `(owner, name, prs)` per repo; a pool with a blank (empty/whitespace)
+/// owner or name is skipped entirely — no meaningful label can be formed —
+/// matching the identity-less-root skip upstream. A merged/closed entry in
+/// ANY pool suppresses that `(repo, number)` entirely: the freshest terminal
+/// state wins over a stale open duplicate regardless of which pool carries
+/// it. Among surviving open duplicates the workspace pool (yielded first)
+/// wins the grouping. Returns `None` when no open PR survives (the field is
+/// then omitted).
+fn grouped_open_prs<'a>(
+    pools: impl IntoIterator<Item = (&'a str, &'a str, &'a [PullRequestInfo])>,
+) -> Option<AgentSnapshotPrs> {
+    let pools: Vec<(&str, &str, &[PullRequestInfo])> = pools
+        .into_iter()
+        .filter(|(owner, name, _)| !owner.trim().is_empty() && !name.trim().is_empty())
+        .collect();
+    // Seed the seen-set with every merged/closed key so a terminal state in
+    // any pool suppresses stale open duplicates of the same PR.
+    let mut seen: HashSet<(&str, &str, u64)> = HashSet::new();
+    for &(owner, name, prs) in &pools {
+        for pr in prs {
+            if matches!(
+                pr.status,
+                PullRequestStatus::Merged | PullRequestStatus::Closed
+            ) {
+                seen.insert((owner, name, pr.number));
+            }
+        }
+    }
+    let mut groups = AgentSnapshotPrs::default();
+    for &(owner, name, prs) in &pools {
+        for pr in prs {
+            if !seen.insert((owner, name, pr.number)) {
+                continue;
+            }
+            if let Some(group) = groups.group_for(pr) {
+                group.push(crate::harness::latest().pr_monitor_label(
+                    owner,
+                    name,
+                    pr.number.cast_signed(),
+                ));
+            }
+        }
+    }
+    (!groups.is_empty()).then_some(groups)
 }
 
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
@@ -215,6 +319,7 @@ impl AgentSnapshot {
             && self.running_sub_agents == 0
             && self.num_questions_asked == 0
             && self.pr_monitors.is_empty()
+            && self.prs.is_none()
             && self.pending_attention.is_none()
     }
 }
@@ -10244,8 +10349,10 @@ impl Services {
     /// (`ws.agent.diagnostics` stays the deep-dive tool). O(this agent):
     /// every field reads a per-agent registry length or a bounded per-agent
     /// count statement — no workspace-wide scans, no transcript or blob
-    /// hydration. `session` is the caller's already-fetched summary row so
-    /// the op path stays at one session read.
+    /// hydration (`prs` adds the workspace row plus the workspace's
+    /// registered git roots, both single bounded statements). `session` is
+    /// the caller's already-fetched summary row so the op path stays at one
+    /// session read.
     pub(crate) async fn build_agent_snapshot(
         &self,
         session: &AgentSession,
@@ -10293,6 +10400,10 @@ impl Services {
         // Per-agent indexed read over this agent's monitor rows; labels only,
         // no snapshot hydration. Fails open to empty.
         let pr_monitors = self.active_pr_monitor_labels(agent_id).await;
+        // Tracked open PRs from persisted columns only (workspace row +
+        // registered git roots) — no forge calls, no per-PR statements.
+        // Fails open to None.
+        let prs = self.tracked_open_prs_grouped(&session.workspace_id).await;
         // Whole-second UTC timestamp — the snapshot line is injected into
         // every turn prompt, so sub-second precision only spends tokens.
         let time = {
@@ -10313,8 +10424,66 @@ impl Services {
             running_sub_agents,
             num_questions_asked,
             pr_monitors,
+            prs,
             pending_attention: session.attention_request_kind.clone(),
         })
+    }
+
+    /// The snapshot's `prs` field: the workspace's tracked open PRs grouped
+    /// by state (see [`AgentSnapshotPrs`]), read from persisted columns only
+    /// — the workspace row's `pull_requests` under its
+    /// `repository_owner`/`repository_name`, plus each registered git root's
+    /// `pull_requests` under its `repo_owner`/`repo_name` (a pool whose repo
+    /// identity is missing or blank is skipped: no label can be formed). No
+    /// forge calls and
+    /// no per-PR statements (RPC cost contract); best-effort — a store
+    /// failure reads as `None` so a snapshot build never fails on it.
+    async fn tracked_open_prs_grouped(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<AgentSnapshotPrs> {
+        let workspace = match self.store.get_workspace(workspace_id).await {
+            Ok(ws) => Some(ws),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "workspace lookup failed; snapshot prs skips the workspace pool"
+                );
+                None
+            }
+        };
+        let roots = match self.store.list_workspace_git_roots(workspace_id).await {
+            Ok(roots) => roots,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "git-root lookup failed; snapshot prs skips the root pools"
+                );
+                Vec::new()
+            }
+        };
+        let mut pools: Vec<(&str, &str, &[PullRequestInfo])> = Vec::new();
+        if let Some(ws) = &workspace {
+            if let (Some(owner), Some(name), Some(prs)) = (
+                ws.repository_owner.as_deref(),
+                ws.repository_name.as_deref(),
+                ws.pull_requests.as_deref(),
+            ) {
+                pools.push((owner, name, prs));
+            }
+        }
+        for root in &roots {
+            if let (Some(owner), Some(name), Some(prs)) = (
+                root.repo_owner.as_deref(),
+                root.repo_name.as_deref(),
+                root.pull_requests.as_deref(),
+            ) {
+                pools.push((owner, name, prs));
+            }
+        }
+        grouped_open_prs(pools)
     }
 
     /// `ws.agent.snapshot()` (MCP-only, PROTOCOL §7.1): the caller's own
