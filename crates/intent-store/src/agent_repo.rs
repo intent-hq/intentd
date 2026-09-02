@@ -48,6 +48,49 @@ pub(crate) const SESSION_MESSAGE_STATS_SQL: &str = "SELECT s.id AS agent_id, \
     FROM agent_session s \
     WHERE s.workspace_id = ?";
 
+/// Two-phase search SQL behind [`Store::search_agent_messages_fts`],
+/// extracted so the monorepo#4127 plan-shape guard
+/// (`search_messages_fts_ranking_pass_avoids_fat_tables`) runs
+/// `EXPLAIN QUERY PLAN` on the exact production statement (see
+/// [`SESSION_MESSAGE_STATS_SQL`] for the precedent). The three flags splice
+/// in the optional scope filters, which bind after the MATCH expression in
+/// this order: workspace, agent, role.
+pub(crate) fn search_messages_fts_sql(
+    workspace_filter: bool,
+    agent_filter: bool,
+    role_filter: bool,
+) -> String {
+    let mut filters = String::new();
+    if workspace_filter {
+        filters.push_str(" AND c.workspace_id = ?");
+    }
+    if agent_filter {
+        filters.push_str(" AND c.agent_id = ?");
+    }
+    if role_filter {
+        filters.push_str(" AND c.role = ?");
+    }
+    format!(
+        "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
+                s.workspace_id, s.name AS agent_name, top.adjusted_rank \
+         FROM ( \
+             SELECT agent_message_fts.rowid AS msg_rowid, \
+                    bm25(agent_message_fts) \
+                      - (CASE WHEN c.workspace_id = ? THEN ? ELSE 0.0 END) \
+                      + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
+             FROM agent_message_fts \
+             JOIN agent_message_search_ctx c ON c.message_rowid = agent_message_fts.rowid \
+             JOIN workspace w ON w.id = c.workspace_id \
+             WHERE agent_message_fts MATCH ?{filters} \
+             ORDER BY adjusted_rank ASC, msg_rowid DESC \
+             LIMIT ? \
+         ) top \
+         JOIN agent_message m ON m.rowid = top.msg_rowid \
+         JOIN agent_session s ON s.id = m.agent_id \
+         ORDER BY top.adjusted_rank ASC, m.created_at DESC, m.id ASC"
+    )
+}
+
 /// Single-session projection SQL behind
 /// [`Store::get_agent_session_message_projection`] (see
 /// [`SESSION_MESSAGE_STATS_SQL`] for why it is extracted).
@@ -3107,6 +3150,9 @@ impl Store {
     /// precisely the overflow-page cost this shape removes; see
     /// `search_messages_fts_rowid_tiebreak_divergence_after_import`.
     ///
+    /// The statement itself is built by [`search_messages_fts_sql`] so the
+    /// plan-shape regression guard EXPLAINs the exact production SQL.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
@@ -3119,35 +3165,8 @@ impl Store {
         prefer_workspace_id: Option<&WorkspaceId>,
         limit: Option<i64>,
     ) -> Result<Vec<MessageFtsMatch>> {
-        let mut filters = String::new();
-        if workspace_id.is_some() {
-            filters.push_str(" AND c.workspace_id = ?");
-        }
-        if agent_id.is_some() {
-            filters.push_str(" AND c.agent_id = ?");
-        }
-        if role.is_some() {
-            filters.push_str(" AND c.role = ?");
-        }
-        let sql = format!(
-            "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
-                    s.workspace_id, s.name AS agent_name, top.adjusted_rank \
-             FROM ( \
-                 SELECT agent_message_fts.rowid AS msg_rowid, \
-                        bm25(agent_message_fts) \
-                          - (CASE WHEN c.workspace_id = ? THEN ? ELSE 0.0 END) \
-                          + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
-                 FROM agent_message_fts \
-                 JOIN agent_message_search_ctx c ON c.message_rowid = agent_message_fts.rowid \
-                 JOIN workspace w ON w.id = c.workspace_id \
-                 WHERE agent_message_fts MATCH ?{filters} \
-                 ORDER BY adjusted_rank ASC, msg_rowid DESC \
-                 LIMIT ? \
-             ) top \
-             JOIN agent_message m ON m.rowid = top.msg_rowid \
-             JOIN agent_session s ON s.id = m.agent_id \
-             ORDER BY top.adjusted_rank ASC, m.created_at DESC, m.id ASC"
-        );
+        let sql =
+            search_messages_fts_sql(workspace_id.is_some(), agent_id.is_some(), role.is_some());
         let mut query = sqlx::query(&sql)
             .bind(prefer_workspace_id.map(|w| w.0.as_str()))
             .bind(PREFER_WORKSPACE_BOOST)
@@ -11257,6 +11276,85 @@ mod tests {
         );
     }
 
+    /// Direct `UPDATE agent_message SET role/agent_id` (the 0074-style
+    /// repair path) keeps the 0112 ranking-context table in sync via the
+    /// `agent_message_search_ctx_after_update` trigger: role changes move
+    /// rows in and out of the indexed subset exactly like the FTS index,
+    /// and an `agent_id` re-parent refreshes the denormalized
+    /// agent/workspace columns instead of stranding stale values (ctx's
+    /// trigger fires on `agent_id` too because — unlike the FTS text — it
+    /// denormalizes session-derived context).
+    #[tokio::test]
+    async fn search_ctx_synced_on_direct_role_and_agent_updates() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-ctx-update-trigger");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_a = WorkspaceId("ws-ctx-upd-a".to_string());
+        let ws_b = WorkspaceId("ws-ctx-upd-b".to_string());
+        for ws in [&ws_a, &ws_b] {
+            store
+                .insert_workspace(&baseline_test_workspace(ws, &ts))
+                .await
+                .expect("insert workspace");
+        }
+        let agent_a = AgentId("agent-ctx-upd-a".to_string());
+        let agent_b = AgentId("agent-ctx-upd-b".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_a, &ws_a, &ts, None))
+            .await
+            .expect("insert session a");
+        store
+            .insert_agent_session(&baseline_test_session(&agent_b, &ws_b, &ts, None))
+            .await
+            .expect("insert session b");
+        let msg = store
+            .append_agent_message(
+                &agent_a,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "ctxupdterm"}]),
+                &ts,
+            )
+            .await
+            .expect("append user");
+        assert_eq!(ctx_row_count(&store).await, 1);
+
+        // role → non-indexed: the row leaves ctx (and the FTS index).
+        sqlx::query("UPDATE agent_message SET role = 'tool' WHERE id = ?")
+            .bind(&msg.id)
+            .execute(store.write_pool())
+            .await
+            .expect("update role to tool");
+        assert_eq!(ctx_row_count(&store).await, 0);
+        assert_search_ctx_consistent(&store).await;
+
+        // role → indexed again: the row re-enters ctx.
+        sqlx::query("UPDATE agent_message SET role = 'assistant' WHERE id = ?")
+            .bind(&msg.id)
+            .execute(store.write_pool())
+            .await
+            .expect("update role back");
+        assert_eq!(ctx_row_count(&store).await, 1);
+        assert_search_ctx_consistent(&store).await;
+
+        // agent_id re-parent: denormalized agent/workspace must refresh.
+        sqlx::query("UPDATE agent_message SET agent_id = ? WHERE id = ?")
+            .bind(&agent_b.0)
+            .bind(&msg.id)
+            .execute(store.write_pool())
+            .await
+            .expect("re-parent message");
+        let (ctx_agent, ctx_ws): (String, String) =
+            sqlx::query("SELECT agent_id, workspace_id FROM agent_message_search_ctx")
+                .fetch_one(store.read_pool())
+                .await
+                .map(|row| (row.get("agent_id"), row.get("workspace_id")))
+                .expect("read ctx row");
+        assert_eq!(ctx_agent, agent_b.0);
+        assert_eq!(ctx_ws, ws_b.0);
+        assert_search_ctx_consistent(&store).await;
+    }
+
     /// The 0074 migration backfills pre-existing rows: raw-inserted messages
     /// (triggers dropped to simulate a pre-0074 database) become searchable
     /// after re-running the migration file verbatim, with the same role
@@ -12244,28 +12342,14 @@ mod tests {
             .await
             .expect("insert session");
 
-        // Same SQL construction as search_agent_messages_fts with every
-        // optional filter present (the widest surface that could regress).
-        let sql = "EXPLAIN QUERY PLAN \
-             SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
-                    s.workspace_id, s.name AS agent_name, top.adjusted_rank \
-             FROM ( \
-                 SELECT agent_message_fts.rowid AS msg_rowid, \
-                        bm25(agent_message_fts) \
-                          - (CASE WHEN c.workspace_id = ? THEN ? ELSE 0.0 END) \
-                          + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
-                 FROM agent_message_fts \
-                 JOIN agent_message_search_ctx c ON c.message_rowid = agent_message_fts.rowid \
-                 JOIN workspace w ON w.id = c.workspace_id \
-                 WHERE agent_message_fts MATCH ? AND c.workspace_id = ? \
-                   AND c.agent_id = ? AND c.role = ? \
-                 ORDER BY adjusted_rank ASC, msg_rowid DESC \
-                 LIMIT ? \
-             ) top \
-             JOIN agent_message m ON m.rowid = top.msg_rowid \
-             JOIN agent_session s ON s.id = m.agent_id \
-             ORDER BY top.adjusted_rank ASC, m.created_at DESC, m.id ASC";
-        let plan: Vec<String> = sqlx::query(sql)
+        // The exact production statement (shared builder — see
+        // `search_messages_fts_sql`) with every optional filter present,
+        // the widest surface that could regress.
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            search_messages_fts_sql(true, true, true)
+        );
+        let plan: Vec<String> = sqlx::query(&sql)
             .bind("ws-plan")
             .bind(PREFER_WORKSPACE_BOOST)
             .bind(ARCHIVED_WORKSPACE_PENALTY)

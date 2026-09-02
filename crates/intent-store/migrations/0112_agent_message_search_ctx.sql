@@ -20,11 +20,21 @@
 -- Scope mirrors the FTS index exactly: only role IN ('user','assistant')
 -- rows, keyed by `agent_message`'s implicit rowid, maintained by the same
 -- trigger discipline as 0074 (append, replaceMessages swap, session-delete
--- cascade, role UPDATEs) — keep both trigger sets in sync. Like the FTS
--- index it is rebuilt after the one-time activation VACUUM
+-- cascade, role/agent_id UPDATEs) — keep both trigger sets in sync. Like
+-- the FTS index it is rebuilt after the one-time activation VACUUM
 -- (`Store::rebuild_agent_message_fts`), and it is derived state: transfers
 -- exclude it (`TRANSFER_EXCLUDED_TABLES`) because the target daemon's
 -- insert triggers regenerate it from the imported `agent_message` rows.
+--
+-- One asymmetry vs the 0074 backfill, which indexes messages
+-- unconditionally: ctx rows only materialize when the owning
+-- `agent_session` row exists (the INSERT…SELECT joins it for
+-- `workspace_id`). Every live path guarantees that — `agent_id` is
+-- NOT NULL REFERENCES agent_session(id) with foreign_keys=ON, and both
+-- bulk writers insert the session before its messages — but a legacy DB
+-- carrying pre-FK-enforcement orphaned messages would leave them
+-- FTS-indexed yet unmatchable (the ranking join drops them), which is
+-- acceptable: with no session there is no workspace to attribute them to.
 --
 -- No FK / no secondary indexes on purpose: rowid keys cannot carry an FK
 -- (same as the FTS table), lifecycle is fully trigger-owned, and every read
@@ -51,8 +61,12 @@ BEGIN
   DELETE FROM agent_message_search_ctx WHERE message_rowid = old.rowid;
 END;
 
+-- `OF role, agent_id`: 0074's trigger only needs `role, content`, but ctx
+-- additionally denormalizes `agent_id` (and, through it, `workspace_id`),
+-- so a future re-parenting UPDATE must refresh the row rather than
+-- silently stranding the stale agent/workspace.
 CREATE TRIGGER agent_message_search_ctx_after_update
-AFTER UPDATE OF role ON agent_message
+AFTER UPDATE OF role, agent_id ON agent_message
 BEGIN
   DELETE FROM agent_message_search_ctx WHERE message_rowid = old.rowid;
   INSERT INTO agent_message_search_ctx(message_rowid, agent_id, workspace_id, role)
