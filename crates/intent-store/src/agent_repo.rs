@@ -121,13 +121,56 @@ pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
 /// (`metadata.lastSeenMessageId`, v4.5) has not caught up with. Shared by the
 /// single-workspace EXISTS probe, the batch list-path derivation, and the
 /// guarded workspace-attention clear so the three can never drift.
+///
+/// The seen marker is read with `->>` (NOT `json_extract()`) and the three
+/// consumers force [`UNREAD_TOP_LEVEL_SESSION_INDEX`] via `INDEXED BY`, so
+/// each statement is answered entirely from the 0114 partial covering index
+/// instead of fetching every candidate row's metadata JSON from the main
+/// table B-tree — on a ~1GB dogfood DB that difference is ~5.6MB of
+/// scattered page reads vs ~86KB, and cold-cache it pushed the
+/// `workspace.list` dispatch past its 1s budget (intent-hq/monorepo#4190).
+/// `json_extract()` would silently break the covering property: it carries
+/// the `SQLITE_RESULT_SUBTYPE` property, which makes `SQLite` refuse
+/// index-expression substitution (values here are plain strings/NULL, so
+/// `->>` is semantically identical). A plan-shape test guards this.
 pub(crate) const UNREAD_TOP_LEVEL_SESSION_PREDICATE: &str = "parent_agent_id IS NULL \
     AND is_background = 0 \
     AND status <> 'deleted' \
     AND last_message_id IS NOT NULL \
     AND last_message_role = 'assistant' \
-    AND (json_extract(metadata, '$.lastSeenMessageId') IS NULL \
-         OR json_extract(metadata, '$.lastSeenMessageId') <> last_message_id)";
+    AND (metadata ->> '$.lastSeenMessageId' IS NULL \
+         OR metadata ->> '$.lastSeenMessageId' <> last_message_id)";
+
+/// The 0114 partial covering index answering
+/// [`UNREAD_TOP_LEVEL_SESSION_PREDICATE`] statements. Named explicitly (via
+/// `INDEXED BY`) by all three consumers because the planner's stat1
+/// estimates otherwise prefer `idx_agent_parent` (`parent_agent_id IS NULL`
+/// is costed like a ~4-row equality match) — same precedent as the
+/// `idx_agent_parent` `INDEXED BY` uses below. `INDEXED BY` fails loudly if
+/// the index is dropped or the predicate stops matching its WHERE clause.
+pub(crate) const UNREAD_TOP_LEVEL_SESSION_INDEX: &str = "idx_agent_session_unread_top_level";
+
+/// SQL behind [`Store::workspace_has_unread_top_level_session`], extracted so
+/// the monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
+/// statement (see [`SESSION_MESSAGE_STATS_SQL`] for the precedent).
+pub(crate) fn unread_workspace_probe_sql() -> String {
+    format!(
+        "SELECT EXISTS(\
+            SELECT 1 FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
+            WHERE workspace_id = ? AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}\
+        ) AS unread"
+    )
+}
+
+/// SQL behind [`Store::workspaces_with_unread_top_level_sessions`], extracted
+/// for the same monorepo#4190 plan-shape guard.
+pub(crate) fn unread_workspaces_batch_sql() -> String {
+    format!(
+        "SELECT DISTINCT workspace_id \
+         FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
+         WHERE {UNREAD_TOP_LEVEL_SESSION_PREDICATE}"
+    )
+}
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
@@ -1270,12 +1313,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<bool> {
-        let sql = format!(
-            "SELECT EXISTS(\
-                SELECT 1 FROM agent_session \
-                WHERE workspace_id = ? AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}\
-            ) AS unread"
-        );
+        let sql = unread_workspace_probe_sql();
         let row = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .fetch_one(self.read_pool())
@@ -1299,10 +1337,7 @@ impl Store {
     pub async fn workspaces_with_unread_top_level_sessions(
         &self,
     ) -> Result<std::collections::HashSet<String>> {
-        let sql = format!(
-            "SELECT DISTINCT workspace_id FROM agent_session \
-             WHERE {UNREAD_TOP_LEVEL_SESSION_PREDICATE}"
-        );
+        let sql = unread_workspaces_batch_sql();
         let rows = sqlx::query(&sql)
             .fetch_all(self.read_pool())
             .await
@@ -4629,6 +4664,65 @@ mod tests {
                     .iter()
                     .any(|d| d.contains("INDEX idx_agent_workspace_retired")),
                 "{label} read must use the partial retired index, plan: {details:?}"
+            );
+        }
+    }
+
+    /// The three unread-derivation statements (single-workspace EXISTS
+    /// probe, workspace.list batch derivation, guarded settle-clear) must be
+    /// answered entirely from the 0114 partial covering index
+    /// `idx_agent_session_unread_top_level` (intent-hq/monorepo#4190
+    /// regression guard): the plan must name the index, and the bytecode
+    /// must contain no `Function` opcode — a JSON function call in the
+    /// program means `SQLite` declined index-expression substitution (e.g.
+    /// someone reverted `->>` to `json_extract()`, whose `RESULT_SUBTYPE`
+    /// property blocks substitution) and every candidate row's metadata is
+    /// being fetched from the main table B-tree again.
+    #[tokio::test]
+    async fn unread_derivation_uses_partial_covering_index() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        for (label, sql, bind) in [
+            ("probe", unread_workspace_probe_sql(), true),
+            ("batch", unread_workspaces_batch_sql(), false),
+            (
+                "settle-clear",
+                crate::workspace_repo::clear_workspace_unread_if_all_seen_sql(),
+                true,
+            ),
+        ] {
+            let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
+            let bytecode_sql = format!("EXPLAIN {sql}");
+            let mut plan = sqlx::query(&plan_sql);
+            let mut bytecode = sqlx::query(&bytecode_sql);
+            if bind {
+                plan = plan.bind("ws-plan");
+                bytecode = bytecode.bind("ws-plan");
+            }
+            let details: Vec<String> = plan
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.contains("INDEX idx_agent_session_unread_top_level")),
+                "{label} must use the partial unread index, plan: {details:?}"
+            );
+            let opcodes: Vec<String> = bytecode
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain bytecode")
+                .iter()
+                .map(|row| row.get::<String, _>("opcode"))
+                .collect();
+            assert!(
+                !opcodes.iter().any(|o| o == "Function"),
+                "{label} must read the seen marker from the index expression, \
+                 not recompute it per row (covering property lost), opcodes: {opcodes:?}"
             );
         }
     }
@@ -10683,8 +10777,14 @@ mod tests {
         raw_insert(&system_only, 0, "system").await;
 
         // Raw inserts bypass write-time maintenance: still NULL. Recreate
-        // the pre-0070 shape and re-run the migration file verbatim.
+        // the pre-0070 shape and re-run the migration file verbatim (the
+        // 0114 unread index references the column, so drop the index first
+        // and re-run its migration after).
         assert_eq!(read_role_column(&store, &user_newest).await, None);
+        sqlx::query("DROP INDEX idx_agent_session_unread_top_level")
+            .execute(store.write_pool())
+            .await
+            .expect("drop 0114 index");
         sqlx::query("ALTER TABLE agent_session DROP COLUMN last_message_role")
             .execute(store.write_pool())
             .await
@@ -10695,6 +10795,12 @@ mod tests {
         .execute(store.write_pool())
         .await
         .expect("re-run 0070 migration");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0114_agent_session_unread_covering_index.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0114 migration");
 
         assert_eq!(
             read_role_column(&store, &user_newest).await,
@@ -10996,6 +11102,12 @@ mod tests {
 
         // Recreate the pre-0088 shape and re-run the migration file
         // verbatim: the backfill stamps from the newest user/assistant row.
+        // (The 0114 unread index references the column, so drop the index
+        // first and re-run its migration after.)
+        sqlx::query("DROP INDEX idx_agent_session_unread_top_level")
+            .execute(store.write_pool())
+            .await
+            .expect("drop 0114 index");
         sqlx::query("ALTER TABLE agent_session DROP COLUMN last_message_id")
             .execute(store.write_pool())
             .await
@@ -11006,6 +11118,12 @@ mod tests {
         .execute(store.write_pool())
         .await
         .expect("re-run 0088 migration");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0114_agent_session_unread_covering_index.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0114 migration");
 
         assert_eq!(
             read_id_column(&store, &user_newest).await,
