@@ -451,10 +451,8 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             json!({"workspaceId":workspace_id,"agentId":agent}),
         )
         .await;
-        assert_eq!(
-            agent["agent"]["model"],
-            "antigravity:gemini-3.6-flash-medium"
-        );
+        assert_eq!(agent["agent"]["provider"], "antigravity");
+        assert_eq!(agent["agent"]["model"], "gemini-3.6-flash-medium");
     }
 }
 
