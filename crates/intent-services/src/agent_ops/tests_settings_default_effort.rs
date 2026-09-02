@@ -40,9 +40,18 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
             .expect("load registry"),
     );
     // monorepo#3044: creation requires a resolvable provider (no positional
-    // fallback) — seed the effective default provider explicitly.
+    // fallback) — seed the effective default provider explicitly. The
+    // `providers.paths` override points auggie at a deterministic executable
+    // so the delegate path's availability check passes without the real
+    // binary on the test host (CI has none).
     registry
-        .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
+        .apply(&[
+            ("model.defaultProvider".into(), serde_json::json!("auggie")),
+            (
+                "providers.paths".into(),
+                serde_json::json!({ "auggie": "/bin/sh" }),
+            ),
+        ])
         .expect("seed default provider");
     let services = Services::new(store)
         .with_settings_registry(registry)
