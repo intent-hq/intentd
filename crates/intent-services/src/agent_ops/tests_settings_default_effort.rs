@@ -40,9 +40,19 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
             .expect("load registry"),
     );
     // monorepo#3044: creation requires a resolvable provider (no positional
-    // fallback) — seed the effective default provider explicitly.
+    // fallback) — seed the effective default provider explicitly. The
+    // `providers.paths` override points auggie at a deterministic executable
+    // (the `test_registry_with_default_provider` pattern, monorepo#3162) so
+    // delegate-path availability checks pass without a real binary on the
+    // test host (monorepo#4202: gh-hosted coverage runners have none).
     registry
-        .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
+        .apply(&[
+            ("model.defaultProvider".into(), serde_json::json!("auggie")),
+            (
+                "providers.paths".into(),
+                serde_json::json!({ "auggie": "/bin/sh" }),
+            ),
+        ])
         .expect("seed default provider");
     let services = Services::new(store)
         .with_settings_registry(registry)
@@ -63,11 +73,11 @@ fn set(svc: &Services, path: &str, value: serde_json::Value) {
 /// Seed a provider catalog so `fable-5` has effort evidence and `sonnet5`
 /// has none.
 ///
-/// Both `auggie` and `mock` are seeded: the create-path tests never spawn, so
-/// they can name `auggie`, while the delegate-path tests resolve a *provider*
-/// and must use `mock` — its availability is gated purely on
-/// `MOCK_AGENT_SCRIPT_PATH` ([`EnvGuard`]), so they do not depend on a real
-/// ACP provider binary being installed on the test host (CI has none).
+/// Both `auggie` and `mock` are seeded: delegate-path tests resolve a
+/// *provider* and validate its availability, so both rails are hermetic —
+/// `auggie` via the `providers.paths` override in [`setup`] and `mock` via
+/// `MOCK_AGENT_SCRIPT_PATH` ([`mock_provider_env`]) — and no test depends on
+/// a real ACP provider binary being installed on the test host (CI has none).
 fn seed_catalog(svc: &Services) {
     for provider in ["auggie", "mock"] {
         let version_key = crate::model_catalog::source_for(provider)
