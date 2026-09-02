@@ -137,7 +137,7 @@ fn resolve_quick_action_model(
 /// gates the flag itself — for providers with no CLI model flag the caller
 /// applies `model` best-effort after `session/new` instead (see
 /// [`config_option_model`]).
-fn one_shot_launch(
+pub(crate) fn one_shot_launch(
     provider: &intent_providers::ProviderConfig,
     resolved_bin: Option<PathBuf>,
     npx: Option<PathBuf>,
@@ -177,7 +177,7 @@ fn one_shot_launch(
 /// `AgentManager::config_option_model_target`: the adapter's
 /// `configOptions[id="model"]` select values are bare base ids, so a
 /// suffixed value would never match.
-fn config_option_model<'m>(
+pub(crate) fn config_option_model<'m>(
     provider: &intent_providers::ProviderConfig,
     model: Option<&'m str>,
 ) -> Option<&'m str> {

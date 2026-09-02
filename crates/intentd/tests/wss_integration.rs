@@ -6080,6 +6080,98 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
+    // host.providerTestPrompt (§5.14) over the real wire, both terminal
+    // shapes against the mock ACP fixture. A provider whose adapter answers
+    // the live "say hello" turn is `{ ok: true }` and the cached
+    // host.providerAuthStatus verdict is promoted to a hard `true`; an
+    // adapter that rejects session/prompt with an auth-required JSON-RPC
+    // error is `{ ok: false, reason: "auth-required" }` and the verdict is
+    // demoted to `false` — observed here through non-forced
+    // host.providerAuthStatus reads, which serve the cache before any probe.
+    //
+    // One sequential test (not two) because the daemon runs in-process and
+    // the auth-verdict cache is process-global: two parallel tests promoting
+    // and demoting the same provider would race each other's assertions.
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping providerTestPrompt e2e: node not on PATH");
+        return;
+    }
+    let (_ok_dir, ok_bin) = fake_acp_adapter_script("test-prompt-ok", r#"{"response":"hello"}"#);
+    let (_auth_dir, auth_bin) = fake_acp_adapter_script(
+        "test-prompt-auth",
+        r#"{"promptRpcError":{"code":-32000,"message":"Authentication required"}}"#,
+    );
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "codex": ok_bin.to_string_lossy() }),
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":70,"method":"host.providerTestPrompt","params":{"providerId":"codex"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 70);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "ok": true }),
+        "a live answered turn is a bare pass: {resp}"
+    );
+    let status = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":71,"method":"host.providerAuthStatus","params":{"providerId":"codex"}}"#,
+    )
+    .await;
+    assert_eq!(
+        status["result"]["providers"][0]["authenticated"], true,
+        "a passed test prompt promotes the cached verdict: {status}"
+    );
+
+    // Same provider, now behind an adapter that rejects the prompt with the
+    // claude-code auth-required shape (-32000 + auth-pattern message).
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "codex": auth_bin.to_string_lossy() }),
+    );
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":72,"method":"host.providerTestPrompt","params":{"providerId":"codex"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 72);
+    assert_eq!(resp["result"]["ok"], false);
+    assert_eq!(
+        resp["result"]["reason"], "auth-required",
+        "the -32000/auth-pattern mapping from the spawn-feedback seam: {resp}"
+    );
+    assert!(
+        resp["result"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("authentication required"),
+        "message carries the adapter's error: {resp}"
+    );
+    let status = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":73,"method":"host.providerAuthStatus","params":{"providerId":"codex"}}"#,
+    )
+    .await;
+    assert_eq!(
+        status["result"]["providers"][0]["authenticated"], false,
+        "an auth-required test prompt demotes the cached verdict: {status}"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
     // Adapters that hold their slot for ~10s before answering the turn, so the
     // bound is saturated for a wide, non-racy window. The wrapper records one

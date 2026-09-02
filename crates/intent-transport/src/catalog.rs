@@ -329,7 +329,7 @@ pub(crate) const METHOD_ALIASES: &[(&str, &str)] =
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 37 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 38 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`, `server.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
@@ -365,6 +365,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "host.openInEditor",
     "host.providerAuthStatus",
     "host.providerDiscovery",
+    "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
     "pairing.getInfo",

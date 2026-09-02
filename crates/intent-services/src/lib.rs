@@ -108,6 +108,7 @@ mod primitive_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_models;
+pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
 mod rtk;
