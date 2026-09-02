@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.8] - 2026-09-02
+
+### 🐛 Bug Fixes
+
+- *(services)* Stop infinite advisory-wake retries to retired watchers ([#1655](https://github.com/intent-hq/intentd/pull/1655))
+
+### 🧪 Testing
+
+- *(services)* Make settings-default-effort tests hermetic (seed providers.paths for auggie) ([#1664](https://github.com/intent-hq/intentd/pull/1664))
+- *(git)* Make identity tests hermetic vs inherited GIT_* env ([#1659](https://github.com/intent-hq/intentd/pull/1659))
+
+
 ## [0.9.7] - 2026-09-02
 
 ### 🚀 Features
