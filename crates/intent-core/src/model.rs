@@ -926,6 +926,8 @@ pub struct WorkspaceCreate {
 pub struct WorkspaceCreateInitialAgent {
     pub prompt: Option<String>,
     pub name: Option<String>,
+    /// Bare model id (no `provider:` prefix — compound ids are rejected
+    /// `-32602` at the wire boundary, PROTOCOL §5.5); pair with `provider`.
     pub model: Option<String>,
     pub specialist: Option<String>,
     pub provider: Option<String>,

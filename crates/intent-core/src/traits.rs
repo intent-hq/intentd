@@ -1852,7 +1852,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// the next prompt (the truncated history replays as `<supervisor>` XML so
     /// the provider does not retain the truncated turns), then sends `content`
     /// as a fresh user message with the same per-turn semantics as
-    /// `agent.sendMessage`.
+    /// `agent.sendMessage`. An explicit `model` must be a bare model id
+    /// (compound `provider:model` ids reject `-32602` at the wire boundary,
+    /// §5.5).
     #[allow(clippy::too_many_arguments)]
     fn agent_edit_and_regenerate(
         &self,
@@ -2103,6 +2105,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.enhancePrompt`: one-shot prompt-enhance / AI-layout generation via
     /// the auggie CLI — `{ enhanced, original, mode }`; `mode` is `"enhance"` or
     /// `"layout"`, `workspaceId` optionally pins the CLI's cwd (PROTOCOL §5.31).
+    /// `model` must be a bare model id (compound `provider:model` ids reject
+    /// `-32602` at the wire boundary, §5.5).
     fn agent_enhance_prompt(
         &self,
         prompt: String,
@@ -2128,7 +2132,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// `quick_action_type` is the optional quick-action `type` hint keying
     /// `quickActions.typeOverrides`; with no explicit `model` the daemon
     /// resolves that override then `quickActions.defaultModel` before the
-    /// provider CLI default (monorepo#1734).
+    /// provider CLI default (monorepo#1734). An explicit `model` must be a
+    /// bare model id (compound `provider:model` ids reject `-32602` at the
+    /// wire boundary, §5.5).
     fn agent_complete_once(
         &self,
         prompt: String,

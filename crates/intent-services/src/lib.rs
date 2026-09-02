@@ -15321,6 +15321,15 @@ impl WorkspaceApi for Services {
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
+        if let Some(model) = input
+            .initial_agent
+            .as_ref()
+            .and_then(|a| a.model.as_deref())
+        {
+            if let Err(e) = reject_compound_model("initialAgent.model", model) {
+                return Box::pin(async move { Err(e) });
+            }
+        }
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
@@ -24742,6 +24751,9 @@ impl WorkspaceApi for Services {
         model: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(model) = model.as_deref() {
+                reject_compound_model("model", model)?;
+            }
             // Attachment-reference validation (PROTOCOL §5.5), same seam as
             // agent.sendMessage — before any state change.
             crate::agent_ops::validate_file_blocks(
@@ -24957,6 +24969,9 @@ impl WorkspaceApi for Services {
         timeout_ms: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(model) = model.as_deref() {
+                reject_compound_model("model", model)?;
+            }
             self.agent_enhance_prompt_op(prompt, mode, model, workspace_id, timeout_ms)
                 .await
         })
@@ -24972,6 +24987,9 @@ impl WorkspaceApi for Services {
         timeout_ms: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if let Some(model) = model.as_deref() {
+                reject_compound_model("model", model)?;
+            }
             self.agent_complete_once_op(
                 prompt,
                 system_prompt,

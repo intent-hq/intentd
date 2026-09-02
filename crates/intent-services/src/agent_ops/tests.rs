@@ -24995,18 +24995,14 @@ async fn agent_edit_and_regenerate_fallback_applies_model_and_truncates() {
             "edited via fallback".into(),
             None,
             None,
-            Some("mock:other".into()),
+            Some("other".into()),
         )
         .await
         .expect("fallback edit");
     assert_eq!(result["truncatedCount"], json!(2));
 
     let session = svc.agent_get_session_op(id.clone()).await.expect("get");
-    assert_eq!(
-        session.model.as_deref(),
-        Some("mock:other"),
-        "model applied"
-    );
+    assert_eq!(session.model.as_deref(), Some("other"), "model applied");
     assert_eq!(session.messages.len(), 3, "prefix + edited message");
     assert_eq!(session.messages[2].role, "user");
     assert_eq!(
@@ -25023,7 +25019,7 @@ async fn agent_edit_and_regenerate_fallback_applies_model_and_truncates() {
             "x".into(),
             None,
             None,
-            Some("mock:third".into()),
+            Some("third".into()),
         )
         .await
         .expect_err("unknown target");
@@ -25031,7 +25027,7 @@ async fn agent_edit_and_regenerate_fallback_applies_model_and_truncates() {
     let session = svc.agent_get_session_op(id).await.expect("get");
     assert_eq!(
         session.model.as_deref(),
-        Some("mock:other"),
+        Some("other"),
         "model unchanged by rejected edit"
     );
     assert_eq!(session.messages.len(), 3, "transcript unchanged");
@@ -38104,4 +38100,87 @@ async fn wire_agent_wake_or_create_rejects_compound_model() {
     .await
     .expect("bare model accepted");
     assert_eq!(resp["created"], true);
+}
+
+#[tokio::test]
+async fn wire_create_workspace_rejects_compound_initial_agent_model() {
+    let (_t, svc, _ws) = setup().await;
+    let before = svc.list_workspaces(true).await.expect("list").len();
+    for bad in ["mock:default", ":default"] {
+        let err = WorkspaceApi::create_workspace(
+            &svc,
+            intent_core::WorkspaceCreate {
+                title: Some("W".into()),
+                initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                    model: Some(bad.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("compound initialAgent.model must reject");
+        assert_compound_model_rejection(err, "initialAgent.model");
+    }
+    let after = svc.list_workspaces(true).await.expect("list").len();
+    assert_eq!(after, before, "rejection must precede any side effect");
+}
+
+#[tokio::test]
+async fn wire_agent_enhance_prompt_rejects_compound_model() {
+    let (_t, svc, _ws) = setup().await;
+    for bad in ["mock:default", ":default"] {
+        let err = WorkspaceApi::agent_enhance_prompt(
+            &svc,
+            "p".into(),
+            "enhance".into(),
+            Some(bad.into()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("compound model must reject");
+        assert_compound_model_rejection(err, "model");
+    }
+}
+
+#[tokio::test]
+async fn wire_agent_edit_and_regenerate_rejects_compound_model() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Editor").await;
+    for bad in ["mock:default", ":default"] {
+        let err = WorkspaceApi::agent_edit_and_regenerate(
+            &svc,
+            ws.clone(),
+            id.clone(),
+            "msg-1".into(),
+            "edited".into(),
+            None,
+            None,
+            Some(bad.into()),
+        )
+        .await
+        .expect_err("compound model must reject");
+        assert_compound_model_rejection(err, "model");
+    }
+}
+
+#[tokio::test]
+async fn wire_agent_complete_once_rejects_compound_model() {
+    let (_t, svc, _ws) = setup().await;
+    for bad in ["mock:default", ":default"] {
+        let err = WorkspaceApi::agent_complete_once(
+            &svc,
+            "p".into(),
+            None,
+            Some(bad.into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("compound model must reject");
+        assert_compound_model_rejection(err, "model");
+    }
 }

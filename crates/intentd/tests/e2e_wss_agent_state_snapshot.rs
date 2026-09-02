@@ -1018,7 +1018,7 @@ async fn snapshot_prs_groups_tracked_open_prs_over_wss() {
             "initialAgent": {
                 "prompt": "plain first turn",
                 "name": "PrsAgent",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
