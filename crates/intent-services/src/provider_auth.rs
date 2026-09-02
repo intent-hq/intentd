@@ -408,6 +408,12 @@ fn resolve_probe_binary(
 struct AuthStatusCache {
     entries: Mutex<HashMap<&'static str, (Instant, Option<bool>)>>,
     inflight: Mutex<HashMap<&'static str, Arc<OnceCell<Option<bool>>>>>,
+    /// Per-provider runtime-demotion counter ([`AuthStatusCache::demote`]).
+    /// A probe captures the counter when it starts and its store is dropped
+    /// if a demotion landed in between ([`AuthStatusCache::store_probe`]),
+    /// so an already-in-flight probe's older verdict cannot overwrite the
+    /// authoritative runtime auth failure (PR #1650 review).
+    demotions: Mutex<HashMap<&'static str, u64>>,
 }
 
 impl AuthStatusCache {
@@ -415,6 +421,7 @@ impl AuthStatusCache {
         Self {
             entries: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
+            demotions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -430,6 +437,47 @@ impl AuthStatusCache {
             .lock()
             .expect("auth cache poisoned")
             .insert(provider_id, (Instant::now(), value));
+    }
+
+    /// The provider's current demotion counter — captured by a probe before
+    /// it runs so [`AuthStatusCache::store_probe`] can detect a concurrent
+    /// runtime demotion.
+    fn demotion_epoch(&self, provider_id: &str) -> u64 {
+        self.demotions
+            .lock()
+            .expect("auth demotions poisoned")
+            .get(provider_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Store a probe outcome UNLESS a runtime demotion landed since `epoch`
+    /// was captured: the demotion observed an authoritative auth-required
+    /// error from the provider's adapter, which supersedes a probe that
+    /// started earlier. The demotions lock is held across the store so a
+    /// demotion cannot slip between the check and the write (lock order:
+    /// demotions → entries, same as [`AuthStatusCache::demote`]).
+    fn store_probe(&self, provider_id: &'static str, value: Option<bool>, epoch: u64) {
+        let demotions = self.demotions.lock().expect("auth demotions poisoned");
+        if demotions.get(provider_id).copied().unwrap_or(0) != epoch {
+            tracing::debug!(
+                provider = provider_id,
+                "auth probe outcome discarded — a runtime demotion superseded it"
+            );
+            return;
+        }
+        self.store(provider_id, value);
+    }
+
+    /// Harden the provider's verdict to `Some(false)` after an authoritative
+    /// runtime auth failure and bump the demotion counter so any probe
+    /// already in flight discards its (older) outcome instead of overwriting
+    /// this one. Lock order: demotions → entries (see
+    /// [`AuthStatusCache::store_probe`]).
+    fn demote(&self, provider_id: &'static str) {
+        let mut demotions = self.demotions.lock().expect("auth demotions poisoned");
+        *demotions.entry(provider_id).or_insert(0) += 1;
+        self.store(provider_id, Some(false));
     }
 
     fn join_inflight(&self, provider_id: &'static str) -> Arc<OnceCell<Option<bool>>> {
@@ -458,15 +506,28 @@ fn cache() -> &'static AuthStatusCache {
     CACHE.get_or_init(AuthStatusCache::new)
 }
 
+/// Resolve the cache key a (possibly alias/legacy) provider id gates and
+/// demotes under: persisted legacy default aliases (`default` / `acp` /
+/// `augment`) and unknown ids spawn the catalog fallback provider
+/// ([`intent_providers::provider_config`]), so the verdict must be keyed by
+/// the id that actually runs, not the persisted alias — otherwise an
+/// alias-backed demotion is a no-op and alias-backed creates stay permissive
+/// (PR #1650 review). Known catalog ids map to themselves.
+fn auth_cache_key(provider_id: &str) -> &'static str {
+    intent_providers::provider_config(provider_id).id
+}
+
 /// Read-only view of one provider's *fresh* cached auth verdict:
 /// `Some(false)` only when a still-fresh cache entry holds an explicit
 /// not-authenticated probe outcome; `Some(true)` for a fresh authenticated
 /// outcome; `None` when the cache entry is absent, expired, or holds an
 /// inconclusive (unknown) outcome. Never triggers a probe — callers gating
 /// on it (the agent create/delegate auth gate in [`crate::agent_ops`]) must
-/// stay permissive on `None`.
+/// stay permissive on `None`. Legacy alias ids resolve to the catalog
+/// fallback provider's verdict ([`auth_cache_key`]) — the provider an
+/// alias-backed create would actually spawn.
 pub(crate) fn cached_auth_verdict(provider_id: &str) -> Option<bool> {
-    cache().fresh(provider_id).flatten()
+    cache().fresh(auth_cache_key(provider_id)).flatten()
 }
 
 /// The shared "provider is not authenticated" message body: names the
@@ -495,13 +556,13 @@ pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
 /// runtime observed an authoritative auth-required error from its adapter
 /// (session/new / session/load / session/prompt). This makes the
 /// create/delegate gate in [`crate::agent_ops`] reject follow-up spawns for
-/// the cache TTL instead of letting each one die on its first turn. No-op
-/// for ids outside [`AUTH_PROBE_PROVIDERS`] (the cache is keyed by the
-/// catalog's static ids).
+/// the cache TTL instead of letting each one die on its first turn. Legacy
+/// alias ids demote the catalog fallback provider they actually spawn
+/// ([`auth_cache_key`]). The demotion also supersedes any probe already in
+/// flight ([`AuthStatusCache::demote`]) so a stale probe outcome cannot
+/// overwrite this authoritative `false`.
 pub(crate) fn demote_auth_verdict(provider_id: &str) {
-    if let Some(id) = AUTH_PROBE_PROVIDERS.iter().find(|id| **id == provider_id) {
-        cache().store(id, Some(false));
-    }
+    cache().demote(auth_cache_key(provider_id));
 }
 
 /// Test seam: plant a verdict in the process-wide auth cache so gate tests
@@ -535,8 +596,13 @@ async fn resolve_auth_status(
     let cell = cache().join_inflight(provider_id);
     let value = *cell
         .get_or_init(|| async {
+            // Captured before the probe runs: a runtime demotion landing
+            // while the probe is in flight supersedes its (older) outcome —
+            // `store_probe` drops the store instead of overwriting the
+            // authoritative hard `false` (PR #1650 review).
+            let epoch = cache().demotion_epoch(provider_id);
             let value = probe_provider(provider_id, program).await;
-            cache().store(provider_id, value);
+            cache().store_probe(provider_id, value, epoch);
             value
         })
         .await;
@@ -959,20 +1025,50 @@ mod tests {
 
     /// Runtime demotion (intent-hq/intent#3941): an authoritative
     /// auth-required failure hardens the cached verdict to `false` so the
-    /// create/delegate gate rejects follow-up spawns for the cache TTL; ids
-    /// outside `AUTH_PROBE_PROVIDERS` are a no-op (nothing to key the cache
-    /// with).
+    /// create/delegate gate rejects follow-up spawns for the cache TTL.
+    /// Legacy alias ids (`acp` / `augment` / `default`) demote — and gate —
+    /// under the catalog fallback provider they actually spawn, so an
+    /// alias-backed demotion is not a silent no-op (PR #1650 review).
     #[test]
-    fn demote_auth_verdict_hardens_probe_provider_and_ignores_unknown() {
+    fn demote_auth_verdict_hardens_probe_provider_and_canonicalizes_aliases() {
         let id = AUTH_PROBE_PROVIDERS[0];
         let prior = cache().fresh(id);
         demote_auth_verdict(id);
         assert_eq!(cached_auth_verdict(id), Some(false), "{id}");
-        // Restore whatever the suite had (unknown ⇒ permissive None).
         cache().store(id, prior.flatten());
 
-        demote_auth_verdict("not-a-provider");
-        assert_eq!(cached_auth_verdict("not-a-provider"), None);
+        // Alias ids resolve to the catalog fallback (the first registered
+        // provider) for both the demotion write and the gate read.
+        let fallback = intent_providers::provider_config("acp").id;
+        assert_eq!(fallback, AUTH_PROBE_PROVIDERS[0]);
+        let prior = cache().fresh(fallback);
+        demote_auth_verdict("acp");
+        assert_eq!(cached_auth_verdict("acp"), Some(false));
+        assert_eq!(cached_auth_verdict(fallback), Some(false));
+        cache().store(fallback, prior.flatten());
+    }
+
+    /// A probe already in flight when a runtime demotion lands must not
+    /// overwrite the authoritative hard `false` with its older outcome:
+    /// `store_probe` drops the store when the demotion epoch moved (PR
+    /// #1650 review). A probe with an unmoved epoch still stores normally.
+    #[test]
+    fn stale_probe_outcome_cannot_overwrite_runtime_demotion() {
+        let id = AUTH_PROBE_PROVIDERS[0];
+        let prior = cache().fresh(id);
+
+        // Probe captured its epoch, then a demotion landed mid-flight.
+        let epoch = cache().demotion_epoch(id);
+        cache().demote(id);
+        cache().store_probe(id, Some(true), epoch);
+        assert_eq!(cached_auth_verdict(id), Some(false), "stale probe stored");
+
+        // A fresh probe (epoch captured after the demotion) stores normally.
+        let epoch = cache().demotion_epoch(id);
+        cache().store_probe(id, Some(true), epoch);
+        assert_eq!(cached_auth_verdict(id), Some(true));
+
+        cache().store(id, prior.flatten());
     }
 
     /// The shared login message names the provider, carries the catalog

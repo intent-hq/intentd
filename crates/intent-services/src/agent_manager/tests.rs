@@ -11411,6 +11411,94 @@ async fn pre_output_transport_failure_redrives_silently_once() {
     let _ = std::fs::remove_file(&attempt_file);
 }
 
+/// End-to-end auth-required prompt failure (intent-hq/intent#3941): a real
+/// worker-driven turn against the mock ACP agent failing `session/prompt`
+/// with a 401 surfaces the actionable login message on every client-visible
+/// seam — the persisted `stop_reason`, the `agent:failed` event payload (not
+/// the raw adapter error), and the parked Error status — and the terminal
+/// `agent:failed` + `agent:stream:end` pair reaches the bus EXACTLY once
+/// (the `InvalidParams` shape is recognized by
+/// `turn_failure_events_already_emitted`, so the worker's terminal path does
+/// not re-emit).
+#[tokio::test]
+async fn auth_required_prompt_failure_surfaces_login_remedy_end_to_end() {
+    let script = mock_agent_script();
+    let behavior = json!({
+        "promptRpcError": { "code": 401, "message": "Unauthorized" },
+        "response": "unreached",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-auth-e2e"),
+        AgentId::from("a-auth-e2e"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "dies auth-required".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let status = mgr.services.store.get_agent_session_status(&id).await;
+            if status.ok() == Some(AgentStatus::Error)
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("auth-required failure parks the session in Error");
+
+    let expected = format!(
+        "session/prompt: {}",
+        crate::provider_auth::not_authenticated_message("mock")
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    // The stop_reason is the wrapped error's Display — identical to what the
+    // JSON-RPC layer renders for the returned `InvalidParams`.
+    assert_eq!(
+        session.stop_reason.as_deref(),
+        Some(format!("invalid params: {expected}").as_str()),
+        "persisted stop_reason carries the actionable login message"
+    );
+
+    let mut failed_payloads = Vec::new();
+    let mut stream_ends = 0;
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        for ev in batch {
+            match ev.event_type.as_str() {
+                "agent:failed" => failed_payloads.push(ev.data["error"].clone()),
+                "agent:stream:end" => stream_ends += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        failed_payloads,
+        vec![json!(expected)],
+        "exactly one agent:failed, carrying the mapped message (not the raw adapter error)"
+    );
+    assert_eq!(stream_ends, 1, "exactly one terminal agent:stream:end");
+}
+
 /// The consuming half of the monorepo#2050 handoff: a full worker-driven
 /// ordinary mid-turn failure — `run_prompt_turn` persists + stashes, then the
 /// worker's `handle_terminal_turn_failure` CONSUMES the stash instead of

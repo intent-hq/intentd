@@ -147,6 +147,26 @@ pub(crate) const PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX: &str = "[turn streamed out
 pub(crate) const PROMPT_SUSPEND_INTERRUPT_PREFIX: &str =
     "session/prompt interrupted by system suspend:";
 
+/// Prefix of the auth-required `session/prompt` failure mapping
+/// (intent-hq/intent#3941): [`Services::run_prompt_turn`] surfaces such a
+/// failure as `Error::InvalidParams("session/prompt: provider \"…\" … is not
+/// authenticated …")` and has ALREADY emitted the terminal `agent:failed` +
+/// `agent:stream:end` pair (and persisted + stashed the Error status), so the
+/// turn worker's terminal-failure path must not re-emit the pair
+/// ([`prompt_auth_required_turn_error`]). The mapped message is composed as
+/// `session/prompt: ` + [`crate::provider_auth::not_authenticated_message`]
+/// (which starts with `provider "…"`); a unit test pins that composition
+/// against this prefix so the contract cannot drift.
+pub(crate) const PROMPT_AUTH_REQUIRED_PREFIX: &str = "session/prompt: provider \"";
+
+/// Whether a turn error is the auth-required `session/prompt` mapping from
+/// [`Services::run_prompt_turn`] (see [`PROMPT_AUTH_REQUIRED_PREFIX`]).
+/// Prefix-anchored on the `InvalidParams` payload — mid-string mentions and
+/// other `InvalidParams` shapes never classify.
+pub(crate) fn prompt_auth_required_turn_error(err: &Error) -> bool {
+    matches!(err, Error::InvalidParams(msg) if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX))
+}
+
 /// Debounce before the self-healing resume that [`enroll_suspend_interrupted_turn`]
 /// fires directly (independent of the host-wake broadcast). It must outlast the
 /// turn worker's post-enrollment teardown (`kill_child_only` + `end_turn`) so the
@@ -3189,8 +3209,7 @@ impl Services {
                     .get_agent_session_token_usage(workspace_id, agent_id)
                     .await
                 {
-                    Ok((model, _, provider, _)) => resolve_provider_id(
-                        model.as_deref(),
+                    Ok((_, _, provider, _)) => resolve_provider_id(
                         provider.as_deref(),
                         derived_default_provider(&self.effective_settings()).as_deref(),
                     )
@@ -3446,7 +3465,11 @@ impl Services {
                 // A turn error also ends the turn — surface a mid-turn raise
                 // now (same ordering rationale as the idle arm above).
                 self.flush_deferred_attention(agent_id, workspace_id).await;
-                let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
+                // Auth-required mapping (intent-hq/intent#3941): the event
+                // carries the same actionable message as the persisted
+                // stop_reason and returned error, not the raw adapter error.
+                let error_text = prompt_auth_message.clone().unwrap_or_else(|| e.to_string());
+                let mut data = json!({ "agentId": agent_id.0, "error": error_text });
                 if let Some(tid) = turn_id {
                     data["turnId"] = json!(tid);
                 }

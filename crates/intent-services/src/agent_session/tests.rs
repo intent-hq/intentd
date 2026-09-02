@@ -8537,3 +8537,43 @@ fn map_acp_session_error_maps_auth_and_demotes_verdict() {
         "non-auth failure must not touch the cached verdict"
     );
 }
+
+/// The auth-mapped `session/prompt` failure is recognized by the turn
+/// worker's dedupe classifier so the terminal `agent:failed` +
+/// `agent:stream:end` pair is emitted exactly once (PR #1650 review): the
+/// composed message (`"session/prompt: "` + the shared login message) must
+/// start with `PROMPT_AUTH_REQUIRED_PREFIX` for every provider the runtime
+/// can demote, and only that `InvalidParams` shape classifies.
+#[test]
+fn prompt_auth_required_turn_error_matches_mapped_shape() {
+    use intent_core::Error;
+    for id in ["auggie", "claude-code", "codex", "opencode", "droid", "pi"] {
+        let msg = format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message(id)
+        );
+        assert!(
+            msg.starts_with(super::PROMPT_AUTH_REQUIRED_PREFIX),
+            "{id}: {msg}"
+        );
+        assert!(
+            super::prompt_auth_required_turn_error(&Error::InvalidParams(msg)),
+            "{id}"
+        );
+    }
+    // Other InvalidParams shapes, mid-string mentions, and Internal errors
+    // never classify — they still need the worker-emitted event pair.
+    for err in [
+        Error::InvalidParams("agent.create: provider \"pi\" is not authenticated".into()),
+        Error::InvalidParams(format!(
+            "bad params: {}session/prompt: provider \"pi\"",
+            "prefix "
+        )),
+        Error::Internal(format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message("pi")
+        )),
+    ] {
+        assert!(!super::prompt_auth_required_turn_error(&err), "{err:?}");
+    }
+}
