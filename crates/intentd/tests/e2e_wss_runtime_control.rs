@@ -102,7 +102,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
 /// Spawn `intentd serve` as the CHILD of a stand-in sitter: `sitter_bin` (a
 /// shell COPIED as `intentd-sitter` — the kernel-visible process name comes
 /// from the executed image itself, so a copy carries the name on every
-/// platform, where a symlink resolves to the target's name on macOS —
+/// platform, whereas a symlink resolves to the target's name on macOS —
 /// intent-hq/monorepo#4220) backgrounds the daemon, records the daemon's pid
 /// in `daemon_pid_path`, and waits. The returned child (the wrapper) is thus
 /// both sitter-named AND the daemon's parent — the conjunction
@@ -121,7 +121,25 @@ fn spawn_serve_under_stand_in_sitter(
         .arg(env!("CARGO_BIN_EXE_intentd"))
         .arg(daemon_pid_path);
     configure_serve(&mut cmd, data_dir, listen, env);
-    cmd.spawn().expect("spawn stand-in sitter wrapper")
+    spawn_retrying_etxtbsy(&mut cmd, "stand-in sitter wrapper")
+}
+
+/// `spawn` with a bounded retry on ETXTBSY: a concurrently forked test
+/// child can transiently inherit a just-written copy's write fd (it is
+/// closed only at that child's own exec), making exec of the fresh copy
+/// fail with "Text file busy". Only needed for the COPIED sitter/decoy
+/// binaries (intent-hq/monorepo#4220).
+fn spawn_retrying_etxtbsy(cmd: &mut Command, what: &str) -> Child {
+    for _ in 0..400 {
+        match cmd.spawn() {
+            Ok(child) => return child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("spawn {what}: {e}"),
+        }
+    }
+    panic!("spawn {what} kept failing with ETXTBSY");
 }
 
 /// SIGKILLs a raw pid on drop — cleanup for the daemon grandchild, which
@@ -844,7 +862,9 @@ async fn wss_system_request_update_signals_the_sitter() {
     // A COPY, not a symlink: macOS names a process after the resolved
     // executable image (a `/bin/sh` symlink reports `bash`), so only a copy
     // makes the kernel-visible name `intentd-sitter` cross-platform
-    // (intent-hq/monorepo#4220).
+    // (intent-hq/monorepo#4220). Caveat: the copy executes out of the /tmp
+    // data dir, so this assumes /tmp is not mounted noexec (true on CI
+    // runners and macOS); if that ever bites, move the copy destination.
     std::fs::copy("/bin/sh", &sitter_bin).expect("copy stand-in sitter shell");
     let daemon_pid_path = sitter_dir.join("daemon.pid");
 
@@ -926,10 +946,7 @@ async fn wss_system_request_update_signals_the_sitter() {
     // the decoy must actually be sitter-NAMED for this arm to prove the
     // name alone is insufficient.
     std::fs::copy(sleep_bin, &decoy_bin).expect("copy decoy sitter");
-    let mut decoy = std::process::Command::new(&decoy_bin)
-        .arg("30")
-        .spawn()
-        .expect("spawn decoy sitter");
+    let mut decoy = spawn_retrying_etxtbsy(Command::new(&decoy_bin).arg("30"), "decoy sitter");
     std::fs::write(sitter_dir.join("sitter.pid"), format!("{}\n", decoy.id()))
         .expect("write sitter pidfile");
     let resp = wss_rpc(&mut ws, 43, "system.requestUpdate", json!({})).await;
