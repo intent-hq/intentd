@@ -187,6 +187,12 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "FTS5 shadow table of `agent_message_fts` (derived, rebuilt on the target)",
     ),
     (
+        "agent_message_search_ctx",
+        "derived ranking-context side table over `agent_message` (0112); the \
+         target's insert triggers rebuild it from the imported rows, same as \
+         the FTS index",
+    ),
+    (
         "workspace_git_root",
         "registered git roots point at machine-local canonical paths (often outside \
          the workspace checkout) that do not exist on the target host; the sweep \
