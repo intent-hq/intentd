@@ -1022,12 +1022,19 @@ async fn runtime_toggled_wss_serves_system_status() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
-    // Verify no WSS port initially
+    // Verify no WSS port initially — and that a UDS-only daemon advertises
+    // no TCP routes: with the listener down every localIps entry would be a
+    // dead route, so the set is empty (not the interface enumeration).
     let status_before = uds_rpc(&socket, 1, "system.status", json!({})).await;
     assert_eq!(
         status_before["result"]["port"],
         json!(null),
         "WSS should not be running"
+    );
+    assert_eq!(
+        status_before["result"]["localIps"],
+        json!([]),
+        "UDS-only daemon must not advertise TCP routes: {status_before}"
     );
 
     // Toggle WSS on at runtime via settings.update

@@ -11,6 +11,7 @@
 //! subsequent `start()` cannot race the freed listen port.
 
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -131,8 +132,9 @@ impl WsInner {
     /// silently serves fewer interfaces than configured (monorepo#3314). A
     /// `base_port` of 0 (the E2E ephemeral seam) binds the first address on
     /// an OS-assigned port and the remaining addresses on that same port.
-    /// Re-checks the stop generation so a concurrent `stop()` unwinds
-    /// instead of binding.
+    /// An IPv6-unspecified (`::`) bind is made explicitly dual-stack (see
+    /// [`bind_listener`]). Re-checks the stop generation so a concurrent
+    /// `stop()` unwinds instead of binding.
     async fn bind_once(
         self: &Arc<Self>,
         generation: u64,
@@ -155,7 +157,7 @@ impl WsInner {
         let mut listeners = Vec::with_capacity(self.bind_addresses.len());
         let mut port = self.base_port;
         for addr in &self.bind_addresses {
-            match TcpListener::bind((*addr, port)).await {
+            match bind_listener(*addr, port).await {
                 Ok(listener) => {
                     // First bind resolves an ephemeral port 0; the rest of
                     // the set joins it on the same resolved port.
@@ -223,5 +225,84 @@ impl WsInner {
         let mut st = self.state.lock().await;
         st.shutting_down = false;
         st.port = None;
+    }
+}
+
+/// Bind one TCP listener at `addr:port`. An IPv6-unspecified (`::`) bind is
+/// explicitly configured dual-stack (`IPV6_V6ONLY = false`) before binding,
+/// so the IPv4 routes the pairing / `system.status` surfaces advertise for
+/// it are reachable via v4-mapped sockets regardless of the OS default
+/// (Windows and some Linux configurations default to IPv6-only). Every other
+/// address keeps the plain `TcpListener::bind` path; the socket setup here
+/// mirrors what that path does (non-blocking, `SO_REUSEADDR` on Unix).
+async fn bind_listener(addr: IpAddr, port: u16) -> io::Result<TcpListener> {
+    match addr {
+        IpAddr::V6(v6) if v6.is_unspecified() => {
+            let sock_addr = SocketAddr::new(addr, port);
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.set_only_v6(false)?;
+            #[cfg(unix)]
+            socket.set_reuse_address(true)?;
+            socket.set_nonblocking(true)?;
+            socket.bind(&sock_addr.into())?;
+            socket.listen(1024)?;
+            TcpListener::from_std(socket.into())
+        }
+        _ => TcpListener::bind((addr, port)).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    /// Reachability regression for the `::` bind: `advertised_hosts` includes
+    /// the machine's IPv4 enumeration for an IPv6-unspecified bind, so the
+    /// listener must actually accept plain IPv4 connections (dual-stack) —
+    /// not depend on the OS's `IPV6_V6ONLY` default.
+    #[tokio::test]
+    async fn ipv6_unspecified_bind_accepts_ipv4() {
+        let listener = match bind_listener(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).await {
+            Ok(l) => l,
+            // Hosts without IPv6 support cannot exercise this path at all.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Unsupported | io::ErrorKind::AddrNotAvailable
+                ) =>
+            {
+                eprintln!("skipping: IPv6 unavailable ({e})");
+                return;
+            }
+            Err(e) => panic!("bind [::]:0 failed: {e}"),
+        };
+        let port = listener.local_addr().expect("local addr").port();
+        let (conn, accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            listener.accept()
+        );
+        conn.expect("IPv4 connect to a dual-stack :: listener must succeed");
+        accepted.expect("dual-stack listener accepts the v4-mapped connection");
+    }
+
+    /// The non-`::` arm keeps plain bind semantics: a loopback IPv4 bind
+    /// still works through the helper.
+    #[tokio::test]
+    async fn specific_bind_still_works() {
+        let listener = bind_listener(IpAddr::from([127, 0, 0, 1]), 0)
+            .await
+            .expect("bind 127.0.0.1:0");
+        let port = listener.local_addr().expect("local addr").port();
+        let (conn, accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            listener.accept()
+        );
+        conn.expect("loopback connect");
+        accepted.expect("accept loopback connection");
     }
 }

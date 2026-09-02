@@ -168,8 +168,10 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 /// `::` — always the sole entry per the settings validation) or an unknown
 /// set falls back to enumerating the machine's local IPs.
 /// An IPv6-unspecified bind (`::`) also accepts native IPv6 connections
-/// (v4-mapped sockets cover the IPv4 side), so its enumeration additionally
-/// carries the machine's global IPv6 addresses.
+/// (the listener is bound explicitly dual-stack — `IPV6_V6ONLY = false` in
+/// `lifecycle::bind_listener` — so v4-mapped sockets cover the IPv4 side on
+/// every OS), and its enumeration additionally carries the machine's global
+/// IPv6 addresses.
 pub(crate) fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
     advertised_hosts(
         snapshot.bind_addresses.as_deref(),

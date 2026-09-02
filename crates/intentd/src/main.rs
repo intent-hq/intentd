@@ -3221,9 +3221,17 @@ impl SystemControl for DaemonControl {
         // its stored host list from `system.status` alone — and only learns
         // addresses the listener is actually bound to. Enumerations come from
         // the background sampler's TTL cache — never collected inline on the
-        // read path; only the cheap bind-set filter runs here.
+        // read path; only the cheap bind-set filter runs here. With no live
+        // TCP listener (UDS-only daemon, failed/stopped WSS — or the
+        // try_lock contention above, matching its transient `uds` posture)
+        // there are no dialable TCP routes at all, so `localIps` is empty
+        // rather than the historical full enumeration.
         let (local_v4, local_v6, hostname, pretty_hostname) = self.route_info.load();
-        let local_ips = advertised_hosts(bind_addresses.as_deref(), &local_v4, &local_v6);
+        let local_ips = if port.is_some() {
+            advertised_hosts(bind_addresses.as_deref(), &local_v4, &local_v6)
+        } else {
+            Vec::new()
+        };
         // Live tunnel route, same availability semantics as pairing surfaces:
         // present while the sidecar runs, absent otherwise. try_lock like the
         // port/fingerprint reads above — never blocks the status path.
