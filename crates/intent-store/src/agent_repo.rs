@@ -1362,6 +1362,12 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, String)>> {
+        // Deliberately NOT `UNREAD_TOP_LEVEL_SESSION_PREDICATE` / the partial
+        // covering index: this query drops the `last_message_role =
+        // 'assistant'` term (markSeen must advance user-last sessions too),
+        // so `idx_agent_session_unread_top_level`'s WHERE does not cover its
+        // rows — an `INDEXED BY` here would fail to plan. Per-workspace and
+        // rare (markSeen), so the plain `json_extract` spelling is fine.
         let sql = "SELECT id, last_message_id FROM agent_session \
             WHERE workspace_id = ? \
               AND parent_agent_id IS NULL \
@@ -4725,6 +4731,35 @@ mod tests {
                  not recompute it per row (covering property lost), opcodes: {opcodes:?}"
             );
         }
+
+        // Positive control: the no-`Function` assertion above is the
+        // load-bearing half of this guard (a `json_extract` revert still
+        // satisfies the partial index's WHERE, so EXPLAIN QUERY PLAN keeps
+        // naming the index), but EXPLAIN opcode names are not a stable
+        // interface. Prove the opcode check can still fail: the same batch
+        // statement with the seen marker spelled `json_extract()` MUST emit
+        // a `Function` opcode (RESULT_SUBTYPE blocks index-expression
+        // substitution). If a bundled-SQLite bump ever renames the opcode,
+        // this control fails loudly instead of the guard going vacuous.
+        let control_sql = unread_workspaces_batch_sql()
+            .replace("metadata ->> ", "json_extract(metadata, ")
+            .replace("'$.lastSeenMessageId'", "'$.lastSeenMessageId')");
+        assert_ne!(control_sql, unread_workspaces_batch_sql());
+        let control_bytecode_sql = format!("EXPLAIN {control_sql}");
+        let opcodes: Vec<String> = sqlx::query(&control_bytecode_sql)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("explain control bytecode")
+            .iter()
+            .map(|row| row.get::<String, _>("opcode"))
+            .collect();
+        assert!(
+            opcodes.iter().any(|o| o == "Function"),
+            "positive control lost: a json_extract-spelled statement no longer \
+             emits a `Function` opcode, so the no-Function guard above is \
+             vacuous — re-verify the opcode name for this SQLite version, \
+             opcodes: {opcodes:?}"
+        );
     }
 
     /// A UNIQUE violation on the session id maps to `Internal` naming the
