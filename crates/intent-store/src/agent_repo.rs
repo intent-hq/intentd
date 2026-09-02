@@ -2995,16 +2995,18 @@ pub struct MessageFtsMatch {
 }
 
 impl Store {
-    /// Rebuild the `agent_message_fts` full-text index (0074) from scratch:
-    /// delete-all, then re-insert the extracted text of every
-    /// user/assistant `agent_message` row keyed by its current rowid.
+    /// Rebuild the `agent_message_fts` full-text index (0074) and its
+    /// companion `agent_message_search_ctx` ranking-context table (0112)
+    /// from scratch: delete-all, then re-insert the extracted text /
+    /// denormalized context of every user/assistant `agent_message` row
+    /// keyed by its current rowid.
     ///
-    /// The index is trigger-maintained on every message write, so this is
+    /// Both tables are trigger-maintained on every message write, so this is
     /// only needed after an operation that renumbers `agent_message`'s
     /// implicit rowids — in practice the one-time activation `VACUUM` in
     /// [`Store::activate_incremental_vacuum`] (`agent_message` has a TEXT
     /// primary key, so `VACUUM` may reassign its rowids and silently desync
-    /// the rowid-keyed index). Runs in one write transaction.
+    /// the rowid-keyed tables). Runs in one write transaction.
     pub(crate) async fn rebuild_agent_message_fts(&self) -> Result<()> {
         let pool = self.write_pool();
         crate::with_write_txn_retry(|| async {
@@ -3025,6 +3027,19 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("fts rebuild backfill failed: {e}")))?;
+            sqlx::query("DELETE FROM agent_message_search_ctx")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("search ctx rebuild clear failed: {e}")))?;
+            sqlx::query(
+                "INSERT INTO agent_message_search_ctx(message_rowid, agent_id, workspace_id, role) \
+                 SELECT m.rowid, m.agent_id, s.workspace_id, m.role \
+                 FROM agent_message m JOIN agent_session s ON s.id = m.agent_id \
+                 WHERE m.role IN ('user', 'assistant')",
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("search ctx rebuild backfill failed: {e}")))?;
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("fts rebuild commit failed: {e}")))?;
@@ -3059,16 +3074,19 @@ impl Store {
     /// fields only); a future full-fidelity consumer must hydrate
     /// explicitly.
     ///
-    /// Shape (monorepo#3529): ranking and result materialization split into
-    /// two phases inside one statement, and — critically — the ranking phase
-    /// never reads any `agent_message` column stored *after* `content`. In
-    /// the record layout `created_at` follows the multi-KB `content` blob,
-    /// so reading it walks the row's overflow-page chain; the single-pass
-    /// predecessor did that for every FTS candidate and took ~6.5s cold on a
-    /// 600MB dogfood DB (vs 0.04s for the FTS rank itself). The inner
-    /// subquery therefore ranks candidates using only cheap leading columns
-    /// (`agent_id` for the workspace boost, plus any filters), tiebreaks
-    /// equal ranks by `rowid DESC` (insertion-order-newest), and applies the
+    /// Shape (monorepo#3529, monorepo#4127): ranking and result
+    /// materialization split into two phases inside one statement, and —
+    /// critically — the ranking phase never touches `agent_message` at all.
+    /// The #3529 two-phase split kept `content`/`created_at` (overflow-page
+    /// reads) out of the ranking pass but still joined `agent_message` (for
+    /// `agent_id`) + `agent_session` per FTS candidate — one random page
+    /// read into a fat multi-KB-row table per matching row, O(matches), so
+    /// broad terms on a grown corpus breached the 1s budget again (#4127).
+    /// The inner subquery now resolves the workspace scope filter and the
+    /// prefer/archived rank adjustments from the dense rowid-keyed
+    /// `agent_message_search_ctx` table (0112; three short TEXT columns,
+    /// many rows per page) plus the tiny `workspace` table, tiebreaks equal
+    /// ranks by `rowid DESC` (insertion-order-newest), and applies the
     /// LIMIT; the outer query joins `content`, `created_at` and the session
     /// context back for just the returned rows and orders the final page by
     /// the documented `rank/created_at/id` key. The optional filters are
@@ -3103,13 +3121,13 @@ impl Store {
     ) -> Result<Vec<MessageFtsMatch>> {
         let mut filters = String::new();
         if workspace_id.is_some() {
-            filters.push_str(" AND s.workspace_id = ?");
+            filters.push_str(" AND c.workspace_id = ?");
         }
         if agent_id.is_some() {
-            filters.push_str(" AND m.agent_id = ?");
+            filters.push_str(" AND c.agent_id = ?");
         }
         if role.is_some() {
-            filters.push_str(" AND m.role = ?");
+            filters.push_str(" AND c.role = ?");
         }
         let sql = format!(
             "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
@@ -3117,12 +3135,11 @@ impl Store {
              FROM ( \
                  SELECT agent_message_fts.rowid AS msg_rowid, \
                         bm25(agent_message_fts) \
-                          - (CASE WHEN s.workspace_id = ? THEN ? ELSE 0.0 END) \
+                          - (CASE WHEN c.workspace_id = ? THEN ? ELSE 0.0 END) \
                           + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
                  FROM agent_message_fts \
-                 JOIN agent_message m ON m.rowid = agent_message_fts.rowid \
-                 JOIN agent_session s ON s.id = m.agent_id \
-                 JOIN workspace w ON w.id = s.workspace_id \
+                 JOIN agent_message_search_ctx c ON c.message_rowid = agent_message_fts.rowid \
+                 JOIN workspace w ON w.id = c.workspace_id \
                  WHERE agent_message_fts MATCH ?{filters} \
                  ORDER BY adjusted_rank ASC, msg_rowid DESC \
                  LIMIT ? \
@@ -11016,6 +11033,42 @@ mod tests {
             .get("n")
     }
 
+    /// Assert the 0112 `agent_message_search_ctx` table exactly mirrors the
+    /// user/assistant subset of `agent_message`: same rowid set, and every
+    /// ctx row's denormalized agent/workspace/role matches the joined source
+    /// values. The trigger discipline is shared with the FTS index, so any
+    /// drift here means the two trigger sets fell out of sync.
+    async fn assert_search_ctx_consistent(store: &Store) {
+        let drift: i64 = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM agent_message m \
+                      WHERE m.role IN ('user','assistant') \
+                        AND NOT EXISTS (SELECT 1 FROM agent_message_search_ctx c \
+                                         WHERE c.message_rowid = m.rowid \
+                                           AND c.agent_id = m.agent_id \
+                                           AND c.role = m.role \
+                                           AND c.workspace_id = (SELECT s.workspace_id \
+                                                                   FROM agent_session s \
+                                                                  WHERE s.id = m.agent_id))) \
+                  + (SELECT COUNT(*) FROM agent_message_search_ctx c \
+                      WHERE NOT EXISTS (SELECT 1 FROM agent_message m \
+                                         WHERE m.rowid = c.message_rowid \
+                                           AND m.role IN ('user','assistant'))) AS n",
+        )
+        .fetch_one(store.read_pool())
+        .await
+        .expect("ctx consistency query")
+        .get("n");
+        assert_eq!(drift, 0, "agent_message_search_ctx drifted from source");
+    }
+
+    async fn ctx_row_count(store: &Store) -> i64 {
+        sqlx::query("SELECT COUNT(*) AS n FROM agent_message_search_ctx")
+            .fetch_one(store.read_pool())
+            .await
+            .expect("ctx count")
+            .get("n")
+    }
+
     /// Append-path FTS maintenance (0074): user/assistant appends are
     /// indexed with the search-side `message_text` extraction semantics —
     /// bare-string content as-is, content-block arrays as their string
@@ -11114,6 +11167,9 @@ mod tests {
         assert!(fts_match_ids(&store, "excludedblockterm").await.is_empty());
         assert!(fts_match_ids(&store, "toolonlyterm").await.is_empty());
         assert!(fts_match_ids(&store, "systemonlyterm").await.is_empty());
+        // The 0112 ranking-context table tracks the same subset.
+        assert_eq!(ctx_row_count(&store).await, 3);
+        assert_search_ctx_consistent(&store).await;
     }
 
     /// The `agent.replaceMessages` swap (DELETE + re-INSERT) drops every
@@ -11182,6 +11238,8 @@ mod tests {
         );
         assert!(fts_match_ids(&store, "swappedtoolterm").await.is_empty());
         assert_eq!(fts_row_count(&store).await, 1);
+        assert_eq!(ctx_row_count(&store).await, 1);
+        assert_search_ctx_consistent(&store).await;
 
         assert!(store
             .delete_agent_session(&ws_id, &agent)
@@ -11191,6 +11249,11 @@ mod tests {
             fts_row_count(&store).await,
             0,
             "cascade delete of agent_message empties the index"
+        );
+        assert_eq!(
+            ctx_row_count(&store).await,
+            0,
+            "cascade delete empties the ranking-context table too"
         );
     }
 
@@ -11261,6 +11324,71 @@ mod tests {
         assert_eq!(fts_match_ids(&store, "backfilledterm").await.len(), 1);
         assert!(fts_match_ids(&store, "backfilltoolterm").await.is_empty());
         assert_eq!(fts_row_count(&store).await, 1);
+    }
+
+    /// The 0112 migration backfills pre-existing rows: raw-inserted messages
+    /// (0112 triggers dropped to simulate a pre-0112 database) get their
+    /// ranking-context rows after re-running the migration file verbatim,
+    /// with the same user/assistant role filter as the write-time triggers.
+    #[tokio::test]
+    async fn search_ctx_migration_backfills_existing_rows() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-ctx-backfill".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-ctx-backfill".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        // Recreate the pre-0112 shape (no ctx table, no triggers), then
+        // insert rows the way a pre-0112 daemon would have (the 0074 FTS
+        // triggers stay in place, matching that daemon's schema).
+        for stmt in [
+            "DROP TRIGGER agent_message_search_ctx_after_insert",
+            "DROP TRIGGER agent_message_search_ctx_after_delete",
+            "DROP TRIGGER agent_message_search_ctx_after_update",
+            "DROP TABLE agent_message_search_ctx",
+        ] {
+            sqlx::query(stmt)
+                .execute(store.write_pool())
+                .await
+                .expect("drop 0112 objects");
+        }
+        for (role, text) in [("user", "ctxbackfilledterm"), ("tool", "ctxtoolterm")] {
+            store
+                .append_agent_message(
+                    &agent,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append pre-0112 row");
+        }
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0112_agent_message_search_ctx.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0112 migration");
+
+        assert_eq!(ctx_row_count(&store).await, 1);
+        assert_search_ctx_consistent(&store).await;
+        // And the searched-through path resolves via the rebuilt ctx table.
+        let hits = store
+            .search_agent_messages_fts("ctxbackfilledterm", None, None, None, None, None)
+            .await
+            .expect("search via ctx");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].workspace_id, ws_id.0);
     }
 
     /// The one-time activation VACUUM (`activate_incremental_vacuum`) may
@@ -11358,6 +11486,10 @@ mod tests {
             fts_match_ids(&store, "postvacuumterm").await,
             vec![after.id]
         );
+        // The 0112 ranking-context table was rebuilt in the same pass and
+        // keeps tracking subsequent writes.
+        assert_eq!(ctx_row_count(&store).await, 2);
+        assert_search_ctx_consistent(&store).await;
     }
 
     /// `search.messages` workspace tiering: with equally-relevant matches in
@@ -12084,6 +12216,96 @@ mod tests {
                  prefer={prefer:?} limit={limit:?}"
             );
         }
+    }
+
+    /// Plan-shape regression guard (monorepo#4127): the ranking subquery
+    /// must resolve filters and rank adjustments from the dense
+    /// `agent_message_search_ctx` table (0112), never by joining the fat
+    /// `agent_message` / `agent_session` tables per FTS candidate — that
+    /// per-candidate random page read into multi-KB rows is exactly what
+    /// breached the 1s budget. `EXPLAIN QUERY PLAN` names each table an
+    /// execution step touches; `agent_message` and `agent_session` may each
+    /// appear exactly once (the outer LIMIT-rows join), and the ctx table
+    /// must appear as a rowid SEARCH, not a SCAN.
+    #[tokio::test]
+    async fn search_messages_fts_ranking_pass_avoids_fat_tables() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-fts-plan-shape");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-plan".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-plan".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        // Same SQL construction as search_agent_messages_fts with every
+        // optional filter present (the widest surface that could regress).
+        let sql = "EXPLAIN QUERY PLAN \
+             SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
+                    s.workspace_id, s.name AS agent_name, top.adjusted_rank \
+             FROM ( \
+                 SELECT agent_message_fts.rowid AS msg_rowid, \
+                        bm25(agent_message_fts) \
+                          - (CASE WHEN c.workspace_id = ? THEN ? ELSE 0.0 END) \
+                          + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
+                 FROM agent_message_fts \
+                 JOIN agent_message_search_ctx c ON c.message_rowid = agent_message_fts.rowid \
+                 JOIN workspace w ON w.id = c.workspace_id \
+                 WHERE agent_message_fts MATCH ? AND c.workspace_id = ? \
+                   AND c.agent_id = ? AND c.role = ? \
+                 ORDER BY adjusted_rank ASC, msg_rowid DESC \
+                 LIMIT ? \
+             ) top \
+             JOIN agent_message m ON m.rowid = top.msg_rowid \
+             JOIN agent_session s ON s.id = m.agent_id \
+             ORDER BY top.adjusted_rank ASC, m.created_at DESC, m.id ASC";
+        let plan: Vec<String> = sqlx::query(sql)
+            .bind("ws-plan")
+            .bind(PREFER_WORKSPACE_BOOST)
+            .bind(ARCHIVED_WORKSPACE_PENALTY)
+            .bind("deploy")
+            .bind("ws-plan")
+            .bind("agent-plan")
+            .bind("user")
+            .bind(10_i64)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        // EXPLAIN QUERY PLAN details name tables by their alias
+        // ("SEARCH m USING INTEGER PRIMARY KEY (rowid=?)"); `m`/`s` are the
+        // fat outer-phase tables, `c` the ranking ctx table.
+        let joined = plan.join("\n");
+        let touches = |alias: &str| {
+            plan.iter()
+                .filter(|d| {
+                    d.starts_with(&format!("SEARCH {alias} ")) || **d == format!("SCAN {alias}")
+                })
+                .count()
+        };
+        assert_eq!(
+            touches("m"),
+            1,
+            "agent_message must be joined exactly once (outer phase only):\n{joined}"
+        );
+        assert_eq!(
+            touches("s"),
+            1,
+            "agent_session must be joined exactly once (outer phase only):\n{joined}"
+        );
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH c USING INTEGER PRIMARY KEY")),
+            "ranking ctx lookups must be rowid probes, not scans:\n{joined}"
+        );
     }
 
     /// Documents the accepted rowid-tiebreak trade-off (monorepo#3529, PR
