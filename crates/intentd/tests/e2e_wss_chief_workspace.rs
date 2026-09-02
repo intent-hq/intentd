@@ -390,7 +390,7 @@ async fn chief_workspace_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "name": "Chief Assistant",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -567,7 +567,7 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "name": "Chief Cwd Probe",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -690,7 +690,7 @@ async fn ws_app_surface_events_and_gating_over_wss() {
         &socket,
         12,
         "agent.create",
-        json!({ "workspaceId": ws1_id, "name": "Agent One", "model": "mock:default" }),
+        json!({ "workspaceId": ws1_id, "name": "Agent One", "model": "default", "provider": "mock" }),
     )
     .await;
     let ag1_id = ag1["result"]["agent"]["id"]
@@ -702,7 +702,7 @@ async fn ws_app_surface_events_and_gating_over_wss() {
         &socket,
         13,
         "agent.create",
-        json!({ "workspaceId": ws2_id, "name": "Agent Two", "model": "mock:default" }),
+        json!({ "workspaceId": ws2_id, "name": "Agent Two", "model": "default", "provider": "mock" }),
     )
     .await;
     let _ag2_id = ag2["result"]["agent"]["id"]
@@ -870,7 +870,7 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "name": "Chief",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -884,7 +884,7 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
         &mut rpc,
         4,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Child", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Child", "model": "default", "provider": "mock" }),
     )
     .await;
     let child_id = resp["result"]["agent"]["id"]
@@ -1160,7 +1160,7 @@ where
         ws,
         id_base + 1,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": agent_name, "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": agent_name, "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = resp["result"]["agent"]["id"]
@@ -1281,7 +1281,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "name": "Chief Waiter",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -1667,7 +1667,7 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "name": "Chief Group Waiter",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -1874,7 +1874,7 @@ async fn chief_scoped_group_cancel_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "name": "Chief Group Canceller",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -2316,7 +2316,7 @@ async fn chief_workspace_archive_gated_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "name": "Chief Archiver",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -2436,7 +2436,7 @@ async fn chief_agent_send_cross_workspace_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "name": "Chief Sender",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -2601,7 +2601,7 @@ async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "name": "Chief Asker",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;

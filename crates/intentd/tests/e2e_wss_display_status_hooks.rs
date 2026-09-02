@@ -462,7 +462,7 @@ async fn active_hook_serves_waiting_and_hook_cancel_drops_it_over_wss() {
     let created = wss_rpc(
         &mut rpc,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "hookowner", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "hookowner", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

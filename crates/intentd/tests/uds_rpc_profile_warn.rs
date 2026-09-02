@@ -326,7 +326,7 @@ async fn get_subscriptions_stays_within_statement_budget() {
     let resp = rpc_with_params(
         &socket,
         "agent.create",
-        json!({ "workspaceId": workspace_id, "name": "Subs Agent", "model": "auggie:sonnet4.5" }),
+        json!({ "workspaceId": workspace_id, "name": "Subs Agent", "model": "sonnet4.5", "provider": "auggie" }),
     )
     .await;
     let agent_id = resp["result"]["agent"]["id"]
@@ -414,7 +414,7 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     let resp = rpc_with_params(
         &socket,
         "agent.create",
-        json!({ "workspaceId": workspace_id, "name": "Queue Agent", "model": "auggie:sonnet4.5" }),
+        json!({ "workspaceId": workspace_id, "name": "Queue Agent", "model": "sonnet4.5", "provider": "auggie" }),
     )
     .await;
     let agent_id = resp["result"]["agent"]["id"]
@@ -586,7 +586,7 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
         let resp = rpc_with_params(
             &socket,
             "agent.create",
-            json!({ "workspaceId": workspace_id, "name": format!("A{i}"), "model": "auggie:sonnet4.5" }),
+            json!({ "workspaceId": workspace_id, "name": format!("A{i}"), "model": "sonnet4.5", "provider": "auggie" }),
         )
         .await;
         let agent_id = resp["result"]["agent"]["id"]

@@ -489,7 +489,7 @@ async fn question_ask_round_trip_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QAsk", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QAsk", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -774,7 +774,7 @@ async fn workspace_sibling_proposal_round_trip_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SiblingProposer", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "SiblingProposer", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -940,7 +940,7 @@ async fn pending_proposals_projection_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "PendingProposer", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "PendingProposer", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -1316,7 +1316,7 @@ async fn sub_agent_question_ask_denied_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "TopLevel", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "TopLevel", "model": "default", "provider": "mock" }),
     )
     .await;
     let top_agent = created["agent"]["id"]
@@ -1362,7 +1362,7 @@ async fn sub_agent_question_ask_denied_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "BgWorker",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
             "isBackground": true,
         }),
     )

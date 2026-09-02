@@ -332,7 +332,7 @@ async fn create_agent(rpc: &mut TlsWs, budget: Budget, id: i64, ws_id: &str, nam
         budget,
         id,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": name, "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock" }),
     )
     .await;
     created["agent"]["id"]

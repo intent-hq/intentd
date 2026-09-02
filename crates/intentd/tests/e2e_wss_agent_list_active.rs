@@ -281,7 +281,7 @@ async fn list_active_tracks_only_mid_turn_agents_over_real_wss() {
         &mut ws,
         2,
         "agent.create",
-        json!({ "workspaceId": workspace_id, "name": "Busy", "model": "mock:default" }),
+        json!({ "workspaceId": workspace_id, "name": "Busy", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["result"]["agent"]["id"]

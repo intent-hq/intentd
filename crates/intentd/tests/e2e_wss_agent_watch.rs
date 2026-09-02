@@ -439,7 +439,7 @@ async fn create_agent(rpc: &mut TlsWs, id: i64, ws_id: &str, name: &str) -> Stri
         rpc,
         id,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": name, "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock" }),
     )
     .await;
     created["agent"]["id"]
@@ -1661,7 +1661,7 @@ async fn report_progress_keeps_original_watch_for_terminal_completion_over_wss()
 
     let spawn_js = format!(
         "const r = await ws.agent.create('AdoptChild', '{CHILD_GO} do your work', \
-         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
     );
     let child_watch_js = r"
         const agents = await ws.agent.list();
@@ -1813,7 +1813,7 @@ async fn in_turn_progress_is_followed_by_terminal_wake_over_wss() {
 
     let spawn_js = format!(
         "const r = await ws.agent.create('DedupChild', '{CHILD_GO} do your work', \
-         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
     );
     let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     // Wake-ack rule FIRST: the report wake and any completion wake ack,
@@ -1950,7 +1950,7 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
 
     let spawn_js = format!(
         "const r = await ws.agent.create('HookChild', '{CHILD_GO} do your work', \
-         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
     );
     // Armed-timer hook: the immediate validation run holds (state marker),
     // every later run (driven by hook.runNow below) dispatches — the
@@ -2247,7 +2247,7 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
 
     let spawn_js = format!(
         "const r = await ws.agent.create('DiscloseChild', '{CHILD_GO} do your work', \
-         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
     );
     let report1_js = format!("return await ws.agent.reportToParent({});", json!(REPORT1));
     let report2_js = format!("return await ws.agent.reportToParent({});", json!(REPORT2));
@@ -2533,7 +2533,7 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
 
     let spawn_js = format!(
         "const r = await ws.agent.create('AdvisoryChild', '{CHILD_GO} do your work', \
-         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
     );
     // Armed-timer hook, NO report: the child idles hook-waiting, so its idle
     // is a monitoring idle — not a settled completion. The immediate

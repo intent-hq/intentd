@@ -37930,3 +37930,178 @@ mod sender_attribution {
         assert_eq!(md, before);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wire-boundary compound-model rejection (PROTOCOL §5.5): the `WorkspaceApi`
+// trait impls (the wire front doors) reject compound `provider:model` ids
+// with `-32602` before any side effect. The internal `_op` entry points are
+// untouched — internal callers keep their behavior.
+// ---------------------------------------------------------------------------
+
+fn assert_compound_model_rejection(err: Error, param: &str) {
+    match err {
+        Error::InvalidParams(msg) => {
+            assert!(
+                msg.contains(param),
+                "error must name the offending param {param:?}: {msg}"
+            );
+            assert!(
+                msg.contains("bare model id"),
+                "error must tell the caller to pass a bare model id: {msg}"
+            );
+        }
+        other => panic!("expected InvalidParams, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn wire_agent_create_rejects_compound_model() {
+    let (_t, svc, ws) = setup().await;
+    for bad in ["mock:default", ":default"] {
+        let err = WorkspaceApi::agent_create(
+            &svc,
+            ws.clone(),
+            Some("A".into()),
+            Some(bad.into()),
+            None,
+            None,
+            None,
+            AgentCreateExtra::default(),
+        )
+        .await
+        .expect_err("compound model must reject");
+        assert_compound_model_rejection(err, "model");
+    }
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "rejection must precede any side effect");
+    WorkspaceApi::agent_create(
+        &svc,
+        ws.clone(),
+        Some("A".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        AgentCreateExtra::default(),
+    )
+    .await
+    .expect("bare model accepted");
+}
+
+#[tokio::test]
+async fn wire_agent_delegate_rejects_compound_model() {
+    let (_t, svc, ws) = setup().await;
+    for bad in ["mock:default", ":default"] {
+        let err = WorkspaceApi::agent_delegate(
+            &svc,
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do".into()),
+                model: Some(bad.into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("compound model must reject");
+        assert_compound_model_rejection(err, "model");
+    }
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "rejection must precede any side effect");
+    WorkspaceApi::agent_delegate(
+        &svc,
+        ws.clone(),
+        AgentDelegateInput {
+            agent_instructions: Some("do".into()),
+            model: Some("fable-5".into()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("bare model accepted");
+}
+
+#[tokio::test]
+async fn wire_agent_delegate_rejects_compound_model_in_batch_tasks() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Batch").await;
+    let err = WorkspaceApi::agent_delegate(
+        &svc,
+        ws.clone(),
+        AgentDelegateInput {
+            tasks: Some(vec![BatchTaskEntry::Options(BatchTaskOptions {
+                task_note_id: note_id.clone(),
+                specialist: None,
+                model: Some("mock:default".into()),
+                provider: None,
+                reasoning_effort: None,
+                agent_instructions: None,
+            })]),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect_err("compound batch-entry model must reject");
+    assert_compound_model_rejection(err, "tasks[0].model");
+}
+
+#[tokio::test]
+async fn wire_agent_set_model_rejects_compound_model_id() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Setter").await;
+    for bad in ["mock:default", ":default"] {
+        let err = WorkspaceApi::agent_set_model(&svc, ws.clone(), id.clone(), bad.into(), None)
+            .await
+            .expect_err("compound modelId must reject");
+        assert_compound_model_rejection(err, "modelId");
+    }
+    WorkspaceApi::agent_set_model(&svc, ws.clone(), id.clone(), "fable-5".into(), None)
+        .await
+        .expect("bare modelId accepted");
+}
+
+#[tokio::test]
+async fn wire_agent_wake_or_create_rejects_compound_model() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Wake").await;
+    for bad in ["mock:default", ":default"] {
+        let err = WorkspaceApi::agent_wake_or_create(
+            &svc,
+            ws.clone(),
+            note_id.clone(),
+            "go".into(),
+            wake_input(Some(bad)),
+        )
+        .await
+        .expect_err("compound model must reject");
+        assert_compound_model_rejection(err, "model");
+    }
+    let err = WorkspaceApi::agent_wake_or_create(
+        &svc,
+        ws.clone(),
+        note_id.clone(),
+        "go".into(),
+        AgentWakeOrCreateInput {
+            create: Some(intent_core::AgentWakeCreateOptions {
+                model: Some("mock:default".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("compound create.model must reject");
+    assert_compound_model_rejection(err, "create.model");
+    let resp = WorkspaceApi::agent_wake_or_create(
+        &svc,
+        ws.clone(),
+        note_id,
+        "go".into(),
+        wake_input(Some("fable-5")),
+    )
+    .await
+    .expect("bare model accepted");
+    assert_eq!(resp["created"], true);
+}

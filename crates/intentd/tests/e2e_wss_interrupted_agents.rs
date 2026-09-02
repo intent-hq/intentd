@@ -528,7 +528,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Graceful Agent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Graceful Agent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

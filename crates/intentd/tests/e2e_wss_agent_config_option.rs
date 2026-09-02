@@ -365,7 +365,7 @@ async fn stored_model_applied_via_set_config_option_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "CfgOpt",
-            "model": "mock:sonnet",
+            "model": "sonnet", "provider": "mock",
         }),
     )
     .await;
@@ -484,7 +484,7 @@ async fn stored_model_applied_via_set_model_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "SetModel",
-            "model": "mock:grok-4.5",
+            "model": "grok-4.5", "provider": "mock",
         }),
     )
     .await;
@@ -608,7 +608,7 @@ async fn stored_model_effort_suffix_stripped_for_config_option_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "StripEffort",
-            "model": "mock:gpt-5.3-codex/high",
+            "model": "gpt-5.3-codex/high", "provider": "mock",
         }),
     )
     .await;
@@ -706,7 +706,7 @@ async fn set_model_failure_does_not_fail_the_turn() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SetModelReject", "model": "mock:bogus-model" }),
+        json!({ "workspaceId": ws_id, "name": "SetModelReject", "model": "bogus-model", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -808,7 +808,7 @@ async fn set_config_option_failure_does_not_fail_the_turn() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "CfgOptReject", "model": "mock:bogus-model" }),
+        json!({ "workspaceId": ws_id, "name": "CfgOptReject", "model": "bogus-model", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -917,7 +917,7 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "Effort",
-            "model": "mock:sonnet",
+            "model": "sonnet", "provider": "mock",
             "reasoningEffort": "high",
         }),
     )
@@ -1060,7 +1060,7 @@ async fn effort_levels_persisted_and_served_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "EffortLevels", "model": "mock:sonnet" }),
+        json!({ "workspaceId": ws_id, "name": "EffortLevels", "model": "sonnet", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1183,7 +1183,7 @@ async fn reasoning_effort_is_a_no_op_without_a_thought_level_option() {
         json!({
             "workspaceId": ws_id,
             "name": "EffortNoOp",
-            "model": "mock:sonnet",
+            "model": "sonnet", "provider": "mock",
             "reasoningEffort": "high",
         }),
     )

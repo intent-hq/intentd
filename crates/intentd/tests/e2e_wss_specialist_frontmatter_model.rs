@@ -342,9 +342,9 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
 
     // agent.create with the alias persists the canonical specialist id and
     // derives the display name from the canonical specialist. The explicit
-    // compound model satisfies provider resolution (the bundled spec-writer
-    // pins no frontmatter model and this hermetic env configures no default
-    // provider) without touching the alias seam under test.
+    // provider + bare model satisfies provider resolution (the bundled
+    // spec-writer pins no frontmatter model and this hermetic env configures
+    // no default provider) without touching the alias seam under test.
     let created = wss_rpc(
         &mut ws,
         3,
@@ -352,7 +352,8 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         json!({
             "workspaceId": ws_id,
             "specialistId": "coordinator",
-            "model": "auggie:opus"
+            "model": "opus",
+            "provider": "auggie"
         }),
     )
     .await;
@@ -379,7 +380,8 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         json!({
             "workspaceId": ws_id,
             "specialistId": "no-such-specialist",
-            "model": "auggie:opus"
+            "model": "opus",
+            "provider": "auggie"
         }),
     )
     .await;
@@ -917,7 +919,7 @@ async fn specialist_model_options_round_trip_over_wss() {
             "scope": "user",
             "spec": {
                 "id": "sigma", "name": "Sigma", "description": "Authored",
-                "modelOptions": [{ "model": "opencode:kimi-k3", "hint": "cheap" }],
+                "modelOptions": [{ "model": "kimi-k3", "hint": "cheap" }],
                 "prompt": "Sigma body."
             }
         }),
@@ -925,7 +927,7 @@ async fn specialist_model_options_round_trip_over_wss() {
     .await;
     assert_eq!(
         created["specialist"]["modelOptions"],
-        json!([{ "model": "opencode:kimi-k3", "hint": "cheap" }]),
+        json!([{ "model": "kimi-k3", "hint": "cheap" }]),
         "create round-trips modelOptions over WSS"
     );
     let got = wss_rpc(&mut ws, 5, "specialist.get", json!({ "id": "sigma" })).await;

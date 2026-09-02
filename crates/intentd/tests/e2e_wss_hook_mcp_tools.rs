@@ -456,7 +456,7 @@ async fn hook_calls_mcp_tool_end_to_end_and_gated_toggle_rejects() {
     let created = wss_rpc(
         &mut rpc,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-HOOK-MCP", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-HOOK-MCP", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

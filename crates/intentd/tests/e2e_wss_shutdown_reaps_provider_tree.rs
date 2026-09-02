@@ -351,7 +351,7 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Reap Agent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Reap Agent", "model": "default", "provider": "mock" }),
     )
     .await;
     assert!(

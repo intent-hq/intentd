@@ -392,7 +392,7 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-ARCHIVE", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-ARCHIVE", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

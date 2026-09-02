@@ -380,7 +380,7 @@ async fn agent_retry_redrive_preserves_original_turn_id_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-TURNID", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-TURNID", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

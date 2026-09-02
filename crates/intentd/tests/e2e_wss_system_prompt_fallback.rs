@@ -430,7 +430,7 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "SPF",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
             "specialistId": "spf-e2e-tester",
         }),
     )
@@ -594,7 +594,7 @@ async fn specialist_prompt_frozen_across_file_edit_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "Freeze",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
             "specialistId": "freeze-e2e-tester",
         }),
     )

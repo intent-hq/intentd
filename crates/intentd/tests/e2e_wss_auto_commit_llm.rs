@@ -466,9 +466,10 @@ async fn auto_commit_uses_generated_message_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": task_note_id,
             "contextMessage": "do the task",
-            "model": "mock:default",
+            "model": "default",
             "create": {
-                "name": "WSS Builder"
+                "name": "WSS Builder",
+                "provider": "mock"
             }
         }),
     )
@@ -659,7 +660,7 @@ async fn auto_commit_falls_back_when_auggie_missing() {
         &mut rpc,
         12,
         "agent.wakeOrCreate",
-        json!({ "workspaceId": ws_id, "taskNoteId": task_id, "contextMessage": "write a file", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "taskNoteId": task_id, "contextMessage": "write a file", "model": "default", "create": { "provider": "mock" } }),
     )
     .await;
     let agent_id = woke["agentId"].as_str().expect("agent id").to_string();

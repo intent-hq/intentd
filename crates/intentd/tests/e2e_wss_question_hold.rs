@@ -502,7 +502,7 @@ where
     let created = wss_rpc(
         rpc,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": name, "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock" }),
     )
     .await;
     created["agent"]["id"]

@@ -443,7 +443,7 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let created = wss_rpc(
         &mut rpc,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-ARCHIVE-HOOK", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-ARCHIVE-HOOK", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -633,7 +633,7 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     let created = wss_rpc(
         &mut rpc,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-PARKED-WAKE", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-PARKED-WAKE", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

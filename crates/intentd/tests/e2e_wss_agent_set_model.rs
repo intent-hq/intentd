@@ -214,11 +214,11 @@ fn gate() -> Option<String> {
 }
 
 /// STAB-115: agent.setModel triggers respawn on next turn when provider child is live.
-/// 1. Create agent with model "auggie:sonnet4.5"
+/// 1. Create agent with model "sonnet4.5" on provider "auggie"
 /// 2. Send message (spawns child with sonnet4.5)
-/// 3. Call agent.setModel to change to "auggie:haiku"
+/// 3. Call agent.setModel to change to "haiku"
 /// 4. Send another message (should respawn with haiku)
-/// 5. Verify agent.get shows model="auggie:haiku"
+/// 5. Verify agent.get shows model="haiku"
 #[tokio::test]
 async fn agent_set_model_triggers_respawn_over_wss() {
     let Some(script) = gate() else {
@@ -264,7 +264,7 @@ async fn agent_set_model_triggers_respawn_over_wss() {
     .await;
     let ws_id = ws_result["workspace"]["id"].as_str().expect("workspace id");
 
-    // Create agent with initial model "auggie:sonnet4.5"
+    // Create agent with initial model "sonnet4.5" on provider "auggie"
     let agent_result = wss_rpc(
         &mut ws,
         20,
@@ -272,7 +272,7 @@ async fn agent_set_model_triggers_respawn_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "SetModel Test",
-            "model": "auggie:sonnet4.5",
+            "model": "sonnet4.5", "provider": "auggie",
         }),
     )
     .await;
@@ -291,7 +291,7 @@ async fn agent_set_model_triggers_respawn_over_wss() {
     )
     .await;
 
-    // Change model to "auggie:haiku"
+    // Change model to "haiku"
     wss_rpc(
         &mut ws,
         40,
@@ -299,7 +299,8 @@ async fn agent_set_model_triggers_respawn_over_wss() {
         json!({
             "workspaceId": ws_id,
             "agentId": agent_id,
-            "modelId": "auggie:haiku",
+            "modelId": "haiku",
+            "providerId": "auggie",
         }),
     )
     .await;
@@ -337,12 +338,12 @@ async fn agent_set_model_triggers_respawn_over_wss() {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        if model == "auggie:haiku" {
+        if model == "haiku" {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "model should have changed to auggie:haiku after setModel; last saw {model:?}"
+            "model should have changed to haiku after setModel; last saw {model:?}"
         );
         rpc_id += 1;
         tokio::time::sleep(Duration::from_millis(100)).await;

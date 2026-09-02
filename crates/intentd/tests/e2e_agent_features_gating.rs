@@ -536,7 +536,7 @@ async fn agent_features_gate_new_sessions_only() {
             "initialAgent": {
                 "prompt": "say done",
                 "name": "Full Surface Agent",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
@@ -677,7 +677,7 @@ async fn agent_features_gate_new_sessions_only() {
         &mut rpc,
         40,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Gated Agent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Gated Agent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_b = created_b["result"]["agent"]["id"]
@@ -1003,7 +1003,7 @@ async fn specialist_model_options_surface_in_bridge_description() {
             "initialAgent": {
                 "prompt": "say done",
                 "name": "Options Agent",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
@@ -1122,7 +1122,7 @@ async fn create_top_level_creates_independent_agent_over_wss() {
             "initialAgent": {
                 "prompt": "say done",
                 "name": "Sponsor A",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
@@ -1144,7 +1144,7 @@ async fn create_top_level_creates_independent_agent_over_wss() {
     let mut bridge_a = BridgeClient::connect(&bridge_addr_from_config(&configs_a[0])).await;
     let (err, text) = bridge_a
         .call_js(
-            "return await ws.agent.create('DeniedPeer', 'nope', { topLevel: true, model: 'mock:default' })",
+            "return await ws.agent.create('DeniedPeer', 'nope', { topLevel: true, model: 'default', provider: 'mock' })",
         )
         .await;
     assert!(err, "topLevel must be denied with peerAgents off: {text}");
@@ -1167,7 +1167,7 @@ async fn create_top_level_creates_independent_agent_over_wss() {
         &mut rpc,
         30,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "Sponsor B", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "Sponsor B", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_b = created_b["result"]["agent"]["id"]
@@ -1201,7 +1201,7 @@ async fn create_top_level_creates_independent_agent_over_wss() {
     // `subscriptionId`.
     let (err, text) = bridge_b
         .call_js(
-            "return await ws.agent.create('PeerAgent', 'independent hello', { topLevel: true, model: 'mock:default' })",
+            "return await ws.agent.create('PeerAgent', 'independent hello', { topLevel: true, model: 'default', provider: 'mock' })",
         )
         .await;
     assert!(!err, "topLevel create must succeed on B: {text}");
@@ -1223,7 +1223,7 @@ async fn create_top_level_creates_independent_agent_over_wss() {
     // Control on the SAME bridge: a plain (sub-agent) create still
     // auto-subscribes — the no-watch behavior is specific to topLevel.
     let (err, text) = bridge_b
-        .call_js("return await ws.agent.create('ControlChild', 'hi', { model: 'mock:default' })")
+        .call_js("return await ws.agent.create('ControlChild', 'hi', { model: 'default', provider: 'mock' })")
         .await;
     assert!(!err, "plain create must succeed on B: {text}");
     let control: Value = serde_json::from_str(&text).expect("plain create result JSON");

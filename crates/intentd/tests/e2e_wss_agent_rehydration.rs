@@ -283,7 +283,7 @@ async fn seed_conversation(data_dir: &Path) -> (String, String, Vec<Value>) {
         "workspaceId": ws.0,
         "name": "Rehydrated",
         "nameExplicitlySet": true,
-        "model": "mock:default",
+        "model": "default", "provider": "mock",
         "systemPrompt": "be helpful",
         "status": "idle",
         "isActive": false,

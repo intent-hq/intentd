@@ -5,7 +5,8 @@
 //!
 //! The DB is pre-seeded with a workspace + target note, then the daemon process
 //! is launched with the mock ACP provider. A UDS client subscribes to events,
-//! calls `agent.create` + `agent.sendMessage` (model `mock:default`), and we
+//! calls `agent.create` + `agent.sendMessage` (model `default`, provider
+//! `mock`), and we
 //! assert the daemon-spawned child reached the per-agent workspace MCP server
 //! via the generated `--mcp-config` (mutating the note), and that the tool's
 //! `note:updated` domain event and the terminal `agent:stream:end` arrive over
@@ -297,7 +298,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
         &mut rpc_reader,
         10,
         "agent.create",
-        json!({ "workspaceId": ws.0, "name": "OTW", "model": "mock:default" }),
+        json!({ "workspaceId": ws.0, "name": "OTW", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -429,7 +430,7 @@ async fn agent_stop_interrupts_keep_alive_and_emits_terminal_stream_end_over_uds
         &mut rpc_reader,
         10,
         "agent.create",
-        json!({ "workspaceId": ws.0, "name": "OTW", "model": "mock:default" }),
+        json!({ "workspaceId": ws.0, "name": "OTW", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

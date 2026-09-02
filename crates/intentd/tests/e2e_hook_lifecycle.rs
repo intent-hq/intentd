@@ -721,7 +721,7 @@ async fn hook_lifecycle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "HookOwner", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "HookOwner", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1022,7 +1022,7 @@ async fn hook_lifecycle_over_wss() {
         &mut rpc,
         420,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Intruder", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Intruder", "model": "default", "provider": "mock" }),
     )
     .await;
     let intruder_id = intruder["agent"]["id"]
