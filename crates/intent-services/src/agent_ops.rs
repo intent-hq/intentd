@@ -4561,6 +4561,16 @@ impl Services {
         // the condition still matters.
         self.cancel_agent_hooks(&session.id).await;
         self.cancel_agent_pr_monitors(&session.id).await;
+        // Drop the retiring agent's OWN outgoing completion watches and
+        // delegation groups (monorepo#4183): a retired watcher can never
+        // consume a wake — every delivery attempt fails on the soft-retire
+        // inertness gate, so a watch left armed feeds the completion
+        // delivery retry loop with permanent failures forever. Mirrors the
+        // delete cascade and `agent.cancelSubscriptions` remove-all sweep.
+        // `agent.restore` does NOT resurrect them (same contract as hooks /
+        // PR monitors above) — the agent re-watches if it still cares.
+        self.remove_all_for_parent(&session.id);
+        self.remove_groups_for_parent(&session.id);
         let mut data = json!({
             "agentId": session.id.0,
             "agentName": session.name,

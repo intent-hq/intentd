@@ -5340,6 +5340,41 @@ impl Services {
         }
     }
 
+    /// Terminal-failure classification for a failed parent wake
+    /// (monorepo#4183): a RETIRED watcher can never consume a wake — the
+    /// soft-retire inertness gate rejects every delivery until
+    /// `agent.restore` — so retrying is a permanent-failure loop, not
+    /// recovery. When the failed delivery's target is retired, drop the
+    /// watch outright (memory + persisted row) and return `true` so the
+    /// caller skips the retry scheduling; the restored agent re-arms with
+    /// `ws.agent.watch` if it still cares. Fails open: a store read error
+    /// (or a live parent) returns `false` and the normal retry path runs.
+    /// This is a backstop — `agent.retire` drops the retiree's own watches
+    /// up front — covering watches that raced the retire sweep or predate
+    /// the fix in persisted form.
+    async fn drop_watch_if_parent_retired(
+        &self,
+        watch: &agent_subscriptions::CompletionWatch,
+        child_id: &AgentId,
+    ) -> bool {
+        let retired = matches!(
+            self.store
+                .get_agent_session_retired_at(&watch.parent_agent_id)
+                .await,
+            Ok(Some(_))
+        );
+        if retired {
+            tracing::warn!(
+                parent = %watch.parent_agent_id.0,
+                child = %child_id.0,
+                watch = %watch.id,
+                "dropping completion watch — watcher is retired and can never consume the wake; no retry"
+            );
+            self.remove_watch(&watch.id);
+        }
+        retired
+    }
+
     /// Retry failed durable terminal wakes for `child_id` until its
     /// ungrouped watches retire or a pass completes without a delivery
     /// failure. Retry ownership is coalesced per child
@@ -5368,7 +5403,10 @@ impl Services {
 
         let services = self.clone();
         tokio::spawn(async move {
-            let mut backoff = std::time::Duration::from_millis(100);
+            // 500ms initial (monorepo#4183): the old 100ms start burst three
+            // attempts inside the first second on every transient failure;
+            // wakes are not latency-critical enough to justify that.
+            let mut backoff = std::time::Duration::from_millis(500);
             let max_backoff = std::time::Duration::from_secs(5);
             loop {
                 tokio::time::sleep(backoff).await;
@@ -6387,6 +6425,14 @@ impl Services {
                 )
                 .await
             {
+                // Retired watcher = terminal (monorepo#4183): drop the
+                // watch instead of scheduling a retry the inertness gate
+                // would fail forever. The retracted report entries are NOT
+                // restored — their target is inert and can never consume
+                // them either.
+                if self.drop_watch_if_parent_retired(&watch, child_id).await {
+                    continue;
+                }
                 tracing::warn!(
                     error = %e,
                     parent = %watch.parent_agent_id.0,
@@ -6629,6 +6675,13 @@ impl Services {
             )
             .await
         {
+            // Retired watcher = terminal (monorepo#4183): drop the watch
+            // instead of scheduling the retry loop the inertness gate would
+            // fail forever. Applies to grouped watches too — group
+            // settlement toward a retired parent is equally undeliverable.
+            if self.drop_watch_if_parent_retired(watch, child_id).await {
+                return false;
+            }
             tracing::warn!(
                 error = %e,
                 parent = %watch.parent_agent_id.0,

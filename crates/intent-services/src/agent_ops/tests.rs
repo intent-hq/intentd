@@ -746,6 +746,153 @@ async fn restoring_the_parent_does_not_restore_cascaded_children() {
     assert!(s.retired_at.is_none());
 }
 
+/// monorepo#4183: retiring an agent drops its OWN outgoing completion
+/// watches and delegation groups — a retired watcher can never consume a
+/// wake, so a watch left armed would feed the delivery retry loop with
+/// permanent "agent is retired" failures forever.
+#[tokio::test]
+async fn retire_drops_owned_watches_and_delegation_groups() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        target.clone(),
+        None,
+    )
+    .expect("register watch");
+    let _gid = svc.get_or_create_delegation_group(&ws, &watcher);
+    assert_eq!(svc.list_watches_for_parent(&watcher).len(), 1);
+    assert!(svc.delegation_group_for_parent(&watcher).is_some());
+
+    svc.agent_retire_op(watcher.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire watcher");
+
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "retire must drop the retiree's outgoing watches"
+    );
+    assert!(
+        svc.delegation_group_for_parent(&watcher).is_none(),
+        "retire must drop the retiree's delegation groups"
+    );
+    // The persisted rows are swept too (best-effort spawned deletes).
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+/// monorepo#4183 delivery-path backstop: a monitoring-idle advisory whose
+/// watcher is retired (a watch that raced the retire sweep, or a stale
+/// persisted row from before the retire cleanup existed) is TERMINAL — the
+/// watch is dropped, no per-child retry task is scheduled, and no message
+/// reaches the retired parent's transcript.
+#[tokio::test]
+async fn monitoring_idle_advisory_to_retired_watcher_drops_watch_without_retry() {
+    let (_t, svc, _manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    // Retire the parent DIRECTLY in the store, bypassing the retire op's
+    // own watch sweep — simulating the raced/stale-row case the delivery
+    // backstop exists for.
+    let now = now_iso();
+    svc.store()
+        .set_agent_session_retired_at(&ws, &parent, Some(&now), &now)
+        .await
+        .expect("mark parent retired");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "advisory toward a retired watcher must drop the watch"
+    );
+    assert!(
+        svc.completion_delivery_retries
+            .lock()
+            .expect("retries lock")
+            .is_empty(),
+        "no retry task may be scheduled for a retired watcher"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no wake reaches the retired parent"
+    );
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+/// monorepo#4183 delivery-path backstop, completion-wake flavor: a terminal
+/// completion wake toward a retired watcher drops the watch instead of
+/// scheduling the infinite retry loop.
+#[tokio::test]
+async fn completion_wake_to_retired_watcher_drops_watch_without_retry() {
+    let (_t, svc, _manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    let now = now_iso();
+    svc.store()
+        .set_agent_session_retired_at(&ws, &parent, Some(&now), &now)
+        .await
+        .expect("mark parent retired");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "completion wake toward a retired watcher must drop the watch"
+    );
+    assert!(
+        svc.completion_delivery_retries
+            .lock()
+            .expect("retries lock")
+            .is_empty(),
+        "no retry task may be scheduled for a retired watcher"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no wake reaches the retired parent"
+    );
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
 #[tokio::test]
 async fn completion_delivery_wakes_watching_parent_and_removes_watch() {
     let (_t, svc, ws) = setup().await;
