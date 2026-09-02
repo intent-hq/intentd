@@ -79,7 +79,9 @@ pub struct SettingsFile {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProvidersSettings {
-    /// `providers.active` — default agent provider.
+    /// `providers.active` — deprecated legacy default-provider key, superseded
+    /// by `model.defaultProvider`. Still parsed so an upgraded config loads,
+    /// but the boot migration carries it over and removes it from the file.
     pub active: Option<String>,
     /// `providers.enabled` — providers offered to users (id → enabled).
     pub enabled: Option<BTreeMap<String, bool>>,
@@ -1372,8 +1374,6 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret
 # they belong in .secrets.json next to this file.
 
 [providers]
-# Active provider -- default agent provider.
-# active = "claude-code"
 # Enabled providers -- providers offered to users (id -> enabled).
 # enabled = { claude-code = true }
 # Provider paths -- per-provider CLI path overrides.

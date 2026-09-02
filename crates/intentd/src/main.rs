@@ -1548,10 +1548,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // already-set ones are left alone.
     intent_services::migrate_quick_action_settings(&settings_registry)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // One-time carry-over of the deprecated `providers.active` into
-    // `model.defaultProvider` (which superseded it), plus a deprecation WARN
-    // while the legacy key remains set. An already-set target is never
-    // clobbered.
+    // One-time removal of the deprecated `providers.active` from config.toml
+    // (comment-preserving rewrite; runs only when the key exists). Its value
+    // is carried over into `model.defaultProvider` (which superseded it)
+    // first; an already-set target is never clobbered.
     intent_services::migrate_active_provider_setting(&settings_registry)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // One-time legacy handling: retired keys still present in config.toml
