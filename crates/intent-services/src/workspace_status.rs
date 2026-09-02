@@ -443,7 +443,11 @@ impl Services {
     /// The `unread` workspace attention flag never feeds the signals — it
     /// is the flag's own contract (§9.9), not a displayStatus axis.
     /// Child/background sessions never count — their attention surface is
-    /// the parent/subscriber (attention-retire taxonomy). The cheap metadata
+    /// the parent/subscriber (attention-retire taxonomy). A pending request
+    /// raised MID-TURN whose surfacing is still parked on the
+    /// deferred-attention registry does not count either: the workspace
+    /// stays `in_progress` until the raising agent's turn-end flush
+    /// surfaces the request. The cheap metadata
     /// checks run over every candidate first, so the per-session hold reads
     /// only happen when `needs_attention` is still undecided. Best-effort: a
     /// store read failure fails open — session-derived signals read `false`
@@ -486,6 +490,15 @@ impl Services {
         for s in &top_level {
             if s.status == intent_core::AgentStatus::Error {
                 signals.failed = true;
+            }
+            // A pending request whose surfacing is parked awaiting the idle
+            // flush does not promote the displayStatus yet — the workspace
+            // reads `in_progress` while the raising turn is still running,
+            // and the turn-end flush's recompute promotes it (the marker is
+            // consumed there first, so this read flips at exactly the
+            // surfacing point).
+            if self.attention_surfacing_deferred(&s.id) {
+                continue;
             }
             match s.attention_request_kind.as_deref() {
                 Some("blocker") => signals.blocked = true,

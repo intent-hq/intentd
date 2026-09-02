@@ -240,6 +240,24 @@ impl PendingMarkerMutationPark {
     }
 }
 
+/// One mid-turn attention raise parked for the turn-end flush (see the
+/// [`Services::deferred_attention`] registry docs). Captured at raise time by
+/// `agent_request_attention_op` so every raise keeps its own payload — the
+/// store's pending-request columns are latest-wins, but the surfacing
+/// (transcript notice + `agent:attention-requested`) is per-raise.
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredAttention {
+    /// Transcript-notice `meta.kind` (`"discussion-request"` / `"blocker-report"`).
+    pub(crate) meta_kind: &'static str,
+    /// The raise's trimmed reason text.
+    pub(crate) reason: String,
+    /// The raise's persisted timestamp.
+    pub(crate) saved_at: String,
+    /// The full `agent:attention-requested` payload built at raise time
+    /// (includes `parentAgentId` for delegated callers).
+    pub(crate) attention_data: serde_json::Value,
+}
+
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
 /// (§6.8) and dispatched to by the transport router.
@@ -614,6 +632,25 @@ pub struct Services {
     /// reads through it; this set is empty there. Shared across clones so a
     /// `set_test_busy` on one handle is visible to every other handle.
     test_busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Attention requests (`ws.agent.requestDiscussion` /
+    /// `ws.agent.reportBlocker`) raised MID-TURN, whose user-facing
+    /// surfacing (`agent:attention-requested`, the `agent:updated` attention
+    /// fields, the transcript notice, and the displayStatus promotion) is
+    /// parked until the agent goes idle. Each raise queues its own
+    /// [`DeferredAttention`] payload (captured at raise time) so multiple
+    /// raises in one turn each surface at the flush — the store's pending
+    /// columns are latest-wins, but the event history and transcript get one
+    /// entry per raise, matching the immediate arm and the per-raise
+    /// parent/watcher wakes. The turn-end choke points (`run_prompt_turn`
+    /// settlement, suspend-interrupt enrollment, harness-wake idle,
+    /// interrupt, terminal failure) flush via
+    /// [`Services::flush_deferred_attention`]; the turn-begin clear
+    /// (`clear_attention_request_if_present`) retires an agent's queue when
+    /// its request was dismissed before idle. In-memory only (a daemon
+    /// restart loses the queue — the persisted session fields then surface
+    /// through the ordinary list/get reads). Shared across clones so the
+    /// raising op and the turn worker observe the same map.
+    deferred_attention: Arc<Mutex<HashMap<AgentId, Vec<DeferredAttention>>>>,
     /// Per-note debouncers for `attribute_lines` recomputes (PROTOCOL §5.2.1,
     /// FE parity with `LineAttributionService.scheduleComputation`). Every
     /// content-changing `note.*` mutation schedules a delayed recompute
@@ -1000,6 +1037,7 @@ impl Services {
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
+            deferred_attention: Arc::new(Mutex::new(HashMap::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
@@ -3039,6 +3077,39 @@ impl Services {
             } else {
                 set.remove(agent_id);
             }
+        }
+    }
+
+    /// Park the user-facing surfacing of one mid-turn attention raise until
+    /// the agent goes idle (see the [`Self::deferred_attention`] registry
+    /// docs). Each call queues its own payload — two raises in one turn each
+    /// surface at the flush. Set by `agent_request_attention_op` for a
+    /// mid-turn raise; consumed by [`Self::flush_deferred_attention`].
+    pub(crate) fn mark_deferred_attention(&self, agent_id: &AgentId, entry: DeferredAttention) {
+        if let Ok(mut map) = self.deferred_attention.lock() {
+            map.entry(agent_id.clone()).or_default().push(entry);
+        }
+    }
+
+    /// Consume `agent_id`'s deferred-attention queue in raise order. Returns
+    /// an empty vec when nothing was parked. Also the retire path: the
+    /// turn-begin clear and the delete teardown drop the queue through this
+    /// without surfacing.
+    pub(crate) fn take_deferred_attention(&self, agent_id: &AgentId) -> Vec<DeferredAttention> {
+        match self.deferred_attention.lock() {
+            Ok(mut map) => map.remove(agent_id).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Whether `agent_id` has attention raises parked awaiting the idle
+    /// flush — the [`workspace_status`] derivation skips such sessions so
+    /// `displayStatus` stays `in_progress` until the requests actually
+    /// surface.
+    pub(crate) fn attention_surfacing_deferred(&self, agent_id: &AgentId) -> bool {
+        match self.deferred_attention.lock() {
+            Ok(map) => map.contains_key(agent_id),
+            Err(_) => false,
         }
     }
 

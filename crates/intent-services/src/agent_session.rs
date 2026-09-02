@@ -3278,6 +3278,11 @@ impl Services {
                         "complete"
                     },
                 );
+                // Surface an attention request the turn raised mid-flight
+                // BEFORE the idle emit, so subscribers see the notice/toast
+                // and then the idle — never a "quiet idle" that later grows
+                // an attention card.
+                self.flush_deferred_attention(agent_id, workspace_id).await;
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "stream_complete",
@@ -3387,6 +3392,9 @@ impl Services {
                     block_count,
                     "failed",
                 );
+                // A turn error also ends the turn — surface a mid-turn raise
+                // now (same ordering rationale as the idle arm above).
+                self.flush_deferred_attention(agent_id, workspace_id).await;
                 let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
                 if let Some(tid) = turn_id {
                     data["turnId"] = json!(tid);
@@ -3554,6 +3562,12 @@ impl Services {
         );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
+        // A suspend interruption also ends the turn — surface a mid-turn
+        // attention raise now, after the interrupted terminal emit (spec:
+        // surface on ANY turn end). Without this the raise would stay parked
+        // until a later resumed turn happens to finish — or indefinitely if
+        // no resume completes.
+        self.flush_deferred_attention(agent_id, workspace_id).await;
         tracing::info!(
             agent = %agent_id,
             error = %err,
@@ -3890,6 +3904,9 @@ impl Services {
             );
             return;
         }
+        // Surface an attention request the wake turn raised mid-flight before
+        // the idle emit (same ordering as the prompt-turn idle).
+        self.flush_deferred_attention(agent_id, workspace_id).await;
         let mut data = json!({
             "agentId": agent_id.0,
             "reason": "harness_wake_complete",

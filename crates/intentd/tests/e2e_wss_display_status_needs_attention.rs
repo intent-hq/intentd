@@ -22,6 +22,15 @@
 //!    retires a pending-question `needs_attention`, and
 //!    `agent.replaceMessages` swapping back to a question-tail transcript
 //!    raises it again.
+//! 6. Deferred surfacing (mid-turn raise): a top-level agent calling
+//!    `ws.agent.requestDiscussion` from INSIDE a live turn surfaces NOTHING
+//!    while the turn is still running — no `agent:attention-requested`, no
+//!    attention fields on `agent:updated`, no transcript notice, no
+//!    `needs_attention` promotion (the read path stays `in_progress`) — and
+//!    the whole surfacing bundle arrives once the turn ends.
+//! 7. The blocker variant of 6: a top-level mid-turn `ws.agent.reportBlocker`
+//!    stays invisible until turn end, then promotes the derived
+//!    `displayStatus` to `blocked`.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -67,6 +76,12 @@ const BLOCK_MARKER: &str = "RAISE_BLOCKER_NEEDS_ATTN_E2E";
 /// Reasons carried by the attention requests.
 const DISCUSS_REASON: &str = "NATTN_WSS need a decision before continuing";
 const BLOCKER_REASON: &str = "NATTN_WSS sandbox is broken, cannot proceed";
+
+/// Kickoff markers + reasons for the deferred-surfacing scenarios (6 + 7).
+const DEFER_DISCUSS_MARKER: &str = "DEFER_DISCUSSION_NEEDS_ATTN_E2E";
+const DEFER_BLOCK_MARKER: &str = "DEFER_BLOCKER_NEEDS_ATTN_E2E";
+const DEFER_DISCUSS_REASON: &str = "NATTN_WSS deferred: decision needed at turn end";
+const DEFER_BLOCK_REASON: &str = "NATTN_WSS deferred: environment broken at turn end";
 
 /// Monotonic JSON-RPC id source shared by all helpers/tests in this file.
 static NEXT_ID: AtomicI64 = AtomicI64::new(100);
@@ -1130,4 +1145,309 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
         "needs_attention",
         "workspace.get serves needs_attention after the swap"
     );
+}
+
+/// Mid-turn hold window (ms): the mock parks this long AFTER the raise tool
+/// call resolves and BEFORE resolving the prompt, keeping the turn in flight
+/// while the test asserts nothing surfaced. Well under the 8-minute
+/// silent-tail suspicion threshold, so the tail stays annotation-free.
+const DEFER_TAIL_MS: u64 = 10_000;
+
+/// Assert one subscriber event observed DURING the mid-turn hold window is
+/// not part of the attention surfacing bundle: no `agent:attention-requested`,
+/// no attention fields on the raiser's `agent:updated`, no `needs_attention`/
+/// `blocked` promotion, and no transcript-notice `agent:message` (matched via
+/// the `meta.kind` marker in the serialized event).
+fn assert_not_surfaced_mid_turn(ev: &Value, agent_id: &str, meta_kind: &str) {
+    let data = &ev["data"];
+    match ev["type"].as_str().unwrap_or_default() {
+        "agent:attention-requested" => {
+            panic!("agent:attention-requested must not fire mid-turn: {ev}")
+        }
+        "workspace:displayStatus-changed" => {
+            let status = data["displayStatus"].as_str().unwrap_or_default();
+            assert!(
+                status != "needs_attention" && status != "blocked",
+                "no attention promotion mid-turn: {ev}"
+            );
+        }
+        "agent:updated" if data["agentId"] == json!(agent_id) => {
+            assert!(
+                data.get("attentionRequestKind").is_none(),
+                "no attention fields on agent:updated mid-turn: {ev}"
+            );
+        }
+        "agent:message" => {
+            assert!(
+                !ev.to_string().contains(meta_kind),
+                "no transcript notice mid-turn: {ev}"
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Scenarios 6 + 7 — deferred surfacing: a top-level agent raising attention
+/// from INSIDE a live turn surfaces NOTHING until the turn ends. The mock's
+/// marker turn runs the raise tool call and then parks (`DEFER_TAIL_MS`)
+/// before resolving the prompt, opening a mid-turn window where the request
+/// is already PERSISTED (`agent.getSession` serves the kind — store writes
+/// and parent wakes stay immediate) yet nothing user-facing has moved: no
+/// events, no transcript notice, `displayStatus` still `in_progress`. Once
+/// the prompt resolves, the turn-end flush delivers the whole bundle — the
+/// `agent:updated` attention fields, the notice, the self-sufficient
+/// `agent:attention-requested`, and the `want_status` promotion.
+async fn run_deferred_surfacing_scenario(
+    test: &str,
+    kind: &str,
+    method: &str,
+    marker: &str,
+    reason: &str,
+    meta_kind: &str,
+    want_status: &str,
+) {
+    let Some(script) = gate(test) else {
+        return;
+    };
+
+    let raise_js = format!("return await ws.agent.{method}({});", json!(reason));
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": marker,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": raise_js, "summary": "raise attention mid-turn" }
+            },
+            "silentTailBeforeResultMs": DEFER_TAIL_MS,
+            "response": "turn ended after the deferred raise",
+        }],
+        "response": "acknowledged",
+    })
+    .to_string();
+    let (_daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    assert_eq!(get_display_status(&mut rpc, &ws_id).await, "idle");
+
+    // SUBSCRIBER conn — registered BEFORE the turn so we miss nothing.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed", "agent:*"],
+            "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // ---- Kickoff: the marker turn raises mid-turn, then parks ----
+    let agent_id = create_agent(&mut rpc, &ws_id, "deferred-raiser").await;
+    let sent = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": format!("{marker} raise attention mid-turn"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "kickoff sendMessage ok: {sent}");
+
+    // ---- Mid-turn window: wait for the raise to PERSIST (store write is
+    // immediate even when surfacing defers) while the prompt is still parked.
+    let mut persisted = false;
+    for _ in 0..240 {
+        let got = wss_rpc(
+            &mut rpc,
+            "agent.getSession",
+            json!({ "agentId": agent_id, "workspaceId": ws_id }),
+        )
+        .await;
+        if got["session"]["attentionRequestKind"] == json!(kind) {
+            assert_eq!(
+                got["session"]["attentionRequestReason"],
+                json!(reason),
+                "persisted reason: {got}"
+            );
+            persisted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(persisted, "the raise persisted on the session mid-turn");
+
+    // Drain everything the subscriber saw so far plus a short live window:
+    // none of it may be part of the surfacing bundle.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    while let Some(ev) = wss_event_until(&mut sub, drain_deadline).await {
+        assert_not_surfaced_mid_turn(&ev, &agent_id, meta_kind);
+    }
+
+    // No transcript notice mid-turn.
+    let conv = wss_rpc(
+        &mut rpc,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        !conv["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .any(|m| m["role"] == "system"
+                && m["contentBlocks"][0]["meta"]["kind"] == json!(meta_kind)),
+        "the transcript notice must not exist mid-turn"
+    );
+
+    // The read path still serves `in_progress` (agent running) — the pending
+    // request does not promote while the surfacing is deferred.
+    assert_eq!(
+        get_display_status(&mut rpc, &ws_id).await,
+        "in_progress",
+        "displayStatus stays in_progress while the raiser's turn runs"
+    );
+
+    // Prove all the negative checks above really ran MID-TURN: the raiser is
+    // still draining the parked prompt.
+    let got = wss_rpc(
+        &mut rpc,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        got["agent"]["isResponding"],
+        json!(true),
+        "the hold window must outlive the mid-turn checks (raise DEFER_TAIL_MS?): {got}"
+    );
+
+    // ---- Turn end: the flush delivers the whole bundle ----
+    // Order-insensitive milestones under one deadline: the attention fields
+    // on agent:updated, the self-sufficient attention event, the promotion,
+    // and the terminal idle.
+    let mut updated_fields = false;
+    let mut attention = false;
+    let mut promoted = false;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    while !(updated_fields && attention && promoted && idle) {
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!(
+                "timed out: updated_fields={updated_fields} attention={attention} \
+                 promoted={promoted} idle={idle}"
+            )
+        };
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:updated"
+                if data["agentId"] == json!(agent_id)
+                    && data.get("attentionRequestKind").is_some() =>
+            {
+                assert_eq!(data["attentionRequestKind"], json!(kind), "kind: {data}");
+                assert!(
+                    data["attentionRequestTimestamp"].is_string(),
+                    "timestamp rides the update: {data}"
+                );
+                updated_fields = true;
+            }
+            "agent:attention-requested" if data["agentId"] == json!(agent_id) => {
+                assert_eq!(data["kind"], json!(kind), "attention kind: {data}");
+                assert_eq!(data["reason"], json!(reason), "attention reason: {data}");
+                assert_eq!(data["workspaceId"], json!(ws_id), "workspaceId: {data}");
+                assert!(
+                    data["agentName"].is_string(),
+                    "agentName rides the event: {data}"
+                );
+                assert!(
+                    data.get("parentAgentId").is_none(),
+                    "top-level raiser carries no parentAgentId: {data}"
+                );
+                attention = true;
+            }
+            "workspace:displayStatus-changed" if data["displayStatus"] == json!(want_status) => {
+                assert_eq!(
+                    data,
+                    &json!({ "workspaceId": ws_id, "displayStatus": want_status }),
+                    "self-sufficient promotion payload (PROTOCOL §6.5): {ev}"
+                );
+                promoted = true;
+            }
+            "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
+            _ => {}
+        }
+    }
+
+    // Post-turn: the transcript notice exists exactly once, and the read
+    // path serves the promoted status while the request stays pending.
+    let conv = wss_rpc(
+        &mut rpc,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let notices: Vec<&Value> = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| {
+            m["role"] == "system" && m["contentBlocks"][0]["meta"]["kind"] == json!(meta_kind)
+        })
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "exactly one transcript notice after the flush"
+    );
+    assert_eq!(
+        notices[0]["contentBlocks"][0]["text"],
+        json!(reason),
+        "the notice carries the reason: {}",
+        notices[0]
+    );
+    assert_eq!(
+        get_display_status(&mut rpc, &ws_id).await,
+        want_status,
+        "the read path serves the promotion after the flush"
+    );
+}
+
+/// Scenario 6 — a top-level agent's mid-turn `ws.agent.requestDiscussion`
+/// surfaces nothing while the turn runs; the full bundle (attention fields,
+/// notice, event, `needs_attention` promotion) arrives at turn end.
+#[tokio::test]
+async fn mid_turn_discussion_defers_surfacing_until_idle_over_wss() {
+    run_deferred_surfacing_scenario(
+        "WSS deferred discussion-surfacing E2E",
+        "discussion",
+        "requestDiscussion",
+        DEFER_DISCUSS_MARKER,
+        DEFER_DISCUSS_REASON,
+        "discussion-request",
+        "needs_attention",
+    )
+    .await;
+}
+
+/// Scenario 7 — the blocker variant: a top-level agent's mid-turn
+/// `ws.agent.reportBlocker` stays invisible until turn end, then promotes
+/// the derived `displayStatus` to `blocked`.
+#[tokio::test]
+async fn mid_turn_blocker_defers_surfacing_until_idle_over_wss() {
+    run_deferred_surfacing_scenario(
+        "WSS deferred blocker-surfacing E2E",
+        "blocker",
+        "reportBlocker",
+        DEFER_BLOCK_MARKER,
+        DEFER_BLOCK_REASON,
+        "blocker-report",
+        "blocked",
+    )
+    .await;
 }
