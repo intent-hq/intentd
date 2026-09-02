@@ -103,7 +103,7 @@ pub(crate) async fn create(
         },
     };
     let mut spawn_env = overlay_credential_env(
-        git_credential_env(settings.as_deref(), spawn_cwd.as_deref()),
+        injected_git_env(settings.as_deref(), spawn_cwd.as_deref()),
         user_env,
     );
     let inherited_term = std::env::var("TERM").ok();
@@ -207,6 +207,21 @@ pub(crate) fn git_credential_env(
         return Vec::new();
     }
     credential_pairs(cwd)
+}
+
+/// All git env pairs injected under the caller's overlay for a spawn in
+/// `cwd`: the gated credential-helper pair ([`git_credential_env`]) plus the
+/// ungated commit-identity vars (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`, resolved
+/// from `cwd`'s repository via the same config chain `git.commit` uses —
+/// intent-hq/intent#4142; identity is not a secret, so no settings gate).
+/// Caller-supplied keys still win via [`overlay_credential_env`].
+pub(crate) fn injected_git_env(
+    settings: Option<&SettingsRegistry>,
+    cwd: Option<&Path>,
+) -> Vec<(String, String)> {
+    let mut env = git_credential_env(settings, cwd);
+    env.extend(intent_git::identity::commit_identity_env(cwd));
+    env
 }
 
 /// The `exposeGitCredentialToChildren` gate. `None` (registry not wired —
@@ -635,7 +650,7 @@ impl TerminalHost for PtyTerminalHost {
         let settings = self.settings.clone();
         let terminal_requires_shell = self.terminal_requires_shell;
         Box::pin(async move {
-            let credential = git_credential_env(settings.as_deref(), params.cwd.as_deref());
+            let credential = injected_git_env(settings.as_deref(), params.cwd.as_deref());
             let (command, args) = if terminal_requires_shell {
                 shell_true_invocation(&params.command, &params.args)
             } else {
@@ -1064,6 +1079,38 @@ mod tests {
             !keys.contains(&intent_git::auth::TOKEN_ENV),
             "no token env pair may be injected"
         );
+    }
+
+    /// intent-hq/intent#4142: the combined injection carries the four
+    /// commit-identity `GIT_*` vars when the spawn cwd's repository resolves
+    /// an identity — ungated (no settings registry needed) — and none when
+    /// the cwd is absent.
+    #[test]
+    fn injected_git_env_carries_commit_identity_ungated() {
+        let dir =
+            std::env::temp_dir().join(format!("intentd-term-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Term Test").unwrap();
+        cfg.set_str("user.email", "term@example.com").unwrap();
+        drop(cfg);
+
+        let env = injected_git_env(None, Some(&dir));
+        for key in intent_git::identity::GIT_IDENTITY_ENV_VARS {
+            assert!(env.iter().any(|(k, _)| k == key), "missing {key}");
+        }
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "GIT_COMMITTER_EMAIL" && v == "term@example.com"));
+
+        assert!(
+            !injected_git_env(None, None)
+                .iter()
+                .any(|(k, _)| k.starts_with("GIT_AUTHOR") || k.starts_with("GIT_COMMITTER")),
+            "no cwd must inject no identity vars"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Caller-supplied env wins: a colliding key drops the injected pair and

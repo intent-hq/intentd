@@ -24,6 +24,7 @@ pub mod diff;
 pub mod fetch;
 pub mod fs_remove;
 pub mod history;
+pub mod identity;
 pub mod ls_remote;
 pub mod pull;
 pub mod push;

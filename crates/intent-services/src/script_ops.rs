@@ -1305,15 +1305,16 @@ impl ScriptManager {
     }
 
     /// Build the [`SpawnSpec`] for a run: login shell + `-c command`, workspace
-    /// scope, and the `FORCE_COLOR/TERM` + enhanced-PATH + script env overlay,
-    /// with an inherited `npm_config_prefix` scrubbed so nvm's login-shell init
-    /// succeeds. An explicit script env value is preserved.
+    /// scope, and the `FORCE_COLOR/TERM` + enhanced-PATH + commit-identity +
+    /// script env overlay, with an inherited `npm_config_prefix` scrubbed so
+    /// nvm's login-shell init succeeds. An explicit script env value is
+    /// preserved.
     fn build_spec(ws: &WorkspaceId, def: &Script, cwd: Option<&PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
         spec.cwd = cwd.cloned();
-        spec.env = spawn_env_overlay(def.env.as_ref());
+        spec.env = spawn_env_overlay(cwd.map(PathBuf::as_path), def.env.as_ref());
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.listed = false;
         spec
@@ -1322,10 +1323,14 @@ impl ScriptManager {
 
 /// Build the env overlay for a spawned script/agent shell: `FORCE_COLOR/TERM`, an
 /// enhanced PATH (essential system dirs + homebrew + node/version-manager dirs),
+/// the commit-identity `GIT_*` vars resolved from `cwd`'s repository (so a
+/// `git commit` in the script uses the user's real identity —
+/// intent-hq/intent#4142; nothing is exported when no identity resolves),
 /// then the script's own `env` last so it can override. The enhanced PATH keeps
 /// git/node resolvable even when the daemon inherited a sparse Finder/launchd
 /// PATH or the login-shell init is degraded.
 fn spawn_env_overlay(
+    cwd: Option<&std::path::Path>,
     def_env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Vec<(String, String)> {
     let mut env = vec![
@@ -1335,6 +1340,7 @@ fn spawn_env_overlay(
     if let Some(path) = enhanced_shell_path() {
         env.push(("PATH".to_string(), path));
     }
+    env.extend(intent_git::identity::commit_identity_env(cwd));
     if let Some(map) = def_env {
         for (k, v) in map {
             env.push((k.clone(), v.clone()));
@@ -1637,7 +1643,7 @@ mod tests {
 
     #[test]
     fn spawn_overlay_scrubs_only_inherited_npm_config_prefix_and_enhances_path() {
-        let env = spawn_env_overlay(None);
+        let env = spawn_env_overlay(None, None);
         assert!(scrubbed_env_vars_except(&env)
             .iter()
             .any(|name| name == "npm_config_prefix"));
@@ -1645,7 +1651,7 @@ mod tests {
 
         let mut def_env = std::collections::BTreeMap::new();
         def_env.insert("npm_config_prefix".to_string(), "/custom".to_string());
-        let explicit_env = spawn_env_overlay(Some(&def_env));
+        let explicit_env = spawn_env_overlay(None, Some(&def_env));
         assert!(scrubbed_env_vars_except(&explicit_env).is_empty());
 
         // The enhanced PATH overlay includes the essential system dirs + homebrew.
@@ -1666,8 +1672,50 @@ mod tests {
     fn spawn_overlay_appends_script_env_last() {
         let mut def_env = std::collections::BTreeMap::new();
         def_env.insert("MY_VAR".to_string(), "1".to_string());
-        let env = spawn_env_overlay(Some(&def_env));
+        let env = spawn_env_overlay(None, Some(&def_env));
         assert_eq!(env.last(), Some(&("MY_VAR".to_string(), "1".to_string())));
+    }
+
+    /// #4142: a script spawned inside a repo with a configured identity
+    /// carries the four `GIT_*` identity vars; the script's own env still
+    /// wins (applied after) and an absent cwd exports none.
+    #[test]
+    fn spawn_overlay_injects_commit_identity_script_env_wins() {
+        let dir =
+            std::env::temp_dir().join(format!("intentd-script-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Script Test").unwrap();
+        cfg.set_str("user.email", "script@example.com").unwrap();
+        drop(cfg);
+
+        let env = spawn_env_overlay(Some(&dir), None);
+        for key in intent_git::identity::GIT_IDENTITY_ENV_VARS {
+            assert!(env.iter().any(|(k, _)| k == key), "missing {key}");
+        }
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "GIT_AUTHOR_EMAIL" && v == "script@example.com"));
+
+        let mut def_env = std::collections::BTreeMap::new();
+        def_env.insert("GIT_AUTHOR_NAME".to_string(), "Script".to_string());
+        let env = spawn_env_overlay(Some(&dir), Some(&def_env));
+        let last_author = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "GIT_AUTHOR_NAME")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            last_author,
+            Some("Script"),
+            "script env wins (applied last)"
+        );
+
+        assert!(!spawn_env_overlay(None, None)
+            .iter()
+            .any(|(k, _)| k.starts_with("GIT_AUTHOR") || k.starts_with("GIT_COMMITTER")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
