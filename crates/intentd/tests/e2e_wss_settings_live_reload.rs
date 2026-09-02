@@ -793,8 +793,13 @@ async fn active_provider_boot_migration_rewrites_config_once_over_wss() {
         // On disk: key removed, carried value written, comment and untouched
         // keys preserved (toml_edit comment-preserving rewrite).
         let text = std::fs::read_to_string(&config_path).expect("read config.toml");
+        let has_active_key = text.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix("active")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        });
         assert!(
-            !text.contains("active"),
+            !has_active_key,
             "providers.active must be removed from the file: {text}"
         );
         assert!(

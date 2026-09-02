@@ -1954,6 +1954,11 @@ pub fn migrate_active_provider_setting(registry: &SettingsRegistry) -> Result<()
             "removed deprecated providers.active from config.toml; the \
              already-set model.defaultProvider wins"
         );
+    } else if active.is_empty() {
+        tracing::info!(
+            "removed deprecated providers.active from config.toml; the value \
+             was blank, so nothing was carried over to model.defaultProvider"
+        );
     } else {
         tracing::info!(
             value = active,
@@ -4280,6 +4285,17 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
     }
 
+    /// True when the TOML text still carries an `active` key line — matched
+    /// as a key assignment, not a bare substring, so fixture keys that merely
+    /// contain "active" (e.g. `interactive`) can never false-fail.
+    fn has_active_key(text: &str) -> bool {
+        text.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix("active")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+    }
+
     /// Upgrade path: a config that predates `model.defaultProvider` and only
     /// carries the deprecated `providers.active` has that value carried over
     /// once at boot ([`migrate_active_provider_setting`]) AND the legacy key
@@ -4313,7 +4329,7 @@ mod tests {
         );
         let text = std::fs::read_to_string(&config_path).expect("read migrated config");
         assert!(
-            !text.contains("active"),
+            !has_active_key(&text),
             "providers.active must be removed from the file: {text}"
         );
         assert!(
@@ -4367,7 +4383,7 @@ mod tests {
         );
         let text = std::fs::read_to_string(&config_path).expect("read config");
         assert!(
-            !text.contains("active"),
+            !has_active_key(&text),
             "the legacy key is removed even when the target is set: {text}"
         );
         assert!(text.contains("defaultProvider = \"claude-code\""), "{text}");
@@ -4402,7 +4418,7 @@ mod tests {
         );
         let text2 = std::fs::read_to_string(&config_path2).expect("read config");
         assert!(
-            !text2.contains("active"),
+            !has_active_key(&text2),
             "an unregistered legacy value is still removed from the file: {text2}"
         );
         let _ = std::fs::remove_file(&config_path2);
@@ -4465,7 +4481,7 @@ mod tests {
             "the ignored write must not resurrect the key"
         );
         let text = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(!text.contains("active"), "{text}");
+        assert!(!has_active_key(&text), "{text}");
 
         // A batch mixing the legacy path with a live one still applies the
         // live entry instead of failing wholesale.
