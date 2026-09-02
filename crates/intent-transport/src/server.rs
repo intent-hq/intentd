@@ -171,7 +171,29 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 /// (v4-mapped sockets cover the IPv4 side), so its enumeration additionally
 /// carries the machine's global IPv6 addresses.
 pub(crate) fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
-    match snapshot.bind_addresses.as_deref() {
+    advertised_hosts(
+        snapshot.bind_addresses.as_deref(),
+        &collect_local_ips(),
+        &collect_local_ipv6s(),
+    )
+}
+
+/// Pure core of [`pairing_hosts`]: pick the advertised host set for a bind
+/// set from pre-enumerated local address lists (`local_v4` from
+/// [`collect_local_ips`], `local_v6` from [`collect_local_ipv6s`]). Shared
+/// with the `system.status` route snapshot (composition root), which passes
+/// its background-sampled enumerations so the status read path never touches
+/// `getifaddrs(3)` — a listener bound to specific addresses (loopback
+/// included) advertises exactly those, an unspecified bind falls back to the
+/// enumerated lists (v4 only for `0.0.0.0`, v4 + v6 for `::`), and an
+/// unknown set (`None`) keeps the historical full enumeration.
+#[must_use]
+pub fn advertised_hosts(
+    bind_addresses: Option<&[std::net::IpAddr]>,
+    local_v4: &[String],
+    local_v6: &[String],
+) -> Vec<String> {
+    match bind_addresses {
         Some(addrs) if !addrs.is_empty() && !addrs.iter().any(std::net::IpAddr::is_unspecified) => {
             addrs.iter().map(std::string::ToString::to_string).collect()
         }
@@ -180,11 +202,11 @@ pub(crate) fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
                 .iter()
                 .any(|a| a.is_unspecified() && matches!(a, std::net::IpAddr::V6(_))) =>
         {
-            let mut hosts = collect_local_ips();
-            hosts.extend(collect_local_ipv6s());
+            let mut hosts = local_v4.to_vec();
+            hosts.extend_from_slice(local_v6);
             hosts
         }
-        _ => collect_local_ips(),
+        _ => local_v4.to_vec(),
     }
 }
 
@@ -192,7 +214,8 @@ pub(crate) fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
 /// [`collect_local_ips`] for advertising hosts of an IPv6-unspecified (`::`)
 /// bind; link-local (`fe80::/10`) addresses are skipped because they are not
 /// usable without a zone index.
-fn collect_local_ipv6s() -> Vec<String> {
+#[must_use]
+pub fn collect_local_ipv6s() -> Vec<String> {
     let mut ips = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for iface in ifaces {
