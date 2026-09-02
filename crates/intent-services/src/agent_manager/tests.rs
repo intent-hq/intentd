@@ -3988,6 +3988,92 @@ async fn suspend_enrollment_kills_child_so_resume_issues_session_load() {
     );
 }
 
+/// Regression (PR #1639 review): an attention request raised mid-turn must
+/// surface when the turn ends through the SUSPEND-INTERRUPT enrollment, not
+/// stay parked until a later resumed turn happens to finish. Parks a raise,
+/// drives a turn that fails with a suspend-overlapping transient disconnect
+/// (routing through `enroll_suspend_interrupted_turn`), and asserts the
+/// flush surfaces `agent:attention-requested` and consumes the queue.
+#[tokio::test]
+async fn suspend_enrollment_flushes_deferred_attention() {
+    // Keep the enrollment self-heal from firing mid-test.
+    let _env = EnvGuard::set_all(&[("INTENTD_WAKE_RESUME_SELF_HEAL_MS", "600000")]);
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_suspend_tracker(Arc::new(AlwaysSuspended(Duration::from_secs(120))));
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services, sink, 8));
+
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-suspend-attn"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "existing-id")
+        .await
+        .unwrap();
+
+    // A mid-turn raise: pending request persisted, surfacing parked (the
+    // deterministic stand-in for `agent_request_attention_op` on a busy
+    // agent — same seam the agent_ops unit tests use).
+    let saved_at = now_iso();
+    mgr.services
+        .store
+        .set_attention_request(&ws, &id, "discussion", "raised before suspend", &saved_at)
+        .await
+        .unwrap();
+    mgr.services.mark_deferred_attention(
+        &id,
+        crate::DeferredAttention {
+            meta_kind: "discussion-request",
+            reason: "raised before suspend".into(),
+            saved_at,
+            attention_data: json!({
+                "workspaceId": ws.0,
+                "agentId": id.0,
+                "agentName": "WS",
+                "kind": "discussion",
+                "reason": "raised before suspend",
+            }),
+        },
+    );
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_ATTENTION_REQUESTED.to_string()],
+        ..Default::default()
+    });
+
+    // Drive the turn: live child fails its prompt transiently while a
+    // suspend overlaps → `enroll_suspend_interrupted_turn` runs. The default
+    // Automatic origin keeps the turn-begin attention clear from firing.
+    let _agent = track_mock_agent_prompt_rpc_error(&mgr, &id, "Connection reset by peer");
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "hi".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message starts the turn worker");
+
+    // The suspend enrollment flushed the parked raise.
+    let batch = timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect("suspend-interrupted turn end must flush the parked attention raise")
+        .expect("subscription open");
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(batch[0].data["kind"], json!("discussion"));
+    assert_eq!(batch[0].data["reason"], json!("raised before suspend"));
+    assert!(
+        mgr.services.take_deferred_attention(&id).is_empty(),
+        "the flush consumed the parked queue"
+    );
+}
+
 /// A test provider that skips `authenticate` (deterministic handshake).
 fn test_provider() -> intent_providers::ProviderConfig {
     intent_providers::ProviderConfig {

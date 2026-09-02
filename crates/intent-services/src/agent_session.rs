@@ -3562,6 +3562,12 @@ impl Services {
         );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
+        // A suspend interruption also ends the turn — surface a mid-turn
+        // attention raise now, after the interrupted terminal emit (spec:
+        // surface on ANY turn end). Without this the raise would stay parked
+        // until a later resumed turn happens to finish — or indefinitely if
+        // no resume completes.
+        self.flush_deferred_attention(agent_id, workspace_id).await;
         tracing::info!(
             agent = %agent_id,
             error = %err,

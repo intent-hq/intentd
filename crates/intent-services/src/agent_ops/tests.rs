@@ -23208,8 +23208,8 @@ async fn request_attention_cleared_before_idle_flushes_nothing() {
         .await
         .expect("clear");
     assert!(
-        svc.take_deferred_attention(&agent),
-        "marker was parked and is retired by the clear"
+        !svc.take_deferred_attention(&agent).is_empty(),
+        "raise was parked and is retired by the clear"
     );
 
     let mut sub = bus.subscribe(SubscriptionFilter {
@@ -23233,9 +23233,18 @@ async fn request_attention_cleared_before_idle_flushes_nothing() {
         "no transcript notice for a dismissed raise"
     );
 
-    // Defense in depth: a marker that somehow survives a cleared request
-    // still surfaces nothing (the flush re-checks the session fields).
-    svc.mark_deferred_attention(&agent);
+    // Defense in depth: a parked raise that somehow survives a cleared
+    // request still surfaces nothing (the flush re-checks the session
+    // fields).
+    svc.mark_deferred_attention(
+        &agent,
+        crate::DeferredAttention {
+            meta_kind: "discussion-request",
+            reason: "answered mid-turn".into(),
+            saved_at: now_iso(),
+            attention_data: json!({ "agentId": agent.0, "kind": "discussion" }),
+        },
+    );
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
         timeout(Duration::from_millis(200), sub.recv())
@@ -23271,13 +23280,14 @@ async fn request_attention_idle_agent_surfaces_immediately() {
         .expect("open");
     assert_eq!(batch[0].data["kind"], json!("blocker"));
     assert!(
-        !svc.take_deferred_attention(&agent),
-        "no deferred marker for an idle raise"
+        svc.take_deferred_attention(&agent).is_empty(),
+        "no parked raise for an idle raise"
     );
 }
 
-/// The deferred flush rebuilds `parentAgentId` from the session for a
-/// delegated child, matching the immediate arm's payload contract.
+/// The deferred flush surfaces the payload captured at raise time, so a
+/// delegated child's flush carries `parentAgentId`, matching the immediate
+/// arm's payload contract.
 #[tokio::test]
 async fn deferred_attention_flush_carries_parent_agent_id() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
@@ -23319,6 +23329,91 @@ async fn deferred_attention_flush_carries_parent_agent_id() {
         Some(parent.0.as_str()),
         "flush payload carries the parent id: {:?}",
         batch[0].data
+    );
+}
+
+/// Two raises in one busy turn EACH surface at the flush, in raise order —
+/// the registry queues per-raise payloads (the store's pending columns are
+/// latest-wins, but the event history and transcript get one entry per
+/// raise, matching the per-raise parent/watcher wakes).
+#[tokio::test]
+async fn multiple_mid_turn_raises_each_surface_at_flush() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent = create_agent(&svc, &ws, "DoubleRaise").await;
+    svc.set_test_busy(&agent, true);
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "first: which approach?".into(),
+        Some(agent.clone()),
+    )
+    .await
+    .expect("first raise");
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "second: sandbox broke".into(),
+        Some(agent.clone()),
+    )
+    .await
+    .expect("second raise");
+
+    // The store keeps latest-wins pending fields…
+    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    assert_eq!(session.attention_request_kind.as_deref(), Some("blocker"));
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![
+            AGENT_ATTENTION_REQUESTED.to_string(),
+            AGENT_MESSAGE.to_string(),
+        ],
+        ..Default::default()
+    });
+    // …but the flush surfaces BOTH raises, in order.
+    svc.set_test_busy(&agent, false);
+    svc.flush_deferred_attention(&agent, &ws).await;
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let attention: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == AGENT_ATTENTION_REQUESTED)
+        .collect();
+    assert_eq!(
+        attention.len(),
+        2,
+        "one attention event per raise: {events:?}"
+    );
+    assert_eq!(attention[0].data["kind"], json!("discussion"));
+    assert_eq!(attention[0].data["reason"], json!("first: which approach?"));
+    assert_eq!(attention[1].data["kind"], json!("blocker"));
+    assert_eq!(attention[1].data["reason"], json!("second: sandbox broke"));
+
+    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let notices: Vec<_> = session
+        .messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .collect();
+    assert_eq!(notices.len(), 2, "one transcript notice per raise");
+    assert_eq!(
+        notices[0].content[0]["meta"]["kind"],
+        json!("discussion-request")
+    );
+    assert_eq!(
+        notices[1].content[0]["meta"]["kind"],
+        json!("blocker-report")
+    );
+
+    // The flush consumed the queue — a second flush is a no-op.
+    svc.flush_deferred_attention(&agent, &ws).await;
+    assert!(
+        timeout(Duration::from_millis(200), sub.recv())
+            .await
+            .is_err(),
+        "second flush surfaces nothing"
     );
 }
 

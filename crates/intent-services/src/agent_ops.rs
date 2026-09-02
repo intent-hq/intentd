@@ -7568,14 +7568,25 @@ impl Services {
         // normal tool-call path — is parked on the deferred registry and
         // flushed by the turn-end choke points once the agent goes idle, so
         // the notice lands after the turn's own output and the workspace
-        // stays `in_progress` while the agent is still working. A raise with
-        // no in-flight turn (empty-wake recovery, FE-less edge paths)
-        // surfaces immediately as before. Everything below this branch
-        // (linked-task transition, parent wake, watcher fan-out) stays
-        // immediate either way — backend coordination must not wait for the
-        // child's turn to end.
+        // stays `in_progress` while the agent is still working. Each raise
+        // parks its own payload (captured here, at raise time): the store's
+        // pending columns are latest-wins, but the flush surfaces every
+        // parked raise so the event history matches the per-raise
+        // parent/watcher wakes. A raise with no in-flight turn (empty-wake
+        // recovery, FE-less edge paths) surfaces immediately as before.
+        // Everything below this branch (linked-task transition, parent wake,
+        // watcher fan-out) stays immediate either way — backend coordination
+        // must not wait for the child's turn to end.
         if self.agent_is_busy(caller.clone()) {
-            self.mark_deferred_attention(&caller);
+            self.mark_deferred_attention(
+                &caller,
+                crate::DeferredAttention {
+                    meta_kind,
+                    reason: reason.clone(),
+                    saved_at: saved_at.clone(),
+                    attention_data: attention_data.clone(),
+                },
+            );
         } else {
             self.surface_attention_request(
                 &workspace_id,
@@ -7803,28 +7814,31 @@ impl Services {
         self.maybe_emit_display_status_changed(workspace_id).await;
     }
 
-    /// Turn-end flush of a mid-turn attention raise: if `agent_id` holds a
-    /// deferred-attention marker AND the persisted request is still pending
-    /// (not cleared by a mid-turn user delivery), rebuild the surfacing
-    /// payload from the session fields and run
-    /// [`Self::surface_attention_request`]. Called from every turn
-    /// termination choke point — the prompt-turn settlement (clean idle and
-    /// terminal error), the harness-wake idle, and the interrupt path — so
-    /// the request surfaces at the FIRST idle after the raise regardless of
-    /// how the turn ended. Consuming the marker up front makes the flush
-    /// idempotent across racing choke points; a marker whose request was
-    /// already cleared retires silently. Best-effort: a session read failure
-    /// only logs (the persisted fields still surface through ordinary
-    /// list/get reads).
+    /// Turn-end flush of the mid-turn attention raises: if `agent_id` holds
+    /// parked raises AND the persisted request is still pending (not cleared
+    /// by a mid-turn user delivery), surface each parked raise in order via
+    /// [`Self::surface_attention_request`] using the payload captured at
+    /// raise time — so two raises in one turn each get their transcript
+    /// notice and `agent:attention-requested` event, matching the per-raise
+    /// parent/watcher wakes. Called from every turn termination choke point
+    /// — the prompt-turn settlement (clean idle and terminal error), the
+    /// suspend-interrupt enrollment, the harness-wake idle, and the
+    /// interrupt path — so the requests surface at the FIRST turn end after
+    /// the raise regardless of how the turn ended. Consuming the queue up
+    /// front makes the flush idempotent across racing choke points; a queue
+    /// whose persisted request was already cleared retires silently.
+    /// Best-effort: a session read failure only logs (the persisted fields
+    /// still surface through ordinary list/get reads).
     pub(crate) async fn flush_deferred_attention(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) {
-        if !self.take_deferred_attention(agent_id) {
+        let parked = self.take_deferred_attention(agent_id);
+        if parked.is_empty() {
             return;
         }
-        let session = match self.store.get_agent_session(agent_id).await {
+        let session = match self.store.get_agent_session_summary(agent_id).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -7835,41 +7849,22 @@ impl Services {
                 return;
             }
         };
-        let (Some(kind), Some(reason)) = (
-            session.attention_request_kind.clone(),
-            session.attention_request_reason.clone(),
-        ) else {
+        if session.attention_request_kind.is_none() {
             // Cleared before idle (user-origin delivery mid-turn) — nothing
             // to surface.
             return;
-        };
-        let saved_at = session
-            .attention_request_timestamp
-            .clone()
-            .unwrap_or_else(now_iso);
-        let meta_kind = match kind.as_str() {
-            "discussion" => "discussion-request",
-            _ => "blocker-report",
-        };
-        let mut attention_data = json!({
-            "workspaceId": workspace_id.0,
-            "agentId": agent_id.0,
-            "agentName": session.name.clone(),
-            "kind": kind,
-            "reason": reason,
-        });
-        if let Some(parent) = &session.parent_agent_id {
-            attention_data["parentAgentId"] = json!(parent.0);
         }
-        self.surface_attention_request(
-            workspace_id,
-            agent_id,
-            meta_kind,
-            &reason,
-            &saved_at,
-            &attention_data,
-        )
-        .await;
+        for entry in parked {
+            self.surface_attention_request(
+                workspace_id,
+                agent_id,
+                entry.meta_kind,
+                &entry.reason,
+                &entry.saved_at,
+                &entry.attention_data,
+            )
+            .await;
+        }
     }
 
     /// `agent.delegate`: create a session and (best-effort) assign it to the
