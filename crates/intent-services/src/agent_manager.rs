@@ -2764,6 +2764,7 @@ impl AgentManager {
                 self.services.pty(),
                 self.services.settings_registry(),
                 opts.provider.terminal_requires_shell,
+                Some(cwd.clone()),
             ));
         let handler = Arc::new(
             ClientRequestHandler::new(
@@ -7477,6 +7478,9 @@ impl AgentManager {
             .github
             .expose_git_credential_to_children;
         inject_git_credential_env(&mut opts.extra_env, opts.cwd, git_credential_expose);
+        // Commit identity for `git commit` run by the agent's own tools
+        // (intent-hq/intent#4142) — ungated: identity is not a secret.
+        inject_git_identity_env(&mut opts.extra_env, opts.cwd);
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
             // frontmatter (SP-B); falls back to the default interactive type so
@@ -8869,6 +8873,21 @@ fn inject_git_credential_env(
     };
     let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
     for (key, value) in intent_git::auth::daemon_helper_env(&intentd, cwd, inherited.as_deref()) {
+        extra_env.entry(key).or_insert(value);
+    }
+}
+
+/// Append the commit-identity `GIT_AUTHOR_*`/`GIT_COMMITTER_*` vars to a
+/// provider spawn's extra env, resolved from `cwd`'s repository via the same
+/// config chain `git.commit` uses (intent-hq/intent#4142), so a `git commit`
+/// run by the agent (or any shell it spawns that inherits the provider env)
+/// carries the user's real identity even when the worktree has no local
+/// `user.*` config. No identity resolved ⇒ no changes; a var already in the
+/// daemon's own env is inherited untouched, and pre-existing caller keys are
+/// never clobbered. Identity is not a secret, so this is not gated on
+/// `exposeGitCredentialToChildren`.
+fn inject_git_identity_env(extra_env: &mut BTreeMap<String, String>, cwd: Option<&Path>) {
+    for (key, value) in intent_git::identity::commit_identity_env(cwd) {
         extra_env.entry(key).or_insert(value);
     }
 }
@@ -13679,6 +13698,39 @@ mod rebuild_spawn_opts_tests {
             env[intent_git::auth::GIT_CONFIG_PARAMETERS_ENV],
             "caller-set"
         );
+    }
+
+    /// intent-hq/intent#4142: the provider-spawn identity seam exports the
+    /// four `GIT_*` identity vars when the spawn cwd's repository resolves an
+    /// identity, never clobbers a caller-set key, and injects nothing without
+    /// a cwd.
+    #[test]
+    fn inject_git_identity_env_from_repo_cwd_never_clobbers() {
+        let dir =
+            std::env::temp_dir().join(format!("intentd-agent-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Agent Test").unwrap();
+        cfg.set_str("user.email", "agent@example.com").unwrap();
+        drop(cfg);
+
+        let mut env = BTreeMap::new();
+        inject_git_identity_env(&mut env, Some(&dir));
+        for key in intent_git::identity::GIT_IDENTITY_ENV_VARS {
+            assert!(env.contains_key(key), "missing {key}");
+        }
+        assert_eq!(env["GIT_AUTHOR_EMAIL"], "agent@example.com");
+
+        let mut env = BTreeMap::from([("GIT_AUTHOR_NAME".to_string(), "caller-set".to_string())]);
+        inject_git_identity_env(&mut env, Some(&dir));
+        assert_eq!(env["GIT_AUTHOR_NAME"], "caller-set");
+        assert_eq!(env["GIT_COMMITTER_NAME"], "Agent Test");
+
+        let mut env = BTreeMap::new();
+        inject_git_identity_env(&mut env, None);
+        assert!(env.is_empty(), "no cwd must inject nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

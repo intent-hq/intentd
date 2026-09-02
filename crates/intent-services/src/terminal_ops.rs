@@ -103,7 +103,7 @@ pub(crate) async fn create(
         },
     };
     let mut spawn_env = overlay_credential_env(
-        git_credential_env(settings.as_deref(), spawn_cwd.as_deref()),
+        injected_git_env(settings.as_deref(), spawn_cwd.as_deref()),
         user_env,
     );
     let inherited_term = std::env::var("TERM").ok();
@@ -207,6 +207,22 @@ pub(crate) fn git_credential_env(
         return Vec::new();
     }
     credential_pairs(cwd)
+}
+
+/// All git env pairs injected under the caller's overlay for a spawn in
+/// `cwd`: the gated credential-helper pair ([`git_credential_env`]) plus the
+/// ungated commit-identity vars (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`, resolved
+/// from `cwd`'s repository via the same config chain `git.commit` uses —
+/// intent-hq/intent#4142; identity is not a secret, so no settings gate).
+/// An identity var already set in the daemon's own env is inherited untouched,
+/// and caller-supplied keys still win via [`overlay_credential_env`].
+pub(crate) fn injected_git_env(
+    settings: Option<&SettingsRegistry>,
+    cwd: Option<&Path>,
+) -> Vec<(String, String)> {
+    let mut env = git_credential_env(settings, cwd);
+    env.extend(intent_git::identity::commit_identity_env(cwd));
+    env
 }
 
 /// The `exposeGitCredentialToChildren` gate. `None` (registry not wired —
@@ -606,25 +622,34 @@ pub(crate) struct PtyTerminalHost {
     /// so providers that pack a shell line into `command` still work. Sourced
     /// from [`intent_providers::ProviderConfig::terminal_requires_shell`].
     terminal_requires_shell: bool,
+    /// The agent session's working directory, used when a `terminal/create`
+    /// request omits `cwd`: the spawn (and thus the git env resolution) falls
+    /// back to it, so a provider terminal without an explicit cwd still runs
+    /// in — and resolves the commit identity from — the session's repository
+    /// (intent-hq/intent#4142) instead of the daemon's own cwd.
+    session_cwd: Option<PathBuf>,
 }
 
 impl PtyTerminalHost {
     /// Wire the adapter over the shared host (argv-only terminal spawn).
     #[cfg(test)]
     pub fn new(pty: Arc<PtyHost>, settings: Option<Arc<SettingsRegistry>>) -> Self {
-        Self::with_shell_mode(pty, settings, false)
+        Self::with_shell_mode(pty, settings, false, None)
     }
 
-    /// Like [`Self::new`], with an explicit shell-wrap mode for the provider.
+    /// Like [`Self::new`], with an explicit shell-wrap mode for the provider
+    /// and the session cwd fallback for requests that omit `cwd`.
     pub(crate) fn with_shell_mode(
         pty: Arc<PtyHost>,
         settings: Option<Arc<SettingsRegistry>>,
         terminal_requires_shell: bool,
+        session_cwd: Option<PathBuf>,
     ) -> Self {
         Self {
             pty,
             settings,
             terminal_requires_shell,
+            session_cwd,
         }
     }
 }
@@ -634,8 +659,10 @@ impl TerminalHost for PtyTerminalHost {
         let pty = self.pty.clone();
         let settings = self.settings.clone();
         let terminal_requires_shell = self.terminal_requires_shell;
+        let session_cwd = self.session_cwd.clone();
         Box::pin(async move {
-            let credential = git_credential_env(settings.as_deref(), params.cwd.as_deref());
+            let spawn_cwd = params.cwd.or(session_cwd);
+            let credential = injected_git_env(settings.as_deref(), spawn_cwd.as_deref());
             let (command, args) = if terminal_requires_shell {
                 shell_true_invocation(&params.command, &params.args)
             } else {
@@ -647,7 +674,7 @@ impl TerminalHost for PtyTerminalHost {
             let inherited_term = std::env::var("TERM").ok();
             ensure_terminal_term(&mut spec.env, inherited_term.as_deref());
             spec.env_remove = scrubbed_env_vars_except(&spec.env);
-            spec.cwd = params.cwd;
+            spec.cwd = spawn_cwd;
             if let Some(limit) = params
                 .output_byte_limit
                 .and_then(|n| usize::try_from(n).ok())
@@ -1064,6 +1091,38 @@ mod tests {
             !keys.contains(&intent_git::auth::TOKEN_ENV),
             "no token env pair may be injected"
         );
+    }
+
+    /// intent-hq/intent#4142: the combined injection carries the four
+    /// commit-identity `GIT_*` vars when the spawn cwd's repository resolves
+    /// an identity — ungated (no settings registry needed) — and none when
+    /// the cwd is absent.
+    #[test]
+    fn injected_git_env_carries_commit_identity_ungated() {
+        let dir =
+            std::env::temp_dir().join(format!("intentd-term-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Term Test").unwrap();
+        cfg.set_str("user.email", "term@example.com").unwrap();
+        drop(cfg);
+
+        let env = injected_git_env(None, Some(&dir));
+        for key in intent_git::identity::GIT_IDENTITY_ENV_VARS {
+            assert!(env.iter().any(|(k, _)| k == key), "missing {key}");
+        }
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "GIT_COMMITTER_EMAIL" && v == "term@example.com"));
+
+        assert!(
+            !injected_git_env(None, None)
+                .iter()
+                .any(|(k, _)| k.starts_with("GIT_AUTHOR") || k.starts_with("GIT_COMMITTER")),
+            "no cwd must inject no identity vars"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Caller-supplied env wins: a colliding key drops the injected pair and
@@ -1968,6 +2027,55 @@ mod tests {
         assert!(exit.signal.is_none());
     }
 
+    /// intent-hq/intent#4142: a `terminal/create` that omits `cwd` falls back
+    /// to the agent session's cwd for both the spawn directory and the git
+    /// env resolution, so the commit identity resolved from the session's
+    /// repository still reaches the child.
+    #[tokio::test]
+    async fn acp_create_without_cwd_falls_back_to_session_cwd_with_identity() {
+        let dir =
+            std::env::temp_dir().join(format!("intentd-acp-session-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Session Test").unwrap();
+        cfg.set_str("user.email", "session@example.com").unwrap();
+        drop(cfg);
+        let dir = dir.canonicalize().unwrap();
+
+        let pty = host();
+        let adapter = PtyTerminalHost::with_shell_mode(pty.clone(), None, false, Some(dir.clone()));
+        let params = TerminalCreateParams {
+            session_id: "sess-cwd".to_string(),
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'cwd=%s email=%s\\n' \"$(pwd)\" \"$GIT_AUTHOR_EMAIL\"".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            output_byte_limit: None,
+        };
+        let id = adapter.create(params).await.unwrap();
+        let exit = tokio::time::timeout(LONG_TIMEOUT, adapter.wait_for_exit(id.clone()))
+            .await
+            .expect("child exits within the deadline")
+            .unwrap();
+        assert_eq!(exit.exit_code, Some(0));
+        let out = adapter.output(id).await.unwrap();
+        assert!(
+            out.output.contains(&format!("cwd={}", dir.display())),
+            "spawn falls back to the session cwd; got {:?}",
+            out.output
+        );
+        assert!(
+            out.output.contains("email=session@example.com"),
+            "identity resolved from the session cwd's repo; got {:?}",
+            out.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn acp_create_with_byte_limit_then_release() {
         let pty = host();
@@ -2014,7 +2122,7 @@ mod tests {
     #[tokio::test]
     async fn acp_shell_mode_accepts_packed_shell_command() {
         let pty = host();
-        let adapter = PtyTerminalHost::with_shell_mode(pty.clone(), None, true);
+        let adapter = PtyTerminalHost::with_shell_mode(pty.clone(), None, true, None);
         let params = TerminalCreateParams {
             session_id: "sess-shell".to_string(),
             // Grok-style packed shell line (would ENOENT under argv-only

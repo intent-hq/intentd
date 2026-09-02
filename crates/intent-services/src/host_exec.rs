@@ -389,6 +389,13 @@ fn build_command_with_captured(
     }
     // Enrich PATH so a user-supplied `env["PATH"]` still wins if provided.
     cmd.env("PATH", enhanced_path(None));
+    // Commit-identity `GIT_*` vars resolved from the exec's cwd repository
+    // (intent-hq/intent#4142) — same config chain `git.commit` uses; nothing
+    // is set when no identity resolves, a var already in the daemon's own env
+    // is inherited untouched, and the caller's `env` (below) wins.
+    for (k, v) in intent_git::identity::commit_identity_env(cwd_resolved) {
+        cmd.env(k, v);
+    }
     for (k, v) in &args.env {
         cmd.env(k, v);
     }
@@ -755,6 +762,54 @@ mod tests {
             Some("caller-wins"),
             "caller env wins over captured"
         );
+    }
+
+    /// intent-hq/intent#4142: an exec resolved into a repository cwd carries
+    /// the commit-identity `GIT_*` vars; a caller-set key still wins, and no
+    /// cwd means no identity vars.
+    #[test]
+    fn build_command_injects_commit_identity_caller_wins() {
+        let dir = std::env::temp_dir().join(format!(
+            "intentd-hostexec-identity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Exec Test").unwrap();
+        cfg.set_str("user.email", "exec@example.com").unwrap();
+        drop(cfg);
+
+        let args = HostExecArgs {
+            command: "echo".to_string(),
+            args: vec![],
+            cwd: None,
+            env: btree(&[("GIT_AUTHOR_NAME", "caller-wins")]),
+            timeout_ms: None,
+            workspace_id: None,
+        };
+        let cmd = build_command_with_captured(&args, Some(&dir), &BTreeMap::new());
+        let envs = cmd_envs(&cmd);
+        assert_eq!(
+            envs.get("GIT_AUTHOR_EMAIL").map(String::as_str),
+            Some("exec@example.com")
+        );
+        assert_eq!(
+            envs.get("GIT_COMMITTER_NAME").map(String::as_str),
+            Some("Exec Test")
+        );
+        assert_eq!(
+            envs.get("GIT_AUTHOR_NAME").map(String::as_str),
+            Some("caller-wins"),
+            "caller env wins over injected identity"
+        );
+
+        let no_cwd = build_command_with_captured(&args, None, &BTreeMap::new());
+        assert!(
+            !cmd_envs(&no_cwd).contains_key("GIT_AUTHOR_EMAIL"),
+            "no cwd must inject no identity vars"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
