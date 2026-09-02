@@ -59,6 +59,10 @@ If GitHub auth is not configured, `gh` commands fail until `gh auth login` runs 
 
 **CRITICAL**: "Add to the spec" means `ws.note.add`, not `ws.note.setContent` (which replaces everything).
 
+## Show media
+
+Chat and notes accept `![alt](intent://local/file/<workspace-relative-path>)` for png, jpg, gif, webp, mp4, and webm files; SVG does not render. For generated media, call `ws.note.saveAsset({ data, mimeType, originalName? })` and embed the returned `url`. Use `ws.workspace.setStatusImage` for the workspace card screenshot.
+
 ## Raising Attention
 
 If you cannot proceed with your assignment, raise attention explicitly instead of burying it in transcript prose — in both cases BEFORE ending your turn:

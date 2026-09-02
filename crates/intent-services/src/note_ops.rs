@@ -1586,6 +1586,8 @@ pub(crate) fn extension_from_mime(mime_type: &str) -> &'static str {
         "image/svg+xml" => ".svg",
         "image/bmp" => ".bmp",
         "image/tiff" => ".tiff",
+        "video/mp4" => ".mp4",
+        "video/webm" => ".webm",
         _ => ".png",
     }
 }
@@ -1650,6 +1652,8 @@ pub(crate) fn mime_from_extension(asset_id: &str) -> String {
         "svg" => "image/svg+xml",
         "bmp" => "image/bmp",
         "tiff" => "image/tiff",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
         _ => "image/png",
     }
     .to_string()
@@ -2407,6 +2411,10 @@ mod tests {
     fn save_asset_helpers() {
         assert_eq!(extension_from_mime("image/jpeg"), ".jpg");
         assert_eq!(extension_from_mime("image/webp"), ".webp");
+        assert_eq!(extension_from_mime("video/mp4"), ".mp4");
+        assert_eq!(extension_from_mime("video/webm"), ".webm");
+        assert_eq!(mime_from_extension("clip.mp4"), "video/mp4");
+        assert_eq!(mime_from_extension("clip.webm"), "video/webm");
         assert_eq!(extension_from_mime("application/pdf"), ".png");
 
         assert_eq!(strip_data_url_prefix("data:image/png;base64,AAAA"), "AAAA");
