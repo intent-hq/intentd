@@ -425,6 +425,48 @@ async fn blank_settings_default_effort_leaves_the_session_unset() {
     assert_eq!(effort_of(&svc, id).await, None);
 }
 
+/// The model-option effort rung matches on the effective `{ provider, model }`
+/// pair: two options sharing a bare model id under different providers apply
+/// their own efforts, keyed by the provider the delegate actually resolves.
+#[tokio::test]
+async fn delegate_model_option_effort_matches_the_effective_provider() {
+    let (_t, svc, ws, spec_dir, _cfg) = setup().await;
+    seed_catalog(&svc);
+    set(&svc, "model.default", json!("fable-5"));
+    let _env = mock_provider_env();
+    write_specialist(
+        spec_dir.path(),
+        "paired",
+        "modelOptions:\n\
+         \x20 - provider: \"other\"\n\
+         \x20   model: \"fable-5\"\n\
+         \x20   reasoningEffort: \"high\"\n\
+         \x20 - provider: \"mock\"\n\
+         \x20   model: \"fable-5\"\n\
+         \x20   reasoningEffort: \"low\"\n",
+    );
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("paired".into()),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let id = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert_eq!(
+        effort_of(&svc, id).await.as_deref(),
+        Some("low"),
+        "the option pinned to the effective provider wins over one sharing the bare model id"
+    );
+}
+
 /// The settings rung also applies through `agent.delegate` (which routes into
 /// `agent_create_op`) when neither the caller nor a specialist decided it.
 #[tokio::test]

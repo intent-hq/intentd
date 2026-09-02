@@ -3595,6 +3595,98 @@ mod tests {
     }
 
     #[test]
+    fn legacy_compound_model_scalar_splits_on_read() {
+        // Lenient read normalization: a pre-triple on-disk file with a
+        // compound `model` scalar reads as the bare model plus `codingAgent`
+        // set to the prefix — the prefix WINS over a `codingAgent` the same
+        // file declares (preserving the spawn precedence compound ids had).
+        let content = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opencode:kimi-k3\"\ncodingAgent: \"claude\"\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["model"], "kimi-k3", "bare model after the split");
+        assert_eq!(
+            def["codingAgent"], "opencode",
+            "the model prefix outranks the file's own codingAgent"
+        );
+        // Without a codingAgent of its own the prefix still lands there.
+        let content = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opencode:kimi-k3\"\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["model"], "kimi-k3");
+        assert_eq!(def["codingAgent"], "opencode");
+        // A bare model is untouched and the declared codingAgent stands.
+        let content = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"kimi-k3\"\ncodingAgent: \"claude\"\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["model"], "kimi-k3");
+        assert_eq!(def["codingAgent"], "claude");
+        // An unusable compound (empty prefix or rest) reads as omitted.
+        for bad in ["\":kimi-k3\"", "\"opencode:\"", "\" : \""] {
+            let content = format!("---\nname: \"Z\"\ndescription: \"d\"\nmodel: {bad}\n---\n\nbody");
+            let def = build_def("z", &content, "user", Path::new("/tmp/z.md"));
+            assert!(
+                def.get("model").is_none(),
+                "unusable compound {bad} reads as an omitted key"
+            );
+        }
+        // Omitted-after-split behaves like any omitted key: it inherits.
+        let bundled =
+            "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opus4.5\"\n---\n\nbody";
+        let base = build_def("z", bundled, "bundled", Path::new("/tmp/z.md"));
+        let user_file = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \":broken\"\n---\n\nbody";
+        let folded =
+            build_def_inheriting("z", user_file, "user", Path::new("/tmp/z.md"), Some(&base));
+        assert_eq!(
+            folded["model"], "opus4.5",
+            "an unusable compound inherits the lower tier's model"
+        );
+    }
+
+    #[test]
+    fn model_option_effort_matches_on_the_provider_model_pair() {
+        // Pair matching (PROTOCOL §5.11): two options sharing a bare model id
+        // under different providers resolve their own efforts; a
+        // provider-less option matches any provider; a provider mismatch on
+        // every candidate resolves nothing.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        user.write(
+            "chooser",
+            "---\nname: \"Chooser\"\ndescription: \"d\"\nmodelOptions: [\
+             {\"provider\":\"opencode\",\"model\":\"kimi-k3\",\"hint\":\"\",\"reasoningEffort\":\"low\"},\
+             {\"provider\":\"auggie\",\"model\":\"kimi-k3\",\"hint\":\"\",\"reasoningEffort\":\"high\"},\
+             {\"model\":\"opus4.5\",\"hint\":\"\",\"reasoningEffort\":\"medium\"}]\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("opencode"), "kimi-k3"),
+            Some("low".to_string())
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("auggie"), "kimi-k3"),
+            Some("high".to_string()),
+            "the same bare model resolves per provider"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("grok"), "kimi-k3"),
+            None,
+            "a provider matching no candidate resolves nothing"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, None, "kimi-k3"),
+            None,
+            "an unknown effective provider never matches a provider-pinned option"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("grok"), "opus4.5"),
+            Some("medium".to_string()),
+            "a provider-less option matches any provider"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, None, "opus4.5"),
+            Some("medium".to_string()),
+            "a provider-less option matches an unknown provider too"
+        );
+    }
+
+    #[test]
     fn role_icon_and_team_agents_round_trip_losslessly() {
         // The picker-metadata fields write as frontmatter (role/icon as
         // quoted scalars, teamAgents as a single-line JSON-array scalar) and
