@@ -1007,6 +1007,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_compound_model_default_loads_as_the_split_triple() {
+        // A user-authored config predating the bare-id contract carries a
+        // compound `model.default`; the registry surfaces the split triple —
+        // the effective state is identical to the split form and the on-disk
+        // file is untouched.
+        let legacy = "[model]\ndefault = \"codex:gpt-5\"\n";
+        let (_dir, path) = temp_config(Some(legacy));
+        let reg = SettingsRegistry::load(&path).expect("load legacy config");
+        assert_eq!(reg.get("model.default"), Some(json!("gpt-5")));
+        assert_eq!(reg.get("model.defaultProvider"), Some(json!("codex")));
+
+        let (_dir2, path2) = temp_config(Some(
+            "[model]\ndefault = \"gpt-5\"\ndefaultProvider = \"codex\"\n",
+        ));
+        let split = SettingsRegistry::load(&path2).expect("load split config");
+        assert_eq!(
+            reg.snapshot().effective,
+            split.snapshot().effective,
+            "legacy and split forms must produce identical effective settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            legacy,
+            "normalization never rewrites the user's file"
+        );
+
+        // reload() (live-reload watcher path) normalizes the same way.
+        reg.reload("[model]\ndefault = \"auggie:sonnet4.5\"\n")
+            .expect("reload");
+        assert_eq!(reg.get("model.default"), Some(json!("sonnet4.5")));
+        assert_eq!(reg.get("model.defaultProvider"), Some(json!("auggie")));
+    }
+
+    #[test]
     fn apply_preserves_comments_and_untouched_keys() {
         let seed = "# top comment\n\n[git]\n# keep me\nautoCommit = true\n\n[rtk]\n# rtk stays off\nenabled = false\n";
         let (_dir, path) = temp_config(Some(seed));

@@ -59,19 +59,24 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
 /// opaque per-provider snapshot cache (restored into the two keys above on a
 /// provider switch), not an additional precedence tier.
 ///
-/// The result is provider-guarded and returned BARE — the settings value is
-/// user-authored and easily outlives a provider switch, so the CLI must never
-/// be fed a foreign model id. A legacy compound `{provider}:{model}` value
-/// (colon-bearing, pre-wire-rejection) is dropped with a warn log — settings
-/// values are bare ids now. A bare id reuses `agent.create`'s asymmetric
-/// cached-catalog evidence rule ([`ensure_bare_model_matches_provider`]): it is
-/// dropped only when the effective provider's own cached catalog affirmatively
-/// disproves ownership, so a cold start still passes it through.
+/// The result is a `(provider, bare model)` pair — quick-action settings
+/// resolve the same way as the default-model triple. A bare value pairs with
+/// the effective provider; a legacy compound `{provider}:{model}` value
+/// (pre-wire-rejection, user-authored TOML is never rejected) splits on read:
+/// the prefix names the provider to run on when it is registered, the
+/// remainder is the bare model. Either shape is provider-guarded — the CLI
+/// must never be fed a foreign model id — via `agent.create`'s asymmetric
+/// cached-catalog evidence rule ([`ensure_bare_model_matches_provider`]): the
+/// model is dropped only when the paired provider's own cached catalog
+/// affirmatively disproves ownership, so a cold start still passes it
+/// through. An unregistered compound prefix or a blank half drops the rung
+/// with a warn log.
 ///
 /// Every drop is PER RUNG and falls to the next one rather than erroring or
 /// skipping the chain: a dropped type override still tries
-/// `quickActions.defaultModel`, and only when every rung drops does the CLI
-/// default apply — a `-32602` here would reject a model the caller never sent.
+/// `quickActions.defaultModel`, and only when every rung drops does the
+/// effective provider's CLI default apply — a `-32602` here would reject a
+/// model the caller never sent.
 ///
 /// This chain is scoped to one-shot quick actions only — agent sessions,
 /// delegated ones included, keep the background-agnostic creation-time chain
@@ -81,30 +86,39 @@ fn resolve_quick_action_model(
     catalog: &crate::model_catalog::ModelCatalogCache,
     quick_action_type: Option<&str>,
     effective_provider: &str,
-) -> Option<String> {
+) -> (String, Option<String>) {
     let quick = &settings.quick_actions;
-    let vet = |configured: &str| -> Option<String> {
-        let owned_bare = if configured.contains(':') {
-            None
-        } else {
+    let vet = |configured: &str| -> Option<(String, String)> {
+        // Split a legacy compound value into its (provider, model) pair; a
+        // bare value pairs with the effective provider.
+        let pair = match configured.split_once(':') {
+            Some((prefix, bare)) => {
+                let bare = bare.trim();
+                let provider = intent_providers::find_provider(prefix.trim())
+                    .map(|p| p.id.to_string())
+                    .filter(|_| !bare.is_empty());
+                provider.map(|p| (p, bare.to_string()))
+            }
+            None => Some((effective_provider.to_string(), configured.to_string())),
+        };
+        let owned = pair.filter(|(provider, bare)| {
             crate::agent_ops::ensure_bare_model_matches_provider(
                 "agent.completeOnce",
                 catalog,
-                effective_provider,
-                configured,
+                provider,
+                bare,
             )
-            .ok()
-            .map(|()| configured.to_string())
-        };
-        if owned_bare.is_none() {
+            .is_ok()
+        });
+        if owned.is_none() {
             tracing::warn!(
                 model = configured,
                 provider = effective_provider,
-                "configured quick-action model does not belong to the effective \
-                 provider; falling back to the next rung"
+                "configured quick-action model does not resolve to a (provider, \
+                 model) pair; falling back to the next rung"
             );
         }
-        owned_bare
+        owned
     };
     quick_action_type
         .map(str::trim)
@@ -122,6 +136,10 @@ fn resolve_quick_action_model(
                 .filter(|m| !m.is_empty())
                 .and_then(vet)
         })
+        .map_or_else(
+            || (effective_provider.to_string(), None),
+            |(provider, model)| (provider, Some(model)),
+        )
 }
 
 /// Pick the one-shot launch for `provider`, mirroring the model probe's
@@ -212,7 +230,9 @@ impl Services {
     /// settings itself ([`resolve_quick_action_model`], monorepo#1734) so any
     /// client — not just the FE — gets `quickActions.typeOverrides[type]` /
     /// `quickActions.defaultModel` for free; `quick_action_type` is the
-    /// caller's optional `type` hint keying the override map.
+    /// caller's optional `type` hint keying the override map. The chain
+    /// resolves to a `(provider, model)` pair, so a legacy compound value
+    /// naming another registered provider routes the one-shot there.
     pub(crate) async fn agent_complete_once_op(
         &self,
         prompt: String,
@@ -233,10 +253,12 @@ impl Services {
             }
         };
 
-        // An explicit client model always wins; only a caller that sent none
-        // falls through to the quick-action settings chain.
-        let model = match model.filter(|m| !m.trim().is_empty()) {
-            Some(m) => Some(m),
+        // An explicit client model always wins (it runs on the effective
+        // provider); only a caller that sent none falls through to the
+        // quick-action settings chain, whose result is a (provider, model)
+        // pair.
+        let (run_provider, model) = match model.filter(|m| !m.trim().is_empty()) {
+            Some(m) => (effective_provider.clone(), Some(m)),
             None => resolve_quick_action_model(
                 &settings,
                 &self.models_catalog,
@@ -265,15 +287,9 @@ impl Services {
         };
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
-        if effective_provider != "auggie" {
+        if run_provider != "auggie" {
             return self
-                .complete_once_via_acp(
-                    &effective_provider,
-                    &full_prompt,
-                    model.as_deref(),
-                    cwd,
-                    timeout,
-                )
+                .complete_once_via_acp(&run_provider, &full_prompt, model.as_deref(), cwd, timeout)
                 .await;
         }
 
@@ -933,34 +949,46 @@ rl.on('line', (line) => {
         crate::model_catalog::ModelCatalogCache::new(None)
     }
 
+    /// The expected pair for a rung that resolved on the effective provider.
+    fn on(provider: &str, model: &str) -> (String, Option<String>) {
+        (provider.to_string(), Some(model.to_string()))
+    }
+
+    /// The expected pair for a chain that fell through entirely: the
+    /// effective provider with its CLI default.
+    fn cli_default(provider: &str) -> (String, Option<String>) {
+        (provider.to_string(), None)
+    }
+
     #[test]
     fn quick_action_model_precedence() {
         // typeOverrides[type] outranks defaultModel; an absent/blank override
         // (and an unknown type key) falls through to the default; nothing
-        // configured resolves to the CLI default.
+        // configured resolves to the CLI default. Bare values pair with the
+        // effective provider.
         let catalog = empty_catalog();
         let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "haiku4.5")]);
         assert_eq!(
             resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
-            Some("haiku4.5".to_string())
+            on("auggie", "haiku4.5")
         );
         assert_eq!(
             resolve_quick_action_model(&settings, &catalog, Some("pr"), "auggie"),
-            Some("sonnet4.5".to_string())
+            on("auggie", "sonnet4.5")
         );
         assert_eq!(
             resolve_quick_action_model(&settings, &catalog, Some("not-a-type"), "auggie"),
-            Some("sonnet4.5".to_string())
+            on("auggie", "sonnet4.5")
         );
         assert_eq!(
             resolve_quick_action_model(&settings, &catalog, None, "auggie"),
-            Some("sonnet4.5".to_string())
+            on("auggie", "sonnet4.5")
         );
 
         let blank = quick_action_settings(Some("  "), &[("commit", "")]);
         assert_eq!(
             resolve_quick_action_model(&blank, &catalog, Some("commit"), "auggie"),
-            None,
+            cli_default("auggie"),
             "blank values read as unset, not as an empty model id"
         );
         assert_eq!(
@@ -970,27 +998,39 @@ rl.on('line', (line) => {
                 Some("commit"),
                 "auggie"
             ),
-            None
+            cli_default("auggie")
         );
     }
 
     #[test]
-    fn quick_action_model_drops_legacy_compound_values() {
-        // Settings values are bare model ids now: ANY colon-bearing legacy
-        // compound value — owned, foreign, or malformed alike — is dropped
-        // with a warn log rather than fed to the CLI.
+    fn quick_action_compound_value_resolves_to_its_own_pair() {
+        // A legacy compound value splits on read into a (provider, model)
+        // pair: a registered prefix routes the one-shot to that provider —
+        // even a foreign one — instead of being dropped.
         let catalog = empty_catalog();
-        for legacy in [
-            "auggie:sonnet4.5",
-            "codex:gpt-5",
-            ":sonnet4.5",
-            "not-a-provider:sonnet4.5",
-            "auggie:",
-        ] {
+        let settings = quick_action_settings(Some("auggie:sonnet4.5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+            on("auggie", "sonnet4.5")
+        );
+        let settings = quick_action_settings(Some("codex:gpt-5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+            on("codex", "gpt-5"),
+            "a foreign registered prefix routes the one-shot to that provider"
+        );
+    }
+
+    #[test]
+    fn quick_action_malformed_compound_values_drop_the_rung() {
+        // An unregistered prefix or a blank half cannot form a pair; the
+        // rung drops with a warn log and the chain falls through.
+        let catalog = empty_catalog();
+        for legacy in [":sonnet4.5", "not-a-provider:sonnet4.5", "auggie:"] {
             let settings = quick_action_settings(Some(legacy), &[]);
             assert_eq!(
                 resolve_quick_action_model(&settings, &catalog, None, "auggie"),
-                None,
+                cli_default("auggie"),
                 "{legacy} must fall through to the CLI default"
             );
         }
@@ -998,22 +1038,24 @@ rl.on('line', (line) => {
 
     #[test]
     fn quick_action_dropped_override_falls_to_default_model() {
-        // A drop is per rung: a legacy compound type override still falls
-        // through to a valid quickActions.defaultModel — the documented
-        // override → default → CLI-default chain — rather than skipping
-        // straight to the CLI default.
+        // A drop is per rung: a malformed type override still falls through
+        // to a valid quickActions.defaultModel — the documented override →
+        // default → CLI-default chain — rather than skipping straight to the
+        // CLI default.
         let catalog = empty_catalog();
-        let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "auggie:haiku")]);
+        let settings =
+            quick_action_settings(Some("sonnet4.5"), &[("commit", "not-a-provider:haiku")]);
         assert_eq!(
             resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
-            Some("sonnet4.5".to_string()),
+            on("auggie", "sonnet4.5"),
             "a dropped override must fall to the default-model rung"
         );
-        // Both rungs compound ⇒ CLI default.
-        let settings = quick_action_settings(Some("codex:gpt-5"), &[("commit", "auggie:haiku")]);
+        // Both rungs malformed ⇒ CLI default.
+        let settings =
+            quick_action_settings(Some("bogus:gpt-5"), &[("commit", "not-a-provider:haiku")]);
         assert_eq!(
             resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
-            None
+            cli_default("auggie")
         );
     }
 
@@ -1026,7 +1068,7 @@ rl.on('line', (line) => {
         let settings = quick_action_settings(Some("grok-4"), &[]);
         assert_eq!(
             resolve_quick_action_model(&settings, &empty_catalog(), None, "auggie"),
-            Some("grok-4".to_string()),
+            on("auggie", "grok-4"),
             "no cached evidence must not drop a bare id"
         );
 
@@ -1044,13 +1086,21 @@ rl.on('line', (line) => {
         );
         assert_eq!(
             resolve_quick_action_model(&settings, &catalog, None, "auggie"),
-            None,
+            cli_default("auggie"),
             "a bare id the effective provider's catalog disproves is dropped"
         );
         let owned = quick_action_settings(Some("sonnet4.5"), &[]);
         assert_eq!(
             resolve_quick_action_model(&owned, &catalog, None, "auggie"),
-            Some("sonnet4.5".to_string())
+            on("auggie", "sonnet4.5")
+        );
+        // The ownership guard applies to a compound rung's own pair too: a
+        // split pair whose provider's catalog disproves the model drops.
+        let foreign = quick_action_settings(Some("grok:sonnet4.5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&foreign, &catalog, None, "auggie"),
+            cli_default("auggie"),
+            "a split pair failing its own provider's ownership guard drops"
         );
     }
 
