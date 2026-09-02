@@ -4843,7 +4843,10 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
 
 /// Task C boundary: a NON-transient error (a terminal 4xx) is NOT enrolled even
 /// when a suspend overlapped — the classifier rejects it, so the turn surfaces
-/// terminally with `agent:failed` and no `interrupted_agent` row.
+/// terminally with `agent:failed` and no `interrupted_agent` row. (A 404, not
+/// a 401: an auth-flavored 4xx now takes the auth-required mapping instead of
+/// the ordinary wrapper — pinned separately by
+/// `map_acp_session_error_maps_auth_and_demotes_verdict`.)
 #[tokio::test]
 async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
@@ -4851,7 +4854,7 @@ async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
         Duration::from_secs(120),
     ))));
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(Vec::new(), "HTTP 401 Unauthorized");
+        connect_with_prompt_rpc_error(Vec::new(), "HTTP 404 Not Found");
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
@@ -8446,4 +8449,167 @@ async fn resolve_session_is_orchestrator_project_tier_via_repository_path() {
             .await,
         "project-tier orchestrator must resolve via repositoryPath fallback"
     );
+}
+
+/// Classification pin for [`super::is_acp_auth_required`]: the dedicated
+/// `Auth` variant and RPC errors matching the shared auth-required matcher
+/// (401 code or auth-flavored message, e.g. claude-code's `-32000
+/// "Authentication required"`, intent-hq/intent#3178) are auth-required;
+/// other RPC errors and transport failures are not.
+#[test]
+fn is_acp_auth_required_classifies_variants() {
+    use intent_acp::{AcpError, JsonRpcError};
+    let rpc = |code: i64, message: &str| {
+        AcpError::Rpc(JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        })
+    };
+    assert!(super::is_acp_auth_required(&AcpError::Auth(
+        "login required".into()
+    )));
+    assert!(super::is_acp_auth_required(&rpc(
+        -32000,
+        "Authentication required"
+    )));
+    assert!(super::is_acp_auth_required(&rpc(401, "nope")));
+    assert!(!super::is_acp_auth_required(&rpc(-32603, "internal error")));
+    assert!(!super::is_acp_auth_required(&AcpError::Transport(
+        "pipe closed".into()
+    )));
+}
+
+/// [`super::map_acp_session_error`] (intent-hq/intent#3941): an
+/// auth-required ACP failure maps to the same actionable
+/// `Error::InvalidParams` login message the create/delegate gate emits AND
+/// demotes the provider's cached auth verdict to a hard `false`; any other
+/// failure keeps the opaque `Error::Internal("{context} failed: {e}")`
+/// shape and leaves the cache alone.
+#[test]
+fn map_acp_session_error_maps_auth_and_demotes_verdict() {
+    use intent_acp::{AcpError, JsonRpcError};
+    use intent_core::Error;
+    // "pi" is a probe provider no other test seeds, so the demotion is
+    // observable without racing parallel gate tests (which use "mock").
+    crate::provider_auth::seed_auth_verdict_for_tests("pi", None);
+
+    let err = super::map_acp_session_error(
+        "session/new",
+        &AcpError::Rpc(JsonRpcError {
+            code: -32000,
+            message: "Authentication required".into(),
+            data: None,
+        }),
+        "pi",
+    );
+    match err {
+        Error::InvalidParams(msg) => {
+            assert!(msg.starts_with("session/new: "), "{msg}");
+            assert!(
+                msg.contains(&crate::provider_auth::not_authenticated_message("pi")),
+                "{msg}"
+            );
+        }
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+    assert_eq!(
+        crate::provider_auth::cached_auth_verdict("pi"),
+        Some(false),
+        "auth-required failure must demote the cached verdict"
+    );
+    crate::provider_auth::seed_auth_verdict_for_tests("pi", None);
+
+    let err = super::map_acp_session_error(
+        "session/prompt",
+        &AcpError::Transport("pipe closed".into()),
+        "pi",
+    );
+    match err {
+        Error::Internal(msg) => {
+            assert!(msg.starts_with("session/prompt failed:"), "{msg}");
+        }
+        other => panic!("expected Internal, got {other:?}"),
+    }
+    assert_eq!(
+        crate::provider_auth::cached_auth_verdict("pi"),
+        None,
+        "non-auth failure must not touch the cached verdict"
+    );
+}
+
+/// The auth-mapped `session/prompt` failure is recognized by the turn
+/// worker's dedupe classifier so the terminal `agent:failed` +
+/// `agent:stream:end` pair is emitted exactly once (PR #1650 review): the
+/// composed message (`"session/prompt: "` + the shared login message) must
+/// start with `PROMPT_AUTH_REQUIRED_PREFIX` for every provider the runtime
+/// can demote, and only that `InvalidParams` shape classifies.
+#[test]
+fn prompt_auth_required_turn_error_matches_mapped_shape() {
+    use intent_core::Error;
+    for id in ["auggie", "claude-code", "codex", "opencode", "droid", "pi"] {
+        let msg = format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message(id)
+        );
+        assert!(
+            msg.starts_with(super::PROMPT_AUTH_REQUIRED_PREFIX),
+            "{id}: {msg}"
+        );
+        assert!(
+            super::prompt_auth_required_turn_error(&Error::InvalidParams(msg)),
+            "{id}"
+        );
+    }
+    // Other InvalidParams shapes, mid-string mentions, and Internal errors
+    // never classify — they still need the worker-emitted event pair.
+    for err in [
+        Error::InvalidParams("agent.create: provider \"pi\" is not authenticated".into()),
+        Error::InvalidParams(format!(
+            "bad params: {}session/prompt: provider \"pi\"",
+            "prefix "
+        )),
+        Error::Internal(format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message("pi")
+        )),
+    ] {
+        assert!(!super::prompt_auth_required_turn_error(&err), "{err:?}");
+    }
+}
+
+/// The auth-required `session/load` mapping is recognized by
+/// `load_auth_required_error` so `AgentManager::start_session` propagates the
+/// actionable login error instead of falling through to recreate (PR #1650
+/// review): the composed message (`"session/load: "` + the shared login
+/// message) must start with `LOAD_AUTH_REQUIRED_PREFIX` for every demotable
+/// provider, and only that `InvalidParams` shape classifies.
+#[test]
+fn load_auth_required_error_matches_mapped_shape() {
+    use intent_core::Error;
+    for id in ["auggie", "claude-code", "codex", "opencode", "droid", "pi"] {
+        let msg = format!(
+            "session/load: {}",
+            crate::provider_auth::not_authenticated_message(id)
+        );
+        assert!(
+            msg.starts_with(super::LOAD_AUTH_REQUIRED_PREFIX),
+            "{id}: {msg}"
+        );
+        assert!(
+            super::load_auth_required_error(&Error::InvalidParams(msg)),
+            "{id}"
+        );
+    }
+    // Ordinary load failures (the Internal wrapper) and other InvalidParams
+    // shapes never classify — start_session still falls through to recreate.
+    for err in [
+        Error::Internal("session/load failed: transport closed".into()),
+        Error::InvalidParams(format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message("pi")
+        )),
+    ] {
+        assert!(!super::load_auth_required_error(&err), "{err:?}");
+    }
 }

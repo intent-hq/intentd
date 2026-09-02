@@ -3216,6 +3216,14 @@ impl AgentManager {
                 return Ok(opened.session_id);
             }
             Ok(None) => {}
+            // Auth-required resume failure (intent-hq/intent#3941): the
+            // provider said it is not logged in — propagate the actionable
+            // login error instead of recreating. For claude-code the
+            // recreate's `session/new` can succeed while logged out, which
+            // would defer the failure to an opaque first-prompt error.
+            Err(e) if crate::agent_session::load_auth_required_error(&e) => {
+                return Err(e);
+            }
             // `session/load` was attempted but failed → fall through to recreate.
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "session/load failed; recreating");
@@ -11195,16 +11203,20 @@ fn stderr_settle_timeout() -> Duration {
 
 /// Whether `run_prompt_turn` already emitted the terminal `agent:failed` +
 /// `agent:stream:end` pair for this error. Its post-prompt failure path wraps
-/// every prompt error as `Internal("session/prompt failed: …")` AFTER emitting
-/// both events; errors WITHOUT that prefix (e.g. the transcript-append store
+/// every prompt error as `Internal("session/prompt failed: …")` — or, for an
+/// auth-required failure (intent-hq/intent#3941), as the actionable
+/// `InvalidParams` mapping recognized by
+/// [`crate::agent_session::prompt_auth_required_turn_error`] — AFTER emitting
+/// both events; errors WITHOUT either shape (e.g. the transcript-append store
 /// error, which propagates via `?` before the emits, or a pre-output
 /// transport failure — see [`pre_output_transport_failure`] — whose emits are
 /// deliberately suppressed for a possible silent redrive) still need the
-/// events. Prefix-anchored on the structured `Error::Internal` payload so an
-/// unrelated error that merely mentions the phrase mid-string cannot
-/// suppress the terminal events.
+/// events. Prefix-anchored on the structured payloads so an unrelated error
+/// that merely mentions the phrases mid-string cannot suppress the terminal
+/// events.
 fn turn_failure_events_already_emitted(err: &Error) -> bool {
     matches!(err, Error::Internal(msg) if msg.starts_with(PROMPT_FAILED_PREFIX))
+        || crate::agent_session::prompt_auth_required_turn_error(err)
 }
 
 /// Whether a `run_turn` error carries the pre-output transport marker from
@@ -14286,6 +14298,25 @@ mod turn_failure_tests {
             "session/prompt failed: transport closed: writer task closed".to_string(),
         );
         assert!(turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
+    fn auth_mapped_prompt_failure_means_events_already_emitted() {
+        // The auth-required mapping (intent-hq/intent#3941) also emits the
+        // terminal pair before returning its actionable InvalidParams shape —
+        // the worker must not emit a second pair. Other InvalidParams (e.g.
+        // the create/delegate gate's, prefixed by its own method name) still
+        // need the events.
+        let err = Error::InvalidParams(format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message("claude-code")
+        ));
+        assert!(turn_failure_events_already_emitted(&err));
+        let err = Error::InvalidParams(format!(
+            "agent.create: {}",
+            crate::provider_auth::not_authenticated_message("claude-code")
+        ));
+        assert!(!turn_failure_events_already_emitted(&err));
     }
 
     #[test]

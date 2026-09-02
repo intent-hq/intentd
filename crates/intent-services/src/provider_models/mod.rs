@@ -48,7 +48,7 @@ use serde_json::Value;
 mod parse;
 mod probe;
 
-pub(crate) use parse::{gguf_bytes_fit_within_ram, is_default_pseudo_row};
+pub(crate) use parse::{gguf_bytes_fit_within_ram, is_auth_required_error, is_default_pseudo_row};
 use probe::{run_acp_probe, AcpProbeCommand, ProbeError};
 
 /// Timeout for the one-shot `opencode models` CLI invocation.
