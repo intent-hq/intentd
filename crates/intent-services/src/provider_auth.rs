@@ -480,6 +480,17 @@ impl AuthStatusCache {
         self.store(provider_id, Some(false));
     }
 
+    /// Harden the provider's verdict to `Some(true)` after the runtime
+    /// observed an authoritative end-to-end success (a live test prompt
+    /// answered). Bumps the same counter as [`AuthStatusCache::demote`] so a
+    /// probe already in flight discards its (older) outcome instead of
+    /// overwriting this one; lock order: demotions → entries.
+    fn promote(&self, provider_id: &'static str) {
+        let mut demotions = self.demotions.lock().expect("auth demotions poisoned");
+        *demotions.entry(provider_id).or_insert(0) += 1;
+        self.store(provider_id, Some(true));
+    }
+
     fn join_inflight(&self, provider_id: &'static str) -> Arc<OnceCell<Option<bool>>> {
         self.inflight
             .lock()
@@ -563,6 +574,18 @@ pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
 /// overwrite this authoritative `false`.
 pub(crate) fn demote_auth_verdict(provider_id: &str) {
     cache().demote(auth_cache_key(provider_id));
+}
+
+/// Promote one provider's cached auth verdict to a hard `true` after the
+/// runtime observed an authoritative end-to-end success — a live test prompt
+/// (`host.providerTestPrompt`) got a real answer from the adapter, which is
+/// stronger evidence than any local probe. Legacy alias ids promote the
+/// catalog fallback provider they actually spawn ([`auth_cache_key`]), and
+/// the promotion supersedes any probe already in flight
+/// ([`AuthStatusCache::promote`]) so a stale probe outcome cannot overwrite
+/// this authoritative `true`.
+pub(crate) fn promote_auth_verdict(provider_id: &str) {
+    cache().promote(auth_cache_key(provider_id));
 }
 
 /// Test seam: plant a verdict in the process-wide auth cache so gate tests
@@ -1073,6 +1096,24 @@ mod tests {
         let epoch = cache().demotion_epoch("pi");
         cache().store_probe("pi", Some(true), epoch);
         assert_eq!(cached_auth_verdict("pi"), Some(true));
+
+        cache().store("pi", prior.flatten());
+    }
+
+    /// A live test-prompt success hardens the verdict to `true` under the
+    /// same canonical key as demotion, and its epoch bump supersedes a probe
+    /// already in flight — the mirror image of the demotion test above.
+    #[test]
+    fn promote_auth_verdict_hardens_verdict_and_supersedes_inflight_probe() {
+        // "pi" for parallel-test hygiene — see the demotion test above.
+        let prior = cache().fresh("pi");
+
+        let epoch = cache().demotion_epoch("pi");
+        promote_auth_verdict("pi");
+        assert_eq!(cached_auth_verdict("pi"), Some(true));
+        // The stale probe (epoch captured before the promotion) is dropped.
+        cache().store_probe("pi", Some(false), epoch);
+        assert_eq!(cached_auth_verdict("pi"), Some(true), "stale probe stored");
 
         cache().store("pi", prior.flatten());
     }

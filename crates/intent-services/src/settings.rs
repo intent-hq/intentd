@@ -61,6 +61,14 @@ pub(crate) const RETIRED_BACKGROUND_AGENT_PATHS: &[&str] = &[
     "backgroundAgents.providerSettings",
 ];
 
+/// The deprecated legacy default-provider path. Unlike the retired paths
+/// above it keeps a (read-only) catalog entry during the deprecation window,
+/// so `settings.get`/`settings.list` stay answerable — but writes via
+/// `settings.update` are tolerated-and-ignored so a client can never recreate
+/// the key after [`migrate_active_provider_setting`] removed it from
+/// `config.toml`.
+pub(crate) const DEPRECATED_ACTIVE_PROVIDER_PATH: &str = "providers.active";
+
 /// Settings path of the user-editable transcription vocabulary (§5.12).
 pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
 
@@ -929,16 +937,23 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         None,
     );
     specialists_dir.read_only = true;
+    // Deprecated: kept in the catalog so `settings.get`/`settings.list` stay
+    // answerable during the deprecation window, but read-only so no write path
+    // can recreate the key after [`migrate_active_provider_setting`] removed
+    // it from config.toml (`settings.update` tolerates-and-ignores it before
+    // the read-only rejection would fire, so old clients never fail a batch).
+    let mut providers_active = string(
+        "providers.active",
+        "Active provider (deprecated)",
+        "Deprecated: superseded by model.defaultProvider (carried over and removed from \
+         config.toml once at startup; never consulted; read-only on the wire)",
+        "providers",
+        None,
+    );
+    providers_active.read_only = true;
     vec![
         // --- Group A: providers / agents -----------------------------------
-        string(
-            "providers.active",
-            "Active provider (deprecated)",
-            "Deprecated: superseded by model.defaultProvider (migrated once at startup, then \
-             never consulted); remove it from config.toml",
-            "providers",
-            None,
-        ),
+        providers_active,
         object(
             "providers.enabled",
             "Enabled providers",
@@ -1869,68 +1884,89 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
     Ok(())
 }
 
-/// One-time boot carry-over of the deprecated `providers.active` into
-/// `model.defaultProvider`, which superseded it as the default-provider key
-/// (provider resolution never consults `providers.active` anymore). Without
-/// this an upgraded installation whose config only carries the legacy key
-/// would derive NO default provider and get self-healed to a registry-order
-/// pick — silently switching the user's configured provider.
+/// One-time boot migration of the deprecated `providers.active` OUT of
+/// `config.toml`: when the file still carries the legacy key, its value is
+/// carried over into `model.defaultProvider` (which superseded it as the
+/// default-provider key; provider resolution never consults
+/// `providers.active` anymore) and the key is removed from the file with a
+/// comment-preserving rewrite. Without the carry-over an upgraded
+/// installation whose config only carries the legacy key would derive NO
+/// default provider and get self-healed to a registry-order pick — silently
+/// switching the user's configured provider.
 ///
 /// The value carries over only when it names a registered provider
 /// (whitespace-trimmed) AND `model.defaultProvider` is still unset — an
-/// already-set target is never clobbered, making the carry-over idempotent
-/// across boots. Independently of whether anything migrates, a set
-/// `providers.active` logs a deprecation WARN every boot until the user
-/// removes it from `config.toml`.
+/// already-set target always wins, and a blank or unregistered value is
+/// dropped with the key (nothing is invented). Either way the legacy key is
+/// removed and a one-time INFO log records what happened; a file without the
+/// key is never rewritten (the read path stays rewrite-free). Both writes go
+/// through [`SettingsRegistry::apply`] in one atomic batch, so the raw
+/// document, typed file, and effective snapshot stay in sync — origin
+/// tracking and `settings.reset` behave as if the key was never set.
 ///
 /// # Errors
 ///
-/// Never errors today: migration failures are logged and skipped. The `Result` keeps parity with the other startup migrations.
+/// Never errors today: migration failures are logged and skipped (the file
+/// stays intact, so the next boot retries). The `Result` keeps parity with
+/// the other startup migrations.
 pub fn migrate_active_provider_setting(registry: &SettingsRegistry) -> Result<()> {
     let Some(active) = registry
         .get("providers.active")
         .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
-        .filter(|v| !v.is_empty())
     else {
         return Ok(());
     };
-    tracing::warn!(
-        value = active,
-        "providers.active is deprecated and no longer consulted by provider \
-         resolution; remove it from config.toml (model.defaultProvider is the \
-         default-provider key now)"
-    );
     let target_set = registry
         .get("model.defaultProvider")
         .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
         .is_some_and(|v| !v.is_empty());
-    if target_set {
-        return Ok(());
+    let carried = if target_set || active.is_empty() {
+        None
+    } else {
+        intent_providers::find_provider(&active)
+            .map(|_| intent_providers::provider_config(&active).id)
+    };
+    let mut changes: Vec<(String, Value)> = Vec::with_capacity(2);
+    if let Some(canonical) = carried {
+        changes.push((
+            "model.defaultProvider".to_string(),
+            Value::String(canonical.to_string()),
+        ));
     }
-    if intent_providers::find_provider(&active).is_none() {
-        tracing::warn!(
-            value = active,
-            "providers.active names no registered provider; not carried over \
-             to model.defaultProvider"
-        );
-        return Ok(());
-    }
-    let canonical = intent_providers::provider_config(&active).id;
-    if let Err(e) = registry.apply(&[(
-        "model.defaultProvider".to_string(),
-        Value::String(canonical.to_string()),
-    )]) {
+    changes.push(("providers.active".to_string(), Value::Null));
+    if let Err(e) = registry.apply(&changes) {
         tracing::warn!(
             error = %e,
-            "failed to carry providers.active over to model.defaultProvider; \
+            "failed to migrate deprecated providers.active out of config.toml; \
              continuing (next boot retries)"
         );
         return Ok(());
     }
-    tracing::info!(
-        provider = canonical,
-        "migrated deprecated providers.active into model.defaultProvider"
-    );
+    if let Some(canonical) = carried {
+        tracing::info!(
+            provider = canonical,
+            "migrated deprecated providers.active into model.defaultProvider \
+             and removed it from config.toml"
+        );
+    } else if target_set {
+        tracing::info!(
+            value = active,
+            "removed deprecated providers.active from config.toml; the \
+             already-set model.defaultProvider wins"
+        );
+    } else if active.is_empty() {
+        tracing::info!(
+            "removed deprecated providers.active from config.toml; the value \
+             was blank, so nothing was carried over to model.defaultProvider"
+        );
+    } else {
+        tracing::info!(
+            value = active,
+            "removed deprecated providers.active from config.toml; the value \
+             names no registered provider, so nothing was carried over to \
+             model.defaultProvider"
+        );
+    }
     Ok(())
 }
 
@@ -2185,8 +2221,13 @@ impl<'a> SettingsService<'a> {
             // monorepo#1729 compatibility: pre-rename clients still write the
             // `backgroundAgents.*` paths. Same tolerate-and-ignore treatment —
             // the renamed `quickActions.*` keys are the only writable surface.
+            // The deprecated `providers.active` gets the same treatment so a
+            // write can never recreate the key `migrate_active_provider_setting`
+            // removed from config.toml (its catalog entry is read-only, but a
+            // hard rejection would fail whole batches from old clients).
             if path == RETIRED_WORKSPACE_OVERRIDES_PATH
                 || RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
+                || path == DEPRECATED_ACTIVE_PROVIDER_PATH
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
@@ -4244,18 +4285,35 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
     }
 
+    /// True when the TOML text still carries an `active` key line — matched
+    /// as a key assignment, not a bare substring, so fixture keys that merely
+    /// contain "active" (e.g. `interactive`) can never false-fail.
+    fn has_active_key(text: &str) -> bool {
+        text.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix("active")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+    }
+
     /// Upgrade path: a config that predates `model.defaultProvider` and only
     /// carries the deprecated `providers.active` has that value carried over
-    /// once at boot ([`migrate_active_provider_setting`]) — provider
-    /// resolution never consults the legacy key, so without the carry-over an
-    /// upgraded install would degrade to "no default" and get self-healed to
-    /// a registry-order pick (a silent provider switch).
+    /// once at boot ([`migrate_active_provider_setting`]) AND the legacy key
+    /// removed from config.toml — provider resolution never consults the
+    /// legacy key, so without the carry-over an upgraded install would
+    /// degrade to "no default" and get self-healed to a registry-order pick
+    /// (a silent provider switch). User comments survive the rewrite, and a
+    /// second boot from the migrated file is a byte-identical no-op.
     #[tokio::test]
-    async fn active_provider_migration_carries_legacy_value_over() {
+    async fn active_provider_migration_carries_legacy_value_over_and_removes_key() {
         let tag = uuid::Uuid::new_v4();
         let config_path = std::env::temp_dir().join(format!("intentd-settings-actmig-{tag}.toml"));
-        std::fs::write(&config_path, "[providers]\nactive = \" codex \"\n")
-            .expect("seed legacy config");
+        std::fs::write(
+            &config_path,
+            "# Operator note — must survive the migration rewrite.\n\
+             [providers]\nactive = \" codex \"\n\n[git]\nautoCommit = false\n",
+        )
+        .expect("seed legacy config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
 
         migrate_active_provider_setting(&registry).expect("migrate");
@@ -4264,27 +4322,52 @@ mod tests {
             Some(json!("codex")),
             "the trimmed legacy value must carry over"
         );
-
-        // Re-running (next boot) is a no-op: the target is set now.
-        registry
-            .apply(&[("model.defaultProvider".into(), json!("auggie"))])
-            .expect("user re-picks");
-        migrate_active_provider_setting(&registry).expect("migrate again");
         assert_eq!(
-            registry.get("model.defaultProvider"),
-            Some(json!("auggie")),
-            "an already-set target is never clobbered"
+            registry.origin("model.defaultProvider"),
+            Some(SettingOrigin::File),
+            "the carried-over value is persisted to the file layer"
         );
+        let text = std::fs::read_to_string(&config_path).expect("read migrated config");
+        assert!(
+            !has_active_key(&text),
+            "providers.active must be removed from the file: {text}"
+        );
+        assert!(
+            text.contains("defaultProvider = \"codex\""),
+            "the carried-over value must be written to the file: {text}"
+        );
+        assert!(
+            text.contains("# Operator note — must survive the migration rewrite."),
+            "user comments must survive the migration rewrite: {text}"
+        );
+        assert!(
+            text.contains("autoCommit = false"),
+            "untouched keys must survive the migration rewrite: {text}"
+        );
+
+        // Next boot from the migrated file: no key → no rewrite, byte-identical.
+        let registry2 = SettingsRegistry::load(&config_path).expect("reload registry");
+        migrate_active_provider_setting(&registry2).expect("migrate again");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("re-read config"),
+            text,
+            "a file without the legacy key is never rewritten"
+        );
+        assert_eq!(registry2.get("model.defaultProvider"), Some(json!("codex")));
 
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// The carry-over never clobbers an already-set `model.defaultProvider`,
-    /// and an unregistered legacy value is left where it is (WARN only) —
-    /// nothing is invented.
+    /// The migration removes `providers.active` from the file in every case,
+    /// but never clobbers an already-set `model.defaultProvider` and never
+    /// carries over an unregistered value — nothing is invented, and the
+    /// removed key stays gone across reloads (no resurrection via
+    /// `settings.reset`-style Null applies either).
     #[tokio::test]
-    async fn active_provider_migration_respects_target_and_registry() {
+    async fn active_provider_migration_removes_key_without_inventing_values() {
         let tag = uuid::Uuid::new_v4();
+
+        // Both keys set: the target wins; the legacy key is still removed.
         let config_path = std::env::temp_dir().join(format!("intentd-settings-actkeep-{tag}.toml"));
         std::fs::write(
             &config_path,
@@ -4298,8 +4381,31 @@ mod tests {
             Some(json!("claude-code")),
             "a set model.defaultProvider must win over the legacy key"
         );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            !has_active_key(&text),
+            "the legacy key is removed even when the target is set: {text}"
+        );
+        assert!(text.contains("defaultProvider = \"claude-code\""), "{text}");
+        // A fresh load of the rewritten file agrees: the key is gone for good.
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(
+            reloaded.origin("providers.active"),
+            Some(SettingOrigin::Default),
+            "the removed key must not resurrect on reload"
+        );
+        // settings.reset-style Null apply on the migrated key is a clean no-op
+        // (the doc no longer carries it), not a resurrection.
+        reloaded
+            .apply(&[("providers.active".into(), Value::Null)])
+            .expect("reset after migration");
+        assert_eq!(
+            reloaded.origin("providers.active"),
+            Some(SettingOrigin::Default)
+        );
         let _ = std::fs::remove_file(&config_path);
 
+        // Unregistered value: dropped with the key, nothing carried over.
         let config_path2 = std::env::temp_dir().join(format!("intentd-settings-actbad-{tag}.toml"));
         std::fs::write(&config_path2, "[providers]\nactive = \"not-a-provider\"\n")
             .expect("seed config");
@@ -4310,19 +4416,98 @@ mod tests {
             Some(SettingOrigin::Default),
             "an unregistered legacy value must not carry over"
         );
+        let text2 = std::fs::read_to_string(&config_path2).expect("read config");
+        assert!(
+            !has_active_key(&text2),
+            "an unregistered legacy value is still removed from the file: {text2}"
+        );
         let _ = std::fs::remove_file(&config_path2);
 
-        // No legacy key at all: nothing to do.
+        // No legacy key at all: nothing to do, file untouched byte-for-byte.
         let config_path3 =
             std::env::temp_dir().join(format!("intentd-settings-actnone-{tag}.toml"));
-        std::fs::write(&config_path3, "").expect("seed config");
+        let seed = "# comment only\n[git]\nautoCommit = true\n";
+        std::fs::write(&config_path3, seed).expect("seed config");
         let registry3 = SettingsRegistry::load(&config_path3).expect("load registry");
         migrate_active_provider_setting(&registry3).expect("migrate");
         assert_eq!(
             registry3.origin("model.defaultProvider"),
             Some(SettingOrigin::Default)
         );
+        assert_eq!(
+            std::fs::read_to_string(&config_path3).expect("re-read config"),
+            seed,
+            "a file without the legacy key is never rewritten"
+        );
         let _ = std::fs::remove_file(&config_path3);
+    }
+
+    /// The deprecated `providers.active` cannot be recreated through the
+    /// settings API after the boot migration removed it: the catalog entry is
+    /// read-only, and `settings.update` tolerates-and-ignores writes to it
+    /// (nothing validated, persisted, echoed, or published) so an old client's
+    /// batch never fails wholesale — mirroring the retired-path treatment.
+    #[tokio::test]
+    async fn active_provider_update_is_tolerated_and_ignored() {
+        let def = find_definition(DEPRECATED_ACTIVE_PROVIDER_PATH)
+            .expect("providers.active must stay in the catalog during deprecation");
+        assert!(
+            def.read_only,
+            "providers.active must be read-only so no write path recreates it"
+        );
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-actwrite-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-actwrite-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // A lone legacy write is ignored: nothing applied, nothing persisted.
+        let applied = svc
+            .update(&json!([
+                { "path": "providers.active", "value": "codex" },
+            ]))
+            .await
+            .expect("legacy providers.active write must be tolerated");
+        assert_eq!(applied, Vec::<Value>::new());
+        assert_eq!(
+            registry.origin("providers.active"),
+            Some(SettingOrigin::Default),
+            "the ignored write must not resurrect the key"
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!has_active_key(&text), "{text}");
+
+        // A batch mixing the legacy path with a live one still applies the
+        // live entry instead of failing wholesale.
+        let applied = svc
+            .update(&json!([
+                { "path": "providers.active", "value": "codex" },
+                { "path": "model.defaultProvider", "value": "codex" },
+            ]))
+            .await
+            .expect("mixed batch must apply its live entry");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["path"], "model.defaultProvider");
+        assert_eq!(registry.get("model.defaultProvider"), Some(json!("codex")));
+
+        // The catalog entry keeps get/reset answerable during deprecation.
+        let got = svc.get("providers.active").await.expect("get");
+        assert_eq!(got["origin"], json!("default"));
+        svc.reset("providers.active").await.expect("reset");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// `settings.update` rejects compound `provider:model` values on the
