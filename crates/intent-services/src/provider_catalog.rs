@@ -48,6 +48,7 @@ fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> 
     row.insert("shortName".into(), json!(p.short_name));
     row.insert("command".into(), json!(p.command));
     row.insert("canBeDisabled".into(), json!(p.can_be_disabled));
+    row.insert("supportsTestPrompt".into(), json!(p.supports_test_prompt));
     if let Some(hint) = p.login_command_hint {
         row.insert("loginCommandHint".into(), json!(hint));
     }
@@ -102,6 +103,7 @@ mod tests {
         assert_eq!(auggie["shortName"], "Auggie");
         assert_eq!(auggie["command"], "auggie");
         assert_eq!(auggie["canBeDisabled"], true);
+        assert_eq!(auggie["supportsTestPrompt"], true);
         assert_eq!(auggie["loginCommandHint"], "auggie login");
         // The generic provider row's login CTA reads `loginDocsUrl`.
         assert!(auggie["loginDocsUrl"].is_string());
@@ -150,6 +152,19 @@ mod tests {
             .iter()
             .find(|p| p["id"] == id)
             .unwrap()
+    }
+
+    #[test]
+    fn supports_test_prompt_present_on_every_row_and_false_for_unsloth() {
+        let v = catalog(&|_| false);
+        for p in v["providers"].as_array().unwrap() {
+            let expected = p["id"] != "unsloth";
+            assert_eq!(
+                p["supportsTestPrompt"], expected,
+                "supportsTestPrompt mismatch for {}",
+                p["id"]
+            );
+        }
     }
 
     #[test]
