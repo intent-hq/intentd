@@ -303,7 +303,7 @@ mod tests {
             None,
             Duration::from_millis(500),
         )
-        .expect_err("fetch must time out against a non-routable remote");
+        .expect_err("fetch must time out against an unresponsive remote");
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(10),
