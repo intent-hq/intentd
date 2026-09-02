@@ -2,14 +2,25 @@
 //! (intent-hq/intent#4142).
 //!
 //! Resolves the same committer identity `git.commit` uses — git2's
-//! [`git2::Repository::signature`], i.e. the worktree → local → global
-//! `user.name`/`user.email` config chain — and exposes it as the four
-//! `GIT_AUTHOR_*` / `GIT_COMMITTER_*` variables, so a plain `git commit` run
-//! inside an agent-spawned shell/terminal/script/exec commits as the user's
-//! real identity instead of a hostname-derived fallback, even when the
+//! [`git2::Repository::signature`], i.e. the worktree → local → global →
+//! system/XDG `user.name`/`user.email` config chain — and exposes it as the
+//! four `GIT_AUTHOR_*` / `GIT_COMMITTER_*` variables, so a plain `git commit`
+//! run inside an agent-spawned shell/terminal/script/exec commits as the
+//! user's real identity instead of a hostname-derived fallback, even when the
 //! repo/worktree carries no local `user.*` config. When no identity resolves,
 //! no variables are exported (the spawn keeps its current environment;
 //! empty/placeholder values are never emitted).
+//!
+//! Because env vars outrank *all* config files in git's own resolution, two
+//! consequences are deliberate (#4142 explicitly wants env to outrank config
+//! to close the fallback hole in /tmp clones and fresh worktrees):
+//!
+//! - **Spawn-time snapshot** — a long-lived PTY freezes the identity at
+//!   create time; changing `user.*` config later does not affect terminals
+//!   already running.
+//! - **Cross-repo override** — `cd` inside a spawned shell into another repo
+//!   whose local `user.*` differs still commits with the spawn-cwd identity
+//!   (the env shadows that repo's local config).
 
 use std::path::Path;
 
