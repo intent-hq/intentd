@@ -924,17 +924,9 @@ fn ensure_provider_authenticated(
     if auth_verdict != Some(false) {
         return Ok(());
     }
-    let display = intent_providers::provider_config(provider_id).display_name;
-    let login_cmd = intent_providers::login_command(provider_id);
-    let caveat = if provider_id == "claude-code" {
-        " Note: signing into the Claude desktop app does not carry over to the CLI — run \
-         \"claude\" in a terminal, then \"/login\"."
-    } else {
-        ""
-    };
     Err(Error::InvalidParams(format!(
-        "{method}: provider \"{provider_id}\" ({display}) is not authenticated — run \
-         \"{login_cmd}\" in a terminal, then retry.{caveat}"
+        "{method}: {}",
+        crate::provider_auth::not_authenticated_message(provider_id)
     )))
 }
 

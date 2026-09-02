@@ -1169,6 +1169,43 @@ pub(crate) fn no_default_provider_error(context: &str) -> Error {
     ))
 }
 
+/// Whether an ACP failure from the adapter signals "authentication required"
+/// for the provider (intent-hq/intent#3941). [`AcpError::Auth`] is the
+/// structural signal (`session/new` answered with an auth-required error and
+/// no usable auth method); adapters that reject later calls surface it as a
+/// JSON-RPC error instead, classified by the same code/message heuristic as
+/// the model-list auth probe ([`crate::provider_models::is_auth_required_error`]).
+fn is_acp_auth_required(e: &AcpError) -> bool {
+    match e {
+        AcpError::Auth(_) => true,
+        AcpError::Rpc(rpc) => {
+            crate::provider_models::is_auth_required_error(rpc.code, &rpc.message)
+        }
+        _ => false,
+    }
+}
+
+/// Map an ACP session-setup/prompt failure to the surfaced [`Error`]. An
+/// auth-required failure becomes the same actionable
+/// [`Error::InvalidParams`] login message as the create/delegate gate
+/// ([`crate::provider_auth::not_authenticated_message`]) — non-retryable at
+/// spawn, with the catalog login command and the claude-code desktop-app
+/// caveat — and demotes the provider's cached auth verdict to a hard `false`
+/// so follow-up spawns fail fast at the gate instead of dying on their first
+/// turn. Everything else keeps the existing opaque
+/// `Error::Internal("{context} failed: {e}")` shape (`context` is the ACP
+/// method name, e.g. `session/new`).
+fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
+    if is_acp_auth_required(e) {
+        crate::provider_auth::demote_auth_verdict(provider_id);
+        return Error::InvalidParams(format!(
+            "{context}: {}",
+            crate::provider_auth::not_authenticated_message(provider_id)
+        ));
+    }
+    Error::Internal(format!("{context} failed: {e}"))
+}
+
 /// Resolve the effective model a provider is actually running from the
 /// `configOptions` of a `session/new` / `session/load` response (D13): the
 /// select option with `id == "model"` (falling back to `category == "model"`)
@@ -2233,7 +2270,7 @@ impl Services {
         .await;
         let resp = session::new_session(conn, cwd, mcp_servers, meta)
             .await
-            .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
+            .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
         let acp_session_id = resp.session_id.0.to_string();
         self.store
             .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
@@ -2306,7 +2343,7 @@ impl Services {
         .await;
         let resp = session::new_session(conn, cwd, mcp_servers, meta)
             .await
-            .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
+            .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
         let new_acp_session_id = resp.session_id.0.to_string();
         let canonical = self
             .store
@@ -2436,7 +2473,7 @@ impl Services {
         .await;
         let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
             .await
-            .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
+            .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
         self.persist_effective_model(
             &workspace_id,
             agent_id,
@@ -3161,9 +3198,51 @@ impl Services {
         // wrapped text matches the ordinary error the final `map_err` returns
         // below, so the persisted `stop_reason` is byte-identical to what the
         // worker would have written.
+        //
+        // Auth-required prompt failure (intent-hq/intent#3941): resolved BEFORE
+        // the persist seam so the persisted `stop_reason` and the returned
+        // error carry the identical actionable message. The provider's cached
+        // auth verdict is demoted to a hard `false` so follow-up spawns fail
+        // fast at the create/delegate gate instead of dying on their first
+        // turn. Falls back to the opaque wrapper when the agent's provider
+        // cannot be resolved from the session row.
+        let prompt_auth_message = match &result {
+            Err(e)
+                if !pre_output_transport_failure
+                    && !prompt_idle_timeout
+                    && is_acp_auth_required(e) =>
+            {
+                match self
+                    .store
+                    .get_agent_session_token_usage(workspace_id, agent_id)
+                    .await
+                {
+                    Ok((model, _, provider, _)) => resolve_provider_id(
+                        model.as_deref(),
+                        provider.as_deref(),
+                        derived_default_provider(&self.effective_settings()).as_deref(),
+                    )
+                    .map(|provider_id| {
+                        crate::provider_auth::demote_auth_verdict(&provider_id);
+                        format!(
+                            "session/prompt: {}",
+                            crate::provider_auth::not_authenticated_message(&provider_id)
+                        )
+                    }),
+                    Err(e) => {
+                        tracing::warn!(agent = %agent_id, error = %e, "read provider for auth-failure mapping failed");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout {
-                let wrapped = Error::Internal(format!("session/prompt failed: {e}"));
+                let wrapped = match prompt_auth_message.as_deref() {
+                    Some(msg) => Error::InvalidParams(msg.to_string()),
+                    None => Error::Internal(format!("session/prompt failed: {e}")),
+                };
                 if !crate::agent_manager::prompt_cancellation_error(&wrapped) {
                     let persist = crate::agent_manager::persist_terminal_error_status_via_services(
                         self,
@@ -3413,6 +3492,10 @@ impl Services {
                 Error::Internal(format!(
                     "session/prompt failed: {e} {PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX}"
                 ))
+            } else if let Some(msg) = prompt_auth_message {
+                // Auth-required failure: identical message to the persisted
+                // stop_reason above (intent-hq/intent#3941).
+                Error::InvalidParams(msg)
             } else {
                 Error::Internal(format!("session/prompt failed: {e}"))
             }

@@ -469,6 +469,41 @@ pub(crate) fn cached_auth_verdict(provider_id: &str) -> Option<bool> {
     cache().fresh(provider_id).flatten()
 }
 
+/// The shared "provider is not authenticated" message body: names the
+/// provider and the catalog login remedy ([`intent_providers::login_command`]);
+/// for claude-code it also spells out the desktop-app caveat — a Claude
+/// desktop-app sign-in does not carry over to the CLI credential chain
+/// (intent-hq/intent#3941). Used by both the create/delegate gate in
+/// [`crate::agent_ops`] and the runtime session/prompt auth-failure mapping
+/// so the two surfaces stay word-for-word consistent.
+pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
+    let display = intent_providers::provider_config(provider_id).display_name;
+    let login_cmd = intent_providers::login_command(provider_id);
+    let caveat = if provider_id == "claude-code" {
+        " Note: signing into the Claude desktop app does not carry over to the CLI — run \
+         \"claude\" in a terminal, then \"/login\"."
+    } else {
+        ""
+    };
+    format!(
+        "provider \"{provider_id}\" ({display}) is not authenticated — run \
+         \"{login_cmd}\" in a terminal, then retry.{caveat}"
+    )
+}
+
+/// Demote one provider's cached auth verdict to a hard `false` after the
+/// runtime observed an authoritative auth-required error from its adapter
+/// (session/new / session/load / session/prompt). This makes the
+/// create/delegate gate in [`crate::agent_ops`] reject follow-up spawns for
+/// the cache TTL instead of letting each one die on its first turn. No-op
+/// for ids outside [`AUTH_PROBE_PROVIDERS`] (the cache is keyed by the
+/// catalog's static ids).
+pub(crate) fn demote_auth_verdict(provider_id: &str) {
+    if let Some(id) = AUTH_PROBE_PROVIDERS.iter().find(|id| **id == provider_id) {
+        cache().store(id, Some(false));
+    }
+}
+
 /// Test seam: plant a verdict in the process-wide auth cache so gate tests
 /// are deterministic without spawning probes. Seed `None` to restore the
 /// permissive cached-unknown state.
@@ -920,5 +955,46 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// Runtime demotion (intent-hq/intent#3941): an authoritative
+    /// auth-required failure hardens the cached verdict to `false` so the
+    /// create/delegate gate rejects follow-up spawns for the cache TTL; ids
+    /// outside `AUTH_PROBE_PROVIDERS` are a no-op (nothing to key the cache
+    /// with).
+    #[test]
+    fn demote_auth_verdict_hardens_probe_provider_and_ignores_unknown() {
+        let id = AUTH_PROBE_PROVIDERS[0];
+        let prior = cache().fresh(id);
+        demote_auth_verdict(id);
+        assert_eq!(cached_auth_verdict(id), Some(false), "{id}");
+        // Restore whatever the suite had (unknown ⇒ permissive None).
+        cache().store(id, prior.flatten());
+
+        demote_auth_verdict("not-a-provider");
+        assert_eq!(cached_auth_verdict("not-a-provider"), None);
+    }
+
+    /// The shared login message names the provider, carries the catalog
+    /// login command, and appends the desktop-app caveat only for
+    /// claude-code — one builder keeps the gate and the runtime seams
+    /// word-for-word consistent.
+    #[test]
+    fn not_authenticated_message_names_provider_and_login_remedy() {
+        let claude = not_authenticated_message("claude-code");
+        assert!(claude.contains("\"claude-code\""), "{claude}");
+        assert!(
+            claude.contains(&intent_providers::login_command("claude-code")),
+            "{claude}"
+        );
+        assert!(claude.contains("desktop app"), "{claude}");
+
+        let droid = not_authenticated_message("droid");
+        assert!(droid.contains("\"droid\""), "{droid}");
+        assert!(
+            droid.contains(&intent_providers::login_command("droid")),
+            "{droid}"
+        );
+        assert!(!droid.contains("desktop app"), "{droid}");
     }
 }
