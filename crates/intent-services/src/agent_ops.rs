@@ -383,9 +383,9 @@ fn resolve_default_model_from_settings(
     let settings = services.effective_settings();
 
     // 1. Check provider defaults. With no explicit provider, key the lookup
-    // by the settings-derived default (model.default prefix, else
-    // providers.active); with neither, there is no provider to key on
-    // (monorepo#3044: no positional last resort) and the step is skipped.
+    // by the settings-derived default (model.defaultProvider); with neither,
+    // there is no provider to key on (monorepo#3044: no positional last
+    // resort) and the step is skipped.
     let derived;
     let provider_key = if let Some(p) = provider {
         Some(p)
@@ -475,11 +475,10 @@ pub(crate) fn resolve_agent_default_model_with_source(
 ) -> (Option<String>, DefaultModelSource) {
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
-    // provider, guard against the settings-derived default (model.default
-    // prefix, else providers.active). With neither there is no effective
-    // provider (monorepo#3044: no positional last resort) — the
-    // provider-keyed steps below are skipped and ownership guards pass
-    // compound ids through on their own prefix.
+    // provider, guard against the settings-derived default
+    // (model.defaultProvider). With neither there is no effective provider
+    // (monorepo#3044: no positional last resort) — the provider-keyed steps
+    // below are skipped.
     let derived;
     let effective_provider: Option<&str> = if let Some(p) = provider {
         Some(intent_providers::provider_config(p).id)
@@ -497,7 +496,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
         // bundled) — only if it belongs to the resolved provider; a model
         // owned by another provider falls through instead of leaking.
         if let Some(m) = specialists_svc.resolve_model(spec_id, workspace_path) {
-            if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
+            if default_model_belongs_to_provider(services, effective_provider, &m) {
                 return (Some(m), DefaultModelSource::Specialist);
             }
             tracing::debug!(
@@ -513,7 +512,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // by another provider must not be pinned (monorepo#607); drop to the
     // catalog/CLI default instead of rejecting a model the caller never sent.
     if let Some(m) = resolve_default_model_from_settings(services, provider) {
-        if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
+        if default_model_belongs_to_provider(services, effective_provider, &m) {
             return (Some(m), DefaultModelSource::Settings);
         }
         tracing::warn!(
@@ -540,40 +539,32 @@ pub(crate) fn resolve_agent_default_model_with_source(
 }
 
 /// Ownership guard for resolver-derived defaults (never explicit client
-/// models). Compound ids must name the resolved provider — except when no
-/// provider was requested, where a known compound prefix *becomes* the
-/// resolved provider (`agent_create_op` derives `session.provider` from it).
-/// Bare ids reuse [`ensure_bare_model_matches_provider`]'s asymmetric
-/// evidence rules (cached dynamic catalogs; absence of evidence passes).
-/// With no effective provider at all (monorepo#3044), only a known compound
-/// id passes — it carries its own provider; a bare id has nothing to be
-/// validated against and falls through.
+/// models). Models are bare ids and reuse
+/// [`ensure_bare_model_matches_provider`]'s asymmetric evidence rules
+/// (cached dynamic catalogs; absence of evidence passes). A legacy compound
+/// `provider:model` value (e.g. an old on-disk specialist frontmatter or
+/// settings default that predates the wire-level rejection) never passes —
+/// `session.model` must stay a bare id. With no effective provider at all
+/// (monorepo#3044), a bare id has nothing to be validated against and falls
+/// through.
 fn default_model_belongs_to_provider(
     services: &Services,
-    provider_param: Option<&str>,
     effective_provider: Option<&str>,
     model: &str,
 ) -> bool {
     if model.contains(':') {
-        let (prefix, _) = intent_providers::parse_compound_model_id(model);
-        if intent_providers::find_provider(&prefix).is_none() {
-            return false;
-        }
-        provider_param.is_none()
-            || effective_provider
-                .is_some_and(|ep| intent_providers::provider_config(&prefix).id == ep)
-    } else {
-        let Some(effective_provider) = effective_provider else {
-            return false;
-        };
-        ensure_bare_model_matches_provider(
-            "agent.create",
-            &services.models_catalog,
-            effective_provider,
-            model,
-        )
-        .is_ok()
+        return false;
     }
+    let Some(effective_provider) = effective_provider else {
+        return false;
+    };
+    ensure_bare_model_matches_provider(
+        "agent.create",
+        &services.models_catalog,
+        effective_provider,
+        model,
+    )
+    .is_ok()
 }
 
 /// Reject a provider id that is not in the ACP registry with `-32602`
@@ -754,13 +745,12 @@ fn resolve_delegate_reasoning_effort(
 /// which would fall through to the spawn path's positional last resort
 /// regardless of the user's actual configured default.
 ///
-/// 1. The specialist's frontmatter `codingAgent` (3-tier resolution), or —
-///    when that is unset — the provider prefix of its compound `model`
-///    (e.g. `opencode:kimi-k3`). Either must be a known, available provider
-///    or the delegate fails with a clear error (never silently substituted).
-/// 2. The settings-derived default (provider of `model.default`, else
-///    `providers.active` — [`crate::agent_session::derived_default_provider`]),
-///    with the same known/available requirement.
+/// 1. The specialist's frontmatter `codingAgent` (3-tier resolution). It
+///    must be a known, available provider or the delegate fails with a
+///    clear error (never silently substituted).
+/// 2. The settings-derived default (`model.defaultProvider` —
+///    [`crate::agent_session::derived_default_provider`]), with the same
+///    known/available requirement.
 /// 3. Neither is set: a clear `-32602` (monorepo#3044) — the former residual
 ///    `Ok(None)` left the session's `provider` unset, and spawn-time
 ///    resolution bottomed out at the first registered provider (auggie),
@@ -775,14 +765,7 @@ fn resolve_delegate_provider(
 
     if let Some(spec_id) = specialist {
         let specialists_svc = services.specialists_service();
-        let explicit = specialists_svc
-            .resolve_coding_agent(spec_id, workspace_path)
-            .or_else(|| {
-                specialists_svc
-                    .resolve_model(spec_id, workspace_path)
-                    .filter(|m| m.contains(':'))
-                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
-            });
+        let explicit = specialists_svc.resolve_coding_agent(spec_id, workspace_path);
         if let Some(provider_id) = explicit {
             ensure_known_provider("agent.delegate", &provider_id)?;
             ensure_provider_available("agent.delegate", &provider_id, &settings.providers)?;
@@ -803,8 +786,8 @@ fn resolve_delegate_provider(
 }
 
 /// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
-/// the specialist's frontmatter `codingAgent` (or its compound `model`
-/// prefix) when it names a *known* provider, else the settings-derived
+/// the specialist's frontmatter `codingAgent` when it names a *known*
+/// provider, else the settings-derived
 /// default — but tolerant of an unknown/unavailable provider instead of
 /// erroring, since a preview must never fail. `None` when nothing resolves
 /// (monorepo#3044: no positional last resort) — the preview then shows the
@@ -820,14 +803,7 @@ pub(crate) fn resolve_delegate_provider_preview(
 ) -> Option<String> {
     if let Some(spec_id) = specialist {
         let specialists_svc = services.specialists_service();
-        let explicit = specialists_svc
-            .resolve_coding_agent(spec_id, workspace_path)
-            .or_else(|| {
-                specialists_svc
-                    .resolve_model(spec_id, workspace_path)
-                    .filter(|m| m.contains(':'))
-                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
-            });
+        let explicit = specialists_svc.resolve_coding_agent(spec_id, workspace_path);
         if let Some(provider_id) = explicit {
             if intent_providers::find_provider(&provider_id).is_some() {
                 return Some(provider_id);
@@ -3670,31 +3646,18 @@ impl Services {
             ),
         };
 
-        // Initialize provider from the model's compound prefix if not explicitly
-        // set. This ensures sessions created with a compound model id like
-        // "opencode:kimi-k3" have the correct provider from the start.
-        let provider = provider.or_else(|| {
-            resolved_model.as_ref().and_then(|m| {
-                if m.contains(':') {
-                    Some(intent_providers::parse_compound_model_id(m).0)
-                } else {
-                    None
-                }
-            })
-        });
-        // Validate the resolved provider (explicit param or compound-prefix
-        // derived) before persisting anything: an unknown provider is -32602,
-        // never a session row that would silently spawn the default binary.
-        // Absent provider (defaulting) remains valid.
+        // Validate the explicit provider before persisting anything: an
+        // unknown provider is -32602, never a session row that would
+        // silently spawn the default binary. Absent provider (defaulting)
+        // remains valid.
         if let Some(p) = provider.as_deref() {
             ensure_known_provider("agent.create", p)?;
         }
-        // monorepo#3044: with no explicit provider, no compound model prefix
-        // (`provider` was just derived from one when present), and no
-        // settings-derived default, no spawn provider could ever resolve for
-        // this session. Fail loudly at the front door — the former behavior
-        // persisted the row and the spawn silently bottomed out at the first
-        // registered provider (auggie), installed or not.
+        // monorepo#3044: with no explicit provider and no settings-derived
+        // default, no spawn provider could ever resolve for this session.
+        // Fail loudly at the front door — the former behavior persisted the
+        // row and the spawn silently bottomed out at the first registered
+        // provider (auggie), installed or not.
         let derived_default =
             crate::agent_session::derived_default_provider(&self.effective_settings());
         if provider.is_none() && derived_default.is_none() {
@@ -3706,11 +3669,8 @@ impl Services {
         // one the user explicitly disabled in `providers.enabled` — fail fast
         // with the distinct "not enabled" -32602 before any session row is
         // persisted. Resolve it with the spawn path's own precedence
-        // (`resolve_provider_id`: compound `resolved_model` prefix →
-        // `provider` field → settings-derived default) so an explicit
-        // `provider` cannot smuggle in a disabled compound-model provider —
-        // spawn would run the prefix, so the prefix is what gets gated. This
-        // one gate covers every create seam (`agent.create`,
+        // (`resolve_provider_id`: `provider` field → settings-derived
+        // default). This one gate covers every create seam (`agent.create`,
         // `agent.wakeOrCreate`, and delegate's child creation). The
         // hard-false auth-verdict gate (`ensure_provider_authenticated`)
         // rides the same seam: a provider the daemon already observed as
@@ -3720,7 +3680,6 @@ impl Services {
         // direct creates on a known, enabled-but-uninstalled provider keep
         // their existing spawn-time failure mode.
         if let Some(p) = crate::agent_session::resolve_provider_id(
-            resolved_model.as_deref(),
             provider.as_deref(),
             derived_default.as_deref(),
         ) {
@@ -3735,55 +3694,44 @@ impl Services {
                 crate::provider_auth::cached_auth_verdict(&p),
             )?;
         }
-        // Also validate the resolved model's compound prefix unconditionally:
-        // the spawn path (`resolve_provider_id`) gives the model prefix
-        // precedence over session.provider, so a valid explicit provider must
-        // not smuggle in an unknown-prefixed model.
+        // A bare model that provably belongs to a different provider (cached
+        // dynamic catalogs) must not be persisted: the spawn would feed the
+        // effective provider another provider's model id (monorepo#607). The
+        // effective provider mirrors `resolve_provider_id`: provider field →
+        // settings-derived default (guaranteed present by the guard above).
+        // Bare ids with no ownership evidence pass — ownership cannot be
+        // proven for model lists that were never fetched.
+        //
+        // Only a *client-supplied* mismatch hard-fails. A mismatch in a
+        // derived default (specialist frontmatter / settings chain — e.g. a
+        // global `model.default` naming an auggie model while the caller
+        // asked for `provider: "grok"` with no model param) would reject a
+        // model the caller never sent and make the provider uncreatable
+        // until settings change; drop it to the CLI default instead
+        // (session.model stays None).
         if let Some(m) = resolved_model.as_deref() {
-            if m.contains(':') {
-                let (model_provider, _) = intent_providers::parse_compound_model_id(m);
-                ensure_known_provider("agent.create", &model_provider)?;
-            } else {
-                // A bare model that provably belongs to a different provider
-                // (cached dynamic catalogs) must not be persisted either: the
-                // spawn would feed the effective provider another provider's
-                // model id (monorepo#607). The effective provider mirrors
-                // `resolve_provider_id` for a bare model: provider field →
-                // settings-derived default (guaranteed present by the guard
-                // above). Bare ids with no ownership evidence pass —
-                // ownership cannot be proven for model lists that were never
-                // fetched.
-                //
-                // Only a *client-supplied* mismatch hard-fails. A mismatch in
-                // a derived default (specialist frontmatter / settings chain
-                // — e.g. a global `model.default` naming an auggie model
-                // while the caller asked for `provider: "grok"` with no model
-                // param) would reject a model the caller never sent and make
-                // the provider uncreatable until settings change; drop it to
-                // the CLI default instead (session.model stays None).
-                let effective = provider
-                    .as_deref()
-                    .or(derived_default.as_deref())
-                    .expect("guarded above: provider or derived default present");
-                match ensure_bare_model_matches_provider(
-                    "agent.create",
-                    &self.models_catalog,
-                    effective,
-                    m,
-                ) {
-                    Ok(()) => {}
-                    Err(e) if model_explicit => return Err(e),
-                    Err(e) => {
-                        tracing::warn!(
-                            model = m,
-                            provider = effective,
-                            error = %e,
-                            "configured default model belongs to another provider; \
-                             falling back to the CLI default"
-                        );
-                        resolved_model = None;
-                        model_source = DefaultModelSource::CliDefault;
-                    }
+            let effective = provider
+                .as_deref()
+                .or(derived_default.as_deref())
+                .expect("guarded above: provider or derived default present");
+            match ensure_bare_model_matches_provider(
+                "agent.create",
+                &self.models_catalog,
+                effective,
+                m,
+            ) {
+                Ok(()) => {}
+                Err(e) if model_explicit => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        model = m,
+                        provider = effective,
+                        error = %e,
+                        "configured default model belongs to another provider; \
+                         falling back to the CLI default"
+                    );
+                    resolved_model = None;
+                    model_source = DefaultModelSource::CliDefault;
                 }
             }
         }
@@ -4036,16 +3984,15 @@ impl Services {
 
     /// `agent.setModel` (PROTOCOL §5.5). Emits `agent:updated`.
     ///
-    /// When the new model is a compound id (`provider:model`) whose provider
-    /// differs from session.provider, this updates session.provider to match,
-    /// ensuring the next spawn uses the correct binary.
+    /// `model_id` is always a bare id (compound `provider:model` ids are
+    /// rejected at the wire).
     ///
     /// `provider_id` is the optional explicit provider (additive param,
     /// monorepo#1657): absent keeps the historical behavior byte-for-byte;
-    /// present it must name a registered provider, a compound `model_id`'s
-    /// prefix must agree with it, and a bare `model_id` is validated against
-    /// — and session.provider reconciled to — the GIVEN provider instead of
-    /// the session's effective one.
+    /// present it must name a registered provider, and `model_id` is
+    /// validated against — and session.provider reconciled to — the GIVEN
+    /// provider instead of the session's effective one (a cross-provider
+    /// switch spawns the new provider's binary on the next turn).
     pub(crate) async fn agent_set_model_op(
         &self,
         agent_id: AgentId,
@@ -4054,38 +4001,16 @@ impl Services {
     ) -> Result<Value> {
         let session = self.load_session_internal(&agent_id).await?;
         // An explicit providerId must be a registered provider before any
-        // mutation (same misroute vector as the compound prefix below).
+        // mutation (persisting an unknown one would make the next spawn
+        // silently fall back to the default binary, -32602).
         if let Some(pid) = provider_id.as_deref() {
             ensure_known_provider("agent.setModel", pid)?;
         }
-        // Parse the compound prefix once: reject unknown providers before any
-        // mutation (the same misroute vector as agent.create — persisting one
-        // would make the next spawn silently fall back to the default binary,
-        // -32602), then reuse the derived provider for session.provider
-        // reconciliation so cross-provider model switches spawn the new
-        // provider's binary.
-        let model_provider = if model_id.contains(':') {
-            let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
-            ensure_known_provider("agent.setModel", &model_provider)?;
-            // An explicit providerId must agree with the compound prefix
-            // (normalized): a conflict is a client bug — reject before any
-            // mutation rather than guessing which provider was meant.
-            if let Some(pid) = provider_id.as_deref() {
-                let prefix = intent_providers::provider_config(&model_provider).id;
-                if prefix != pid {
-                    return Err(Error::InvalidParams(format!(
-                        "agent.setModel: modelId {model_id} names provider {prefix} \
-                         but providerId is {pid}"
-                    )));
-                }
-            }
-            Some(model_provider)
-        } else if let Some(pid) = provider_id {
-            // Bare model with an explicit providerId: ownership is validated
-            // against the GIVEN provider (not the session's effective one),
-            // and session.provider is reconciled to it below — same write
-            // path as the compound-prefix case — so the next spawn runs the
-            // intended binary (monorepo#1657).
+        let model_provider = if let Some(pid) = provider_id {
+            // Explicit providerId: ownership is validated against the GIVEN
+            // provider (not the session's effective one), and
+            // session.provider is reconciled to it below so the next spawn
+            // runs the intended binary (monorepo#1657).
             ensure_bare_model_matches_provider(
                 "agent.setModel",
                 &self.models_catalog,
@@ -4094,9 +4019,9 @@ impl Services {
             )?;
             Some(pid)
         } else {
-            // A bare model is validated against the session's effective
-            // provider (same precedence as `resolve_provider_id` when the
-            // model has no prefix: session.provider → settings-derived
+            // Without an explicit providerId the model is validated against
+            // the session's effective provider (same precedence as
+            // `resolve_provider_id`: session.provider → settings-derived
             // default): a bare id provably owned by another provider (cached
             // dynamic catalogs) is the same misroute vector (monorepo#607).
             // With neither set the session could never spawn — fail loudly
@@ -4121,8 +4046,8 @@ impl Services {
             )?;
             None
         };
-        // Reconcile the provider to the compound prefix or explicit
-        // providerId (bare ids without one keep the session's provider). The
+        // Reconcile the provider to the explicit providerId (models without
+        // one keep the session's provider). The
         // write goes through the narrow
         // `set_agent_session_model` — the ONE writer allowed to change
         // `provider` after first real use — because a cross-provider switch
@@ -8238,17 +8163,11 @@ impl Services {
                 + 1
         });
         // D2: resolve the provider up front. Precedence (PROTOCOL §5.5):
-        // explicit `provider` param > compound-`model` prefix > specialist
-        // frontmatter `codingAgent` (or its compound `model` prefix) >
+        // explicit `provider` param > specialist frontmatter `codingAgent` >
         // settings-derived default. An explicit `provider` must be known and
-        // available, and a compound explicit `model` naming a DIFFERENT
-        // known provider is a contradiction — both reject with `-32602`
-        // before any side effect (an unknown compound prefix is left to
-        // `agent_create_op`'s unconditional prefix validation). When nothing
-        // resolves at all, `resolve_delegate_provider` fails loudly with
-        // `-32602` (monorepo#3044: no positional last resort); a compound
-        // explicit `model` (e.g. `opencode:kimi-k3`) pins its own provider
-        // via `agent_create_op`'s existing derivation.
+        // available — it rejects with `-32602` before any side effect. When
+        // nothing resolves at all, `resolve_delegate_provider` fails loudly
+        // with `-32602` (monorepo#3044: no positional last resort).
         // SECURITY: derive workspace_path from the stored workspace record,
         // never a client-supplied value (same rationale as
         // `agent_create_op`'s model resolution).
@@ -8275,36 +8194,7 @@ impl Services {
                 provider_param,
                 &self.effective_settings().providers,
             )?;
-            if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
-                let (prefix, _) = intent_providers::parse_compound_model_id(model);
-                if intent_providers::find_provider(&prefix)
-                    .is_some_and(|cfg| cfg.id != provider_param)
-                {
-                    return Err(Error::InvalidParams(format!(
-                        "agent.delegate: model {model} names provider {prefix} but provider is {provider_param}"
-                    )));
-                }
-            }
             Some(provider_param.to_string())
-        } else if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
-            // A compound explicit `model` pins its own provider (spawn
-            // precedence: the prefix outranks everything), so gate that
-            // prefix on the same full availability check as an explicit
-            // `provider` param — otherwise a disabled/uninstalled/env-gated
-            // provider smuggled in via the model prefix would persist a
-            // session and only fail at spawn (monorepo#3178). An unknown
-            // prefix is left to `agent_create_op`'s unconditional prefix
-            // validation; the provider itself stays `None` because
-            // `agent_create_op`'s existing derivation pins it from the model.
-            let (prefix, _) = intent_providers::parse_compound_model_id(model);
-            if intent_providers::find_provider(&prefix).is_some() {
-                ensure_provider_available(
-                    "agent.delegate",
-                    &prefix,
-                    &self.effective_settings().providers,
-                )?;
-            }
-            None
         } else if input.model.is_none() {
             resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
         } else {
@@ -8809,13 +8699,9 @@ impl Services {
         // that doesn't override it, so validate it up front — before the
         // classification loop can start any task — rather than surfacing the
         // same failure as N per-row `error` dispositions after earlier rows
-        // already spawned. A top-level compound `model` default gets the same
-        // up-front gate on its prefix-named provider (spawn precedence: the
-        // prefix outranks `provider`), so a disabled/unrunnable provider
-        // smuggled in via the model default also fails once, up front.
-        // Per-entry `provider`/`model` overrides stay per-row (`error`
-        // disposition via the single-task path), consistent with the other
-        // per-entry options.
+        // already spawned. Per-entry `provider`/`model` overrides stay
+        // per-row (`error` disposition via the single-task path), consistent
+        // with the other per-entry options.
         if let Some(provider_param) = input.provider.as_deref() {
             ensure_known_provider("agent.delegate", provider_param)?;
             ensure_provider_available(
@@ -8823,16 +8709,6 @@ impl Services {
                 provider_param,
                 &self.effective_settings().providers,
             )?;
-        }
-        if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
-            let (prefix, _) = intent_providers::parse_compound_model_id(model);
-            if intent_providers::find_provider(&prefix).is_some() {
-                ensure_provider_available(
-                    "agent.delegate",
-                    &prefix,
-                    &self.effective_settings().providers,
-                )?;
-            }
         }
         // The top-level `specialist` is likewise the batch default shared by
         // every entry that doesn't override it — validate it once up front

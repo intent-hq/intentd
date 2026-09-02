@@ -226,12 +226,17 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     let specialists_dir = data_dir.join(".intent").join("specialists");
     std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
     let specialist_content =
-        "---\nmodel: auggie:opus\n---\n# Test Specialist\nTest behavior prompt.";
+        "---\ncodingAgent: auggie\nmodel: opus\n---\n# Test Specialist\nTest behavior prompt.";
     std::fs::write(
         specialists_dir.join("test-specialist.md"),
         specialist_content,
     )
     .expect("write specialist file");
+
+    // Seed a configured default provider: since monorepo#3044 `agent.create`
+    // fails loudly when neither an explicit provider nor a settings-derived
+    // default resolves (the frontmatter model no longer carries a provider).
+    common::seed_default_provider(&data_dir);
 
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -277,7 +282,7 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
 
     // Assert the session's model IS the frontmatter model (make the test fail if resolution is skipped)
     assert_eq!(
-        get_res["agent"]["model"], "auggie:opus",
+        get_res["agent"]["model"], "opus",
         "specialist frontmatter model not resolved"
     );
 

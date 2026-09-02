@@ -436,8 +436,8 @@ impl ModelCatalogCache {
     /// disproof can outlive the provider's real catalog (e.g. a model added
     /// upstream after the last fetch keeps being rejected until the entry
     /// ages past [`MODELS_STALE_AFTER`] and a `models.list` read — or a
-    /// forced refresh — replaces it); a compound `provider:model` id always
-    /// bypasses the bare-model guard, so callers are never wedged.
+    /// forced refresh — replaces it); a stale entry is repaired by the next
+    /// catalog refresh, so callers are never wedged for good.
     pub(crate) fn cached_catalog_claims(&self, provider_id: &str, bare_id: &str) -> Option<bool> {
         let source = source_for(provider_id)?;
         let version_key = (source.version_key)();
@@ -505,9 +505,10 @@ impl ModelCatalogCache {
     }
 
     /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).
-    /// `model_id` may be compound (`provider:model`, restricting the search to
-    /// that provider) or bare (searched across every registered provider in
-    /// registry order). Returns the first non-empty `effortLevels` list found
+    /// `model_id` is a bare id (searched across every registered provider in
+    /// registry order); a legacy compound `provider:model` value from an old
+    /// session row still restricts the search to its named provider.
+    /// Returns the first non-empty `effortLevels` list found
     /// on a matching cached row, or `None` when there is no evidence — no
     /// cached entry, no matching row, or a row that declares no levels.
     /// Synchronous, read-only, and probe-free like

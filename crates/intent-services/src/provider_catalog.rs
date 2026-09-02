@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 /// Build the full `providers.catalog` result: `{ providers: [...] }`. No
 /// provider carries a default designation — clients derive an effective
-/// default from settings (`model.default` prefix, else `providers.active`).
+/// default from settings (`model.defaultProvider`).
 /// Gating is evaluated against the daemon's process environment (see
 /// [`provider_visible`]).
 pub(crate) fn build_providers_catalog() -> Value {

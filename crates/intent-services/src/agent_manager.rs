@@ -3133,11 +3133,10 @@ impl AgentManager {
             })
             .collect();
 
-        // The persisted model (bare part of a compound id) feeds the
-        // post-session model application for providers whose adapter takes
-        // the model over ACP — `session/set_model` (grok) or
-        // `session/set_config_option` (claude-code, codex) — see
-        // `maybe_apply_session_model`.
+        // The persisted model (a bare id) feeds the post-session model
+        // application for providers whose adapter takes the model over ACP —
+        // `session/set_model` (grok) or `session/set_config_option`
+        // (claude-code, codex) — see `maybe_apply_session_model`.
         let stored_model = session_record.model.clone();
 
         // The persisted `reasoningEffort` (PROTOCOL §5.5) feeds the generic
@@ -8508,24 +8507,16 @@ fn derive_is_orchestrator(
     services.session_specialist_is_orchestrator(session, workspace_path.as_deref())
 }
 
-/// Effective provider id for a session. Provider precedence: when the model
-/// carries an explicit `provider:` prefix (e.g., "opencode:kimi-k3"), that
-/// prefix wins over `session.provider`, because a cross-provider model switch
-/// should spawn the new provider's binary. `session.provider` is only used as
-/// a fallback for bare model ids, then `configured_default` (the settings-
-/// derived default — `model.default` prefix, else `providers.active`).
-/// Delegates to [`crate::agent_session::resolve_provider_id`], which also
-/// guards against malformed compound ids like `:sonnet` (empty prefixes fall
-/// through to the provider field / configured default). `None` when nothing
-/// resolves (monorepo#3044): the spawn must fail loudly instead of running
-/// the positional first registered provider (auggie), which may not be
-/// installed.
+/// Effective provider id for a session: `session.provider`, then
+/// `configured_default` (the settings-derived default —
+/// `model.defaultProvider`). Session `model` is always a bare id and never
+/// participates (compound `provider:model` ids are rejected at the wire).
+/// Delegates to [`crate::agent_session::resolve_provider_id`]. `None` when
+/// nothing resolves (monorepo#3044): the spawn must fail loudly instead of
+/// running the positional first registered provider (auggie), which may not
+/// be installed.
 fn session_provider_id(session: &AgentSession, configured_default: Option<&str>) -> Option<String> {
-    crate::agent_session::resolve_provider_id(
-        session.model.as_deref(),
-        session.provider.as_deref(),
-        configured_default,
-    )
+    crate::agent_session::resolve_provider_id(session.provider.as_deref(), configured_default)
 }
 
 /// Fallback phrasing for the workspace-naming nudge when the provider's MCP
@@ -8571,16 +8562,19 @@ fn resolve_spawn(
         crate::agent_session::derived_default_provider(settings).as_deref(),
     )
     .ok_or_else(|| crate::agent_session::no_default_provider_error("agent spawn"))?;
-    // Whitespace-bearing bare ids are effective-model display names persisted
-    // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows, e.g.
-    // `claude-code:Opus 4.8`) — stats/attribution values, not spawnable model
-    // ids. They must not reach `SpawnOptions.model` (CLI `--model` flags,
-    // codex config args, opencode env config); dropping them spawns on the
-    // provider default, exactly what the placeholder resolved from.
+    // Whitespace-bearing ids are effective-model display names persisted
+    // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows,
+    // e.g. `Opus 4.8`) — stats/attribution values, not spawnable model ids.
+    // They must not reach `SpawnOptions.model` (CLI `--model` flags, codex
+    // config args, opencode env config); dropping them spawns on the
+    // provider default, exactly what the placeholder resolved from. Legacy
+    // compound rows (`provider:model`, pre-wire-rejection) are stripped to
+    // their bare part on the same terms.
     let model = session
         .model
         .as_ref()
-        .map(|m| intent_providers::parse_compound_model_id(m).1)
+        .map(|m| m.split_once(':').map_or(m.as_str(), |(_, bare)| bare))
+        .map(str::to_string)
         .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace));
     // Session-level reasoning effort (PROTOCOL §5.5, Option B): threaded to
     // `SpawnOptions.reasoning_effort` so the codex spawn path applies it as
@@ -13294,7 +13288,7 @@ mod v1_turn_envelope_goldens {
         .unwrap();
         let (mgr, _seeded, _db) =
             manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
-        // Untitled workspace + auggie-modeled agent → deterministic naming
+        // Untitled workspace + auggie-provided agent → deterministic naming
         // nudge with the auggie tool spelling.
         let ws = WorkspaceId::from("ws-untitled");
         let mut w = workspace(&ws);
@@ -13302,7 +13296,8 @@ mod v1_turn_envelope_goldens {
         mgr.services.store.insert_workspace(&w).await.unwrap();
         let agent_id = AgentId::from("agent-env");
         let mut s = session(&agent_id, &ws, Some("implementor"));
-        s.model = Some("auggie:sonnet4.5".to_string());
+        s.provider = Some("auggie".to_string());
+        s.model = Some("sonnet4.5".to_string());
         s.system_prompt = Some("SP body".to_string());
         mgr.services.store.insert_agent_session(&s).await.unwrap();
         // Arm the §18.1 prepend fallback (mock has no native SP mechanism)

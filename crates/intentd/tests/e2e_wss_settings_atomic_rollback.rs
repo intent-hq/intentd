@@ -6,7 +6,7 @@
 //! - retired `model.workspaceOverrides`: `settings.update` over WSS
 //!   tolerates-and-ignores the retired path while `settings.get` rejects it;
 //! - default-provider switch (monorepo#3177): a `settings.update` batch
-//!   switching `providers.active` re-resolves `model.default` for the new
+//!   switching `model.defaultProvider` re-resolves `model.default` for the new
 //!   provider (cached catalog default, else cleared);
 //! - `tokenImpact` annotations: every `agentFeatures.*` definition in
 //!   `settings.list` carries its approximate token-impact string, and
@@ -546,7 +546,7 @@ fn model_default_values(changes: &Value) -> Vec<Value> {
 }
 
 /// Default-provider switch over WSS (monorepo#3177): a `settings.update`
-/// batch that switches `providers.active` re-resolves `model.default` for the
+/// batch that switches `model.defaultProvider` re-resolves `model.default` for the
 /// new provider — the cached catalog default as a compound id when the cache
 /// is warm (seeded `models-cache.json`), a blank clearing value when it is
 /// cold — and the injected entry rides the same response `applied` list AND
@@ -610,15 +610,16 @@ async fn provider_switch_reresolves_default_model_over_wss() {
     assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
 
     // Baseline: an explicit model pick in the same batch is authoritative —
-    // the side effect must not run even though providers.active is written.
+    // the side effect must not run even though model.defaultProvider is
+    // written.
     let resp = wss_rpc(
         &mut ws,
         1,
         "settings.update",
         json!({
             "changes": [
-                {"path": "providers.active", "value": "auggie"},
-                {"path": "model.default", "value": "auggie:fable-5"}
+                {"path": "model.defaultProvider", "value": "auggie"},
+                {"path": "model.default", "value": "fable-5"}
             ]
         }),
     )
@@ -629,21 +630,21 @@ async fn provider_switch_reresolves_default_model_over_wss() {
     let changes = next_settings_changed(&mut sub).await;
     assert_eq!(
         model_default_values(&changes),
-        vec![json!("auggie:fable-5")],
+        vec![json!("fable-5")],
         "explicit pick rides the event verbatim, exactly once: {changes}"
     );
     let resp = wss_rpc(&mut ws, 2, "settings.get", json!({"path": "model.default"})).await;
-    assert_eq!(resp["result"]["value"], json!("auggie:fable-5"));
+    assert_eq!(resp["result"]["value"], json!("fable-5"));
 
     // Switch to grok (warm cache): the batch gains a re-resolved
-    // model.default — the catalog row marked isDefault, compound-prefixed.
+    // model.default — the catalog row marked isDefault, as a bare id.
     let resp = wss_rpc(
         &mut ws,
         3,
         "settings.update",
         json!({
             "changes": [
-                {"path": "providers.active", "value": "grok"}
+                {"path": "model.defaultProvider", "value": "grok"}
             ]
         }),
     )
@@ -655,17 +656,17 @@ async fn provider_switch_reresolves_default_model_over_wss() {
         2,
         "switch must apply provider + re-resolved model: {resp}"
     );
-    assert_eq!(applied[0]["path"], json!("providers.active"), "{resp}");
+    assert_eq!(applied[0]["path"], json!("model.defaultProvider"), "{resp}");
     assert_eq!(applied[1]["path"], json!("model.default"), "{resp}");
-    assert_eq!(applied[1]["value"], json!("grok:grok-code-fast"), "{resp}");
+    assert_eq!(applied[1]["value"], json!("grok-code-fast"), "{resp}");
     let changes = next_settings_changed(&mut sub).await;
     assert_eq!(
         model_default_values(&changes),
-        vec![json!("grok:grok-code-fast")],
+        vec![json!("grok-code-fast")],
         "injected re-resolved model rides the event exactly once: {changes}"
     );
     let resp = wss_rpc(&mut ws, 4, "settings.get", json!({"path": "model.default"})).await;
-    assert_eq!(resp["result"]["value"], json!("grok:grok-code-fast"));
+    assert_eq!(resp["result"]["value"], json!("grok-code-fast"));
 
     // Switch back to auggie (cold cache — nothing seeded for it): the stale
     // grok model is CLEARED, never left shadowing the switched provider.
@@ -675,7 +676,7 @@ async fn provider_switch_reresolves_default_model_over_wss() {
         "settings.update",
         json!({
             "changes": [
-                {"path": "providers.active", "value": "auggie"}
+                {"path": "model.defaultProvider", "value": "auggie"}
             ]
         }),
     )
@@ -698,7 +699,7 @@ async fn provider_switch_reresolves_default_model_over_wss() {
         &mut ws,
         7,
         "settings.get",
-        json!({"path": "providers.active"}),
+        json!({"path": "model.defaultProvider"}),
     )
     .await;
     assert_eq!(resp["result"]["value"], json!("auggie"));

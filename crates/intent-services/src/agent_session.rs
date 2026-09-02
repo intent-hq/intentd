@@ -1092,42 +1092,33 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 }
 
 /// Derive the user-configured default provider from the effective settings:
-/// the provider prefix of the configured default model (`model.default`
-/// compound prefix), else `providers.active`. Each candidate is validated
-/// against the provider registry ([`intent_providers::find_provider`]) so a
-/// stale, mistyped, or foreign-build id falls through to the next precedence
-/// step instead of being trusted (an unknown `model.default` prefix must not
-/// shadow a perfectly valid `providers.active`). `None` when neither yields
-/// a registered provider — no provider carries a hardcoded default
+/// `model.defaultProvider`, validated against the provider registry
+/// ([`intent_providers::find_provider`]) so a stale, mistyped, or
+/// foreign-build id reads as unset instead of being trusted. `None` when it
+/// is unset or fails validation — no provider carries a hardcoded default
 /// designation, and there is no positional last resort (monorepo#3044):
 /// resolution that falls through entirely fails loudly at the caller.
+/// The deprecated `providers.active` is deliberately NOT consulted — the
+/// boot migration ([`crate::settings::migrate_active_provider_setting`])
+/// carries a legacy value into `model.defaultProvider` once at startup.
 pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
-    /// Accept a candidate id only when it names a registered provider
-    /// (whitespace-trimmed, so padded settings values still resolve).
-    fn registered(id: &str) -> Option<String> {
-        let id = id.trim();
-        intent_providers::find_provider(id).map(|p| p.id.to_string())
-    }
-    settings
-        .model
-        .default
-        .as_deref()
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .and_then(|id| registered(&id))
-        .or_else(|| settings.providers.active.as_deref().and_then(registered))
+    settings.model.default_provider.as_deref().and_then(|id| {
+        // Accept the candidate only when it names a registered provider
+        // (whitespace-trimmed, so padded settings values still resolve).
+        intent_providers::find_provider(id.trim()).map(|p| p.id.to_string())
+    })
 }
 
-/// Resolve the effective provider id for an agent session using the same precedence
-/// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
-/// yields a non-empty provider) → `provider` field → `configured_default` (the
-/// settings-derived default — see [`derived_default_provider`] — when the
-/// caller has one to offer). Malformed compound ids like `:sonnet` yield an
-/// empty prefix and fall through to the provider field / configured default.
-/// This ensures `_meta` injection, spawn args, and all provider-keyed logic
-/// use a consistent provider id.
+/// Resolve the effective provider id for an agent session using the same
+/// precedence as the spawn path (§6.9): explicit `provider` field →
+/// `configured_default` (the settings-derived default — see
+/// [`derived_default_provider`] — when the caller has one to offer). Session
+/// `model` is always a bare id and never participates in provider resolution
+/// (compound `provider:model` ids are rejected at the wire). This ensures
+/// `_meta` injection, spawn args, and all provider-keyed logic use a
+/// consistent provider id.
 ///
 /// `None` when nothing resolves (monorepo#3044): the former positional last
 /// resort (the first registered provider, auggie) silently spawned a binary
@@ -1135,19 +1126,12 @@ pub(crate) fn derived_default_provider(
 /// [`no_default_provider_error`] instead; stats-attribution callers (which
 /// pass `configured_default: None`) fall to their existing `"unknown"` tail.
 pub(crate) fn resolve_provider_id(
-    model: Option<&str>,
     provider: Option<&str>,
     configured_default: Option<&str>,
 ) -> Option<String> {
-    model
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
-        .or_else(|| {
-            provider
-                .filter(|p| !p.is_empty())
-                .map(std::string::ToString::to_string)
-        })
+    provider
+        .filter(|p| !p.is_empty())
+        .map(std::string::ToString::to_string)
         .or_else(|| {
             configured_default
                 .filter(|p| !p.is_empty())
@@ -1163,9 +1147,9 @@ pub(crate) fn resolve_provider_id(
 pub(crate) fn no_default_provider_error(context: &str) -> Error {
     Error::InvalidParams(format!(
         "{context}: no default provider/model is configured — no explicit \
-         provider or model was given and neither providers.active nor a \
-         compound model.default is set. Choose a provider in Settings > \
-         Agents, or pass an explicit provider/model."
+         provider or model was given and model.defaultProvider is not set. \
+         Choose a provider in Settings > Agents, or pass an explicit \
+         provider/model."
     ))
 }
 
@@ -1234,7 +1218,7 @@ fn resolve_effective_model(config_options: Option<&[SessionConfigOption]>) -> Op
 
 /// Resolve the display identity of an EXPLICITLY selected model id against
 /// the same `configOptions[id="model"]` option list the default path uses
-/// (D14): match the stored bare id (compound prefix stripped) against an
+/// (D14): match the stored bare id against an
 /// option's `value` and derive a version-bearing family display from that
 /// entry's name/description (e.g. `claude-fable-5[1m]` → name "Fable" is
 /// version-less, description "Fable 5 with 1M context · …" → `"Fable 5"`).
@@ -2066,13 +2050,6 @@ impl Services {
     /// value (`None` matches NULL), so it loses benignly to a concurrent
     /// `agent.setModel`.
     ///
-    /// Dropped guarantee (intentional): the old rewrite persisted the
-    /// compound `{provider_id}:{effective}`, which as a side effect pinned
-    /// the provider for legacy rows with a NULL `model` AND an empty
-    /// `provider`. Such rows now fall through to the configured default /
-    /// first-registered provider on every resolution — a reversion to
-    /// pre-D13 behavior; current creation paths pin `model` at creation, so
-    /// no new rows enter that population.
     ///
     /// A NON-placeholder (explicitly selected) model takes the D14 branch
     /// instead: its display identity is resolved against the same option
@@ -2129,9 +2106,8 @@ impl Services {
     /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
     /// resolve an EXPLICITLY selected model id's display identity against the
     /// session-open `configOptions` and persist it to `resolved_model`. The
-    /// bare id (compound `{provider}:` prefix stripped — stored explicit
-    /// picks are compound, option values are bare) is matched against the
-    /// model select's option values. The outcome is persisted EITHER way — a
+    /// stored bare id is matched against the model select's option values.
+    /// The outcome is persisted EITHER way — a
     /// `None` resolution overwrites (clears) any previously persisted
     /// display name, so a resolution from an older option list can never go
     /// stale and mis-attribute stats after the provider's catalog changes.
@@ -2147,8 +2123,7 @@ impl Services {
         config_options: Option<&[SessionConfigOption]>,
     ) {
         let Some(stored) = stored_model else { return };
-        let (_, bare_id) = intent_providers::parse_compound_model_id(stored);
-        let resolved = resolve_explicit_display_model(&bare_id, config_options);
+        let resolved = resolve_explicit_display_model(stored, config_options);
         match self
             .store
             .set_agent_session_resolved_model(
@@ -2240,13 +2215,12 @@ impl Services {
         // resolved this agent id inside a workspace-scoped path.
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
-        // Resolve provider using the same precedence as spawn path (compound model
-        // prefix → provider field → configured default), then build
-        // provider-specific _meta. Reached only after a successful spawn (which
-        // resolved the same inputs), so a fall-through here is a settings race —
-        // fail loudly rather than fabricating a positional default (monorepo#3044).
+        // Resolve provider using the same precedence as spawn path (provider
+        // field → configured default), then build provider-specific _meta.
+        // Reached only after a successful spawn (which resolved the same
+        // inputs), so a fall-through here is a settings race — fail loudly
+        // rather than fabricating a positional default (monorepo#3044).
         let provider_id = resolve_provider_id(
-            stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
@@ -2319,7 +2293,6 @@ impl Services {
         // the same prompt as new/load). Same loud fall-through as
         // [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
-            stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
@@ -2408,7 +2381,6 @@ impl Services {
         // provider-specific _meta for system-prompt injection. Same loud
         // fall-through as [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
-            stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
@@ -4113,8 +4085,7 @@ impl Services {
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((model, _, provider, _)) => resolve_provider_id(
-                model.as_deref(),
+            Ok((_, _, provider, _)) => resolve_provider_id(
                 provider.as_deref(),
                 derived_default_provider(&self.effective_settings()).as_deref(),
             ),
@@ -4163,20 +4134,19 @@ impl Services {
     ) {
         // The session row is read unconditionally: the stored snapshot backs
         // both the missing-half fallback and the SUM accumulation, and the
-        // model/provider columns key the report semantics. The configured
-        // default is passed through so the resolution mirrors the spawn
-        // precedence exactly: a bare-model session with `provider = NULL`
-        // actually runs on `providers.active`, and classifying it as the
-        // Cumulative default would reintroduce the undercount for a SUM
-        // default provider (#3794/#3795).
+        // provider column keys the report semantics. The configured default
+        // is passed through so the resolution mirrors the spawn precedence
+        // exactly: a session with `provider = NULL` actually runs on the
+        // settings-derived default, and classifying it as the Cumulative
+        // default would reintroduce the undercount for a SUM default
+        // provider (#3794/#3795).
         let (stored, semantics, per_turn_cost, thought_subset) = match self
             .store
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((model, _, provider, stored)) => {
+            Ok((_, _, provider, stored)) => {
                 let provider_id = resolve_provider_id(
-                    model.as_deref(),
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 );
@@ -4306,17 +4276,16 @@ impl Services {
                 (None, None, None, None, false)
             }
         };
-        // Resolution mirrors the spawn precedence (compound model prefix →
-        // provider field → configured default) so a bare-model session with
-        // `provider = NULL` — which actually runs on `providers.active` —
-        // keys the correct report semantics instead of falling to the
-        // Cumulative default (#3794/#3795). A still-unresolvable provider
-        // falls to the `"unknown"` stats tail (and the cumulative semantics
-        // default below).
+        // Resolution mirrors the spawn precedence (provider field →
+        // configured default) so a session with `provider = NULL` — which
+        // actually runs on the settings-derived default — keys the correct
+        // report semantics instead of falling to the Cumulative default
+        // (#3794/#3795). A still-unresolvable provider falls to the
+        // `"unknown"` stats tail (and the cumulative semantics default
+        // below).
         let provider_id = prev_readable
             .then(|| {
                 resolve_provider_id(
-                    model.as_deref(),
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 )

@@ -892,41 +892,6 @@ fn enhanced_path_dirs_mirror_the_joined_spawn_path() {
 }
 
 #[test]
-fn compound_model_id_round_trip() {
-    assert_eq!(
-        parse_compound_model_id("opencode:claude-sonnet-4"),
-        ("opencode".to_string(), "claude-sonnet-4".to_string())
-    );
-    // Only the first ':' splits; the model may itself contain ':'.
-    assert_eq!(
-        parse_compound_model_id("codex:gpt-5.3-codex/high"),
-        ("codex".to_string(), "gpt-5.3-codex/high".to_string())
-    );
-    // Bare id belongs to the default provider.
-    assert_eq!(
-        parse_compound_model_id("opus4.7"),
-        ("auggie".to_string(), "opus4.7".to_string())
-    );
-    assert_eq!(
-        create_compound_model_id("codex", "gpt-5.3-codex/high"),
-        "codex:gpt-5.3-codex/high"
-    );
-}
-
-#[test]
-fn model_validity_follows_compound_prefix() {
-    assert!(is_model_valid_for_provider(
-        "codex:gpt-5.3-codex/high",
-        "codex"
-    ));
-    assert!(is_model_valid_for_provider("opus4.7", "auggie"));
-    assert!(!is_model_valid_for_provider(
-        "codex:gpt-5.3-codex/high",
-        "auggie"
-    ));
-}
-
-#[test]
 fn fuzzy_and_override_resolution() {
     let pool = ["sonnet4.5", "sonnet4.6", "haiku4.5"];
     assert_eq!(

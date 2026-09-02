@@ -660,6 +660,45 @@ pub(crate) fn find_definition(path: &str) -> Option<SettingDefinition> {
     definitions().into_iter().find(|d| d.path == path)
 }
 
+/// The model-valued settings keys whose string value must be a BARE model id
+/// (no `provider:model` compounds — the wire contract since the compound-id
+/// rejection). Object-shaped siblings (`model.providerDefaults`,
+/// `quickActions.typeOverrides`) enforce the same rule on their map values.
+const BARE_MODEL_STRING_PATHS: &[&str] = &["model.default", "quickActions.defaultModel"];
+const BARE_MODEL_MAP_PATHS: &[&str] = &["model.providerDefaults", "quickActions.typeOverrides"];
+
+/// `settings.update` guard: reject a compound `provider:model` value written
+/// to a model-valued key with `-32602`, instead of persisting a value the
+/// resolvers would then silently discard (they only accept bare ids). Blank
+/// values pass — they read as unset.
+fn validate_bare_model_id(path: &str, value: &Value) -> Result<()> {
+    let reject = |value: &str| {
+        Err(Error::InvalidParams(format!(
+            "{path}: model values must be bare model ids without ':' (got \"{value}\"); \
+             set the provider via model.defaultProvider instead"
+        )))
+    };
+    if BARE_MODEL_STRING_PATHS.contains(&path) {
+        if let Some(s) = value.as_str() {
+            if s.contains(':') {
+                return reject(s);
+            }
+        }
+    }
+    if BARE_MODEL_MAP_PATHS.contains(&path) {
+        if let Some(map) = value.as_object() {
+            for v in map.values() {
+                if let Some(s) = v.as_str() {
+                    if s.contains(':') {
+                        return reject(s);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn boolean(
     path: &'static str,
     label: &'static str,
@@ -894,8 +933,9 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         // --- Group A: providers / agents -----------------------------------
         string(
             "providers.active",
-            "Active provider",
-            "Default agent provider",
+            "Active provider (deprecated)",
+            "Deprecated: superseded by model.defaultProvider (migrated once at startup, then \
+             never consulted); remove it from config.toml",
             "providers",
             None,
         ),
@@ -916,7 +956,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         string(
             "model.default",
             "Default model",
-            "Fallback model for new agents",
+            "Fallback model for new agents (a bare model id; pair with model.defaultProvider)",
+            "providers",
+            None,
+        ),
+        string(
+            "model.defaultProvider",
+            "Default provider",
+            "Provider new agents run on when none is requested explicitly (blank means unset)",
             "providers",
             None,
         ),
@@ -1822,6 +1869,71 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
     Ok(())
 }
 
+/// One-time boot carry-over of the deprecated `providers.active` into
+/// `model.defaultProvider`, which superseded it as the default-provider key
+/// (provider resolution never consults `providers.active` anymore). Without
+/// this an upgraded installation whose config only carries the legacy key
+/// would derive NO default provider and get self-healed to a registry-order
+/// pick — silently switching the user's configured provider.
+///
+/// The value carries over only when it names a registered provider
+/// (whitespace-trimmed) AND `model.defaultProvider` is still unset — an
+/// already-set target is never clobbered, making the carry-over idempotent
+/// across boots. Independently of whether anything migrates, a set
+/// `providers.active` logs a deprecation WARN every boot until the user
+/// removes it from `config.toml`.
+///
+/// # Errors
+///
+/// Never errors today: migration failures are logged and skipped. The `Result` keeps parity with the other startup migrations.
+pub fn migrate_active_provider_setting(registry: &SettingsRegistry) -> Result<()> {
+    let Some(active) = registry
+        .get("providers.active")
+        .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(());
+    };
+    tracing::warn!(
+        value = active,
+        "providers.active is deprecated and no longer consulted by provider \
+         resolution; remove it from config.toml (model.defaultProvider is the \
+         default-provider key now)"
+    );
+    let target_set = registry
+        .get("model.defaultProvider")
+        .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
+        .is_some_and(|v| !v.is_empty());
+    if target_set {
+        return Ok(());
+    }
+    if intent_providers::find_provider(&active).is_none() {
+        tracing::warn!(
+            value = active,
+            "providers.active names no registered provider; not carried over \
+             to model.defaultProvider"
+        );
+        return Ok(());
+    }
+    let canonical = intent_providers::provider_config(&active).id;
+    if let Err(e) = registry.apply(&[(
+        "model.defaultProvider".to_string(),
+        Value::String(canonical.to_string()),
+    )]) {
+        tracing::warn!(
+            error = %e,
+            "failed to carry providers.active over to model.defaultProvider; \
+             continuing (next boot retries)"
+        );
+        return Ok(());
+    }
+    tracing::info!(
+        provider = canonical,
+        "migrated deprecated providers.active into model.defaultProvider"
+    );
+    Ok(())
+}
+
 /// One-time boot cleanup of stale `SQLite` rows for retired settings. The
 /// per-workspace override blob (`model.workspaceOverrides`, monorepo#1000)
 /// no longer has a catalog entry or any reader; delete its row so stale
@@ -2088,6 +2200,7 @@ impl<'a> SettingsService<'a> {
                 return Err(Error::InvalidParams(format!("{path} is read-only")));
             }
             def.validate(&value)?;
+            validate_bare_model_id(path, &value)?;
             planned.push((def, value));
         }
 
@@ -3997,7 +4110,7 @@ mod tests {
         let applied = svc
             .update(&json!([
                 { "path": "backgroundAgents.defaultModel", "value": "auggie:haiku" },
-                { "path": "quickActions.defaultModel", "value": "auggie:opus" },
+                { "path": "quickActions.defaultModel", "value": "opus" },
             ]))
             .await
             .expect("mixed batch must apply its live entry");
@@ -4005,7 +4118,7 @@ mod tests {
         assert_eq!(applied[0]["path"], "quickActions.defaultModel");
         assert_eq!(
             registry.get("quickActions.defaultModel"),
-            Some(json!("auggie:opus"))
+            Some(json!("opus"))
         );
 
         let _ = std::fs::remove_file(&config_path);
@@ -4129,6 +4242,140 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// Upgrade path: a config that predates `model.defaultProvider` and only
+    /// carries the deprecated `providers.active` has that value carried over
+    /// once at boot ([`migrate_active_provider_setting`]) — provider
+    /// resolution never consults the legacy key, so without the carry-over an
+    /// upgraded install would degrade to "no default" and get self-healed to
+    /// a registry-order pick (a silent provider switch).
+    #[tokio::test]
+    async fn active_provider_migration_carries_legacy_value_over() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-actmig-{tag}.toml"));
+        std::fs::write(&config_path, "[providers]\nactive = \" codex \"\n")
+            .expect("seed legacy config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_active_provider_setting(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("model.defaultProvider"),
+            Some(json!("codex")),
+            "the trimmed legacy value must carry over"
+        );
+
+        // Re-running (next boot) is a no-op: the target is set now.
+        registry
+            .apply(&[("model.defaultProvider".into(), json!("auggie"))])
+            .expect("user re-picks");
+        migrate_active_provider_setting(&registry).expect("migrate again");
+        assert_eq!(
+            registry.get("model.defaultProvider"),
+            Some(json!("auggie")),
+            "an already-set target is never clobbered"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// The carry-over never clobbers an already-set `model.defaultProvider`,
+    /// and an unregistered legacy value is left where it is (WARN only) —
+    /// nothing is invented.
+    #[tokio::test]
+    async fn active_provider_migration_respects_target_and_registry() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-actkeep-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[providers]\nactive = \"codex\"\n\n[model]\ndefaultProvider = \"claude-code\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        migrate_active_provider_setting(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("model.defaultProvider"),
+            Some(json!("claude-code")),
+            "a set model.defaultProvider must win over the legacy key"
+        );
+        let _ = std::fs::remove_file(&config_path);
+
+        let config_path2 = std::env::temp_dir().join(format!("intentd-settings-actbad-{tag}.toml"));
+        std::fs::write(&config_path2, "[providers]\nactive = \"not-a-provider\"\n")
+            .expect("seed config");
+        let registry2 = SettingsRegistry::load(&config_path2).expect("load registry");
+        migrate_active_provider_setting(&registry2).expect("migrate");
+        assert_eq!(
+            registry2.origin("model.defaultProvider"),
+            Some(SettingOrigin::Default),
+            "an unregistered legacy value must not carry over"
+        );
+        let _ = std::fs::remove_file(&config_path2);
+
+        // No legacy key at all: nothing to do.
+        let config_path3 =
+            std::env::temp_dir().join(format!("intentd-settings-actnone-{tag}.toml"));
+        std::fs::write(&config_path3, "").expect("seed config");
+        let registry3 = SettingsRegistry::load(&config_path3).expect("load registry");
+        migrate_active_provider_setting(&registry3).expect("migrate");
+        assert_eq!(
+            registry3.origin("model.defaultProvider"),
+            Some(SettingOrigin::Default)
+        );
+        let _ = std::fs::remove_file(&config_path3);
+    }
+
+    /// `settings.update` rejects compound `provider:model` values on the
+    /// model-valued keys with `-32602` (string keys and the map values of the
+    /// object-shaped ones) instead of persisting a value the resolvers would
+    /// silently discard; bare ids and blank values still pass.
+    #[tokio::test]
+    async fn update_rejects_compound_model_values() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-baremdl-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-baremdl-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        for (path, value) in [
+            ("model.default", json!("codex:gpt-5")),
+            ("quickActions.defaultModel", json!("auggie:haiku")),
+            ("model.providerDefaults", json!({ "codex": "codex:gpt-5" })),
+            (
+                "quickActions.typeOverrides",
+                json!({ "commit": "auggie:fast" }),
+            ),
+        ] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("compound model value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path}, got {err:?}"
+            );
+        }
+
+        // Bare ids and blanks pass; the map shape accepts bare values.
+        svc.update(&json!([
+            { "path": "model.default", "value": "gpt-5" },
+            { "path": "quickActions.defaultModel", "value": "" },
+            { "path": "model.providerDefaults", "value": { "codex": "gpt-5" } },
+        ]))
+        .await
+        .expect("bare values must pass");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// [`cleanup_retired_settings`] deletes the stale `SQLite` row left behind

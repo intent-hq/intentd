@@ -5687,11 +5687,12 @@ async fn build_turn_prompt_naming_instruction_uses_opencode_tool_name() {
     );
 }
 
-/// A compound `provider:model` id wins over `session.provider` for the nudge
-/// spelling (same precedence as `resolve_spawn`): an auggie-flagged session
-/// whose model targets opencode gets the opencode tool name.
+/// `session.provider` rules the nudge spelling regardless of the model id
+/// (same precedence as `resolve_spawn`): a legacy compound model row on an
+/// auggie-flagged session still gets the auggie tool name — model strings
+/// never participate in provider resolution.
 #[tokio::test]
-async fn build_turn_prompt_naming_instruction_prefers_model_provider_prefix() {
+async fn build_turn_prompt_naming_instruction_ignores_model_string() {
     let (_tmp, mgr) = manager().await;
     let (ws, id) = (
         WorkspaceId::from("ws-compound"),
@@ -5725,51 +5726,8 @@ async fn build_turn_prompt_naming_instruction_prefers_model_provider_prefix() {
         .unwrap()
         .to_string();
     assert!(
-        text.contains("`workspace-mcp_set_workspace_title`"),
-        "model provider prefix wins over session.provider: {text:?}"
-    );
-}
-
-/// A malformed compound model id (`:sonnet` — empty provider prefix) must not
-/// shadow `session.provider`: the empty prefix falls through and the session's
-/// provider spelling is used (guard in `agent_session::resolve_provider_id`).
-#[tokio::test]
-async fn build_turn_prompt_naming_instruction_ignores_empty_compound_prefix() {
-    let (_tmp, mgr) = manager().await;
-    let (ws, id) = (
-        WorkspaceId::from("ws-malformed"),
-        AgentId::from("a-malformed"),
-    );
-    seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
-    session.provider = Some("auggie".to_string());
-    session.model = Some(":sonnet".to_string());
-    mgr.services
-        .store
-        .update_agent_session(&ws, &session)
-        .await
-        .unwrap();
-    mgr.services
-        .store
-        .append_agent_message(
-            &id,
-            "user",
-            &json!([{ "type": "text", "text": "hello" }]),
-            &now_iso(),
-        )
-        .await
-        .unwrap();
-
-    let prompt = mgr
-        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
-    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
         text.contains("`set_workspace_title_workspace-mcp`"),
-        "empty compound prefix must fall through to session.provider: {text:?}"
+        "session.provider rules; the model string never overrides it: {text:?}"
     );
 }
 
@@ -8229,14 +8187,13 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
         "chooser",
         "---\nname: \"Chooser\"\ndescription: \"Has options\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"},{\"model\":\"auggie:opus\"}]\n---\n\nbody",
     );
-    // Carries options plus a frontmatter `model` on the default provider →
-    // the resolved default is reported alongside them.
+    // Carries options plus a bare frontmatter `model` → the resolved default
+    // is reported alongside them (validated against the settings-derived
+    // default provider seeded below).
     let default_provider = intent_providers::first_provider_id();
     dir.write(
         "pinned",
-        &format!(
-            "---\nname: \"Pinned\"\ndescription: \"Pinned default\"\nmodel: \"{default_provider}:pinned-model\"\nmodelOptions: [{{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}}]\n---\n\nbody"
-        ),
+        "---\nname: \"Pinned\"\ndescription: \"Pinned default\"\nmodel: \"pinned-model\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}]\n---\n\nbody",
     );
     // No options → omitted.
     dir.write(
@@ -8248,7 +8205,12 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
         "ghost",
         "---\nname: \"Ghost\"\ndescription: \"Hidden\"\nhidden: true\nmodelOptions: [{\"model\":\"grok:grok-5\",\"hint\":\"fast\"}]\n---\n\nbody",
     );
-    let (_tmp, services) = services_with_specialists(&dir).await;
+    let (_tmp, services, _cfg) = services_with_specialists_and_registry(&dir).await;
+    services
+        .settings_registry()
+        .expect("registry wired")
+        .apply(&[("model.defaultProvider".to_string(), json!(default_provider))])
+        .expect("set default provider");
 
     let listed = services.specialist_model_options(None);
     let chooser = listed
@@ -8268,7 +8230,7 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
         .expect("pinned listed");
     assert_eq!(
         pinned.default_model.as_deref(),
-        Some(format!("{default_provider}:pinned-model").as_str()),
+        Some("pinned-model"),
         "the frontmatter default must be reported as the specialist's default"
     );
     assert!(
@@ -8302,7 +8264,7 @@ async fn specialist_model_options_default_honors_specialist_coding_agent_overrid
         .expect("registry wired")
         .apply(&[(
             "model.providerDefaults".to_string(),
-            json!({ "opencode": "opencode:default-model" }),
+            json!({ "opencode": "default-model" }),
         )])
         .expect("set opencode provider default");
 
@@ -8313,7 +8275,7 @@ async fn specialist_model_options_default_honors_specialist_coding_agent_overrid
         .expect("opencode-pinned listed");
     assert_eq!(
         pinned.default_model.as_deref(),
-        Some("opencode:default-model"),
+        Some("default-model"),
         "default must be resolved against the specialist's own codingAgent \
          override ({default_provider} is the settings-derived default, not opencode)"
     );
@@ -8338,7 +8300,8 @@ async fn specialist_model_options_default_ignores_quick_action_settings() {
                 "quickActions.typeOverrides".to_string(),
                 json!({ "chooser": "auggie:quick-action-model" }),
             ),
-            ("model.default".to_string(), json!("auggie:settings-model")),
+            ("model.default".to_string(), json!("settings-model")),
+            ("model.defaultProvider".to_string(), json!("auggie")),
         ])
         .expect("set quick-action type override + default model");
 
@@ -8349,7 +8312,7 @@ async fn specialist_model_options_default_ignores_quick_action_settings() {
         .expect("chooser listed");
     assert_eq!(
         chooser.default_model.as_deref(),
-        Some("auggie:settings-model"),
+        Some("settings-model"),
         "quick-action type override must not apply to a delegated specialist"
     );
 }
@@ -12170,12 +12133,12 @@ async fn resolve_spawn_without_provider_or_default_fails_loudly() {
 }
 
 /// A bare session with no `provider`/`model` resolves via the settings-derived
-/// default (`providers.active`), no model, and the temp dir as cwd (no
+/// default (`model.defaultProvider`), no model, and the temp dir as cwd (no
 /// workspace path).
 #[tokio::test]
 async fn resolve_spawn_uses_configured_default_and_temp_cwd() {
     let mut settings = intent_core::settings_file::SettingsFile::default();
-    settings.providers.active = Some("mock".to_string());
+    settings.model.default_provider = Some("mock".to_string());
     let session = session_with_specialist(None);
     let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/mock-agent.js")]);
     let resolved = resolve_spawn(&session, None, &settings, None).expect("default resolves");
@@ -12185,10 +12148,9 @@ async fn resolve_spawn_uses_configured_default_and_temp_cwd() {
 }
 
 /// A persisted effective-model display name (legacy pre-monorepo#1534 row,
-/// whitespace-bearing, e.g. `claude-code:Opus 4.8`) still selects the
-/// provider via its compound prefix but never reaches `SpawnOptions.model` —
-/// it is a stats/attribution value, not a spawnable model id; the spawn runs
-/// on the provider default.
+/// whitespace-bearing, e.g. `claude-code:Opus 4.8`) never reaches
+/// `SpawnOptions.model` — it is a stats/attribution value, not a spawnable
+/// model id; the spawn runs on the provider default.
 #[tokio::test]
 async fn resolve_spawn_drops_effective_display_name_model() {
     if intent_providers::find_npx().is_none() {
@@ -12197,29 +12159,31 @@ async fn resolve_spawn_drops_effective_display_name_model() {
     }
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
+    session.provider = Some("claude-code".to_string());
     session.model = Some("claude-code:Opus 4.8".to_string());
     let resolved = resolve_spawn(&session, None, &settings, None).expect("resolves");
-    assert_eq!(resolved.provider.id, "claude-code", "prefix still wins");
+    assert_eq!(resolved.provider.id, "claude-code");
     assert!(
         resolved.model.is_none(),
         "display name must not become a spawn model id"
     );
 }
 
-/// A compound `provider:model` id selects both the provider and the bare model
-/// id, without needing an explicit `provider` on the session. claude-code is
-/// npx-only, so a successful resolution always carries the pinned npx package
-/// and never a locally-discovered provider binary.
+/// A legacy compound `provider:model` row (pre-wire-rejection) is stripped to
+/// its bare model half; the provider comes from `session.provider`.
+/// claude-code is npx-only, so a successful resolution always carries the
+/// pinned npx package and never a locally-discovered provider binary.
 #[tokio::test]
-async fn resolve_spawn_parses_compound_model_id() {
+async fn resolve_spawn_strips_legacy_compound_model_rows() {
     if intent_providers::find_npx().is_none() {
         eprintln!("skipping: npx not available on this host");
         return;
     }
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
+    session.provider = Some("claude-code".to_string());
     session.model = Some("claude-code:sonnet".to_string());
-    let resolved = resolve_spawn(&session, None, &settings, None).expect("compound resolves");
+    let resolved = resolve_spawn(&session, None, &settings, None).expect("legacy row resolves");
     assert_eq!(resolved.provider.id, "claude-code");
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
     assert_eq!(
@@ -12273,32 +12237,32 @@ fn resolve_npx_only_rejects_non_npx_only_provider() {
     assert!(err.to_string().contains("not configured for npx-only"));
 }
 
-/// When a model carries an explicit `provider:` prefix, that prefix wins over
-/// session.provider. This is the fix for cross-provider model switches: the
-/// compound prefix is the user's latest intent.
+/// `session.provider` rules the spawn regardless of the model string: a
+/// legacy compound row naming another provider does NOT reroute the spawn —
+/// only its bare model half survives.
 #[tokio::test]
-async fn resolve_spawn_compound_prefix_wins_over_session_provider() {
+async fn resolve_spawn_session_provider_wins_over_model_string() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
     session.model = Some("opencode:opencode-go/kimi-k3".to_string());
-    let resolved = resolve_spawn(&session, None, &settings, None).expect("compound prefix wins");
-    // The compound prefix (opencode) should win over session.provider (auggie).
-    assert_eq!(resolved.provider.id, "opencode");
+    let resolved = resolve_spawn(&session, None, &settings, None).expect("session provider wins");
+    // session.provider (auggie) rules; the legacy prefix never reroutes.
+    assert_eq!(resolved.provider.id, "auggie");
     // The model string is the bare half.
     assert_eq!(resolved.model.as_deref(), Some("opencode-go/kimi-k3"));
 }
 
-/// Session.provider is used as a fallback for bare model ids (no `:` prefix).
+/// The session's bare model id is passed through as-is under
+/// `session.provider`.
 #[tokio::test]
-async fn resolve_spawn_session_provider_fallback_for_bare_model() {
+async fn resolve_spawn_session_provider_with_bare_model() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("codex".to_string());
     session.model = Some("gpt-5.3-codex/high".to_string());
     let resolved =
-        resolve_spawn(&session, None, &settings, None).expect("session provider fallback");
-    // Bare model → session.provider is used.
+        resolve_spawn(&session, None, &settings, None).expect("session provider resolves");
     assert_eq!(resolved.provider.id, "codex");
     // The bare model is passed through as-is.
     assert_eq!(resolved.model.as_deref(), Some("gpt-5.3-codex/high"));

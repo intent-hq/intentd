@@ -1751,7 +1751,7 @@ impl Store {
     /// Persist a model switch (`agent.setModel`): a narrow write of `model`,
     /// `provider`, and `updated_at` only. This is the ONE writer allowed to
     /// change `provider` after first real use — an intentional cross-provider
-    /// model switch must reconcile `provider` to the compound id's prefix so
+    /// model switch must reconcile `provider` to the explicit providerId so
     /// the next spawn tears down the old child and runs the new provider's
     /// binary (monorepo#882). Accidental provider drift from every other
     /// writer is still rejected by [`Store::update_agent_session`]'s
@@ -6749,12 +6749,13 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
     }
 
-    /// Migration 0080 splits legacy codex `{base}/{effort}` compound model
-    /// ids into base model + `reasoning_effort`, guarded on codex evidence
-    /// (provider column, `codex:` prefix, or known effort-variant base) AND a
-    /// known effort suffix — slash-bearing non-codex ids stay untouched.
+    /// Migration 0080 splits legacy codex `{base}/{effort}` effort-suffixed
+    /// model ids into base model + `reasoning_effort`, guarded on codex
+    /// evidence (provider column, legacy `codex:` prefix, or known
+    /// effort-variant base) AND a known effort suffix — slash-bearing
+    /// non-codex ids stay untouched.
     #[tokio::test]
-    async fn migration_0080_splits_codex_compound_model_ids() {
+    async fn migration_0080_splits_codex_effort_suffixed_model_ids() {
         use intent_core::now_iso;
 
         use uuid::Uuid;
