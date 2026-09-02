@@ -8,10 +8,26 @@
 //! [`crate::one_shot_acp::run_one_shot_acp`]); this module owns only the
 //! structured result contract and the auth-verdict cache coupling.
 //!
+//! Unlike `completeOnce` (curated to `ACP_ONE_SHOT_PROVIDERS` because its
+//! *answer* is the product), the test prompt covers the whole catalog:
+//! every provider is driven through the same ACP adapter and launch args
+//! (`build_provider_args`) that real agent sessions spawn, and only turn
+//! *completion* matters — so any adapter a live session can use, the probe
+//! can exercise. Providers outside the completeOnce set are intentionally
+//! best-effort: a provider whose adapter cannot complete a bare one-shot
+//! turn surfaces a structured failure, never a wire error. `unsloth` alone
+//! opts out (`supports_test_prompt: false`) — its first prompt can trigger
+//! a very long model download/load cycle.
+//!
 //! Result contract (never a wire error once the provider id is known):
 //! success is `{ ok: true }`; failure is `{ ok: false, reason, message }`
 //! with `reason` ∈ `"unsupported" | "not-installed" | "spawn-failed" |
-//! "auth-required" | "timeout" | "error"`. An auth-required failure demotes
+//! "auth-required" | "busy" | "timeout" | "error"`. `busy` is pre-spawn
+//! queueing pressure — the daemon-wide adapter bound never freed a slot, no
+//! provider was ever launched, and the client can back off and retry — kept
+//! distinct from `timeout` (the provider itself blew a setup/prompt budget),
+//! mirroring `agent.completeOnce`'s `adapter-busy` split (monorepo#2062).
+//! An auth-required failure demotes
 //! the cached `host.providerAuthStatus` verdict to a hard `false`
 //! ([`crate::provider_auth::demote_auth_verdict`]); a success promotes it to
 //! `true` ([`crate::provider_auth::promote_auth_verdict`]) — a live answer
@@ -40,9 +56,8 @@ const TEST_PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
 fn failure_reason(err: &OneShotError) -> &'static str {
     match err {
         OneShotError::Spawn(_) => "spawn-failed",
-        OneShotError::QueueTimeout { .. }
-        | OneShotError::SetupTimeout
-        | OneShotError::PromptTimeout => "timeout",
+        OneShotError::QueueTimeout { .. } => "busy",
+        OneShotError::SetupTimeout | OneShotError::PromptTimeout => "timeout",
         OneShotError::Rpc(rpc)
             if crate::provider_models::is_auth_required_error(rpc.code, &rpc.message) =>
         {
@@ -173,8 +188,10 @@ mod tests {
 
     /// Every one-shot failure maps onto the wire `reason` vocabulary:
     /// auth-required detection rides the same code/message heuristic as the
-    /// spawn-feedback seam (`is_auth_required_error`), timeouts collapse the
-    /// three phase-timeout shapes, and everything else is a generic error.
+    /// spawn-feedback seam (`is_auth_required_error`), pre-spawn queueing
+    /// pressure is `busy` (distinct from the provider's own phase timeouts,
+    /// mirroring completeOnce's adapter-busy split), and everything else is
+    /// a generic error.
     #[test]
     fn failure_reason_covers_the_wire_vocabulary() {
         assert_eq!(
@@ -186,7 +203,7 @@ mod tests {
                 waited_ms: 1,
                 limit: 4
             }),
-            "timeout"
+            "busy"
         );
         assert_eq!(failure_reason(&OneShotError::SetupTimeout), "timeout");
         assert_eq!(failure_reason(&OneShotError::PromptTimeout), "timeout");

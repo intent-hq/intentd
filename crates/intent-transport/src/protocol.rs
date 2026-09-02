@@ -329,7 +329,8 @@
 //! (claude-code). Success `{ ok: true }` promotes the cached
 //! `host.providerAuthStatus` verdict to a hard `true`; failures are
 //! structured `{ ok: false, reason, message }` (`reason` ∈ `unsupported |
-//! not-installed | spawn-failed | auth-required | timeout | error`, never a
+//! not-installed | spawn-failed | auth-required | busy | timeout | error`,
+//! never a
 //! wire error — only an unknown `providerId` is `-32602`), and an
 //! auth-required failure demotes the verdict like the runtime spawn seam.
 //! `providers.catalog` rows gain the always-present `supportsTestPrompt`
