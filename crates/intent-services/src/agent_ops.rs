@@ -5300,6 +5300,12 @@ impl Services {
                 &format!("no dynamic model discovery for provider '{provider_id}'"),
             ));
         };
+        let antigravity_path = self
+            .effective_settings()
+            .providers
+            .paths
+            .get("antigravity")
+            .cloned();
         let version_key = (source.version_key)();
         let resolved = crate::model_catalog::resolve_with_cache(
             &self.models_catalog,
@@ -5307,7 +5313,20 @@ impl Services {
             &version_key,
             force_refresh,
             crate::model_catalog::ModelCatalogCache::now_ms(),
-            source.fetch,
+            move || {
+                if source.provider_id == "antigravity" {
+                    Box::pin(async move {
+                        crate::model_catalog::from_provider_fetch(
+                            crate::provider_models::fetch_antigravity_models(
+                                antigravity_path.as_deref(),
+                            )
+                            .await,
+                        )
+                    })
+                } else {
+                    (source.fetch)()
+                }
+            },
         )
         .await;
         match resolved.models {

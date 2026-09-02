@@ -316,6 +316,9 @@ function selectBehavior(behavior, promptText) {
 // effort application discovers it by (PROTOCOL §5.5). Omitted by default so
 // existing tests see the bare `{ sessionId }` result.
 function sessionConfigOptions() {
+  if (process.env.MOCK_AGENT_SESSION_RESULT) {
+    return JSON.parse(process.env.MOCK_AGENT_SESSION_RESULT);
+  }
   const current = process.env.MOCK_AGENT_THOUGHT_LEVEL;
   if (!current) return {};
   return {
@@ -838,6 +841,12 @@ function getAndIncrementAttempt() {
 }
 
 async function dispatch(msg) {
+  if (process.env.MOCK_AGENT_RPC_LOG) {
+    fs.appendFileSync(process.env.MOCK_AGENT_RPC_LOG, JSON.stringify({
+      method: msg.method, params: msg.params, pid: process.pid,
+      geminiHome: process.env.GEMINI_HOME,
+    }) + '\n');
+  }
   let behavior = {};
   try {
     behavior = JSON.parse(process.env.MOCK_AGENT_BEHAVIOR || '{}');

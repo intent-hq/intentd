@@ -213,6 +213,251 @@ fn gate() -> Option<String> {
     Some(script)
 }
 
+/// Exercise the real Antigravity registry/launch/session path with the existing
+/// deterministic ACP fixture, including both cold load and recreation.
+#[tokio::test]
+async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(script) = gate() else { return };
+    let node = intent_providers::resolve_on_path("node").unwrap();
+    for (load, reject_model) in [(true, false), (false, false), (true, true)] {
+        let data_dir = temp_data_dir();
+        let wrapper = data_dir.join("antigravity-fixture");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nexec '{}' '{}'\n", node.display(), script),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            data_dir.join("config.toml"),
+            format!(
+                "[providers.paths]\nantigravity = \"{}\"\n",
+                wrapper.display()
+            ),
+        )
+        .unwrap();
+        let log = data_dir.join("acp-rpc.jsonl");
+        let behavior =
+            json!({"advertiseLoadSession":load,"rejectSetConfigOption":reject_model,"response":"antigravity fixture complete"})
+                .to_string();
+        let catalog = json!({"models":{"currentModelId":"gemini-3.7-flash-low","availableModels":[
+            {"modelId":"gemini-3.7-flash-low","name":"Gemini 3.7 Flash (Low)"},
+            {"modelId":"gemini-3.6-flash-medium","name":"Gemini 3.6 Flash (Medium)"}
+        ]},"configOptions":[{"id":"model","category":"model","name":"Model","type":"select","currentValue":"gemini-3.7-flash-low","options":[
+            {"value":"gemini-3.7-flash-low","name":"Gemini 3.7 Flash (Low)"},
+            {"value":"gemini-3.6-flash-medium","name":"Gemini 3.6 Flash (Medium)"}
+        ]}]})
+        .to_string();
+        let child = spawn_serve(
+            &data_dir,
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("INTENTD_TCP_PORT", "0"),
+                ("MOCK_AGENT_BEHAVIOR", &behavior),
+                ("MOCK_AGENT_SESSION_RESULT", &catalog),
+                ("MOCK_AGENT_RPC_LOG", log.to_str().unwrap()),
+            ],
+        );
+        let _daemon = Daemon {
+            child,
+            data_dir: data_dir.clone(),
+        };
+        let socket = data_dir.join("intentd.sock");
+        assert!(await_uds(&socket).await, "daemon did not start");
+        let status = common::await_wss_status(&socket).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+        let mut rpc = connect_ws(port, cfg.clone()).await;
+        let discovered = wss_rpc(&mut rpc, 2, "host.providerDiscovery", json!({})).await;
+        let provider = discovered["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "antigravity")
+            .unwrap();
+        assert_eq!(provider["installed"], true);
+        // resolvedPath intentionally reports auto-detection, while installed
+        // and the auth/model/session paths honor the configured override.
+        assert_eq!(provider["command"], "antigravity-acp");
+        let authenticated = wss_rpc(
+            &mut rpc,
+            3,
+            "host.providerAuthStatus",
+            json!({"providerId":"antigravity","force":true}),
+        )
+        .await;
+        assert_eq!(authenticated["providers"][0]["authenticated"], true);
+        let models = wss_rpc(
+            &mut rpc,
+            4,
+            "models.list",
+            json!({"providerId":"antigravity","forceRefresh":true}),
+        )
+        .await;
+        assert_eq!(models["models"].as_array().unwrap().len(), 2);
+        assert_eq!(models["models"][0]["id"], "gemini-3.7-flash-low");
+        assert_eq!(models["models"][0]["isDefault"], true);
+        assert!(models["models"][0].get("effortLevels").is_none());
+        let workspace = wss_rpc(
+            &mut rpc,
+            10,
+            "workspace.create",
+            json!({"title":"Antigravity session test","noPrompt":true}),
+        )
+        .await;
+        let workspace_id = workspace["workspace"]["id"].as_str().unwrap();
+        let mut events = connect_ws(port, cfg).await;
+        wss_rpc(
+            &mut events,
+            1,
+            "events.subscribe",
+            json!({"workspaceId":workspace_id,"eventTypes":["agent:*"]}),
+        )
+        .await;
+        let created = wss_rpc(&mut rpc, 11, "agent.create", json!({"workspaceId":workspace_id,"name":"Antigravity fixture","provider":"antigravity","model":"gemini-3.7-flash-low"})).await;
+        let agent = created["agent"]["id"].as_str().unwrap();
+        for (turn, model) in [(0, "gemini-3.7-flash-low"), (1, "gemini-3.6-flash-medium")] {
+            if turn == 1 && !reject_model {
+                wss_rpc(&mut rpc, 12, "agent.setModel", json!({"workspaceId":workspace_id,"agentId":agent,"providerId":"antigravity","modelId":model})).await;
+            }
+            wss_rpc(&mut rpc, 20 + turn, "agent.sendMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":format!("test turn {turn}")})).await;
+            timeout(common::test_timeout(Duration::from_secs(40)), async {
+                loop {
+                    if let Some(Ok(Message::Text(text))) = events.next().await {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        let event = &frame["params"]["event"];
+                        if event["data"]["agentId"] == agent {
+                            if event["type"] == "agent:failed" {
+                                assert!(reject_model, "session error: {event}");
+                                assert!(event.to_string().contains("rejected model"));
+                                break;
+                            }
+                            if event["type"] == "agent:idle" {
+                                assert!(!reject_model, "rejected model must not run a prompt");
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("Antigravity turn must finish");
+            if reject_model {
+                // Let the terminal failure's queue/status publication finish
+                // before redriving the same model on the next user message.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let calls: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let prompts: Vec<_> = calls
+            .iter()
+            .filter(|call| call["method"] == "session/prompt")
+            .collect();
+        if reject_model {
+            assert!(
+                prompts.is_empty(),
+                "a failed setup never reaches session/prompt"
+            );
+            let attempts: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "session/set_config_option")
+                .collect();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "each redrive reapplies the rejected model"
+            );
+            assert_ne!(
+                attempts[0]["pid"], attempts[1]["pid"],
+                "failed setup is reaped, not cached"
+            );
+            continue;
+        }
+        assert_eq!(prompts.len(), 2, "one prompt per turn: {calls:?}");
+        assert_ne!(
+            prompts[0]["pid"], prompts[1]["pid"],
+            "model change respawns"
+        );
+        assert_eq!(
+            prompts[0]["geminiHome"], prompts[1]["geminiHome"],
+            "restore keeps private conversation state"
+        );
+        let home = Path::new(prompts[0]["geminiHome"].as_str().unwrap());
+        assert!(home.starts_with(data_dir.canonicalize().unwrap().join("antigravity")));
+        let hooks = std::fs::read_to_string(home.join("config/hooks.json")).unwrap();
+        assert!(hooks.contains("antigravity-tool-guard"));
+        assert!(!hooks.contains("--allow-tool 'start_subagent'"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &std::fs::read(home.join("config/mcp_config.json")).unwrap()
+            )
+            .unwrap(),
+            json!({"mcpServers":{}})
+        );
+        for (prompt, model) in prompts
+            .iter()
+            .zip(["gemini-3.7-flash-low", "gemini-3.6-flash-medium"])
+        {
+            let process: Vec<_> = calls
+                .iter()
+                .filter(|call| call["pid"] == prompt["pid"])
+                .collect();
+            let mode = process
+                .iter()
+                .position(|call| call["method"] == "session/set_mode")
+                .unwrap();
+            let selected = process
+                .iter()
+                .position(|call| call["method"] == "session/set_config_option")
+                .unwrap();
+            let sent = process
+                .iter()
+                .position(|call| call["method"] == "session/prompt")
+                .unwrap();
+            assert!(mode < selected && selected < sent);
+            assert_eq!(process[mode]["params"]["modeId"], "default");
+            assert_eq!(process[selected]["params"]["value"], model);
+            assert!(!process.iter().any(|call| call["method"] == "authenticate"));
+            let opened = process
+                .iter()
+                .find(|call| call["method"] == "session/new" || call["method"] == "session/load")
+                .unwrap();
+            assert!(opened["params"]["mcpServers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|server| server["name"] == "workspace-mcp"));
+        }
+        assert!(
+            prompts[0]["params"]["prompt"]
+                .to_string()
+                .contains("<system>"),
+            "first-turn instructions delivered"
+        );
+        assert_eq!(
+            calls.iter().any(|call| call["method"] == "session/load"),
+            load
+        );
+        let agent = wss_rpc(
+            &mut rpc,
+            40,
+            "agent.get",
+            json!({"workspaceId":workspace_id,"agentId":agent}),
+        )
+        .await;
+        assert_eq!(
+            agent["agent"]["model"],
+            "antigravity:gemini-3.6-flash-medium"
+        );
+    }
+}
+
 /// STAB-115: agent.setModel triggers respawn on next turn when provider child is live.
 /// 1. Create agent with model "sonnet4.5" on provider "auggie"
 /// 2. Send message (spawns child with sonnet4.5)

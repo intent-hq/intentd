@@ -101,7 +101,7 @@ intentd assembles one effective system prompt per agent (`assemble_system_prompt
 | `RulesFileFlag` | auggie (`--rules`), droid (`--append-system-prompt-file`) | `create_agent` writes a temp rules file; `build_provider_args` (`crates/intent-providers/src/args.rs`) appends `rules_flag` + path, gated on `supports_rules_file`. |
 | `SessionMeta` | claude-code (system prompt), codex (session title only) | `build_session_meta` (`crates/intent-services/src/agent_session.rs`) builds a provider-shaped `_meta`: claude-code `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": "<prompt>" }` (a string `systemPrompt` fully replaces the claude_code preset prompt — at adapter 0.66.0 the string is passed to the SDK as-is and treated as a custom prompt, so the model sees only our assembled instructions), sent on `session/new` **and** `session/load` (and the recreate path); codex `{ "sessionTitle": "<agent name>" }`, sent on `session/new` only (create + recreate; never on `session/load` — monorepo#3151), while its system prompt still travels via `FirstTurnPrepend` below. Carried by `session::new_session` / `load_session` (`crates/intent-acp/src/session.rs`). |
 | `EnvConfig` | opencode | `build_provider_env` (`crates/intent-providers/src/args.rs`) emits `OPENCODE_CONFIG_CONTENT` with an `instructions: [<rules file path>]` key (plus `model`, `permission`, `mcp` — see §3b and §6). |
-| `FirstTurnPrepend` | codex (the pinned codex-acp adapter ignores `_meta.developerInstructions`, #479), cortex, pi, grok (fallback), plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
+| `FirstTurnPrepend` | codex (the pinned codex-acp adapter ignores `_meta.developerInstructions`, #479), cortex, pi, grok (fallback), antigravity, plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
 | `None` | — | Provider gets no system prompt. Avoid if at all possible. |
 
 Add a new mechanism only if the provider genuinely supports none of these; prefer reusing
@@ -127,7 +127,7 @@ per provider — pick exactly one delivery path:
   `opencode_env_mcp_config` → `to_opencode_mcp_config` serializes the set as the
   OpenCode `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` by `build_provider_env`
   (`SpawnOptions.env_mcp_config`, `crates/intent-acp/src/spawn.rs`).
-- **(c) ACP session field** (claude-code, codex, droid, grok):
+- **(c) ACP session field** (claude-code, codex, droid, grok, antigravity):
   `supports_session_mcp_servers: true`. `create_agent` stashes
   `to_acp_session_mcp_servers(...)` on the agent handle; `start_session`
   (`crates/intent-services/src/agent_manager.rs`) passes it into every session-open
@@ -281,3 +281,47 @@ semantics). Today that is **Grok Build** only (`/bin/bash -lc '…'` in
 `command`). intentd then spawns the packed line exactly as Node `shell: true`
 would — `/bin/sh -c` on POSIX, the native shell (PowerShell `-Command` /
 `cmd /c`) on Windows — instead of exec'ing the packed string as argv[0].
+
+## Antigravity setup and compatibility boundary
+
+Antigravity uses the official native ACP server, not `agy` and not an npm adapter.
+The initial verified target is macOS Apple Silicon with personal Google OAuth.
+The tested upstream build is `agy_acp_server_20260818_01_RC01`.
+
+1. Get the archive from the [official ACP registry](https://github.com/agentclientprotocol/registry/blob/a3d294f480dee2e506a1c51f802455d4d49783a2/antigravity-acp/agent.json).
+   Keep `agy_acp_server.par` and `localharness_external` together.
+2. Set `providers.paths.antigravity` to the server executable, or provide an
+   `antigravity-acp` launcher that starts it. Intent does not install or update this archive.
+3. On the daemon host, run `intentd provider login antigravity`.
+   Use `--path /absolute/path/to/agy_acp_server.par` for an explicit login-path override.
+   Follow the official Google authorization URL printed in that terminal.
+   The command verifies a fresh guarded session after authentication.
+4. Refresh provider status and enable Antigravity explicitly in Settings.
+   Refresh the model list before selecting a model.
+
+The [official setup guide](https://antigravity.google/docs/ide/extensions/zed)
+describes the upstream authentication choices. Intent currently uses only personal OAuth.
+Credentials stay in the official macOS Keychain entry. Intent never copies tokens into profiles.
+Normal sessions and discovery probes cannot open a browser. Unknown authentication stays unknown.
+
+`intent-services/src/antigravity.rs` owns profile isolation and the native tool guard.
+Profiles use private permissions and persist under `<data-dir>/antigravity/` by workspace and agent identity.
+They contain conversation state, not token copies. They survive daemon restarts and are not temporary configuration files.
+Global Gemini MCP settings and hooks are excluded, without changing those global files.
+
+The guard permits only known native tools and the caller-filtered workspace tool set.
+Native subagent aliases are always denied. Permission mode stays `default`. Unrestricted Intent permissions do not select `yolo`.
+User MCP tools require an exact schema under the permitted server in the current private conversation:
+`antigravity-acp/brain/<conversationId>/mcp/<server>/<tool>.json`.
+This is an observed upstream layout, not a public contract. A missing or changed schema denies the tool.
+Recheck this behavior before certifying another server build. These hooks are provider policy controls, not an OS sandbox.
+
+Cold load can reset the upstream model. Intent reapplies the exact saved ID and requires confirmation before sending a prompt.
+Model rejection is an actionable setup error, never silent fallback.
+This ACP build does not emit usage events. Do not infer usage from stderr or display missing accounting as measured zero.
+One-shot quick actions and the generic onboarding test prompt are not enabled for this provider.
+
+To roll back, disable Antigravity and select another provider. Do not delete global credentials or configuration.
+Private conversation profiles remain under the daemon data directory. If their history is no longer needed, remove the profiles.
+Backend protocol support must land before frontend support. Do not create a manual submodule-pin bump.
+After authorized merges, monitor the carrying cloudlands-fe alpha release before calling the work shipped.

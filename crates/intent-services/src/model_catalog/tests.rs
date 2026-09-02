@@ -562,8 +562,9 @@ async fn droid_source_serves_gated_empty_list_by_default() {
 }
 
 #[test]
-fn registry_covers_all_nine_providers() {
+fn registry_covers_dynamic_providers() {
     for provider in [
+        "antigravity",
         "auggie",
         "cortex",
         "claude-code",

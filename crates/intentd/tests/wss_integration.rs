@@ -4594,6 +4594,7 @@ async fn wss_providers_catalog_round_trip() {
             "pi",
             "droid",
             "grok",
+            "antigravity",
             "mock"
         ],
         "one row per registry entry, registry order: {resp}"
@@ -4647,7 +4648,10 @@ async fn wss_providers_catalog_round_trip() {
 
     // mock's env-var gate passes the raw field through regardless of the
     // daemon environment.
-    let mock = &providers[9];
+    let mock = providers
+        .iter()
+        .find(|provider| provider["id"] == "mock")
+        .unwrap();
     assert_eq!(
         mock["requiresEnvVar"].as_str(),
         Some("MOCK_AGENT_SCRIPT_PATH")

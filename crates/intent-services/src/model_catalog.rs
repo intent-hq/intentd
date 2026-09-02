@@ -172,7 +172,9 @@ fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
 /// Adapt a completed [`crate::provider_models`] fetch into the cache's fetch
 /// result (same `Option<rows>` + warning semantics, so a probe failure flows
 /// into the cache's last-good/stale fallback).
-fn from_provider_fetch(fetched: crate::provider_models::ProviderModelsFetch) -> ModelFetchResult {
+pub(crate) fn from_provider_fetch(
+    fetched: crate::provider_models::ProviderModelsFetch,
+) -> ModelFetchResult {
     ModelFetchResult {
         models: fetched.models,
         warning: fetched.warning,
@@ -268,6 +270,11 @@ fn unsloth_fetch() -> BoxFuture<'static, ModelFetchResult> {
 /// The provider→source registry: every provider with a daemon-side model
 /// source.
 static SOURCES: &[ModelSource] = &[
+    ModelSource {
+        provider_id: "antigravity",
+        version_key: no_version,
+        fetch: || provider_models_fetch("antigravity"),
+    },
     ModelSource {
         provider_id: "auggie",
         version_key: auggie_catalog_version,

@@ -21,6 +21,7 @@ fn registry_first_provider_and_lookups() {
             "pi",
             "droid",
             "grok",
+            "antigravity",
             "mock"
         ]
     );
@@ -245,7 +246,7 @@ fn cortex_and_droid_gate_on_enable_env_vars() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid", "grok"];
+    let opted_in = ["claude-code", "codex", "droid", "grok", "antigravity"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -256,7 +257,7 @@ fn session_mcp_servers_partition() {
     }
 }
 
-/// Exactly claude-code, pi, and codex apply the stored model post-session via
+/// These providers apply the stored model post-session via
 /// `session/set_config_option { configId: "model" }` (their pinned adapters
 /// expose the model as a `configOptions[id="model"]` select; claude-code and
 /// pi have no CLI model flag, and codex's npx-fallback adapter ignores the
@@ -264,7 +265,7 @@ fn session_mcp_servers_partition() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn config_option_model_partition() {
-    let opted_in = ["claude-code", "codex", "pi"];
+    let opted_in = ["claude-code", "codex", "pi", "antigravity"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -1030,6 +1031,7 @@ fn disableable_and_always_enabled_partition_registry() {
             "pi",
             "droid",
             "grok",
+            "antigravity",
             "mock"
         ]
     );

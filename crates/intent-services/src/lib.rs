@@ -58,6 +58,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+pub mod antigravity;
 mod attachment_upload;
 mod auggie_cli;
 mod auto_commit;
