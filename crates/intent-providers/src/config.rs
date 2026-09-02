@@ -244,6 +244,12 @@ pub struct ProviderConfig {
     /// next `agent.sendMessage` respawns the child and resumes the session
     /// via the normal `session/load` ladder.
     pub kills_child_on_interrupt: bool,
+    /// Whether the provider supports the live test-prompt probe
+    /// (`host.providerTestPrompt`): an ephemeral end-to-end ACP prompt used
+    /// by onboarding to verify the provider actually answers. `false` for
+    /// unsloth — its first prompt can trigger a very long model
+    /// download/load cycle, so a bounded probe would time out spuriously.
+    pub supports_test_prompt: bool,
 }
 
 impl ProviderConfig {
@@ -291,6 +297,7 @@ impl ProviderConfig {
             terminal_requires_shell: false,
             truncates_tool_descriptions: false,
             kills_child_on_interrupt: false,
+            supports_test_prompt: true,
         }
     }
 
@@ -481,6 +488,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // `unsloth start opencode` directly, independent of the ACP spawn.
         requires_secondary_binary: Some("unsloth"),
         short_name: "Unsloth",
+        // The first prompt can trigger a very long model download/load
+        // cycle, so the bounded `host.providerTestPrompt` probe would time
+        // out spuriously.
+        supports_test_prompt: false,
         ..ProviderConfig::empty("unsloth", "Unsloth", "opencode")
     },
     ProviderConfig {

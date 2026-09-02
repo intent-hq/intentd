@@ -58,6 +58,11 @@ pub(crate) enum HostMethod {
     /// `{ providerId?, force? }` → `{ providers: [{ id, authenticated }] }`
     /// with `authenticated: true | false | null`.
     ProviderAuthStatus,
+    /// Live end-to-end provider test prompt (`host.providerTestPrompt`,
+    /// §5.14): `{ providerId, model? }` → `{ ok: true }` or `{ ok: false,
+    /// reason, message }` — one ephemeral ACP prompt proving the provider
+    /// actually answers, coupled to the auth-verdict cache.
+    ProviderTestPrompt,
     /// Client-callable editor-open trigger (`host.openInEditor`, §5.14):
     /// dispatched to [`open_in_editor`], which short-circuits locally on a
     /// local connection and re-dispatches to the connected FE as the
@@ -118,6 +123,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
         "host.providerDiscovery" => HostMethod::ProviderDiscovery,
         "host.providerAuthStatus" => HostMethod::ProviderAuthStatus,
+        "host.providerTestPrompt" => HostMethod::ProviderTestPrompt,
         "host.openInEditor" => HostMethod::OpenInEditor,
         "host.exec" => HostMethod::Exec,
         "host.execStream" => HostMethod::ExecStream,
@@ -416,6 +422,52 @@ pub(crate) async fn handle(
             match intent_services::provider_auth::provider_auth_status(
                 provider_id.as_deref(),
                 force,
+                &provider_paths,
+            )
+            .await
+            {
+                Ok(result) => success_frame(&id_echo, &result),
+                Err(msg) => error_frame(&id_echo, -32602, &msg),
+            }
+        }
+        HostMethod::ProviderTestPrompt => {
+            let provider_id = match params.get("providerId").and_then(Value::as_str) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        &id_echo,
+                        -32602,
+                        "Missing required parameter: providerId",
+                    ));
+                }
+            };
+            let model = match params.get("model") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                Some(_) => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        &id_echo,
+                        -32602,
+                        "Invalid parameter: model must be a non-empty string",
+                    ));
+                }
+            };
+            // Same settings seam as `ProviderAuthStatus` / `ProviderDiscovery`
+            // (monorepo#1065): binary resolution must honor `providers.paths`
+            // overrides, with `context.auggiePath` winning for auggie.
+            let mut provider_paths = read_provider_paths(api).await;
+            if let Some(p) = read_setting_string(api, "context.auggiePath").await {
+                provider_paths.insert("auggie".to_string(), p);
+            }
+            match intent_services::provider_test_prompt::provider_test_prompt(
+                &provider_id,
+                model.as_deref(),
                 &provider_paths,
             )
             .await

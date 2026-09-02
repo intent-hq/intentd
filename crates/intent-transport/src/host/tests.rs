@@ -207,6 +207,10 @@ fn classify_matches_host_status_and_host_services() {
         classify(&json!({ "jsonrpc": "2.0", "id": 9, "method": "host.providerAuthStatus" }))
             .is_some()
     );
+    assert!(
+        classify(&json!({ "jsonrpc": "2.0", "id": 10, "method": "host.providerTestPrompt" }))
+            .is_some()
+    );
     // `host.openExternal` (FE-served reverse RPC) / wrong version / bad id fall through.
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "host.openExternal" })).is_none()
@@ -583,6 +587,85 @@ async fn handle_provider_auth_status_scoped_to_grok_returns_one_entry() {
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0]["id"], "grok");
     assert!(providers[0]["authenticated"].is_boolean() || providers[0]["authenticated"].is_null());
+}
+
+#[tokio::test]
+async fn handle_provider_test_prompt_requires_provider_id() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 28,
+        "method": "host.providerTestPrompt",
+        "params": {}
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("missing providerId produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 28);
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(
+        parsed["error"]["message"],
+        "Missing required parameter: providerId"
+    );
+}
+
+#[tokio::test]
+async fn handle_provider_test_prompt_unknown_provider_is_invalid_params() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 29,
+        "method": "host.providerTestPrompt",
+        "params": { "providerId": "not-a-provider" }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("unknown provider produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 29);
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
+}
+
+#[tokio::test]
+async fn handle_provider_test_prompt_rejects_non_string_model() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "host.providerTestPrompt",
+        "params": { "providerId": "codex", "model": 42 }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("non-string model produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 31);
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
+}
+
+#[tokio::test]
+async fn handle_provider_test_prompt_unsupported_provider_is_structured_result() {
+    // unsloth opts out (`supports_test_prompt: false`): the reply is a
+    // success frame carrying `{ ok: false, reason: "unsupported" }` — never a
+    // wire error, and nothing is resolved or spawned.
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "host.providerTestPrompt",
+        "params": { "providerId": "unsloth" }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("unsupported provider still replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 32);
+    assert_eq!(parsed["result"]["ok"], false);
+    assert_eq!(parsed["result"]["reason"], "unsupported");
+    assert!(parsed["result"]["message"].is_string());
 }
 
 #[tokio::test]

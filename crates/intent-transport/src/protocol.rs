@@ -322,13 +322,27 @@
 //! unknown/foreign id → `-32602` "Unknown git root: <id>"), and the
 //! resulting `git:commit` / `changes:git-status` events carry an additive
 //! `gitRootId` field. No method-catalog change — 298 router methods, 338
-//! total.
+//! total. Version 9.3 adds the `host.providerTestPrompt` fast-path method
+//! (additive; §5.14): one live end-to-end ACP prompt ("say hello") against a
+//! provider's adapter — the only conclusive auth check for providers that
+//! serve local probes uncredentialed and fail only at `session/prompt`
+//! (claude-code). Success `{ ok: true }` promotes the cached
+//! `host.providerAuthStatus` verdict to a hard `true`; failures are
+//! structured `{ ok: false, reason, message }` (`reason` ∈ `unsupported |
+//! not-installed | spawn-failed | auth-required | busy | timeout | error`,
+//! never a
+//! wire error — only an unknown `providerId` is `-32602`), and an
+//! auth-required failure demotes the verdict like the runtime spawn seam.
+//! `providers.catalog` rows gain the always-present `supportsTestPrompt`
+//! boolean (`false` only for unsloth, whose first prompt can trigger a very
+//! long model download). Method catalog grows by one fast-path method —
+//! 298 router methods, 39 fast-path, 339 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.2";
+pub const PROTOCOL_VERSION: &str = "9.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
