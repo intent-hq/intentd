@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.6] - 2026-09-02
+
+### 🚀 Features
+
+- Normalize legacy compound model values on settings read ([#1651](https://github.com/intent-hq/intentd/pull/1651))
+- *(store)* Migrate compound provider:model session ids to the split pair ([#1653](https://github.com/intent-hq/intentd/pull/1653))
+- Specialist model triple (frontmatter + modelOptions + hints) ([#1654](https://github.com/intent-hq/intentd/pull/1654))
+
+### 🐛 Bug Fixes
+
+- *(services)* Map ACP auth-required session failures to actionable login error and demote cached verdict ([#1650](https://github.com/intent-hq/intentd/pull/1650))
+
+
 ## [0.9.5] - 2026-09-02
 
 ### 🚀 Features
