@@ -122,6 +122,29 @@ fn make_tar_xz(bin_contents: &[u8]) -> Vec<u8> {
     builder.into_inner().unwrap().finish().unwrap()
 }
 
+/// `.tar.xz` like [`make_tar_xz`] but with a `libexec/` sidecar payload
+/// next to the binary — the layout of release archives that ship tailcat.
+fn make_tar_xz_with_libexec(bin_contents: &[u8], tailcat_contents: &[u8]) -> Vec<u8> {
+    let encoder = liblzma::write::XzEncoder::new(Vec::new(), 6);
+    let mut builder = tar::Builder::new(encoder);
+    let root = format!("intentd-{TARGET_TRIPLE}");
+    let mut append = |path: String, mode: u32, contents: &[u8]| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder.append_data(&mut header, path, contents).unwrap();
+    };
+    append(format!("{root}/{DAEMON_BIN_NAME}"), 0o755, bin_contents);
+    append(format!("{root}/libexec/tailcat"), 0o755, tailcat_contents);
+    append(
+        format!("{root}/libexec/tailcat.LICENSE"),
+        0o644,
+        b"license text",
+    );
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
 /// Schema-v1 manifest with one platform entry for this build's triple.
 fn manifest_json(version: &str, base_url: &str, asset: &str, sha256: &str) -> Vec<u8> {
     serde_json::json!({
@@ -184,6 +207,27 @@ fn publish_channel(
 /// Publish a release on the stable channel: manifest + archive routes.
 fn publish_stable(routes: &Routes, base_url: &str, version: &str, bin_contents: &[u8]) -> String {
     publish_channel(routes, base_url, "stable", version, bin_contents)
+}
+
+/// Publish a stable release whose archive carries `libexec/tailcat` (+
+/// LICENSE) next to the binary, like real release archives.
+fn publish_stable_with_libexec(
+    routes: &Routes,
+    base_url: &str,
+    version: &str,
+    bin_contents: &[u8],
+    tailcat_contents: &[u8],
+) -> String {
+    let asset = format!("intentd-stable-{TARGET_TRIPLE}.tar.xz");
+    let archive = make_tar_xz_with_libexec(bin_contents, tailcat_contents);
+    let sha = sha256_hex(&archive);
+    let mut routes = routes.lock().unwrap();
+    routes.insert(format!("/{asset}"), archive);
+    routes.insert(
+        "/channel-stable/stable.json".to_string(),
+        manifest_json(version, base_url, &asset, &sha),
+    );
+    asset
 }
 
 fn daemon_log_path(data_dir: &Path) -> std::path::PathBuf {
@@ -421,6 +465,70 @@ fn update_installs_newer_version_and_reports_no_running_service() {
     assert!(
         !daemon_log_path(dir.path()).exists(),
         "`intentd update` must never spawn the daemon"
+    );
+    // Regression guard for the inverse of
+    // update_installs_libexec_sidecar_next_to_the_daemon: an archive
+    // without libexec/ (older releases) must still install — and stage no
+    // stray sidecar dir.
+    assert!(
+        !paths
+            .daemon_binary("0.2.0")
+            .parent()
+            .unwrap()
+            .join("libexec")
+            .exists(),
+        "a libexec-less archive must not grow a libexec dir"
+    );
+}
+
+#[test]
+fn update_installs_libexec_sidecar_next_to_the_daemon() {
+    // Release archives ship libexec/tailcat (+ LICENSE) next to the daemon
+    // binary and resolve_tailcat_bin() looks it up at
+    // <exe-dir>/libexec/tailcat; the sitter must install that sibling
+    // payload, not just the binary (intent-hq/intent#4193).
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0");
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, _requests) = serve_recording(Arc::clone(&routes));
+    publish_stable_with_libexec(
+        &routes,
+        &base_url,
+        "0.2.0",
+        b"new daemon 0.2.0",
+        b"tailcat sidecar",
+    );
+
+    let output = run_sitter(dir.path(), &base_url, &["update"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+
+    let bin = paths.daemon_binary("0.2.0");
+    assert_eq!(fs::read(&bin).unwrap(), b"new daemon 0.2.0");
+    let libexec = bin.parent().unwrap().join("libexec");
+    let tailcat = libexec.join("tailcat");
+    assert_eq!(fs::read(&tailcat).unwrap(), b"tailcat sidecar");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&tailcat).unwrap().permissions().mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "installed tailcat must stay executable, mode: {mode:o}"
+        );
+    }
+    assert_eq!(
+        fs::read(libexec.join("tailcat.LICENSE")).unwrap(),
+        b"license text"
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
     );
 }
 
