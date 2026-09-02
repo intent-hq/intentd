@@ -35584,6 +35584,8 @@ async fn agent_snapshot_groups_tracked_open_prs_and_forces_injection() {
             Some(true),
         ),
         tracked_pr(2, PullRequestStatus::Draft, None, None, None),
+        // REST `mergeable_state: "draft"` alone (is_draft unset) is draft too.
+        tracked_pr(10, PullRequestStatus::Open, None, Some("draft"), None),
         // A blocked-family mergeable_state wins over mergeable=true.
         tracked_pr(3, PullRequestStatus::Open, Some(true), Some("dirty"), None),
         tracked_pr(4, PullRequestStatus::Open, Some(false), None, None),
@@ -35602,7 +35604,7 @@ async fn agent_snapshot_groups_tracked_open_prs_and_forces_injection() {
     assert_eq!(
         v["prs"],
         json!({
-            "draft": ["o/r#1", "o/r#2"],
+            "draft": ["o/r#1", "o/r#2", "o/r#10"],
             "blocked": ["o/r#3", "o/r#4"],
             "mergeable": ["o/r#5", "o/r#6"],
             "unknown": ["o/r#7"],

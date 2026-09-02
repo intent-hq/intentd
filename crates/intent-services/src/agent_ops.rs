@@ -236,10 +236,13 @@ impl AgentSnapshotPrs {
         ) {
             return None;
         }
-        if pr.is_draft == Some(true) || pr.status == PullRequestStatus::Draft {
+        let state = pr.mergeable_state.as_deref();
+        if pr.is_draft == Some(true)
+            || pr.status == PullRequestStatus::Draft
+            || state == Some("draft")
+        {
             return Some(&mut self.draft);
         }
-        let state = pr.mergeable_state.as_deref();
         if matches!(state, Some("blocked" | "dirty" | "behind")) || pr.mergeable == Some(false) {
             return Some(&mut self.blocked);
         }
@@ -252,16 +255,19 @@ impl AgentSnapshotPrs {
 
 /// Group tracked PR pools into the snapshot's `prs` object. `pools` yields
 /// `(owner, name, prs)` per repo — the workspace pool first, so its entry
-/// wins the `(repo, number)` dedup over a git-root duplicate of the same PR.
+/// wins the `(repo, number)` dedup over a git-root duplicate of the same PR
+/// even when the workspace entry is merged/closed: the merged entry consumes
+/// the `(repo, number)` key, suppressing a stale open duplicate from a git
+/// root, so the PR is excluded entirely (fresher workspace data wins).
 /// Returns `None` when no open PR survives (the field is then omitted).
 fn grouped_open_prs<'a>(
     pools: impl IntoIterator<Item = (&'a str, &'a str, &'a [PullRequestInfo])>,
 ) -> Option<AgentSnapshotPrs> {
     let mut groups = AgentSnapshotPrs::default();
-    let mut seen: HashSet<(String, String, u64)> = HashSet::new();
+    let mut seen: HashSet<(&str, &str, u64)> = HashSet::new();
     for (owner, name, prs) in pools {
         for pr in prs {
-            if !seen.insert((owner.to_string(), name.to_string(), pr.number)) {
+            if !seen.insert((owner, name, pr.number)) {
                 continue;
             }
             if let Some(group) = groups.group_for(pr) {
