@@ -167,6 +167,16 @@ version_group = "intentd"
 # the Release PR now also advances crates/intentd-sitter/Cargo.toml when
 # sitter files changed, so cutting a sitter release no longer needs a manual
 # version bump — push the `sitter-v<Cargo.toml version>` tag.
+#
+# Caveat: only commits touching files under crates/intentd-sitter are
+# detected. The installer scripts live at the repo-root scripts/ (outside the
+# crate root), so a commit touching ONLY scripts/install.{sh,ps1} is still
+# invisible here — cargo can't package files outside the crate root, and
+# release-plz's history walk is bounded to the package path. In practice this
+# hasn't occurred: the sitter guard tests (tests/install_*.rs) pin the
+# scripts' contracts, so every installer change to date also touched crate
+# files (including #1619/#1629). Moving the scripts into the crate would
+# close the gap if a scripts-only commit ever becomes a real pattern.
 [[package]]
 name = "intentd-sitter"
 release = true
