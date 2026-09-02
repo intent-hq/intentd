@@ -1134,6 +1134,9 @@ fn auth_gate_names_each_providers_catalog_login_hint() {
     for (id, hint) in [
         ("auggie", "auggie login"),
         ("grok", "grok login"),
+        // codex's hint names the real `codex` CLI (the probe target), not
+        // the non-runnable adapter fallback "codex-acp login".
+        ("codex", "codex login"),
         // No catalog hint: falls back to `{command} login`.
         ("opencode", "opencode login"),
     ] {

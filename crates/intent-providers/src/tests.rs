@@ -1039,9 +1039,15 @@ fn auth_error_message_uses_login_hint() {
     assert!(remote.contains("on the remote server"));
     assert!(remote.contains("auggie login"));
 
-    // Providers without a hint fall back to `{command} login`.
+    // codex's hint names the real `codex` CLI, never the `codex-acp`
+    // adapter command the `{command} login` fallback would produce.
     let codex = auth_error_message("codex", false);
-    assert!(codex.contains("codex-acp login"));
+    assert!(codex.contains("codex login"));
+    assert!(!codex.contains("codex-acp login"));
+
+    // Providers without a hint fall back to `{command} login`.
+    let droid = auth_error_message("droid", false);
+    assert!(droid.contains("droid login"));
 }
 
 #[test]
@@ -1105,11 +1111,17 @@ fn auth_error_pattern_matching_is_case_insensitive_across_patterns() {
 
 #[test]
 fn auth_error_message_remote_falls_back_to_command_login() {
-    // codex has no login_command_hint → falls back to `{command} login`,
+    // droid has no login_command_hint → falls back to `{command} login`,
     // and the remote variant includes the remote-server phrasing.
-    let msg = auth_error_message("codex", true);
-    assert!(msg.contains("codex-acp login"));
+    let msg = auth_error_message("droid", true);
+    assert!(msg.contains("droid login"));
     assert!(msg.contains("on the remote server"));
+
+    // codex carries an explicit hint: the fallback would print the
+    // non-runnable adapter command "codex-acp login".
+    let codex = auth_error_message("codex", true);
+    assert!(codex.contains("codex login"));
+    assert!(!codex.contains("codex-acp login"));
 
     // claude-code carries an explicit hint (intent-hq/intent#3941): the
     // `{command} login` fallback would print the non-runnable

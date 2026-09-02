@@ -421,6 +421,12 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         supports_config_option_model: true,
         config_option_model_strips_effort: true,
         auth_check_args: Some(&["login", "status"]),
+        // The auth-remedy hint must name the real `codex` CLI — the auth
+        // probe runs `codex login status` on it — not the adapter `command`
+        // the default `{command} login` fallback would produce
+        // ("codex-acp login" is not a runnable command; same rationale as
+        // the claude-code hint above).
+        login_command_hint: Some("codex login"),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),
         short_name: "Codex",

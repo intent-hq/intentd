@@ -10,6 +10,9 @@
 //!   to fall through to the hardcoded default provider (Auggie).
 //! - an unavailable configured default fails the RPC with a clear error
 //!   naming the configured provider, never silently substituting Auggie.
+//! - a hard-false cached auth verdict (seeded through a real
+//!   `host.providerAuthStatus` probe) fails both `agent.delegate` and
+//!   `agent.create` with the actionable `-32602` login remedy.
 
 #![cfg(unix)]
 
@@ -589,5 +592,165 @@ async fn delegate_explicit_provider_param_over_wss() {
     assert!(
         message.contains("unknown provider: typo-provider"),
         "error names the bad id: {message}"
+    );
+}
+
+/// Executable stub standing in for a provider CLI whose auth check reports
+/// "not logged in": exit 2 lands on the probe's not-authenticated arm
+/// (non-zero, and not the loader's 127 could-not-run code).
+fn write_failing_auth_probe(data_dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = data_dir.join("fake-opencode");
+    std::fs::write(&script, "#!/bin/sh\nexit 2\n").expect("write probe stub");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod probe stub");
+    script
+}
+
+/// Seed `config.toml` with a `providers.paths` override pinning `opencode` to
+/// the stub — the highest-precedence tier of provider binary resolution, read
+/// by both the auth probe and the install gate, so a real opencode install
+/// can never be picked up.
+fn seed_opencode_path_override(data_dir: &Path, stub: &Path) {
+    use std::fmt::Write as _;
+    let path = data_dir.join("config.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let _ = write!(
+        text,
+        "\n[providers.paths]\nopencode = \"{}\"\n",
+        stub.display()
+    );
+    std::fs::write(&path, text).expect("write config.toml");
+}
+
+/// Hard-false auth-verdict gate over the real WSS wire: a genuine
+/// `host.providerAuthStatus` probe (against a stub CLI that reports "not
+/// logged in") plants the hard-false verdict in the daemon's cache, and both
+/// `agent.delegate` and `agent.create` then reject with the actionable
+/// `-32602` login remedy (PROTOCOL §9) before any session row is persisted.
+/// opencode is the probe target because its auth probe honors the
+/// `providers.paths` override (its probe CLI is its catalog `command`),
+/// keeping the test hermetic.
+#[tokio::test]
+async fn create_and_delegate_reject_hard_false_auth_verdict_over_wss() {
+    let data_dir = temp_data_dir();
+    let stub = write_failing_auth_probe(&data_dir);
+    seed_opencode_path_override(&data_dir, &stub);
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    let ws_result = wss_rpc(
+        &mut ws,
+        10,
+        "workspace.create",
+        json!({ "title": "auth gate WSS E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"].as_str().expect("workspace id");
+
+    // A real probe of the stub plants the hard-false verdict in the daemon's
+    // auth cache — the exact producer (`host.providerAuthStatus`) the gate
+    // reads in production, not a test seam.
+    let probed = wss_rpc(
+        &mut ws,
+        20,
+        "host.providerAuthStatus",
+        json!({ "providerId": "opencode" }),
+    )
+    .await;
+    assert_eq!(
+        probed["providers"][0]["authenticated"],
+        json!(false),
+        "stub probe yields a hard-false verdict: {probed}"
+    );
+
+    wss_rpc(
+        &mut ws,
+        30,
+        "settings.update",
+        json!({ "changes": [{ "path": "providers.active", "value": "opencode" }] }),
+    )
+    .await;
+
+    // agent.delegate resolves the configured default onto the gate.
+    let delegate_resp = wss_rpc_raw(
+        &mut ws,
+        40,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do the thing",
+        }),
+    )
+    .await;
+    let error = delegate_resp
+        .get("error")
+        .unwrap_or_else(|| panic!("hard-false verdict must fail the delegate: {delegate_resp}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "not-authenticated rejection maps to invalid params (§9): {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not authenticated") && message.contains("OpenCode"),
+        "error names the provider and the auth failure: {message}"
+    );
+    assert!(
+        message.contains("opencode login"),
+        "error names the CLI login remedy: {message}"
+    );
+
+    // agent.create rides the same gate via its explicit provider param.
+    let create_resp = wss_rpc_raw(
+        &mut ws,
+        50,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "Blocked",
+            "provider": "opencode",
+        }),
+    )
+    .await;
+    let error = create_resp
+        .get("error")
+        .unwrap_or_else(|| panic!("hard-false verdict must fail the create: {create_resp}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "create rejection maps to invalid params (§9): {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not authenticated") && message.contains("opencode login"),
+        "create error carries the same actionable remedy: {message}"
+    );
+
+    // Fail-fast means fail-clean: no session row was persisted by either call.
+    let list = wss_rpc(&mut ws, 60, "agent.list", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(
+        list["agents"].as_array().map(Vec::len),
+        Some(0),
+        "no session row persisted by the rejected calls: {list}"
     );
 }

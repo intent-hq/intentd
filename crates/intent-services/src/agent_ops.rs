@@ -756,14 +756,15 @@ fn ensure_provider_enabled(
     Ok(())
 }
 
-/// Reject a known provider id that is disabled in settings or that the
-/// daemon's own provider discovery reports as unrunnable (not installed, or
-/// gated off by a missing env var/feature code) with a clear,
-/// caller-surfaceable `-32602` — so the FE can toast it — instead of letting
-/// the delegate succeed and the spawn fail later with a raw "No such file or
-/// directory" (spec Decision D2 step 3). The disabled check
-/// ([`ensure_provider_enabled`]) runs first, with its own distinct message
-/// (monorepo#3178). Mirrors `resolve_spawn`'s override-aware resolution
+/// Reject a known provider id that is disabled in settings, whose cached
+/// auth verdict is hard-false, or that the daemon's own provider discovery
+/// reports as unrunnable (not installed, or gated off by a missing env
+/// var/feature code) with a clear, caller-surfaceable `-32602` — so the FE
+/// can toast it — instead of letting the delegate succeed and the spawn fail
+/// later with a raw "No such file or directory" (spec Decision D2 step 3).
+/// The funnel runs disabled ([`ensure_provider_enabled`], monorepo#3178) →
+/// not-authenticated ([`ensure_provider_authenticated`]) → unrunnable, each
+/// with its own distinct message. Mirrors `resolve_spawn`'s override-aware resolution
 /// (monorepo#1065) via [`intent_providers::provider_availability_for`], keyed
 /// by the same `providers.paths` settings, and aligns "installed" with what
 /// the spawn path can actually run: a provider whose only runnable path is
@@ -805,6 +806,11 @@ fn ensure_provider_available(
 /// claude-code it also spells out the desktop-app caveat — a Claude
 /// desktop-app sign-in does not carry over to the CLI credential chain
 /// (intent-hq/intent#3941), the exact trap that produced dead agents.
+///
+/// Accepted staleness: logging in does not invalidate a cached hard-false
+/// verdict, so a retry within the cache TTL (60s) can still reject until
+/// the entry expires or a forced `host.providerAuthStatus` refresh (the
+/// FE's recheck) overwrites it — bounded and deemed acceptable.
 fn ensure_provider_authenticated(
     method: &str,
     provider_id: &str,
