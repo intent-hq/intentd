@@ -13578,6 +13578,30 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn specialist_list_dispatch(
+        &self,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let ws_path = workspace_path.as_deref().map(Path::new);
+            let mut result = self.specialists_service().list(ws_path)?;
+            if let Some(specs) = result
+                .get_mut("specialists")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for def in specs {
+                    // No caller/settings provider context: `provider: None`
+                    // makes the decoration resolve each row through
+                    // `resolve_delegate_provider_preview` — the specialist's
+                    // own pin first, else the settings-derived default —
+                    // exactly what a no-model `agent.delegate` would spawn on.
+                    decorate_specialist_resolved(self, def, ws_path, None);
+                }
+            }
+            Ok(result)
+        })
+    }
+
     fn specialist_get(
         &self,
         id: String,

@@ -487,6 +487,168 @@ async fn agent_bindings_list_and_status() {
     }
 }
 
+/// `ws.agent.listSpecialists` over the real MCP loop: the project tier
+/// (`.intent/specialists/`) applies via the workspace path, rows carry the
+/// compact dispatch shape (no prompt bodies), and `defaultModel` reflects
+/// per-specialist resolution — a compound-`model` pin wins over the settings
+/// default provider (auggie in this harness).
+#[tokio::test]
+async fn agent_bindings_list_specialists() {
+    let Some(script) = gate() else { return };
+
+    let ws_root = std::env::temp_dir().join(format!("itd-e2e-spec-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(ws_root.join(".intent/specialists")).expect("mkdir specialists");
+    std::fs::write(
+        ws_root.join(".intent/specialists/e2e-pinned.md"),
+        "---\nname: \"E2E Pinned\"\ndescription: \"Project-tier pinned specialist\"\nmodel: \"codex:test-model\"\n---\n\nYou are a project-tier e2e specialist.\n",
+    )
+    .expect("write project specialist");
+
+    let db = std::env::temp_dir().join(format!("intentd-e2e-spec-{}.db", uuid::Uuid::new_v4()));
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.clone())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root))
+        .with_event_bus(bus.clone());
+
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&ws, Some(ws_root.clone())))
+        .await
+        .expect("insert ws");
+
+    let agent_val = services
+        .agent_create(
+            ws.clone(),
+            Some("E2E Specialists".into()),
+            None,
+            None,
+            None,
+            None,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create agent");
+    let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+
+    // Persist the rows through ws.file.write so the test can assert the
+    // projected shape from outside the agent loop.
+    let js = r"
+        const rows = await ws.agent.listSpecialists();
+        await ws.file.write('specialists.json', JSON.stringify(rows));
+        return { count: rows.length };
+    ";
+
+    let behavior = serde_json::json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "list specialists e2e" }
+        },
+        "response": "specialists listed",
+    })
+    .to_string();
+
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = AgentManager::new(services.clone(), sink, 8)
+        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+
+    manager
+        .create_agent(
+            agent_id.clone(),
+            ws.clone(),
+            "E2E Specialists",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&agent_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(serde_json::json!({ "type": "text", "text": "list specialists" }))
+            .unwrap();
+    let stop = manager
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
+        .await
+        .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
+
+    let workspace_record = services
+        .get_workspace(ws.clone())
+        .await
+        .expect("get workspace");
+    let actual_ws_root = std::path::PathBuf::from(
+        workspace_record
+            .worktree_path
+            .expect("workspace should have worktree_path"),
+    );
+    let raw = std::fs::read_to_string(actual_ws_root.join("specialists.json"))
+        .expect("specialists.json written by the agent");
+    let rows: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    let rows = rows.as_array().expect("listSpecialists returns an array");
+    assert!(!rows.is_empty(), "catalog is never empty (bundled tier)");
+    for row in rows {
+        assert!(row.get("id").is_some() && row.get("name").is_some());
+        assert!(
+            row.get("modelOptions")
+                .is_some_and(serde_json::Value::is_array),
+            "modelOptions always present as an array: {row}"
+        );
+        for key in ["prompt", "behaviorPrompt", "source", "isCustomized"] {
+            assert!(row.get(key).is_none(), "{key} must never reach a row");
+        }
+    }
+    assert!(
+        rows.iter().any(|r| r["id"] == "implementor"),
+        "bundled tier listed"
+    );
+    let pinned = rows
+        .iter()
+        .find(|r| r["id"] == "e2e-pinned")
+        .expect("project-tier specialist listed");
+    assert_eq!(pinned["name"], "E2E Pinned");
+    assert_eq!(
+        pinned["defaultModel"],
+        serde_json::json!({ "provider": "codex", "model": "codex:test-model" }),
+        "compound-model pin resolved per-specialist, not via the settings default"
+    );
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&ws_root);
+}
+
 /// `ws.agent.getQueue` + `ws.agent.removeQueuedMessage` + the queue merged
 /// into `ws.agent.status`: another sender's entry surfaces with attribution
 /// (full content in getQueue, 200-char truncation in status), ordering is

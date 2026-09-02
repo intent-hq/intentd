@@ -929,8 +929,11 @@ async fn list(
 /// compact dispatch-oriented shape — prompt bodies are deliberately dropped
 /// (the purpose is model/specialist selection, not prompt inspection). The
 /// loader runs at call time with the workspace's path so the project tier
-/// (`.intent/specialists/`) applies, and with no provider filter so the
-/// `resolvedProvider`/`resolvedModel` preview reflects the daemon default.
+/// (`.intent/specialists/`) applies. The dispatch variant of the list
+/// resolves the `resolvedProvider`/`resolvedModel` preview per-specialist —
+/// each row against the provider a no-`model` delegate of that specialist
+/// would actually spawn on (its own pin first, else the settings default) —
+/// matching the session-start specialist hints.
 async fn list_specialists(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
     // Best-effort workspace path: a workspace without a checkout (e.g. chief)
     // simply gets no project tier.
@@ -940,7 +943,7 @@ async fn list_specialists(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Resu
         .ok()
         .and_then(|w| w.effective_path().map(String::from));
     let result = api
-        .specialist_list(workspace_path, None)
+        .specialist_list_dispatch(workspace_path)
         .await
         .map_err(map_err)?;
     let specialists = result
@@ -2019,9 +2022,10 @@ mod tests {
 
         /// `WorkspaceApi` fake: `get_workspace` serves a row with a worktree
         /// path (so the binding forwards it as the project-tier root) and
-        /// `specialist_list` records the received path and returns resolved
-        /// defs in the wire `SpecialistDef` shape — prompt bodies included,
-        /// so the projection's dropping of them is actually exercised.
+        /// `specialist_list_dispatch` records the received path and returns
+        /// resolved defs in the wire `SpecialistDef` shape — prompt bodies
+        /// included, so the projection's dropping of them is actually
+        /// exercised.
         struct FakeApi {
             received_path: std::sync::Mutex<Option<String>>,
         }
@@ -2076,10 +2080,9 @@ mod tests {
                 })
             }
 
-            fn specialist_list(
+            fn specialist_list_dispatch(
                 &self,
                 workspace_path: Option<String>,
-                _provider: Option<String>,
             ) -> BoxFuture<'_, Result<Value>> {
                 *self.received_path.lock().unwrap() = workspace_path;
                 Box::pin(async move {
