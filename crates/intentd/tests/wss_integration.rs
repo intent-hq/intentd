@@ -6288,7 +6288,7 @@ async fn wss_agent_complete_once_unavailable_when_provider_has_no_one_shot() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "completeOnce is not supported for the effective default provider: opencode"
+            "reason": "completeOnce is not supported for the resolved provider: opencode"
         })
     );
     srv.ws.stop().await;
@@ -6342,7 +6342,7 @@ async fn wss_agent_complete_once_gate_follows_model_default_provider() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "completeOnce is not supported for the effective default provider: opencode"
+            "reason": "completeOnce is not supported for the resolved provider: opencode"
         }),
         "non-auggie model.defaultProvider routes away from the auggie CLI"
     );
@@ -6418,6 +6418,46 @@ async fn wss_agent_complete_once_resolves_quick_action_settings() {
     assert!(
         text.contains("--model opus4.7"),
         "an explicit model outranks the quick-action settings, got {resp}"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_provider() {
+    // A user-authored `quickActions.defaultModel = "codex:gpt-5"` (legacy
+    // compound; the wire rejects compounds but user files are never
+    // rejected) splits on read into a (codex, gpt-5) pair and routes the
+    // one-shot over the ephemeral ACP route — with `model.defaultProvider`
+    // left UNSET, proving a decidable compound rung opens the gate on its
+    // own instead of dying on the closed-gate path.
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping legacy compound quick-action e2e: node not on PATH");
+        return;
+    }
+    let (_adapter_dir, bin) =
+        fake_acp_adapter_script("compound-quick", r#"{"response":"🤖\ncompound-routed"}"#);
+    let srv = start(WsOptions::default()).await;
+    // Seed via reload() — the live-reload watcher path for an externally
+    // edited config.toml — since settings.update rejects compound values.
+    srv.registry
+        .reload(&format!(
+            "[providers.paths]\ncodex = {:?}\n\n[quickActions]\ndefaultModel = \"codex:gpt-5\"\n",
+            bin.to_string_lossy()
+        ))
+        .expect("reload legacy config");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":52,"method":"agent.completeOnce","params":{"prompt":"msg"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 52);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "text": "compound-routed" }),
+        "a legacy compound quick-action value must route to its own provider"
     );
     srv.ws.stop().await;
 }

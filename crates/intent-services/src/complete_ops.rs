@@ -69,8 +69,14 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
 /// cached-catalog evidence rule ([`ensure_bare_model_matches_provider`]): the
 /// model is dropped only when the paired provider's own cached catalog
 /// affirmatively disproves ownership, so a cold start still passes it
-/// through. An unregistered compound prefix or a blank half drops the rung
-/// with a warn log.
+/// through. An unregistered compound prefix, a blank half, or a remainder
+/// that still carries a `:` (never a bare id) drops the rung with a warn log.
+///
+/// `effective_provider` is `None` when the settings resolve no default
+/// provider. A compound rung names its own provider and still resolves; a
+/// bare rung has no provider to pair with and drops. `None` is returned only
+/// when the chain produces no pair AND there is no effective provider to
+/// fall back to — the caller's closed gate.
 ///
 /// Every drop is PER RUNG and falls to the next one rather than erroring or
 /// skipping the chain: a dropped type override still tries
@@ -85,21 +91,23 @@ fn resolve_quick_action_model(
     settings: &intent_core::settings_file::SettingsFile,
     catalog: &crate::model_catalog::ModelCatalogCache,
     quick_action_type: Option<&str>,
-    effective_provider: &str,
-) -> (String, Option<String>) {
+    effective_provider: Option<&str>,
+) -> Option<(String, Option<String>)> {
     let quick = &settings.quick_actions;
     let vet = |configured: &str| -> Option<(String, String)> {
         // Split a legacy compound value into its (provider, model) pair; a
-        // bare value pairs with the effective provider.
+        // bare value pairs with the effective provider (when there is one).
         let pair = match configured.split_once(':') {
             Some((prefix, bare)) => {
                 let bare = bare.trim();
-                let provider = intent_providers::find_provider(prefix.trim())
+                intent_providers::find_provider(prefix.trim())
                     .map(|p| p.id.to_string())
-                    .filter(|_| !bare.is_empty());
-                provider.map(|p| (p, bare.to_string()))
+                    // A remainder still carrying `:` is not a bare id; the
+                    // rung drops rather than feeding a compound to the CLI.
+                    .filter(|_| !bare.is_empty() && !bare.contains(':'))
+                    .map(|p| (p, bare.to_string()))
             }
-            None => Some((effective_provider.to_string(), configured.to_string())),
+            None => effective_provider.map(|p| (p.to_string(), configured.to_string())),
         };
         let owned = pair.filter(|(provider, bare)| {
             crate::agent_ops::ensure_bare_model_matches_provider(
@@ -136,10 +144,8 @@ fn resolve_quick_action_model(
                 .filter(|m| !m.is_empty())
                 .and_then(vet)
         })
-        .map_or_else(
-            || (effective_provider.to_string(), None),
-            |(provider, model)| (provider, Some(model)),
-        )
+        .map(|(provider, model)| (provider, Some(model)))
+        .or_else(|| effective_provider.map(|p| (p.to_string(), None)))
 }
 
 /// Pick the one-shot launch for `provider`, mirroring the model probe's
@@ -244,27 +250,35 @@ impl Services {
     ) -> Result<Value> {
         let settings = self.effective_settings();
         let effective_provider = crate::agent_session::derived_default_provider(&settings);
-        let effective_provider = match effective_provider.as_deref() {
-            Some(p) => p.to_string(),
-            None => {
-                return Ok(unavailable(
-                    "completeOnce requires a decidable effective default provider",
-                ))
-            }
-        };
 
-        // An explicit client model always wins (it runs on the effective
-        // provider); only a caller that sent none falls through to the
-        // quick-action settings chain, whose result is a (provider, model)
-        // pair.
+        // An explicit client model always wins, but it is bare and so needs
+        // the effective provider to run on. A caller that sent none falls
+        // through to the quick-action settings chain, whose result is a
+        // (provider, model) pair — a compound rung names its own provider, so
+        // the chain can still resolve when the default provider is unset;
+        // the gate closes only when neither yields a provider.
         let (run_provider, model) = match model.filter(|m| !m.trim().is_empty()) {
-            Some(m) => (effective_provider.clone(), Some(m)),
-            None => resolve_quick_action_model(
+            Some(m) => match effective_provider {
+                Some(p) => (p, Some(m)),
+                None => {
+                    return Ok(unavailable(
+                        "completeOnce requires a decidable effective default provider",
+                    ))
+                }
+            },
+            None => match resolve_quick_action_model(
                 &settings,
                 &self.models_catalog,
                 quick_action_type.as_deref(),
-                &effective_provider,
-            ),
+                effective_provider.as_deref(),
+            ) {
+                Some(pair) => pair,
+                None => {
+                    return Ok(unavailable(
+                        "completeOnce requires a decidable effective default provider",
+                    ))
+                }
+            },
         };
 
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
@@ -354,7 +368,7 @@ impl Services {
     ) -> Result<Value> {
         if !ACP_ONE_SHOT_PROVIDERS.contains(&provider_id) {
             return Ok(unavailable(format!(
-                "completeOnce is not supported for the effective default provider: {provider_id}"
+                "completeOnce is not supported for the resolved provider: {provider_id}"
             )));
         }
         let Some(provider) = intent_providers::find_provider(provider_id) else {
@@ -633,7 +647,7 @@ rl.on('line', (line) => {{
             v,
             serde_json::json!({
                 "available": false,
-                "reason": "completeOnce is not supported for the effective default provider: opencode"
+                "reason": "completeOnce is not supported for the resolved provider: opencode"
             })
         );
     }
@@ -950,14 +964,18 @@ rl.on('line', (line) => {
     }
 
     /// The expected pair for a rung that resolved on the effective provider.
-    fn on(provider: &str, model: &str) -> (String, Option<String>) {
-        (provider.to_string(), Some(model.to_string()))
+    /// (Wrapped in `Some` to mirror the resolver's return type — `None` is
+    /// the closed gate.)
+    #[allow(clippy::unnecessary_wraps)]
+    fn on(provider: &str, model: &str) -> Option<(String, Option<String>)> {
+        Some((provider.to_string(), Some(model.to_string())))
     }
 
     /// The expected pair for a chain that fell through entirely: the
     /// effective provider with its CLI default.
-    fn cli_default(provider: &str) -> (String, Option<String>) {
-        (provider.to_string(), None)
+    #[allow(clippy::unnecessary_wraps)]
+    fn cli_default(provider: &str) -> Option<(String, Option<String>)> {
+        Some((provider.to_string(), None))
     }
 
     #[test]
@@ -969,25 +987,25 @@ rl.on('line', (line) => {
         let catalog = empty_catalog();
         let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "haiku4.5")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), Some("auggie")),
             on("auggie", "haiku4.5")
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("pr"), "auggie"),
+            resolve_quick_action_model(&settings, &catalog, Some("pr"), Some("auggie")),
             on("auggie", "sonnet4.5")
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("not-a-type"), "auggie"),
+            resolve_quick_action_model(&settings, &catalog, Some("not-a-type"), Some("auggie")),
             on("auggie", "sonnet4.5")
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+            resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
             on("auggie", "sonnet4.5")
         );
 
         let blank = quick_action_settings(Some("  "), &[("commit", "")]);
         assert_eq!(
-            resolve_quick_action_model(&blank, &catalog, Some("commit"), "auggie"),
+            resolve_quick_action_model(&blank, &catalog, Some("commit"), Some("auggie")),
             cli_default("auggie"),
             "blank values read as unset, not as an empty model id"
         );
@@ -996,7 +1014,7 @@ rl.on('line', (line) => {
                 &intent_core::settings_file::SettingsFile::default(),
                 &catalog,
                 Some("commit"),
-                "auggie"
+                Some("auggie")
             ),
             cli_default("auggie")
         );
@@ -1010,26 +1028,62 @@ rl.on('line', (line) => {
         let catalog = empty_catalog();
         let settings = quick_action_settings(Some("auggie:sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+            resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
             on("auggie", "sonnet4.5")
         );
         let settings = quick_action_settings(Some("codex:gpt-5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+            resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
             on("codex", "gpt-5"),
             "a foreign registered prefix routes the one-shot to that provider"
         );
     }
 
     #[test]
-    fn quick_action_malformed_compound_values_drop_the_rung() {
-        // An unregistered prefix or a blank half cannot form a pair; the
-        // rung drops with a warn log and the chain falls through.
+    fn quick_action_compound_rung_resolves_without_an_effective_provider() {
+        // A compound rung names its own provider, so the chain still yields a
+        // pair when the default provider is undecidable; a bare rung has
+        // nothing to pair with and the chain resolves to None (closed gate).
         let catalog = empty_catalog();
-        for legacy in [":sonnet4.5", "not-a-provider:sonnet4.5", "auggie:"] {
+        let compound = quick_action_settings(Some("codex:gpt-5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&compound, &catalog, None, None),
+            on("codex", "gpt-5"),
+            "a decidable compound rung must open the gate on its own"
+        );
+        let bare = quick_action_settings(Some("sonnet4.5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&bare, &catalog, None, None),
+            None,
+            "a bare rung with no effective provider must close the gate"
+        );
+        assert_eq!(
+            resolve_quick_action_model(
+                &intent_core::settings_file::SettingsFile::default(),
+                &catalog,
+                None,
+                None
+            ),
+            None,
+            "nothing configured and no effective provider must close the gate"
+        );
+    }
+
+    #[test]
+    fn quick_action_malformed_compound_values_drop_the_rung() {
+        // An unregistered prefix, a blank half, or a remainder still carrying
+        // a colon cannot form a (provider, bare model) pair; the rung drops
+        // with a warn log and the chain falls through.
+        let catalog = empty_catalog();
+        for legacy in [
+            ":sonnet4.5",
+            "not-a-provider:sonnet4.5",
+            "auggie:",
+            "codex:org:model",
+        ] {
             let settings = quick_action_settings(Some(legacy), &[]);
             assert_eq!(
-                resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+                resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
                 cli_default("auggie"),
                 "{legacy} must fall through to the CLI default"
             );
@@ -1046,7 +1100,7 @@ rl.on('line', (line) => {
         let settings =
             quick_action_settings(Some("sonnet4.5"), &[("commit", "not-a-provider:haiku")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), Some("auggie")),
             on("auggie", "sonnet4.5"),
             "a dropped override must fall to the default-model rung"
         );
@@ -1054,7 +1108,7 @@ rl.on('line', (line) => {
         let settings =
             quick_action_settings(Some("bogus:gpt-5"), &[("commit", "not-a-provider:haiku")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), Some("auggie")),
             cli_default("auggie")
         );
     }
@@ -1067,7 +1121,7 @@ rl.on('line', (line) => {
         // while another provider claims it.
         let settings = quick_action_settings(Some("grok-4"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &empty_catalog(), None, "auggie"),
+            resolve_quick_action_model(&settings, &empty_catalog(), None, Some("auggie")),
             on("auggie", "grok-4"),
             "no cached evidence must not drop a bare id"
         );
@@ -1085,20 +1139,20 @@ rl.on('line', (line) => {
             vec![serde_json::json!({ "id": "grok-4", "provider": "grok" })],
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+            resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
             cli_default("auggie"),
             "a bare id the effective provider's catalog disproves is dropped"
         );
         let owned = quick_action_settings(Some("sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&owned, &catalog, None, "auggie"),
+            resolve_quick_action_model(&owned, &catalog, None, Some("auggie")),
             on("auggie", "sonnet4.5")
         );
         // The ownership guard applies to a compound rung's own pair too: a
         // split pair whose provider's catalog disproves the model drops.
         let foreign = quick_action_settings(Some("grok:sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&foreign, &catalog, None, "auggie"),
+            resolve_quick_action_model(&foreign, &catalog, None, Some("auggie")),
             cli_default("auggie"),
             "a split pair failing its own provider's ownership guard drops"
         );
