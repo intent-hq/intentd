@@ -1469,7 +1469,13 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
-        self.specialist_model_options(wp.as_deref())
+        // The options walk lists the full specialist catalog — blocking pool
+        // (monorepo#4148); a JoinError degrades to no options, matching the
+        // "spawning never fails on this" doctrine above.
+        let services = self.clone();
+        tokio::task::spawn_blocking(move || services.specialist_model_options(wp.as_deref()))
+            .await
+            .unwrap_or_default()
     }
 
     /// Non-empty trimmed string at `key` in a session's raw metadata JSON —
@@ -13666,19 +13672,28 @@ impl WorkspaceApi for Services {
         workspace_path: Option<String>,
         provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Catalog assembly walks every specialist tier on disk and the
+        // per-row decoration re-resolves through the same tiers, so the
+        // whole read runs on the blocking pool — never inline on the async
+        // runtime (monorepo#4148).
+        let services = self.clone();
         Box::pin(async move {
-            let provider = specialist_preview_provider(self, provider)?;
-            let ws_path = workspace_path.as_deref().map(Path::new);
-            let mut result = self.specialists_service().list(ws_path)?;
-            if let Some(specs) = result
-                .get_mut("specialists")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for def in specs {
-                    decorate_specialist_resolved(self, def, ws_path, provider.as_deref());
+            tokio::task::spawn_blocking(move || {
+                let provider = specialist_preview_provider(&services, provider)?;
+                let ws_path = workspace_path.as_deref().map(Path::new);
+                let mut result = services.specialists_service().list(ws_path)?;
+                if let Some(specs) = result
+                    .get_mut("specialists")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for def in specs {
+                        decorate_specialist_resolved(&services, def, ws_path, provider.as_deref());
+                    }
                 }
-            }
-            Ok(result)
+                Ok(result)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.list task failed: {e}")))?
         })
     }
 
@@ -13686,23 +13701,29 @@ impl WorkspaceApi for Services {
         &self,
         workspace_path: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Same tier walk as `specialist_list` — blocking pool (monorepo#4148).
+        let services = self.clone();
         Box::pin(async move {
-            let ws_path = workspace_path.as_deref().map(Path::new);
-            let mut result = self.specialists_service().list(ws_path)?;
-            if let Some(specs) = result
-                .get_mut("specialists")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for def in specs {
-                    // No caller/settings provider context: `provider: None`
-                    // makes the decoration resolve each row through
-                    // `resolve_delegate_provider_preview` — the specialist's
-                    // own pin first, else the settings-derived default —
-                    // exactly what a no-model `agent.delegate` would spawn on.
-                    decorate_specialist_resolved(self, def, ws_path, None);
+            tokio::task::spawn_blocking(move || {
+                let ws_path = workspace_path.as_deref().map(Path::new);
+                let mut result = services.specialists_service().list(ws_path)?;
+                if let Some(specs) = result
+                    .get_mut("specialists")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for def in specs {
+                        // No caller/settings provider context: `provider: None`
+                        // makes the decoration resolve each row through
+                        // `resolve_delegate_provider_preview` — the specialist's
+                        // own pin first, else the settings-derived default —
+                        // exactly what a no-model `agent.delegate` would spawn on.
+                        decorate_specialist_resolved(&services, def, ws_path, None);
+                    }
                 }
-            }
-            Ok(result)
+                Ok(result)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.listDispatch task failed: {e}")))?
         })
     }
 
@@ -13712,14 +13733,21 @@ impl WorkspaceApi for Services {
         workspace_path: Option<String>,
         provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Single-id resolve still walks the tier directories — blocking pool
+        // (monorepo#4148).
+        let services = self.clone();
         Box::pin(async move {
-            let provider = specialist_preview_provider(self, provider)?;
-            let ws_path = workspace_path.as_deref().map(Path::new);
-            let mut result = self.specialists_service().get(&id, ws_path)?;
-            if let Some(def) = result.get_mut("specialist") {
-                decorate_specialist_resolved(self, def, ws_path, provider.as_deref());
-            }
-            Ok(result)
+            tokio::task::spawn_blocking(move || {
+                let provider = specialist_preview_provider(&services, provider)?;
+                let ws_path = workspace_path.as_deref().map(Path::new);
+                let mut result = services.specialists_service().get(&id, ws_path)?;
+                if let Some(def) = result.get_mut("specialist") {
+                    decorate_specialist_resolved(&services, def, ws_path, provider.as_deref());
+                }
+                Ok(result)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.get task failed: {e}")))?
         })
     }
 
@@ -13756,13 +13784,20 @@ impl WorkspaceApi for Services {
         scope: Option<String>,
         workspace_path: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Write ops validate against the full on-disk catalog — blocking pool
+        // (monorepo#4148).
+        let service = self.specialists_service();
         Box::pin(async move {
-            self.specialists_service().create(
-                &id,
-                &spec,
-                scope.as_deref(),
-                workspace_path.as_deref().map(Path::new),
-            )
+            tokio::task::spawn_blocking(move || {
+                service.create(
+                    &id,
+                    &spec,
+                    scope.as_deref(),
+                    workspace_path.as_deref().map(Path::new),
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.create task failed: {e}")))?
         })
     }
 
@@ -13773,13 +13808,13 @@ impl WorkspaceApi for Services {
         scope: String,
         workspace_path: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let service = self.specialists_service();
         Box::pin(async move {
-            self.specialists_service().edit(
-                &id,
-                &spec,
-                &scope,
-                workspace_path.as_deref().map(Path::new),
-            )
+            tokio::task::spawn_blocking(move || {
+                service.edit(&id, &spec, &scope, workspace_path.as_deref().map(Path::new))
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.edit task failed: {e}")))?
         })
     }
 
@@ -13789,9 +13824,13 @@ impl WorkspaceApi for Services {
         scope: String,
         workspace_path: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let service = self.specialists_service();
         Box::pin(async move {
-            self.specialists_service()
-                .delete(&id, &scope, workspace_path.as_deref().map(Path::new))
+            tokio::task::spawn_blocking(move || {
+                service.delete(&id, &scope, workspace_path.as_deref().map(Path::new))
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("specialist.delete task failed: {e}")))?
         })
     }
 
