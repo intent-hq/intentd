@@ -74,9 +74,11 @@ fn set(svc: &Services, path: &str, value: serde_json::Value) {
 ///
 /// Both `auggie` and `mock` are seeded: the create-path tests never spawn, so
 /// they can name `auggie`, while the delegate-path tests resolve a *provider*
-/// and must use `mock` — its availability is gated purely on
-/// `MOCK_AGENT_SCRIPT_PATH` ([`EnvGuard`]), so they do not depend on a real
-/// ACP provider binary being installed on the test host (CI has none).
+/// and pass its availability check — `mock` is gated purely on
+/// `MOCK_AGENT_SCRIPT_PATH` ([`EnvGuard`]), and delegate tests that resolve
+/// the settings default `auggie` rely on the `providers.paths` override in
+/// [`setup`], so neither depends on a real ACP provider binary being
+/// installed on the test host (CI has none).
 fn seed_catalog(svc: &Services) {
     for provider in ["auggie", "mock"] {
         let version_key = crate::model_catalog::source_for(provider)
