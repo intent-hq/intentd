@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.7] - 2026-09-02
+
+### 🚀 Features
+
+- Live provider test-prompt RPC + supportsTestPrompt catalog flag ([#1657](https://github.com/intent-hq/intentd/pull/1657))
+- One-time boot migration removes providers.active from config.toml ([#1658](https://github.com/intent-hq/intentd/pull/1658))
+
+
 ## [0.9.6] - 2026-09-02
 
 ### 🚀 Features
