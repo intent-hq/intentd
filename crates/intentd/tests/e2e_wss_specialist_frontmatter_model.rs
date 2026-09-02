@@ -738,13 +738,19 @@ async fn specialist_config_scalars_inherit_over_wss() {
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
-    // get — omitted scalars inherit the bundled values; roleReminder does not.
+    // get — omitted scalars inherit the bundled values; roleReminder does
+    // not. The bundled compound `model` scalar reads as the bare model plus
+    // `codingAgent` set to the prefix (lenient legacy normalization).
     let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
     let def = &got["specialist"];
     assert_eq!(def["source"], "user", "user tier wins the merge");
     assert_eq!(
-        def["model"], "auggie:opus",
-        "omitted model inherits the bundled value on specialist.get over WSS"
+        def["model"], "opus",
+        "omitted model inherits the bundled value (split to the bare id) on specialist.get over WSS"
+    );
+    assert_eq!(
+        def["codingAgent"], "auggie",
+        "the legacy compound's prefix lands on codingAgent over WSS"
     );
     assert_eq!(
         def["agentType"], "zeta-type",
@@ -770,8 +776,8 @@ async fn specialist_config_scalars_inherit_over_wss() {
         .find(|s| s["id"] == "zeta")
         .expect("zeta listed");
     assert_eq!(
-        zeta["model"], "auggie:opus",
-        "omitted model inherits in specialist.list over WSS"
+        zeta["model"], "opus",
+        "omitted model inherits (split to the bare id) in specialist.list over WSS"
     );
     assert_eq!(
         zeta["agentType"], "zeta-type",
@@ -883,7 +889,9 @@ async fn specialist_model_options_round_trip_over_wss() {
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
-    let expected = json!([{ "model": "auggie:opus", "hint": "smart" }]);
+    // The bundled legacy compound entry reads as the provider+model triple
+    // (lenient legacy normalization).
+    let expected = json!([{ "provider": "auggie", "model": "opus", "hint": "smart" }]);
 
     // get — an omitted key inherits the bundled tier's list.
     let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;

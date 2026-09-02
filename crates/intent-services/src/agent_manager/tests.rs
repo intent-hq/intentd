@@ -8224,9 +8224,12 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
         .find(|s| s.specialist == "chooser")
         .expect("chooser listed");
     assert_eq!(chooser.options.len(), 2);
-    assert_eq!(chooser.options[0].model, "opencode:kimi-k3");
+    // Legacy compound `model` ids in frontmatter split into the triple on read.
+    assert_eq!(chooser.options[0].provider, "opencode");
+    assert_eq!(chooser.options[0].model, "kimi-k3");
     assert_eq!(chooser.options[0].hint, "cheap");
-    assert_eq!(chooser.options[1].model, "auggie:opus");
+    assert_eq!(chooser.options[1].provider, "auggie");
+    assert_eq!(chooser.options[1].model, "opus");
     assert_eq!(chooser.options[1].hint, "");
     // No frontmatter model and no configured default → provider CLI default.
     assert_eq!(chooser.default_model, None);

@@ -35,10 +35,14 @@ pub(crate) struct ToolDef {
 }
 
 /// One delegation model option a specialist declares (PROTOCOL §5.11
-/// `modelOptions`): the internal compound model id plus the author's hint.
+/// `modelOptions`): the `{ provider?, model, hint, reasoningEffort? }` triple.
 pub struct SpecialistModelOption {
-    /// Internal compound model id (e.g. `opencode:kimi-k3`), passed verbatim
-    /// as the `model` param of `ws.agent.delegate` / `ws.agent.create`.
+    /// Provider the option pins (e.g. `opencode`), passed as the `provider`
+    /// param of `ws.agent.delegate` / `ws.agent.create` when the option is
+    /// chosen; empty when the author declared none (any provider).
+    pub provider: String,
+    /// Bare model id (e.g. `kimi-k3`), passed verbatim as the `model` param
+    /// of `ws.agent.delegate` / `ws.agent.create`.
     pub model: String,
     /// Free-text hint for choosing this option; empty when the author gave none.
     pub hint: String,
@@ -52,8 +56,8 @@ pub struct SpecialistModelOption {
 pub struct SpecialistModelOptions {
     /// Specialist id (the `specialist` param of delegate/create).
     pub specialist: String,
-    /// Compound id a no-`model` delegate would pin, as resolved by the same
-    /// resolver the `resolvedModel` preview uses; `None` when resolution
+    /// Bare model id a no-`model` delegate would pin, as resolved by the
+    /// same resolver the `resolvedModel` preview uses; `None` when resolution
     /// yields the provider CLI default.
     pub default_model: Option<String>,
     /// Ordered options as authored in the winning tier's frontmatter.
@@ -230,7 +234,7 @@ API:
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
   ws.agent.listSpecialists() → [specialists]  // Specialist catalog with model dispatch hints; prompt bodies omitted. The live counterpart to the session-start specialist hints; each row is `{ id, name, description, hidden?, aliases?, defaultModel?, modelOptions }`.
-    `defaultModel` is `{ provider, model }` (what a no-`model` delegate would pin; omitted when resolution yields the provider default); `modelOptions` is `[{ model, hint?, reasoningEffort? }]`.
+    `defaultModel` is `{ provider, model, reasoningEffort? }` with bare `model` (what a no-`model` delegate would pin, including the effort it would apply; omitted when resolution yields the provider default); `modelOptions` is `[{ provider?, model, hint?, reasoningEffort? }]` with bare `model` (pass `provider` when the option pins one).
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars).
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries. Check it for an entry with your `fromAgentId` before sending again — the single-pending-message rule on `ws.agent.send` refuses a second send while one is pending.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected. This is the remediation when `ws.agent.send` / `ws.agent.sendToTask` refuse a second send under the single-pending-message rule: remove the pending entry, then re-send ONE combined message.
@@ -478,7 +482,7 @@ API:
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
   ws.agent.listSpecialists() → [specialists]  // Specialist catalog with model dispatch hints; prompt bodies omitted. The live counterpart to the session-start specialist hints; each row is `{ id, name, description, hidden?, aliases?, defaultModel?, modelOptions }`.
-    `defaultModel` is `{ provider, model }` (what a no-`model` delegate would pin; omitted when resolution yields the provider default); `modelOptions` is `[{ model, hint?, reasoningEffort? }]`.
+    `defaultModel` is `{ provider, model, reasoningEffort? }` with bare `model` (what a no-`model` delegate would pin, including the effort it would apply; omitted when resolution yields the provider default); `modelOptions` is `[{ provider?, model, hint?, reasoningEffort? }]` with bare `model` (pass `provider` when the option pins one).
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
   ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). Zero/absent fields are omitted; `time` is current UTC.
@@ -1161,11 +1165,13 @@ fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) ->
 }
 
 /// Render the injected continuation block: one header line plus one line per
-/// specialist naming its resolved default (`` default `<compound id>` ``, or
+/// specialist naming its resolved default (`` default `<model>` ``, or
 /// `default: provider default` when resolution yields the provider CLI
-/// default) followed by its options as `` `<compound id>` (<hint>) `` entries
-/// (the hint parenthetical is omitted when empty, and an option's declared
-/// reasoning effort is appended to it as `effort: <level>`). All lines are
+/// default) followed by its options as `` `<model>` (<hint>) `` entries. An
+/// option that pins a provider is shown as `` `model` on <provider> `` (pass
+/// the provider as the `provider` param — `model` is always the bare id); the
+/// hint parenthetical is omitted when empty, and an option's declared
+/// reasoning effort is appended to it as `effort: <level>`. All lines are
 /// indented ≥4 so the `[agentFeatures]` pruning treats them as continuation
 /// lines of the `ws.agent.delegate` entry. Author-supplied text is flattened
 /// onto one line so a multi-line hint cannot break the description's line
@@ -1174,9 +1180,9 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
     let flat = |s: &str| s.replace(['\n', '\r'], " ");
     let mut block = String::from(
         "    Specialist model options (for `ws.agent.delegate`/`ws.agent.create` \
-         pass a BARE model id as `model` — an option shown as compound \
-         `provider:model` splits into `provider` + bare `model`, compound ids \
-         are rejected; omit `model` to use the \
+         pass the BARE model id as `model` — compound `provider:model` ids are \
+         rejected; an option shown as `model` on <provider> also takes that \
+         provider as the `provider` param; omit `model` to use the \
          specialist's default; on `ws.agent.delegate` an option's `effort` is \
          applied automatically unless you pass an explicit `reasoningEffort` — \
          `ws.agent.create` applies only the `reasoningEffort` you pass):\n",
@@ -1190,6 +1196,11 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
             None => "default: provider default".to_string(),
         }];
         entries.extend(spec.options.iter().map(|o| {
+            use std::fmt::Write as _;
+            let mut entry = format!("`{}`", flat(&o.model));
+            if !o.provider.is_empty() {
+                let _ = write!(entry, " on {}", flat(&o.provider));
+            }
             let mut paren: Vec<String> = Vec::new();
             if !o.hint.is_empty() {
                 paren.push(flat(&o.hint));
@@ -1197,11 +1208,10 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
             if !o.reasoning_effort.is_empty() {
                 paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
             }
-            if paren.is_empty() {
-                format!("`{}`", flat(&o.model))
-            } else {
-                format!("`{}` ({})", flat(&o.model), paren.join("; "))
+            if !paren.is_empty() {
+                let _ = write!(entry, " ({})", paren.join("; "));
             }
+            entry
         }));
         block.push_str(&entries.join(", "));
         block.push('\n');
@@ -2004,9 +2014,10 @@ mod tests {
     fn condensed_description_injects_model_options() {
         let options = vec![SpecialistModelOptions {
             specialist: "implementor".to_string(),
-            default_model: Some("auggie:claude-opus-5".to_string()),
+            default_model: Some("claude-opus-5".to_string()),
             options: vec![SpecialistModelOption {
-                model: "opencode:kimi-k3".to_string(),
+                provider: "opencode".to_string(),
+                model: "kimi-k3".to_string(),
                 hint: "cheap".to_string(),
                 reasoning_effort: String::new(),
             }],
@@ -2014,9 +2025,8 @@ mod tests {
         let condensed =
             condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &options);
         assert!(
-            condensed.contains(
-                "implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"
-            ),
+            condensed
+                .contains("implementor: default `claude-opus-5`, `kimi-k3` on opencode (cheap)"),
             "condensed description must carry the specialist model options"
         );
         let delegate_pos = condensed.find("  ws.agent.delegate(").unwrap();
@@ -2799,15 +2809,17 @@ mod tests {
         vec![
             SpecialistModelOptions {
                 specialist: "implementor".to_string(),
-                default_model: Some("auggie:claude-opus-5".to_string()),
+                default_model: Some("claude-opus-5".to_string()),
                 options: vec![
                     SpecialistModelOption {
-                        model: "opencode:kimi-k3".to_string(),
+                        provider: "opencode".to_string(),
+                        model: "kimi-k3".to_string(),
                         hint: "cheap".to_string(),
                         reasoning_effort: String::new(),
                     },
                     SpecialistModelOption {
-                        model: "auggie:opus".to_string(),
+                        provider: String::new(),
+                        model: "opus".to_string(),
                         hint: String::new(),
                         reasoning_effort: String::new(),
                     },
@@ -2818,7 +2830,8 @@ mod tests {
                 specialist: "verifier".to_string(),
                 default_model: None,
                 options: vec![SpecialistModelOption {
-                    model: "grok:grok-5".to_string(),
+                    provider: "grok".to_string(),
+                    model: "grok-5".to_string(),
                     hint: "fast reviews".to_string(),
                     reasoning_effort: String::new(),
                 }],
@@ -2847,9 +2860,10 @@ mod tests {
     }
 
     // Options are injected as continuation lines directly under the
-    // `ws.agent.delegate` doc entry: the resolved default first, then compound
-    // id + hint per specialist, the hint parenthetical omitted when empty, and
-    // the next method line (`ws.agent.send`) still follows.
+    // `ws.agent.delegate` doc entry: the resolved default first, then bare
+    // model (+ provider suffix) + hint per specialist, the hint parenthetical
+    // omitted when empty, and the next method line (`ws.agent.send`) still
+    // follows.
     #[test]
     fn model_options_injected_into_delegate_docs() {
         let features = AgentFeaturesSettings::default();
@@ -2866,15 +2880,17 @@ mod tests {
             );
             assert!(
                 got.contains(
-                    "implementor: default `auggie:claude-opus-5`, \
-                     `opencode:kimi-k3` (cheap), `auggie:opus`"
+                    "implementor: default `claude-opus-5`, \
+                     `kimi-k3` on opencode (cheap), `opus`"
                 ),
                 "chief={is_chief}: implementor options line missing/miswritten:\n{got}"
             );
             // An unresolved default renders the provider-CLI-default label
             // rather than a fabricated id.
             assert!(
-                got.contains("verifier: default: provider default, `grok:grok-5` (fast reviews)"),
+                got.contains(
+                    "verifier: default: provider default, `grok-5` on grok (fast reviews)"
+                ),
                 "chief={is_chief}: verifier options line missing/miswritten:\n{got}"
             );
             // The block sits between the delegate entry and the next method
@@ -2915,11 +2931,13 @@ mod tests {
             default_model: None,
             options: vec![
                 SpecialistModelOption {
+                    provider: String::new(),
                     model: "fable-5".to_string(),
                     hint: "hard tasks".to_string(),
                     reasoning_effort: "high".to_string(),
                 },
                 SpecialistModelOption {
+                    provider: String::new(),
                     model: "sonnet5".to_string(),
                     hint: String::new(),
                     reasoning_effort: "low".to_string(),
@@ -2958,7 +2976,7 @@ mod tests {
         );
         assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
         assert!(
-            got.contains("implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"),
+            got.contains("implementor: default `claude-opus-5`, `kimi-k3` on opencode (cheap)"),
             "options block missing on a pruned description"
         );
     }
@@ -2969,9 +2987,10 @@ mod tests {
     fn model_options_flatten_multiline_hints() {
         let options = vec![SpecialistModelOptions {
             specialist: "implementor".to_string(),
-            default_model: Some("auggie:claude-opus-5".to_string()),
+            default_model: Some("claude-opus-5".to_string()),
             options: vec![SpecialistModelOption {
-                model: "opencode:kimi-k3".to_string(),
+                provider: "opencode".to_string(),
+                model: "kimi-k3".to_string(),
                 hint: "line one\nline two".to_string(),
                 reasoning_effort: String::new(),
             }],
@@ -2983,7 +3002,7 @@ mod tests {
             false,
         );
         assert!(
-            got.contains("`opencode:kimi-k3` (line one line two)"),
+            got.contains("`kimi-k3` on opencode (line one line two)"),
             "multi-line hint not flattened:\n{got}"
         );
     }

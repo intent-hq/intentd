@@ -465,61 +465,104 @@ fn validate_icon_spec(value: Option<&Value>) -> Result<()> {
 }
 
 /// Frontmatter/wire key for the ordered list of delegation model options —
-/// `{ model, hint, reasoningEffort? }` entries a delegating agent can pick
-/// from (PROTOCOL §5.11).
+/// `{ provider?, model, hint, reasoningEffort? }` triples a delegating agent
+/// can pick from (PROTOCOL §5.11). `model` is a BARE model id; an omitted
+/// `provider` means the specialist's own provider (`codingAgent`, else the
+/// settings-derived default).
 /// Encoded in frontmatter as a **single-line JSON-array scalar** (e.g.
-/// `modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap"}]`) so it fits
-/// the line-based parser and round-trips losslessly. Resolution follows the
-/// same inherit-on-omit fold as [`INHERITED_CONFIG_KEYS`]: an omitted key
-/// inherits the lower tiers' effective list, an explicit `[]` clears it, and
-/// a non-empty list overrides it wholesale (entries never merge across tiers).
+/// `modelOptions: [{"provider":"opencode","model":"kimi-k3","hint":"cheap"}]`)
+/// so it fits the line-based parser and round-trips losslessly. Resolution
+/// follows the same inherit-on-omit fold as [`INHERITED_CONFIG_KEYS`]: an
+/// omitted key inherits the lower tiers' effective list, an explicit `[]`
+/// clears it, and a non-empty list overrides it wholesale (entries never
+/// merge across tiers).
 const MODEL_OPTIONS_KEY: &str = "modelOptions";
 
-/// Normalize one `modelOptions` entry to its documented fields, or `None` when
-/// the entry is unusable: `model` must be a non-empty (non-whitespace) string;
-/// `hint` is carried when it is a string and defaults to `""` otherwise;
-/// `reasoningEffort` is carried only when it is a non-empty string (the
-/// per-option effort level, PROTOCOL §5.11) and omitted otherwise.
+/// Normalize one `modelOptions` entry to its documented triple fields, or
+/// `None` when the entry is unusable: `model` must be a non-empty
+/// (non-whitespace) string; `provider` is carried when it is a non-empty
+/// string; `hint` is carried when it is a string and defaults to `""`
+/// otherwise; `reasoningEffort` is carried only when it is a non-empty string
+/// (the per-option effort level, PROTOCOL §5.11) and omitted otherwise.
+///
+/// Legacy compound `model` ids split on read: `provider:model` becomes the
+/// explicit `provider` plus the bare `model` (both halves trimmed), the
+/// prefix winning over an entry-level `provider` field (mirroring the spawn
+/// precedence compound ids had, where the model prefix outranked the provider
+/// column). A compound id with an empty prefix or an empty rest is unusable.
+/// The re-split on every read is safe because bare model ids never contain a
+/// colon — `reject_compound_model` enforces that invariant on every wire
+/// write, so a persisted triple's `model` can never re-split.
 fn normalize_model_option_entry(entry: &Value) -> Option<Value> {
     let obj = entry.as_object()?;
-    let model = obj
+    let raw_model = obj
         .get("model")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())?;
+    let (provider, model) = match raw_model.split_once(':') {
+        Some((prefix, rest)) => {
+            if prefix.trim().is_empty() || rest.trim().is_empty() {
+                return None;
+            }
+            (Some(prefix.trim().to_string()), rest.trim().to_string())
+        }
+        None => (
+            obj.get("provider")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+            raw_model.to_string(),
+        ),
+    };
     let hint = obj.get("hint").and_then(Value::as_str).unwrap_or("");
-    let mut out = json!({ "model": model, "hint": hint });
+    let mut out = Map::new();
+    if let Some(provider) = provider {
+        out.insert("provider".into(), json!(provider));
+    }
+    out.insert("model".into(), json!(model));
+    out.insert("hint".into(), json!(hint));
     if let Some(effort) = obj
         .get("reasoningEffort")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
     {
-        out["reasoningEffort"] = json!(effort);
+        out.insert("reasoningEffort".into(), json!(effort));
     }
-    Some(out)
+    Some(Value::Object(out))
 }
 
 /// Strictly validate a wire `modelOptions` value (`specialist.create`/`edit`
-/// specs): must be a JSON array of `{ model, hint?, reasoningEffort? }`
-/// objects with a non-empty string `model`, a string `hint` (defaulting to
-/// `""` when absent), and — when present — a string `reasoningEffort`.
+/// specs): must be a JSON array of `{ provider?, model, hint?, reasoningEffort? }`
+/// objects with a non-empty string `model`, an optional non-empty string
+/// `provider`, a string `hint` (defaulting to `""` when absent), and — when
+/// present — a string `reasoningEffort`.
 /// Returns the normalized entries in input order (`None` when the key is
 /// absent — the inherit-on-omit case); any invalid shape → `-32602`. Compound
 /// `provider:model` ids are NOT rejected here — legacy defs re-render through
-/// this path ([`render_file`]) and must stay lossless; the wire-boundary
-/// colon guard lives in [`reject_compound_model_options_spec`].
+/// this path ([`render_file`]) and split into the explicit triple; the
+/// wire-boundary colon guard lives in [`reject_compound_model_options_spec`].
 fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
     let Some(value) = value else { return Ok(None) };
     let Some(arr) = value.as_array() else {
         return Err(Error::InvalidParams(
-            "modelOptions must be an array of { model, hint } objects".to_string(),
+            "modelOptions must be an array of { provider?, model, hint } objects".to_string(),
         ));
     };
     let mut out = Vec::with_capacity(arr.len());
     for entry in arr {
         if !entry.is_object() {
             return Err(Error::InvalidParams(
-                "modelOptions entries must be { model, hint } objects".to_string(),
+                "modelOptions entries must be { provider?, model, hint } objects".to_string(),
             ));
+        }
+        match entry.get("provider") {
+            None => {}
+            Some(Value::String(s)) if !s.trim().is_empty() => {}
+            Some(_) => {
+                return Err(Error::InvalidParams(
+                    "modelOptions entry provider must be a non-empty string".to_string(),
+                ));
+            }
         }
         match entry.get("hint") {
             None | Some(Value::String(_)) => {}
@@ -741,6 +784,32 @@ fn effective_hidden(def: &Value) -> bool {
     def.get("hidden").and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Lenient read normalization of a legacy compound frontmatter `model`
+/// scalar (PROTOCOL §5.11): `model: "provider:model"` splits into the bare
+/// `model` plus a `codingAgent` set to the prefix — the prefix WINS over any
+/// `codingAgent` the same file declares, preserving the spawn precedence
+/// compound ids had (the model prefix outranked the provider column). A
+/// compound with an empty prefix or empty rest is unusable and reads as an
+/// omitted key (which inherits). Wire writes of compound `model` values are
+/// rejected up front (`reject_compound_model`), so this only ever fires for
+/// pre-triple on-disk files — a bare model id never contains a colon, which
+/// is what makes the re-split on every read idempotent.
+fn split_compound_model_scalar(fm: &mut Map<String, Value>) {
+    let Some(raw) = fm.get("model").and_then(Value::as_str) else {
+        return;
+    };
+    let Some((prefix, rest)) = raw.split_once(':') else {
+        return;
+    };
+    if prefix.trim().is_empty() || rest.trim().is_empty() {
+        fm.remove("model");
+        return;
+    }
+    let (prefix, rest) = (prefix.trim().to_string(), rest.trim().to_string());
+    fm.insert("model".into(), json!(rest));
+    fm.insert("codingAgent".into(), json!(prefix));
+}
+
 /// Build a wire `SpecialistDef` from one file's `content`. `source` is the
 /// winning tier; `path` is the resolved file (omitted for `bundled`,
 /// PROTOCOL §5.11). `prompt` is the markdown body; the optional frontmatter
@@ -775,7 +844,8 @@ fn build_def_inheriting(
     path: &Path,
     inherited: Option<&Value>,
 ) -> Value {
-    let (fm, body) = parse_frontmatter(content);
+    let (mut fm, body) = parse_frontmatter(content);
+    split_compound_model_scalar(&mut fm);
     let name = fm
         .get("name")
         .and_then(Value::as_str)
@@ -1380,21 +1450,32 @@ impl SpecialistsService {
     }
 
     /// Resolve the `reasoningEffort` declared by the specialist's
-    /// [`MODEL_OPTIONS_KEY`] entry whose `model` equals `model` (PROTOCOL
-    /// §5.11) — the model-option rung of the delegation effort resolution.
+    /// [`MODEL_OPTIONS_KEY`] entry matching the `{ provider, model }` pair
+    /// (PROTOCOL §5.11) — the model-option rung of the delegation effort
+    /// resolution. `model` matches the entry's bare `model`; an entry that
+    /// declares a `provider` additionally requires it to equal the effective
+    /// `provider` (so two providers offering the same bare model id resolve
+    /// their own efforts), while an entry without one matches any provider.
     /// Returns `None` when the specialist is unknown, declares no matching
     /// option, or the matching option carries no effort.
     pub(crate) fn resolve_model_option_effort(
         &self,
         id: &str,
         workspace_path: Option<&Path>,
+        provider: Option<&str>,
         model: &str,
     ) -> Option<String> {
         self.resolve(id, workspace_path).and_then(|def| {
             def.get(MODEL_OPTIONS_KEY)
                 .and_then(Value::as_array)?
                 .iter()
-                .find(|o| o.get("model").and_then(Value::as_str) == Some(model))
+                .find(|o| {
+                    o.get("model").and_then(Value::as_str) == Some(model)
+                        && match o.get("provider").and_then(Value::as_str) {
+                            None => true,
+                            Some(op) => provider == Some(op),
+                        }
+                })
                 .and_then(|o| o.get("reasoningEffort"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
@@ -3177,19 +3258,21 @@ mod tests {
     fn model_options_round_trip_losslessly() {
         // A wire spec's modelOptions list is written as a single-line
         // JSON-array frontmatter scalar and parses back byte-identical.
+        // A legacy compound `model` splits into the explicit triple on the
+        // first normalization and stays stable from then on.
         let spec = json!({
             "name": "Zeta",
             "description": "d",
             "modelOptions": [
                 { "model": "opencode:kimi-k3", "hint": "cheap & fast" },
-                { "model": "opus4.5", "hint": "smart, \"expensive\"" }
+                { "provider": "auggie", "model": "opus4.5", "hint": "smart, \"expensive\"" }
             ],
             "prompt": "body"
         });
         let rendered = render_file("zeta", &spec);
         assert!(
             rendered.contains(
-                r#"modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap & fast"},{"model":"opus4.5","hint":"smart, \"expensive\""}]"#
+                r#"modelOptions: [{"provider":"opencode","model":"kimi-k3","hint":"cheap & fast"},{"provider":"auggie","model":"opus4.5","hint":"smart, \"expensive\""}]"#
             ),
             "single-line JSON-array scalar is written: {rendered}"
         );
@@ -3197,8 +3280,8 @@ mod tests {
         assert_eq!(
             def["modelOptions"],
             json!([
-                { "model": "opencode:kimi-k3", "hint": "cheap & fast" },
-                { "model": "opus4.5", "hint": "smart, \"expensive\"" }
+                { "provider": "opencode", "model": "kimi-k3", "hint": "cheap & fast" },
+                { "provider": "auggie", "model": "opus4.5", "hint": "smart, \"expensive\"" }
             ]),
             "parse→write→parse round-trips losslessly"
         );
@@ -3355,8 +3438,9 @@ mod tests {
         let got = svc.get("zeta", None).unwrap();
         assert_eq!(
             got["specialist"]["modelOptions"],
-            json!([{ "model": "opencode:kimi-k3", "hint": "cheap" }]),
-            "a non-empty list overrides wholesale, never merges"
+            json!([{ "provider": "opencode", "model": "kimi-k3", "hint": "cheap" }]),
+            "a non-empty list overrides wholesale, never merges \
+             (a legacy compound model splits into the triple on read)"
         );
 
         // Non-empty but all-unusable → inherit, not clear.
@@ -3431,6 +3515,12 @@ mod tests {
             json!({ "name": "Z", "description": "d",
                 "modelOptions": [{ "model": "opus4.5", "hint": 42 }] }),
             json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "provider": 42 }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "provider": "" }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "provider": "   " }] }),
+            json!({ "name": "Z", "description": "d",
                 "modelOptions": [{ "model": "opencode:kimi-k3", "hint": "cheap" }] }),
             json!({ "name": "Z", "description": "d", "modelOptions": [{ "model": ":kimi-k3" }] }),
             json!({ "name": "Z", "description": "d", "model": "opencode:kimi-k3" }),
@@ -3457,6 +3547,20 @@ mod tests {
                 "edit rejects {spec} with InvalidParams, got {err:?}"
             );
         }
+        // Positive case: a valid explicit `{provider, model}` triple persists
+        // through the wire edit path and reads back normalized.
+        let paired = json!({
+            "name": "Z", "description": "d", "prompt": "body",
+            "modelOptions": [{ "provider": "opencode", "model": "kimi-k3", "hint": "cheap" }]
+        });
+        let edited = svc.edit("zeta", &paired, "user", None).unwrap();
+        let expected = json!([{ "provider": "opencode", "model": "kimi-k3", "hint": "cheap" }]);
+        assert_eq!(edited["specialist"]["modelOptions"], expected);
+        assert_eq!(
+            svc.get("zeta", None).unwrap()["specialist"]["modelOptions"],
+            expected,
+            "the provider-pinned entry round-trips through the wire write path"
+        );
     }
 
     #[test]
@@ -3512,6 +3616,99 @@ mod tests {
             .expect("bare model ids accepted on create");
         svc.edit("zeta", &bare, "user", None)
             .expect("bare model ids accepted on edit");
+    }
+
+    #[test]
+    fn legacy_compound_model_scalar_splits_on_read() {
+        // Lenient read normalization: a pre-triple on-disk file with a
+        // compound `model` scalar reads as the bare model plus `codingAgent`
+        // set to the prefix — the prefix WINS over a `codingAgent` the same
+        // file declares (preserving the spawn precedence compound ids had).
+        let content = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opencode:kimi-k3\"\ncodingAgent: \"claude\"\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["model"], "kimi-k3", "bare model after the split");
+        assert_eq!(
+            def["codingAgent"], "opencode",
+            "the model prefix outranks the file's own codingAgent"
+        );
+        // Without a codingAgent of its own the prefix still lands there.
+        let content =
+            "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opencode:kimi-k3\"\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["model"], "kimi-k3");
+        assert_eq!(def["codingAgent"], "opencode");
+        // A bare model is untouched and the declared codingAgent stands.
+        let content = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"kimi-k3\"\ncodingAgent: \"claude\"\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["model"], "kimi-k3");
+        assert_eq!(def["codingAgent"], "claude");
+        // An unusable compound (empty prefix or rest) reads as omitted.
+        for bad in ["\":kimi-k3\"", "\"opencode:\"", "\" : \""] {
+            let content =
+                format!("---\nname: \"Z\"\ndescription: \"d\"\nmodel: {bad}\n---\n\nbody");
+            let def = build_def("z", &content, "user", Path::new("/tmp/z.md"));
+            assert!(
+                def.get("model").is_none(),
+                "unusable compound {bad} reads as an omitted key"
+            );
+        }
+        // Omitted-after-split behaves like any omitted key: it inherits.
+        let bundled = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opus4.5\"\n---\n\nbody";
+        let base = build_def("z", bundled, "bundled", Path::new("/tmp/z.md"));
+        let user_file = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \":broken\"\n---\n\nbody";
+        let folded =
+            build_def_inheriting("z", user_file, "user", Path::new("/tmp/z.md"), Some(&base));
+        assert_eq!(
+            folded["model"], "opus4.5",
+            "an unusable compound inherits the lower tier's model"
+        );
+    }
+
+    #[test]
+    fn model_option_effort_matches_on_the_provider_model_pair() {
+        // Pair matching (PROTOCOL §5.11): two options sharing a bare model id
+        // under different providers resolve their own efforts; a
+        // provider-less option matches any provider; a provider mismatch on
+        // every candidate resolves nothing.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        user.write(
+            "chooser",
+            "---\nname: \"Chooser\"\ndescription: \"d\"\nmodelOptions: [\
+             {\"provider\":\"opencode\",\"model\":\"kimi-k3\",\"hint\":\"\",\"reasoningEffort\":\"low\"},\
+             {\"provider\":\"auggie\",\"model\":\"kimi-k3\",\"hint\":\"\",\"reasoningEffort\":\"high\"},\
+             {\"model\":\"opus4.5\",\"hint\":\"\",\"reasoningEffort\":\"medium\"}]\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("opencode"), "kimi-k3"),
+            Some("low".to_string())
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("auggie"), "kimi-k3"),
+            Some("high".to_string()),
+            "the same bare model resolves per provider"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("grok"), "kimi-k3"),
+            None,
+            "a provider matching no candidate resolves nothing"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, None, "kimi-k3"),
+            None,
+            "an unknown effective provider never matches a provider-pinned option"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("grok"), "opus4.5"),
+            Some("medium".to_string()),
+            "a provider-less option matches any provider"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, None, "opus4.5"),
+            Some("medium".to_string()),
+            "a provider-less option matches an unknown provider too"
+        );
     }
 
     #[test]

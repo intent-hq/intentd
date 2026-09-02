@@ -711,8 +711,10 @@ fn resolve_settings_default_reasoning_effort(
 
 /// Resolve the effective `reasoningEffort` for a delegated/woken child
 /// (PROTOCOL §5.11), in precedence order: the caller's explicit `param`, then
-/// the chosen model option's declared effort, then the specialist's
-/// `reasoningEffort` frontmatter scalar, then unset.
+/// the chosen model option's declared effort (matched on the effective
+/// `{ provider, model }` pair — see
+/// [`crate::specialists::SpecialistsService::resolve_model_option_effort`]),
+/// then the specialist's `reasoningEffort` frontmatter scalar, then unset.
 ///
 /// An empty/whitespace-only `param` is an explicit clear and is returned
 /// verbatim rather than as `None`: the create seam reads a present-but-blank
@@ -724,6 +726,7 @@ fn resolve_delegate_reasoning_effort(
     services: &Services,
     param: Option<&str>,
     specialist: Option<&str>,
+    provider: Option<&str>,
     model: Option<&str>,
     workspace_path: Option<&Path>,
 ) -> Option<String> {
@@ -733,7 +736,9 @@ fn resolve_delegate_reasoning_effort(
     let spec_id = specialist?;
     let specialists_svc = services.specialists_service();
     model
-        .and_then(|m| specialists_svc.resolve_model_option_effort(spec_id, workspace_path, m))
+        .and_then(|m| {
+            specialists_svc.resolve_model_option_effort(spec_id, workspace_path, provider, m)
+        })
         .or_else(|| specialists_svc.resolve_reasoning_effort(spec_id, workspace_path))
 }
 
@@ -3785,6 +3790,7 @@ impl Services {
             // pool (monorepo#4148).
             let services = self.clone();
             let specialist = specialist.clone();
+            let effective_provider = provider.clone().or_else(|| derived_default.clone());
             let resolved_model = resolved_model.clone();
             let spec_wp = spec_wp.clone();
             tokio::task::spawn_blocking(move || {
@@ -3792,6 +3798,7 @@ impl Services {
                     &services,
                     None,
                     specialist.as_deref(),
+                    effective_provider.as_deref(),
                     resolved_model.as_deref(),
                     spec_wp.as_deref(),
                 )
@@ -8308,10 +8315,22 @@ impl Services {
                         delegate_provider.as_deref(),
                     )
                 });
+                // The model-option rung matches on the effective `{ provider,
+                // model }` pair. With an explicit `model` param the provider
+                // was left `None` above, and `agent_create_op` then persists
+                // the settings-derived default (`resolve_provider_id`:
+                // provider field → settings default — the specialist's
+                // `codingAgent` never participates there); mirror exactly
+                // that so the pair match sees the provider the spawn will
+                // actually use.
+                let effective_provider = delegate_provider.clone().or_else(|| {
+                    crate::agent_session::derived_default_provider(&services.effective_settings())
+                });
                 let reasoning_effort = resolve_delegate_reasoning_effort(
                     &services,
                     effort_param.as_deref(),
                     specialist_param.as_deref(),
+                    effective_provider.as_deref(),
                     effective_model.as_deref(),
                     ws_path.as_deref(),
                 );
@@ -11917,10 +11936,18 @@ impl Services {
                         provider.as_deref(),
                     )
                 });
+                // Same effective-provider rule as `agent.delegate`: without
+                // an explicit `create.provider`, `agent_create_op` persists
+                // the settings-derived default, so the model-option pair
+                // match keys on that same provider.
+                let effective_provider = provider.clone().or_else(|| {
+                    crate::agent_session::derived_default_provider(&services.effective_settings())
+                });
                 let reasoning_effort = resolve_delegate_reasoning_effort(
                     &services,
                     effort_param.as_deref(),
                     specialist.as_deref(),
+                    effective_provider.as_deref(),
                     effort_model.as_deref(),
                     workspace_path.as_deref(),
                 );

@@ -958,12 +958,16 @@ async fn list_specialists(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Resu
 
 /// Project one resolved `SpecialistDef` into the compact
 /// `ws.agent.listSpecialists` row: `{ id, name, description, hidden?,
-/// aliases?, defaultModel?, modelOptions }`. `defaultModel` pairs the
+/// aliases?, defaultModel?, modelOptions }`. `defaultModel` is
+/// `{ provider, model, reasoningEffort? }` with bare `model`, pairing the
 /// loader's `resolvedProvider`/`resolvedModel` preview fields (what a
-/// no-`model` delegate would pin) and is omitted when the loader omitted
-/// them — resolution yielding the provider CLI default. `modelOptions`
-/// entries keep the loader's normalized `{ model, hint, reasoningEffort? }`
-/// shape, dropping an empty `hint`.
+/// no-`model` delegate would pin) plus its `resolvedReasoningEffort` (the
+/// effort a no-`reasoningEffort` delegate would apply) when the loader
+/// resolved one; the whole object is omitted when the loader omitted the
+/// pair — resolution yielding the provider CLI default. `modelOptions`
+/// entries keep the loader's normalized triple shape
+/// `{ provider?, model, hint?, reasoningEffort? }` with bare `model`,
+/// dropping an empty `hint`.
 fn project_specialist_row(def: &Value) -> Value {
     let mut row = serde_json::Map::new();
     for key in ["id", "name", "description"] {
@@ -986,10 +990,13 @@ fn project_specialist_row(def: &Value) -> Value {
         def.get("resolvedProvider").and_then(Value::as_str),
         def.get("resolvedModel").and_then(Value::as_str),
     ) {
-        row.insert(
-            "defaultModel".to_string(),
-            json!({ "provider": provider, "model": model }),
-        );
+        let mut default_model = serde_json::Map::new();
+        default_model.insert("provider".to_string(), json!(provider));
+        default_model.insert("model".to_string(), json!(model));
+        if let Some(effort) = def.get("resolvedReasoningEffort").and_then(Value::as_str) {
+            default_model.insert("reasoningEffort".to_string(), json!(effort));
+        }
+        row.insert("defaultModel".to_string(), Value::Object(default_model));
     }
     let options: Vec<Value> = def
         .get("modelOptions")
@@ -999,6 +1006,9 @@ fn project_specialist_row(def: &Value) -> Value {
                 .filter_map(|opt| {
                     let model = opt.get("model").and_then(Value::as_str)?;
                     let mut out = serde_json::Map::new();
+                    if let Some(provider) = opt.get("provider").and_then(Value::as_str) {
+                        out.insert("provider".to_string(), json!(provider));
+                    }
                     out.insert("model".to_string(), json!(model));
                     if let Some(hint) = opt
                         .get("hint")
@@ -2100,9 +2110,10 @@ mod tests {
                                 "aliases": ["builder"],
                                 "resolvedProvider": "claude",
                                 "resolvedModel": "sonnet-4.5",
+                                "resolvedReasoningEffort": "medium",
                                 "modelOptions": [
-                                    { "model": "opencode:kimi-k3", "hint": "cheap" },
-                                    { "model": "claude:opus", "hint": "", "reasoningEffort": "high" }
+                                    { "provider": "opencode", "model": "kimi-k3", "hint": "cheap" },
+                                    { "model": "opus", "hint": "", "reasoningEffort": "high" }
                                 ]
                             },
                             {
@@ -2145,14 +2156,18 @@ mod tests {
             assert_eq!(imp["description"], json!("Implements tasks"));
             assert_eq!(
                 imp["defaultModel"],
-                json!({ "provider": "claude", "model": "sonnet-4.5" })
+                json!({
+                    "provider": "claude",
+                    "model": "sonnet-4.5",
+                    "reasoningEffort": "medium"
+                })
             );
             assert_eq!(imp["aliases"], json!(["builder"]));
             assert_eq!(
                 imp["modelOptions"],
                 json!([
-                    { "model": "opencode:kimi-k3", "hint": "cheap" },
-                    { "model": "claude:opus", "reasoningEffort": "high" }
+                    { "provider": "opencode", "model": "kimi-k3", "hint": "cheap" },
+                    { "model": "opus", "reasoningEffort": "high" }
                 ])
             );
             // Prompt bodies and loader internals never reach the row.
@@ -2163,6 +2178,7 @@ mod tests {
                 "isCustomized",
                 "resolvedProvider",
                 "resolvedModel",
+                "resolvedReasoningEffort",
                 "hidden",
             ] {
                 assert!(imp.get(key).is_none(), "{key} must be omitted");
