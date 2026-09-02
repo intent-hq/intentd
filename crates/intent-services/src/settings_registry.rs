@@ -732,7 +732,32 @@ fn sync_normalized_compounds(doc: &mut DocumentMut, file: &SettingsFile) -> Resu
             doc_set(doc, &path, &Value::String(bare.clone()))?;
         }
     }
+    // Normalization can also REMOVE an entry (own-prefix with a blank
+    // remainder, e.g. `codex = "codex:"` reads as unset): drop the stale
+    // document key so origin/reset agree with the typed file.
+    let stale: Vec<String> = doc_table_keys(doc, "model.providerDefaults")
+        .into_iter()
+        .filter(|k| !file.model.provider_defaults.contains_key(k))
+        .collect();
+    for key in stale {
+        doc_remove(doc, &format!("model.providerDefaults.{key}"));
+    }
     Ok(())
+}
+
+/// Keys of a table-like value at a dotted path (empty when absent or not a
+/// table).
+fn doc_table_keys(doc: &DocumentMut, path: &str) -> Vec<String> {
+    let mut item = doc.as_item();
+    for seg in path.split('.') {
+        match item.as_table_like().and_then(|t| t.get(seg)) {
+            Some(next) => item = next,
+            None => return Vec::new(),
+        }
+    }
+    item.as_table_like()
+        .map(|t| t.iter().map(|(k, _)| k.to_string()).collect())
+        .unwrap_or_default()
 }
 
 /// Set a dotted path in the raw document to a JSON value, preserving all
@@ -1086,6 +1111,22 @@ mod tests {
             "normalization never rewrites the user's file"
         );
 
+        // apply() on model.default persists the split-off provider: the
+        // synced document already holds the split form, so rewriting the
+        // default leaves `defaultProvider = "codex"` in the file and a
+        // fresh load agrees with the running daemon — no silent provider
+        // change across a restart.
+        reg.apply(&set("model.default", json!("gpt-6")))
+            .expect("update the default model");
+        assert_eq!(reg.get("model.defaultProvider"), Some(json!("codex")));
+        let reloaded = SettingsRegistry::load(&path).expect("reload after update");
+        assert_eq!(reloaded.get("model.default"), Some(json!("gpt-6")));
+        assert_eq!(
+            reloaded.get("model.defaultProvider"),
+            Some(json!("codex")),
+            "the split-off provider must survive a write to model.default"
+        );
+
         // settings.reset on the split-off provider durably clears it: the
         // apply(null) rewrite persists the normalized split form, so the
         // compound never resurrects the provider on the next load.
@@ -1098,7 +1139,7 @@ mod tests {
             Some(Value::Null),
             "the cleared provider must not reappear on the next load"
         );
-        assert_eq!(reloaded.get("model.default"), Some(json!("gpt-5")));
+        assert_eq!(reloaded.get("model.default"), Some(json!("gpt-6")));
 
         // reload() (live-reload watcher path) normalizes the same way.
         reg.reload("[model]\ndefault = \"auggie:sonnet4.5\"\n")

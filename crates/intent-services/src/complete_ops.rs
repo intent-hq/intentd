@@ -63,14 +63,18 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
 /// resolve the same way as the default-model triple. A bare value pairs with
 /// the effective provider; a legacy compound `{provider}:{model}` value
 /// (pre-wire-rejection, user-authored TOML is never rejected) splits on read:
-/// the prefix names the provider to run on when it is registered, the
-/// remainder is the bare model. Either shape is provider-guarded — the CLI
-/// must never be fed a foreign model id — via `agent.create`'s asymmetric
-/// cached-catalog evidence rule ([`ensure_bare_model_matches_provider`]): the
-/// model is dropped only when the paired provider's own cached catalog
-/// affirmatively disproves ownership, so a cold start still passes it
-/// through. An unregistered compound prefix, a blank half, or a remainder
-/// that still carries a `:` (never a bare id) drops the rung with a warn log.
+/// the prefix names the provider to run on when it is registered AND can
+/// serve one-shots (auggie or [`ACP_ONE_SHOT_PROVIDERS`]) — a registered but
+/// one-shot-incapable prefix (e.g. `grok:m`) drops the rung so stale
+/// settings degrade gracefully to the next rung instead of routing to a
+/// hard `{ available: false }` — the remainder is the bare model. Either
+/// shape is provider-guarded — the CLI must never be fed a foreign model id
+/// — via `agent.create`'s asymmetric cached-catalog evidence rule
+/// ([`ensure_bare_model_matches_provider`]): the model is dropped only when
+/// the paired provider's own cached catalog affirmatively disproves
+/// ownership, so a cold start still passes it through. An unregistered
+/// compound prefix, a blank half, or a remainder that still carries a `:`
+/// (never a bare id) drops the rung with a warn log.
 ///
 /// `effective_provider` is `None` when the settings resolve no default
 /// provider. A compound rung names its own provider and still resolves; a
@@ -105,6 +109,11 @@ fn resolve_quick_action_model(
                     // A remainder still carrying `:` is not a bare id; the
                     // rung drops rather than feeding a compound to the CLI.
                     .filter(|_| !bare.is_empty() && !bare.contains(':'))
+                    // A routed provider that cannot serve one-shots drops
+                    // the rung (falls through) rather than routing to a
+                    // hard `{ available: false }` — stale settings keep
+                    // degrading gracefully, as pre-split colon rungs did.
+                    .filter(|p| p == "auggie" || ACP_ONE_SHOT_PROVIDERS.contains(&p.as_str()))
                     .map(|p| (p, bare.to_string()))
             }
             None => effective_provider.map(|p| (p.to_string(), configured.to_string())),
@@ -1091,6 +1100,35 @@ rl.on('line', (line) => {
     }
 
     #[test]
+    fn quick_action_compound_rung_with_non_one_shot_provider_drops() {
+        // A registered prefix whose provider cannot serve one-shots (not
+        // auggie / ACP_ONE_SHOT_PROVIDERS) drops the rung and falls through
+        // — the pre-split behavior for colon rungs — instead of routing to a
+        // hard `{ available: false }`.
+        let catalog = empty_catalog();
+        for legacy in ["grok:m", "droid:m", "opencode:m"] {
+            let settings = quick_action_settings(Some(legacy), &[]);
+            assert_eq!(
+                resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
+                cli_default("auggie"),
+                "{legacy} must fall through to the CLI default"
+            );
+            assert_eq!(
+                resolve_quick_action_model(&settings, &catalog, None, None),
+                None,
+                "{legacy} with no effective provider must close the gate"
+            );
+        }
+        // The dropped override still falls to a capable default rung.
+        let settings = quick_action_settings(Some("codex:gpt-5"), &[("commit", "grok:m")]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), None),
+            on("codex", "gpt-5"),
+            "a dropped non-one-shot override must fall to the default-model rung"
+        );
+    }
+
+    #[test]
     fn quick_action_dropped_override_falls_to_default_model() {
         // A drop is per rung: a malformed type override still falls through
         // to a valid quickActions.defaultModel — the documented override →
@@ -1150,7 +1188,18 @@ rl.on('line', (line) => {
         );
         // The ownership guard applies to a compound rung's own pair too: a
         // split pair whose provider's catalog disproves the model drops.
-        let foreign = quick_action_settings(Some("grok:sonnet4.5"), &[]);
+        // (codex is one-shot capable, so the rung reaches the guard; the
+        // entry is stored under codex's CURRENT version key so it counts as
+        // live evidence on any host.)
+        let codex_version = (crate::model_catalog::source_for("codex")
+            .expect("codex source")
+            .version_key)();
+        catalog.store_for_test(
+            "codex",
+            &codex_version,
+            vec![serde_json::json!({ "id": "gpt-5", "provider": "codex" })],
+        );
+        let foreign = quick_action_settings(Some("codex:sonnet4.5"), &[]);
         assert_eq!(
             resolve_quick_action_model(&foreign, &catalog, None, Some("auggie")),
             cli_default("auggie"),
