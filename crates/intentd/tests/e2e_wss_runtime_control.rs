@@ -1022,12 +1022,19 @@ async fn runtime_toggled_wss_serves_system_status() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
-    // Verify no WSS port initially
+    // Verify no WSS port initially — and that a UDS-only daemon advertises
+    // no TCP routes: with the listener down every localIps entry would be a
+    // dead route, so the set is empty (not the interface enumeration).
     let status_before = uds_rpc(&socket, 1, "system.status", json!({})).await;
     assert_eq!(
         status_before["result"]["port"],
         json!(null),
         "WSS should not be running"
+    );
+    assert_eq!(
+        status_before["result"]["localIps"],
+        json!([]),
+        "UDS-only daemon must not advertise TCP routes: {status_before}"
     );
 
     // Toggle WSS on at runtime via settings.update
@@ -1119,9 +1126,10 @@ async fn runtime_toggled_wss_serves_system_status() {
 /// Runtime `server.bindAddress` hook (monorepo#2900): changing the bind
 /// address while the WSS listener is running restarts it on the new address.
 /// Observable end to end: the listener stays connectable on the fixed port
-/// across both restarts, and `pairing.getInfo` advertises the bind-aware
-/// hosts (exactly the specific address for a loopback bind; the non-loopback
-/// enumeration for 0.0.0.0 — which never contains 127.0.0.1).
+/// across both restarts, and both `pairing.getInfo` hosts and
+/// `system.status` localIps advertise the bind-aware set (exactly the
+/// specific address for a loopback bind; the non-loopback enumeration for
+/// 0.0.0.0 — which never contains 127.0.0.1).
 #[tokio::test]
 async fn runtime_bind_address_change_restarts_listener() {
     let data_dir = temp_data_dir();
@@ -1150,12 +1158,20 @@ async fn runtime_bind_address_change_restarts_listener() {
         .to_string();
     let cfg = client_config(&fingerprint);
 
-    // Default loopback bind: pairing advertises exactly 127.0.0.1.
+    // Default loopback bind: pairing advertises exactly 127.0.0.1, and
+    // system.status localIps agrees (same bind-aware semantics — never the
+    // full interface enumeration for a loopback-only listener).
     let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
     assert_eq!(
         info["result"]["hosts"],
         json!(["127.0.0.1"]),
         "loopback bind advertises exactly 127.0.0.1: {info}"
+    );
+    let status = uds_rpc(&socket, 102, "system.status", json!({})).await;
+    assert_eq!(
+        status["result"]["localIps"],
+        json!(["127.0.0.1"]),
+        "loopback bind: system.status localIps is exactly 127.0.0.1: {status}"
     );
 
     // Widen the bind while the listener is running: the hook restarts it on
@@ -1188,12 +1204,20 @@ async fn runtime_bind_address_change_restarts_listener() {
     );
 
     // Bind-aware advertisement followed the restart: an unspecified bind
-    // enumerates non-loopback local IPs, never 127.0.0.1.
+    // enumerates non-loopback local IPs, never 127.0.0.1 — on both surfaces.
     let info = uds_rpc(&socket, 4, "pairing.getInfo", json!({})).await;
     let hosts = info["result"]["hosts"].as_array().expect("hosts array");
     assert!(
         !hosts.iter().any(|h| h == "127.0.0.1"),
         "0.0.0.0 bind must not advertise loopback: {info}"
+    );
+    let status = uds_rpc(&socket, 104, "system.status", json!({})).await;
+    let local_ips = status["result"]["localIps"]
+        .as_array()
+        .expect("localIps array");
+    assert!(
+        !local_ips.iter().any(|h| h == "127.0.0.1"),
+        "0.0.0.0 bind: system.status localIps must not contain loopback: {status}"
     );
 
     // Narrow back to loopback: hook restarts again, listener survives, and
@@ -1226,6 +1250,12 @@ async fn runtime_bind_address_change_restarts_listener() {
         info["result"]["hosts"],
         json!(["127.0.0.1"]),
         "loopback bind advertises exactly 127.0.0.1 again: {info}"
+    );
+    let status = uds_rpc(&socket, 106, "system.status", json!({})).await;
+    assert_eq!(
+        status["result"]["localIps"],
+        json!(["127.0.0.1"]),
+        "narrowed bind: system.status localIps returns to exactly 127.0.0.1: {status}"
     );
 
     // A non-IP value is rejected at write time (never deferred to the next
@@ -1335,12 +1365,19 @@ async fn runtime_bind_address_list_applies_and_validates() {
         "list form persists and reads back as an array: {get}"
     );
 
-    // Pairing advertises exactly the configured set (specific addresses).
+    // Pairing advertises exactly the configured set (specific addresses),
+    // and system.status localIps mirrors it (same bind-aware semantics).
     let info = uds_rpc(&socket, 4, "pairing.getInfo", json!({})).await;
     assert_eq!(
         info["result"]["hosts"],
         json!(["127.0.0.1", "::1"]),
         "list bind advertises exactly its entries: {info}"
+    );
+    let status = uds_rpc(&socket, 104, "system.status", json!({})).await;
+    assert_eq!(
+        status["result"]["localIps"],
+        json!(["127.0.0.1", "::1"]),
+        "list bind: system.status localIps is exactly the configured set: {status}"
     );
 
     // Invalid sets are rejected at write time; the listener stays up.
@@ -1374,6 +1411,47 @@ async fn runtime_bind_address_list_applies_and_validates() {
     assert!(
         sub2.get("error").is_none(),
         "listener must survive rejected bindAddress writes: {sub2}"
+    );
+}
+
+/// Tunnel-only advertisement: with `server.tunnel.only = true` the listener
+/// binds loopback regardless of a wide `server.bindAddress`, and both
+/// `pairing.getInfo` hosts and `system.status` localIps advertise exactly
+/// 127.0.0.1 — never the machine's interface enumeration, whose routes are
+/// all dead in this posture (direct LAN connects are refused).
+#[tokio::test]
+async fn tunnel_only_advertises_loopback_only() {
+    let data_dir = temp_data_dir();
+    // Seed a wide bindAddress alongside tunnel-only BEFORE boot, so the test
+    // proves the loopback override wins on the advertised surfaces.
+    // configure_serve appends [server.wsApi] after these tables.
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"0.0.0.0\"\n\n[server.tunnel]\nonly = true\n",
+    )
+    .expect("seed config.toml");
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    assert_eq!(
+        status["result"]["localIps"],
+        json!(["127.0.0.1"]),
+        "tunnel-only: system.status localIps is exactly loopback despite the \
+         wide bindAddress: {status}"
+    );
+    let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    assert_eq!(
+        info["result"]["hosts"],
+        json!(["127.0.0.1"]),
+        "tunnel-only: pairing advertises exactly loopback: {info}"
     );
 }
 

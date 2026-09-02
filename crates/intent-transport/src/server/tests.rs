@@ -332,6 +332,42 @@ fn pairing_hosts_v6_unspecified_bind_includes_v4_and_specific_v6_stays_exact() {
 }
 
 #[test]
+fn advertised_hosts_filters_by_bind_set_deterministically() {
+    // Pure core shared by pairing.getInfo and system.status localIps: with
+    // fixed enumerations, every bind shape maps to a deterministic host set.
+    let bind = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    let v4 = vec!["192.168.1.23".to_string(), "100.64.0.3".to_string()];
+    let v6 = vec!["2001:db8::7".to_string()];
+
+    // Specific binds (loopback included) advertise exactly those addresses —
+    // never the full enumeration.
+    assert_eq!(
+        advertised_hosts(Some(&[bind("127.0.0.1")]), &v4, &v6),
+        vec!["127.0.0.1".to_string()]
+    );
+    assert_eq!(
+        advertised_hosts(Some(&[bind("192.168.1.23"), bind("100.64.0.3")]), &v4, &v6),
+        vec!["192.168.1.23".to_string(), "100.64.0.3".to_string()]
+    );
+
+    // 0.0.0.0 → the v4 enumeration only; :: → v4 + v6.
+    assert_eq!(advertised_hosts(Some(&[bind("0.0.0.0")]), &v4, &v6), v4);
+    assert_eq!(
+        advertised_hosts(Some(&[bind("::")]), &v4, &v6),
+        vec![
+            "192.168.1.23".to_string(),
+            "100.64.0.3".to_string(),
+            "2001:db8::7".to_string()
+        ]
+    );
+
+    // Unknown bind set (None) and an empty bind list keep the historical
+    // v4 enumeration fallback.
+    assert_eq!(advertised_hosts(None, &v4, &v6), v4);
+    assert_eq!(advertised_hosts(Some(&[]), &v4, &v6), v4);
+}
+
+#[test]
 fn collect_bind_interfaces_loopback_first_no_duplicates() {
     let ifaces = collect_bind_interfaces();
     // Machines without any interface (rare CI sandboxes) yield an empty list;
