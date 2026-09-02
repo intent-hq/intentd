@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.5] - 2026-09-02
+
+### 🚀 Features
+
+- *(services)* Export commit-identity GIT_* env into agent-spawned processes ([#1644](https://github.com/intent-hq/intentd/pull/1644))
+- Add monotonic settings revisions ([#1636](https://github.com/intent-hq/intentd/pull/1636))
+- Defer attention-request surfacing until agent turn ends ([#1639](https://github.com/intent-hq/intentd/pull/1639))
+- Add ws.agent.listSpecialists() workspace binding ([#1641](https://github.com/intent-hq/intentd/pull/1641))
+- Surface tracked open PRs grouped by state in agent snapshot ([#1643](https://github.com/intent-hq/intentd/pull/1643))
+- Hard-reject compound model ids on the wire ([#1647](https://github.com/intent-hq/intentd/pull/1647))
+- Resolve providers without compound model prefixes ([#1648](https://github.com/intent-hq/intentd/pull/1648))
+
+### 🐛 Bug Fixes
+
+- *(store)* Rank search.messages from dense context table, not fat rows ([#1640](https://github.com/intent-hq/intentd/pull/1640))
+- Merge configured Codex catalog entries ([#1621](https://github.com/intent-hq/intentd/pull/1621))
+- *(services)* Claude-code ACP auth fallback no longer treats model list as proof of auth ([#1642](https://github.com/intent-hq/intentd/pull/1642))
+- *(services)* Fail fast on hard-false cached auth verdict at agent create/delegate ([#1645](https://github.com/intent-hq/intentd/pull/1645))
+
+
 ## [0.9.4] - 2026-09-01
 
 ### 🐛 Bug Fixes
