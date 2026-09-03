@@ -8,16 +8,27 @@
 //! answering on the socket reports the target version, mirroring
 //! install.sh's "waiting for the daemon to respond..." verification.
 
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// How long the update path waits for the restarted daemon before giving
-/// up (matches install.sh's verification budget).
+/// up. Deliberately shorter than install.sh's 300s first-install
+/// verification budget: an update restarts an already-configured daemon,
+/// which answers within seconds when healthy.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Pause between readiness probes.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Hard ceiling on a single probe subprocess. `intentd call` has no
+/// client-side RPC timeout, so a daemon that accepts the connection but
+/// stalls before responding would otherwise hang the probe — and with it
+/// the whole wait — forever, never reaching [`DEFAULT_TIMEOUT`]. A hung
+/// probe is killed and counts as "no answer"; the overall wait can thus
+/// overshoot its deadline by at most this much.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Result of [`wait_for_version`].
 #[derive(Debug, PartialEq, Eq)]
@@ -32,18 +43,57 @@ pub enum WaitOutcome {
 
 /// Probe the daemon once via the installed binary's `call system.status`
 /// fast-path: the version the daemon on the socket reports, or `None`
-/// while nothing answers. The spawned binary resolves the socket exactly
-/// like any other one-shot CLI invocation (env inherited).
+/// while nothing answers (including a probe killed at [`PROBE_TIMEOUT`]).
+/// The spawned binary resolves the socket exactly like any other one-shot
+/// CLI invocation (env inherited).
 #[must_use]
 pub fn probe_daemon_version(daemon_binary: &Path) -> Option<String> {
-    let output = Command::new(daemon_binary)
+    probe_daemon_version_with_timeout(daemon_binary, PROBE_TIMEOUT)
+}
+
+/// [`probe_daemon_version`] with an explicit per-probe deadline (split out
+/// so tests can exercise the kill path without waiting the real ceiling).
+fn probe_daemon_version_with_timeout(daemon_binary: &Path, timeout: Duration) -> Option<String> {
+    let mut child = Command::new(daemon_binary)
         .args(["call", "system.status"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    // Drain stdout on a helper thread so a chatty child can never fill the
+    // pipe and deadlock against our exit-polling loop. On the kill paths
+    // the reader is dropped (detached), not joined: a grandchild holding
+    // the inherited write end would keep the pipe open past the kill, and
+    // joining would trade the subprocess hang for a thread hang.
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let stdout = reader.join().ok()?;
+    if !status.success() {
         return None;
     }
-    parse_status_version(&String::from_utf8_lossy(&output.stdout))
+    parse_status_version(&stdout)
 }
 
 /// Extract the `version` field from a `system.status` result JSON.
@@ -188,5 +238,29 @@ mod tests {
         );
         assert_eq!(probe_daemon_version(&failing), None);
         assert_eq!(probe_daemon_version(&dir.path().join("missing")), None);
+    }
+
+    /// Regression: `intentd call` has no client-side RPC timeout, so a
+    /// daemon that accepts the connection but never responds used to hang
+    /// the probe (and the whole wait) forever. The probe now kills the
+    /// subprocess at its deadline and reports "no answer".
+    #[cfg(unix)]
+    #[test]
+    fn probe_kills_a_hung_subprocess_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        // Writes a valid status then stalls: only the timeout path returns.
+        // The exec'd sleep IS the child (no intermediate shell), so the
+        // kill reaches it and nothing outlives the test.
+        let hung = fake_daemon(
+            dir.path(),
+            r#"echo '{ "version": "0.9.10" }'; exec sleep 600"#,
+        );
+        let started = Instant::now();
+        let probed = probe_daemon_version_with_timeout(&hung, Duration::from_millis(200));
+        assert_eq!(probed, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "probe must not wait for the hung child"
+        );
     }
 }
