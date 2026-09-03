@@ -55,8 +55,11 @@ pub(crate) enum HostMethod {
     ListInstalledEditors,
     ProviderDiscovery,
     /// Daemon-owned provider auth probes (`host.providerAuthStatus`, §5.14):
-    /// `{ providerId?, force? }` → `{ providers: [{ id, authenticated }] }`
-    /// with `authenticated: true | false | null`.
+    /// `{ providerId?, force? }` → `{ providers: [{ id, authenticated,
+    /// identity? }] }` with `authenticated: true | false | null` and the
+    /// additive optional `identity` object `{ email?, orgName?,
+    /// subscriptionType? }` (v9.4) present only when the provider's probe
+    /// captured identity metadata (today: claude-code's logged-in JSON).
     ProviderAuthStatus,
     /// Live end-to-end provider test prompt (`host.providerTestPrompt`,
     /// §5.14): `{ providerId, model? }` → `{ ok: true }` or `{ ok: false,

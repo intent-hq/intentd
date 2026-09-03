@@ -613,22 +613,33 @@ impl AuthStatusCache {
             .unwrap_or(0)
     }
 
-    /// Store a probe outcome UNLESS a runtime demotion landed since `epoch`
-    /// was captured: the demotion observed an authoritative auth-required
-    /// error from the provider's adapter, which supersedes a probe that
-    /// started earlier. The demotions lock is held across the store so a
-    /// demotion cannot slip between the check and the write (lock order:
-    /// demotions → entries, same as [`AuthStatusCache::demote`]).
-    fn store_probe(&self, provider_id: &'static str, verdict: AuthVerdict, epoch: u64) {
+    /// Store a probe outcome UNLESS a runtime demotion/promotion landed since
+    /// `epoch` was captured: the runtime observed an authoritative outcome
+    /// from the provider's adapter, which supersedes a probe that started
+    /// earlier. The demotions lock is held across the store so a demotion
+    /// cannot slip between the check and the write (lock order: demotions →
+    /// entries, same as [`AuthStatusCache::demote`]).
+    ///
+    /// Returns the verdict callers must serve: the stored probe outcome, or —
+    /// when superseded — the authoritative cached verdict that displaced it,
+    /// so joined `providerAuthStatus` responses never expose a stale verdict
+    /// (or identity metadata) that a mid-flight demotion just cleared.
+    fn store_probe(
+        &self,
+        provider_id: &'static str,
+        verdict: AuthVerdict,
+        epoch: u64,
+    ) -> AuthVerdict {
         let demotions = self.demotions.lock().expect("auth demotions poisoned");
         if demotions.get(provider_id).copied().unwrap_or(0) != epoch {
             tracing::debug!(
                 provider = provider_id,
-                "auth probe outcome discarded — a runtime demotion superseded it"
+                "auth probe outcome discarded — an authoritative runtime verdict superseded it"
             );
-            return;
+            return self.fresh(provider_id).unwrap_or_default();
         }
-        self.store(provider_id, verdict);
+        self.store(provider_id, verdict.clone());
+        verdict
     }
 
     /// Harden the provider's verdict to `Some(false)` after an authoritative
@@ -647,19 +658,16 @@ impl AuthStatusCache {
     /// observed an authoritative end-to-end success (a live test prompt
     /// answered). Bumps the same counter as [`AuthStatusCache::demote`] so a
     /// probe already in flight discards its (older) outcome instead of
-    /// overwriting this one; lock order: demotions → entries. The cached
-    /// identity is preserved on the refreshed entry — a test-prompt success
-    /// proves the same session still works but reports no identity of its
-    /// own.
+    /// overwriting this one; lock order: demotions → entries. Cached identity
+    /// is preserved on the refreshed entry only while the entry is still
+    /// *fresh* — a test-prompt success proves the same session still works but
+    /// reports no identity of its own, and an expired entry's identity may
+    /// belong to a previous account (CLI account switch), so it is never
+    /// revived past the TTL.
     fn promote(&self, provider_id: &'static str) {
         let mut demotions = self.demotions.lock().expect("auth demotions poisoned");
         *demotions.entry(provider_id).or_insert(0) += 1;
-        let identity = self
-            .entries
-            .lock()
-            .expect("auth cache poisoned")
-            .get(provider_id)
-            .and_then(|(_, verdict)| verdict.identity.clone());
+        let identity = self.fresh(provider_id).and_then(|verdict| verdict.identity);
         self.store(
             provider_id,
             AuthVerdict {
@@ -807,11 +815,12 @@ async fn resolve_auth_status(
             // Captured before the probe runs: a runtime demotion landing
             // while the probe is in flight supersedes its (older) outcome —
             // `store_probe` drops the store instead of overwriting the
-            // authoritative hard `false` (PR #1650 review).
+            // authoritative hard `false` (PR #1650 review), and hands back
+            // the superseding cached verdict so every joined caller serves
+            // the authoritative outcome, not the stale probe result.
             let epoch = cache().demotion_epoch(provider_id);
             let verdict = probe_provider(provider_id, program).await;
-            cache().store_probe(provider_id, verdict.clone(), epoch);
-            verdict
+            cache().store_probe(provider_id, verdict, epoch)
         })
         .await
         .clone();
@@ -1431,16 +1440,25 @@ mod tests {
         // "pi" for parallel-test hygiene — see the demotion test above.
         let prior = cache().fresh("pi");
 
-        // Probe captured its epoch, then a demotion landed mid-flight.
+        // Probe captured its epoch, then a demotion landed mid-flight. The
+        // superseded probe hands back the authoritative demoted verdict —
+        // what every joined `providerAuthStatus` caller must serve — instead
+        // of its own stale outcome.
         let epoch = cache().demotion_epoch("pi");
         cache().demote("pi");
-        cache().store_probe("pi", AuthVerdict::plain(Some(true)), epoch);
+        let served = cache().store_probe("pi", AuthVerdict::plain(Some(true)), epoch);
         assert_eq!(cached_auth_verdict("pi"), Some(false), "stale probe stored");
+        assert_eq!(
+            served,
+            AuthVerdict::plain(Some(false)),
+            "stale probe served"
+        );
 
         // A fresh probe (epoch captured after the demotion) stores normally.
         let epoch = cache().demotion_epoch("pi");
-        cache().store_probe("pi", AuthVerdict::plain(Some(true)), epoch);
+        let served = cache().store_probe("pi", AuthVerdict::plain(Some(true)), epoch);
         assert_eq!(cached_auth_verdict("pi"), Some(true));
+        assert_eq!(served, AuthVerdict::plain(Some(true)));
 
         cache().store("pi", prior.unwrap_or_default());
     }
@@ -1456,11 +1474,45 @@ mod tests {
         let epoch = cache().demotion_epoch("pi");
         promote_auth_verdict("pi");
         assert_eq!(cached_auth_verdict("pi"), Some(true));
-        // The stale probe (epoch captured before the promotion) is dropped.
-        cache().store_probe("pi", AuthVerdict::plain(Some(false)), epoch);
+        // The stale probe (epoch captured before the promotion) is dropped,
+        // and the superseded probe serves the authoritative hard `true`.
+        let served = cache().store_probe("pi", AuthVerdict::plain(Some(false)), epoch);
         assert_eq!(cached_auth_verdict("pi"), Some(true), "stale probe stored");
+        assert_eq!(served, AuthVerdict::plain(Some(true)), "stale probe served");
 
         cache().store("pi", prior.unwrap_or_default());
+    }
+
+    /// Promotion never revives identity metadata past the cache TTL: an
+    /// expired entry's identity may belong to a previous account (CLI account
+    /// switch after expiry), so a later test-prompt promotion refreshes the
+    /// verdict to a hard `true` WITHOUT the stale identity. Unique cache key:
+    /// this test owns it, so the process-global mutation cannot race parallel
+    /// tests.
+    #[test]
+    fn promotion_never_revives_expired_identity() {
+        let expired_at = Instant::now()
+            .checked_sub(AUTH_CACHE_TTL + Duration::from_secs(1))
+            .expect("test clock predates process start");
+        cache().entries.lock().expect("auth cache poisoned").insert(
+            "test-identity-expired-promote",
+            (
+                expired_at,
+                AuthVerdict {
+                    authenticated: Some(true),
+                    identity: Some(AuthIdentity {
+                        email: Some("old-account@example.com".into()),
+                        org_name: Some("Old Org".into()),
+                        subscription_type: Some("max".into()),
+                    }),
+                },
+            ),
+        );
+        cache().promote("test-identity-expired-promote");
+        assert_eq!(
+            cache().fresh("test-identity-expired-promote"),
+            Some(AuthVerdict::plain(Some(true)))
+        );
     }
 
     /// Demotion clears the cached identity along with hardening the verdict
