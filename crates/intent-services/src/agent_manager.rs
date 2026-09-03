@@ -3143,7 +3143,11 @@ impl AgentManager {
         // post-session effort application through whatever `thought_level`
         // config option the provider advertised — see
         // `install_and_apply_thought_level`.
-        let stored_effort = session_record.reasoning_effort.clone();
+        let stored_effort = Self::session_model_effort(
+            provider,
+            stored_model.as_deref(),
+            session_record.reasoning_effort.as_deref(),
+        );
 
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
@@ -3198,13 +3202,14 @@ impl AgentManager {
                     opened.modes.as_ref(),
                 )
                 .await;
-                Self::maybe_apply_session_model(
+                self.maybe_apply_session_model(
                     conn.as_ref(),
+                    agent_id,
                     provider,
                     &opened.session_id,
                     stored_model.as_deref(),
                 )
-                .await;
+                .await?;
                 self.install_and_apply_thought_level(
                     conn.as_ref(),
                     agent_id,
@@ -3258,13 +3263,14 @@ impl AgentManager {
                 opened.modes.as_ref(),
             )
             .await;
-            Self::maybe_apply_session_model(
+            self.maybe_apply_session_model(
                 conn.as_ref(),
+                agent_id,
                 provider,
                 &opened.session_id,
                 stored_model.as_deref(),
             )
-            .await;
+            .await?;
             self.install_and_apply_thought_level(
                 conn.as_ref(),
                 agent_id,
@@ -3290,13 +3296,14 @@ impl AgentManager {
             opened.modes.as_ref(),
         )
         .await;
-        Self::maybe_apply_session_model(
+        self.maybe_apply_session_model(
             conn.as_ref(),
+            agent_id,
             provider,
             &opened.session_id,
             stored_model.as_deref(),
         )
-        .await;
+        .await?;
         self.install_and_apply_thought_level(
             conn.as_ref(),
             agent_id,
@@ -3429,14 +3436,17 @@ impl AgentManager {
     /// are honored only when their provider prefix matches the running
     /// provider (a stale id from a pre-spawn provider switch must not be
     /// sent); bare ids are treated as provider-local. The `default` sentinel
-    /// and empty ids are no-ops. Failures are logged at WARN and never fail
-    /// session startup.
+    /// and empty ids are no-ops. Codex rejection fails startup and discards
+    /// the child so a retry cannot reuse its default model. Other providers
+    /// retain their best-effort compatibility behavior.
     async fn maybe_apply_session_model(
+        &self,
         conn: &Connection,
+        agent_id: &AgentId,
         provider: &ProviderConfig,
         acp_session_id: &str,
         stored_model: Option<&str>,
-    ) {
+    ) -> Result<()> {
         if let Some(model_id) = Self::set_model_target(provider, stored_model) {
             match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
                 Ok(()) => {
@@ -3476,6 +3486,25 @@ impl AgentManager {
                     );
                 }
                 Err(e) => {
+                    // Codex is the only production provider with this
+                    // capability. Its explicit selection must succeed before
+                    // any prompt (or successful model-change notice) is sent.
+                    if provider.config_option_model_strips_effort {
+                        self.kill_child_only(agent_id).await;
+                        return Err(match &e {
+                            intent_acp::AcpError::Rpc(rpc) if rpc.code == -32602 => {
+                                Error::InvalidParams(format!(
+                                    "Could not apply Codex model '{model_id}': {e}. Select a supported model and retry."
+                                ))
+                            }
+                            // Preserve the ACP detail for the existing spawn
+                            // retry classifier; a transport or timeout failure
+                            // does not mean the selected model is unsupported.
+                            _ => Error::Internal(format!(
+                                "session/set_config_option failed: {e}"
+                            )),
+                        });
+                    }
                     tracing::warn!(
                         provider = provider.id,
                         session_id = acp_session_id,
@@ -3486,6 +3515,7 @@ impl AgentManager {
                 }
             }
         }
+        Ok(())
     }
 
     /// Resolve the model id `maybe_apply_session_model` should send via
@@ -3508,8 +3538,8 @@ impl AgentManager {
     /// `supports_config_option_model`, or ids rejected by
     /// [`Self::provider_local_model_target`]. For providers whose stored ids
     /// may embed a reasoning effort (`config_option_model_strips_effort`;
-    /// codex `{base}/{effort}` ids), the suffix is stripped: the adapter's
-    /// model select values are bare base ids, and the effort rides the
+    /// codex `{base}/{effort}` and `{base}[effort]` ids), the suffix is stripped:
+    /// the model select values are bare base ids, and the effort rides the
     /// separate `thought_level` config option.
     fn config_option_model_target<'m>(
         provider: &ProviderConfig,
@@ -3520,10 +3550,48 @@ impl AgentManager {
         }
         let target = Self::provider_local_model_target(provider, stored_model)?;
         if provider.config_option_model_strips_effort {
-            let base = target.split_once('/').map_or(target, |(base, _)| base);
+            let (base, _) = Self::split_codex_model_effort(target);
             return (!base.is_empty()).then_some(base);
         }
         Some(target)
+    }
+
+    /// Legacy Codex slash ids retain their existing parsing. Bracket ids
+    /// split only for recognized catalog effort levels; arbitrary/malformed
+    /// brackets must reach the adapter unchanged and be rejected there.
+    fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
+        if let Some((base, effort)) = model.split_once('/') {
+            return (base, Some(effort));
+        }
+        if let Some((base, effort)) = model.strip_suffix(']').and_then(|m| m.split_once('[')) {
+            if !base.is_empty() && !base.contains(']') {
+                if let Some(level) = ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
+                    .into_iter()
+                    .find(|level| effort.eq_ignore_ascii_case(level))
+                {
+                    return (base, Some(level));
+                }
+            }
+        }
+        (model, None)
+    }
+
+    /// The explicit field is canonical. Embedded legacy Codex effort is a
+    /// fallback only when that field is absent/empty, both at startup and
+    /// when reusing a child; otherwise reuse would reset suffix-only effort.
+    fn session_model_effort(
+        provider: &ProviderConfig,
+        model: Option<&str>,
+        explicit: Option<&str>,
+    ) -> Option<String> {
+        explicit
+            .filter(|effort| !effort.trim().is_empty())
+            .or_else(|| {
+                provider.config_option_model_strips_effort.then_some(())?;
+                let model = Self::provider_local_model_target(provider, model)?;
+                Self::split_codex_model_effort(model).1
+            })
+            .map(str::to_string)
     }
 
     /// Shared gating for the post-session model-application paths: `None` for
@@ -7357,13 +7425,13 @@ impl AgentManager {
                         .get(agent_id)
                         .map(|h| h.connection.clone());
                     if let Some(conn) = conn {
-                        self.apply_thought_level(
-                            conn.as_ref(),
-                            agent_id,
-                            &acp,
+                        let effort = Self::session_model_effort(
+                            &resolved.provider,
+                            session.model.as_deref(),
                             session.reasoning_effort.as_deref(),
-                        )
-                        .await;
+                        );
+                        self.apply_thought_level(conn.as_ref(), agent_id, &acp, effort.as_deref())
+                            .await;
                     }
                     return Ok(acp);
                 }
@@ -8586,8 +8654,8 @@ fn resolve_spawn(
         .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace));
     // Session-level reasoning effort (PROTOCOL §5.5, Option B): threaded to
     // `SpawnOptions.reasoning_effort` so the codex spawn path applies it as
-    // `-c model_reasoning_effort=…` (an effort embedded in a compound
-    // `{base}/{effort}` model id still wins inside the codex arg builder).
+    // `-c model_reasoning_effort=…`. Codex legacy model ids are normalized
+    // below so explicit effort wins over any embedded suffix at spawn too.
     let reasoning_effort = session
         .reasoning_effort
         .clone()
@@ -8710,6 +8778,18 @@ fn resolve_spawn(
     }
 
     let provider = *intent_providers::provider_config(&provider_id);
+    let reasoning_effort = AgentManager::session_model_effort(
+        &provider,
+        model.as_deref(),
+        reasoning_effort.as_deref(),
+    );
+    let model = model.map(|model| {
+        if provider.config_option_model_strips_effort {
+            AgentManager::split_codex_model_effort(&model).0.to_string()
+        } else {
+            model
+        }
+    });
     // Filled by `ensure_started` (unsloth spawn gate) — pure resolution here
     // never starts the managed server.
     let unsloth_endpoint = None;
@@ -13888,6 +13968,37 @@ mod provider_path_override_tests {
                 .insert((*id).to_string(), path.to_string_lossy().into_owned());
         }
         settings
+    }
+
+    #[test]
+    fn codex_spawn_normalizes_legacy_model_and_explicit_effort_before_cli_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = exec_stub(dir.path(), "codex-acp");
+        let settings = settings_with_paths(&[("codex", &stub)]);
+        for model in ["gpt-5.5[low]", "gpt-5.5/low"] {
+            for (explicit, expected) in [(None, "low"), (Some("medium"), "medium")] {
+                let mut session = session(
+                    &AgentId::from("codex-spawn"),
+                    &WorkspaceId::from("ws"),
+                    None,
+                );
+                session.provider = Some("codex".to_string());
+                session.model = Some(model.to_string());
+                session.reasoning_effort = explicit.map(str::to_string);
+                let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
+                assert_eq!(resolved.model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(resolved.reasoning_effort.as_deref(), Some(expected));
+                let mut opts = SpawnOptions::new(&resolved.provider);
+                opts.model = resolved.model.as_deref();
+                opts.reasoning_effort = resolved.reasoning_effort.as_deref();
+                let args = intent_acp::spawn::build_args(&opts);
+                assert!(
+                    args.contains(&format!("model_reasoning_effort=\"{expected}\"")),
+                    "{args:?}"
+                );
+                assert!(args.contains(&"model=\"gpt-5.5\"".to_string()), "{args:?}");
+            }
+        }
     }
 
     fn unsloth_session() -> AgentSession {

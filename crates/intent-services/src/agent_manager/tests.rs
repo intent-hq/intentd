@@ -12353,8 +12353,8 @@ async fn resolve_spawn_session_provider_wins_over_model_string() {
     assert_eq!(resolved.model.as_deref(), Some("opencode-go/kimi-k3"));
 }
 
-/// The session's bare model id is passed through as-is under
-/// `session.provider`.
+/// The session provider owns a bare model id. Codex legacy effort suffixes
+/// are separated before spawning so the explicit effort field can win.
 #[tokio::test]
 async fn resolve_spawn_session_provider_with_bare_model() {
     let settings = intent_core::settings_file::SettingsFile::default();
@@ -12364,8 +12364,8 @@ async fn resolve_spawn_session_provider_with_bare_model() {
     let resolved =
         resolve_spawn(&session, None, &settings, None).expect("session provider resolves");
     assert_eq!(resolved.provider.id, "codex");
-    // The bare model is passed through as-is.
-    assert_eq!(resolved.model.as_deref(), Some("gpt-5.3-codex/high"));
+    assert_eq!(resolved.model.as_deref(), Some("gpt-5.3-codex"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
 }
 
 /// A workspace whose `path` exists on disk becomes the spawn cwd; a missing
@@ -18431,5 +18431,204 @@ mod flush_queued_messages_tests {
                 .count();
             assert_eq!(rows, 1, "{needle} lands exactly once: {messages:?}");
         }
+    }
+}
+
+mod session_model_tests {
+    use super::*;
+
+    enum ConfigReply {
+        Rpc(i64, &'static str),
+        Timeout,
+        Accept,
+    }
+
+    /// Exercise the real ACP request/response boundary, including a provider
+    /// that accepts the request bytes but never answers them.
+    fn track_config_reply(
+        mgr: &AgentManager,
+        id: &AgentId,
+        reply: ConfigReply,
+    ) -> (
+        Arc<Connection>,
+        JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<Value>,
+    ) {
+        let (client, agent) = tokio::io::duplex(16 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (agent_r, mut agent_w) = tokio::io::split(agent);
+        let (tx, request) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let line = BufReader::new(agent_r)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            tx.send(msg.clone()).unwrap();
+            let response = match reply {
+                ConfigReply::Rpc(code, message) => {
+                    json!({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": code, "message": message}})
+                }
+                ConfigReply::Accept => {
+                    json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+                }
+                ConfigReply::Timeout => std::future::pending().await,
+            };
+            agent_w
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let conn = Arc::new(Connection::new(
+            client_w,
+            client_r,
+            None,
+            ConnectionHooks::default(),
+        ));
+        track(mgr, id);
+        mgr.handles.lock().unwrap().get_mut(id).unwrap().connection = conn.clone();
+        (conn, server, request)
+    }
+
+    async fn assert_codex_config_failure(
+        reply: ConfigReply,
+        invalid_params: bool,
+        retryable: bool,
+    ) {
+        let (_tmp, mgr) = manager().await;
+        let id = AgentId::from("codex-config");
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let (conn, server, request) = track_config_reply(&mgr, &id, reply);
+        let err = mgr
+            .maybe_apply_session_model(&conn, &id, provider, "session", Some("gpt-5.5"))
+            .await
+            .expect_err("configuration must fail");
+        let sent = request.await.unwrap();
+        assert_eq!(sent["method"], "session/set_config_option");
+        assert_eq!(
+            sent["params"],
+            json!({"sessionId": "session", "configId": "model", "value": "gpt-5.5"})
+        );
+        if invalid_params {
+            assert!(
+                matches!(&err, Error::InvalidParams(message) if message.contains("gpt-5.5") && message.contains("Select a supported model")),
+                "{err:?}"
+            );
+        } else {
+            assert!(
+                matches!(&err, Error::Internal(message) if message.starts_with("session/set_config_option failed:")),
+                "{err:?}"
+            );
+            assert!(!err.to_string().contains("Select a supported model"));
+        }
+        assert_eq!(
+            super::super::is_retryable_spawn_error(&err),
+            retryable,
+            "{err:?}"
+        );
+        assert!(
+            !mgr.contains(&id),
+            "failed configuration discards the handle"
+        );
+        assert!(
+            !mgr.registry.is_registered(&id),
+            "failed configuration releases the slot"
+        );
+        server.abort();
+
+        let (conn, server, request) = track_config_reply(&mgr, &id, ConfigReply::Accept);
+        mgr.maybe_apply_session_model(&conn, &id, provider, "recovered", Some("gpt-5.5"))
+            .await
+            .expect("fresh connection recovers");
+        assert_eq!(
+            request.await.unwrap()["params"],
+            json!({"sessionId": "recovered", "configId": "model", "value": "gpt-5.5"})
+        );
+        assert!(
+            mgr.contains(&id),
+            "successful configuration keeps the handle"
+        );
+        mgr.kill_child_only(&id).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_invalid_params_stays_terminal_even_with_timeout_text() {
+        assert_codex_config_failure(
+            ConfigReply::Rpc(-32602, "validation timed out"),
+            true,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_other_rpc_error_keeps_classification_even_with_rejection_text() {
+        assert_codex_config_failure(
+            ConfigReply::Rpc(-32603, "unknown config value"),
+            false,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_config_timeout_keeps_retry_classification_and_discards_handle() {
+        assert_codex_config_failure(ConfigReply::Timeout, false, true).await;
+    }
+
+    #[test]
+    fn codex_legacy_effort_normalization_is_bounded() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        for level in [
+            "none", "low", "medium", "high", "xhigh", "max", "ultra", "LOW",
+        ] {
+            let model = format!("codex:gpt-5.5[{level}]");
+            assert_eq!(
+                AgentManager::config_option_model_target(codex, Some(&model)),
+                Some("gpt-5.5")
+            );
+            assert_eq!(
+                AgentManager::session_model_effort(codex, Some(&model), None).as_deref(),
+                Some(level.to_ascii_lowercase().as_str())
+            );
+            assert_eq!(
+                AgentManager::session_model_effort(codex, Some(&model), Some("medium")).as_deref(),
+                Some("medium")
+            );
+        }
+        for model in [
+            "gpt-5.5[bogus]",
+            "gpt-5.5[low",
+            "gpt-5.5[]",
+            "[low]",
+            "gpt-5.5[[low]]",
+            "gpt-5.5[low][high]",
+        ] {
+            assert_eq!(
+                AgentManager::config_option_model_target(codex, Some(model)),
+                Some(model)
+            );
+            assert_eq!(
+                AgentManager::session_model_effort(codex, Some(model), None),
+                None
+            );
+        }
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("opus[low]")),
+            Some("opus[low]")
+        );
+        assert_eq!(
+            AgentManager::session_model_effort(claude, Some("opus[low]"), None),
+            None
+        );
+        assert_eq!(
+            AgentManager::session_model_effort(codex, Some("grok:foo[low]"), None),
+            None
+        );
     }
 }

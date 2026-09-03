@@ -24,6 +24,10 @@ const SESSION_ID = 'mock-session-1';
 // daemon resumes into sees `true`; a fresh `session/new` resets it. Drives the
 // `failPromptIfLoadedRpcError` behavior (monorepo#940 poisoned-session e2e).
 let sessionFromLoad = false;
+// Optional stateful model selector. Prompts report this accepted state, not
+// the last requested value, so rejected selections expose default-model turns.
+let effectiveModel = null;
+let effectiveEffort = null;
 
 // Per-process turn counter + the ids of prompts parked by `blockUntilCancel`.
 // These persist across messages within ONE child, so a follow-up prompt landing
@@ -315,7 +319,23 @@ function selectBehavior(behavior, promptText) {
 // it) with `category: "thought_level"` — the category the daemon's generic
 // effort application discovers it by (PROTOCOL §5.5). Omitted by default so
 // existing tests see the bare `{ sessionId }` result.
-function sessionConfigOptions() {
+function sessionConfigOptions(behavior = {}) {
+  if (behavior.modelSelection) {
+    return {
+      configOptions: [
+        {
+          id: 'model', name: 'Model', category: 'model', type: 'select',
+          currentValue: effectiveModel,
+          options: behavior.modelSelection.models.map(value => ({ value, name: value })),
+        },
+        {
+          id: 'effort', name: 'Effort', category: 'thought_level', type: 'select',
+          currentValue: effectiveEffort,
+          options: ['low', 'medium', 'high'].map(value => ({ value, name: value })),
+        },
+      ],
+    };
+  }
   const current = process.env.MOCK_AGENT_THOUGHT_LEVEL;
   if (!current) return {};
   return {
@@ -355,6 +375,7 @@ async function handlePrompt(id, params) {
         promptLog,
         JSON.stringify({
           turn: promptCount,
+          ...(effectiveModel !== null ? { effectiveModel, effectiveEffort } : {}),
           text: extractPromptText(params),
           blockTypes: blocks.map((b) => (b && typeof b.type === 'string' ? b.type : '')),
         }) + '\n',
@@ -673,6 +694,9 @@ async function handlePrompt(id, params) {
     }
   }
   let base = active.response || behavior.response || 'Mock agent completed.';
+  if (behavior.modelSelection) {
+    base = `effective-model=${effectiveModel} effort=${effectiveEffort} loaded=${sessionFromLoad}`;
+  }
   // Opt-in dynamic response for E2E cases where the agent-side JS must derive
   // its final prose from the real MCP result (for example, an exact message
   // link returned after reading a conversation).
@@ -869,6 +893,10 @@ async function dispatch(msg) {
     case 'authenticate':
       return result(msg.id, {});
     case 'session/new': {
+      if (behavior.modelSelection) {
+        effectiveModel = behavior.modelSelection.defaultModel;
+        effectiveEffort = 'high';
+      }
       // Deterministic failure mode: ignore session/new for the first N attempts
       if (typeof behavior.ignoreSessionNewAttempts === 'number' && behavior.ignoreSessionNewAttempts > 0) {
         const attempt = getAndIncrementAttempt();
@@ -887,9 +915,13 @@ async function dispatch(msg) {
         : [];
       sessionFromLoad = false;
       logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta);
-      return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions() });
+      return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions(behavior) });
     }
     case 'session/load':
+      if (behavior.modelSelection) {
+        effectiveModel = behavior.modelSelection.defaultModel;
+        effectiveEffort = 'high';
+      }
       // Mirror session/new's stash-overwrite so a loadSession-capable run (or
       // a test sending session/load first) can't observe a stale list.
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
@@ -907,7 +939,7 @@ async function dispatch(msg) {
         if (behavior.advertiseLoadSession === true) {
           sessionFromLoad = true;
         }
-        return result(msg.id, sessionConfigOptions());
+        return result(msg.id, sessionConfigOptions(behavior));
       }
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
     case 'session/set_mode':
@@ -956,6 +988,12 @@ async function dispatch(msg) {
           log(`config log write failed: ${err.message}`);
         }
       }
+      // Close the actual ACP pipe before accepting the model on the first
+      // N child launches. The shared attempt file lets a fresh child recover.
+      if (msg.params?.configId === 'model' && behavior.exitOnModelConfigForAttempts > 0) {
+        const attempt = getAndIncrementAttempt();
+        if (attempt <= behavior.exitOnModelConfigForAttempts) process.exit(1);
+      }
       // Deterministic failure mode: reject the call (invalid params, e.g. an
       // unknown model id) so tests can assert the daemon logs a warning and
       // the turn still completes on the provider's default model.
@@ -965,6 +1003,20 @@ async function dispatch(msg) {
           id: msg.id,
           error: { code: -32602, message: 'unknown config value' },
         });
+      }
+      if (behavior.modelSelection) {
+        const { configId, value } = msg.params || {};
+        if (configId === 'model' && behavior.modelSelection.models.includes(value)) {
+          effectiveModel = value;
+        } else if (configId === 'effort' && ['low', 'medium', 'high'].includes(value)) {
+          effectiveEffort = value;
+        } else {
+          return send({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32602, message: 'unknown config value' },
+          });
+        }
+        return result(msg.id, sessionConfigOptions(behavior));
       }
       return result(msg.id, {
         configOptions: [
