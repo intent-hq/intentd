@@ -42,6 +42,7 @@ struct MockPairingInfo {
     tc_address: Option<String>,
     data_dir: PathBuf,
     token_store: crate::AsyncTokenStore,
+    host_environment: crate::host_env::HostEnvironment,
 }
 
 impl ServerPairingInfo for MockPairingInfo {
@@ -57,11 +58,23 @@ impl ServerPairingInfo for MockPairingInfo {
             }
         })
     }
+    fn host_environment(&self) -> crate::host_env::HostEnvironment {
+        self.host_environment.clone()
+    }
     fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }
     fn token_store(&self) -> &crate::AsyncTokenStore {
         &self.token_store
+    }
+}
+
+fn host_environment(device_kind: Option<&str>) -> crate::host_env::HostEnvironment {
+    crate::host_env::HostEnvironment {
+        hostname: "build-01".to_string(),
+        pretty_hostname: "Build Server 01".to_string(),
+        device_kind: device_kind.map(str::to_string),
+        hardware_model: device_kind.map(|_| "PowerEdge R760".to_string()),
     }
 }
 
@@ -112,6 +125,7 @@ async fn handle_pairing_info_local_success() {
         tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store,
+        host_environment: host_environment(Some("server")),
     });
 
     let req = ServerRequest {
@@ -133,7 +147,7 @@ async fn handle_pairing_info_local_success() {
     // availableIps is always present and is exactly the bind-candidate
     // enumeration (machine-dependent contents, so compare against the source).
     assert_eq!(result["availableIps"], json!(collect_local_ips()));
-    assert!(result["hostname"].is_string());
+    assert_eq!(result["hostname"], "build-01");
     assert!(
         !result["prettyHostname"]
             .as_str()
@@ -141,6 +155,8 @@ async fn handle_pairing_info_local_success() {
             .is_empty(),
         "prettyHostname non-empty"
     );
+    assert_eq!(result["deviceKind"], "server");
+    assert_eq!(result["hardwareModel"], "PowerEdge R760");
     // No tunnel in the snapshot: tcAddress is ABSENT, not null.
     assert!(result.get("tcAddress").is_none());
     let _ = std::fs::remove_dir_all(&tmpdir);
@@ -208,6 +224,7 @@ async fn handle_pairing_info_includes_tc_address_when_tunnel_up() {
         tc_address: Some("tc7f2a91.tailcat.net".to_string()),
         data_dir: tmpdir.clone(),
         token_store: store,
+        host_environment: host_environment(None),
     });
 
     let req = ServerRequest {
@@ -219,6 +236,8 @@ async fn handle_pairing_info_includes_tc_address_when_tunnel_up() {
     let resp = handle(req, &provider, true).await.unwrap();
     let parsed: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(parsed["result"]["tcAddress"], "tc7f2a91.tailcat.net");
+    assert!(parsed["result"].get("deviceKind").is_none());
+    assert!(parsed["result"].get("hardwareModel").is_none());
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
@@ -238,6 +257,7 @@ async fn handle_pairing_info_remote_rejects() {
         tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store,
+        host_environment: host_environment(Some("server")),
     });
 
     let req = ServerRequest {
@@ -286,6 +306,7 @@ async fn handle_rotate_token_local_success() {
         tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store.clone(),
+        host_environment: host_environment(Some("server")),
     });
 
     let req = ServerRequest {

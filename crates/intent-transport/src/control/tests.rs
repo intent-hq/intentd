@@ -40,6 +40,8 @@ impl FakeControl {
                 tc_address: Some("tc7f2a91.tailcat.net".to_string()),
                 hostname: "studio.local".to_string(),
                 pretty_hostname: "Clement's Mac Studio".to_string(),
+                device_kind: Some("macStudio".to_string()),
+                hardware_model: Some("Mac Studio".to_string()),
                 cpu_percent: 12.5,
                 memory_bytes: 104_857_600,
                 child_processes: Some(4),
@@ -84,6 +86,14 @@ impl FakeControl {
 impl SystemControl for FakeControl {
     fn status(&self) -> SystemStatus {
         self.status.clone()
+    }
+    fn host_environment(&self) -> crate::host_env::HostEnvironment {
+        crate::host_env::HostEnvironment {
+            hostname: self.status.hostname.clone(),
+            pretty_hostname: self.status.pretty_hostname.clone(),
+            device_kind: self.status.device_kind.clone(),
+            hardware_model: self.status.hardware_model.clone(),
+        }
     }
     fn request_shutdown(&self) {
         self.shutdown_called.store(true, Ordering::SeqCst);
@@ -167,6 +177,8 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
     assert_eq!(local["host"]["hasDisplay"], true);
+    assert_eq!(local["host"]["deviceKind"], "macStudio");
+    assert_eq!(local["host"]["hardwareModel"], "Mac Studio");
     // Supervision probe (intent-hq/intent#3875): a plain boolean, always
     // present, so a client can gate its update affordance without probing
     // system.requestUpdate.
@@ -204,6 +216,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         tc_address: None,
         hostname: "intent".to_string(),
         pretty_hostname: "intent".to_string(),
+        device_kind: None,
+        hardware_model: None,
         cpu_percent: 0.0,
         memory_bytes: 0,
         child_processes: None,
@@ -250,6 +264,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     // Unsupervised daemon ⇒ updateSupported is PRESENT and false — a plain
     // boolean, never absent or null.
     assert_eq!(v["updateSupported"], false);
+    assert!(v["host"].get("deviceKind").is_none());
+    assert!(v["host"].get("hardwareModel").is_none());
 }
 
 /// The descendant-tree fields ride `system.status` so a debug

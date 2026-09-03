@@ -279,6 +279,8 @@ fn status_json_local_includes_all_fields() {
         "Build Server 01",
         true,
         Some("wayland"),
+        Some("server"),
+        Some("PowerEdge R760"),
         true,
     );
     assert_eq!(v["os"], "linux");
@@ -288,12 +290,14 @@ fn status_json_local_includes_all_fields() {
     assert_eq!(v["hasDisplay"], true);
     assert_eq!(v["locality"], "local");
     assert_eq!(v["displayServer"], "wayland");
+    assert_eq!(v["deviceKind"], "server");
+    assert_eq!(v["hardwareModel"], "PowerEdge R760");
 }
 
 #[test]
 fn status_json_remote_omits_absent_display_server() {
     let v = host_status_json(
-        "linux", "x86_64", "build-01", "build-01", false, None, false,
+        "linux", "x86_64", "build-01", "build-01", false, None, None, None, false,
     );
     assert_eq!(v["locality"], "remote");
     assert_eq!(v["hasDisplay"], false);
@@ -302,6 +306,8 @@ fn status_json_remote_omits_absent_display_server() {
         "falls back to hostname when no pretty name exists"
     );
     assert_eq!(v.get("displayServer"), None, "omitted when not detected");
+    assert_eq!(v.get("deviceKind"), None, "omitted when unknown");
+    assert_eq!(v.get("hardwareModel"), None, "omitted when unknown");
 }
 
 #[tokio::test]

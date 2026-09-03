@@ -58,6 +58,14 @@ impl ServerPairingInfo for MockPairingInfo {
             }
         })
     }
+    fn host_environment(&self) -> crate::host_env::HostEnvironment {
+        crate::host_env::HostEnvironment {
+            hostname: "test".to_string(),
+            pretty_hostname: "test".to_string(),
+            device_kind: None,
+            hardware_model: None,
+        }
+    }
     fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }

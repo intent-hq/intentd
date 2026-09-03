@@ -22,9 +22,10 @@ use intent_services::{
 use intent_store::Store;
 use intent_transport::{
     advertised_hosts, collect_local_ips, collect_local_ipv6s, detect_has_display,
-    ensure_tls_certificate, get_or_create_token, local_hostname, pretty_hostname,
-    serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry,
-    RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
+    detect_host_environment, ensure_tls_certificate, get_or_create_token, local_hostname,
+    pretty_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore,
+    HostEnvironment, PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore,
+    WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -2234,7 +2235,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         start_time: std::time::Instant::now(),
         proc_usage,
         child_usage,
-        route_info,
+        route_info: route_info.clone(),
         workspaces_disk,
         watch_health,
         legacy_import_store,
@@ -2390,6 +2391,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                 token_store: ts.clone(),
                 ws_runtime: runtime.clone(),
                 tunnel: tunnel_supervisor.clone(),
+                route_info: route_info.clone(),
             }))
         } else {
             None
@@ -2647,11 +2649,11 @@ impl ProcUsage {
 /// semantics as `server.pairingInfo`) and follows a runtime bind change
 /// immediately.
 struct RouteInfo {
-    inner: std::sync::RwLock<(Vec<String>, Vec<String>, String, String)>,
+    inner: std::sync::RwLock<(Vec<String>, Vec<String>, HostEnvironment)>,
 }
 
 impl RouteInfo {
-    fn load(&self) -> (Vec<String>, Vec<String>, String, String) {
+    fn load(&self) -> (Vec<String>, Vec<String>, HostEnvironment) {
         self.inner.read().expect("route info lock poisoned").clone()
     }
 }
@@ -2662,13 +2664,12 @@ impl RouteInfo {
 /// changes with external network state, so a short-TTL cache keeps the status
 /// read path free of `getifaddrs(3)`/hostname syscalls.
 fn spawn_route_info_sampler() -> Arc<RouteInfo> {
-    let sample = || {
-        (
-            collect_local_ips(),
-            collect_local_ipv6s(),
-            local_hostname(),
-            pretty_hostname(),
-        )
+    let detected = detect_host_environment();
+    let sample = move || {
+        let mut host = detected.clone();
+        host.hostname = local_hostname();
+        host.pretty_hostname = pretty_hostname();
+        (collect_local_ips(), collect_local_ipv6s(), host)
     };
     let info = Arc::new(RouteInfo {
         inner: std::sync::RwLock::new(sample()),
@@ -3247,6 +3248,8 @@ struct DaemonPairingInfo {
     /// Tunnel supervisor reference so pairing surfaces advertise the live
     /// `tc...` address (`tcAddress` / the URI's `tc=` param) while it runs.
     tunnel: Arc<tunnel::TunnelSupervisor>,
+    /// Background-refreshed host identity shared with `system.status`.
+    route_info: Arc<RouteInfo>,
 }
 
 impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
@@ -3264,6 +3267,10 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
                 tc_address,
             }
         })
+    }
+
+    fn host_environment(&self) -> HostEnvironment {
+        self.route_info.load().2
     }
 
     fn data_dir(&self) -> &std::path::Path {
@@ -3309,7 +3316,7 @@ impl SystemControl for DaemonControl {
         // try_lock contention above, matching its transient `uds` posture)
         // there are no dialable TCP routes at all, so `localIps` is empty
         // rather than the historical full enumeration.
-        let (local_v4, local_v6, hostname, pretty_hostname) = self.route_info.load();
+        let (local_v4, local_v6, host_environment) = self.route_info.load();
         let local_ips = if port.is_some() {
             advertised_hosts(bind_addresses.as_deref(), &local_v4, &local_v6)
         } else {
@@ -3351,8 +3358,10 @@ impl SystemControl for DaemonControl {
             uptime_seconds: self.start_time.elapsed().as_secs(),
             local_ips,
             tc_address,
-            hostname,
-            pretty_hostname,
+            hostname: host_environment.hostname,
+            pretty_hostname: host_environment.pretty_hostname,
+            device_kind: host_environment.device_kind,
+            hardware_model: host_environment.hardware_model,
             cpu_percent,
             memory_bytes,
             child_processes: child_tree.as_ref().map(|s| s.count),
@@ -3379,6 +3388,10 @@ impl SystemControl for DaemonControl {
             // signal, so status stays cheap and side-effect free.
             update_supported: sitter_update_supported(&self.sitter_pid_path),
         }
+    }
+
+    fn host_environment(&self) -> HostEnvironment {
+        self.route_info.load().2
     }
 
     fn request_shutdown(&self) {
@@ -3619,6 +3632,7 @@ impl intent_core::ServerControl for DaemonControl {
                     token_store: ts.clone(),
                     ws_runtime: self.ws_runtime.clone(),
                     tunnel: self.tunnel.clone(),
+                    route_info: self.route_info.clone(),
                 })
                     as Arc<dyn intent_transport::ServerPairingInfo>;
                 server.install_pairing_info(pairing_provider);

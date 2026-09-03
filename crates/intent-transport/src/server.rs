@@ -23,6 +23,8 @@ use intent_core::{Error, Result};
 pub trait ServerPairingInfo: Send + Sync {
     /// Get the current bound WSS port, or `None` if the listener is stopped.
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>>;
+    /// Cached host identity, refreshed by the composition root off the RPC path.
+    fn host_environment(&self) -> crate::host_env::HostEnvironment;
     /// Data directory for TLS cert access.
     fn data_dir(&self) -> &std::path::Path;
     /// Token store for get/generate operations.
@@ -133,8 +135,7 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     // reports what a client could switch the bind to.
     let available_ips = collect_local_ips();
     let local_ips = pairing_hosts_from(&snapshot, &available_ips, &collect_local_ipv6s());
-    let hostname = crate::host_env::local_hostname();
-    let pretty_hostname = crate::host_env::pretty_hostname();
+    let host = provider.host_environment();
 
     let mut result = json!({
         "token": token,
@@ -143,16 +144,22 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
         "path": "/ws",
         "localIps": local_ips,
         "availableIps": available_ips,
-        "hostname": hostname,
-        "prettyHostname": pretty_hostname,
+        "hostname": host.hostname,
+        "prettyHostname": host.pretty_hostname,
     });
+    let obj = result
+        .as_object_mut()
+        .expect("pairing_info_json literal is an object");
+    if let Some(device_kind) = host.device_kind {
+        obj.insert("deviceKind".into(), device_kind.into());
+    }
+    if let Some(hardware_model) = host.hardware_model {
+        obj.insert("hardwareModel".into(), hardware_model.into());
+    }
     // Additive tunnel route (presence-detected): omitted when the tunnel is
     // disabled or down, so older clients are unaffected.
     if let Some(tc) = &snapshot.tc_address {
-        result
-            .as_object_mut()
-            .expect("pairing_info_json literal is an object")
-            .insert("tcAddress".into(), tc.clone().into());
+        obj.insert("tcAddress".into(), tc.clone().into());
     }
     Ok(result)
 }

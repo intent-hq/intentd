@@ -253,6 +253,29 @@ async fn host_detection_services_over_wss() {
     // §5.14 sanity: WSS connections report remote locality.
     let status = wss_rpc(&mut ws, 1, "host.status", json!({})).await;
     assert_eq!(status["locality"], "remote", "WSS ⇒ remote (§5.14)");
+    if std::env::consts::OS == "linux" {
+        assert!(
+            status["deviceKind"].is_string(),
+            "Linux always has a device fallback: {status}"
+        );
+    }
+    if let Some(kind) = status.get("deviceKind").and_then(Value::as_str) {
+        assert!(
+            [
+                "macMini",
+                "macStudio",
+                "laptop",
+                "desktop",
+                "server",
+                "cloudVm"
+            ]
+            .contains(&kind),
+            "known deviceKind: {status}"
+        );
+    }
+    if let Some(model) = status.get("hardwareModel") {
+        assert!(model.is_string(), "hardwareModel is a string: {status}");
+    }
 
     // host.findBinary requires a `name` — missing ⇒ -32602 (PROTOCOL §9).
     {

@@ -371,6 +371,9 @@ pub(crate) async fn process_frame(
             }
         }
         if let Some(req) = host::classify(value) {
+            let host_environment = control
+                .map(|control| control.host_environment())
+                .or_else(|| server_pairing_info.map(|info| info.host_environment()));
             // Slow path: spawn so `host.exec` and friends can't block the read
             // loop (UDS HOL fix). `openInEditor` in particular awaits an
             // FE-served reverse RPC on this same connection (§5.14) — running
@@ -400,7 +403,14 @@ pub(crate) async fn process_frame(
                         panic_guard::guard_frame(
                             &method,
                             rpc_id,
-                            host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse),
+                            host::handle_with_host_environment(
+                                req,
+                                api.as_ref(),
+                                Some(&bus),
+                                host_environment,
+                                is_local,
+                                &reverse,
+                            ),
                         ),
                         slot,
                     )
