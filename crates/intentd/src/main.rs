@@ -564,33 +564,40 @@ struct BindChoice {
     addr: std::net::IpAddr,
 }
 
-/// Build the picker entries from the enumerated `(interface, IPv4)` pairs
-/// (loopback first, per [`intent_transport::collect_bind_interfaces`]), then
-/// an explicit all-interfaces `0.0.0.0` entry carrying its exposure warning.
-/// A loopback entry is always present (synthesized when enumeration found
-/// none) so the first — and thus default — choice is never the wide bind.
-/// Pure over its input so the list shape is unit-testable.
+/// The loopback guarantee: the WSS listener always binds `127.0.0.1` in
+/// addition to the configured `server.bindAddress` set — local clients and
+/// the tailcat sidecar (which forwards tunnel traffic to `127.0.0.1`) must
+/// reach the daemon no matter which endpoints were selected. Appends the
+/// IPv4 loopback unless the set already carries it or an unspecified
+/// address (`0.0.0.0` / `::` — the `::` listener is bound dual-stack, so it
+/// covers `127.0.0.1` too). Applied at listener composition time only (boot
+/// and `start_ws_listener`); the persisted setting is left untouched. Pure
+/// so the matrix is unit-testable.
+fn ensure_loopback_bind(addrs: &mut Vec<std::net::IpAddr>) {
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    if !addrs.iter().any(|a| a.is_unspecified() || *a == loopback) {
+        addrs.push(loopback);
+    }
+}
+
+/// Build the picker entries from the enumerated `(interface, IPv4)` pairs:
+/// the non-loopback addresses (per
+/// [`intent_transport::collect_bind_interfaces`]), then an explicit
+/// all-interfaces `0.0.0.0` entry carrying its exposure warning. Loopback is
+/// NOT offered: the daemon binds `127.0.0.1` unconditionally
+/// ([`ensure_loopback_bind`]), so the picker chooses only the ADDITIONAL
+/// endpoints — and with nothing pre-checked for an empty/loopback-only
+/// persisted set ([`listen_default_indices`]), the default is never the
+/// wide bind. Pure over its input so the list shape is unit-testable.
 fn build_bind_choices(interfaces: &[(String, std::net::Ipv4Addr)]) -> Vec<BindChoice> {
     let mut choices: Vec<BindChoice> = interfaces
         .iter()
+        .filter(|(_, ip)| !ip.is_loopback())
         .map(|(name, ip)| BindChoice {
-            label: if ip.is_loopback() {
-                format!("{ip} ({name}) — this machine only (loopback)")
-            } else {
-                format!("{ip} ({name})")
-            },
+            label: format!("{ip} ({name})"),
             addr: std::net::IpAddr::V4(*ip),
         })
         .collect();
-    if !choices.iter().any(|c| c.addr.is_loopback()) {
-        choices.insert(
-            0,
-            BindChoice {
-                label: "127.0.0.1 — this machine only (loopback)".to_string(),
-                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            },
-        );
-    }
     choices.push(BindChoice {
         label: "0.0.0.0 — ALL interfaces; exposed to every network this machine is on, \
                 including the internet"
@@ -604,13 +611,16 @@ fn build_bind_choices(interfaces: &[(String, std::net::Ipv4Addr)]) -> Vec<BindCh
 /// choice (e.g. a tailnet IP whose interface was not discovered, or an IPv6
 /// address) ahead of the all-interfaces entry, labeled as currently
 /// configured — so the multi-select can always pre-check the persisted set
-/// faithfully. Pure so the merged list shape is unit-testable.
+/// faithfully. Loopback entries are skipped: loopback is not selectable
+/// (always bound — [`ensure_loopback_bind`]), so an explicit loopback
+/// selection persisted by older versions never resurrects a loopback row.
+/// Pure so the merged list shape is unit-testable.
 fn merge_current_into_bind_choices(
     mut choices: Vec<BindChoice>,
     current: &[std::net::IpAddr],
 ) -> Vec<BindChoice> {
     for addr in current {
-        if choices.iter().any(|c| c.addr == *addr) {
+        if addr.is_loopback() || choices.iter().any(|c| c.addr == *addr) {
             continue;
         }
         // Keep the exclusive all-interfaces entry last.
@@ -630,10 +640,11 @@ fn merge_current_into_bind_choices(
 }
 
 /// Parse one line of multi-select picker input into 0-based choice indices:
-/// empty (plain Enter) keeps `default_set`; otherwise 1-based numbers
-/// separated by commas and/or whitespace, deduplicated in input order.
-/// `Err` carries the re-prompt message (bad token / out of range / empty
-/// selection).
+/// empty (plain Enter) keeps `default_set`; `none` (case-insensitive, alone)
+/// is the explicit empty selection — no additional endpoints, loopback-only
+/// bind; otherwise 1-based numbers separated by commas and/or whitespace,
+/// deduplicated in input order. `Err` carries the re-prompt message (bad
+/// token / out of range / empty selection).
 fn parse_bind_multi_selection(
     input: &str,
     count: usize,
@@ -642,6 +653,9 @@ fn parse_bind_multi_selection(
     let t = input.trim();
     if t.is_empty() {
         return Ok(default_set.to_vec());
+    }
+    if t.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
     }
     let mut indices = Vec::new();
     for token in t.split(|c: char| c == ',' || c.is_whitespace()) {
@@ -656,7 +670,8 @@ fn parse_bind_multi_selection(
             }
             _ => {
                 return Err(format!(
-                    "enter numbers between 1 and {count}, separated by commas (got {token:?})"
+                    "enter numbers between 1 and {count}, separated by commas, \
+                     or 'none' (got {token:?})"
                 ))
             }
         }
@@ -786,9 +801,12 @@ async fn current_bool_setting(socket: &Path, path: &str) -> anyhow::Result<bool>
 /// bind is an implementation detail of that posture, and pre-checking it
 /// too would make Enter ("keep current selection") resolve to
 /// loopback+tailcat, silently writing `server.tunnel.only = false` and
-/// restarting the listener. Otherwise: the current addresses (loopback when
-/// empty), plus the tailcat entry when the tunnel is enabled. Pure so the
-/// round-trip is unit-testable.
+/// restarting the listener. Otherwise: the current non-loopback addresses,
+/// plus the tailcat entry when the tunnel is enabled. Loopback entries in
+/// `current` match no choice (loopback is not selectable — always bound),
+/// so an empty or loopback-only persisted set pre-checks nothing and Enter
+/// round-trips to the unchanged loopback bind. Pure so the round-trip is
+/// unit-testable.
 fn listen_default_indices(
     choices: &[BindChoice],
     current: &[std::net::IpAddr],
@@ -798,30 +816,29 @@ fn listen_default_indices(
     if tunnel_only {
         return vec![choices.len()];
     }
-    let mut default_set: Vec<usize> = if current.is_empty() {
-        vec![0]
-    } else {
-        // Every current entry has a choice (merged above); collect in
-        // display order so the default echo reads naturally.
-        (0..choices.len())
-            .filter(|&i| current.contains(&choices[i].addr))
-            .collect()
-    };
+    // Every current non-loopback entry has a choice (merged above); collect
+    // in display order so the default echo reads naturally.
+    let mut default_set: Vec<usize> = (0..choices.len())
+        .filter(|&i| current.contains(&choices[i].addr))
+        .collect();
     if tunnel_enabled {
         default_set.push(choices.len());
     }
     default_set
 }
 
-/// Interactive multi-select listen-target picker: this machine's interfaces
-/// plus the explicit all-interfaces option (and any persisted addresses
-/// matching no enumerated entry), then the tailcat tunnel entry —
-/// pre-checked per [`listen_default_indices`] (the effective
-/// `server.bindAddress` set and tunnel state; tunnel-only pre-checks the
-/// tailcat entry alone so Enter round-trips to an empty changeset).
-/// Selecting ONLY the tunnel binds loopback and turns on tunnel-only mode;
-/// an all-interfaces address stays exclusive among the addresses. Reads one
-/// selection line from stdin, so a piped run works without a TTY.
+/// Interactive multi-select listen-target picker: this machine's
+/// non-loopback interfaces plus the explicit all-interfaces option (and any
+/// persisted non-loopback addresses matching no enumerated entry), then the
+/// tailcat tunnel entry — pre-checked per [`listen_default_indices`] (the
+/// effective `server.bindAddress` set and tunnel state; tunnel-only
+/// pre-checks the tailcat entry alone so Enter round-trips to an empty
+/// changeset). Loopback is not offered — it is always bound
+/// ([`ensure_loopback_bind`]) and the header says so; `none` selects no
+/// additional endpoint (loopback-only bind). Selecting ONLY the tunnel
+/// turns on tunnel-only mode; an all-interfaces address stays exclusive
+/// among the addresses. Reads one selection line from stdin, so a piped run
+/// works without a TTY.
 fn prompt_listen_targets(
     current: &[std::net::IpAddr],
     tunnel_enabled: bool,
@@ -835,6 +852,10 @@ fn prompt_listen_targets(
     let count = choices.len() + 1;
     let default_set = listen_default_indices(&choices, current, tunnel_enabled, tunnel_only);
     eprintln!("Where should the daemon accept connections?");
+    eprintln!(
+        "Loopback (127.0.0.1) is always enabled — clients on this machine reach the \
+         daemon regardless of this selection."
+    );
     for (i, choice) in choices.iter().enumerate() {
         let mark = if default_set.contains(&i) { "x" } else { " " };
         eprintln!("  {}) [{mark}] {}", i + 1, choice.label);
@@ -847,15 +868,20 @@ fn prompt_listen_targets(
     eprintln!("  {count}) [{mark}] {TAILCAT_CHOICE_LABEL}");
     eprintln!("         {TAILCAT_CHOICE_NOTE}");
     eprintln!(
-        "Enter numbers separated by commas (e.g. 1,3), or press Enter to keep the current \
-         selection; an all-interfaces address (0.0.0.0 / ::) must be selected alone. \
-         Selecting only the tunnel binds loopback and accepts tunnel traffic only."
+        "Enter numbers separated by commas (e.g. 1,3), 'none' for loopback only, or \
+         press Enter to keep the current selection; an all-interfaces address \
+         (0.0.0.0 / ::) must be selected alone. Selecting only the tunnel accepts \
+         tunnel traffic only."
     );
-    let default_display = default_set
-        .iter()
-        .map(|i| (i + 1).to_string())
-        .collect::<Vec<_>>()
-        .join(",");
+    let default_display = if default_set.is_empty() {
+        "none".to_string()
+    } else {
+        default_set
+            .iter()
+            .map(|i| (i + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     loop {
         eprint!("Selection [{default_display}]: ");
         std::io::stderr().flush()?;
@@ -2032,6 +2058,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             ws_options.bind_addresses = loopback;
         }
     }
+    // The loopback guarantee ([`ensure_loopback_bind`]): 127.0.0.1 is always
+    // bound alongside the configured set — local clients and the tailcat
+    // sidecar must reach the daemon whatever endpoints were selected. The
+    // runtime start path (`start_ws_listener`) applies the same guarantee.
+    ensure_loopback_bind(&mut ws_options.bind_addresses);
     // Loud upgrade-path warning (monorepo#2900): the old config template wrote
     // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
     // file-origin wide bind that predates the loopback default. When that wide
@@ -3477,7 +3508,7 @@ impl intent_core::ServerControl for DaemonControl {
                 .get("server.tunnel.only")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
-            let bind_addresses = if tunnel_only {
+            let mut bind_addresses = if tunnel_only {
                 let loopback = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
                 if bind_addresses != loopback {
                     tracing::info!(
@@ -3489,6 +3520,11 @@ impl intent_core::ServerControl for DaemonControl {
             } else {
                 bind_addresses
             };
+            // The loopback guarantee ([`ensure_loopback_bind`]), mirroring
+            // the boot path: 127.0.0.1 is always bound alongside the
+            // configured set.
+            ensure_loopback_bind(&mut bind_addresses);
+            let bind_addresses = bind_addresses;
 
             // Clone ws_options and override the port + bind address set
             let mut ws_options = runtime.ws_options.clone();
@@ -6234,82 +6270,90 @@ mod tests {
     }
 
     #[test]
-    fn bind_choices_list_interfaces_then_all_interfaces_option() {
+    fn bind_choices_offer_no_loopback_row() {
+        // Loopback is filtered out of the picker: it is not selectable —
+        // the daemon binds it unconditionally (ensure_loopback_bind) — so
+        // only the additional endpoints are offered.
         let ifaces = vec![
             ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
             ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
         ];
         let choices = build_bind_choices(&ifaces);
-        assert_eq!(choices.len(), 3);
+        assert_eq!(choices.len(), 2);
+        assert!(
+            !choices.iter().any(|c| c.addr.is_loopback()),
+            "no loopback row"
+        );
         assert_eq!(
             choices[0].addr,
-            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert!(
-            choices[0].label.contains("loopback"),
-            "{}",
-            choices[0].label
-        );
-        assert_eq!(
-            choices[1].addr,
             "192.168.1.5".parse::<std::net::IpAddr>().unwrap()
         );
-        assert!(choices[1].label.contains("eth0"), "{}", choices[1].label);
+        assert!(choices[0].label.contains("eth0"), "{}", choices[0].label);
         // The all-interfaces entry is explicit and carries the exposure warning.
         assert_eq!(
-            choices[2].addr,
+            choices[1].addr,
             "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
         );
         assert!(
-            choices[2].label.contains("ALL interfaces"),
+            choices[1].label.contains("ALL interfaces"),
             "{}",
-            choices[2].label
+            choices[1].label
         );
         assert!(
-            choices[2].label.contains("internet"),
+            choices[1].label.contains("internet"),
             "{}",
-            choices[2].label
+            choices[1].label
         );
     }
 
     #[test]
-    fn bind_choices_no_interfaces_synthesize_loopback_default() {
-        // Empty enumeration must NOT leave 0.0.0.0 as the first (default)
-        // entry: a loopback choice is synthesized ahead of it.
-        let choices = build_bind_choices(&[]);
-        assert_eq!(choices.len(), 2);
-        assert_eq!(
-            choices[0].addr,
-            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert!(
-            choices[0].label.contains("loopback"),
-            "{}",
-            choices[0].label
-        );
-        assert_eq!(
-            choices[1].addr,
-            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
-        );
+    fn bind_choices_empty_enumeration_offers_only_the_unchecked_wide_entry() {
+        // Empty (or loopback-only) enumeration leaves just the
+        // all-interfaces entry — and nothing is pre-checked for it
+        // (listen_default_indices), so the default is never the wide bind:
+        // plain Enter resolves to the loopback-only bind.
+        for ifaces in [
+            Vec::new(),
+            vec![("lo".to_string(), std::net::Ipv4Addr::LOCALHOST)],
+        ] {
+            let choices = build_bind_choices(&ifaces);
+            assert_eq!(choices.len(), 1);
+            assert!(choices[0].addr.is_unspecified());
+            assert_eq!(
+                listen_default_indices(&choices, &[], false, false),
+                Vec::<usize>::new()
+            );
+        }
     }
 
     #[test]
-    fn bind_choices_non_loopback_only_enumeration_synthesizes_loopback_first() {
-        let ifaces = vec![("eth0".to_string(), std::net::Ipv4Addr::new(10, 0, 0, 7))];
-        let choices = build_bind_choices(&ifaces);
-        assert_eq!(choices.len(), 3);
-        assert_eq!(
-            choices[0].addr,
-            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert_eq!(
-            choices[1].addr,
-            "10.0.0.7".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert_eq!(
-            choices[2].addr,
-            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
-        );
+    fn ensure_loopback_bind_matrix() {
+        let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: std::net::IpAddr = "192.168.1.5".parse().unwrap();
+        // An IP-only selection gains the loopback bind.
+        let mut set = vec![lan];
+        ensure_loopback_bind(&mut set);
+        assert_eq!(set, vec![lan, lo]);
+        // Loopback already present, or a wide bind that covers it (0.0.0.0;
+        // dual-stack ::): no append, no duplicate.
+        for existing in ["127.0.0.1", "0.0.0.0", "::"] {
+            let mut set = vec![existing.parse::<std::net::IpAddr>().unwrap()];
+            ensure_loopback_bind(&mut set);
+            assert_eq!(set.len(), 1, "{existing} needs no append");
+        }
+        let mut set = vec![lo, lan];
+        ensure_loopback_bind(&mut set);
+        assert_eq!(set, vec![lo, lan]);
+        // IPv6 loopback alone does not cover 127.0.0.1 (tailcat dials the
+        // IPv4 loopback): the v4 loopback is appended.
+        let mut set = vec!["::1".parse::<std::net::IpAddr>().unwrap()];
+        ensure_loopback_bind(&mut set);
+        assert_eq!(set, vec!["::1".parse::<std::net::IpAddr>().unwrap(), lo]);
+        // Defense in depth: an empty set (validation forbids it) still
+        // yields the loopback bind.
+        let mut set = Vec::new();
+        ensure_loopback_bind(&mut set);
+        assert_eq!(set, vec![lo]);
     }
 
     #[test]
@@ -6333,20 +6377,26 @@ mod tests {
         assert!(parse_bind_multi_selection("1,4", 3, &[0]).is_err());
         // Only separators (no numbers) → Err, not an empty selection.
         assert!(parse_bind_multi_selection(",, ,", 3, &[0]).is_err());
+        // 'none' (case-insensitive, alone) → the explicit empty selection
+        // (no additional endpoints — loopback-only bind).
+        assert_eq!(parse_bind_multi_selection("none", 3, &[0]), Ok(vec![]));
+        assert_eq!(parse_bind_multi_selection(" NONE \n", 3, &[0]), Ok(vec![]));
+        // …but it cannot combine with numbers.
+        assert!(parse_bind_multi_selection("none,1", 3, &[0]).is_err());
     }
 
     #[test]
     fn resolve_bind_selection_enforces_exclusive_all_interfaces() {
         let choices = build_bind_choices(&[
-            ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
             ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
+            ("ts0".to_string(), std::net::Ipv4Addr::new(100, 64, 0, 3)),
         ]);
         // Specific IPs combine freely.
         assert_eq!(
             resolve_bind_selection(&choices, &[0, 1]).unwrap(),
             vec![
-                "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
                 "192.168.1.5".parse::<std::net::IpAddr>().unwrap(),
+                "100.64.0.3".parse::<std::net::IpAddr>().unwrap(),
             ]
         );
         // 0.0.0.0 alone is fine…
@@ -6364,7 +6414,7 @@ mod tests {
         // daemon schema) is equally exclusive, and the message names it
         // rather than hardcoding 0.0.0.0.
         let with_v6_wide = merge_current_into_bind_choices(
-            build_bind_choices(&[("lo".to_string(), std::net::Ipv4Addr::LOCALHOST)]),
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]),
             &["::".parse::<std::net::IpAddr>().unwrap()],
         );
         let v6_wide_idx = with_v6_wide
@@ -6398,18 +6448,24 @@ mod tests {
 
     #[test]
     fn merge_current_into_bind_choices_adds_unknown_entries_before_all_interfaces() {
-        let base = build_bind_choices(&[("lo".to_string(), std::net::Ipv4Addr::LOCALHOST)]);
+        let base =
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]);
         let current = vec![
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
             "100.64.0.7".parse::<std::net::IpAddr>().unwrap(),
         ];
         let merged = merge_current_into_bind_choices(base, &current);
-        // Known entry (loopback) is not duplicated; the unknown tailnet IP is
+        // A persisted loopback entry (older versions offered the row) is
+        // skipped — loopback is not selectable; the unknown tailnet IP is
         // inserted ahead of the trailing all-interfaces entry.
         assert_eq!(merged.len(), 3);
+        assert!(
+            !merged.iter().any(|c| c.addr.is_loopback()),
+            "persisted loopback must not resurrect a loopback row"
+        );
         assert_eq!(
             merged[0].addr,
-            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+            "192.168.1.5".parse::<std::net::IpAddr>().unwrap()
         );
         assert_eq!(
             merged[1].addr,
@@ -6471,21 +6527,33 @@ mod tests {
         let sel = resolve_listen_selection(&choices, &defaults).unwrap();
         assert!(listen_selection_changes(&sel, &[lan], true, false).is_empty());
 
-        // No persisted addresses, tunnel off: loopback entry only.
-        assert_eq!(listen_default_indices(&choices, &[], false, false), vec![0]);
+        // No persisted addresses, tunnel off: nothing pre-checked (loopback
+        // is not selectable — always bound). Enter (the empty default)
+        // round-trips to the unchanged loopback bind.
+        let defaults = listen_default_indices(&choices, &[], false, false);
+        assert_eq!(defaults, Vec::<usize>::new());
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lo], false, false).is_empty());
+
+        // A loopback-only persisted set (older versions offered the row)
+        // matches no choice: same empty default, same clean round-trip.
+        let defaults = listen_default_indices(&choices, &[lo], false, false);
+        assert_eq!(defaults, Vec::<usize>::new());
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lo], false, false).is_empty());
     }
 
     #[test]
     fn resolve_listen_selection_maps_tailcat_entry() {
         let choices = build_bind_choices(&[
-            ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
             ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
+            ("ts0".to_string(), std::net::Ipv4Addr::new(100, 64, 0, 3)),
         ]);
         // Tailcat entry is the index just past the address choices.
         let tc_idx = choices.len();
 
         // Address-only selection: tunnel off.
-        let sel = resolve_listen_selection(&choices, &[1]).unwrap();
+        let sel = resolve_listen_selection(&choices, &[0]).unwrap();
         assert_eq!(
             sel.addresses,
             vec!["192.168.1.5".parse::<std::net::IpAddr>().unwrap()]
