@@ -2769,13 +2769,26 @@ impl Services {
         None
     }
 
+    /// Start the one-time repository owner/name backfill during daemon startup.
+    /// The workspace projection is read once before listeners accept RPCs; all
+    /// filesystem/git probing stays in the bounded background worker below and
+    /// never runs from `workspace.list` or another hot read path.
+    pub async fn prewarm_repository_metadata(&self) {
+        match self.store.list_workspaces(false).await {
+            Ok(workspaces) => self.spawn_repository_owner_backfill(&workspaces),
+            Err(error) => tracing::warn!(
+                %error,
+                "repository metadata startup prewarm skipped; workspace read failed"
+            ),
+        }
+    }
+
     /// Spawn a background task to backfill `repository_owner` / `repository_name`
     /// for active workspaces with a local `repositoryPath` and missing owner/name.
     /// Non-blocking for the caller; each workspace is probed at most once per
     /// daemon lifecycle (tracked in a static dedupe set). FE
     /// `performBackgroundEnrichment` parity (fills only missing fields, persists
     /// once, emits `workspace:updated`).
-    #[allow(dead_code)]
     fn spawn_repository_owner_backfill(&self, workspaces: &[Workspace]) {
         use std::collections::HashSet;
         use std::sync::Mutex;
@@ -2828,7 +2841,6 @@ impl Services {
     /// Backfill one workspace: derive owner/name from origin remote, persist,
     /// and emit `workspace:updated` with the changed fields. Non-github remotes
     /// are skipped silently.
-    #[allow(dead_code)]
     async fn backfill_one_workspace(&self, candidate: BackfillCandidate) -> Result<()> {
         let repo_path = std::path::PathBuf::from(&candidate.repository_path);
         if !repo_path.join(".git").exists() {

@@ -23951,13 +23951,13 @@ mod known_repo {
         );
     }
 
-    /// `workspace.list` backfills `repository_owner` and `repository_name` for
+    /// Startup prewarming backfills `repository_owner` and `repository_name` for
     /// existing workspaces with a `repositoryPath` and missing owner/name:
     /// derive from the `origin` remote URL (same helper as `workspace.create`),
     /// persist, and emit `workspace:updated` with the changed fields (STAB-64
     /// backfill).
     #[tokio::test]
-    async fn list_workspaces_backfills_owner_and_name_from_origin_remote() {
+    async fn startup_prewarm_backfills_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
         struct TempRepo(PathBuf);
@@ -24058,9 +24058,8 @@ mod known_repo {
                     ..Default::default()
                 });
 
-        // Trigger workspace.list → spawns backfill
-        let list = svc.list_workspaces(false).await.expect("list workspaces");
-        assert!(list.iter().any(|w| w.id == id), "workspace appears in list");
+        // Startup prewarm loads candidates once, then spawns the backfill.
+        svc.prewarm_repository_metadata().await;
 
         // Wait for the backfill to complete and emit workspace:updated
         let mut updated_event = None;
