@@ -705,6 +705,11 @@ struct ListenSelection {
 const TAILCAT_CHOICE_LABEL: &str =
     "Tailcat tunnel — stable tc… address, reachable from other networks (server.tunnel.*)";
 
+/// One-line context printed under the tailcat picker entry: what the tunnel
+/// provides plus the upstream project URL.
+const TAILCAT_CHOICE_NOTE: &str =
+    "Secure, encrypted traffic between your devices — https://github.com/tailscale/tailcat";
+
 /// Map selected picker indices — over the address `choices` plus the
 /// trailing tailcat entry at index `choices.len()` — to a
 /// [`ListenSelection`]. The exclusive all-interfaces rule applies among the
@@ -840,6 +845,7 @@ fn prompt_listen_targets(
         " "
     };
     eprintln!("  {count}) [{mark}] {TAILCAT_CHOICE_LABEL}");
+    eprintln!("         {TAILCAT_CHOICE_NOTE}");
     eprintln!(
         "Enter numbers separated by commas (e.g. 1,3), or press Enter to keep the current \
          selection; an all-interfaces address (0.0.0.0 / ::) must be selected alone. \

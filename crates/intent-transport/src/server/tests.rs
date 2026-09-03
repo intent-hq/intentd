@@ -253,15 +253,42 @@ async fn handle_rotate_token_local_success() {
 
 #[test]
 fn pairing_hosts_specific_bind_advertises_only_that_address() {
-    // A listener bound to one address (loopback or a single interface) is
-    // reachable only there (monorepo#2900).
-    for addr in ["127.0.0.1", "192.168.1.23"] {
-        let snapshot = PairingSnapshot {
+    // A listener bound to one address is reachable only there
+    // (monorepo#2900).
+    let snapshot = PairingSnapshot {
+        port: Some(5181),
+        bind_addresses: Some(vec!["192.168.1.23".parse().unwrap()]),
+        tc_address: None,
+    };
+    assert_eq!(pairing_hosts(&snapshot), vec!["192.168.1.23".to_string()]);
+}
+
+#[test]
+fn pairing_hosts_never_advertise_loopback() {
+    // Pairing hosts feed remote clients (QR payload, keychain sync), and
+    // loopback is not dialable from another device: a bound loopback entry
+    // is dropped — a mixed bind keeps only the non-loopback entries, and a
+    // loopback-only bind advertises nothing.
+    let mixed = PairingSnapshot {
+        port: Some(5181),
+        bind_addresses: Some(vec![
+            "127.0.0.1".parse().unwrap(),
+            "192.168.1.23".parse().unwrap(),
+        ]),
+        tc_address: None,
+    };
+    assert_eq!(pairing_hosts(&mixed), vec!["192.168.1.23".to_string()]);
+    for lo in ["127.0.0.1", "::1"] {
+        let loopback_only = PairingSnapshot {
             port: Some(5181),
-            bind_addresses: Some(vec![addr.parse().unwrap()]),
+            bind_addresses: Some(vec![lo.parse().unwrap()]),
             tc_address: None,
         };
-        assert_eq!(pairing_hosts(&snapshot), vec![addr.to_string()]);
+        assert_eq!(
+            pairing_hosts(&loopback_only),
+            Vec::<String>::new(),
+            "loopback-only bind ({lo}) advertises nothing"
+        );
     }
 }
 

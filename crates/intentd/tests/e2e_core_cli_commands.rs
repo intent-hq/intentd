@@ -165,6 +165,27 @@ async fn stop_succeeds_when_daemon_not_running() {
 /// token via `INTENTD_AUTH_TOKEN`; `None` uses the file-backed secrets store
 /// (required by rotation tests — an env-fixed token cannot rotate).
 fn spawn_daemon_both(data_dir: &PathBuf, token: Option<&str>) -> Child {
+    spawn_daemon_both_inner(data_dir, token, None)
+}
+
+/// [`spawn_daemon_both`] plus an active (fake) tailcat tunnel: pairing needs
+/// at least one dialable route, and these hermetic tests keep the loopback
+/// default bind (never advertised), so the deterministic tc address is what
+/// makes `intentd pair` succeed without real networking.
+fn spawn_daemon_both_tunneled(data_dir: &PathBuf, token: Option<&str>) -> Child {
+    let config = data_dir.join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap_or_default();
+    text.push_str("[server.tunnel]\nenabled = true\n");
+    std::fs::write(&config, text).expect("seed config.toml with server.tunnel.enabled");
+    let tailcat_bin = write_fake_tailcat(data_dir);
+    spawn_daemon_both_inner(data_dir, token, Some(&tailcat_bin))
+}
+
+fn spawn_daemon_both_inner(
+    data_dir: &PathBuf,
+    token: Option<&str>,
+    tailcat_bin: Option<&Path>,
+) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -183,12 +204,46 @@ fn spawn_daemon_both(data_dir: &PathBuf, token: Option<&str>) -> Child {
         Some(token) => cmd.env("INTENTD_AUTH_TOKEN", token),
         None => cmd.env_remove("INTENTD_AUTH_TOKEN"),
     };
+    if let Some(bin) = tailcat_bin {
+        cmd.env("INTENTD_TAILCAT_BIN", bin);
+    }
     cmd.spawn().expect("spawn intentd serve (ws api enabled)")
 }
 
+/// Write an executable fake-tailcat script into `dir`: `genkey` creates the
+/// key file, `serve` prints the JSON address derived from the key file's
+/// content and sleeps (mirrors the seam in `e2e_wss_server_pairing.rs`).
+fn write_fake_tailcat(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-tailcat.sh");
+    let script = r#"#!/bin/sh
+key=""
+for arg in "$@"; do
+  case "$arg" in
+    --key=*) key="${arg#--key=}" ;;
+  esac
+done
+case "$1" in
+  genkey)
+    printf 'key-%s' $$ > "$key"
+    ;;
+  serve)
+    printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
+    sleep 600
+    ;;
+esac
+"#;
+    std::fs::write(&path, script).expect("write fake tailcat");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake tailcat");
+    path
+}
+
 /// Run `intentd pair` with `args`, retrying until it succeeds: the WSS
-/// listener binds asynchronously after the UDS socket accepts, so early runs
-/// can fail with listener-down (bounded by the startup budget).
+/// listener binds asynchronously after the UDS socket accepts (early runs can
+/// fail with listener-down), and the fake tailcat address registers
+/// asynchronously too (early runs can fail with no-dialable-route) — both
+/// bounded by the startup budget.
 async fn run_pair_until_success(data_dir: &Path, args: &[&str]) -> std::process::Output {
     let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
     loop {
@@ -250,7 +305,7 @@ async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
     let socket = data_dir.join("intentd.sock");
     let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
-    let child = spawn_daemon_both(&data_dir, Some(token));
+    let child = spawn_daemon_both_tunneled(&data_dir, Some(token));
     let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -395,16 +450,20 @@ fn has_uncommented_enabled_true(config: &str) -> bool {
 }
 
 #[tokio::test]
-async fn pair_with_yes_enables_wss_and_prints_payload() {
+async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
     let id = Uuid::new_v4().simple().to_string();
     let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let socket = data_dir.join("intentd.sock");
 
-    // UDS-only daemon: the WSS listener is down. `pair --yes` must enable it
-    // via settings.update (persisting server.wsApi.enabled = true), then
-    // succeed end-to-end. INTENTD_TCP_PORT=0 makes the started listener bind
-    // an OS-assigned ephemeral port, so parallel suites cannot collide.
+    // UDS-only daemon: the WSS listener is down. `pair --yes` enables it via
+    // settings.update (persisting server.wsApi.enabled = true) on the
+    // persisted bind — a fresh config here, so the loopback default. Loopback
+    // is never advertised and no tunnel is active, so pairing has no dialable
+    // route: the command must FAIL with guidance instead of printing a
+    // payload no other device can connect through. INTENTD_TCP_PORT=0 makes
+    // the started listener bind an OS-assigned ephemeral port, so parallel
+    // suites cannot collide.
     let child = spawn_daemon(&data_dir);
     let mut daemon = Daemon {
         child,
@@ -422,8 +481,8 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "pair --yes should enable the listener and succeed: {stderr}"
+        !output.status.success(),
+        "pair --yes on a loopback-only bind must fail (no dialable route): {stderr}"
     );
     assert!(
         stderr.contains("External connections enabled"),
@@ -435,13 +494,18 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
         stderr.contains("listening on 127.0.0.1"),
         "should report the effective bind address: {stderr}"
     );
+    assert!(
+        stderr.contains("loopback only"),
+        "should carry the loopback-only guidance: {stderr}"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("intent://pair?v=1&host="),
-        "pair output should include the payload URI: {stdout}"
+        !stdout.contains("intent://pair?"),
+        "must not print a route-less pairing payload: {stdout}"
     );
 
-    // The enable must be persisted to config.toml, not just in-memory.
+    // The enable IS persisted to config.toml — the failure is about the
+    // missing route, not the listener.
     let config = std::fs::read_to_string(data_dir.join("config.toml"))
         .expect("config.toml written by settings.update");
     assert!(
@@ -449,7 +513,8 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
         "server.wsApi.enabled = true should be persisted: {config}"
     );
 
-    // A second run finds the listener already up — no prompt, no re-enable.
+    // A second run finds the listener already up — no prompt, no re-enable —
+    // and fails the same way on the missing route.
     let output2 = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
         .env("INTENTD_DATA_DIR", &data_dir)
@@ -458,12 +523,16 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
         .expect("run intentd pair (second)");
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
     assert!(
-        output2.status.success(),
-        "pair should succeed with the listener already up: {stderr2}"
+        !output2.status.success(),
+        "second run still has no dialable route: {stderr2}"
     );
     assert!(
         !stderr2.contains("External connections enabled"),
         "second run must not re-enable: {stderr2}"
+    );
+    assert!(
+        stderr2.contains("loopback only"),
+        "second run carries the same guidance: {stderr2}"
     );
 }
 
@@ -502,7 +571,7 @@ async fn pair_rotate_mints_new_token() {
     // File-backed token store (no INTENTD_AUTH_TOKEN): rotation goes through
     // the daemon's `server.rotateToken`, so the subsequent `pairing.getInfo`
     // must serve the NEW token (not a stale in-process cache entry).
-    let child = spawn_daemon_both(&data_dir, None);
+    let child = spawn_daemon_both_tunneled(&data_dir, None);
     let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -545,7 +614,7 @@ async fn pair_rotate_refuses_when_daemon_token_env_fixed() {
     // The DAEMON's token is fixed by INTENTD_AUTH_TOKEN (the CLI's own env is
     // clean — the daemon is the authority): `server.rotateToken` rejects,
     // which becomes a stderr note, and the fixed token is printed unchanged.
-    let child = spawn_daemon_both(&data_dir, Some(token));
+    let child = spawn_daemon_both_tunneled(&data_dir, Some(token));
     let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -583,7 +652,7 @@ async fn pair_rotate_uses_daemon_authority_not_cli_env() {
     // Regression (PR #1074 review): INTENTD_AUTH_TOKEN set only in the CLI's
     // env, while the daemon uses its file-backed store. The CLI env must NOT
     // gate rotation — the daemon is the authority, so rotation MUST happen.
-    let child = spawn_daemon_both(&data_dir, None);
+    let child = spawn_daemon_both_tunneled(&data_dir, None);
     let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -743,6 +812,11 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
     assert!(
         stderr.contains("Where should the daemon accept connections?"),
         "should show the multi-select picker: {stderr}"
+    );
+    assert!(
+        stderr.contains("https://github.com/tailscale/tailcat"),
+        "tailcat picker entry should carry the explanatory note with the \
+         project URL: {stderr}"
     );
     assert!(
         stderr.contains("listening on 127.0.0.1"),

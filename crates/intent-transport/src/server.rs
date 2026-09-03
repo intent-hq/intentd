@@ -163,21 +163,32 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 }
 
 /// Hosts the pairing payload should advertise for `snapshot`: a listener
-/// bound to specific addresses (loopback included) is reachable only there,
-/// so advertise exactly those addresses; an unspecified bind (`0.0.0.0` /
-/// `::` — always the sole entry per the settings validation) or an unknown
-/// set falls back to enumerating the machine's local IPs.
+/// bound to specific addresses is reachable only there, so advertise exactly
+/// those addresses; an unspecified bind (`0.0.0.0` / `::` — always the sole
+/// entry per the settings validation) or an unknown set falls back to
+/// enumerating the machine's local IPs.
+/// Loopback (`127.0.0.1` / `::1`) is NEVER advertised here, even when bound:
+/// pairing hosts feed remote clients (QR payload, keychain sync), and
+/// loopback is not dialable from another device — with the loopback lock-in
+/// posture it is routinely in `server.bindAddress`. The diagnostic
+/// `system.status` localIps surface keeps loopback by calling
+/// [`advertised_hosts`] directly.
 /// An IPv6-unspecified bind (`::`) also accepts native IPv6 connections
 /// (the listener is bound explicitly dual-stack — `IPV6_V6ONLY = false` in
 /// `lifecycle::bind_listener` — so v4-mapped sockets cover the IPv4 side on
 /// every OS), and its enumeration additionally carries the machine's global
 /// IPv6 addresses.
 pub(crate) fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
-    advertised_hosts(
+    let mut hosts = advertised_hosts(
         snapshot.bind_addresses.as_deref(),
         &collect_local_ips(),
         &collect_local_ipv6s(),
-    )
+    );
+    hosts.retain(|h| {
+        !h.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    });
+    hosts
 }
 
 /// Pure core of [`pairing_hosts`]: pick the advertised host set for a bind
