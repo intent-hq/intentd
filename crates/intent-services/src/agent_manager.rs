@@ -4074,12 +4074,22 @@ impl AgentManager {
             stopping: Arc::clone(&self.stopping),
             ids: agent_ids.to_vec(),
         };
+        // `sync_store: false` per detach, then ONE batched clear below: each
+        // detach drops the agent's in-memory stop-redelivery payload, so the
+        // durable mirror's outcome for every swept agent is "cleared" — the
+        // per-agent DELETE that `detach()` would run is folded into a single
+        // `IN`-list statement, keeping the sweep's statement count bounded in
+        // the agent count (intent-hq/monorepo#4130). Same durable result as
+        // the per-agent sync (the stale-row no-op included).
         let mut children = Vec::new();
         for id in agent_ids {
-            let (_, child) = self.detach(id).await;
+            let (_, child) = self.detach_with_redelivery(id, None, false).await;
             if let Some(child) = child {
                 children.push(child);
             }
+        }
+        if let Err(e) = self.services.store.clear_stop_redeliveries(agent_ids).await {
+            tracing::warn!(error = %e, "stop-redelivery persistence sync failed for batch stop");
         }
         if !children.is_empty() {
             kill_child_trees(children).await;

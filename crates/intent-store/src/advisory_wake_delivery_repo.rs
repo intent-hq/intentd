@@ -108,4 +108,37 @@ impl Store {
             })?;
         Ok(())
     }
+
+    /// Batched [`Store::clear_advisory_wake_deliveries_for_child`]: clear the
+    /// markers naming ANY of `child_agent_ids` as the child in ONE `IN`-list
+    /// statement per 32 000 ids (the workspace-delete sweep —
+    /// intent-hq/monorepo#4130 — settles every session at once, so the
+    /// per-child clear would otherwise cost one statement per agent). No-op
+    /// on an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_advisory_wake_deliveries_for_children(
+        &self,
+        child_agent_ids: &[AgentId],
+    ) -> Result<()> {
+        const IDS_PER_STATEMENT: usize = 32_000;
+        for chunk in child_agent_ids.chunks(IDS_PER_STATEMENT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "DELETE FROM advisory_wake_delivery WHERE child_agent_id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(&id.0);
+            }
+            query.execute(self.write_pool()).await.map_err(|e| {
+                Error::Internal(format!(
+                    "clear advisory_wake_delivery by children failed: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
 }

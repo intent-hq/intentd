@@ -58,7 +58,8 @@ pub const DEFAULT_STATEMENT_WARN_THRESHOLD: u64 = 25;
 /// [`DEFAULT_STATEMENT_WARN_THRESHOLD`] so a legitimately compound
 /// multi-entity op doesn't trip the guardrail. Sized off observed dispatch
 /// counts — `workspace.create` deterministically runs ~40 statements and
-/// `workspace.delete` scales with workspace contents (26–72 observed,
+/// `workspace.delete` ~10 regardless of workspace contents (its per-agent
+/// sweep was batched in intent-hq/monorepo#4130; 26–72 observed before that,
 /// intent-hq/monorepo#3074) — while staying an order of magnitude below the
 /// hundreds a real N+1 regression produces.
 pub const DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD: u64 = 100;
