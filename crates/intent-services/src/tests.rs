@@ -24058,6 +24058,16 @@ mod known_repo {
                     ..Default::default()
                 });
 
+        let probes_before = repository_backfill_probe_count(&repo_path);
+        let listed = svc.list_workspaces(false).await.expect("list workspaces");
+        assert!(listed.iter().any(|workspace| workspace.id == id));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            repository_backfill_probe_count(&repo_path),
+            probes_before,
+            "workspace.list must not probe repository paths"
+        );
+
         // Startup prewarm loads candidates once, then spawns the backfill.
         svc.prewarm_repository_metadata().await;
 
@@ -24122,6 +24132,44 @@ mod known_repo {
             Some("hello-world"),
             "repositoryName persisted"
         );
+
+        // A repository path that appears after startup uses the same
+        // background probe and does not require another daemon prewarm.
+        let path_update_repo = make_repo("git@github.com:octocat/path-update.git");
+        let path_update_id = WorkspaceId::from_string("path-update-test".to_string());
+        let mut path_update_ws = workspace(&path_update_id);
+        path_update_ws.repository_path = None;
+        path_update_ws.repository_owner = None;
+        path_update_ws.repository_name = None;
+        store
+            .insert_workspace(&path_update_ws)
+            .await
+            .expect("insert path-update workspace");
+        svc.update_workspace(
+            path_update_id.clone(),
+            WorkspaceUpdate {
+                repository_path: Some(path_update_repo.0.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update repository path");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let updated = store
+                .get_workspace(&path_update_id)
+                .await
+                .expect("get path-update workspace");
+            if updated.repository_owner.as_deref() == Some("octocat") {
+                assert_eq!(updated.repository_name.as_deref(), Some("path-update"));
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "repository-path update backfill did not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }
 

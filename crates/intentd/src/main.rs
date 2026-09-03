@@ -1737,10 +1737,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // process-wide probe warms intent-git's low-level result; this detached
     // handoff makes workspace/list capability reads cache-only.
     services.prewarm_cow_supported();
-    // Existing rows may predate persisted repository owner/name fields. Kick
-    // their bounded git/FS enrichment off once at startup, never from the hot
-    // workspace.list path.
-    services.prewarm_repository_metadata().await;
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -2473,7 +2469,20 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // relies on (status/stop/doctor, FE sidecar, pairing RPCs).
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
     let system_control: Arc<dyn SystemControl> = control.clone();
-    serve_uds_with_reverse(
+    // Wait for the local listener to accept connections before launching the
+    // best-effort repository metadata prewarm. Its candidate read and bounded
+    // blocking probes never gate readiness or the first workspace.list call.
+    let repository_metadata_prewarm = {
+        let services = services.clone();
+        let socket_path = config.socket_path.clone();
+        tokio::spawn(async move {
+            while !uds_is_live(&socket_path).await {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            services.prewarm_repository_metadata().await;
+        })
+    };
+    let serve_result = serve_uds_with_reverse(
         api,
         bus,
         &config.socket_path,
@@ -2483,7 +2492,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         rpc_limiter,
         shutdown,
     )
-    .await?;
+    .await;
+    repository_metadata_prewarm.abort();
+    serve_result?;
 
     // Clean shutdown: stop the tailcat tunnel sidecar (kill the child), stop
     // the WSS listener (graceful close + port release), stop the PR refresh

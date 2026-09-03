@@ -2769,10 +2769,10 @@ impl Services {
         None
     }
 
-    /// Start the one-time repository owner/name backfill during daemon startup.
-    /// The workspace projection is read once before listeners accept RPCs; all
-    /// filesystem/git probing stays in the bounded background worker below and
-    /// never runs from `workspace.list` or another hot read path.
+    /// Start the one-time repository owner/name backfill after daemon listeners
+    /// are live. The daemon invokes this from a detached readiness task, so the
+    /// candidate read and every git/filesystem probe stay off startup and RPC
+    /// critical paths.
     pub async fn prewarm_repository_metadata(&self) {
         match self.store.list_workspaces(false).await {
             Ok(workspaces) => self.spawn_repository_owner_backfill(&workspaces),
@@ -2800,21 +2800,24 @@ impl Services {
 
             let mut candidates = Vec::new();
             for ws in workspaces {
-                if ws.archived || backfilled.contains(ws.id.as_str()) {
+                let Some(repository_path) = ws.repository_path.as_deref().filter(|p| !p.is_empty())
+                else {
+                    continue;
+                };
+                let dedupe_key = format!("{}\0{repository_path}", ws.id.as_str());
+                if ws.archived || backfilled.contains(&dedupe_key) {
                     continue;
                 }
                 let missing_owner = ws.repository_owner.is_none()
                     || ws.repository_owner.as_deref().is_some_and(str::is_empty);
                 let missing_name = ws.repository_name.is_none()
                     || ws.repository_name.as_deref().is_some_and(str::is_empty);
-                if (missing_owner || missing_name)
-                    && ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
-                {
+                if missing_owner || missing_name {
                     candidates.push(BackfillCandidate {
                         workspace_id: ws.id.clone(),
-                        repository_path: ws.repository_path.clone().unwrap(),
+                        repository_path: repository_path.to_string(),
                     });
-                    backfilled.insert(ws.id.0.clone());
+                    backfilled.insert(dedupe_key);
                 }
             }
             candidates
@@ -2842,18 +2845,22 @@ impl Services {
     /// and emit `workspace:updated` with the changed fields. Non-github remotes
     /// are skipped silently.
     async fn backfill_one_workspace(&self, candidate: BackfillCandidate) -> Result<()> {
-        let repo_path = std::path::PathBuf::from(&candidate.repository_path);
-        if !repo_path.join(".git").exists() {
-            return Ok(());
-        }
-
-        let origin_url = intent_git::remote::origin_url(&repo_path).ok().flatten();
-
-        let Some(origin_url) = origin_url else {
-            return Ok(());
-        };
-
-        let Some((owner, name)) = Self::parse_github_owner_repo(&origin_url) else {
+        let repository_path = candidate.repository_path.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            let repo_path = std::path::PathBuf::from(&repository_path);
+            #[cfg(test)]
+            record_repository_backfill_probe(&repo_path);
+            if !repo_path.join(".git").exists() {
+                return None;
+            }
+            intent_git::remote::origin_url(&repo_path)
+                .ok()
+                .flatten()
+                .and_then(|url| Self::parse_github_owner_repo(&url))
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("repository metadata probe failed: {error}")))?;
+        let Some((owner, name)) = metadata else {
             return Ok(());
         };
 
@@ -10157,6 +10164,28 @@ pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
 struct BackfillCandidate {
     workspace_id: WorkspaceId,
     repository_path: String,
+}
+
+#[cfg(test)]
+fn repository_backfill_probe_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_repository_backfill_probe(path: &Path) {
+    let mut counts = repository_backfill_probe_counts().lock().unwrap();
+    *counts.entry(path.to_path_buf()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn repository_backfill_probe_count(path: &Path) -> u64 {
+    repository_backfill_probe_counts()
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Recursively scan `dir` for git repositories (a directory that contains a
@@ -18479,6 +18508,7 @@ impl WorkspaceApi for Services {
                 || update.active_pull_request.is_some()
                 || update.pull_requests.is_some();
             let attention_changed = update.attention.is_some();
+            let repository_path_changed = update.repository_path.is_some();
             let mut ws = if id.is_chief() {
                 chief_workspace()
             } else {
@@ -18608,6 +18638,9 @@ impl WorkspaceApi for Services {
                 // response carries `agent_running` when agents are in-flight,
                 // not the stale default `idle` from the persisted row.
                 ws.activity = this.workspace_activity(&ws.id);
+                if repository_path_changed {
+                    this.spawn_repository_owner_backfill(std::slice::from_ref(&ws));
+                }
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
