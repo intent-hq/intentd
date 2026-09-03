@@ -286,6 +286,18 @@ async fn server_pairing_info_over_uds() {
     assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
     assert_eq!(result["path"].as_str().unwrap(), "/ws");
     assert!(result["localIps"].is_array());
+    // Additive bind-candidate set: always present, string entries, never
+    // loopback (the FE renders loopback itself).
+    let available_ips = result["availableIps"]
+        .as_array()
+        .expect("availableIps is array");
+    assert!(
+        available_ips.iter().all(|v| v
+            .as_str()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| !ip.is_loopback())),
+        "availableIps entries are non-loopback IPs: {result}"
+    );
     assert!(result["hostname"].is_string());
     assert!(
         !result["prettyHostname"]

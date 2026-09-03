@@ -1,7 +1,8 @@
 //! Server pairing fast-path: `server.pairingInfo` + `server.rotateToken`
 //! (docs/protocol/05-method-catalog.md §5 fast-path catalog).
 //!
-//! These two methods expose pairing credentials (token + fingerprint + port + local IPs + hostname + pretty hostname)
+//! These two methods expose pairing credentials (token + fingerprint + port + local IPs + available
+//! bind-candidate IPs + hostname + pretty hostname)
 //! and rotate the bearer token. They are LOCAL-ONLY: gated on the real connection origin (UDS vs TCP)
 //! via the task-local context set by the transport layer. WSS connections are ALWAYS remote (TCP),
 //! regardless of the `--mode local` locality flag. UDS connections are ALWAYS local. Remote callers
@@ -126,6 +127,10 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
     let local_ips = pairing_hosts(&snapshot);
+    // Bind-candidate set: every non-loopback IPv4 the machine could listen
+    // on, deliberately NOT narrowed by the current bind set — a loopback
+    // locked-in daemon still reports what a client could switch the bind to.
+    let available_ips = collect_local_ips();
     let hostname = crate::host_env::local_hostname();
     let pretty_hostname = crate::host_env::pretty_hostname();
 
@@ -135,6 +140,7 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
         "port": snapshot.port,
         "path": "/ws",
         "localIps": local_ips,
+        "availableIps": available_ips,
         "hostname": hostname,
         "prettyHostname": pretty_hostname,
     });
