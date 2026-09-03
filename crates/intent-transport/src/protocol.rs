@@ -336,13 +336,20 @@
 //! `providers.catalog` rows gain the always-present `supportsTestPrompt`
 //! boolean (`false` only for unsloth, whose first prompt can trigger a very
 //! long model download). Method catalog grows by one fast-path method —
-//! 298 router methods, 39 fast-path, 339 total.
+//! 298 router methods, 39 fast-path, 339 total. Version 9.4 adds provider
+//! auth identity metadata (additive; §5.14): `host.providerAuthStatus`
+//! entries gain the optional `identity: { email?, orgName?,
+//! subscriptionType? }` object, captured from claude-code's logged-in
+//! `claude auth status` JSON report, riding the cached verdict (demotion
+//! clears it, test-prompt promotion preserves it) and absent for providers
+//! without identity. No method-catalog change — 298 router methods,
+//! 39 fast-path, 339 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.3";
+pub const PROTOCOL_VERSION: &str = "9.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
