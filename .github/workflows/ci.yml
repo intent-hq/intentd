@@ -16,10 +16,17 @@ on:
   # are completely unaffected.
   pull_request:
   # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
-  # merged tree before it lands on main, so merge_group runs the same test
-  # jobs as pull_request CI. Merge groups are created by the repo's own
-  # ruleset from already-filed PRs, so they need no same-repo fork guard.
-  # pr-title / conflict-markers are PR-metadata checks that stay
+  # merged tree before it lands on main. CI is tiered by event: pull_request
+  # runs the fast feedback jobs (check / build / pr-title / conflict-markers /
+  # deb-packaging / release-scripts); merge_group additionally runs the
+  # instrumented coverage jobs (coverage-e2e / coverage-all), which are
+  # merge_group-ONLY — they no longer run on pull_request, so a PR's ~20 min
+  # coverage wall time is paid once, on the merged tree, instead of on every
+  # push to the PR. The gate is event-aware about this (see the gate
+  # comment): it requires the coverage jobs outright on merge_group and
+  # accepts their skip on pull_request / push. Merge groups are created by
+  # the repo's own ruleset from already-filed PRs, so they need no same-repo
+  # fork guard. pr-title / conflict-markers are PR-metadata checks that stay
   # pull_request-only — the gate accepts their skip.
   merge_group:
 
@@ -387,12 +394,13 @@ jobs:
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
       # The full suite is not run here: coverage-all executes it (instrumented,
-      # via cargo llvm-cov nextest) and is the test gate for PRs. Running it
-      # plainly here as well would double the critical path. The exception is
-      # the tests the coverage scripts skip: they are flaky under llvm-cov
-      # instrumentation / heavy parallel load, so they run here instead —
-      # non-instrumented and serially, the conditions under which they pass
-      # reliably — to keep them covered on every PR.
+      # via cargo llvm-cov nextest) and is the test gate in the merge queue
+      # (the coverage jobs are merge_group-only — see the trigger comment).
+      # Running it plainly here as well would double the critical path. The
+      # exception is the tests the coverage scripts skip: they are flaky under
+      # llvm-cov instrumentation / heavy parallel load, so they run here
+      # instead — non-instrumented and serially, the conditions under which
+      # they pass reliably — to keep them covered on every PR.
       #
       # slow_host_exec_does_not_block_fast_workspace_list (STAB-42) is NOT run:
       # it currently fails deterministically even in an isolated, serial,
@@ -451,7 +459,8 @@ jobs:
 
   # Release-PR fast path (intent-hq/monorepo#1374): release-plz PRs change
   # only version strings + changelog, so the compiled code is identical to
-  # what main already tested and the heavy jobs (build matrix, coverage-all,
+  # what main already tested and the heavy jobs (build matrix, and — before
+  # they became merge_group-only, see the trigger comment — coverage-all /
   # coverage-e2e) add no signal — their ~20 min wall time just makes the PR
   # lose the strict up-to-date race against main. This job diffs the PR
   # against its base and emits fast_path=true only when the diff has exactly
@@ -465,12 +474,14 @@ jobs:
   # never gated, and check / pr-title / conflict-markers /
   # deb-packaging still run on every PR. Job names are unchanged, so the
   # required-check ruleset needs no edits — but the gating mechanism differs
-  # by job shape. The non-matrix coverage jobs skip at job level (a skipped
-  # job still reports its required context). The build job CANNOT be skipped
-  # at job level: a job-level skip prevents the matrix from expanding, so
-  # GitHub reports a single skipped check named literally `matrix.name` and
-  # the required per-entry contexts (`build (aarch64-apple-darwin, macos-14)`
-  # etc.) are never reported, leaving release PRs blocked forever (intentd#868).
+  # by job shape. The coverage jobs are no longer consumers of this output:
+  # they are merge_group-only (job-level skipped on every pull_request run,
+  # fast path or not — a skipped job still reports its required context).
+  # The build job CANNOT be skipped at job level: a job-level skip prevents
+  # the matrix from expanding, so GitHub reports a single skipped check named
+  # literally `matrix.name` and the required per-entry contexts
+  # (`build (aarch64-apple-darwin, macos-14)` etc.) are never reported,
+  # leaving release PRs blocked forever (intentd#868).
   # Instead the build job always runs and every step is gated on
   # fast_path != 'true', so on fast-path PRs each matrix entry completes as
   # an all-steps-skipped success under its required name.
@@ -624,22 +635,22 @@ jobs:
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    # Skipped at job level when the diff is release-PR-shaped (safe for
-    # non-matrix jobs — a skipped job still reports its required context;
-    # see release-fast-path). Fail-safe: skips only when the output is
-    # exactly 'true'. The route.result guard preserves the pre-existing
-    # behavior that a route failure skips this job. Also skipped on push to
-    # main — redundant re-test (see the `on: push` comment); the route.result
-    # guard would skip it there anyway (route is push-skipped), the explicit
-    # event guard just makes the intent visible.
-    # The same-repo clause is belt-and-suspenders for the fork-PR policy
-    # (see the `pull_request` trigger comment): the route.result guard
-    # already skips this job on fork PRs (route is fork-skipped), but this
-    # job can land on tinybox, so it carries the guard explicitly (merge
-    # groups come from the repo's own ruleset, so the guard passes there
-    # via the event check).
-    needs: [route, release-fast-path]
-    if: ${{ !cancelled() && github.event_name != 'push' && (github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    # merge_group-ONLY (see the `merge_group` trigger comment): the
+    # instrumented suite runs once, against the queue's merged tree, and is
+    # job-level skipped on every pull_request and push run — a skipped job
+    # still reports its required context, and the gate is event-aware about
+    # the skip (required outright on merge_group, accepted elsewhere). The
+    # event check makes the intent visible; the route.result guard preserves
+    # the pre-existing behavior that a route failure skips this job (and
+    # would skip it on push / fork PRs anyway, where route itself is
+    # skipped). Nothing here may reference github.event.pull_request — that
+    # context does not exist on merge_group. release-fast-path is no longer a
+    # dependency: it is pull_request-only, so its output is empty on
+    # merge_group and must not be required; the fast-path skip it used to
+    # provide is subsumed by the pull_request skip. Merge groups come from
+    # the repo's own ruleset, so no same-repo fork guard applies.
+    needs: route
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -820,22 +831,14 @@ jobs:
           retention-days: 3
 
   coverage-all:
-    # Skipped at job level when the diff is release-PR-shaped (safe for
-    # non-matrix jobs — a skipped job still reports its required context;
-    # see release-fast-path). Fail-safe: skips only when the output is
-    # exactly 'true'. The route.result guard preserves the pre-existing
-    # behavior that a route failure skips this job. Also skipped on push to
-    # main — redundant re-test (see the `on: push` comment); the route.result
-    # guard would skip it there anyway (route is push-skipped), the explicit
-    # event guard just makes the intent visible.
-    # The same-repo clause is belt-and-suspenders for the fork-PR policy
-    # (see the `pull_request` trigger comment): the route.result guard
-    # already skips this job on fork PRs (route is fork-skipped), but this
-    # job can land on tinybox, so it carries the guard explicitly (merge
-    # groups come from the repo's own ruleset, so the guard passes there
-    # via the event check).
-    needs: [route, release-fast-path]
-    if: ${{ !cancelled() && github.event_name != 'push' && (github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    # merge_group-ONLY — same gating and rationale as coverage-e2e (see its
+    # comment and the `merge_group` trigger comment): job-level skipped on
+    # every pull_request and push run, required outright by the gate on
+    # merge_group. No github.event.pull_request reference (absent on
+    # merge_group) and no release-fast-path dependency (pull_request-only,
+    # empty output on merge_group).
+    needs: route
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -1171,16 +1174,21 @@ jobs:
   # the gate, exactly as before); only on push to main, where it is
   # job-skipped as redundant (see the `on: push` comment), does the gate
   # accept skipped — the event-aware branch below keeps the PR semantics
-  # unweakened. coverage-e2e / coverage-all accept success OR skipped — they
-  # are job-level skipped on release-fast-path PRs (fast_path == 'true'), on
-  # a route failure (see release-fast-path above), and on push to main, all
-  # legitimate. pr-title / conflict-markers accept success OR skipped since
+  # unweakened. coverage-e2e / coverage-all are event-aware the other way
+  # round: they are merge_group-only (see the `merge_group` trigger comment),
+  # so on merge_group they must succeed outright — a skip there (e.g. after a
+  # route failure) fails the gate, so the queue can never land a tree whose
+  # coverage run did not happen — while on pull_request and push, where they
+  # are job-level skipped by design, the gate accepts skipped. pr-title /
+  # conflict-markers accept success OR skipped since
   # both carry `if: github.event_name == 'pull_request'` and are legitimately
   # skipped on push and merge_group runs (PR-metadata checks, already
   # validated on the PR) — requiring strict success there would fail the
-  # gate outside pull_request events. On merge_group everything else keeps
-  # the pull_request semantics: check / coverage-e2e / coverage-all run
-  # against the queue's merged tree and must pass.
+  # gate outside pull_request events. Net per event: pull_request requires
+  # check / build / deb-packaging / release-scripts / pr-title /
+  # conflict-markers; merge_group requires check / build / deb-packaging /
+  # release-scripts / coverage-e2e / coverage-all against the queue's merged
+  # tree; push requires build / deb-packaging / release-scripts.
   gate:
     name: CI Gate
     # Seconds-long job: pinned to ubuntu-latest (see pr-title).
@@ -1216,20 +1224,33 @@ jobs:
             echo "One or more required jobs failed"
             exit 1
           fi
-          case "${{ needs.coverage-e2e.result }}" in
-            success|skipped) ;;
-            *)
-              echo "coverage-e2e did not succeed or skip"
+          # Event-aware on purpose: coverage-e2e / coverage-all are
+          # merge_group-only, so on merge_group they must succeed outright
+          # (a skip must never let the queue land an untested tree); on
+          # pull_request and push they are job-skipped by design and the
+          # gate accepts skipped.
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            if [ "${{ needs.coverage-e2e.result }}" != "success" ] || \
+               [ "${{ needs.coverage-all.result }}" != "success" ]; then
+              echo "coverage-e2e / coverage-all must succeed outright on merge_group"
               exit 1
-              ;;
-          esac
-          case "${{ needs.coverage-all.result }}" in
-            success|skipped) ;;
-            *)
-              echo "coverage-all did not succeed or skip"
-              exit 1
-              ;;
-          esac
+            fi
+          else
+            case "${{ needs.coverage-e2e.result }}" in
+              success|skipped) ;;
+              *)
+                echo "coverage-e2e did not succeed or skip"
+                exit 1
+                ;;
+            esac
+            case "${{ needs.coverage-all.result }}" in
+              success|skipped) ;;
+              *)
+                echo "coverage-all did not succeed or skip"
+                exit 1
+                ;;
+            esac
+          fi
           case "${{ needs.pr-title.result }}" in
             success|skipped) ;;
             *)
