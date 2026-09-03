@@ -147,6 +147,16 @@ pub(crate) static V2: InstructionSet = InstructionSet {
     ..V1_1
 };
 
+/// Harness v2.2 keeps every v2 instruction body except `workspace.md` and
+/// `workspace-agent.md`, which rewrite the workspace status-message guidance
+/// to demand one short plain sentence (with good and too-dense examples)
+/// instead of the earlier 1–2 sentence summaries.
+pub(crate) static V2_2: InstructionSet = InstructionSet {
+    workspace: instr!("v2.2", "workspace"),
+    workspace_agent: instr!("v2.2", "workspace-agent"),
+    ..V2
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -454,8 +464,11 @@ mod tests {
     }
 
     /// The latest set's common body. Harness v2 keeps v1.1 behavior and adds
-    /// only scoped sibling-workspace guidance.
-    const COMMON_LATEST: &str = V2.common;
+    /// only scoped sibling-workspace guidance; v2.1 and v2.2 leave it as is.
+    const COMMON_LATEST: &str = V2_2.common;
+    /// The latest set's workspace body. Harness v2.2 rewrites the workspace
+    /// status-message guidance to one short plain sentence.
+    const WORKSPACE_LATEST: &str = V2_2.workspace;
 
     #[test]
     fn common_only_is_not_self_wrapped() {
@@ -503,7 +516,7 @@ mod tests {
     #[test]
     fn workspace_gets_common_prepended_once() {
         let out = get_instruction_with_common("workspace", &all_on());
-        assert_eq!(out, format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}"));
+        assert_eq!(out, format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}"));
     }
 
     #[test]
@@ -543,7 +556,7 @@ mod tests {
         let out = get_instruction_with_common("task-loop", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{TASK_LOOP}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{TASK_LOOP}")
         );
     }
 
@@ -552,7 +565,7 @@ mod tests {
         let out = get_instruction_with_common("ralph-loop", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{RALPH_LOOP}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{RALPH_LOOP}")
         );
     }
 
@@ -562,7 +575,7 @@ mod tests {
         let out = get_instruction_with_common("interactive", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{WORKSPACE}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{WORKSPACE_LATEST}")
         );
     }
 
@@ -571,7 +584,7 @@ mod tests {
         let out = get_instruction_with_common("fix", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{DEBUG}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{DEBUG}")
         );
     }
 
@@ -582,11 +595,11 @@ mod tests {
         // in those sets — so they take the full common+workspace+specific path.
         assert_eq!(
             get_instruction_with_common("review", &all_on()),
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_REVIEW}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{CODE_REVIEW}")
         );
         assert_eq!(
             get_instruction_with_common("walkthrough", &all_on()),
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_WALKTHROUGH}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{CODE_WALKTHROUGH}")
         );
     }
 
@@ -896,8 +909,12 @@ mod tests {
 
     #[test]
     fn scripts_off_removes_workspace_agent_dev_server_guideline() {
-        // Guard: the gated guideline text still matches the bundled body.
+        // Guard: the gated guideline text still matches the bundled bodies,
+        // including the v2.2 rewrite of workspace-agent.md.
         assert!(WORKSPACE_AGENT.contains(WORKSPACE_AGENT_SCRIPTS_GUIDELINE));
+        assert!(V2_2
+            .workspace_agent
+            .contains(WORKSPACE_AGENT_SCRIPTS_GUIDELINE));
         let features = AgentFeaturesSettings {
             scripts: false,
             ..defaults()
