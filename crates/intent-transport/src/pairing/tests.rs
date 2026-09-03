@@ -284,10 +284,11 @@ async fn handle_get_info_specific_bind_advertises_only_that_host() {
 }
 
 #[tokio::test]
-async fn handle_get_info_loopback_bind_advertises_no_hosts() {
+async fn handle_get_info_loopback_bind_without_tunnel_errors() {
     // Loopback is never advertised to pairing clients — it is not dialable
-    // from another device even when bound, so a loopback-only bind yields an
-    // empty host list (and a `host=`-less route set in the URI).
+    // from another device even when bound — and with the tunnel off there is
+    // no dialable route at all: erroring with guidance beats minting a
+    // payload no other device can connect through.
     let token = "abababababababababababababababababababababababababababababababab";
     let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
     let (provider, tmpdir) =
@@ -298,10 +299,42 @@ async fn handle_get_info_loopback_bind_advertises_no_hosts() {
     };
     let resp = handle(req, &provider, true).await.unwrap();
     let parsed: Value = serde_json::from_str(&resp).unwrap();
+    let msg = parsed["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("loopback only"),
+        "actionable guidance names the loopback-only bind: {msg}"
+    );
+    assert!(
+        msg.contains("server.bindAddress") && msg.contains("server.tunnel.enabled"),
+        "guidance names both remediations: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+#[tokio::test]
+async fn handle_get_info_loopback_bind_with_tunnel_pairs_hostless() {
+    // A loopback-only bind with the tunnel up still pairs: the tc= route
+    // carries it, and the host list stays empty (loopback never advertised).
+    let token = "abababababababababababababababababababababababababababababababab";
+    let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let (provider, tmpdir) = provider_full(
+        Some(5181),
+        Some(vec![bind]),
+        Some("tc7f2a91.tailcat.net".to_string()),
+        "pairing_bind_loopback_tc",
+        token,
+    );
+    let req = PairingRequest {
+        id_present: true,
+        id_echo: json!(1),
+    };
+    let resp = handle(req, &provider, true).await.unwrap();
+    let parsed: Value = serde_json::from_str(&resp).unwrap();
     let hosts: Vec<String> = serde_json::from_value(parsed["result"]["hosts"].clone()).unwrap();
     assert_eq!(hosts, Vec::<String>::new());
+    assert_eq!(parsed["result"]["tcAddress"], "tc7f2a91.tailcat.net");
     let fp = parsed["result"]["fingerprint"].as_str().unwrap();
-    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, None);
+    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, Some("tc7f2a91.tailcat.net"));
     assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);
     let _ = std::fs::remove_dir_all(&tmpdir);
 }

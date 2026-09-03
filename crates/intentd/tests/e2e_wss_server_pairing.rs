@@ -344,41 +344,37 @@ async fn server_pairing_info_over_wss_rejects() {
 }
 
 #[tokio::test]
-async fn pairing_get_info_over_uds() {
+async fn pairing_get_info_loopback_default_errors_without_tunnel() {
     let data_dir = temp_data_dir();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
         data_dir: data_dir.clone(),
     };
-    let (port, fp) = boot(&data_dir).await;
+    boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
 
-    // pairing.getInfo over UDS (local) returns the structured QR payload
-    let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
-    let result = &response["result"];
-
-    assert_eq!(result["token"].as_str().unwrap(), TOKEN);
-    assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
-    assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
-    assert_eq!(result["version"].as_u64().unwrap(), 1);
-    assert!(result["hosts"].is_array());
-
     // Fresh config (no server.bindAddress): the listener binds the loopback
-    // default (monorepo#2900), and loopback is never advertised to pairing
-    // clients (not dialable from another device), so the host list is empty.
-    let hosts: Vec<String> = serde_json::from_value(result["hosts"].clone()).unwrap();
-    assert_eq!(hosts, Vec::<String>::new());
-
-    // The uri field is consistent with the component fields
-    let expected_uri = format!(
-        "intent://pair?v=1&host={}&port={port}&fp={fp}&token={TOKEN}",
-        hosts.join(",")
+    // default (monorepo#2900). Loopback is never advertised to pairing
+    // clients (not dialable from another device) and the tunnel is off, so
+    // there is no dialable route at all — pairing.getInfo errors with
+    // actionable guidance instead of minting a payload no other device can
+    // connect through. This is NOT the listener-down error (the listener IS
+    // up — boot() connected over WSS above).
+    let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    let error = &response["error"];
+    let msg = error["message"].as_str().unwrap();
+    assert!(
+        msg.contains("loopback only"),
+        "error names the loopback-only bind: {msg}"
     );
-    assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
-
-    // Tunnel disabled (default): tcAddress is ABSENT, not null, and the
-    // exact-URI assertion above already proves there is no tc= param.
-    assert!(result.get("tcAddress").is_none());
+    assert!(
+        msg.contains("server.bindAddress") && msg.contains("server.tunnel.enabled"),
+        "guidance names both remediations: {msg}"
+    );
+    assert!(
+        error["data"]["code"] != json!("listener-down"),
+        "must not be the listener-down error: {error}"
+    );
 
     daemon.child.kill().ok();
 }
@@ -404,18 +400,23 @@ async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
     let socket = data_dir.join("intentd.sock");
 
     // pairing.getInfo over UDS carries the tunnel address and appends it to
-    // the URI as the additive tc= param.
+    // the URI as the additive tc= param. The tunnel is the payload's one
+    // dialable route here (loopback-default bind, so the host list is empty
+    // — loopback is never advertised), and the structured QR payload fields
+    // are exactly the credential sources the daemon serves.
     let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
     let result = &response["result"];
     let tc = result["tcAddress"]
         .as_str()
         .unwrap_or_else(|| panic!("tcAddress present: {result}"));
     assert!(tc.starts_with("tc-"), "fake sidecar address: {tc}");
-    let uri = result["uri"].as_str().unwrap();
-    assert!(
-        uri.ends_with(&format!("&tc={tc}")),
-        "tc= is the additive last URI param: {uri}"
-    );
+    assert_eq!(result["token"].as_str().unwrap(), TOKEN);
+    assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
+    assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
+    assert_eq!(result["version"].as_u64().unwrap(), 1);
+    assert_eq!(result["hosts"], json!([]));
+    let expected_uri = format!("intent://pair?v=1&host=&port={port}&fp={fp}&token={TOKEN}&tc={tc}");
+    assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
 
     // server.pairingInfo over UDS carries the same field.
     let response = uds_rpc(&socket, 3, "server.pairingInfo", json!({})).await;

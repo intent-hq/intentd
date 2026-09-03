@@ -1126,10 +1126,11 @@ async fn runtime_toggled_wss_serves_system_status() {
 /// Runtime `server.bindAddress` hook (monorepo#2900): changing the bind
 /// address while the WSS listener is running restarts it on the new address.
 /// Observable end to end: the listener stays connectable on the fixed port
-/// across both restarts, and both `pairing.getInfo` hosts and
-/// `system.status` localIps advertise the bind-aware set (exactly the
-/// specific address for a loopback bind; the non-loopback enumeration for
-/// 0.0.0.0 — which never contains 127.0.0.1).
+/// across both restarts, `system.status` localIps advertises the bind-aware
+/// set (exactly the specific address for a loopback bind; the non-loopback
+/// enumeration for 0.0.0.0 — which never contains 127.0.0.1), and
+/// `pairing.getInfo` errors for the loopback-only bind (no dialable route
+/// without a tunnel) while serving loopback-free hosts for 0.0.0.0.
 #[tokio::test]
 async fn runtime_bind_address_change_restarts_listener() {
     let data_dir = temp_data_dir();
@@ -1158,16 +1159,17 @@ async fn runtime_bind_address_change_restarts_listener() {
         .to_string();
     let cfg = client_config(&fingerprint);
 
-    // Default loopback bind: pairing advertises NO hosts (loopback is never
-    // dialable from another device, so it is filtered even when bound),
-    // while system.status localIps — the diagnostic surface — reports
-    // exactly 127.0.0.1 (never the full interface enumeration for a
-    // loopback-only listener).
+    // Default loopback bind: loopback is never dialable from another device
+    // and no tunnel is active, so pairing errors with guidance instead of
+    // minting a route-less payload, while system.status localIps — the
+    // diagnostic surface — reports exactly 127.0.0.1 (never the full
+    // interface enumeration for a loopback-only listener).
     let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
-    assert_eq!(
-        info["result"]["hosts"],
-        json!([]),
-        "loopback bind advertises no pairing hosts: {info}"
+    assert!(
+        info["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("loopback only")),
+        "loopback bind without a tunnel errors on pairing.getInfo: {info}"
     );
     let status = uds_rpc(&socket, 102, "system.status", json!({})).await;
     assert_eq!(
@@ -1223,7 +1225,8 @@ async fn runtime_bind_address_change_restarts_listener() {
     );
 
     // Narrow back to loopback: hook restarts again, listener survives, and
-    // the advertisement returns to exactly 127.0.0.1.
+    // the loopback-only posture returns — pairing errors again and the
+    // diagnostic surface reports exactly 127.0.0.1.
     let narrow = uds_rpc(
         &socket,
         5,
@@ -1248,10 +1251,11 @@ async fn runtime_bind_address_change_restarts_listener() {
         "events.subscribe after narrowing back to loopback should work: {sub2}"
     );
     let info = uds_rpc(&socket, 6, "pairing.getInfo", json!({})).await;
-    assert_eq!(
-        info["result"]["hosts"],
-        json!([]),
-        "loopback bind advertises no pairing hosts again: {info}"
+    assert!(
+        info["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("loopback only")),
+        "narrowed bind errors on pairing.getInfo again: {info}"
     );
     let status = uds_rpc(&socket, 106, "system.status", json!({})).await;
     assert_eq!(
@@ -1290,7 +1294,7 @@ async fn runtime_bind_address_change_restarts_listener() {
 
 /// Runtime `server.bindAddress` list form (monorepo#3314): a list of IPs is
 /// accepted end to end over the settings surface — the restart hook applies
-/// it, the listener stays connectable, and `pairing.getInfo` advertises
+/// it, the listener stays connectable, and `system.status` localIps reports
 /// exactly the configured set. Invalid sets (duplicates, unspecified mixed
 /// with specific) are rejected at write time with the running listener
 /// untouched.
@@ -1368,13 +1372,15 @@ async fn runtime_bind_address_list_applies_and_validates() {
     );
 
     // Pairing filters loopback out of the configured set — both entries here
-    // are loopback-family, so it advertises nothing — while system.status
-    // localIps (diagnostic surface) reports exactly the configured set.
+    // are loopback-family and no tunnel is active, so pairing errors with
+    // guidance — while system.status localIps (diagnostic surface) reports
+    // exactly the configured set.
     let info = uds_rpc(&socket, 4, "pairing.getInfo", json!({})).await;
-    assert_eq!(
-        info["result"]["hosts"],
-        json!([]),
-        "loopback-family list bind advertises no pairing hosts: {info}"
+    assert!(
+        info["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("loopback only")),
+        "loopback-family list bind errors on pairing.getInfo: {info}"
     );
     let status = uds_rpc(&socket, 104, "system.status", json!({})).await;
     assert_eq!(
@@ -1423,7 +1429,8 @@ async fn runtime_bind_address_list_applies_and_validates() {
 /// interface enumeration, whose routes are all dead in this posture (direct
 /// LAN connects are refused) — and `pairing.getInfo` advertises no hosts at
 /// all (loopback is never dialable from another device; the tunnel address
-/// carries the reachable route).
+/// carries the reachable route, so the fake sidecar's tc address is what
+/// makes pairing succeed here).
 #[tokio::test]
 async fn tunnel_only_advertises_loopback_only() {
     let data_dir = temp_data_dir();
@@ -1432,10 +1439,15 @@ async fn tunnel_only_advertises_loopback_only() {
     // configure_serve appends [server.wsApi] after these tables.
     std::fs::write(
         data_dir.join("config.toml"),
-        "[server]\nbindAddress = \"0.0.0.0\"\n\n[server.tunnel]\nonly = true\n",
+        "[server]\nbindAddress = \"0.0.0.0\"\n\n[server.tunnel]\nenabled = true\nonly = true\n",
     )
     .expect("seed config.toml");
-    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let tailcat = write_fake_tailcat(&data_dir);
+    let tailcat_s = tailcat.to_string_lossy().to_string();
+    let env: [(&str, &str); 2] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TAILCAT_BIN", &tailcat_s),
+    ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -1452,11 +1464,27 @@ async fn tunnel_only_advertises_loopback_only() {
         "tunnel-only: system.status localIps is exactly loopback despite the \
          wide bindAddress: {status}"
     );
-    let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    // The sidecar registers its address asynchronously after boot; until it
+    // does, pairing correctly errors (no dialable route). Poll bounded by the
+    // startup budget for the success shape: no hosts, tc route present.
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    let info = loop {
+        let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+        if info.get("error").is_none() || std::time::Instant::now() >= deadline {
+            break info;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(
         info["result"]["hosts"],
         json!([]),
         "tunnel-only: pairing advertises no hosts (loopback filtered): {info}"
+    );
+    assert!(
+        info["result"]["tcAddress"]
+            .as_str()
+            .is_some_and(|tc| tc.starts_with("tc-")),
+        "tunnel-only: the tc address carries the dialable route: {info}"
     );
 }
 
