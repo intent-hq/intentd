@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.10] - 2026-09-03
+
+### 🐛 Bug Fixes
+
+- Honor explicit Claude CLI authentication status ([#1666](https://github.com/intent-hq/intentd/pull/1666))
+
+
 ## [0.9.9] - 2026-09-03
 
 ### 🚀 Features
