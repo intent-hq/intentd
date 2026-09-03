@@ -6039,20 +6039,35 @@ mod tests {
         assert_eq!(std::fs::read(&link).unwrap(), b"secret");
     }
 
-    /// A stand-in "sitter": `sleep` symlinked as `name` (the process name
-    /// follows the executed path's basename) — `intentd-sitter` for the dev
-    /// build, `intentd` for the packaged rename. SIGUSR1's default
-    /// disposition is terminate, so the child exiting on signal 10/30
-    /// proves delivery.
+    /// A stand-in "sitter": `sleep` COPIED as `name` — the kernel-visible
+    /// process name comes from the executed image itself, so a copy carries
+    /// the name on every platform, whereas a symlink resolves to the
+    /// target's name on macOS (intent-hq/monorepo#4220) — `intentd-sitter`
+    /// for the dev build, `intentd` for the packaged rename. SIGUSR1's
+    /// default disposition is terminate, so the child exiting on signal
+    /// 10/30 proves delivery.
     #[cfg(unix)]
     fn spawn_stand_in_sitter(dir: &Path, name: &str) -> std::process::Child {
         let sleep = ["/bin/sleep", "/usr/bin/sleep"]
             .iter()
             .find(|p| Path::new(p).exists())
             .expect("sleep binary");
-        let link = dir.join(name);
-        std::os::unix::fs::symlink(sleep, &link).unwrap();
-        std::process::Command::new(&link).arg("30").spawn().unwrap()
+        let bin = dir.join(name);
+        std::fs::copy(sleep, &bin).unwrap();
+        // Bounded ETXTBSY retry: a concurrently forked test child can
+        // transiently inherit the copy's write fd (closed only at that
+        // child's own exec), making exec of the fresh copy fail with
+        // "Text file busy".
+        for _ in 0..400 {
+            match std::process::Command::new(&bin).arg("30").spawn() {
+                Ok(child) => return child,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("spawn stand-in sitter: {e}"),
+            }
+        }
+        panic!("stand-in sitter spawn kept failing with ETXTBSY");
     }
 
     #[cfg(unix)]
