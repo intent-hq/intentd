@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.10] - 2026-09-03
+
+### 🐛 Bug Fixes
+
+- Complete pending merges with both parents in commit helper ([#1678](https://github.com/intent-hq/intentd/pull/1678))
+- Honor explicit Claude CLI authentication status ([#1666](https://github.com/intent-hq/intentd/pull/1666))
+
+### 🧪 Testing
+
+- Fix full-suite gate timeouts and identity hermeticity ([#1681](https://github.com/intent-hq/intentd/pull/1681))
+
+
 ## [0.9.9] - 2026-09-03
 
 ### 🚀 Features

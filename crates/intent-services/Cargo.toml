@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.9.9"
+version = "0.9.10"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,19 +8,19 @@ license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.9" }
-intent-store = { path = "../intent-store", version = "0.9.9" }
-intent-git = { path = "../intent-git", version = "0.9.9" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.9" }
-intent-linear = { path = "../intent-linear", version = "0.9.9" }
-intent-sentry = { path = "../intent-sentry", version = "0.9.9" }
+intent-core = { path = "../intent-core", version = "0.9.10" }
+intent-store = { path = "../intent-store", version = "0.9.10" }
+intent-git = { path = "../intent-git", version = "0.9.10" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.10" }
+intent-linear = { path = "../intent-linear", version = "0.9.10" }
+intent-sentry = { path = "../intent-sentry", version = "0.9.10" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.9.9" }
-intent-js = { path = "../intent-js", version = "0.9.9" }
-intent-context = { path = "../intent-context", version = "0.9.9" }
-intent-providers = { path = "../intent-providers", version = "0.9.9" }
-intent-pty = { path = "../intent-pty", version = "0.9.9" }
-intent-search = { path = "../intent-search", version = "0.9.9" }
+intent-acp = { path = "../intent-acp", version = "0.9.10" }
+intent-js = { path = "../intent-js", version = "0.9.10" }
+intent-context = { path = "../intent-context", version = "0.9.10" }
+intent-providers = { path = "../intent-providers", version = "0.9.10" }
+intent-pty = { path = "../intent-pty", version = "0.9.10" }
+intent-search = { path = "../intent-search", version = "0.9.10" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
