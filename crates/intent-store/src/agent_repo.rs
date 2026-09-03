@@ -1026,6 +1026,42 @@ impl Store {
         rows.iter().map(map_session_summary_row).collect()
     }
 
+    /// Message-free session summaries for all requested workspaces in one
+    /// statement, grouped by workspace while preserving per-workspace creation
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the batch query or row projection fails.
+    pub async fn list_agent_session_summaries_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<std::collections::HashMap<WorkspaceId, Vec<AgentSession>>> {
+        if workspace_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+             WHERE workspace_id IN ({placeholders}) ORDER BY workspace_id, created_at"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            Error::Internal(format!("batch list agent session summaries failed: {e}"))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in &rows {
+            let session = map_session_summary_row(row)?;
+            out.entry(session.workspace_id.clone())
+                .or_insert_with(Vec::new)
+                .push(session);
+        }
+        Ok(out)
+    }
+
     /// [`Store::list_agent_session_summaries`] restricted to ACTIVE (not
     /// soft-retired) sessions — the default `agent.list` read. The filter
     /// runs in SQL (`retired_at IS NULL`), keeping the handler cost
@@ -1344,6 +1380,91 @@ impl Store {
             .map_err(|e| Error::Internal(format!("batch workspace unread probe failed: {e}")))?;
         rows.iter()
             .map(|r| col::<String>(r, "workspace_id"))
+            .collect()
+    }
+
+    /// The requested workspace ids that currently have an unread top-level
+    /// session. This scoped batch form keeps list-shaped callers from scanning
+    /// unrelated workspaces while retaining one statement for the full batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the batch query or row projection fails.
+    pub async fn workspaces_with_unread_top_level_sessions_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<std::collections::HashSet<WorkspaceId>> {
+        if workspace_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT workspace_id \
+             FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
+             WHERE workspace_id IN ({placeholders}) AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            Error::Internal(format!("scoped batch workspace unread probe failed: {e}"))
+        })?;
+        rows.iter()
+            .map(|row| Ok(WorkspaceId(col(row, "workspace_id")?)))
+            .collect()
+    }
+
+    /// Legacy top-level sessions whose pending-question marker was never
+    /// written, paired with their newest non-system message. List enrichment
+    /// uses this one-statement projection to preserve the pre-upgrade question
+    /// hold fallback without issuing a tail query per session.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the query or JSON projection fails.
+    pub async fn list_legacy_question_tail_candidates_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<Vec<(AgentId, String, String, serde_json::Value)>> {
+        if workspace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT s.id AS agent_id, m.id AS message_id, m.role, m.content \
+             FROM agent_session s \
+             JOIN agent_message m ON m.id = (\
+                 SELECT tail.id FROM agent_message tail \
+                 WHERE tail.agent_id = s.id AND tail.role != 'system' \
+                 ORDER BY tail.seq DESC LIMIT 1\
+             ) \
+             WHERE s.workspace_id IN ({placeholders}) \
+               AND s.parent_agent_id IS NULL AND s.is_background = 0 \
+               AND s.status != 'deleted' \
+               AND json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("batch legacy question tail read failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                let raw: String = col(row, "content")?;
+                let content = serde_json::from_str(&raw).map_err(|e| {
+                    Error::Internal(format!("decode legacy question tail content failed: {e}"))
+                })?;
+                Ok((
+                    AgentId(col(row, "agent_id")?),
+                    col(row, "message_id")?,
+                    col(row, "role")?,
+                    content,
+                ))
+            })
             .collect()
     }
 

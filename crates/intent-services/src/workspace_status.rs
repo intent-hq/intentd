@@ -16,13 +16,13 @@
 //! cache internals are private to this module, so nothing outside it can
 //! emit `workspace:displayStatus-changed` or touch the baseline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use intent_core::events::{WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_WAITING_CHANGED};
 use intent_core::{
-    now_iso, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
+    now_iso, AgentId, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
 };
 use intent_store::NewEvent;
 
@@ -185,6 +185,20 @@ impl Services {
         sessions: Option<&[intent_core::AgentSession]>,
         unread: Option<bool>,
     ) {
+        self.enrich_display_status_with_snapshot(ws, sessions, unread, None)
+            .await;
+    }
+
+    /// List-shaped variant of [`Self::enrich_display_status`]. All store-backed
+    /// signals are supplied by one bulk snapshot, so this method performs only
+    /// in-memory enrichment and cache seeding for each row.
+    pub(crate) async fn enrich_display_status_with_snapshot(
+        &self,
+        ws: &mut Workspace,
+        sessions: Option<&[intent_core::AgentSession]>,
+        unread: Option<bool>,
+        snapshot: Option<WorkspaceStatusSnapshot<'_>>,
+    ) {
         // Served `attention` is DERIVED on this same emit path (§5.1):
         // `unread` = any top-level (non-background, non-deleted) session
         // whose newest user/assistant message is an unseen assistant message
@@ -235,7 +249,10 @@ impl Services {
             // eviction racing the probe must not have this seed
             // resurrect the baseline.
             let waiting_generation = self.last_waiting_statuses.generation();
-            let waiting = self.workspace_is_waiting(&ws.id).await;
+            let waiting = match snapshot {
+                Some(snapshot) => snapshot.waiting,
+                None => self.workspace_is_waiting(&ws.id).await,
+            };
             self.last_waiting_statuses
                 .seed(&ws.id, waiting, waiting_generation);
             waiting
@@ -254,13 +271,21 @@ impl Services {
         // agent-monitored PRs DO feed the PR rungs: an active monitor on an
         // open PR (including cross-repo) reads as an open-PR signal.
         let display_status = compute_display_status(
-            self.workspace_attention_signals(&ws.id, ws.attention, sessions)
-                .await,
+            self.workspace_attention_signals_with_legacy_holds(
+                &ws.id,
+                ws.attention,
+                sessions,
+                snapshot.map(|snapshot| snapshot.legacy_question_holds),
+            )
+            .await,
             ws.activity == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
-            self.workspace_monitor_pr_signals(&ws.id).await,
+            match snapshot {
+                Some(snapshot) => snapshot.monitor_pr_signals,
+                None => self.workspace_monitor_pr_signals(&ws.id).await,
+            },
             ws.task_stats.as_ref(),
         );
         self.last_display_statuses
@@ -464,6 +489,17 @@ impl Services {
         attention: WorkspaceAttention,
         sessions: Option<&[intent_core::AgentSession]>,
     ) -> AttentionSignals {
+        self.workspace_attention_signals_with_legacy_holds(workspace_id, attention, sessions, None)
+            .await
+    }
+
+    async fn workspace_attention_signals_with_legacy_holds(
+        &self,
+        workspace_id: &WorkspaceId,
+        attention: WorkspaceAttention,
+        sessions: Option<&[intent_core::AgentSession]>,
+        legacy_question_holds: Option<&HashSet<AgentId>>,
+    ) -> AttentionSignals {
         let mut signals = AttentionSignals {
             needs_attention: attention == WorkspaceAttention::ReviewRequired,
             ..AttentionSignals::default()
@@ -519,6 +555,8 @@ impl Services {
                         Some(pending) => session.dismissed_questions_message_id() != Some(pending),
                         None => false,
                     }
+                } else if let Some(holds) = legacy_question_holds {
+                    holds.contains(&session.id)
                 } else {
                     self.questions_pending(&session.id).await
                 };
@@ -530,6 +568,14 @@ impl Services {
         }
         signals
     }
+}
+
+/// Store-backed status inputs already fetched for a complete list snapshot.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkspaceStatusSnapshot<'a> {
+    pub(crate) waiting: bool,
+    pub(crate) monitor_pr_signals: MonitorPrSignals,
+    pub(crate) legacy_question_holds: &'a HashSet<AgentId>,
 }
 
 /// Attention-axis inputs to [`compute_display_status`], probed by

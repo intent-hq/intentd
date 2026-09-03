@@ -32,10 +32,6 @@ use std::time::{Duration, Instant};
 /// and backfills the cache for the next poll.
 const AGGREGATE_BUDGET: Duration = Duration::from_millis(900);
 
-/// Cap on concurrent per-workspace enrichment tasks in `workspace.list`, so a
-/// large workspace count doesn't burst-issue unbounded concurrent store reads.
-pub(crate) const MAX_CONCURRENT_ENRICHMENTS: usize = 8;
-
 /// Shared cache + offload gates for the git-derived card aggregates. Held as
 /// an `Arc` field on `Services` so every clone (and thus every concurrent
 /// list/get call) observes the same cache and single-flight state.
@@ -88,6 +84,24 @@ impl WorkspaceAggregateCache {
             cow_probe_gate: tokio::sync::Mutex::new(()),
             budget: AGGREGATE_BUDGET,
         }
+    }
+
+    /// Cache-only read used by every RPC path. A miss omits immediately; only
+    /// [`Self::prewarm_cow_supported`] is allowed to start a live probe.
+    pub(crate) fn cached_cow_supported(&self, workspaces_root: &PathBuf) -> Option<bool> {
+        self.cow.lock().unwrap().get(workspaces_root).copied()
+    }
+
+    /// Start a best-effort detached probe for a cache miss. Single-flight and
+    /// the serialized probe gate remain enforced by [`Self::cow_supported`].
+    pub(crate) fn prewarm_cow_supported(self: &Arc<Self>, workspaces_root: PathBuf) {
+        if self.cached_cow_supported(&workspaces_root).is_some() {
+            return;
+        }
+        let cache = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = cache.cow_supported(workspaces_root).await;
+        });
     }
 
     /// Compute (or serve from cache) the `cowSupported` aggregate for a

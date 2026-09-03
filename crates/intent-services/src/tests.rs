@@ -921,11 +921,20 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
         .await
         .unwrap();
 
+    let bulk = store
+        .count_task_stats_by_workspace(&[ws1.clone(), ws2.clone(), ws3.clone()])
+        .await
+        .expect("bulk task stats");
     for ws in [&ws1, &ws2, &ws3] {
         let notes = store.list_notes(ws).await.expect("list notes");
         let enriched = crate::compute_task_stats(&notes);
         let cheap = store.count_task_stats(ws).await.expect("cheap stats");
         assert_eq!(cheap, enriched, "parity failed for workspace {ws:?}");
+        assert_eq!(
+            bulk.get(ws),
+            Some(&cheap),
+            "bulk parity failed for workspace {ws:?}"
+        );
     }
 
     // Spot-check the expected counts and the services-side helper.
@@ -941,7 +950,8 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
 /// The lite list path (workspace.subscribe seq-0 snapshot) is self-sufficient
 /// for client status rendering: rows carry `taskStats` (cheap counting query),
 /// `displayStatus` (same derivation as the enriched path — a subsequent
-/// enriched `workspace.get` must agree for the same data), and `cowSupported`,
+/// enriched `workspace.get` must agree for the same data), and a prewarmed
+/// `cowSupported`,
 /// while continuing to omit `agentSummary`/`diffSummary`. The lite read also
 /// seeds the `last_display_statuses` baseline (a seed never emits).
 #[tokio::test]
@@ -973,7 +983,36 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
         store.insert_note(&tn).await.expect("task note");
     }
 
-    let list = svc.list_workspaces_lite(true).await.expect("lite list");
+    // A cold read is cache-only: it omits immediately instead of probing the
+    // filesystem from the RPC path.
+    let cold = svc
+        .list_workspaces_lite(true)
+        .await
+        .expect("cold lite list");
+    assert!(
+        cold.iter()
+            .find(|row| row.id == ws)
+            .unwrap()
+            .cow_supported
+            .is_none(),
+        "cold CoW cache miss stays absent"
+    );
+    svc.prewarm_cow_supported();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if svc.compute_cow_supported().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("CoW prewarm completes");
+
+    let list = svc
+        .list_workspaces_lite(true)
+        .await
+        .expect("warm lite list");
     let row = list.iter().find(|w| w.id == ws).expect("row in lite list");
     let stats = row.task_stats.as_ref().expect("taskStats populated");
     assert_eq!((stats.total, stats.completed, stats.in_progress), (3, 1, 1));
@@ -24644,7 +24683,7 @@ mod worktree_provisioning {
                 prior: std::env::var_os("INTENTD_WORKSPACES_DIR"),
             };
             std::env::set_var("INTENTD_WORKSPACES_DIR", &root.0);
-            svc.compute_cow_supported().await
+            svc.compute_cow_supported()
         };
         assert!(
             result.is_some(),
@@ -24672,7 +24711,7 @@ mod worktree_provisioning {
         );
         assert_eq!(
             obj.get("cowSupported").and_then(serde_json::Value::as_bool),
-            svc.compute_cow_supported().await,
+            svc.compute_cow_supported(),
             "capability mirrors the shared workspaces-root probe"
         );
     }

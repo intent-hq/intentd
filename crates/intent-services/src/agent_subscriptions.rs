@@ -660,7 +660,36 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> bool {
-        let parents: Vec<AgentId> = {
+        let parents = self.waiting_subscription_parent_ids(workspace_id);
+        if parents.is_empty() {
+            return false;
+        }
+        match self.store.list_agent_session_summaries(workspace_id).await {
+            Ok(sessions) => Self::sessions_include_waiting_parent(&sessions, &parents),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "waiting-subscriptions displayStatus lookup failed; reads as none"
+                );
+                false
+            }
+        }
+    }
+
+    /// In-memory half of the waiting-subscription derivation, shared by the
+    /// single-workspace probe and batched list enrichment.
+    pub(crate) fn workspace_has_waiting_agent_subscriptions_in_sessions(
+        &self,
+        workspace_id: &WorkspaceId,
+        sessions: &[intent_core::AgentSession],
+    ) -> bool {
+        let parents = self.waiting_subscription_parent_ids(workspace_id);
+        Self::sessions_include_waiting_parent(sessions, &parents)
+    }
+
+    fn waiting_subscription_parent_ids(&self, workspace_id: &WorkspaceId) -> Vec<AgentId> {
+        {
             let guard = self
                 .agent_subscriptions
                 .lock()
@@ -671,26 +700,20 @@ impl Services {
                 .filter(|s| &s.parent_workspace_id == workspace_id && !s.report_delivered)
                 .map(|s| s.parent_agent_id.clone())
                 .collect()
-        };
-        if parents.is_empty() {
-            return false;
         }
-        match self.store.list_agent_session_summaries(workspace_id).await {
-            Ok(sessions) => sessions.iter().any(|s| {
+    }
+
+    fn sessions_include_waiting_parent(
+        sessions: &[intent_core::AgentSession],
+        parents: &[AgentId],
+    ) -> bool {
+        !parents.is_empty()
+            && sessions.iter().any(|s| {
                 s.parent_agent_id.is_none()
                     && !s.is_background
                     && s.status != intent_core::AgentStatus::Deleted
                     && parents.contains(&s.id)
-            }),
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    error = %e,
-                    "waiting-subscriptions displayStatus lookup failed; reads as none"
-                );
-                false
-            }
-        }
+            })
     }
 
     /// Remove a single watch by subscription id; returns whether one was found.

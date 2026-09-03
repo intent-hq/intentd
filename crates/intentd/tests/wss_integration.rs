@@ -1966,7 +1966,10 @@ async fn wss_agent_list_caps_previews_get_serves_full() {
 async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     use std::collections::BTreeMap;
 
-    use intent_core::{AgentId, AgentSession, AgentStatus, TokenUsage, TokenUsageTotals};
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, Hook, HookId, HookState, PrMonitor, PrMonitorId,
+        PrMonitorState, TokenUsage, TokenUsageTotals,
+    };
 
     let srv = start(WsOptions::default()).await;
 
@@ -1998,6 +2001,8 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     };
     let ws_active = WorkspaceId::new();
     let mut active = fixture_workspace(&ws_active);
+    active.created_at = "2026-01-01T00:00:00Z".to_string();
+    active.updated_at = active.created_at.clone();
     active.token_usage = Some(usage.clone());
     srv.store
         .insert_workspace(&active)
@@ -2005,6 +2010,8 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         .expect("insert active workspace");
     let ws_archived = WorkspaceId::new();
     let mut archived = fixture_workspace(&ws_archived);
+    archived.created_at = "2026-01-02T00:00:00Z".to_string();
+    archived.updated_at = archived.created_at.clone();
     archived.archived = true;
     archived.archived_at = Some(now_iso());
     archived.token_usage = Some(usage);
@@ -2059,8 +2066,12 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         pending_delete_at: None,
         retired_at: None,
     };
+    let mut active_session = mk_session("agent-slim-a", &ws_active);
+    active_session.metadata = Some(serde_json::json!({
+        "pendingQuestionsMessageId": "msg-pending"
+    }));
     srv.store
-        .insert_agent_session(&mk_session("agent-slim-a", &ws_active))
+        .insert_agent_session(&active_session)
         .await
         .expect("insert active-workspace session");
     srv.store
@@ -2073,6 +2084,72 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         .insert_agent_session(&background)
         .await
         .expect("insert background active-workspace session");
+    srv.store
+        .append_agent_message_with_id(
+            &active_session.id,
+            "msg-pending",
+            "assistant",
+            &serde_json::json!([
+                { "type": "text", "text": "I have a question." },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "intent-question://shape-test",
+                        "mimeType": "application/vnd.intent.question+json",
+                        "text": "{\"question\":\"?\"}"
+                    }
+                }
+            ]),
+            None,
+            "2026-01-03T00:00:00Z",
+        )
+        .await
+        .expect("append pending question message");
+    srv.store
+        .insert_hook(&Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws_active.clone(),
+            agent_id: active_session.id.clone(),
+            name: "shape hook".to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            cron: None,
+            run_at: None,
+            state: HookState::Scheduled,
+            created_at: "2026-01-03T00:00:00Z".to_string(),
+            last_run_at: None,
+            next_run_at: Some("2026-01-03T01:00:00Z".to_string()),
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some("2026-01-04T00:00:00Z".to_string()),
+            perpetual: false,
+            dispatch_count: 0,
+        })
+        .await
+        .expect("insert active hook");
+    srv.store
+        .insert_pr_monitor(&PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: ws_archived.clone(),
+            agent_id: AgentId("agent-slim-b".to_string()),
+            repo_owner: "acme".to_string(),
+            repo_name: "widgets".to_string(),
+            pr_number: 7,
+            state: PrMonitorState::Active,
+            last_snapshot: None,
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: "2026-01-03T00:00:00Z".to_string(),
+            updated_at: "2026-01-03T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("insert active PR monitor");
 
     // workspace.list (includeArchived): tokenUsage absent on every row;
     // agentSummary absent on the archived row, present on the active one.
@@ -2093,6 +2170,13 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         .iter()
         .find(|w| w["id"] == ws_archived.0.as_str())
         .expect("archived row");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![ws_active.0.as_str(), ws_archived.0.as_str()],
+        "workspace.list preserves store ordering"
+    );
     assert!(
         row_active.get("tokenUsage").is_none(),
         "list rows omit tokenUsage (monorepo#3041): {row_active}"
@@ -2135,6 +2219,31 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         );
     };
     assert_is_background_rows(row_active, "workspace.list");
+    assert_eq!(
+        row_active["attention"], "unread",
+        "batch unread signal: {row_active}"
+    );
+    assert_eq!(
+        row_active["displayStatus"], "needs_attention",
+        "pending-question marker survives bulk session enrichment: {row_active}"
+    );
+    assert_eq!(
+        row_active["waiting"], true,
+        "active hook signal: {row_active}"
+    );
+    assert_eq!(
+        row_archived["waiting"], true,
+        "active PR-monitor signal: {row_archived}"
+    );
+    assert_eq!(
+        row_active["tags"],
+        serde_json::json!([]),
+        "empty sets stay arrays"
+    );
+    assert!(
+        row_active.get("pullRequests").is_none(),
+        "optional empty field stays omitted"
+    );
 
     // workspace.get keeps both fields for detail reads — archived included.
     for ws_id in [&ws_active, &ws_archived] {
@@ -2198,6 +2307,14 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert_eq!(snap["params"]["kind"], "snapshot", "{snap}");
     assert_eq!(snap["params"]["seq"], 0, "{snap}");
     let snap_rows = snap["params"]["snapshot"].as_array().expect("snapshot");
+    assert_eq!(
+        snap_rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![ws_active.0.as_str(), ws_archived.0.as_str()],
+        "workspace.subscribe preserves store ordering"
+    );
     for ws_id in [&ws_active, &ws_archived] {
         let row = snap_rows
             .iter()
@@ -2207,7 +2324,21 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
             row.get("tokenUsage").is_none(),
             "seq-0 snapshot rows omit tokenUsage (monorepo#3041): {row}"
         );
+        assert_eq!(
+            row["waiting"], true,
+            "batched hook/PR waiting signal: {row}"
+        );
     }
+    let active_snap = snap_rows
+        .iter()
+        .find(|row| row["id"] == ws_active.0.as_str())
+        .unwrap();
+    assert_eq!(active_snap["attention"], "unread");
+    assert_eq!(active_snap["displayStatus"], "needs_attention");
+    assert!(
+        active_snap.get("agentSummary").is_none(),
+        "lite shape stays slim"
+    );
 
     srv.ws.stop().await;
 }

@@ -199,6 +199,37 @@ impl Store {
         Ok(n.cast_unsigned())
     }
 
+    /// Requested workspaces that own at least one active hook, in one
+    /// aggregate statement. No hook bodies are hydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the aggregate query fails.
+    pub async fn workspaces_with_active_hooks(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<std::collections::HashSet<WorkspaceId>> {
+        if workspace_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT workspace_id FROM hook WHERE workspace_id IN ({placeholders}) \
+             AND state IN ('scheduled', 'running')"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            intent_core::Error::Internal(format!("batch active workspace hooks failed: {e}"))
+        })?;
+        Ok(rows
+            .iter()
+            .map(|row| WorkspaceId(row.get::<String, _>("workspace_id")))
+            .collect())
+    }
+
     /// List all hooks owned by an agent, oldest first.
     ///
     /// # Errors

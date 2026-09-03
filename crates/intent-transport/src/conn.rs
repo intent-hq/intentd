@@ -18,6 +18,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::browser;
 use crate::client;
@@ -29,7 +30,9 @@ use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::panic_guard;
 use crate::reverse::ReverseChannel;
-use crate::router::{check_envelope, handle_message, EnvelopeCheck};
+use crate::router::{
+    check_envelope, handle_message, EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET,
+};
 use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
@@ -1442,6 +1445,24 @@ async fn forward_channel_subscription(
         let (snapshot, links) = subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
         spec_links = links;
         snapshot
+    } else if channel == Channel::Workspace {
+        // The workspace subscribe fast-path bypasses router::dispatch, but its
+        // seq-0 aggregate read has the same bounded-statement contract as
+        // workspace.list. Give that read the canonical profiling span so the
+        // runtime guardrail and real-daemon integration tests can attribute
+        // sqlx statements to `workspace.subscribe`.
+        let span = tracing::info_span!(
+            target: RPC_DISPATCH_SPAN_TARGET,
+            RPC_DISPATCH_SPAN_NAME,
+            method = "workspace.subscribe",
+            response_bytes = tracing::field::Empty,
+            encode_elapsed_ms = tracing::field::Empty,
+            oversized_replacement = tracing::field::Empty,
+            encode_failed = tracing::field::Empty,
+        );
+        subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
+            .instrument(span)
+            .await
     } else {
         subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
             .await
