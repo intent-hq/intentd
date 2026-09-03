@@ -733,11 +733,22 @@ async fn read_setting_string(api: &dyn WorkspaceApi, path: &str) -> Option<Strin
 }
 
 /// Read a single `u32`-valued setting; returns `None` for missing / null /
-/// non-integer / out-of-`u32`-range values, or when the lookup itself fails.
+/// non-whole / out-of-`u32`-range values, or when the lookup itself fails.
+/// `settings.get` reports `Number` settings as floats (`8192.0`), so the value
+/// is read via `as_f64` — `as_u64` would always be `None` on the wire shape.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
 async fn read_setting_u32(api: &dyn WorkspaceApi, path: &str) -> Option<u32> {
     let payload = api.settings_get(path.to_string()).await.ok()?;
-    let n = payload.get("value")?.as_u64()?;
-    u32::try_from(n).ok()
+    let n = payload.get("value")?.as_f64()?;
+    if n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= f64::from(u32::MAX) {
+        Some(n as u32)
+    } else {
+        None
+    }
 }
 
 /// Opens a URL/file on the daemon host's GUI. Injected so the local path is
