@@ -18558,15 +18558,16 @@ async fn failed_advisory_wake_retries_without_another_event() {
     assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 }
 
-/// intent-hq/intent#4254: the advisory never consumes the watch, so the
-/// period marker is a plain best-effort write AFTER the durable wake (no
-/// retirement transaction exists any more). A failed marker write leaves
-/// the watch armed and schedules NO retry; the next monitoring idle in the
-/// same period — a fresh event id, hence a fresh stable message id —
-/// re-sends at most ONE duplicate advisory, the accepted worst case, and
-/// its marker write then restores same-period silence.
+/// intent-hq/intent#4254 + PR #1686 review: the advisory never consumes the
+/// watch, so the period marker is a plain best-effort write AFTER the
+/// durable wake. A failed marker write leaves the watch armed and schedules
+/// NO retry — and a SUSTAINED write failure must not re-advise on every
+/// fresh idle (fresh event id, fresh stable message id): the process-local
+/// period set is marked before the persisted write, so further same-period
+/// idles stay silent for this process lifetime. The period boundary (turn
+/// start / settlement) clears the set and re-opens the advisory.
 #[tokio::test]
-async fn failed_marker_write_leaves_watch_armed_and_duplicates_at_most_once() {
+async fn sustained_marker_write_failure_advises_once_per_period() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -18614,12 +18615,37 @@ async fn failed_marker_write_leaves_watch_armed_and_duplicates_at_most_once() {
         "a failed marker write schedules no retry — the wake already delivered"
     );
 
-    // The next idle in the same period re-sends ONE duplicate advisory
-    // (fresh event id) and lands the marker; a third idle is then silent.
+    // The store keeps failing: further same-period idles (fresh event ids)
+    // are suppressed by the process-local period set, not re-advised.
+    for _ in 0..2 {
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &child,
+            json!({ "agentId": child.0 }),
+        ))
+        .await;
+    }
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "a sustained marker write failure still advises once per period"
+    );
+    assert!(
+        !svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "no persisted marker ever landed while the store was failing"
+    );
+
+    // Period boundary (the turn-start / settlement clear) re-opens the
+    // advisory; with the store healthy again the marker lands normally.
     sqlx::query("DROP TRIGGER fail_marker_write")
         .execute(svc.store().write_pool())
         .await
         .expect("remove marker failure trigger");
+    svc.clear_advisory_wake_periods_in_memory_for_child(&child);
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -18630,14 +18656,14 @@ async fn failed_marker_write_leaves_watch_armed_and_duplicates_at_most_once() {
     assert_eq!(
         parent_message_count(&svc, &parent).await,
         2,
-        "at most one duplicate advisory after a failed marker write"
+        "a new waiting period advises the still-armed watch again"
     );
     assert!(
         svc.store()
             .has_advisory_wake_delivery(&parent, &child)
             .await
             .expect("marker read"),
-        "the duplicate's marker write restores same-period silence"
+        "the healthy store records the new period's marker"
     );
     svc.handle_completion_event(&completion_event(
         &ws,
@@ -18655,6 +18681,80 @@ async fn failed_marker_write_leaves_watch_armed_and_duplicates_at_most_once() {
         svc.find_watches_for_child(&child).len(),
         1,
         "the watch stays armed throughout"
+    );
+}
+
+/// PR #1686 review: `completion_only` is not sticky. An explicit
+/// `agent.watch` (or any non-ask registration) adopting an existing ask-only
+/// watch upgrades it to a full watch — the explicit watcher expects the
+/// monitoring-idle advisory, so the adopted watch hears it (once per period,
+/// still armed) instead of inheriting the ask path's silent deferral.
+#[tokio::test]
+async fn ask_then_watch_adoption_receives_monitoring_idle_advisory() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    let ask_id = svc
+        .register_completion_watch_strict_durable(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+        )
+        .await
+        .expect("register ask-only watch");
+    let watch_id = svc
+        .register_agent_watch_durable(&ws, &ws, parent.clone(), "Parent".into(), child.clone())
+        .await
+        .expect("register explicit watch");
+    assert_eq!(ask_id, watch_id, "explicit watch adopts the ask-only watch");
+    let watches = svc.find_watches_for_child(&child);
+    assert_eq!(watches.len(), 1, "pair uniqueness: one watch");
+    assert!(
+        !watches[0].completion_only,
+        "adoption by a non-ask registration clears completion_only"
+    );
+    assert!(watches[0].wake_on_attention);
+    let persisted = svc
+        .store()
+        .list_completion_watches()
+        .await
+        .expect("list persisted watches");
+    let row = persisted
+        .iter()
+        .find(|p| p.id == watch_id)
+        .expect("adopted watch persisted");
+    assert!(
+        !row.completion_only,
+        "the cleared flag is restart-durable via the write-through upsert"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "the upgraded watch hears the monitoring-idle advisory"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "the advisory leaves the watch armed"
+    );
+    assert!(
+        svc.store()
+            .has_advisory_wake_delivery(&parent, &child)
+            .await
+            .expect("marker read"),
+        "the period marker is recorded for the upgraded watch"
     );
 }
 

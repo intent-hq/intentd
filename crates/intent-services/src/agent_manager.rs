@@ -4815,6 +4815,8 @@ impl AgentManager {
             // stalled monitoring-idle again parked its watchers in silence
             // indefinitely. Best-effort: a failed clear only suppresses one
             // future advisory, never a real wake — settlement still clears.
+            self.services
+                .clear_advisory_wake_periods_in_memory_for_child(agent_id);
             if let Err(e) = self
                 .services
                 .store

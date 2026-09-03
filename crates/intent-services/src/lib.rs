@@ -433,6 +433,18 @@ pub struct Services {
     /// any re-mark that does not re-qualify. In-memory only, like the
     /// parent set.
     advisory_pending_interim_skips: Arc<Mutex<HashSet<AgentId>>>,
+    /// Process-local mirror of the persisted `advisory_wake_delivery`
+    /// once-per-period markers: `(parent, child)` pairs whose monitoring-idle
+    /// advisory was delivered this waiting period (PR #1686 review). The
+    /// persisted marker is written best-effort AFTER the durable wake, so a
+    /// sustained store write failure would otherwise let every fresh idle
+    /// re-advise (fail-open, unbounded wakes); this set is consulted
+    /// alongside the marker and set BEFORE the write, bounding that failure
+    /// to at most one advisory per period per process lifetime. Cleared at
+    /// the same period boundaries as the marker (genuine settlement, turn
+    /// start). In-memory only: after a restart only the persisted marker
+    /// guards, so the accepted one-duplicate residual window remains.
+    advisory_wake_periods: Arc<Mutex<HashSet<(AgentId, AgentId)>>>,
     /// Message ids whose questions-dismissed notice has already been claimed
     /// per agent (`agent.dismissQuestions`, PROTOCOL §5.5). The persisted
     /// dismissal marker is single-slot (most recent id only), so this set is
@@ -998,6 +1010,7 @@ impl Services {
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
+            advisory_wake_periods: Arc::new(Mutex::new(HashSet::new())),
             stale_report_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             advisory_pending_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
@@ -4856,6 +4869,46 @@ impl Services {
             .remove(&(parent_id.clone(), child_id.clone()));
     }
 
+    /// Whether the process-local advisory period set already records a
+    /// delivered advisory for this pair (see [`Self::advisory_wake_periods`]).
+    fn advisory_wake_period_marked_in_memory(
+        &self,
+        parent_id: &AgentId,
+        child_id: &AgentId,
+    ) -> bool {
+        self.advisory_wake_periods
+            .lock()
+            .expect("advisory wake period registry poisoned")
+            .contains(&(parent_id.clone(), child_id.clone()))
+    }
+
+    /// Record a delivered advisory for this pair in the process-local period
+    /// set — called BEFORE the best-effort persisted marker write so a
+    /// failing store cannot re-open the period.
+    fn mark_advisory_wake_period_in_memory(&self, parent_id: &AgentId, child_id: &AgentId) {
+        self.advisory_wake_periods
+            .lock()
+            .expect("advisory wake period registry poisoned")
+            .insert((parent_id.clone(), child_id.clone()));
+    }
+
+    /// Period boundary for ONE pair (mirrors `clear_advisory_wake_delivery`).
+    fn clear_advisory_wake_period_in_memory(&self, parent_id: &AgentId, child_id: &AgentId) {
+        self.advisory_wake_periods
+            .lock()
+            .expect("advisory wake period registry poisoned")
+            .remove(&(parent_id.clone(), child_id.clone()));
+    }
+
+    /// Period boundary for EVERY parent advised about `child_id` (mirrors
+    /// `clear_advisory_wake_deliveries_for_child`).
+    pub(crate) fn clear_advisory_wake_periods_in_memory_for_child(&self, child_id: &AgentId) {
+        self.advisory_wake_periods
+            .lock()
+            .expect("advisory wake period registry poisoned")
+            .retain(|(_, child)| child != child_id);
+    }
+
     /// Record that an `agent:idle` for `child_id` was classified as interim
     /// (monorepo#1280) — recorded up front, whether or not any ungrouped
     /// watch matched (monorepo#1281), and whether the classification came
@@ -5837,6 +5890,7 @@ impl Services {
             // advisory for the pair (the turn-start clear in `AgentManager`
             // is the other period boundary). Best-effort: a failed clear
             // only suppresses one future advisory, never a real wake.
+            self.clear_advisory_wake_periods_in_memory_for_child(child_id);
             if let Err(e) = self
                 .store
                 .clear_advisory_wake_deliveries_for_child(child_id)
@@ -6196,6 +6250,7 @@ impl Services {
                 // once-per-period advisory marker so a FUTURE waiting period
                 // may advise again. Best-effort, like that clear.
                 if newly_recorded {
+                    self.clear_advisory_wake_period_in_memory(&watch.parent_agent_id, child_id);
                     if let Err(e) = self
                         .store
                         .clear_advisory_wake_delivery(&watch.parent_agent_id, child_id)
@@ -6569,6 +6624,7 @@ impl Services {
             // clear the once-per-period advisory marker: a FUTURE waiting
             // period may advise again. Best-effort: a failed clear only
             // suppresses one future advisory, never a real wake.
+            self.clear_advisory_wake_period_in_memory(&watch.parent_agent_id, child_id);
             if let Err(e) = self
                 .store
                 .clear_advisory_wake_delivery(&watch.parent_agent_id, child_id)
@@ -6668,11 +6724,14 @@ impl Services {
     /// `advisory-wake:{watch.id}` would be dedup-suppressed in every period
     /// after the first. Within one period a replay of the SAME event
     /// (delivery retry) still dedups on the identical id, and a fresh idle
-    /// is marker-suppressed before the id matters; the one residual window
-    /// is a crash or failure after the wake persists but before the
-    /// best-effort marker write, where the next idle's fresh event id
-    /// re-sends one duplicate advisory — accepted, matching the "at worst
-    /// one duplicate" contract. An ungrouped delivery FAILURE still sets
+    /// is marker-suppressed before the id matters — by the persisted marker
+    /// or by the process-local period set (`advisory_wake_periods`), which
+    /// is set before the best-effort marker write so a sustained store
+    /// failure cannot re-advise every idle; the one residual window is a
+    /// crash after the wake persists but before the marker write, where the
+    /// next idle's fresh event id re-sends one duplicate advisory —
+    /// accepted, matching the "at worst one duplicate" contract. An
+    /// ungrouped delivery FAILURE still sets
     /// `ungrouped_delivery_failed` AND schedules the per-child completion
     /// retry task (PR #1578 review) — the advisory is the one event meant
     /// to break the parent's unbounded silent wait (a PR monitor has no
@@ -6713,20 +6772,25 @@ impl Services {
         // distinct same-period idle events processed concurrently would both
         // pass the read and both deliver under different event ids — an
         // accepted low-risk duplicate; a change that parallelizes delivery
-        // must add a real mutex, the marker alone is not one.
+        // must add a real mutex, the marker alone is not one. The
+        // process-local period set is consulted first: it is set before the
+        // persisted marker write, so a sustained store write failure still
+        // degrades to one advisory per period for this process lifetime.
         let already_advised = self
-            .store
-            .has_advisory_wake_delivery(&watch.parent_agent_id, child_id)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    child = %child_id.0,
-                    parent = %watch.parent_agent_id.0,
-                    error = %e,
-                    "advisory-wake marker read failed; deferring silently"
-                );
-                true
-            });
+            .advisory_wake_period_marked_in_memory(&watch.parent_agent_id, child_id)
+            || self
+                .store
+                .has_advisory_wake_delivery(&watch.parent_agent_id, child_id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        error = %e,
+                        "advisory-wake marker read failed; deferring silently"
+                    );
+                    true
+                });
         if already_advised {
             tracing::debug!(
                 child = %child_id.0,
@@ -6789,10 +6853,13 @@ impl Services {
         }
         // The watch stays armed — advisories never consume watches
         // (intent-hq/intent#4254); genuine settlement owns retirement.
-        // Only the shared period marker is recorded; a failure here means
-        // the next idle in this period replays the send under a fresh
-        // event id (see the per-period discriminator above), so the parent
-        // may hear one duplicate advisory — accepted worst case.
+        // Only the shared period marker is recorded: the process-local set
+        // first (so a failing store cannot re-open the period while this
+        // process lives), then the persisted marker. A persisted write
+        // failure therefore only matters across a restart, where the next
+        // idle's fresh event id (see the per-period discriminator above)
+        // replays the send once — the accepted one-duplicate worst case.
+        self.mark_advisory_wake_period_in_memory(&watch.parent_agent_id, child_id);
         if let Err(e) = self
             .store
             .record_advisory_wake_delivery(&watch.parent_agent_id, child_id, &now_iso())
