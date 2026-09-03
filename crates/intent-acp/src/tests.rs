@@ -7592,6 +7592,31 @@ mod wsapi3_bindings_tests {
     }
 
     #[tokio::test]
+    async fn note_read_numbered_content_is_what_the_write_guard_rejects() {
+        // Keeps the binding's `{:>4} | ` rendering and the service-side
+        // write guard in lock-step (monorepo#4208): the `content` field of a
+        // real `note.read` — plain and task-note shapes — must be recognised
+        // as the numbered presentation, while `rawContent` must not, so the
+        // documented remediation (write `rawContent` back) keeps working.
+        let (srv, _api) = server();
+        for id in ["n-1", "task-1"] {
+            let resp = call(&srv, &format!("return await ws.note.read('{id}');")).await;
+            assert_eq!(resp["result"]["isError"], json!(false));
+            let v = body(&resp);
+            let content = v["content"].as_str().unwrap();
+            let raw = v["rawContent"].as_str().unwrap();
+            assert!(
+                intent_services::note_ops::is_numbered_read_presentation(content),
+                "{id}: read content must be detected as numbered: {content}"
+            );
+            assert!(
+                !intent_services::note_ops::is_numbered_read_presentation(raw),
+                "{id}: rawContent must pass the guard: {raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn note_read_missing_id_surfaces_js_error() {
         let (srv, _api) = server();
         let resp = call(&srv, "return await ws.note.read();").await;

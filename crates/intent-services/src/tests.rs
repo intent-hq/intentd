@@ -4190,6 +4190,202 @@ async fn set_note_content_with_task_block_auto_converts() {
     assert_eq!(r.updated_at, persisted.updated_at);
 }
 
+/// The Markdown a spec typically carries: headings, a blank line, a task
+/// checkbox with an `intent://` link, and inline code (monorepo#4208).
+const SPEC_MARKDOWN: &str =
+    "# Spec\n\n## Goal\n\n- [ ] [Do it](intent://local/task/abc-123)\n- [x] use `ws.note.add`";
+
+/// Render `content` the way the agent-facing `note.read` binding does
+/// (`{:>4} | {line}` per line, blank lines included).
+fn numbered_read_presentation(content: &str) -> String {
+    content
+        .split('\n')
+        .enumerate()
+        .map(|(idx, line)| format!("{:>4} | {line}", idx + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn set_note_content_rejects_numbered_read_presentation() {
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let numbered = numbered_read_presentation(SPEC_MARKDOWN);
+    let err = svc
+        .set_note_content(ws.clone(), id.clone(), numbered, true, None, None)
+        .await
+        .expect_err("numbered read presentation must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rawContent"),
+        "remediation must name rawContent: {msg}"
+    );
+    assert!(
+        msg.contains("note.read"),
+        "remediation must name note.read: {msg}"
+    );
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, SPEC_MARKDOWN, "spec must be preserved");
+}
+
+#[tokio::test]
+async fn set_note_content_rejects_numbered_task_note_read_presentation() {
+    // A task note's `note.read` content carries a metadata trailer after the
+    // numbered body; writing that shape back must be rejected too.
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let numbered = format!(
+        "{}\n\n--- Task Metadata ---\nStatus: in_progress\nEstimated Effort: 45m",
+        numbered_read_presentation(SPEC_MARKDOWN)
+    );
+    svc.set_note_content(ws.clone(), id.clone(), numbered, true, None, None)
+        .await
+        .expect_err("numbered task-note read presentation must be rejected");
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, SPEC_MARKDOWN);
+}
+
+#[tokio::test]
+async fn set_note_content_raw_round_trip_preserves_markdown() {
+    // The documented remediation — writing `rawContent` back — must remain a
+    // no-op round trip, and legitimate numbered text inside a fence must pass.
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            SPEC_MARKDOWN.into(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("raw round trip");
+    assert_eq!(r.new_content, SPEC_MARKDOWN);
+
+    let fenced = format!("{SPEC_MARKDOWN}\n\n```text\n   1 | listing\n   2 | example\n```");
+    let r = svc
+        .set_note_content(ws.clone(), id.clone(), fenced.clone(), true, None, None)
+        .await
+        .expect("fenced numbered listing is legitimate content");
+    assert_eq!(r.new_content, fenced);
+
+    // An indented (4-space) code block is one column wider than the read's
+    // `{:>4}` field and must not trip the guard.
+    let indented = "    1 | listing\n    2 | example";
+    let r = svc
+        .set_note_content(ws, id, indented.into(), true, None, None)
+        .await
+        .expect("indented code block is legitimate content");
+    assert_eq!(r.new_content, indented);
+}
+
+#[tokio::test]
+async fn content_edit_ops_reject_numbered_read_presentation() {
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let numbered = numbered_read_presentation(SPEC_MARKDOWN);
+
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: numbered.clone(),
+            heading: None,
+            position: None,
+        },
+        None,
+    )
+    .await
+    .expect_err("note.add must reject the numbered read presentation");
+
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "## Goal".into(),
+            new: "   3 | ## Goal\n   4 | ".into(),
+        },
+        None,
+    )
+    .await
+    .expect_err("note.edit must reject a numbered `new`");
+
+    svc.edit_note_lines(
+        ws.clone(),
+        id.clone(),
+        NoteEditLinesInput {
+            start: 3,
+            end: 4,
+            content: "   3 | ## Goal\n   4 | ".into(),
+        },
+        None,
+    )
+    .await
+    .expect_err("note.editLines must reject numbered `content`");
+
+    svc.update_note(
+        ws.clone(),
+        id.clone(),
+        NoteUpdateInput {
+            content: Some(numbered.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("note.update must reject numbered `content`");
+
+    svc.create_note(
+        ws.clone(),
+        NoteCreate {
+            title: "Copy".into(),
+            content: Some(numbered),
+            tags: None,
+            parent_id: None,
+        },
+        None,
+        None,
+    )
+    .await
+    .expect_err("note.create must reject numbered `content`");
+
+    let persisted = svc.get_note(ws.clone(), id).await.expect("get");
+    assert_eq!(persisted.content, SPEC_MARKDOWN, "spec must be preserved");
+    let notes = svc.list_notes(&ws).await.expect("list");
+    assert!(
+        notes.iter().all(|n| n.title != "Copy"),
+        "rejected create must not persist a note"
+    );
+}
+
+#[tokio::test]
+async fn set_note_content_rejects_numbered_read_presentation_with_appended_lines() {
+    // The reported incident shape: an agent appends raw Markdown to the
+    // numbered `content` of a read and writes the whole thing back. The
+    // unnumbered tail must not launder the numbered body.
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let appended = format!(
+        "{}\n- [ ] new item\n\n## Notes\nprose",
+        numbered_read_presentation(SPEC_MARKDOWN)
+    );
+    svc.set_note_content(ws.clone(), id.clone(), appended, true, None, None)
+        .await
+        .expect_err("numbered body with appended raw lines must be rejected");
+
+    // An empty task note's read is only the metadata trailer; writing it
+    // back would persist the trailer as Markdown.
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "\n\n--- Task Metadata ---\nStatus: not_started".into(),
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect_err("trailer-only task read must be rejected");
+
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, SPEC_MARKDOWN, "spec must be preserved");
+}
+
 #[tokio::test]
 async fn write_without_task_block_reports_zero_conversions() {
     let (_tmp, svc, ws, id) = setup("body").await;
