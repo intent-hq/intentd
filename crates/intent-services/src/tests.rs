@@ -1040,6 +1040,54 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
     assert!(seeded, "lite list must seed the displayStatus baseline");
 }
 
+/// The bulk list projection is byte-for-byte identical to the former
+/// per-workspace enrichment path, including row order and omitted optionals.
+#[tokio::test]
+async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
+    let db = test_tempdir("intentd-bulk-list-shape-");
+    let store = Store::open(&db.path().join("shape.db")).await.unwrap();
+    let active_id = WorkspaceId::from("ws-shape-active");
+    let archived_id = WorkspaceId::from("ws-shape-archived");
+    let mut active = workspace(&active_id);
+    active.created_at = "2026-01-01T00:00:00Z".to_string();
+    active.updated_at = active.created_at.clone();
+    let mut archived = workspace(&archived_id);
+    archived.created_at = "2026-01-02T00:00:00Z".to_string();
+    archived.updated_at = archived.created_at.clone();
+    archived.archived = true;
+    archived.archived_at = Some("2026-01-03T00:00:00Z".to_string());
+    store.insert_workspace(&active).await.unwrap();
+    store.insert_workspace(&archived).await.unwrap();
+
+    let root = WorkspacesRoot::new();
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let unread = store
+        .workspaces_with_unread_top_level_sessions()
+        .await
+        .unwrap();
+    let mut expected = store.list_workspaces(true).await.unwrap();
+    for row in &mut expected {
+        row.activity = svc.workspace_activity(&row.id);
+        row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
+        svc.enrich_workspace_aggregates_with_unread(
+            row,
+            Some(unread.contains(row.id.as_str())),
+        )
+        .await;
+        row.token_usage = None;
+        if row.archived {
+            row.agent_summary = None;
+        }
+    }
+
+    let actual = svc.list_workspaces(true).await.unwrap();
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap(),
+        "bulk enrichment changed serialized workspace.list bytes"
+    );
+}
+
 /// Both list emit paths (`workspace.list` and the lite path behind
 /// `workspace.subscribe` seq-0) merge externally known PRs into each row's
 /// `pullRequests`: git-root PRs (`workspace_git_root.pull_requests`) and
