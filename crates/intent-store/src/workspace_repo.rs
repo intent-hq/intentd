@@ -8,7 +8,9 @@ use intent_core::{
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::agent_repo::{fetch_agent_usage_rows, UNREAD_TOP_LEVEL_SESSION_PREDICATE};
+use crate::agent_repo::{
+    fetch_agent_usage_rows, UNREAD_TOP_LEVEL_SESSION_INDEX, UNREAD_TOP_LEVEL_SESSION_PREDICATE,
+};
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, Store};
 
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
@@ -16,6 +18,21 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode";
+
+/// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
+/// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
+/// statement (see `SESSION_MESSAGE_STATS_SQL` for the precedent).
+pub(crate) fn clear_workspace_unread_if_all_seen_sql() -> String {
+    format!(
+        "UPDATE workspace SET attention='none' \
+         WHERE id = ? AND attention = 'unread' \
+           AND NOT EXISTS(\
+               SELECT 1 FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
+               WHERE workspace_id = workspace.id \
+                 AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}\
+           )"
+    )
+}
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
@@ -387,15 +404,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
-        let sql = format!(
-            "UPDATE workspace SET attention='none' \
-             WHERE id = ? AND attention = 'unread' \
-               AND NOT EXISTS(\
-                   SELECT 1 FROM agent_session \
-                   WHERE workspace_id = workspace.id \
-                     AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}\
-               )"
-        );
+        let sql = clear_workspace_unread_if_all_seen_sql();
         let res = sqlx::query(&sql)
             .bind(&id.0)
             .execute(self.write_pool())

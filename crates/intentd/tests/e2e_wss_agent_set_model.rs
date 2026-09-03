@@ -288,7 +288,10 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             json!({"providerId":"antigravity","force":true}),
         )
         .await;
-        assert_eq!(authenticated["providers"][0]["authenticated"], true);
+        assert_eq!(
+            authenticated["providers"],
+            json!([{"id":"antigravity","authenticated":true}])
+        );
         let models = wss_rpc(
             &mut rpc,
             4,

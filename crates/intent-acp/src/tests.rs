@@ -5839,6 +5839,11 @@ mod workspace_api_tool_tests {
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
+        // Pin the unborn HEAD to `main` explicitly so the initial commit
+        // creates the branch itself: force-creating `main` after the commit
+        // fails on hosts whose `init.defaultBranch = main` already made it
+        // the current HEAD (intent-hq/monorepo#4218).
+        repo.set_head("refs/heads/main").unwrap();
         std::fs::write(dir.path().join("README.md"), "test\n").unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(std::path::Path::new("README.md")).unwrap();
@@ -5849,7 +5854,6 @@ mod workspace_api_tool_tests {
             .commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
             .unwrap();
         let commit = repo.find_commit(commit_id).unwrap();
-        repo.branch("main", &commit, true).unwrap();
         repo.branch("feature/ready", &commit, false).unwrap();
         repo.reference_symbolic(
             "refs/remotes/origin/HEAD",
@@ -6741,7 +6745,7 @@ mod wsapi3_bindings_tests {
         CommentType, CommentWire, Error, Note, NoteAddInput, NoteAddResult, NoteCreate,
         NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
         NoteEditResult, NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow,
-        NoteUpdateMetadataResult, ReadAssetResult, Result, TaskAssignAgentResult,
+        NoteUpdateMetadataResult, ReadAssetResult, Result, SaveAssetResult, TaskAssignAgentResult,
         TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
         TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskUpdateNoteStatusResult,
         TaskUpdateResult, TaskUpdateStatusResult, WorkspaceApi, WorkspaceId,
@@ -6775,6 +6779,7 @@ mod wsapi3_bindings_tests {
         create_note_calls: Mutex<Vec<CreateNoteCall>>,
         list_note_tasks_calls: Mutex<Vec<String>>,
         read_asset_calls: Mutex<Vec<String>>,
+        save_asset_calls: Mutex<Vec<(String, String, Option<String>)>>,
         set_content_calls: Mutex<Vec<(String, String, bool)>>,
         add_calls: Mutex<Vec<AddCall>>,
         edit_calls: Mutex<Vec<(String, String, String)>>,
@@ -6977,6 +6982,26 @@ mod wsapi3_bindings_tests {
                     mime_type: "image/png".to_string(),
                     data: "AAAA".to_string(),
                     size_kb: 1,
+                })
+            })
+        }
+
+        fn save_asset(
+            &self,
+            _ws: WorkspaceId,
+            data: String,
+            mime_type: String,
+            original_name: Option<String>,
+        ) -> BoxFuture<'_, Result<SaveAssetResult>> {
+            self.save_asset_calls
+                .lock()
+                .unwrap()
+                .push((data, mime_type, original_name));
+            Box::pin(async {
+                Ok(SaveAssetResult {
+                    asset_id: "asset-1.webm".to_string(),
+                    path: "/tmp/assets/asset-1.webm".to_string(),
+                    url: "workspace-asset://amber-forest/asset-1.webm".to_string(),
                 })
             })
         }
@@ -7810,6 +7835,54 @@ mod wsapi3_bindings_tests {
         assert_eq!(
             api.read_asset_calls.lock().unwrap()[0],
             "workspace-asset://amber-forest/img-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_save_asset_accepts_media_and_forwards_fields_to_daemon() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.note.saveAsset({ data: 'AAAA', mimeType: 'video/webm', originalName: 'clip.webm' });",
+        )
+        .await;
+        let v = body(&resp);
+        assert_eq!(v["assetId"], json!("asset-1.webm"));
+        assert_eq!(
+            v["url"],
+            json!("workspace-asset://amber-forest/asset-1.webm")
+        );
+        assert_eq!(
+            api.save_asset_calls.lock().unwrap()[0],
+            (
+                "AAAA".to_string(),
+                "video/webm".to_string(),
+                Some("clip.webm".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn note_save_asset_rejects_unsupported_and_parameterized_mime_types() {
+        let (srv, api) = server();
+        for mime_type in ["video/quicktime", "video/mp4; codecs=avc1"] {
+            let resp = call(
+                &srv,
+                &format!(
+                    "return await ws.note.saveAsset({{ data: 'AAAA', mimeType: '{mime_type}' }});"
+                ),
+            )
+            .await;
+            assert_eq!(resp["result"]["isError"], json!(true));
+            assert!(
+                text(&resp).contains("mimeType must be one of"),
+                "unexpected error for {mime_type}: {}",
+                text(&resp)
+            );
+        }
+        assert!(
+            api.save_asset_calls.lock().unwrap().is_empty(),
+            "invalid MIME types must be rejected before persistence"
         );
     }
 

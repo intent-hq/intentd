@@ -208,6 +208,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
+                    assert_eq!(v["jsonrpc"], "2.0", "JSON-RPC response envelope: {v}");
                     assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
                     return v["result"].clone();
                 }
@@ -511,6 +512,123 @@ async fn host_provider_auth_status_over_wss() {
         err["error"]["code"], -32602,
         "unknown providerId ⇒ -32602: {err}"
     );
+}
+
+/// A Claude Desktop sign-in cannot override the CLI's explicit logout.
+/// Override the daemon child's PATH, not providers.paths.claude-code (which
+/// names the adapter), and use only isolated fixtures. Forced checks must
+/// observe login/logout while ordinary reads retain the cached verdict, and
+/// a logged-in report's identity metadata (email / orgName /
+/// subscriptionType) rides the response — including cache-served reads —
+/// while logged-out entries carry no identity object.
+#[tokio::test]
+async fn host_claude_auth_status_honors_cli_json_and_force_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let data_dir = temp_data_dir();
+    let bin_dir = data_dir.join("bin");
+    let home_dir = data_dir.join("home");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let cli = bin_dir.join("claude");
+    std::fs::write(
+        &cli,
+        r#"#!/bin/sh
+[ "$*" = 'auth status' ] || exit 127
+printf 'probe\n' >> "$CLAUDE_AUTH_FIXTURE_DIR/probes"
+IFS= read -r payload < "$CLAUDE_AUTH_FIXTURE_DIR/status.json"
+IFS= read -r code < "$CLAUDE_AUTH_FIXTURE_DIR/exit-code"
+printf '%s\n' "$payload"
+exit "$code"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let npx = bin_dir.join("npx");
+    std::fs::write(
+        &npx,
+        "#!/bin/sh\nprintf 'unexpected adapter spawn\\n' >> \"$CLAUDE_AUTH_FIXTURE_DIR/adapter-spawns\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("PATH", path.as_str()),
+        ("HOME", home_dir.to_str().unwrap()),
+        ("SHELL", "/bin/sh"),
+        ("CLAUDE_AUTH_FIXTURE_DIR", data_dir.to_str().unwrap()),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut ws = connect_ws(port, cfg).await;
+
+    // The initial false/exit-0 pair catches the old exit-code false positive;
+    // true/exit-1 proves the payload wins in the opposite direction as well.
+    for (id, logged_in, exit, force, expected, probe_count) in [
+        (1, false, 0, true, false, 1),
+        (2, true, 1, false, false, 1),
+        (3, true, 1, true, true, 2),
+        (4, false, 1, false, true, 2),
+        (5, false, 1, true, false, 3),
+        (6, false, 0, true, false, 4),
+    ] {
+        let mut status = json!({
+            "loggedIn": logged_in,
+            "authMethod": if logged_in { "oauth" } else { "none" },
+            "apiProvider": "firstParty"
+        });
+        if logged_in {
+            status["email"] = json!("dev@example.com");
+            status["orgName"] = json!("Example Org");
+            status["subscriptionType"] = json!("max");
+        }
+        std::fs::write(data_dir.join("status.json"), format!("{status}\n")).unwrap();
+        std::fs::write(data_dir.join("exit-code"), format!("{exit}\n")).unwrap();
+        let result = wss_rpc(
+            &mut ws,
+            id,
+            "host.providerAuthStatus",
+            json!({ "providerId": "claude-code", "force": force }),
+        )
+        .await;
+        let mut expected_entry = json!({ "id": "claude-code", "authenticated": expected });
+        if expected {
+            // Identity rides every authenticated read — the probe-backed one
+            // AND the cache-served one — and never a logged-out entry.
+            expected_entry["identity"] = json!({
+                "email": "dev@example.com",
+                "orgName": "Example Org",
+                "subscriptionType": "max"
+            });
+        }
+        assert_eq!(
+            result,
+            json!({ "providers": [expected_entry] }),
+            "step {id}: explicit CLI status and cache refresh"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("probes"))
+                .unwrap()
+                .lines()
+                .count(),
+            probe_count,
+            "step {id}: only forced refreshes spawn another CLI"
+        );
+        assert!(
+            !data_dir.join("adapter-spawns").exists(),
+            "step {id}: explicit login/logout must not spawn the adapter"
+        );
+    }
 }
 
 /// host.checkAuggie over the real WSS wire: resolution-only `{ available,

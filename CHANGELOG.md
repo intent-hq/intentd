@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.10] - 2026-09-03
+
+### 🐛 Bug Fixes
+
+- Complete pending merges with both parents in commit helper ([#1678](https://github.com/intent-hq/intentd/pull/1678))
+- Honor explicit Claude CLI authentication status ([#1666](https://github.com/intent-hq/intentd/pull/1666))
+
+### 🧪 Testing
+
+- Fix full-suite gate timeouts and identity hermeticity ([#1681](https://github.com/intent-hq/intentd/pull/1681))
+
+
+## [0.9.9] - 2026-09-03
+
+### 🚀 Features
+
+- *(transport)* Never advertise loopback in pairing hosts + tailcat picker note ([#1672](https://github.com/intent-hq/intentd/pull/1672))
+
+### ⚡ Performance
+
+- *(store)* Answer unread derivation from a partial covering index ([#1661](https://github.com/intent-hq/intentd/pull/1661))
+
+### 🧪 Testing
+
+- *(services)* Isolate durable phase of report_delivered watch test from spawned persists ([#1667](https://github.com/intent-hq/intentd/pull/1667))
+- *(git)* Make fetch timeout fixture deterministic against host network posture ([#1668](https://github.com/intent-hq/intentd/pull/1668))
+- *(acp)* Make git_repo fixture independent of host init.defaultBranch ([#1669](https://github.com/intent-hq/intentd/pull/1669))
+- *(intentd)* Portable stand-in sitter process name for the WSS update fixture ([#1670](https://github.com/intent-hq/intentd/pull/1670))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(sitter)* Bump intentd-sitter to 0.1.8 ([#1674](https://github.com/intent-hq/intentd/pull/1674))
+
+
+## [0.9.8] - 2026-09-02
+
+### 🐛 Bug Fixes
+
+- *(services)* Stop infinite advisory-wake retries to retired watchers ([#1655](https://github.com/intent-hq/intentd/pull/1655))
+
+### 🧪 Testing
+
+- *(services)* Make settings-default-effort tests hermetic (seed providers.paths for auggie) ([#1664](https://github.com/intent-hq/intentd/pull/1664))
+- *(git)* Make identity tests hermetic vs inherited GIT_* env ([#1659](https://github.com/intent-hq/intentd/pull/1659))
+
+
 ## [0.9.7] - 2026-09-02
 
 ### 🚀 Features

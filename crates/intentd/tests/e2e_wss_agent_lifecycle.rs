@@ -354,11 +354,11 @@ fn gate(test: &str) -> Option<String> {
 const MARKER: &str = "MCP_TOOL_MARKER_wss_e2e";
 
 /// Full agent lifecycle over WSS (steps 1–9 of the task note): events.subscribe
-/// + client.hello → agent.create → agent.sendMessage → assert ≥1 chunk + one
-/// terminal stream:end + ≥1 note:updated → note.get sees the MCP-mutated body →
-/// agent.list reports an assistant message persisted.
+/// + client.hello → agent.create → agent.sendMessage → the mock agent calls
+/// `ws.note.saveAsset` and `ws.note.add` through MCP → note.readAsset proves the
+/// returned URL is readable → agent.list reports an assistant message persisted.
 #[tokio::test]
-async fn mock_agent_full_turn_over_wss() {
+async fn mock_agent_full_turn_saves_readable_asset_over_wss() {
     let Some(script) = gate("WSS full-turn E2E") else {
         return;
     };
@@ -368,10 +368,12 @@ async fn mock_agent_full_turn_over_wss() {
     // process starts so it gets a clean handle. Mirrors the UDS analogue.
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
-    // Post-WSAPI-8: agent-supplied JS via `workspace_api` replaces the
-    // discrete `add_to_note` tool.
+    // The agent saves generated media, then embeds the returned URL in a note.
+    // Both calls run through the production workspace_api MCP bridge.
     let js = format!(
-        "return await ws.note.add({}, {{ content: {} }});",
+        "const asset = await ws.note.saveAsset({{ data: 'AAAA', mimeType: 'video/webm', originalName: 'clip.webm' }}); \
+         await ws.note.add({}, {{ content: {} + '\\n![clip](' + asset.url + ')' }}); \
+         return asset;",
         json!(note_id),
         json!(MARKER),
     );
@@ -381,7 +383,7 @@ async fn mock_agent_full_turn_over_wss() {
     let behavior = json!({
         "toolCall": {
             "name": "workspace_api",
-            "arguments": { "code": js, "summary": "WSS E2E ws.note.add" },
+            "arguments": { "code": js, "summary": "WSS E2E ws.note.saveAsset" },
         },
         "response": "first line done\nadded via mcp over wss",
     })
@@ -604,9 +606,28 @@ async fn mock_agent_full_turn_over_wss() {
                 .contains(MARKER),
         "note mutated by the daemon-spawned MCP tool call over WSS: {note}"
     );
+    let content = note["note"]["content"]
+        .as_str()
+        .or_else(|| note["content"].as_str())
+        .expect("note content");
+    let asset_url = content
+        .split_once("![clip](")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(url, _)| url)
+        .expect("agent embedded the returned asset URL");
+    let asset = wss_rpc(
+        &mut rpc,
+        14,
+        "note.readAsset",
+        json!({ "workspaceId": ws_id, "asset": asset_url }),
+    )
+    .await;
+    assert_eq!(asset["assetId"].as_str(), asset_url.rsplit('/').next());
+    assert_eq!(asset["mimeType"], "video/webm");
+    assert_eq!(asset["data"], "AAAA");
 
     // Assistant message persisted (AgentLite messageCount ≥ 1).
-    let list = wss_rpc(&mut rpc, 14, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let list = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": ws_id })).await;
     let agents = list["agents"].as_array().expect("agents array");
     let listed = agents
         .iter()

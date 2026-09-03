@@ -746,6 +746,395 @@ async fn restoring_the_parent_does_not_restore_cascaded_children() {
     assert!(s.retired_at.is_none());
 }
 
+/// monorepo#4183: retiring an agent drops its OWN outgoing completion
+/// watches and delegation groups — a retired watcher can never consume a
+/// wake, so a watch left armed would feed the delivery retry loop with
+/// permanent "agent is retired" failures forever.
+#[tokio::test]
+async fn retire_drops_owned_watches_and_delegation_groups() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        target.clone(),
+        None,
+    )
+    .expect("register watch");
+    let _gid = svc.get_or_create_delegation_group(&ws, &watcher);
+    assert_eq!(svc.list_watches_for_parent(&watcher).len(), 1);
+    assert!(svc.delegation_group_for_parent(&watcher).is_some());
+
+    svc.agent_retire_op(watcher.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire watcher");
+
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "retire must drop the retiree's outgoing watches"
+    );
+    assert!(
+        svc.delegation_group_for_parent(&watcher).is_none(),
+        "retire must drop the retiree's delegation groups"
+    );
+    // The persisted rows are swept too (best-effort spawned deletes).
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+/// monorepo#4183 delivery-path backstop: a monitoring-idle advisory whose
+/// watcher is retired (a watch that raced the retire sweep, or a stale
+/// persisted row from before the retire cleanup existed) is TERMINAL — the
+/// watch is dropped, no per-child retry task is scheduled, and no message
+/// reaches the retired parent's transcript.
+#[tokio::test]
+async fn monitoring_idle_advisory_to_retired_watcher_drops_watch_without_retry() {
+    let (_t, svc, _manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    // Retire the parent DIRECTLY in the store, bypassing the retire op's
+    // own watch sweep — simulating the raced/stale-row case the delivery
+    // backstop exists for.
+    let now = now_iso();
+    svc.store()
+        .set_agent_session_retired_at(&ws, &parent, Some(&now), &now)
+        .await
+        .expect("mark parent retired");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "advisory toward a retired watcher must drop the watch"
+    );
+    assert!(
+        svc.completion_delivery_retries
+            .lock()
+            .expect("retries lock")
+            .is_empty(),
+        "no retry task may be scheduled for a retired watcher"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no wake reaches the retired parent"
+    );
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+/// monorepo#4183 delivery-path backstop, completion-wake flavor: a terminal
+/// completion wake toward a retired watcher drops the watch instead of
+/// scheduling the infinite retry loop.
+#[tokio::test]
+async fn completion_wake_to_retired_watcher_drops_watch_without_retry() {
+    let (_t, svc, _manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    let now = now_iso();
+    svc.store()
+        .set_agent_session_retired_at(&ws, &parent, Some(&now), &now)
+        .await
+        .expect("mark parent retired");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "completion wake toward a retired watcher must drop the watch"
+    );
+    assert!(
+        svc.completion_delivery_retries
+            .lock()
+            .expect("retries lock")
+            .is_empty(),
+        "no retry task may be scheduled for a retired watcher"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no wake reaches the retired parent"
+    );
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+/// monorepo#4183, aggregated `after_all` flavor: a sealed group settling
+/// toward a RETIRED parent is terminal — the group and its grouped watches
+/// are dropped (memory + persisted rows) instead of entering the group
+/// delivery retry loop.
+#[tokio::test]
+async fn after_all_group_wake_to_retired_parent_drops_group_without_retry() {
+    let (_t, svc, _manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+    svc.seal_group_for_parent(&parent).await;
+    // Retire the parent DIRECTLY in the store, bypassing the retire op's
+    // sweep — the raced/stale case the delivery backstop exists for.
+    let now = now_iso();
+    svc.store()
+        .set_agent_session_retired_at(&ws, &parent, Some(&now), &now)
+        .await
+        .expect("mark parent retired");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+
+    assert!(
+        svc.delegation_group_for_parent(&parent).is_none(),
+        "group settlement toward a retired parent must drop the group"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "the grouped watch is swept with the group"
+    );
+    assert!(
+        svc.completion_group_delivery_retries
+            .lock()
+            .expect("group retries lock")
+            .is_empty(),
+        "no group retry task may be scheduled for a retired parent"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no aggregated wake reaches the retired parent"
+    );
+    let groups = svc
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("list persisted groups");
+    assert!(groups.is_empty(), "persisted group row deleted");
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+/// monorepo#4183, unknown-agent-id flavor: a sealed group settling toward a
+/// DELETED parent (no session row at all — e.g. a stale persisted group
+/// rehydrated after restart) is equally terminal; the "unknown agent id"
+/// failure drops the group instead of retrying forever.
+#[tokio::test]
+async fn after_all_group_wake_to_unknown_parent_drops_group_without_retry() {
+    let (_t, svc, _manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+    svc.seal_group_for_parent(&parent).await;
+    // Delete the parent's session row DIRECTLY in the store (the store-level
+    // delete cascades no subscription state) — simulating pre-fix stale
+    // rows whose parent no longer exists.
+    svc.store()
+        .delete_agent_session(&ws, &parent)
+        .await
+        .expect("delete parent session");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+
+    assert!(
+        svc.delegation_group_for_parent(&parent).is_none(),
+        "group settlement toward an unknown parent must drop the group"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "the grouped watch is swept with the group"
+    );
+    assert!(
+        svc.completion_group_delivery_retries
+            .lock()
+            .expect("group retries lock")
+            .is_empty(),
+        "no group retry task may be scheduled for an unknown parent"
+    );
+    let groups = svc
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("list persisted groups");
+    assert!(groups.is_empty(), "persisted group row deleted");
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+/// monorepo#4183 startup pruning: `heal_completion_watches_on_startup`
+/// prunes persisted watches whose parent is RETIRED or MISSING instead of
+/// rehydrating them into the delivery retry loop; the pruned rows are
+/// deleted so they stay pruned across further restarts.
+#[tokio::test]
+async fn startup_heal_prunes_watches_for_retired_or_missing_parent() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (live, target) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let retired = create_agent(&svc, &ws, "Retired").await;
+        let deleted = create_agent(&svc, &ws, "Deleted").await;
+        let live = create_agent(&svc, &ws, "Live").await;
+        let target = create_agent(&svc, &ws, "Target").await;
+        for parent in [&retired, &deleted, &live] {
+            svc.register_completion_watch(
+                &ws,
+                &ws,
+                parent.clone(),
+                "P".into(),
+                target.clone(),
+                None,
+            )
+            .expect("register watch");
+        }
+        wait_for_persisted_watches(&svc, 3).await;
+        let now = now_iso();
+        svc.store()
+            .set_agent_session_retired_at(&ws, &retired, Some(&now), &now)
+            .await
+            .expect("retire parent");
+        svc.store()
+            .delete_agent_session(&ws, &deleted)
+            .await
+            .expect("delete parent session");
+        (live, target)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "only the live parent's watch rehydrates");
+    let watches = restarted.find_watches_for_child(&target);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].parent_agent_id, live);
+    wait_for_persisted_watches(&restarted, 1).await;
+}
+
+/// monorepo#4183 startup pruning: `rehydrate_delegation_groups` prunes
+/// persisted groups whose parent is RETIRED or MISSING — the exact restart
+/// vector observed live (an `after_all` retry loop to an unknown agent id
+/// resuming from persisted state after a daemon restart). The pruned rows
+/// are deleted so they stay pruned.
+#[tokio::test]
+async fn group_rehydration_prunes_groups_for_retired_or_missing_parent() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let retired = create_agent(&svc, &ws, "Retired").await;
+        let deleted = create_agent(&svc, &ws, "Deleted").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        for parent in [&retired, &deleted] {
+            let gid = svc.get_or_create_delegation_group(&ws, parent);
+            svc.enroll_child_in_group(&gid, &child);
+        }
+        // Wait for both group rows to persist (the upsert is spawned).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let rows = svc
+                .store()
+                .list_undelivered_groups(&ws)
+                .await
+                .expect("list persisted groups");
+            if rows.len() == 2 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "group rows persisted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let now = now_iso();
+        svc.store()
+            .set_agent_session_retired_at(&ws, &retired, Some(&now), &now)
+            .await
+            .expect("retire parent");
+        svc.store()
+            .delete_agent_session(&ws, &deleted)
+            .await
+            .expect("delete parent session");
+    } // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .rehydrate_delegation_groups(&ws)
+        .await
+        .expect("rehydrate groups");
+    assert_eq!(loaded, 0, "no group toward a gone parent rehydrates");
+    let rows = restarted
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("list persisted groups");
+    assert!(rows.is_empty(), "pruned group rows are deleted");
+}
+
 #[tokio::test]
 async fn completion_delivery_wakes_watching_parent_and_removes_watch() {
     let (_t, svc, ws) = setup().await;
@@ -19800,7 +20189,17 @@ async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
 
     // Durable variant: a restarted daemon classifies from persisted rows
     // BEFORE the watch registry loads, so it must honor the column too.
-    let store = Store::open(&tmp.path).await.expect("reopen store");
+    // A SEPARATE TempDb isolates this phase: the live phase's best-effort
+    // spawned persists (`persist_completion_watch`'s upsert of the `bc` row
+    // with `report_delivered: false` and `mark_watch_report_delivered`'s
+    // later sync) race each other, so a stray `bc` row could otherwise land
+    // in the shared DB mid-assertion and misclassify B as waiting
+    // (intent-hq/monorepo#4204).
+    let durable_tmp = TempDb::new();
+    let store = Store::open(&durable_tmp.path)
+        .await
+        .expect("open durable-phase store");
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let restarted = Services::new(store);
     let row = |report_delivered: bool| intent_store::PersistedCompletionWatch {
         id: "watch-1643".to_string(),

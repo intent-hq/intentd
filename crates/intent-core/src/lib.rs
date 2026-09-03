@@ -53,6 +53,7 @@ pub use ids::{
     AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
     CHIEF_WORKSPACE_ID,
 };
+pub use model::asset_extension_from_mime;
 pub use model::extract_spec_task_ids;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
@@ -100,7 +101,7 @@ pub use model::{
     WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
     WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus,
     WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use path_utils::prewarm_login_shell_path;

@@ -766,9 +766,18 @@ mod tests {
 
     /// intent-hq/intent#4142: an exec resolved into a repository cwd carries
     /// the commit-identity `GIT_*` vars; a caller-set key still wins, and no
-    /// cwd means no identity vars.
+    /// cwd means no identity vars. The four vars are unset for the test's
+    /// lifetime: the harness itself may inherit them (agent-spawned shells
+    /// do, post-#4142), and `commit_identity_env` correctly gap-fills nothing
+    /// then (intent-hq/monorepo#4191).
     #[test]
     fn build_command_injects_commit_identity_caller_wins() {
+        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+            ("GIT_AUTHOR_NAME", None),
+            ("GIT_AUTHOR_EMAIL", None),
+            ("GIT_COMMITTER_NAME", None),
+            ("GIT_COMMITTER_EMAIL", None),
+        ]);
         let dir = std::env::temp_dir().join(format!(
             "intentd-hostexec-identity-{}",
             uuid::Uuid::new_v4()

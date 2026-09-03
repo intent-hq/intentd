@@ -1579,15 +1579,7 @@ fn strip_leading_headers(s: &str) -> String {
 /// File extension (with leading dot) for a mime type (default `.png`), the
 /// inverse of [`mime_from_extension`], per the TS `getExtensionFromMimeType`.
 pub(crate) fn extension_from_mime(mime_type: &str) -> &'static str {
-    match mime_type {
-        "image/jpeg" | "image/jpg" => ".jpg",
-        "image/gif" => ".gif",
-        "image/webp" => ".webp",
-        "image/svg+xml" => ".svg",
-        "image/bmp" => ".bmp",
-        "image/tiff" => ".tiff",
-        _ => ".png",
-    }
+    intent_core::asset_extension_from_mime(mime_type).unwrap_or(".png")
 }
 
 /// Strip an optional `data:<mime>;base64,` URL prefix from an asset payload,
@@ -1650,6 +1642,8 @@ pub(crate) fn mime_from_extension(asset_id: &str) -> String {
         "svg" => "image/svg+xml",
         "bmp" => "image/bmp",
         "tiff" => "image/tiff",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
         _ => "image/png",
     }
     .to_string()
@@ -2407,6 +2401,10 @@ mod tests {
     fn save_asset_helpers() {
         assert_eq!(extension_from_mime("image/jpeg"), ".jpg");
         assert_eq!(extension_from_mime("image/webp"), ".webp");
+        assert_eq!(extension_from_mime("video/mp4"), ".mp4");
+        assert_eq!(extension_from_mime("video/webm"), ".webm");
+        assert_eq!(mime_from_extension("clip.mp4"), "video/mp4");
+        assert_eq!(mime_from_extension("clip.webm"), "video/webm");
         assert_eq!(extension_from_mime("application/pdf"), ".png");
 
         assert_eq!(strip_data_url_prefix("data:image/png;base64,AAAA"), "AAAA");

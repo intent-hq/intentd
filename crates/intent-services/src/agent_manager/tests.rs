@@ -4063,8 +4063,11 @@ async fn suspend_enrollment_flushes_deferred_attention() {
     .await
     .expect("send_message starts the turn worker");
 
-    // The suspend enrollment flushed the parked raise.
-    let batch = timeout(Duration::from_secs(5), sub.recv())
+    // The suspend enrollment flushed the parked raise. Generous bound: the
+    // event always arrives once the worker runs, but under full-suite
+    // nextest load the worker's scheduling can starve for several seconds
+    // (monorepo#4230 — 5s flaked while the test passes in ~0.1s isolated).
+    let batch = timeout(Duration::from_secs(30), sub.recv())
         .await
         .expect("suspend-interrupted turn end must flush the parked attention raise")
         .expect("subscription open");
@@ -17562,9 +17565,13 @@ mod attention_request_clear_gates {
         seed_with_pending_request_shaped(mgr, ws, id, None, false).await;
     }
 
-    /// Wait for the in-flight turn + worker drain to finish.
+    /// Wait for the in-flight turn + worker drain to finish. Generous bound:
+    /// the loop exits the instant the worker settles, but each turn spawns a
+    /// real `node` mock-provider child, and under full-suite nextest load
+    /// spawn + handshake can starve well past 10s (monorepo#4246 — 13–17s
+    /// observed while the tests pass in under a second isolated).
     async fn await_worker_idle(mgr: &Arc<AgentManager>, id: &AgentId) {
-        timeout(Duration::from_secs(10), async {
+        timeout(Duration::from_secs(60), async {
             loop {
                 if !mgr.is_busy(id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -17601,7 +17608,10 @@ mod attention_request_clear_gates {
     #[tokio::test]
     async fn automatic_delivery_leaves_attention_request_pending() {
         let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ]);
         let (_tmp, mgr, bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
         let (ws, id) = (
@@ -17647,7 +17657,10 @@ mod attention_request_clear_gates {
     #[tokio::test]
     async fn user_delivery_clears_attention_request() {
         let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ]);
         let (_tmp, mgr, bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
         let (ws, id) = (
@@ -17690,7 +17703,10 @@ mod attention_request_clear_gates {
     #[tokio::test]
     async fn drained_user_origin_entry_clears_attention_request() {
         let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ]);
         let (_tmp, mgr, bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
         let (ws, id) = (
@@ -17732,7 +17748,10 @@ mod attention_request_clear_gates {
     #[tokio::test]
     async fn drained_automatic_entry_leaves_attention_request_pending() {
         let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ]);
         let (_tmp, mgr, bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
         let (ws, id) = (
@@ -17773,7 +17792,10 @@ mod attention_request_clear_gates {
     #[tokio::test]
     async fn automatic_delivery_clears_attention_request_for_child_agent() {
         let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ]);
         let (_tmp, mgr, bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
         let (ws, id) = (
@@ -17814,7 +17836,10 @@ mod attention_request_clear_gates {
     #[tokio::test]
     async fn automatic_delivery_clears_attention_request_for_background_agent() {
         let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ]);
         let (_tmp, mgr, bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
         let (ws, id) = (WorkspaceId::from("ws-attn-bg"), AgentId::from("a-attn-bg"));
@@ -17850,7 +17875,10 @@ mod attention_request_clear_gates {
     #[tokio::test]
     async fn user_delivery_clears_attention_request_for_child_agent() {
         let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ]);
         let (_tmp, mgr, bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
         let (ws, id) = (

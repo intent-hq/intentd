@@ -480,14 +480,24 @@ mod tests {
         assert!(common.contains("ws.agent.reportToParent"));
         assert!(!COMMON.contains("ws.workspace.proposeSibling"));
         assert!(!V1_1.common.contains("ws.workspace.proposeSibling"));
-        assert_eq!(
-            remove_between(
-                V2_COMMON,
-                "## Follow-up Workspaces",
-                "## GitHub & Git Operations",
-            ),
-            V1_1.common
+        let without_followup = remove_between(
+            V2_COMMON,
+            "## Follow-up Workspaces",
+            "## GitHub & Git Operations",
         );
+        assert_eq!(remove_section(&without_followup, "Show media"), V1_1.common);
+    }
+
+    #[test]
+    fn v2_common_teaches_how_to_show_media() {
+        let common = get_instruction_with_common_for(&V2, "common", &all_on());
+        assert!(common.contains("## Show media"));
+        assert!(common.contains("Chat and notes accept"));
+        assert!(common.contains("png, jpg, gif, webp, mp4, and webm"));
+        assert!(common.contains("SVG does not render"));
+        assert!(common.contains("ws.note.saveAsset({ data, mimeType, originalName? })"));
+        assert!(common.contains("embed the returned `url`"));
+        assert!(common.contains("ws.workspace.setStatusImage"));
     }
 
     #[test]
@@ -859,8 +869,10 @@ mod tests {
         assert!(!out.contains("ws.agent.reportBlocker"));
         assert!(!out.contains("ws.agent.requestDiscussion"));
         // Neighboring sections survive intact, with clean separation.
-        assert!(out.contains("## Note Editing"));
-        assert!(out.contains("(which replaces everything).\n\n## Waiting on External Conditions"));
+        assert!(out.contains("(which replaces everything).\n\n## Show media"));
+        assert!(
+            out.contains("for the workspace card screenshot.\n\n## Waiting on External Conditions")
+        );
         // The ungated reportToParent guidance elsewhere in common survives.
         assert!(out.contains("ws.agent.reportToParent"));
     }

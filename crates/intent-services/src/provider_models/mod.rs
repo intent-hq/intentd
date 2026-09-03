@@ -453,9 +453,9 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
 /// claude-code auth fallback probe (`host.providerAuthStatus`): the same
 /// pinned-adapter ACP probe as [`fetch_claude_code_models`], mapped to auth
 /// semantics by [`claude_code_acp_auth_verdict`]. Consulted only when the
-/// cheap `claude auth status` CLI probe does not confirm login — that CLI
-/// has known false negatives (anthropics/claude-code#76168). The fallback
-/// can only demote to `Some(false)` (explicit auth-required error) or stay
+/// cheap `claude auth status` CLI probe is inconclusive; an explicit
+/// `loggedIn` boolean skips this fallback, including a reported logout. The
+/// fallback can only demote to `Some(false)` (explicit auth-required error) or stay
 /// unknown — it can never confirm `Some(true)`, because the adapter serves
 /// its model catalog without credentials (see
 /// [`claude_code_acp_auth_verdict`]). The caller gates on the `claude` CLI

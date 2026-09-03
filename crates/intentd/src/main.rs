@@ -21,10 +21,10 @@ use intent_services::{
 };
 use intent_store::Store;
 use intent_transport::{
-    collect_local_ips, detect_has_display, ensure_tls_certificate, get_or_create_token,
-    local_hostname, pretty_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus,
-    FileTokenStore, PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore,
-    WsApiServer, WsOptions,
+    advertised_hosts, collect_local_ips, collect_local_ipv6s, detect_has_display,
+    ensure_tls_certificate, get_or_create_token, local_hostname, pretty_hostname,
+    serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry,
+    RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -717,6 +717,11 @@ struct ListenSelection {
 const TAILCAT_CHOICE_LABEL: &str =
     "Tailcat tunnel — stable tc… address, reachable from other networks (server.tunnel.*)";
 
+/// One-line context printed under the tailcat picker entry: what the tunnel
+/// provides plus the upstream project URL.
+const TAILCAT_CHOICE_NOTE: &str =
+    "Secure, encrypted traffic between your devices — https://github.com/tailscale/tailcat";
+
 /// Map selected picker indices — over the address `choices` plus the
 /// trailing tailcat entry at index `choices.len()` — to a
 /// [`ListenSelection`]. The exclusive all-interfaces rule applies among the
@@ -852,6 +857,7 @@ fn prompt_listen_targets(
         " "
     };
     eprintln!("  {count}) [{mark}] {TAILCAT_CHOICE_LABEL}");
+    eprintln!("         {TAILCAT_CHOICE_NOTE}");
     eprintln!(
         "Enter numbers separated by commas (e.g. 1,3), or press Enter to keep the current \
          selection; an all-interfaces address (0.0.0.0 / ::) must be selected alone. \
@@ -2566,18 +2572,22 @@ impl ProcUsage {
     }
 }
 
-/// Cached route-discovery snapshot (`localIps` + `hostname` +
-/// `prettyHostname`) for `system.status` (§5.7), written by the background
-/// sampler task and read from `status()` without touching the OS. `localIps`
-/// is invalidated by external network activity, so per the derived-field
-/// ladder it is refreshed off the read path (TTL cache) rather than computed
-/// inline on read.
+/// Cached route-discovery snapshot (raw local IPv4/IPv6 enumerations +
+/// `hostname` + `prettyHostname`) for `system.status` (§5.7), written by the
+/// background sampler task and read from `status()` without touching the OS.
+/// The enumerations are invalidated by external network activity, so per the
+/// derived-field ladder they are refreshed off the read path (TTL cache)
+/// rather than computed inline on read. `status()` filters the cached lists
+/// through [`advertised_hosts`] against the live listener bind set, so
+/// `localIps` only names addresses the daemon actually listens on (same
+/// semantics as `server.pairingInfo`) and follows a runtime bind change
+/// immediately.
 struct RouteInfo {
-    inner: std::sync::RwLock<(Vec<String>, String, String)>,
+    inner: std::sync::RwLock<(Vec<String>, Vec<String>, String, String)>,
 }
 
 impl RouteInfo {
-    fn load(&self) -> (Vec<String>, String, String) {
+    fn load(&self) -> (Vec<String>, Vec<String>, String, String) {
         self.inner.read().expect("route info lock poisoned").clone()
     }
 }
@@ -2588,8 +2598,16 @@ impl RouteInfo {
 /// changes with external network state, so a short-TTL cache keeps the status
 /// read path free of `getifaddrs(3)`/hostname syscalls.
 fn spawn_route_info_sampler() -> Arc<RouteInfo> {
+    let sample = || {
+        (
+            collect_local_ips(),
+            collect_local_ipv6s(),
+            local_hostname(),
+            pretty_hostname(),
+        )
+    };
     let info = Arc::new(RouteInfo {
-        inner: std::sync::RwLock::new((collect_local_ips(), local_hostname(), pretty_hostname())),
+        inner: std::sync::RwLock::new(sample()),
     });
     let task_info = info.clone();
     tokio::spawn(async move {
@@ -2598,8 +2616,7 @@ fn spawn_route_info_sampler() -> Arc<RouteInfo> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let sample = (collect_local_ips(), local_hostname(), pretty_hostname());
-            *task_info.inner.write().expect("route info lock poisoned") = sample;
+            *task_info.inner.write().expect("route info lock poisoned") = sample();
         }
     });
     info
@@ -3196,31 +3213,44 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
 
 impl SystemControl for DaemonControl {
     fn status(&self) -> SystemStatus {
-        // Read live port/fingerprint/client count from runtime state (§5.12 fix).
-        // Use try_lock to avoid blocking; if locked, report as unavailable.
-        let (port, fingerprint, clients) = if let Ok(state) = self.ws_runtime.state.try_lock() {
-            let port = state.port;
-            let fingerprint = state
-                .ws_server
-                .as_ref()
-                .and_then(|s| s.fingerprint().map(str::to_string));
-            let clients = state
-                .ws_server
-                .as_ref()
-                .map_or(0, intent_transport::WsApiServer::client_count);
-            (port, fingerprint, clients)
-        } else {
-            (None, None, 0)
-        };
+        // Read live port/fingerprint/client count/bind set from runtime state
+        // (§5.12 fix). Use try_lock to avoid blocking; if locked, report as
+        // unavailable.
+        let (port, fingerprint, clients, bind_addresses) =
+            if let Ok(state) = self.ws_runtime.state.try_lock() {
+                let port = state.port;
+                let fingerprint = state
+                    .ws_server
+                    .as_ref()
+                    .and_then(|s| s.fingerprint().map(str::to_string));
+                let clients = state
+                    .ws_server
+                    .as_ref()
+                    .map_or(0, intent_transport::WsApiServer::client_count);
+                (port, fingerprint, clients, state.bind_addresses.clone())
+            } else {
+                (None, None, 0, None)
+            };
 
         let (cpu_percent, memory_bytes) = self.proc_usage.load();
         // `None` until the slower descendant-tree sampler lands its first walk.
         let child_tree = self.child_usage.load();
-        // Alternative routes for remote clients: same sources as
-        // `server.pairingInfo`, so a remote caller can refresh its stored
-        // host list from `system.status` alone. Served from the background
-        // sampler's TTL cache — never enumerated inline on the read path.
-        let (local_ips, hostname, pretty_hostname) = self.route_info.load();
+        // Alternative routes for remote clients: same sources and bind-set
+        // semantics as `server.pairingInfo`, so a remote caller can refresh
+        // its stored host list from `system.status` alone — and only learns
+        // addresses the listener is actually bound to. Enumerations come from
+        // the background sampler's TTL cache — never collected inline on the
+        // read path; only the cheap bind-set filter runs here. With no live
+        // TCP listener (UDS-only daemon, failed/stopped WSS — or the
+        // try_lock contention above, matching its transient `uds` posture)
+        // there are no dialable TCP routes at all, so `localIps` is empty
+        // rather than the historical full enumeration.
+        let (local_v4, local_v6, hostname, pretty_hostname) = self.route_info.load();
+        let local_ips = if port.is_some() {
+            advertised_hosts(bind_addresses.as_deref(), &local_v4, &local_v6)
+        } else {
+            Vec::new()
+        };
         // Live tunnel route, same availability semantics as pairing surfaces:
         // present while the sidecar runs, absent otherwise. try_lock like the
         // port/fingerprint reads above — never blocks the status path.
@@ -6022,20 +6052,35 @@ mod tests {
         assert_eq!(std::fs::read(&link).unwrap(), b"secret");
     }
 
-    /// A stand-in "sitter": `sleep` symlinked as `name` (the process name
-    /// follows the executed path's basename) — `intentd-sitter` for the dev
-    /// build, `intentd` for the packaged rename. SIGUSR1's default
-    /// disposition is terminate, so the child exiting on signal 10/30
-    /// proves delivery.
+    /// A stand-in "sitter": `sleep` COPIED as `name` — the kernel-visible
+    /// process name comes from the executed image itself, so a copy carries
+    /// the name on every platform, whereas a symlink resolves to the
+    /// target's name on macOS (intent-hq/monorepo#4220) — `intentd-sitter`
+    /// for the dev build, `intentd` for the packaged rename. SIGUSR1's
+    /// default disposition is terminate, so the child exiting on signal
+    /// 10/30 proves delivery.
     #[cfg(unix)]
     fn spawn_stand_in_sitter(dir: &Path, name: &str) -> std::process::Child {
         let sleep = ["/bin/sleep", "/usr/bin/sleep"]
             .iter()
             .find(|p| Path::new(p).exists())
             .expect("sleep binary");
-        let link = dir.join(name);
-        std::os::unix::fs::symlink(sleep, &link).unwrap();
-        std::process::Command::new(&link).arg("30").spawn().unwrap()
+        let bin = dir.join(name);
+        std::fs::copy(sleep, &bin).unwrap();
+        // Bounded ETXTBSY retry: a concurrently forked test child can
+        // transiently inherit the copy's write fd (closed only at that
+        // child's own exec), making exec of the fresh copy fail with
+        // "Text file busy".
+        for _ in 0..400 {
+            match std::process::Command::new(&bin).arg("30").spawn() {
+                Ok(child) => return child,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("spawn stand-in sitter: {e}"),
+            }
+        }
+        panic!("stand-in sitter spawn kept failing with ETXTBSY");
     }
 
     #[cfg(unix)]
