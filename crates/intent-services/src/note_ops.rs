@@ -5,8 +5,9 @@
 //! task parsing, and asset-id parsing. User-facing failures surface as
 //! [`Error::Internal`] so the router maps them to `-32603` with the original
 //! message in `data`, matching the TS handler — except comment anchoring
-//! failures, which are [`Error::InvalidParams`] (`-32602`) so clients see the
-//! actionable message directly.
+//! failures and the numbered-`note.read`-presentation write guard, which are
+//! [`Error::InvalidParams`] (`-32602`) so clients see the actionable message
+//! directly.
 
 use intent_core::{Error, NoteTaskRow, Result};
 use std::fmt::Write as _;
@@ -196,6 +197,70 @@ pub(crate) fn clean_set_content(content: &str) -> Result<String> {
         return Err(Error::Internal("Content cannot be empty.".to_string()));
     }
     Ok(clean)
+}
+
+/// Separator the agent-facing `note.read` binding emits between a task note's
+/// numbered body and its metadata footer.
+const TASK_METADATA_TRAILER: &str = "\n\n--- Task Metadata ---\n";
+
+/// Line number of a `note.read` display line (`{:>4} | {line}`); `None` when
+/// the line is not in that shape. A blank source line renders as `   N | `,
+/// so a bare `N |` (trailing space trimmed by the caller) also counts.
+fn numbered_read_line(line: &str) -> Option<u64> {
+    let rest = line.trim_start_matches(' ');
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits_end == 0 {
+        return None;
+    }
+    let after = &rest[digits_end..];
+    if after.starts_with(" | ") || after == " |" {
+        rest[..digits_end].parse().ok()
+    } else {
+        None
+    }
+}
+
+/// True when `content` is the line-numbered *display* presentation that
+/// `ws.note.read` returns in `content` (as opposed to `rawContent`): every
+/// line carries a `   N | ` prefix with consecutive `N`, blank lines
+/// included, optionally followed by a task note's metadata footer. Requires
+/// at least two lines so a lone `N | text` line is never mistaken for it;
+/// ordered lists, tables and fenced listings do not match (monorepo#4208).
+#[must_use]
+pub fn is_numbered_read_presentation(content: &str) -> bool {
+    let body = content
+        .split_once(TASK_METADATA_TRAILER)
+        .map_or(content, |(body, _)| body)
+        .trim_end_matches('\n');
+    let mut lines = body.split('\n');
+    let Some(first) = lines.next().and_then(numbered_read_line) else {
+        return false;
+    };
+    let mut expected = first;
+    let mut count = 1;
+    for line in lines {
+        expected += 1;
+        if numbered_read_line(line) != Some(expected) {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 2
+}
+
+/// Write-path guard for every content-accepting `ws.note.*` mutation: reject
+/// the numbered `note.read` presentation instead of persisting it, since the
+/// `   N | ` prefixes turn headings and checkboxes into literal text. The
+/// caller keeps the note untouched and the error names the fix.
+pub(crate) fn reject_numbered_read_presentation(content: &str) -> Result<()> {
+    if is_numbered_read_presentation(content) {
+        return Err(Error::InvalidParams(
+            "Content looks like the line-numbered display returned by note.read (every line is prefixed with `   N | `). Writing it back would corrupt the note's Markdown, so it was rejected and the note is unchanged. Use the `rawContent` field from note.read (or remove the `   N | ` prefixes) and retry; wrap intentionally numbered text in a code fence.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_hex_or_dash(b: u8) -> bool {
@@ -1750,6 +1815,52 @@ mod tests {
             clean_set_content("# normal\ncontent").unwrap(),
             "# normal\ncontent"
         );
+    }
+
+    #[test]
+    fn numbered_read_presentation_detects_note_read_shape() {
+        // Exact `note.read` rendering, blank line included (`   2 | `).
+        assert!(is_numbered_read_presentation(
+            "   1 | # Spec\n   2 | \n   3 | ## Goal\n   4 | - [ ] item"
+        ));
+        // Blank-line trailing space trimmed by the caller, trailing newline.
+        assert!(is_numbered_read_presentation(
+            "   1 | # Spec\n   2 |\n   3 | ## Goal\n"
+        ));
+        // A snippet from the middle of a read (editLines / edit `new`).
+        assert!(is_numbered_read_presentation("  12 | ## Goal\n  13 | body"));
+        // Wide numbers past the 4-column pad.
+        assert!(is_numbered_read_presentation(
+            "9999 | a\n10000 | b\n10001 | c"
+        ));
+        // Task-note read: numbered body plus the metadata trailer.
+        assert!(is_numbered_read_presentation(
+            "   1 | # T\n   2 | body\n\n--- Task Metadata ---\nStatus: in_progress"
+        ));
+    }
+
+    #[test]
+    fn numbered_read_presentation_ignores_legitimate_content() {
+        // Plain Markdown, ordered lists, tables, and fenced listings.
+        assert!(!is_numbered_read_presentation(
+            "# Spec\n\n## Goal\n- [ ] item"
+        ));
+        assert!(!is_numbered_read_presentation("1. first\n2. second"));
+        assert!(!is_numbered_read_presentation(
+            "| n | name |\n| --- | --- |\n| 1 | a |\n| 2 | b |"
+        ));
+        assert!(!is_numbered_read_presentation(
+            "```text\n   1 | listing\n   2 | example\n```"
+        ));
+        // Only some lines numbered, or non-consecutive numbering.
+        assert!(!is_numbered_read_presentation("   1 | a\nplain\n   3 | c"));
+        assert!(!is_numbered_read_presentation("   1 | a\n   3 | c"));
+        assert!(!is_numbered_read_presentation("   2 | a\n   1 | b"));
+        // A single line is too little signal to reject.
+        assert!(!is_numbered_read_presentation("   1 | only"));
+        assert!(!is_numbered_read_presentation(""));
+        // `N|x` without the surrounding spaces is not the read shape.
+        assert!(!is_numbered_read_presentation("1|a\n2|b"));
     }
 
     #[test]

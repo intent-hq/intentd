@@ -98,7 +98,7 @@ mod line_attribution;
 mod linear_ops;
 mod model_catalog;
 mod nested_repos;
-mod note_ops;
+pub mod note_ops;
 mod one_shot_acp;
 pub mod pagination;
 pub mod pi_cli;
@@ -20089,6 +20089,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            note_ops::reject_numbered_read_presentation(&input.content)?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
             let (new_content, position) = note_ops::apply_add(
@@ -20170,6 +20171,7 @@ impl WorkspaceApi for Services {
                     "old is required and cannot be empty".to_string(),
                 ));
             }
+            note_ops::reject_numbered_read_presentation(&input.new)?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
             let (new_content, match_position, was_empty) =
@@ -20245,6 +20247,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            note_ops::reject_numbered_read_presentation(&input.content)?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
             let new_content =
@@ -20321,6 +20324,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            // Guard before the CRDT merge so a rejected write never seeds the
+            // yrs doc with content that is not persisted.
+            note_ops::reject_numbered_read_presentation(&content)?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let old_content = note.content.clone();
             let previous_title = note.title.clone();
