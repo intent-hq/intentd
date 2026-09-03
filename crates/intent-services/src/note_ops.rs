@@ -252,8 +252,9 @@ pub fn is_numbered_read_presentation(content: &str) -> bool {
     lines.next().and_then(numbered_read_line) == Some(first + 1)
 }
 
-/// Write-path guard for every content-accepting `ws.note.*` mutation: reject
-/// the numbered `note.read` presentation instead of persisting it, since the
+/// Write-path guard for every content-accepting `ws.note.*` mutation and
+/// `task.createPrerequisite`'s `content` (monorepo#4299): reject the numbered
+/// `note.read` presentation instead of persisting it, since the
 /// `   N | ` prefixes turn headings and checkboxes into literal text. The
 /// caller keeps the note untouched and the error names the fix.
 pub(crate) fn reject_numbered_read_presentation(content: &str) -> Result<()> {

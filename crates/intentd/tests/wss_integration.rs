@@ -9318,6 +9318,93 @@ async fn wss_note_set_content_rejects_numbered_read_presentation() {
     srv.ws.stop().await;
 }
 
+/// Regression for monorepo#4299 over the real WSS wire: `task.createPrerequisite`
+/// materializes note content outside the `note.*` surface, so its `content`
+/// must hit the same numbered-`note.read` guard — -32602, no child note
+/// created — while raw Markdown still creates the prerequisite.
+#[tokio::test]
+async fn wss_task_create_prerequisite_rejects_numbered_read_presentation() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Prereq Numbered Guard"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let raw = "# Step\n\n- [ ] do it";
+    let numbered = "   1 | # Step\n   2 | \n   3 | - [ ] do it";
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"task.createPrerequisite",
+                "params":{"workspaceId":ws_id,"dependentNoteId":"spec","title":"Numbered Step","content":numbered}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"note.list",
+                "params":{"workspaceId":ws_id}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"task.createPrerequisite",
+                "params":{"workspaceId":ws_id,"dependentNoteId":"spec","title":"Raw Step","content":raw}})
+            .to_string(),
+        ],
+    )
+    .await;
+    for (i, resp) in sess.iter().enumerate() {
+        assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+        assert_eq!(
+            resp["id"].as_i64(),
+            Some(i64::try_from(i).expect("value fits in i64") + 2),
+            "envelope: {resp}"
+        );
+    }
+    assert_eq!(
+        sess[0]["error"]["code"], -32602,
+        "numbered presentation is rejected as invalid params: {}",
+        sess[0]
+    );
+    let msg = sess[0]["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("note.read") && msg.contains("rawContent"),
+        "error names the remediation: {msg}"
+    );
+    let rows = sess[1]["result"]["notes"].as_array().expect("notes array");
+    assert!(
+        rows.iter().all(|n| n["title"] != "Numbered Step"),
+        "rejected createPrerequisite must persist no child note: {}",
+        sess[1]
+    );
+    assert!(
+        sess[2].get("error").is_none(),
+        "raw Markdown content creates the prerequisite: {}",
+        sess[2]
+    );
+    assert_eq!(sess[2]["result"]["ok"], true, "{}", sess[2]);
+    assert_eq!(sess[2]["result"]["title"], "Raw Step", "{}", sess[2]);
+    let child_id = sess[2]["result"]["prerequisiteNoteId"]
+        .as_str()
+        .expect("prerequisiteNoteId")
+        .to_string();
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({"jsonrpc":"2.0","id":5,"method":"note.get",
+            "params":{"workspaceId":ws_id,"noteId":child_id}})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["note"]["content"], raw,
+        "raw Markdown persisted verbatim: {got}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `git.showFile` over WSS (PROTOCOL §5.6 extensions): file content at a
 /// revision (`HEAD` / `HEAD^`), the empty-content fallback for a path missing
 /// at the ref, and -32603 for an unresolvable ref.
