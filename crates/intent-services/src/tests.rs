@@ -9,11 +9,11 @@ use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, Note, NoteAddInput,
     NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata, NoteUpdateInput,
     NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    WorkspaceStatus, WorkspaceUpdate,
 };
 use intent_store::Store;
 
-use crate::Services;
+use crate::{repository_backfill_probe_count, Services};
 
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
@@ -24058,12 +24058,12 @@ mod known_repo {
                     ..Default::default()
                 });
 
-        let probes_before = repository_backfill_probe_count(&repo_path);
+        let probes_before = repository_backfill_probe_count(&repo_path.0);
         let listed = svc.list_workspaces(false).await.expect("list workspaces");
         assert!(listed.iter().any(|workspace| workspace.id == id));
         tokio::task::yield_now().await;
         assert_eq!(
-            repository_backfill_probe_count(&repo_path),
+            repository_backfill_probe_count(&repo_path.0),
             probes_before,
             "workspace.list must not probe repository paths"
         );
