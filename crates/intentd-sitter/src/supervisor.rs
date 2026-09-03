@@ -466,6 +466,22 @@ impl Supervisor {
         } else {
             None
         };
+        #[cfg(unix)]
+        let mut exact_server = if supervised {
+            match crate::exact_update::start(&self.paths, Arc::clone(&self.updater)) {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    eprintln!("intentd-sitter: exact updates unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let mut exact_lock = None;
+        #[cfg(unix)]
+        let mut exact_until = None;
         let mut backoff = self.config.backoff_initial;
         // Failed starts since the last one that stayed up (see
         // `give_up_after_failures`); reset wherever the backoff resets.
@@ -486,6 +502,15 @@ impl Supervisor {
             let binary = self.paths.daemon_binary(&current_version);
             let mut command = tokio::process::Command::new(&binary);
             command.args(&self.passthrough).kill_on_drop(true);
+            #[cfg(unix)]
+            if exact_server.is_some() {
+                command.env(
+                    crate::exact_update::EXACT_UPDATE_ENV,
+                    std::process::id().to_string(),
+                );
+            } else {
+                command.env_remove(crate::exact_update::EXACT_UPDATE_ENV);
+            }
             if last_ran_version
                 .as_ref()
                 .is_some_and(|last| *last != current_version)
@@ -575,6 +600,10 @@ impl Supervisor {
             };
             last_ran_version = Some(current_version.clone());
             let spawned_at = Instant::now();
+            #[cfg(unix)]
+            if exact_lock.is_some() {
+                exact_until = Some(spawned_at + crate::exact_update::STABILIZATION);
+            }
 
             // Supervise this child until it exits or the sitter stops it.
             loop {
@@ -671,6 +700,78 @@ impl Supervisor {
                             BackoffOutcome::Elapsed => {}
                         }
                         break; // respawn (possibly a new version after SIGHUP)
+                    }
+                    request = async {
+                        #[cfg(unix)]
+                        { match exact_server.as_mut() {
+                            Some(server) => server.requests.recv().await,
+                            None => std::future::pending().await,
+                        } }
+                        #[cfg(not(unix))]
+                        std::future::pending::<Option<()>>().await
+                    } => {
+                        #[cfg(not(unix))]
+                        let _ = request;
+                        #[cfg(unix)]
+                        if let Some(request) = request {
+                            let updater = Arc::clone(&self.updater);
+                            let mut install = tokio::task::spawn_blocking(move || {
+                                let result = updater.install_exact_reserved(&request.version);
+                                (request, result)
+                            });
+                            let result = loop {
+                                tokio::select! {
+                                    result = &mut install => break result,
+                                    event = signals.recv() => match event {
+                                        SignalEvent::Shutdown(signal) => {
+                                            self.graceful_stop(&mut child).await;
+                                            return 128 + signal;
+                                        }
+                                        SignalEvent::Restart | SignalEvent::CheckNow => {
+                                            eprintln!("intentd-sitter: exact update in progress; coalescing restart/check request");
+                                        }
+                                    }
+                                }
+                            };
+                            match result {
+                                Ok((request, Ok(_))) => {
+                                    exact_lock = Some(request.lock);
+                                    exact_until = Some(Instant::now() + crate::exact_update::STABILIZATION);
+                                    next_check_at = self.schedule_next_check();
+                                    if current_version != request.version {
+                                        self.graceful_stop(&mut child).await;
+                                        current_version = request.version;
+                                        backoff = self.config.backoff_initial;
+                                        failures = 0;
+                                        break;
+                                    }
+                                }
+                                Ok((request, Err(error))) => {
+                                    // Drain/coalesce concurrent channel-check signals even after
+                                    // failure. They must not turn a missing exact release into latest.
+                                    exact_lock = Some(request.lock);
+                                    exact_until = Some(Instant::now() + crate::exact_update::STABILIZATION);
+                                    eprintln!("intentd-sitter: exact update failed: {error}");
+                                }
+                                Err(error) => eprintln!("intentd-sitter: exact update task failed: {error}"),
+                            }
+                        }
+                    }
+                    () = async {
+                        #[cfg(unix)]
+                        { match exact_until {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        } }
+                        #[cfg(not(unix))]
+                        std::future::pending::<()>().await
+                    } => {
+                        #[cfg(unix)]
+                        {
+                            drop(exact_lock.take());
+                            exact_until = None;
+                            next_check_at = self.schedule_next_check();
+                        }
                     }
                     () = tokio::time::sleep_until(next_check_at), if supervised => {
                         match self.check().await {
@@ -796,6 +897,9 @@ impl Supervisor {
     fn schedule_next_check(&self) -> Instant {
         let delay = next_check_delay(self.config.check_min, self.config.check_max, random_u64());
         let now = OffsetDateTime::now_utc();
+        let Ok(_lock) = self.updater.lock() else {
+            return Instant::now() + delay;
+        };
         let mut state = state::load(&self.paths.state_path);
         state.last_check_at = Some(now);
         state.next_check_at = Some(now + delay);

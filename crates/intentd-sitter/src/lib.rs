@@ -11,6 +11,8 @@
 
 pub mod cli;
 pub mod config;
+#[cfg(unix)]
+pub mod exact_update;
 pub mod manifest;
 pub mod paths;
 pub mod readiness;

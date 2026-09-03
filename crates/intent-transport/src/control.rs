@@ -1,6 +1,6 @@
 //! System control fast-path: `system.status`, `system.shutdown`,
 //! `system.importLegacy` (§5.7), `system.gitCredential` (monorepo#884), and
-//! `system.requestUpdate` (§5.7).
+//! `system.requestUpdate` / `system.requestUpdateVersion` (§5.7).
 //!
 //! These control methods surface live daemon state, request graceful shutdown,
 //! and run legacy import. They sit above the domain [`WorkspaceApi`] router because
@@ -21,7 +21,7 @@ use crate::protocol::PROTOCOL_VERSION;
 /// A point-in-time snapshot of daemon state for `system.status` (§5.7, §12.3).
 /// `locality` is derived per-connection (UDS ⇒ `local`, WSS ⇒ `remote`) and so
 /// is not stored here; it is applied when the snapshot is rendered to JSON.
-// The bools (`uds`, `tcp`, `has_display`, `update_supported`) are independent
+// The transport, display, and updater capability bools are independent
 // wire-facing status flags, not an encoded state machine.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
@@ -143,6 +143,8 @@ pub struct SystemStatus {
     /// `false` on platforms without unix signals, where
     /// `system.requestUpdate` is unsupported.
     pub update_supported: bool,
+    /// Exact version handoff is supported by this daemon AND its current sitter.
+    pub exact_version_update_supported: bool,
 }
 
 /// Live file-watch coverage for `system.status` (intent-hq/intent#3708):
@@ -184,6 +186,16 @@ pub trait SystemControl: Send + Sync {
     /// sitter-supervised (or signaling is unsupported on this platform);
     /// the handler maps it to `-32603`.
     fn request_update(&self) -> Result<(), String>;
+    /// Ask a capable sitter to reserve an exact released version. The response
+    /// acknowledges acceptance only; clients must verify the running version.
+    fn request_update_version(
+        &self,
+        _version: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async {
+            Err("exact-version updates require an upgraded sitter and daemon".into())
+        })
+    }
     /// Import legacy workspaces into the daemon's live store.
     fn import_legacy(
         &self,
@@ -205,6 +217,9 @@ pub(crate) enum SystemMethod {
     Status,
     Shutdown,
     RequestUpdate,
+    RequestUpdateVersion {
+        version: Option<String>,
+    },
     ImportLegacy {
         force: Result<bool, ()>,
     },
@@ -242,6 +257,16 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
         "system.status" => SystemMethod::Status,
         "system.shutdown" => SystemMethod::Shutdown,
         "system.requestUpdate" => SystemMethod::RequestUpdate,
+        "system.requestUpdateVersion" => SystemMethod::RequestUpdateVersion {
+            version: obj
+                .get("params")
+                .and_then(Value::as_object)
+                .filter(|params| params.len() == 1)
+                .and_then(|params| params.get("version"))
+                .and_then(Value::as_str)
+                .filter(|version| exact_update_version_valid(version))
+                .map(str::to_owned),
+        },
         "system.importLegacy" => {
             let force = match obj.get("params") {
                 None | Some(Value::Null) => Ok(false),
@@ -318,6 +343,7 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "prettyHostname": status.pretty_hostname,
         "protocolVersion": PROTOCOL_VERSION,
         "updateSupported": status.update_supported,
+        "exactVersionUpdateSupported": status.exact_version_update_supported,
         "host": {
             "os": status.os,
             "arch": status.arch,
@@ -360,6 +386,12 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     v
 }
 
+/// Canonical `SemVer`, including published prereleases, but no build metadata.
+fn exact_update_version_valid(version: &str) -> bool {
+    semver::Version::parse(version)
+        .is_ok_and(|parsed| parsed.build.is_empty() && parsed.to_string() == version)
+}
+
 /// The daemon-side scope gate for `system.gitCredential` (monorepo#884): only
 /// `protocol=https` + `host=github.com` (case-insensitive, exact host) may
 /// receive the credential. Mirrors the helper's own client-side gate.
@@ -399,6 +431,17 @@ pub(crate) async fn handle(
         SystemMethod::RequestUpdate => control
             .request_update()
             .map(|()| json!({ "ok": true }))
+            .map_err(|message| (-32603, message)),
+        SystemMethod::RequestUpdateVersion { version: None } => Err((
+            -32602,
+            "version must be canonical SemVer without build metadata".into(),
+        )),
+        SystemMethod::RequestUpdateVersion {
+            version: Some(version),
+        } => control
+            .request_update_version(version.clone())
+            .await
+            .map(|()| json!({ "ok": true, "accepted": true, "version": version }))
             .map_err(|message| (-32603, message)),
         SystemMethod::ImportLegacy { .. } if !is_uds => Err((
             -32001,

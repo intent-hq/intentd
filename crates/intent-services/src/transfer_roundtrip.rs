@@ -541,6 +541,23 @@ async fn relay(
 /// rehydration counts, and the finalized (archived) source.
 #[tokio::test]
 async fn transfer_round_trip_between_two_stacks() {
+    let own = env!("CARGO_PKG_VERSION");
+    let parsed = semver::Version::parse(own).unwrap();
+    let mut versions = vec![own.to_string()];
+    if parsed.pre.is_empty() {
+        versions.extend([
+            format!("{}.{}.0", parsed.major, parsed.minor),
+            format!("{}.{}.{}", parsed.major, parsed.minor, parsed.patch + 1),
+        ]);
+    }
+    for source_version in versions {
+        transfer_round_trip_from_version(&source_version).await;
+    }
+}
+
+/// The same real export data crosses the gate in both patch directions;
+/// only the producer version in the sealed manifest is changed for the test.
+async fn transfer_round_trip_from_version(source_version: &str) {
     let src_ws_root = TempDir::new("rt-src-ws");
     let src_assets_root = TempDir::new("rt-src-assets");
     let dst_ws_root = TempDir::new("rt-dst-ws");
@@ -583,6 +600,8 @@ async fn transfer_round_trip_between_two_stacks() {
         .expect("export start");
     let export_id = started["exportId"].as_str().expect("exportId").to_string();
     assert!(wait_ready(&source, &export_id).await, "build must succeed");
+
+    restamp_export_version(&source, &export_id, source_version);
 
     // Multi-chunk relay with a tiny archive: shrink the chunk budget.
     {
@@ -778,6 +797,43 @@ async fn transfer_round_trip_between_two_stacks() {
     assert!(is_untracked(&seeded.repo, "dirty.txt"));
     assert_eq!(repo_head(&seeded.sandbox), seeded.sandbox_tip);
     assert!(seeded.sandbox.join("sb-dirty.txt").exists());
+}
+
+/// Simulate a different released producer without replacing the real row,
+/// attachment or git payload with a comparator-only fixture.
+fn restamp_export_version(source: &Services, export_id: &str, version: &str) {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+    use std::io::{Read as _, Write as _};
+
+    let mut exports = source.transfer_exports.lock().unwrap();
+    let ExportState::Ready(ready) = &mut exports.get_mut(export_id).unwrap().state else {
+        panic!("export not ready");
+    };
+    ready.manifest.creating_intentd_version = version.to_string();
+    let bytes = std::fs::read(&ready.archive_path).unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        writer.start_file(entry.name(), options).unwrap();
+        let mut content = Vec::new();
+        entry.read_to_end(&mut content).unwrap();
+        if entry.name() == "manifest.json" {
+            content = serde_json::to_vec(&ready.manifest).unwrap();
+        }
+        writer.write_all(&content).unwrap();
+    }
+    let bytes = writer.finish().unwrap().into_inner();
+    ready.size_bytes = bytes.len() as u64;
+    ready.sha256 = sha2::Sha256::digest(&bytes)
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            write!(hex, "{byte:02x}").unwrap();
+            hex
+        });
+    std::fs::write(&ready.archive_path, bytes).unwrap();
 }
 
 /// Failure injection: abort the relay mid-chunk. The source stays intact

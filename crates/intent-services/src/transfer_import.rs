@@ -1,6 +1,6 @@
 //! Staged, atomic workspace import (`workspace.import.*`, PROTOCOL §5.1):
 //! the target side of the FE-mediated transfer relay. `begin` validates the
-//! manifest header (format version, exact intentd version, id collision) and
+//! manifest header (format version, compatible intentd version, id collision) and
 //! opens a staging session; `chunk` stages seq-numbered archive bytes
 //! (idempotent per seq — a retry overwrites the same chunk file); `commit`
 //! reassembles the archive, verifies its SHA-256, unpacks it, applies the row
@@ -26,7 +26,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use intent_core::transfer::{TransferManifest, TRANSFER_FORMAT_VERSION};
+use intent_core::transfer::{
+    transfer_versions_compatible, TransferManifest, TRANSFER_FORMAT_VERSION,
+};
 use intent_core::{clock::now_iso, AgentId, Error, Result, Workspace, WorkspaceId};
 use intent_store::{Sandbox, SandboxStatus};
 use sha2::Digest as _;
@@ -85,8 +87,8 @@ impl Services {
     /// `workspace.import.begin`: validate the manifest header and open a
     /// staging session. Rejects (all `InvalidParams`, each naming the
     /// specifics): unknown archive format versions, archives whose creating
-    /// intentd version differs from this daemon's own version (exact match —
-    /// no backwards compatibility, spec decision #5), the chief workspace,
+    /// intentd version is not patch-compatible with this daemon (prereleases
+    /// require an exact match), malformed versions, the chief workspace,
     /// and workspace-id collisions (an existing row OR another pending
     /// import). Returns `{ importId, maxChunkBytes }`.
     pub(crate) async fn workspace_import_begin_op(
@@ -104,11 +106,19 @@ impl Services {
             )));
         }
         let own_version = env!("CARGO_PKG_VERSION");
-        if manifest.creating_intentd_version != own_version {
+        if !transfer_versions_compatible(&manifest.creating_intentd_version, own_version) {
             return Err(Error::InvalidParams(format!(
-                "archive was created by intentd {} but this daemon is {} — versions must match exactly",
+                "archive was created by intentd {} but this daemon is {} — valid released versions must share major/minor; prereleases must match exactly",
                 manifest.creating_intentd_version, own_version
             )));
+        }
+        for table in &manifest.tables {
+            if !is_transfer_table(&table.name) {
+                return Err(Error::InvalidParams(format!(
+                    "unsupported transfer table {} in manifest",
+                    table.name
+                )));
+            }
         }
         if manifest.workspace_id.is_chief() {
             return Err(Error::InvalidParams(
@@ -449,8 +459,8 @@ impl Services {
         // Re-check the collision window between begin and commit.
         self.reject_workspace_collision(&workspace_id).await?;
 
-        // Load rows/<table>.jsonl (unknown files — including event.jsonl —
-        // are skipped defensively; the store layer would reject them anyway).
+        // Unknown payloads must fail, not silently disappear when a newer
+        // patch introduces a table this receiver does not understand.
         let rows = load_row_files(&extracted_dir.join("rows")).await?;
         // Every row must be scoped to the manifest's workspace — collision
         // validation only ran for that id, so smuggled rows for other
@@ -498,12 +508,34 @@ impl Services {
             }
         };
 
+        // Assets must also be placed before committing rows. A patch archive
+        // must not succeed while silently losing files on this receiver.
+        let asset_dir = match self
+            .place_imported_assets(&workspace_id, &extracted_dir.join("assets"))
+            .await
+        {
+            Ok(dir) => dir,
+            Err(e) => {
+                rollback_materialized_attachments(&attachment_paths).await;
+                if let Some(out) = &materialized {
+                    crate::transfer_materialize::rollback_materialized(
+                        out,
+                        &target_root.join(&workspace_id.0),
+                    );
+                }
+                return Err(e);
+            }
+        };
+
         // If the row insert fails AFTER materialization succeeded, unwind
         // the checkout/sandboxes so a retried commit does not hit
         // "materialize target already exists".
         let imported_rows = match self.store.transfer_import_rows(&outcome.rows).await {
             Ok(n) => n,
             Err(e) => {
+                if let Some(dir) = asset_dir {
+                    let _ = tokio::fs::remove_dir_all(dir).await;
+                }
                 rollback_materialized_attachments(&attachment_paths).await;
                 if let Some(out) = &materialized {
                     crate::transfer_materialize::rollback_materialized(
@@ -518,9 +550,6 @@ impl Services {
         // Rows are committed — the import can no longer be rolled back.
         // Everything below is best-effort enrichment of the now-live
         // workspace; failures are logged, never surfaced as a failed import.
-        self.place_imported_assets(&workspace_id, &extracted_dir.join("assets"))
-            .await;
-
         let rehydrated = self.rehydrate_after_import().await;
 
         // Session retired; staging deleted.
@@ -550,34 +579,56 @@ impl Services {
     }
 
     /// Copy `assets/<assetId>` files into `<assets_root>/<workspaceId>/`.
-    /// Best-effort: an unset assets root or a copy failure is logged.
-    async fn place_imported_assets(&self, workspace_id: &WorkspaceId, assets_dir: &Path) {
-        let Ok(mut entries) = tokio::fs::read_dir(assets_dir).await else {
-            // no assets/ in the archive
-            return;
+    /// Return the newly owned directory so failed row inserts can unwind it.
+    async fn place_imported_assets(
+        &self,
+        workspace_id: &WorkspaceId,
+        assets_dir: &Path,
+    ) -> Result<Option<PathBuf>> {
+        let mut entries = match tokio::fs::read_dir(assets_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Internal(format!("read imported assets failed: {e}"))),
         };
-        let Some(root) = self.assets_root.clone() else {
-            tracing::warn!(
-                workspace = %workspace_id.0,
-                "import archive carries assets but no assets root is configured — skipping"
-            );
-            return;
+        let Some(first) = entries
+            .next_entry()
+            .await
+            .map_err(|e| Error::Internal(format!("read imported assets failed: {e}")))?
+        else {
+            return Ok(None);
         };
+        let root = self.assets_root.as_ref().ok_or_else(|| {
+            Error::InvalidParams(
+                "import archive carries assets but no assets root is configured".into(),
+            )
+        })?;
+        tokio::fs::create_dir_all(root)
+            .await
+            .map_err(|e| Error::Internal(format!("create assets root failed: {e}")))?;
         let dest_dir = root.join(&workspace_id.0);
-        if let Err(e) = tokio::fs::create_dir_all(&dest_dir).await {
-            tracing::warn!(error = %e, "create imported assets dir failed");
-            return;
-        }
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name();
-            if let Err(e) = tokio::fs::copy(entry.path(), dest_dir.join(&name)).await {
-                tracing::warn!(
-                    asset = %name.to_string_lossy(),
-                    error = %e,
-                    "copy imported asset failed"
-                );
+        // Never overwrite pre-existing files; rollback owns only this dir.
+        tokio::fs::create_dir(&dest_dir)
+            .await
+            .map_err(|e| Error::Internal(format!("create imported assets dir failed: {e}")))?;
+        let result: Result<()> = async {
+            let mut entry = Some(first);
+            while let Some(file) = entry {
+                tokio::fs::copy(file.path(), dest_dir.join(file.file_name()))
+                    .await
+                    .map_err(|e| Error::Internal(format!("copy imported asset failed: {e}")))?;
+                entry = entries
+                    .next_entry()
+                    .await
+                    .map_err(|e| Error::Internal(format!("read imported assets failed: {e}")))?;
             }
+            Ok(())
         }
+        .await;
+        if let Err(e) = result {
+            let _ = tokio::fs::remove_dir_all(&dest_dir).await;
+            return Err(e);
+        }
+        Ok(Some(dest_dir))
     }
 
     /// Materialize the imported git payload (`git/repo.bundle` +
@@ -806,6 +857,41 @@ fn assemble_and_extract(
         .map_err(|e| Error::Internal(format!("open assembled archive failed: {e}")))?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| Error::InvalidParams(format!("archive is not a valid zip: {e}")))?;
+    let mut names = std::collections::HashSet::new();
+    for index in 0..zip.len() {
+        let entry = zip
+            .by_index(index)
+            .map_err(|e| Error::InvalidParams(format!("invalid archive entry: {e}")))?;
+        let name = entry.name();
+        let supported = if entry.is_dir() {
+            matches!(name, "rows/" | "assets/" | "attachments/" | "git/")
+        } else {
+            match name {
+                "manifest.json" | "git/repo.bundle" | "git/refs.json" => true,
+                _ => name.split_once('/').is_some_and(|(dir, file)| {
+                    !file.is_empty()
+                        && file != "."
+                        && file != ".."
+                        && !file.contains(['/', '\\'])
+                        && match dir {
+                            "rows" => file.strip_suffix(".jsonl").is_some_and(is_transfer_table),
+                            "assets" | "attachments" => true,
+                            _ => false,
+                        }
+                }),
+            }
+        };
+        if !supported || entry.is_symlink() || !names.insert(name.to_string()) {
+            return Err(Error::InvalidParams(format!(
+                "unsupported or duplicate transfer archive entry {name:?}"
+            )));
+        }
+    }
+    if names.contains("git/repo.bundle") != names.contains("git/refs.json") {
+        return Err(Error::InvalidParams(
+            "archive must carry git/repo.bundle and git/refs.json together".into(),
+        ));
+    }
     std::fs::create_dir_all(extracted_dir)
         .map_err(|e| Error::Internal(format!("create extraction dir failed: {e}")))?;
     // `ZipArchive::extract` sanitizes entry names via `enclosed_name` and
@@ -816,9 +902,14 @@ fn assemble_and_extract(
     Ok(())
 }
 
-/// Read every `rows/<table>.jsonl` file into `(table, rows)` pairs. Only
-/// files named for [`intent_store::TRANSFER_TABLES`] members are read —
-/// anything else (`event.jsonl`, stray files) is skipped with a warning.
+fn is_transfer_table(table: &str) -> bool {
+    intent_store::TRANSFER_TABLES
+        .iter()
+        .any(|(name, _)| *name == table)
+}
+
+/// Read every `rows/<table>.jsonl` file into `(table, rows)` pairs. Unknown
+/// tables/files (including excluded event history) fail closed.
 async fn load_row_files(rows_dir: &Path) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
     let mut out = Vec::new();
     let mut entries = match tokio::fs::read_dir(rows_dir).await {
@@ -829,18 +920,21 @@ async fn load_row_files(rows_dir: &Path) -> Result<Vec<(String, Vec<serde_json::
             )))
         }
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| Error::Internal(format!("read archive rows directory failed: {e}")))?
+    {
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(table) = name.strip_suffix(".jsonl") else {
-            tracing::warn!(file = %name, "skipping non-jsonl file in archive rows/");
-            continue;
+            return Err(Error::InvalidParams(format!(
+                "unsupported archive row file {name}"
+            )));
         };
-        if !intent_store::TRANSFER_TABLES
-            .iter()
-            .any(|(t, _)| *t == table)
-        {
-            tracing::warn!(table = %table, "skipping non-transfer table in archive rows/");
-            continue;
+        if !is_transfer_table(table) {
+            return Err(Error::InvalidParams(format!(
+                "unsupported transfer table {table}"
+            )));
         }
         let content = tokio::fs::read_to_string(entry.path())
             .await
@@ -871,8 +965,8 @@ async fn load_row_files(rows_dir: &Path) -> Result<Vec<(String, Vec<serde_json::
 /// Registry rows with no matching file entry are the exported
 /// deleted-is-deleted state — nothing to place, `getAttachment` on the
 /// target reports the deleted-from-disk error. File entries with no
-/// matching registry row are skipped with a warning (defensive, mirroring
-/// `load_row_files`). A `stored_path` that escapes the workspace root fails
+/// matching registry row fail the commit (never silently drop files from a
+/// newer patch archive). A `stored_path` that escapes the workspace root fails
 /// the commit — a tampered row must never write outside the workspace.
 async fn materialize_imported_attachments(
     attachments_dir: &Path,
@@ -926,16 +1020,18 @@ async fn materialize_imported_attachments(
         loop {
             // An iteration error is a real I/O failure mid-materialization —
             // propagate it (and unwind) rather than silently stopping short.
-            let Some(entry) = entries.next_entry().await.map_err(|e| {
-                Error::Internal(format!("read staged attachments dir failed: {e}"))
-            })?
+            let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|e| Error::Internal(format!("read staged attachments dir failed: {e}")))?
             else {
                 break;
             };
             let id = entry.file_name().to_string_lossy().to_string();
             let Some(stored_path) = stored_paths.get(id.as_str()) else {
-                tracing::warn!(attachment = %id, "skipping archive attachment with no registry row");
-                continue;
+                return Err(Error::InvalidParams(format!(
+                    "archive attachment {id} has no registry row with a stored_path"
+                )));
             };
             let Some(root) = root.as_deref() else {
                 return Err(Error::InvalidParams(format!(
@@ -1006,9 +1102,9 @@ async fn materialize_imported_attachments(
             // files stay out of git tracking on the target.
             let marker = parent.join(".gitignore");
             if !marker.exists() {
-                tokio::fs::write(&marker, "*\n")
-                    .await
-                    .map_err(|e| Error::Internal(format!("write attachments marker failed: {e}")))?;
+                tokio::fs::write(&marker, "*\n").await.map_err(|e| {
+                    Error::Internal(format!("write attachments marker failed: {e}"))
+                })?;
                 created.push(marker);
             }
             // Record BEFORE copying: a copy that fails partway can leave a
@@ -1265,6 +1361,10 @@ fn transform_rows(
             "agent_session" => {
                 for object in &mut objects {
                     let map = expect_object(&table, object)?;
+                    // Old patch archives bypass the receiver's one-time
+                    // migration 0113. Preserve its identity split on import.
+                    normalize_imported_model(map, "model", "provider");
+                    normalize_imported_model(map, "last_turn_model", "last_turn_provider");
                     map.insert("acp_session_id".into(), serde_json::Value::Null);
                     map.insert("backend_session_id".into(), serde_json::Value::Null);
                     map.insert("is_active".into(), serde_json::json!(0));
@@ -1378,6 +1478,37 @@ fn transform_rows(
 /// Replace `map[key]`'s LAST path component context: the stored absolute
 /// source path keeps only its final component, re-rooted under `ws_dir`.
 /// Non-string / relative / empty values are left untouched.
+/// Match migration 0113, including leading-colon and empty-model handling.
+/// No-op for bare ids; effort and resolved display identities stay untouched.
+fn normalize_imported_model(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    model_key: &str,
+    provider_key: &str,
+) {
+    let Some(model) = map.get(model_key).and_then(|value| value.as_str()) else {
+        return;
+    };
+    if !model.contains(':') {
+        return;
+    }
+    let model = model.trim_start_matches(':');
+    let (provider, model) = match model.split_once(':') {
+        Some((provider, model)) => (Some(provider.to_string()), model.to_string()),
+        None => (None, model.to_string()),
+    };
+    if let Some(provider) = provider {
+        map.insert(provider_key.into(), serde_json::json!(provider));
+    }
+    map.insert(
+        model_key.into(),
+        if model.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(model)
+        },
+    );
+}
+
 fn rewrite_path(map: &mut serde_json::Map<String, serde_json::Value>, key: &str, ws_dir: &Path) {
     let Some(serde_json::Value::String(value)) = map.get_mut(key) else {
         return;
@@ -1681,6 +1812,34 @@ mod tests {
         assert!(!outcome.rows.iter().any(|(t, _)| t == "draft"));
     }
 
+    #[test]
+    fn transform_normalizes_legacy_model_identities() {
+        for (model, provider, expected_model, expected_provider) in [
+            ("codex:gpt-test", "old", Some("gpt-test"), "codex"),
+            ("::codex:gpt-test", "old", Some("gpt-test"), "codex"),
+            (":bare", "old", Some("bare"), "old"),
+            ("codex:", "old", None, "codex"),
+            ("::", "old", None, "old"),
+            ("bare", "old", Some("bare"), "old"),
+        ] {
+            let out = transform_one(
+                "agent_session",
+                serde_json::json!({
+                    "id": "a", "model": model, "provider": provider,
+                    "last_turn_model": model, "last_turn_provider": provider,
+                    "reasoning_effort": "high", "resolved_model": "display",
+                }),
+            );
+            let row = &find(&out, "agent_session")[0];
+            assert_eq!(row["model"], serde_json::json!(expected_model));
+            assert_eq!(row["provider"], expected_provider);
+            assert_eq!(row["last_turn_model"], serde_json::json!(expected_model));
+            assert_eq!(row["last_turn_provider"], expected_provider);
+            assert_eq!(row["reasoning_effort"], "high");
+            assert_eq!(row["resolved_model"], "display");
+        }
+    }
+
     /// Sandbox paths are re-provisioned under
     /// `<ws-dir>/sandboxes/<agentId>/<repo-slug>`; script cwds re-root like
     /// workspace paths.
@@ -1936,6 +2095,8 @@ mod tests {
                     "id": "agent-live", "workspace_id": ws.0, "name": "A",
                     "status": "active", "is_active": 1,
                     "acp_session_id": "acp-1", "backend_session_id": "b-1",
+                    "model": "codex:gpt-test", "provider": "old-provider",
+                    "last_turn_model": "codex:gpt-test", "last_turn_provider": "old-provider",
                     "message_count": 999, "assistant_message_count": 999,
                     "conversation_bytes": 999,
                     "created_at": t, "updated_at": t
@@ -2069,6 +2230,8 @@ mod tests {
             .expect("session");
         assert_eq!(session.status, intent_core::AgentStatus::RuntimeIdle);
         assert!(session.acp_session_id.is_none());
+        assert_eq!(session.model.as_deref(), Some("gpt-test"));
+        assert_eq!(session.provider.as_deref(), Some("codex"));
 
         // 0103 stats counters rebuilt from the re-inserted messages by the
         // triggers — not the exported 999s, and not doubled.
@@ -2779,6 +2942,41 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("0.0.1-other") && msg.contains(env!("CARGO_PKG_VERSION")));
 
+        for version in [
+            "99.0.0",
+            "0.99.0",
+            "0.9.6-rc.1",
+            "not-semver",
+            "0.9",
+            "v0.9.6",
+        ] {
+            if version == env!("CARGO_PKG_VERSION") {
+                continue;
+            }
+            bad_version.creating_intentd_version = version.to_string();
+            let err = svc
+                .workspace_import_begin_op(
+                    serde_json::to_value(&bad_version).unwrap(),
+                    10,
+                    sha.clone(),
+                )
+                .await
+                .expect_err("incompatible version");
+            assert!(err.to_string().contains(version));
+        }
+        // Harmless additive metadata remains forwards-compatible; required
+        // new semantics must use a format version this receiver rejects.
+        let mut extended = serde_json::to_value(manifest(&ws)).unwrap();
+        extended["exporterLabel"] = serde_json::json!("optional description");
+        extended["git"]["displayLabel"] = serde_json::json!("optional git metadata");
+        let accepted = svc
+            .workspace_import_begin_op(extended, 10, sha.clone())
+            .await
+            .expect("additive metadata");
+        svc.workspace_import_abort_op(accepted["importId"].as_str().unwrap().to_string())
+            .await
+            .unwrap();
+
         let chief = manifest(&WorkspaceId::chief());
         assert!(svc
             .workspace_import_begin_op(serde_json::to_value(&chief).unwrap(), 10, sha.clone())
@@ -2803,6 +3001,109 @@ mod tests {
             .await
             .expect_err("collision");
         assert!(err.to_string().contains(ws.0.as_str()));
+    }
+
+    /// Version compatibility never authorizes dropping unknown data, ignoring
+    /// scope, or bypassing the target schema. Every rejection leaves no rows.
+    #[tokio::test]
+    async fn import_patch_compatible_archive_rejects_incompatible_data() {
+        let ws = WorkspaceId("ws-patch-invalid".into());
+        let ws_root = TempDir::new("import-patch-ws");
+        let assets_root = TempDir::new("import-patch-assets");
+        let mut svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let mut m = manifest(&ws);
+        let mut version = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        if version.pre.is_empty() {
+            version.patch += 1;
+        }
+        m.creating_intentd_version = version.to_string();
+        for (case, expected) in [
+            ("table", "future_state"),
+            ("column", "future_column"),
+            ("scope", "outside workspace"),
+            ("constraint", "NOT NULL"),
+            ("orphan_attachment", "no registry row"),
+            ("assets_unconfigured", "no assets root"),
+        ] {
+            let mut rows = fixture_rows(&ws);
+            let mut attachments: Vec<(&str, &[u8])> = Vec::new();
+            match case {
+                "table" => rows.push((
+                    "future_state",
+                    vec![serde_json::json!({"workspace_id": ws.0})],
+                )),
+                "column" => rows[1].1[0]["future_column"] = serde_json::json!("must not disappear"),
+                "scope" => rows[1].1[0]["workspace_id"] = serde_json::json!("other-workspace"),
+                "constraint" => {
+                    rows[1].1[0]["title"] = serde_json::Value::Null;
+                }
+                "orphan_attachment" => attachments.push(("unregistered", b"must not disappear")),
+                "assets_unconfigured" => svc.assets_root = None,
+                _ => unreachable!(),
+            }
+            let archive = build_archive_full(&m, &rows, None, &attachments);
+            let begun = svc
+                .workspace_import_begin_op(
+                    serde_json::to_value(&m).unwrap(),
+                    archive.len() as u64,
+                    sha256_hex(&archive),
+                )
+                .await
+                .expect("compatible version");
+            let id = begun["importId"].as_str().unwrap().to_string();
+            svc.workspace_import_chunk_op(id.clone(), 0, b64(&archive))
+                .await
+                .unwrap();
+            let err = svc
+                .workspace_import_commit_op(id.clone())
+                .await
+                .expect_err(case);
+            assert!(err.to_string().contains(expected), "{case}: {err}");
+            assert!(matches!(
+                svc.store.get_workspace(&ws).await,
+                Err(Error::NotFound(_))
+            ));
+            assert!(!assets_root.0.join(&ws.0).exists());
+            svc.workspace_import_abort_op(id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn import_asset_copy_failure_rolls_back_without_overwriting_existing_paths() {
+        let ws = WorkspaceId("ws-assets-failure".into());
+        let ws_root = TempDir::new("import-assets-ws");
+        let assets_root = TempDir::new("import-assets-dest");
+        let staged = TempDir::new("import-assets-staged");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        std::fs::write(staged.0.join("good.png"), b"real asset bytes").unwrap();
+        // An actual copy I/O error, regardless of the order read_dir yields.
+        std::fs::create_dir(staged.0.join("uncopyable.png")).unwrap();
+        let dest = assets_root.0.join(&ws.0);
+        let err = svc
+            .place_imported_assets(&ws, &staged.0)
+            .await
+            .expect_err("copy fails");
+        assert!(err.to_string().contains("copy imported asset"), "{err}");
+        assert!(
+            !dest.exists(),
+            "owned directory and any earlier copies rolled back"
+        );
+
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("good.png"), b"pre-existing bytes").unwrap();
+        let err = svc
+            .place_imported_assets(&ws, &staged.0)
+            .await
+            .expect_err("do not overwrite");
+        assert!(
+            err.to_string().contains("create imported assets dir"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("good.png")).unwrap(),
+            b"pre-existing bytes"
+        );
+        assert!(!dest.join("uncopyable.png").exists());
     }
 
     /// `commit` rejects an incomplete upload and a checksum mismatch — and

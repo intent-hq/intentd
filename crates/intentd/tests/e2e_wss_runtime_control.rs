@@ -758,6 +758,7 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     // Supervision probe (intent-hq/intent#3875): always present, and false
     // here — the daemon was spawned by the test harness, not a sitter.
     assert_eq!(r["updateSupported"], false, "updateSupported: {r}");
+    assert_eq!(r["exactVersionUpdateSupported"], false);
     // Routing fields (additive): localIps is a string array (may be empty on
     // hosts with no routable interface), hostname and prettyHostname are
     // non-empty strings.
@@ -960,6 +961,37 @@ async fn wss_system_request_update_signals_the_sitter() {
         format!("{}\n", daemon.child.id()),
     )
     .expect("write sitter pidfile");
+    // A real but legacy supervising sitter cannot honor exact targets.
+    let status = wss_rpc(&mut ws, 440, "system.status", json!({})).await;
+    assert_eq!(status["result"]["updateSupported"], true);
+    assert_eq!(status["result"]["exactVersionUpdateSupported"], false);
+    let exact = wss_rpc(
+        &mut ws,
+        441,
+        "system.requestUpdateVersion",
+        json!({"version":"999.0.0"}),
+    )
+    .await;
+    assert_eq!(exact["jsonrpc"], "2.0");
+    assert_eq!(exact["id"], 441);
+    assert_eq!(exact["error"]["code"], -32603);
+    assert!(exact["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("upgrade/reinstall"));
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "must not signal the legacy sitter"
+    );
+    for params in [
+        json!({}),
+        json!({"version":"v1.2.3"}),
+        json!({"version":"1.2.3-01"}),
+        json!({"version":42}),
+    ] {
+        let response = wss_rpc(&mut ws, 442, "system.requestUpdateVersion", params).await;
+        assert_eq!(response["error"]["code"], -32602);
+    }
     let resp = wss_rpc(&mut ws, 44, "system.requestUpdate", json!({})).await;
     assert_eq!(resp["id"], 44);
     assert_eq!(resp["result"], json!({ "ok": true }), "response: {resp}");
@@ -1674,4 +1706,111 @@ async fn tunnel_settings_over_wss() {
         disable.get("error").is_none(),
         "settings.update server.tunnel.enabled=false over WSS should succeed: {disable}"
     );
+}
+
+#[tokio::test]
+async fn wss_exact_update_handoff_requires_current_sitter_acknowledgement() {
+    let data_dir = temp_data_dir();
+    let sitter_dir = data_dir.join("sitter");
+    std::fs::create_dir_all(&sitter_dir).unwrap();
+    let sitter_bin = sitter_dir.join("intentd-sitter");
+    std::fs::copy("/bin/sh", &sitter_bin).expect("copy stand-in sitter shell");
+    let daemon_pid_path = sitter_dir.join("daemon.pid");
+    let mut command = Command::new(&sitter_bin);
+    command
+        .arg("-c")
+        .arg(r#"export INTENTD_SITTER_EXACT_UPDATE_PID=$$; "$1" serve & echo "$!" > "$2"; wait"#)
+        .arg("intentd-sitter")
+        .arg(env!("CARGO_BIN_EXE_intentd"))
+        .arg(&daemon_pid_path);
+    configure_serve(
+        &mut command,
+        &data_dir,
+        "both",
+        &[("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")],
+    );
+    let daemon = Daemon {
+        child: spawn_retrying_etxtbsy(&mut command, "exact-update stand-in sitter wrapper"),
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    std::fs::write(sitter_dir.join("sitter.pid"), daemon.child.id().to_string()).unwrap();
+    let exact_socket = sitter_dir.join(format!("exact-update-{}.sock", daemon.child.id()));
+    let listener = tokio::net::UnixListener::bind(&exact_socket).unwrap();
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let _kill = KillPidOnDrop(
+        std::fs::read_to_string(daemon_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut ws = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    assert_eq!(status["result"]["exactVersionUpdateSupported"], true);
+    let sitter = tokio::spawn(async move {
+        for success in [true, false] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&request).unwrap(),
+                json!({"protocol":1,"version":"999.0.0-beta.1"})
+            );
+            let response = if success {
+                json!({"ok":true,"accepted":true,"version":"999.0.0-beta.1"})
+            } else {
+                json!({"error":"another update is in progress"})
+            };
+            stream
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let result = wss_rpc(
+        &mut ws,
+        901,
+        "system.requestUpdateVersion",
+        json!({"version":"999.0.0-beta.1"}),
+    )
+    .await;
+    assert_eq!(
+        result,
+        json!({"jsonrpc":"2.0","id":901,"result":{"ok":true,"accepted":true,"version":"999.0.0-beta.1"}})
+    );
+    let busy = wss_rpc(
+        &mut ws,
+        902,
+        "system.requestUpdateVersion",
+        json!({"version":"999.0.0-beta.1"}),
+    )
+    .await;
+    assert_eq!(busy["error"]["code"], -32603);
+    assert_eq!(busy["error"]["message"], "another update is in progress");
+    sitter.await.unwrap();
+    let older = wss_rpc(
+        &mut ws,
+        903,
+        "system.requestUpdateVersion",
+        json!({"version":"0.0.0"}),
+    )
+    .await;
+    assert_eq!(older["error"]["code"], -32603);
+    assert!(older["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("downgrade"));
+    // Acceptance is not a fabricated completed update: this stand-in never installed anything.
+    let unchanged = wss_rpc(&mut ws, 904, "system.status", json!({})).await;
+    assert_eq!(unchanged["result"]["version"], env!("CARGO_PKG_VERSION"));
 }

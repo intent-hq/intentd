@@ -45,6 +45,7 @@ croner = "3.0.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
+semver = "1"
 tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 async-trait = "0.1"

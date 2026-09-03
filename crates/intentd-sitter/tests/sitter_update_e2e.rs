@@ -883,3 +883,265 @@ fn double_dash_forwards_update_to_the_daemon() {
         "the forwarded form must not update anything"
     );
 }
+
+struct SupervisedFixture(std::process::Child);
+impl Drop for SupervisedFixture {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.0.id().cast_signed()),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.0.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn await_fixture(mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(Instant::now() < deadline, "fixture did not become ready");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn serving_script(version: &str) -> Vec<u8> {
+    format!("#!/bin/sh\ntrap 'exit 0' TERM INT\nprintf '%s %s %s\\n' '{version}' \"$$\" \"$INTENTD_SITTER_EXACT_UPDATE_PID\" >> \"$FAKE_DAEMON_LOG\"\nwhile :; do sleep 0.05; done\n").into_bytes()
+}
+
+fn exact_request(socket: &Path, version: &str) -> serde_json::Value {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({"protocol":1,"version":version})
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+fn exact_target_runs_across_restart_while_channel_and_cli_checks_are_excluded() {
+    // Both already-published C at request time, and rapid periodic checks
+    // racing after acceptance, must leave the exact target in charge.
+    for (requested, tip_before_request) in
+        [("1.2.2", true), ("1.2.2-beta.1", true), ("1.2.2", false)]
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let (base, requests) = serve_recording(Arc::clone(&routes));
+        publish_stable(&routes, &base, "1.2.1", &serving_script("1.2.1"));
+        let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+        let target_script = serving_script(requested);
+        let tailcat_script = format!("#!/bin/sh\necho exact {requested}\n");
+        let archive = make_tar_xz_with_libexec(&target_script, tailcat_script.as_bytes());
+        routes.lock().unwrap().insert(
+            format!("/v{requested}/{asset}.sha256"),
+            sha256_hex(&archive).into_bytes(),
+        );
+        routes
+            .lock()
+            .unwrap()
+            .insert(format!("/v{requested}/{asset}"), archive);
+        let fixture = SupervisedFixture(
+            Command::new(SITTER_BIN)
+                .arg("serve")
+                .env_remove(CHANNEL_ENV)
+                .env(DATA_DIR_ENV, dir.path())
+                .env(MANIFEST_BASE_URL_ENV, &base)
+                .env(FAKE_DAEMON_LOG, daemon_log_path(dir.path()))
+                .env(
+                    "INTENTD_SITTER_CHECK_MIN_MS",
+                    if tip_before_request { "3600000" } else { "20" },
+                )
+                .env(
+                    "INTENTD_SITTER_CHECK_MAX_MS",
+                    if tip_before_request { "3600001" } else { "21" },
+                )
+                .env("INTENTD_SITTER_KILL_TIMEOUT_MS", "500")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let socket = paths
+            .sitter_dir
+            .join(format!("exact-update-{}.sock", fixture.0.id()));
+        let log = daemon_log_path(dir.path());
+        await_fixture(|| {
+            fs::read_to_string(&log).is_ok_and(|s| s.contains("1.2.1")) && socket.exists()
+        });
+        if tip_before_request {
+            publish_stable(&routes, &base, "1.2.3", &serving_script("1.2.3"));
+        }
+        // Invalid private requests are also rejected before state mutation.
+        let before = state::load(&paths.state_path).current_version;
+        assert!(exact_request(&socket, "v1.2.2")["error"].is_string());
+        assert_eq!(state::load(&paths.state_path).current_version, before);
+        // A periodic check can win the lock first; that is a safe retryable rejection.
+        let mut accepted = false;
+        await_fixture(|| {
+            let response = exact_request(&socket, requested);
+            accepted =
+                response == serde_json::json!({"ok":true,"accepted":true,"version":requested});
+            accepted
+        });
+        assert!(accepted);
+        if !tip_before_request {
+            publish_stable(&routes, &base, "1.2.3", &serving_script("1.2.3"));
+        }
+        await_fixture(|| fs::read_to_string(&log).is_ok_and(|s| s.contains(requested)));
+        assert!(exact_request(&socket, "1.2.3")["error"]
+            .as_str()
+            .unwrap()
+            .contains("in progress"));
+        let cli = run_sitter(dir.path(), &base, &["update"]);
+        assert!(
+            !cli.status.success(),
+            "CLI must not replace an active exact target"
+        );
+        kill(Pid::from_raw(fixture.0.id().cast_signed()), Signal::SIGUSR1).unwrap();
+        kill(Pid::from_raw(fixture.0.id().cast_signed()), Signal::SIGHUP).unwrap();
+        await_fixture(|| {
+            fs::read_to_string(&log).is_ok_and(|s| {
+                s.lines()
+                    .filter(|l| l.starts_with(&format!("{requested} ")))
+                    .count()
+                    >= 2
+            })
+        });
+        let running = fs::read_to_string(&log).unwrap();
+        assert!(
+            !running.contains("1.2.3"),
+            "must run requested B, not channel C: {running}"
+        );
+        let last = running
+            .lines()
+            .last()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(last[0], requested);
+        assert_eq!(
+            last[2],
+            fixture.0.id().to_string(),
+            "current sitter advertises capability to child"
+        );
+        kill(Pid::from_raw(last[1].parse().unwrap()), None).expect("requested B is still running");
+        let target_bin = paths.daemon_binary(requested);
+        let libexec = target_bin.parent().unwrap().join("libexec");
+        assert_eq!(fs::read(&target_bin).unwrap(), target_script);
+        assert_eq!(
+            fs::read(libexec.join("tailcat")).unwrap(),
+            tailcat_script.as_bytes()
+        );
+        assert_eq!(
+            fs::read(libexec.join("tailcat.LICENSE")).unwrap(),
+            b"license text"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for executable in [&target_bin, &libexec.join("tailcat")] {
+                assert_eq!(
+                    fs::metadata(executable).unwrap().permissions().mode() & 0o777,
+                    0o755,
+                    "exact target executable mode: {}",
+                    executable.display()
+                );
+            }
+        }
+        assert_eq!(
+            state::load(&paths.state_path).current_version.as_deref(),
+            Some(requested)
+        );
+        assert!(!paths.daemon_binary("1.2.3").exists());
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r == &format!("/v{requested}/{asset}")));
+    }
+}
+
+#[test]
+fn failed_exact_update_keeps_running_a_and_coalesces_latest_checks() {
+    for bad_checksum in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let (base, _) = serve_recording(Arc::clone(&routes));
+        publish_stable(&routes, &base, "1.2.1", &serving_script("1.2.1"));
+        if bad_checksum {
+            let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+            routes.lock().unwrap().insert(
+                format!("/v1.2.2/{asset}.sha256"),
+                "0".repeat(64).into_bytes(),
+            );
+            routes.lock().unwrap().insert(
+                format!("/v1.2.2/{asset}"),
+                make_tar_xz(&serving_script("1.2.2")),
+            );
+        }
+        let errors = dir.path().join("sitter.log");
+        let fixture = SupervisedFixture(
+            Command::new(SITTER_BIN)
+                .arg("serve")
+                .env_remove(CHANNEL_ENV)
+                .env(DATA_DIR_ENV, dir.path())
+                .env(MANIFEST_BASE_URL_ENV, &base)
+                .env(FAKE_DAEMON_LOG, daemon_log_path(dir.path()))
+                .env("INTENTD_SITTER_CHECK_MIN_MS", "3600000")
+                .env("INTENTD_SITTER_CHECK_MAX_MS", "3600001")
+                .env("INTENTD_SITTER_KILL_TIMEOUT_MS", "500")
+                .stdout(std::process::Stdio::null())
+                .stderr(fs::File::create(&errors).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let socket = paths
+            .sitter_dir
+            .join(format!("exact-update-{}.sock", fixture.0.id()));
+        let log = daemon_log_path(dir.path());
+        await_fixture(|| socket.exists() && log.exists());
+        let original = fs::read_to_string(&log).unwrap();
+        let response = exact_request(&socket, "1.2.2");
+        assert_eq!(
+            response,
+            serde_json::json!({"ok":true,"accepted":true,"version":"1.2.2"})
+        );
+        publish_stable(&routes, &base, "1.2.3", &serving_script("1.2.3"));
+        await_fixture(|| {
+            fs::read_to_string(&errors).is_ok_and(|s| s.contains("exact update failed"))
+        });
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(fixture.0.id().cast_signed()),
+            nix::sys::signal::Signal::SIGUSR1,
+        )
+        .unwrap();
+        await_fixture(|| {
+            fs::read_to_string(&errors).is_ok_and(|s| s.contains("another update is in progress"))
+        });
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            original,
+            "failed exact operation must not restart onto latest"
+        );
+        assert_eq!(
+            state::load(&paths.state_path).current_version.as_deref(),
+            Some("1.2.1")
+        );
+        assert!(!paths.daemon_binary("1.2.2").exists());
+        assert!(!paths.daemon_binary("1.2.3").exists());
+    }
+}

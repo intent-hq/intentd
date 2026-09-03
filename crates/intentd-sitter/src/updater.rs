@@ -101,6 +101,35 @@ pub enum UpdateError {
     Io(#[from] io::Error),
     #[error("no manifest base URLs configured")]
     NoBaseUrls,
+    #[error("another update is in progress; retry after it finishes")]
+    Busy,
+    #[error("invalid exact version: use canonical SemVer without build metadata")]
+    InvalidExactVersion,
+    #[error("refusing to downgrade installed intentd {installed} to {requested}")]
+    Downgrade {
+        installed: String,
+        requested: String,
+    },
+    #[error("invalid release checksum for {0}")]
+    InvalidChecksum(String),
+}
+
+/// An OS-held reservation; dropping it releases update exclusion, including on crash.
+#[cfg(unix)]
+pub(crate) type UpdateLock = nix::fcntl::Flock<fs::File>;
+#[cfg(not(unix))]
+pub(crate) type UpdateLock = fs::File;
+
+/// Validate the intentionally narrow exact-update wire version grammar.
+///
+/// # Errors
+/// Returns `InvalidExactVersion` for noncanonical `SemVer` or build metadata.
+pub fn validate_exact_version(version: &str) -> Result<semver::Version, UpdateError> {
+    let parsed = semver::Version::parse(version).map_err(|_| UpdateError::InvalidExactVersion)?;
+    if !parsed.build.is_empty() || parsed.to_string() != version {
+        return Err(UpdateError::InvalidExactVersion);
+    }
+    Ok(parsed)
 }
 
 /// The update engine. Holds the resolved sitter paths and an HTTP client
@@ -174,6 +203,7 @@ impl Updater {
     ///
     /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or the download/verify/install sequence fails.
     pub fn check_and_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
+        let _lock = self.lock()?;
         self.install_from_manifest(channel, false)
     }
 
@@ -188,7 +218,132 @@ impl Updater {
     ///
     /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or the download/verify/install sequence fails.
     pub fn force_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
+        let _lock = self.lock()?;
         self.install_from_manifest(channel, true)
+    }
+
+    /// Exclude other updater processes through download, commit and restart.
+    /// Nonblocking: a queued channel check must not run after an exact request.
+    pub(crate) fn lock(&self) -> Result<UpdateLock, UpdateError> {
+        fs::create_dir_all(&self.paths.sitter_dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.paths.sitter_dir.join("update.lock"))?;
+        #[cfg(unix)]
+        {
+            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(
+                |(_, error)| {
+                    if error == nix::errno::Errno::EWOULDBLOCK {
+                        UpdateError::Busy
+                    } else {
+                        UpdateError::Io(io::Error::from_raw_os_error(error as i32))
+                    }
+                },
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(file)
+        }
+    }
+
+    /// Install only the requested released version, never a channel tip.
+    ///
+    /// # Errors
+    /// Rejects invalid versions, downgrades, concurrent updates and bad/missing artifacts.
+    pub fn install_exact(&self, version: &str) -> Result<UpdateOutcome, UpdateError> {
+        validate_exact_version(version)?;
+        let _lock = self.reserve_exact(version)?;
+        self.install_exact_reserved(version)
+    }
+
+    pub(crate) fn reserve_exact(&self, version: &str) -> Result<UpdateLock, UpdateError> {
+        validate_exact_version(version)?;
+        let lock = self.lock()?;
+        let current = state::load(&self.paths.state_path).current_version;
+        if let Some(current) = current {
+            // Unknown installed versions cannot safely be ordered either.
+            let installed =
+                semver::Version::parse(&current).map_err(|_| UpdateError::InvalidExactVersion)?;
+            let requested = validate_exact_version(version)?;
+            if installed > requested {
+                return Err(UpdateError::Downgrade {
+                    installed: current,
+                    requested: version.into(),
+                });
+            }
+        }
+        Ok(lock)
+    }
+
+    // The caller retains the reservation through the supervised restart.
+    pub(crate) fn install_exact_reserved(
+        &self,
+        version: &str,
+    ) -> Result<UpdateOutcome, UpdateError> {
+        validate_exact_version(version)?;
+        let current = state::load(&self.paths.state_path);
+        if current.current_version.as_deref() == Some(version)
+            && self.paths.daemon_binary(version).exists()
+        {
+            return Ok(UpdateOutcome::AlreadyCurrent {
+                version: version.into(),
+            });
+        }
+        let entry = self.fetch_exact_entry(version)?;
+        let tmp = self
+            .paths
+            .tmp_dir
+            .join(format!("exact-{}", std::process::id()));
+        fs::create_dir_all(&tmp)?;
+        let result = self.download_and_install(version, current.channel, &entry, &tmp, false);
+        let _ = fs::remove_dir_all(&tmp);
+        // A legacy external installer may not honor the lock. Never report its
+        // newer winner as success for our exact target or restart backward.
+        match result {
+            Ok(UpdateOutcome::AlreadyCurrent { version: installed }) if installed != version => {
+                Err(UpdateError::Downgrade {
+                    installed,
+                    requested: version.into(),
+                })
+            }
+            result => result,
+        }
+    }
+
+    fn fetch_exact_entry(&self, version: &str) -> Result<PlatformEntry, UpdateError> {
+        let extension = if cfg!(windows) { "zip" } else { "tar.xz" };
+        let asset = format!("intentd-{TARGET_TRIPLE}.{extension}");
+        let mut last = UpdateError::NoBaseUrls;
+        for base in &self.base_urls {
+            let url = format!("{}/v{version}/{asset}", base.trim_end_matches('/'));
+            match self.fetch(&format!("{url}.sha256"), MANIFEST_TIMEOUT) {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let mut fields = text.split_whitespace();
+                    let checksum = fields.next().unwrap_or_default();
+                    if checksum.len() != 64
+                        || !checksum.bytes().all(|b| b.is_ascii_hexdigit())
+                        || fields
+                            .next()
+                            .is_some_and(|name| name.trim_start_matches('*') != asset)
+                        || fields.next().is_some()
+                    {
+                        return Err(UpdateError::InvalidChecksum(asset));
+                    }
+                    return Ok(PlatformEntry {
+                        asset,
+                        url,
+                        sha256: checksum.into(),
+                    });
+                }
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
     }
 
     /// Dry-run: fetch the channel manifest and report installed vs latest
