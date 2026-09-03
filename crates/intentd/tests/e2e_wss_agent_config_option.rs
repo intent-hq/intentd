@@ -644,6 +644,526 @@ async fn stored_model_effort_suffix_stripped_for_config_option_over_wss() {
     );
 }
 
+/// Reproduces the host adapter's independent model state: it starts/loads on
+/// vega-alpha, accepts only base model config values, and reports the model
+/// actually used by each prompt. A logged `set_config_option` alone is not proof.
+async fn assert_effective_codex_model_selection(
+    requested: &str,
+    expected: &str,
+    explicit_effort: Option<&str>,
+    effort: &str,
+    resume: bool,
+) {
+    let Some(script) = gate() else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({
+        "advertiseLoadSession": true,
+        "modelSelection": {
+            "defaultModel": "vega-alpha",
+            "models": ["vega-alpha", "gpt-5.6-luna", "gpt-5.5"],
+        },
+    })
+    .to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_str.as_str()),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL_STRIPS_EFFORT", "1"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "Effective Codex model", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().expect("workspace id");
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Effective model", "provider": "mock",
+            "model": if resume { "gpt-5.6-luna" } else { requested },
+            "reasoningEffort": explicit_effort,
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().expect("agent id");
+    if resume {
+        wss_rpc(
+            &mut rpc,
+            11,
+            "agent.sendMessage",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "control turn" }),
+        )
+        .await;
+        await_stream_end(&mut sub, agent_id).await;
+        let control = wss_rpc(
+            &mut rpc,
+            12,
+            "agent.getConversation",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        assert!(control.to_string().contains(&format!(
+            "effective-model=gpt-5.6-luna effort={} loaded=false",
+            explicit_effort.unwrap_or("high")
+        )));
+        wss_rpc(
+            &mut rpc,
+            13,
+            "agent.setModel",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id,
+                "modelId": requested, "providerId": "mock",
+            }),
+        )
+        .await;
+        // The mock resolver has no spawn model. Restart this isolated daemon
+        // to force session/load of the persisted selection. The live Codex
+        // reproduction separately verified automatic model-change respawn.
+        daemon.child.kill().expect("stop test daemon");
+        daemon.child.wait().expect("reap test daemon");
+        daemon.child = spawn_serve(&data_dir, "both", &env);
+        assert!(await_uds(&socket).await, "daemon did not restart");
+        let status = common::await_wss_status(&socket).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().expect("port"))
+            .expect("value fits in u16");
+        let cfg = client_config(
+            status["result"]["fingerprint"]
+                .as_str()
+                .expect("fingerprint"),
+        );
+        rpc = connect_ws(port, cfg.clone()).await;
+        sub = connect_ws(port, cfg).await;
+        wss_rpc(
+            &mut sub,
+            2,
+            "events.subscribe",
+            json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        )
+        .await;
+    }
+    wss_rpc(
+        &mut rpc,
+        20,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "selected model turn" }),
+    )
+    .await;
+    await_stream_end(&mut sub, agent_id).await;
+    let conversation = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let expected_response = format!("effective-model={expected} effort={effort} loaded={resume}");
+    assert!(
+        conversation.to_string().contains(&expected_response),
+        "requested {requested}, expected execution {expected_response}; actual: {conversation}"
+    );
+
+    // Reusing the same child must not reset a suffix-only effort to its
+    // opening default. The prompt log records actual accepted state.
+    wss_rpc(
+        &mut rpc,
+        22,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "reuse selected model" }),
+    )
+    .await;
+    await_stream_end(&mut sub, agent_id).await;
+    let prompts = read_config_log(&prompt_log);
+    assert_eq!(prompts.len(), if resume { 3 } else { 2 });
+    for prompt in prompts.iter().rev().take(2) {
+        assert_eq!(prompt["effectiveModel"], expected, "{prompt}");
+        assert_eq!(prompt["effectiveEffort"], effort, "{prompt}");
+    }
+    if resume {
+        // Return to the initial model on another loaded child. The new
+        // accepted-state record distinguishes switch-back from earlier output.
+        wss_rpc(
+            &mut rpc,
+            23,
+            "agent.setModel",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id,
+                "modelId": "gpt-5.6-luna", "providerId": "mock",
+            }),
+        )
+        .await;
+        daemon.child.kill().expect("stop test daemon");
+        daemon.child.wait().expect("reap test daemon");
+        daemon.child = spawn_serve(&data_dir, "both", &env);
+        assert!(await_uds(&socket).await, "daemon did not restart");
+        let status = common::await_wss_status(&socket).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+        rpc = connect_ws(port, cfg.clone()).await;
+        sub = connect_ws(port, cfg).await;
+        wss_rpc(
+            &mut sub,
+            24,
+            "events.subscribe",
+            json!({
+                "eventTypes": ["agent:*"], "workspaceId": ws_id,
+            }),
+        )
+        .await;
+        wss_rpc(
+            &mut rpc,
+            25,
+            "agent.sendMessage",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id, "content": "switch back",
+            }),
+        )
+        .await;
+        await_stream_end(&mut sub, agent_id).await;
+        let prompts = read_config_log(&prompt_log);
+        assert_eq!(prompts.len(), 4);
+        assert_eq!(prompts[3]["effectiveModel"], "gpt-5.6-luna");
+        assert_eq!(
+            prompts[3]["effectiveEffort"],
+            explicit_effort.unwrap_or("high")
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_base_model_is_effective_after_resume() {
+    assert_effective_codex_model_selection("gpt-5.5", "gpt-5.5", Some("medium"), "medium", true)
+        .await;
+}
+
+#[tokio::test]
+async fn codex_bracket_model_is_effective_on_fresh_session() {
+    assert_effective_codex_model_selection(
+        "gpt-5.6-luna[low]",
+        "gpt-5.6-luna",
+        Some("low"),
+        "low",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn codex_bracket_model_is_effective_after_resume() {
+    assert_effective_codex_model_selection(
+        "gpt-5.5[medium]",
+        "gpt-5.5",
+        Some("medium"),
+        "medium",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn codex_embedded_effort_is_used_without_explicit_effort() {
+    assert_effective_codex_model_selection("gpt-5.6-luna[low]", "gpt-5.6-luna", None, "low", false)
+        .await;
+    assert_effective_codex_model_selection("gpt-5.5/medium", "gpt-5.5", None, "medium", true).await;
+}
+
+#[tokio::test]
+async fn codex_explicit_effort_overrides_embedded_effort() {
+    assert_effective_codex_model_selection(
+        "gpt-5.6-luna[low]",
+        "gpt-5.6-luna",
+        Some("medium"),
+        "medium",
+        false,
+    )
+    .await;
+    assert_effective_codex_model_selection(
+        "gpt-5.5/low",
+        "gpt-5.5",
+        Some("medium"),
+        "medium",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn codex_default_selection_keeps_provider_default() {
+    assert_effective_codex_model_selection("default", "vega-alpha", None, "high", false).await;
+}
+
+/// A rejected explicit Codex selection cannot execute a default-model prompt,
+/// including on retry. Cover fresh, loaded, and recreated session setup.
+async fn assert_codex_rejection_and_recovery(advertise_load: bool) {
+    let Some(script) = gate() else { return };
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config.jsonl");
+    let session_log = data_dir.join("sessions.jsonl");
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let config_path = config_log.to_string_lossy().into_owned();
+    let session_path = session_log.to_string_lossy().into_owned();
+    let prompt_path = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({
+        "advertiseLoadSession": advertise_load,
+        "modelSelection": {
+            "defaultModel": "vega-alpha",
+            "models": ["vega-alpha", "gpt-5.6-luna", "gpt-5.5"],
+        },
+    })
+    .to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL_STRIPS_EFFORT", "1"),
+        ("MOCK_AGENT_CONFIG_LOG", config_path.as_str()),
+        ("MOCK_AGENT_SESSION_LOG", session_path.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_path.as_str()),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({
+            "title": "Codex rejection", "noPrompt": true,
+        }),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["agent:*"], "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    // Unknown bracket content must not be stripped into a valid base model.
+    let rejected = "gpt-5.5[bogus]";
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Rejected model", "provider": "mock",
+            "model": rejected, "reasoningEffort": "low",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap();
+    let sent = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id, "content": "must not run on default",
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+    for attempt in 0..3 {
+        if attempt > 0 {
+            let retry = wss_rpc(
+                &mut rpc,
+                5,
+                "agent.retry",
+                json!({
+                    "workspaceId": ws_id, "agentId": agent_id,
+                }),
+            )
+            .await;
+            assert_eq!(retry["ok"], true, "{retry}");
+        }
+        let mut failed = false;
+        let mut ended = false;
+        let mut error_status = false;
+        for _ in 0..200 {
+            let frame = wss_event(&mut sub, 30).await;
+            let event = &frame["params"]["event"];
+            if event["data"]["agentId"].as_str() != Some(agent_id) {
+                continue;
+            }
+            match event["type"].as_str() {
+                Some("agent:failed") => {
+                    let error = event["data"]["error"].as_str().unwrap();
+                    assert!(
+                        error.contains(rejected) && error.contains("Select a supported model"),
+                        "{error}"
+                    );
+                    failed = true;
+                }
+                Some("agent:stream:end") => {
+                    assert!(failed, "failure must precede stream end");
+                    ended = true;
+                }
+                Some("agent:status-changed") if event["data"]["status"] == "error" => {
+                    error_status = true;
+                }
+                _ => {}
+            }
+            if failed && ended && error_status {
+                break;
+            }
+        }
+        assert!(
+            failed && ended && error_status,
+            "terminal failure on attempt {attempt}"
+        );
+        let session = wss_rpc(
+            &mut rpc,
+            6,
+            "agent.getSession",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id,
+            }),
+        )
+        .await;
+        assert_eq!(session["session"]["status"], "error");
+        assert!(session["session"]["stopReason"]
+            .as_str()
+            .unwrap()
+            .contains(rejected));
+        assert!(
+            read_config_log(&prompt_log).is_empty(),
+            "no prompt may execute after rejection"
+        );
+        let configs = read_config_log(&config_log);
+        assert_eq!(
+            configs.len(),
+            attempt + 1,
+            "selection must be attempted again on every retry"
+        );
+        assert!(configs.iter().all(|config| config["value"] == rejected));
+        let sessions = read_config_log(&session_log);
+        assert_eq!(sessions.len(), attempt + 1);
+        assert_eq!(
+            sessions[attempt]["method"],
+            if attempt > 0 && advertise_load {
+                "session/load"
+            } else {
+                "session/new"
+            }
+        );
+        if attempt > 0 {
+            assert_ne!(
+                sessions[attempt]["pid"],
+                sessions[attempt - 1]["pid"],
+                "rejected child must be discarded"
+            );
+        }
+    }
+    wss_rpc(
+        &mut rpc,
+        7,
+        "agent.setModel",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id,
+            "modelId": "gpt-5.6-luna[medium]", "providerId": "mock",
+        }),
+    )
+    .await;
+    let retry = wss_rpc(
+        &mut rpc,
+        8,
+        "agent.retry",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id,
+        }),
+    )
+    .await;
+    assert_eq!(retry["ok"], true, "{retry}");
+    await_stream_end(&mut sub, agent_id).await;
+    let prompts = read_config_log(&prompt_log);
+    assert_eq!(
+        prompts.len(),
+        1,
+        "recovery executes exactly one queued prompt"
+    );
+    assert_eq!(prompts[0]["effectiveModel"], "gpt-5.6-luna");
+    assert_eq!(
+        prompts[0]["effectiveEffort"], "low",
+        "explicit effort still wins after recovery"
+    );
+    let conversation = wss_rpc(
+        &mut rpc,
+        9,
+        "agent.getConversation",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id,
+        }),
+    )
+    .await;
+    assert!(conversation
+        .to_string()
+        .contains("effective-model=gpt-5.6-luna effort=low"));
+    assert!(!conversation
+        .to_string()
+        .contains("effective-model=vega-alpha"));
+}
+
+#[tokio::test]
+async fn codex_rejection_invalidates_child_on_fresh_and_loaded_sessions() {
+    assert_codex_rejection_and_recovery(true).await;
+}
+
+#[tokio::test]
+async fn codex_rejection_invalidates_child_on_recreated_sessions() {
+    assert_codex_rejection_and_recovery(false).await;
+}
+
 /// A rejected `session/set_model` (e.g. an unknown model id) is best-effort:
 /// the daemon logs a warning, the provider keeps its default model, and the
 /// turn still completes.

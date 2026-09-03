@@ -12350,8 +12350,8 @@ async fn resolve_spawn_session_provider_wins_over_model_string() {
     assert_eq!(resolved.model.as_deref(), Some("opencode-go/kimi-k3"));
 }
 
-/// The session's bare model id is passed through as-is under
-/// `session.provider`.
+/// The session provider owns a bare model id. Codex legacy effort suffixes
+/// are separated before spawning so the explicit effort field can win.
 #[tokio::test]
 async fn resolve_spawn_session_provider_with_bare_model() {
     let settings = intent_core::settings_file::SettingsFile::default();
@@ -12361,8 +12361,8 @@ async fn resolve_spawn_session_provider_with_bare_model() {
     let resolved =
         resolve_spawn(&session, None, &settings, None).expect("session provider resolves");
     assert_eq!(resolved.provider.id, "codex");
-    // The bare model is passed through as-is.
-    assert_eq!(resolved.model.as_deref(), Some("gpt-5.3-codex/high"));
+    assert_eq!(resolved.model.as_deref(), Some("gpt-5.3-codex"));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
 }
 
 /// A workspace whose `path` exists on disk becomes the spawn cwd; a missing
