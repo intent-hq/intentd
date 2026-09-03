@@ -2110,26 +2110,31 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         "archived list rows omit agentSummary (monorepo#3041): {row_archived}"
     );
     // `isBackground` on agentSummary rows (monorepo#3789): present `true` for
-    // the background session, absent (never `false`) for the foreground one.
-    let summary_agents = row_active["agentSummary"]["agents"]
-        .as_array()
-        .expect("agentSummary.agents array");
-    let fg = summary_agents
-        .iter()
-        .find(|a| a["id"] == "agent-slim-a")
-        .expect("foreground agent row");
-    let bg = summary_agents
-        .iter()
-        .find(|a| a["id"] == "agent-slim-bg")
-        .expect("background agent row");
-    assert!(
-        fg.get("isBackground").is_none(),
-        "foreground agentSummary row omits isBackground: {fg}"
-    );
-    assert_eq!(
-        bg["isBackground"], true,
-        "background agentSummary row carries isBackground: {bg}"
-    );
+    // the background session, absent (never `false`) for the foreground one —
+    // asserted on every surface that serves the active workspace's summary
+    // (`workspace.list` here, `workspace.get` below).
+    let assert_is_background_rows = |ws: &Value, surface: &str| {
+        let summary_agents = ws["agentSummary"]["agents"]
+            .as_array()
+            .expect("agentSummary.agents array");
+        let fg = summary_agents
+            .iter()
+            .find(|a| a["id"] == "agent-slim-a")
+            .expect("foreground agent row");
+        let bg = summary_agents
+            .iter()
+            .find(|a| a["id"] == "agent-slim-bg")
+            .expect("background agent row");
+        assert!(
+            fg.get("isBackground").is_none(),
+            "{surface}: foreground agentSummary row omits isBackground: {fg}"
+        );
+        assert_eq!(
+            bg["isBackground"], true,
+            "{surface}: background agentSummary row carries isBackground: {bg}"
+        );
+    };
+    assert_is_background_rows(row_active, "workspace.list");
 
     // workspace.get keeps both fields for detail reads — archived included.
     for ws_id in [&ws_active, &ws_archived] {
@@ -2151,6 +2156,9 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
             ws["agentSummary"].is_object(),
             "workspace.get keeps agentSummary: {ws}"
         );
+        if ws_id == &ws_active {
+            assert_is_background_rows(ws, "workspace.get");
+        }
     }
 
     // workspace.subscribe seq-0 snapshot (lite list path, global channel —
