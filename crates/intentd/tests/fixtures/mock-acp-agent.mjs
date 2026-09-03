@@ -64,20 +64,28 @@ function log(msg) {
 }
 
 // Session-lifecycle log: one JSON line per session/new | session/load —
-// { method, sessionId, pid, meta } — when MOCK_AGENT_SESSION_LOG points at a
-// file. Lets e2e tests assert exactly which session ids the daemon offered to
-// which child process (e.g. that a cross-provider switch never issues
-// session/load with the old provider's id — monorepo#907). `meta` carries the
-// request's `_meta` verbatim (null when absent) so tests can assert the exact
-// provider-specific payload on the wire (e.g. codex `sessionTitle`,
-// monorepo#3151).
+// { method, sessionId, pid, meta, nodeOptions } — when MOCK_AGENT_SESSION_LOG
+// points at a file. Lets e2e tests assert exactly which session ids the daemon
+// offered to which child process (e.g. that a cross-provider switch never
+// issues session/load with the old provider's id — monorepo#907). `meta`
+// carries the request's `_meta` verbatim (null when absent) so tests can
+// assert the exact provider-specific payload on the wire (e.g. codex
+// `sessionTitle`, monorepo#3151). `nodeOptions` is the child's inherited
+// NODE_OPTIONS (null when unset) so tests can assert the daemon-injected V8
+// heap cap (`agents.acpNodeMaxOldSpaceMb`, intent-hq/intent#4330).
 function logSessionCall(method, sessionId, meta) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
   try {
     fs.appendFileSync(
       path,
-      JSON.stringify({ method, sessionId, pid: process.pid, meta: meta ?? null }) + '\n'
+      JSON.stringify({
+        method,
+        sessionId,
+        pid: process.pid,
+        meta: meta ?? null,
+        nodeOptions: process.env.NODE_OPTIONS ?? null,
+      }) + '\n'
     );
   } catch (err) {
     log(`session log write failed: ${err.message}`);

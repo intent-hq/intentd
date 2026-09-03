@@ -7181,6 +7181,7 @@ mod wsapi3_bindings_tests {
             note_id: NoteId,
             task_text: String,
             status: String,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
             self.task_update_status_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -7222,6 +7223,7 @@ mod wsapi3_bindings_tests {
             })
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn task_update(
             &self,
             _ws: WorkspaceId,
@@ -7230,6 +7232,7 @@ mod wsapi3_bindings_tests {
             text: Option<String>,
             status: Option<String>,
             expected: Option<String>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
             self.task_update_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),

@@ -633,6 +633,7 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         _workspace_id: WorkspaceId,
@@ -641,6 +642,7 @@ impl WorkspaceApi for FakeApi {
         _text: Option<String>,
         status: Option<String>,
         _expected: Option<String>,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
         Box::pin(async move {
             Ok(TaskUpdateResult {

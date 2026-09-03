@@ -796,14 +796,16 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
     await_socket(&mut daemon, &socket).await;
     let before = await_stored_token(&data_dir).await;
 
-    // Selecting entry 1 (loopback) replaces the wide bind: persisted as a
-    // plain string (single entry) and the listener re-binds immediately.
+    // 'none' (no additional endpoints) replaces the wide bind with the
+    // loopback-only bind: persisted as a plain string (single entry) and the
+    // listener re-binds immediately. Loopback is no longer a selectable row,
+    // so 'none' is the deterministic way back from 0.0.0.0.
     // The e2e matrix deliberately never persists a multi-IP selection: the
-    // only universally bindable addresses are loopback and 0.0.0.0, which
-    // cannot combine (exclusive), so an array-shape e2e would be
-    // machine-dependent. The persisted array shape is unit-covered
-    // (bind_addresses_value) and the daemon's array handling by #1431.
-    let output = run_select_endpoints(&data_dir, "1\n");
+    // only universally bindable address is 0.0.0.0, exclusive by rule, so an
+    // array-shape e2e would be machine-dependent. The persisted array shape
+    // is unit-covered (bind_addresses_value) and the daemon's array handling
+    // by #1431.
+    let output = run_select_endpoints(&data_dir, "none\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -812,6 +814,14 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
     assert!(
         stderr.contains("Where should the daemon accept connections?"),
         "should show the multi-select picker: {stderr}"
+    );
+    assert!(
+        stderr.contains("Loopback (127.0.0.1) is always enabled"),
+        "the header must state the unconditional loopback bind: {stderr}"
+    );
+    assert!(
+        !stderr.contains("this machine only (loopback)"),
+        "loopback must not be a selectable row: {stderr}"
     );
     assert!(
         stderr.contains("https://github.com/tailscale/tailcat"),
@@ -837,6 +847,92 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
         line.contains("127.0.0.1") && !line.contains("0.0.0.0"),
         "bindAddress should now be loopback only: {line}"
     );
+}
+
+/// The loopback guarantee behind the picker's "always enabled" header: a
+/// daemon whose `server.bindAddress` selects only a non-`127.0.0.1` endpoint
+/// still binds `127.0.0.1` (local clients and the tailcat sidecar — which
+/// forwards tunnel traffic to the IPv4 loopback — must always reach it).
+/// `::1` needs no routable interface, keeping the e2e machine-independent
+/// wherever IPv6 exists; hosts without IPv6 skip (same signal the
+/// transport's own IPv6 test uses).
+#[tokio::test]
+async fn daemon_binds_loopback_alongside_a_specific_bind() {
+    // Probe ::1 bindability up front: IPv6-less hosts (disabled or
+    // unavailable) report Unsupported/AddrNotAvailable, which the listener
+    // itself treats as "IPv6 not supported here" — skip, don't fail.
+    match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::AddrNotAvailable
+            ) =>
+        {
+            eprintln!("skipping: ::1 not bindable on this host ({e})");
+            return;
+        }
+        Err(e) => panic!("probing ::1 bindability failed: {e}"),
+    }
+
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"::1\"\n",
+    )
+    .expect("seed config.toml with an IPv6-loopback-only bind");
+    let child = spawn_daemon_both(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    // The WSS listener binds asynchronously after the UDS socket accepts:
+    // poll `system.status` (one-shot `intentd call`) until a port shows.
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    let (port, status) = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("call")
+            .arg("system.status")
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run intentd call system.status");
+        let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+        if let Some(port) = status.as_ref().and_then(|s| s["port"].as_u64()) {
+            break (
+                u16::try_from(port).expect("valid TCP port"),
+                status.expect("status parsed"),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WSS listener never reported a port"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    // Pin the advertised order: the unconditional loopback is APPENDED to
+    // the configured set (ensure_loopback_bind), so the configured ::1
+    // leads and 127.0.0.1 trails.
+    assert_eq!(
+        status["localIps"],
+        serde_json::json!(["::1", "127.0.0.1"]),
+        "localIps must list the configured bind first, appended loopback last"
+    );
+
+    // The configured ::1 endpoint is served, AND 127.0.0.1 answers too —
+    // the unconditional loopback bind the selector header promises.
+    for addr in ["::1", "127.0.0.1"] {
+        let target: std::net::IpAddr = addr.parse().unwrap();
+        std::net::TcpStream::connect((target, port))
+            .unwrap_or_else(|e| panic!("{addr}:{port} must accept connections: {e}"));
+    }
 }
 
 #[tokio::test]

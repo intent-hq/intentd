@@ -6575,3 +6575,129 @@ async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
         vec![(ws.clone(), NoteId::from("task-keep"))]
     );
 }
+
+/// Batched `clear_stop_redeliveries` (intent-hq/monorepo#4130): one
+/// statement deletes exactly the listed agents' payloads, an unlisted
+/// agent's row survives, and an empty list is a no-op.
+#[tokio::test]
+async fn clear_stop_redeliveries_deletes_only_listed_agents() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let ids: Vec<AgentId> = (0..3)
+        .map(|i| AgentId::from(format!("agent-4130-stop-{i}")))
+        .collect();
+    for id in &ids {
+        store
+            .insert_agent_session(&sample_agent_session(id, &ws))
+            .await
+            .expect("insert session");
+        store
+            .set_stop_redelivery(id, &json!({ "content": id.0 }), "2026-01-01T00:00:00Z")
+            .await
+            .expect("arm payload");
+    }
+    let armed = |rows: Vec<crate::stop_redelivery_repo::StopRedeliveryRow>| {
+        rows.into_iter().map(|r| r.agent_id).collect::<Vec<_>>()
+    };
+
+    store
+        .clear_stop_redeliveries(&[])
+        .await
+        .expect("empty clear");
+    assert_eq!(
+        armed(store.load_all_stop_redeliveries().await.expect("load")),
+        ids,
+        "empty list is a no-op"
+    );
+
+    store
+        .clear_stop_redeliveries(&ids[..2])
+        .await
+        .expect("batched clear");
+    assert_eq!(
+        armed(store.load_all_stop_redeliveries().await.expect("load")),
+        vec![ids[2].clone()],
+        "only the listed agents' payloads are deleted"
+    );
+
+    // Re-clearing an already-cleared id alongside the survivor is fine.
+    store
+        .clear_stop_redeliveries(&[ids[0].clone(), ids[2].clone()])
+        .await
+        .expect("mixed clear");
+    assert!(store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load")
+        .is_empty());
+}
+
+/// Batched `clear_advisory_wake_deliveries_for_children`
+/// (intent-hq/monorepo#4130): one statement clears every marker whose CHILD
+/// is a listed agent — a marker where a listed agent appears only as the
+/// PARENT survives (it belongs to that parent's watch on some other child),
+/// as does any pair not touching the list, and an empty list is a no-op.
+#[tokio::test]
+async fn clear_advisory_wake_deliveries_for_children_matches_child_side_only() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let parent = AgentId::from("agent-4130-adv-parent");
+    let child_a = AgentId::from("agent-4130-adv-child-a");
+    let child_b = AgentId::from("agent-4130-adv-child-b");
+    let other = AgentId::from("agent-4130-adv-other");
+    for id in [&parent, &child_a, &child_b, &other] {
+        store
+            .insert_agent_session(&sample_agent_session(id, &ws))
+            .await
+            .expect("insert session");
+    }
+    let pairs = [
+        (&parent, &child_a),
+        (&parent, &child_b),
+        // child_a as PARENT of `other`: must survive a clear listing child_a.
+        (&child_a, &other),
+        // Untouched by the list.
+        (&other, &parent),
+    ];
+    for (p, c) in pairs {
+        store
+            .record_advisory_wake_delivery(p, c, "2026-01-01T00:00:00Z")
+            .await
+            .expect("record marker");
+    }
+    let has = |p: &AgentId, c: &AgentId| {
+        let (p, c) = (p.clone(), c.clone());
+        let store = &store;
+        async move { store.has_advisory_wake_delivery(&p, &c).await.expect("has") }
+    };
+
+    store
+        .clear_advisory_wake_deliveries_for_children(&[])
+        .await
+        .expect("empty clear");
+    for (p, c) in pairs {
+        assert!(has(p, c).await, "empty list is a no-op: ({p:?}, {c:?})");
+    }
+
+    store
+        .clear_advisory_wake_deliveries_for_children(&[child_a.clone(), child_b.clone()])
+        .await
+        .expect("batched clear");
+    assert!(!has(&parent, &child_a).await, "child_a marker cleared");
+    assert!(!has(&parent, &child_b).await, "child_b marker cleared");
+    assert!(
+        has(&child_a, &other).await,
+        "a marker where the listed id is only the parent survives"
+    );
+    assert!(has(&other, &parent).await, "unrelated pair survives");
+}

@@ -9,7 +9,7 @@
 //! [`Error::InvalidParams`] (`-32602`) so clients see the actionable message
 //! directly.
 
-use intent_core::{Error, NoteTaskRow, Result};
+use intent_core::{Error, NoteTaskRow, Result, TaskStatus};
 use std::fmt::Write as _;
 
 /// JS `\s` (ASCII subset): space, tab, the line terminators, FF and VT.
@@ -252,8 +252,9 @@ pub fn is_numbered_read_presentation(content: &str) -> bool {
     lines.next().and_then(numbered_read_line) == Some(first + 1)
 }
 
-/// Write-path guard for every content-accepting `ws.note.*` mutation: reject
-/// the numbered `note.read` presentation instead of persisting it, since the
+/// Write-path guard for every content-accepting `ws.note.*` mutation and
+/// `task.createPrerequisite`'s `content` (monorepo#4299): reject the numbered
+/// `note.read` presentation instead of persisting it, since the
 /// `   N | ` prefixes turn headings and checkboxes into literal text. The
 /// caller keeps the note untouched and the error names the fix.
 pub(crate) fn reject_numbered_read_presentation(content: &str) -> Result<()> {
@@ -265,11 +266,11 @@ pub(crate) fn reject_numbered_read_presentation(content: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_hex_or_dash(b: u8) -> bool {
-    b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-'
-}
-
 /// First `[label](intent://local/task/<id>)` link; returns `(label, id)`.
+///
+/// The id is everything up to the closing `)` — the same alphabet as
+/// `intent_core::extract_spec_task_ids` (the materialization prefilter):
+/// `NoteId` is an arbitrary string, so `t1` / `task-a` link like UUIDs do.
 fn find_task_link(s: &str) -> Option<(String, String)> {
     const PREFIX: &str = "](intent://local/task/";
     let bytes = s.as_bytes();
@@ -283,12 +284,13 @@ fn find_task_link(s: &str) -> Option<(String, String)> {
             }
             if j < bytes.len() && j > label_start && s[j..].starts_with(PREFIX) {
                 let id_start = j + PREFIX.len();
-                let mut k = id_start;
-                while k < bytes.len() && is_hex_or_dash(bytes[k]) {
-                    k += 1;
-                }
-                if k > id_start && k < bytes.len() && bytes[k] == b')' {
-                    return Some((s[label_start..j].to_string(), s[id_start..k].to_string()));
+                if let Some(len) = s[id_start..].find(')') {
+                    if len > 0 {
+                        return Some((
+                            s[label_start..j].to_string(),
+                            s[id_start..id_start + len].to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -408,6 +410,115 @@ pub(crate) fn checkbox_for(word: &str) -> Option<&'static str> {
         "done" => Some("[x]"),
         _ => None,
     }
+}
+
+/// Checkbox marker a task-note status materializes as on the lines linking
+/// it: `complete` → `[x]`, `in_progress` → `[/]`, every other status → `[ ]`.
+pub(crate) fn checkbox_for_task_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Complete => "[x]",
+        TaskStatus::InProgress => "[/]",
+        _ => "[ ]",
+    }
+}
+
+/// Byte span of the `[c]` checkbox on a `match_task_line`-shaped line:
+/// `(box_start, after_bracket, checkbox_char)`.
+fn checkbox_span(line: &str) -> Option<(usize, usize, char)> {
+    let mut it = line.char_indices().peekable();
+    while matches!(it.peek(), Some((_, c)) if is_js_space_char(*c)) {
+        it.next();
+    }
+    match it.next() {
+        Some((_, '-' | '*')) => {}
+        _ => return None,
+    }
+    while matches!(it.peek(), Some((_, c)) if is_js_space_char(*c)) {
+        it.next();
+    }
+    let (box_start, '[') = it.next()? else {
+        return None;
+    };
+    let (_, cb @ (' ' | 'x' | 'X' | '/')) = it.next()? else {
+        return None;
+    };
+    let (close, ']') = it.next()? else {
+        return None;
+    };
+    Some((box_start, close + 1, cb))
+}
+
+/// Set the checkbox of every checkbox line whose first task link names
+/// `task_id` (`[label](intent://local/task/{task_id})`) to `checkbox`
+/// (a bracket marker such as `[x]`). Lines already carrying the marker
+/// (`[X]` counts as `[x]`), unlinked lines and lines linking other tasks are
+/// left as-is. Returns `None` when no line changed.
+pub(crate) fn set_linked_checkbox(content: &str, task_id: &str, checkbox: &str) -> Option<String> {
+    let target = checkbox.chars().nth(1)?;
+    let mut changed = false;
+    let out: Vec<String> = content
+        .split('\n')
+        .map(|line| {
+            let Some((box_start, after_idx, cb)) = checkbox_span(line) else {
+                return line.to_string();
+            };
+            if cb.eq_ignore_ascii_case(&target) {
+                return line.to_string();
+            }
+            match find_task_link(&line[after_idx..]) {
+                Some((_, id)) if id == task_id => {
+                    changed = true;
+                    format!("{}{}{}", &line[..box_start], checkbox, &line[after_idx..])
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect();
+    changed.then(|| out.join("\n"))
+}
+
+/// Status word (`todo` / `in-progress` / `done`) a task-note status projects
+/// to on a linked checkbox line — the word form of [`checkbox_for_task_status`].
+pub(crate) fn status_word_for_task_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Complete => "done",
+        TaskStatus::InProgress => "in-progress",
+        _ => "todo",
+    }
+}
+
+/// Task note id linked by the line `task.updateStatus` would rewrite for
+/// `task_text`: the first exact-match checkbox line, else the first linked
+/// line whose link label equals the text (what `note.listTasks` returns as a
+/// linked row's `text`), else the first checkbox line containing the text
+/// ([`apply_task_status`]'s fallback). `None` when no line matches or the
+/// matched line carries no task link.
+pub(crate) fn linked_task_for_text(content: &str, task_text: &str) -> Option<String> {
+    let normalized = task_text.trim();
+    let lines = || {
+        content
+            .split('\n')
+            .filter_map(|line| parse_dash_checkbox(line).map(|(_, after_idx, _)| (line, after_idx)))
+    };
+    let exact = lines().find(|(line, after_idx)| line[*after_idx..].trim() == normalized);
+    let label = || {
+        lines().find(|(line, after_idx)| {
+            find_task_link(&line[*after_idx..]).is_some_and(|(label, _)| label.trim() == normalized)
+        })
+    };
+    let (line, after_idx) = exact
+        .or_else(label)
+        .or_else(|| lines().find(|(line, _)| line.contains(normalized)))?;
+    find_task_link(&line[after_idx..]).map(|(_, id)| id)
+}
+
+/// Task note id linked by checkbox line `line` (1-based); `None` when the
+/// line is out of range, not a checkbox line, or carries no task link.
+pub(crate) fn linked_task_at_line(content: &str, line: i64) -> Option<String> {
+    let index = usize::try_from(line.checked_sub(1)?).ok()?;
+    let current = content.split('\n').nth(index)?;
+    let (_, after_idx, _) = parse_dash_checkbox(current)?;
+    find_task_link(&current[after_idx..]).map(|(_, id)| id)
 }
 
 /// Map a checkbox character to its status word (TS `currentStatus` mapping).
@@ -1930,6 +2041,139 @@ mod tests {
         let content = "- [ ] alpha beta gamma";
         let out = apply_task_status(content, "beta", "[x]").unwrap();
         assert_eq!(out, "- [x] alpha beta gamma");
+    }
+
+    #[test]
+    fn set_linked_checkbox_rewrites_only_lines_linking_the_task() {
+        let body = |a: &str, b: &str| {
+            format!(
+                "# H\n- {a} [T](intent://local/task/a1)\n- [ ] plain\n\
+                 - [ ] [O](intent://local/task/b2)\n  * {b} [T2](intent://local/task/a1) tail\n\
+                 not a task [x](intent://local/task/a1)"
+            )
+        };
+        let content = body("[ ]", "[/]");
+        let out = set_linked_checkbox(&content, "a1", "[x]").expect("changed");
+        assert_eq!(out, body("[x]", "[x]"));
+        // Every linked line already carries the marker → no change.
+        assert_eq!(set_linked_checkbox(&out, "a1", "[x]"), None);
+        // `[X]` counts as already-done for the `[x]` marker.
+        assert_eq!(
+            set_linked_checkbox("- [X] [T](intent://local/task/a1)", "a1", "[x]"),
+            None
+        );
+        // No line links the task → no change.
+        assert_eq!(set_linked_checkbox(&content, "d9", "[x]"), None);
+        // Reverse: `[x]` → `[/]` → `[ ]`.
+        let back = set_linked_checkbox(&out, "a1", "[/]").expect("changed");
+        assert_eq!(back, body("[/]", "[/]"));
+        let open = set_linked_checkbox(&back, "a1", "[ ]").expect("changed");
+        assert_eq!(open, body("[ ]", "[ ]"));
+        // A partial-id prefix is not a link to the task.
+        assert_eq!(
+            set_linked_checkbox("- [ ] [T](intent://local/task/a10)", "a1", "[x]"),
+            None
+        );
+    }
+
+    #[test]
+    fn task_link_ids_share_the_prefilter_alphabet() {
+        // `NoteId` is an arbitrary string: every id `extract_spec_task_ids`
+        // (the materialization prefilter) yields is one the rewriter and the
+        // redirect resolvers accept too — not just hex/dash UUID shapes.
+        for id in ["t1", "task-a", "Task_A.v2", "ZZ"] {
+            let line = format!("- [ ] [T](intent://local/task/{id})");
+            let ids = intent_core::extract_spec_task_ids(&line);
+            assert!(ids.contains(id), "prefilter yields {id}");
+            assert_eq!(
+                find_task_link(&line),
+                Some(("T".to_string(), id.to_string())),
+                "{id}"
+            );
+            assert_eq!(
+                set_linked_checkbox(&line, id, "[x]").as_deref(),
+                Some(format!("- [x] [T](intent://local/task/{id})").as_str()),
+                "{id}"
+            );
+            assert_eq!(linked_task_at_line(&line, 1).as_deref(), Some(id));
+            assert_eq!(linked_task_for_text(&line, "T").as_deref(), Some(id));
+        }
+        // An empty id or an unterminated link is still no link.
+        assert_eq!(find_task_link("[T](intent://local/task/)"), None);
+        assert_eq!(find_task_link("[T](intent://local/task/t1"), None);
+    }
+
+    #[test]
+    fn linked_task_resolvers_follow_the_apply_matching_rules() {
+        let content = "# H\n- [ ] [T](intent://local/task/a1)\n- [ ] plain\n\
+                       - [/] alpha [O](intent://local/task/b2)\n- [x] alpha\nnot a task";
+        // Exact match wins over an earlier containing line.
+        assert_eq!(linked_task_for_text(content, "alpha"), None);
+        assert_eq!(
+            linked_task_for_text(content, "alpha [O](intent://local/task/b2)"),
+            Some("b2".to_string())
+        );
+        // Fallback: first checkbox line containing the text.
+        assert_eq!(linked_task_for_text(content, "T"), Some("a1".to_string()));
+        assert_eq!(
+            linked_task_for_text(content, "  T  "),
+            Some("a1".to_string())
+        );
+        assert_eq!(linked_task_for_text(content, "plain"), None);
+        assert_eq!(linked_task_for_text(content, "missing"), None);
+
+        assert_eq!(linked_task_at_line(content, 2), Some("a1".to_string()));
+        assert_eq!(linked_task_at_line(content, 3), None);
+        assert_eq!(linked_task_at_line(content, 4), Some("b2".to_string()));
+        assert_eq!(linked_task_at_line(content, 1), None);
+        assert_eq!(linked_task_at_line(content, 6), None);
+        assert_eq!(linked_task_at_line(content, 7), None);
+        assert_eq!(linked_task_at_line(content, 0), None);
+    }
+
+    /// `note.listTasks` returns a linked row's link label as its `text`, so a
+    /// label match must beat the `contains` fallback: two linked lines whose
+    /// labels share a substring each resolve to their own task.
+    #[test]
+    fn linked_task_for_text_prefers_a_label_match_over_the_contains_fallback() {
+        let content = "- [ ] [Ship It](intent://local/task/b2)\n\
+                       - [ ] [Ship](intent://local/task/a1)\n\
+                       - [ ] [Ship](intent://local/task/c3)";
+        assert_eq!(
+            linked_task_for_text(content, "Ship"),
+            Some("a1".to_string())
+        );
+        assert_eq!(
+            linked_task_for_text(content, " Ship "),
+            Some("a1".to_string())
+        );
+        assert_eq!(
+            linked_task_for_text(content, "Ship It"),
+            Some("b2".to_string())
+        );
+        // An exact line match still wins over a label match.
+        assert_eq!(
+            linked_task_for_text(content, "[Ship](intent://local/task/c3)"),
+            Some("c3".to_string())
+        );
+        // No label matches: the contains fallback still applies.
+        assert_eq!(linked_task_for_text(content, "Shi"), Some("b2".to_string()));
+    }
+
+    #[test]
+    fn checkbox_for_task_status_mapping() {
+        assert_eq!(checkbox_for_task_status(TaskStatus::Complete), "[x]");
+        assert_eq!(checkbox_for_task_status(TaskStatus::InProgress), "[/]");
+        for status in [
+            TaskStatus::NotStarted,
+            TaskStatus::Waiting,
+            TaskStatus::Blocked,
+            TaskStatus::DiscussionNeeded,
+            TaskStatus::ReviewRequired,
+            TaskStatus::Cancelled,
+        ] {
+            assert_eq!(checkbox_for_task_status(status), "[ ]", "{status:?}");
+        }
     }
 
     #[test]

@@ -2444,6 +2444,7 @@ async fn task_update_atomic_and_conflict() {
             None,
             Some("done".into()),
             Some("do the thing".into()),
+            None,
         )
         .await
         .expect("update");
@@ -2462,6 +2463,7 @@ async fn task_update_atomic_and_conflict() {
             None,
             Some("todo".into()),
             Some("stale text".into()),
+            None,
         )
         .await
         .unwrap_err();
@@ -2472,7 +2474,13 @@ async fn task_update_atomic_and_conflict() {
 async fn task_update_status_and_not_found() {
     let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
     let r = svc
-        .task_update_status(ws.clone(), id.clone(), "beta".into(), "in-progress".into())
+        .task_update_status(
+            ws.clone(),
+            id.clone(),
+            "beta".into(),
+            "in-progress".into(),
+            None,
+        )
         .await
         .expect("updateStatus");
     assert_eq!(r.status, "in-progress");
@@ -2481,7 +2489,7 @@ async fn task_update_status_and_not_found() {
         "- [ ] alpha\n- [/] beta"
     );
     assert!(svc
-        .task_update_status(ws, id, "ghost".into(), "done".into())
+        .task_update_status(ws, id, "ghost".into(), "done".into(), None)
         .await
         .is_err());
 }
@@ -4384,6 +4392,62 @@ async fn set_note_content_rejects_numbered_read_presentation_with_appended_lines
 
     let persisted = svc.get_note(ws, id).await.expect("get");
     assert_eq!(persisted.content, SPEC_MARKDOWN, "spec must be preserved");
+}
+
+#[tokio::test]
+async fn create_prerequisite_rejects_numbered_read_presentation() {
+    // `task.createPrerequisite` materializes note content outside the
+    // `note.*` surface; its `content` must hit the same guard and a rejected
+    // call must create no child note (monorepo#4299).
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let numbered = numbered_read_presentation(SPEC_MARKDOWN);
+    let before = svc.list_notes(&ws).await.expect("list").len();
+
+    let err = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Copied Step".into(),
+            Some(numbered),
+            None,
+            None,
+        )
+        .await
+        .expect_err("numbered read presentation must be rejected");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "guard surfaces as InvalidParams (-32602): {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("note.read") && msg.contains("rawContent"),
+        "remediation must name note.read and rawContent: {msg}"
+    );
+
+    let notes = svc.list_notes(&ws).await.expect("list");
+    assert_eq!(notes.len(), before, "rejected create must persist nothing");
+    assert!(notes.iter().all(|n| n.title != "Copied Step"));
+
+    // Raw Markdown (and an absent `content`) still create the child.
+    let r = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Raw Step".into(),
+            Some(SPEC_MARKDOWN.into()),
+            None,
+            None,
+        )
+        .await
+        .expect("raw Markdown content is accepted");
+    let child = svc
+        .get_note(ws.clone(), r.prerequisite_note_id)
+        .await
+        .expect("child");
+    assert_eq!(child.content, SPEC_MARKDOWN);
+    svc.create_prerequisite(ws, id, "Bare Step".into(), None, None, None)
+        .await
+        .expect("absent content is accepted");
 }
 
 #[tokio::test]
@@ -10196,6 +10260,1086 @@ mod change_event_parity {
 
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(quiet.is_err(), "healthy workspace must not fire adoption");
+    }
+
+    // -----------------------------------------------------------------------
+    // Linked-checkbox materialization (intent-hq/intent#4255): a checkbox that
+    // links a task note is a projection of that note's status, so every
+    // daemon-side status write rewrites the linked lines' markers.
+    // -----------------------------------------------------------------------
+
+    /// Insert a task note directly (no event) with the given status.
+    async fn insert_task_note(h: &Harness, id: &str, status: TaskStatus) {
+        let mut tn = note(&h.ws, id, "body");
+        tn.metadata.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        h.store.insert_note(&tn).await.expect("insert task note");
+    }
+
+    /// Flip a task note's status in the store only (no events, no
+    /// materialization) — stages "the task write already landed" for tests
+    /// that drive the materializer by hand.
+    async fn set_task_status_direct(h: &Harness, id: &str, status: TaskStatus) {
+        let mut tn = h
+            .store
+            .get_note(&h.ws, &intent_core::NoteId::from(id))
+            .await
+            .expect("get task note");
+        tn.metadata.task.as_mut().expect("task metadata").status = status;
+        h.store.update_note(&tn).await.expect("update task note");
+    }
+
+    async fn note_content(h: &Harness, id: &str) -> (String, i64) {
+        let n = h
+            .store
+            .get_note(&h.ws, &intent_core::NoteId::from(id))
+            .await
+            .expect("get note");
+        (n.content, n.rev)
+    }
+
+    async fn set_status(h: &Harness, id: &str, status: &str) {
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from(id),
+                status.to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("updateNoteStatus");
+    }
+
+    const T1: &str = "a1a1";
+    const T2: &str = "b2b2";
+    const FRESH: &str = "c3c3";
+
+    fn linked(marker: &str, label: &str, id: &str) -> String {
+        format!("- {marker} [{label}](intent://local/task/{id})")
+    }
+
+    #[tokio::test]
+    async fn update_note_status_materializes_linked_checkbox() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = format!("# Spec\n{}\n- [ ] plain", linked("[ ]", "T", T1));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        set_status(&h, T1, "complete").await;
+        let events = drain_events(&mut sub).await;
+
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(
+            content,
+            format!("# Spec\n{}\n- [ ] plain", linked("[x]", "T", T1))
+        );
+        assert_eq!(rev, rev_before + 1, "parent write bumps rev");
+        let updated = of_type(&events, "note:updated");
+        assert!(
+            updated.iter().any(|e| e["data"]["noteId"] == "spec"),
+            "note:updated for the spec expected, got {events:?}"
+        );
+        let rows = h
+            .services
+            .list_note_tasks(h.ws.clone(), intent_core::NoteId::from("spec"))
+            .await
+            .expect("listTasks");
+        let row = rows
+            .iter()
+            .find(|r| r.task_note_id.as_deref() == Some(T1))
+            .expect("linked row");
+        assert_eq!(row.status, "done");
+        assert_eq!(rows[1].status, "todo");
+    }
+
+    #[tokio::test]
+    async fn update_note_status_reverse_transitions_and_cancelled() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::Complete).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[x]", "T", T1)))
+            .await
+            .expect("insert spec");
+
+        set_status(&h, T1, "in_progress").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        set_status(&h, T1, "not_started").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+        set_status(&h, T1, "complete").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        set_status(&h, T1, "cancelled").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+    }
+
+    #[tokio::test]
+    async fn materialization_covers_every_linked_line_and_skips_unlinked_notes() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let spec_body = |m: &str| {
+            format!(
+                "{}\n  - [ ] nested plain\n{}\n{}",
+                linked(m, "T", T1),
+                linked("[ ]", "Other", T2),
+                linked(m, "T again", T1)
+            )
+        };
+        h.store
+            .insert_note(&note(&h.ws, "spec", &spec_body("[ ]")))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&note(&h.ws, "plan", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert plan");
+        let other_body = format!("{}\n- [ ] free", linked("[ ]", "O", T2));
+        h.store
+            .insert_note(&note(&h.ws, "other", &other_body))
+            .await
+            .expect("insert other");
+        let (_, other_rev) = note_content(&h, "other").await;
+
+        let mut sub = subscribe(&h);
+        set_status(&h, T1, "complete").await;
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(note_content(&h, "spec").await.0, spec_body("[x]"));
+        assert_eq!(note_content(&h, "plan").await.0, linked("[x]", "T", T1));
+        let (other_content, other_rev_after) = note_content(&h, "other").await;
+        assert_eq!(other_content, other_body);
+        assert_eq!(other_rev_after, other_rev, "unlinked note keeps its rev");
+        let updated: Vec<&Value> = of_type(&events, "note:updated");
+        assert!(updated.iter().any(|e| e["data"]["noteId"] == "spec"));
+        assert!(updated.iter().any(|e| e["data"]["noteId"] == "plan"));
+        assert!(
+            !updated.iter().any(|e| e["data"]["noteId"] == "other"),
+            "no note:updated for an unlinked note, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_char_status_write_does_not_rewrite_parent() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        // not_started → blocked keeps `[ ]`: no parent write, no event.
+        set_status(&h, T1, "blocked").await;
+        let events = drain_events(&mut sub).await;
+
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, linked("[ ]", "T", T1));
+        assert_eq!(rev, rev_before);
+        assert!(!of_type(&events, "note:updated")
+            .iter()
+            .any(|e| e["data"]["noteId"] == "spec"));
+    }
+
+    /// The workspace list a status write hands to materialization only selects
+    /// candidate parents; each parent is rewritten from a fresh, versioned
+    /// read. A snapshot that predates another task's materialized `[x]` and an
+    /// editor save must not revert either (lost-update race from the #1696
+    /// review).
+    #[tokio::test]
+    async fn materialization_writes_from_a_fresh_read_not_the_stale_snapshot() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let body = |a: &str, b: &str| format!("{}\n{}", linked(a, "A", T1), linked(b, "B", T2));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]", "[ ]")))
+            .await
+            .expect("insert spec");
+
+        // B's status write lists the workspace before A's parent write lands.
+        let stale = h.store.list_notes(&h.ws).await.expect("list");
+        set_status(&h, T1, "complete").await;
+        // An editor save lands in the same window.
+        let mut edited = h.store.get_note(&h.ws, &spec_id()).await.expect("get spec");
+        edited.content = format!("{}\n- [ ] added by editor", body("[x]", "[ ]"));
+        h.store.update_note(&edited).await.expect("editor save");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        set_task_status_direct(&h, T2, TaskStatus::Complete).await;
+        h.services
+            .materialize_linked_checkboxes_in(&h.ws, &intent_core::NoteId::from(T2), stale)
+            .await;
+        let events = drain_events(&mut sub).await;
+
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(
+            content,
+            format!("{}\n- [ ] added by editor", body("[x]", "[x]")),
+            "A's marker and the editor's line survive B's materialization"
+        );
+        assert_eq!(rev, rev_before + 1, "exactly one versioned parent write");
+        assert!(of_type(&events, "note:updated")
+            .iter()
+            .any(|e| e["data"]["noteId"] == "spec"));
+    }
+
+    /// Two linked tasks in one parent completing concurrently (the
+    /// `after_all` delegation-group case) both end up materialized.
+    #[tokio::test]
+    async fn concurrent_status_writes_in_one_parent_both_materialize() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let body = |a: &str, b: &str| format!("{}\n{}", linked(a, "A", T1), linked(b, "B", T2));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]", "[ ]")))
+            .await
+            .expect("insert spec");
+
+        tokio::join!(
+            set_status(&h, T1, "complete"),
+            set_status(&h, T2, "complete")
+        );
+
+        assert_eq!(note_content(&h, "spec").await.0, body("[x]", "[x]"));
+        let rows = h
+            .services
+            .list_note_tasks(h.ws.clone(), spec_id())
+            .await
+            .expect("listTasks");
+        assert!(rows.iter().all(|r| r.status == "done"), "{rows:?}");
+    }
+
+    /// Two transitions of the same task racing (`complete`, then
+    /// `in_progress`): a delayed materialization for the earlier write must
+    /// not stamp its stale `[x]` over the `[/]` the later one already
+    /// projected — the marker is derived from the task's status at write
+    /// time, not from the status the caller captured (#1696 review).
+    #[tokio::test]
+    async fn delayed_materialization_projects_the_current_task_status_not_the_stale_one() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+
+        // The first write lists the workspace, then stalls before its parent
+        // write while a second transition lands and materializes.
+        let stale = h.store.list_notes(&h.ws).await.expect("list");
+        set_status(&h, T1, "complete").await;
+        set_status(&h, T1, "in_progress").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .materialize_linked_checkboxes_in(&h.ws, &intent_core::NoteId::from(T1), stale)
+            .await;
+        let events = drain_events(&mut sub).await;
+
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(
+            content,
+            linked("[/]", "T", T1),
+            "the delayed write projects the task's current status"
+        );
+        assert_eq!(rev, rev_before, "marker already current: no parent write");
+        assert_eq!(spec_updates(&events), 0, "{events:?}");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_materializes_linked_checkbox() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = format!("{}\n- [ ] plain", linked("[ ]", "T", T1));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from(T1),
+                "complete".to_string(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            format!("{}\n- [ ] plain", linked("[x]", "T", T1))
+        );
+        assert!(of_type(&events, "note:updated")
+            .iter()
+            .any(|e| e["data"]["noteId"] == "spec"));
+
+        // A fresh markAsTask (note was not a task yet) materializes too.
+        h.store
+            .insert_note(&note(&h.ws, FRESH, "body"))
+            .await
+            .expect("insert fresh");
+        h.store
+            .insert_note(&note(&h.ws, "spec2", &linked("[ ]", "F", FRESH)))
+            .await
+            .expect("insert spec2");
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from(FRESH),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask fresh");
+        assert_eq!(note_content(&h, "spec2").await.0, linked("[/]", "F", FRESH));
+    }
+
+    #[tokio::test]
+    async fn assign_agent_materializes_linked_checkbox() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = format!("{}\n- [ ] plain", linked("[ ]", "T", T1));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .assign_agent(
+                h.ws.clone(),
+                intent_core::NoteId::from(T1),
+                "agent-b0a8044a-5eac-4b52-8456-15d3b784decb".to_string(),
+                None,
+            )
+            .await
+            .expect("assignAgent");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            format!("{}\n- [ ] plain", linked("[/]", "T", T1))
+        );
+        assert!(of_type(&events, "note:updated")
+            .iter()
+            .any(|e| e["data"]["noteId"] == "spec"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkbox-level writes on linked lines redirect to the task note
+    // (intent-hq/intent#4255): `task.updateStatus` / `task.update` write the
+    // task's metadata status, the char follows via materialization.
+    // -----------------------------------------------------------------------
+
+    async fn task_status(h: &Harness, id: &str) -> TaskStatus {
+        h.store
+            .get_note(&h.ws, &intent_core::NoteId::from(id))
+            .await
+            .expect("get task note")
+            .metadata
+            .task
+            .expect("task metadata")
+            .status
+    }
+
+    fn spec_updates(events: &[Value]) -> usize {
+        of_type(events, "note:updated")
+            .iter()
+            .filter(|e| e["data"]["noteId"] == "spec")
+            .count()
+    }
+
+    fn spec_id() -> intent_core::NoteId {
+        intent_core::NoteId::from("spec")
+    }
+
+    #[tokio::test]
+    async fn update_status_on_linked_line_redirects_to_task_note() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = |m: &str| format!("# Spec\n{}\n- [ ] plain", linked(m, "T", T1));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]")))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(r.task_text, "T");
+        assert_eq!(r.note_id, spec_id());
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, body("[x]"));
+        assert_eq!(rev, rev_before + 1, "exactly one parent write");
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T1);
+        assert_eq!(changed[0]["data"]["previousStatus"], "not_started");
+        assert_eq!(changed[0]["data"]["newStatus"], "complete");
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+
+        // The unlinked line on the same note keeps the raw path: no task write.
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(
+                h.ws.clone(),
+                spec_id(),
+                "plain".into(),
+                "in-progress".into(),
+                None,
+            )
+            .await
+            .expect("updateStatus plain");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(r.status, "in-progress");
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            format!("# Spec\n{}\n- [/] plain", linked("[x]", "T", T1))
+        );
+        assert!(of_type(&events, "task:status-changed").is_empty());
+        assert_eq!(spec_updates(&events), 1);
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+    }
+
+    /// `NoteId` is an arbitrary string. A linked row whose id is not a
+    /// hex/dash shape (`task-a`) passes the materialization prefilter
+    /// (`extract_spec_task_ids`) and must be rewritten and redirected like
+    /// a UUID-shaped one — not left with a stale marker / raw fallback.
+    #[tokio::test]
+    async fn non_hex_linked_task_ids_materialize_and_redirect() {
+        const ID: &str = "task-a";
+        let h = harness().await;
+        insert_task_note(&h, ID, TaskStatus::NotStarted).await;
+        let body = |m: &str| format!("# Spec\n{}\n- [ ] plain", linked(m, "T", ID));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]")))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        // Task-side status write → the parent's marker follows.
+        set_status(&h, ID, "in_progress").await;
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, body("[/]"));
+        assert_eq!(rev, rev_before + 1, "materialization writes the parent");
+
+        // Parent-side checkbox write on the linked line → redirected to the
+        // task, no raw checkbox write.
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(r.status, "done");
+        assert_eq!(task_status(&h, ID).await, TaskStatus::Complete);
+        assert_eq!(note_content(&h, "spec").await.0, body("[x]"));
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], ID);
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+
+        // listTasks projects the link too.
+        let rows = h
+            .services
+            .list_note_tasks(h.ws.clone(), spec_id())
+            .await
+            .expect("listTasks");
+        let row = rows.iter().find(|r| r.text == "T").expect("linked row");
+        assert_eq!(row.linked_task_note_id.as_deref(), Some(ID));
+    }
+
+    #[tokio::test]
+    async fn task_update_on_linked_line_redirects_status_to_task_note() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+        let link = format!("[T](intent://local/task/{T1})");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("in-progress".into()),
+                Some(link.clone()),
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "in-progress");
+        assert_eq!(r.line_number, 1);
+        assert_eq!(r.previous_text, link);
+        assert_eq!(r.new_text, link);
+        assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T1);
+        assert_eq!(changed[0]["data"]["newStatus"], "in_progress");
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+
+        // `expected` mismatch still conflicts before anything is written.
+        let err = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("done".into()),
+                Some("stale".into()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, intent_core::Error::Internal(ref m) if m.contains("Conflict detected"))
+        );
+        assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+    }
+
+    #[tokio::test]
+    async fn task_update_text_and_status_on_linked_line_writes_parent_once() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(
+                &h.ws,
+                "spec",
+                &format!("{}\n- [ ] plain", linked("[ ]", "T", T1)),
+            ))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+        let new_text = format!("[Renamed](intent://local/task/{T1}) more");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                Some(new_text.clone()),
+                Some("done".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(r.previous_text, format!("[T](intent://local/task/{T1})"));
+        assert_eq!(r.new_text, new_text);
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, format!("- [x] {new_text}\n- [ ] plain"));
+        assert_eq!(
+            rev,
+            rev_before + 1,
+            "text edit and materialized char land in one parent write"
+        );
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+        assert_eq!(of_type(&events, "task:status-changed").len(), 1);
+    }
+
+    /// `text` that retargets the line's link from task A to task B: the
+    /// redirect resolves against the post-edit line, so the status write
+    /// lands on B, the line carries B's marker, and A is untouched (#1696
+    /// review).
+    #[tokio::test]
+    async fn task_update_retargeting_the_link_redirects_status_to_the_new_task() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "A", T1)))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+        let new_text = format!("[B](intent://local/task/{T2})");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                Some(new_text.clone()),
+                Some("done".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(r.previous_text, format!("[A](intent://local/task/{T1})"));
+        assert_eq!(r.new_text, new_text);
+        assert_eq!(task_status(&h, T2).await, TaskStatus::Complete);
+        assert_eq!(
+            task_status(&h, T1).await,
+            TaskStatus::NotStarted,
+            "the former target is no longer linked here"
+        );
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, linked("[x]", "B", T2));
+        assert_eq!(rev, rev_before + 1, "one parent write");
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T2);
+        assert_eq!(changed[0]["data"]["newStatus"], "complete");
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+    }
+
+    /// A text-only retarget to a task in a different status renders that
+    /// task's marker: the char is a projection of the (new) linked task.
+    #[tokio::test]
+    async fn task_update_text_only_retarget_renders_the_new_tasks_marker() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::InProgress).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "A", T1)))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+        let new_text = format!("[B](intent://local/task/{T2})");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                Some(new_text.clone()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "in-progress");
+        assert_eq!(r.new_text, new_text);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, linked("[/]", "B", T2));
+        assert_eq!(rev, rev_before + 1, "one parent write");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::NotStarted);
+        assert_eq!(task_status(&h, T2).await, TaskStatus::InProgress);
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn todo_on_linked_line_preserves_detailed_task_status() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::Blocked).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into(), None)
+            .await
+            .expect("updateStatus todo");
+        let r2 = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("todo".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update todo");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "todo");
+        assert_eq!(r2.status, "todo");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Blocked);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, linked("[ ]", "T", T1));
+        assert_eq!(
+            rev, rev_before,
+            "no parent write when the char already projects the status"
+        );
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 0, "{events:?}");
+
+        // From a status projecting a different char, `todo` reopens to not_started.
+        set_status(&h, T1, "complete").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into(), None)
+            .await
+            .expect("updateStatus reopen");
+        assert_eq!(r.status, "todo");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::NotStarted);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+
+        set_status(&h, T1, "in_progress").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("todo".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update reopen");
+        assert_eq!(r.status, "todo");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::NotStarted);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+    }
+
+    #[tokio::test]
+    async fn linked_line_write_heals_a_diverged_char() {
+        // The task is already complete but the line still reads `[ ]`: `done`
+        // is a no-op on the task and rewrites the char via materialization.
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::Complete).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn dangling_task_link_keeps_the_raw_checkbox_write() {
+        let h = harness().await;
+        // FRESH exists but is not a task; `d4d4` does not exist at all.
+        h.store
+            .insert_note(&note(&h.ws, FRESH, "body"))
+            .await
+            .expect("insert fresh");
+        let body =
+            |a: &str, b: &str| format!("{}\n{}", linked(a, "F", FRESH), linked(b, "G", "d4d4"));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]", "[ ]")))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_status(h.ws.clone(), spec_id(), "F".into(), "done".into(), None)
+            .await
+            .expect("updateStatus");
+        h.services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                2,
+                None,
+                Some("in-progress".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(note_content(&h, "spec").await.0, body("[x]", "[/]"));
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 2, "{events:?}");
+        let fresh = h
+            .store
+            .get_note(&h.ws, &intent_core::NoteId::from(FRESH))
+            .await
+            .expect("get fresh");
+        assert!(fresh.metadata.task.is_none());
+    }
+
+    fn attribution_recompute_scheduled(h: &Harness, id: &str) -> bool {
+        h.services
+            .line_attribution_debouncers
+            .lock()
+            .expect("debouncer lock")
+            .contains_key(&(h.ws.clone(), intent_core::NoteId::from(id)))
+    }
+
+    fn seed_crdt_session(h: &Harness, id: &str, content: &str) {
+        let nid = intent_core::NoteId::from(id);
+        h.services
+            .crdt_notes
+            .apply_full_content(&h.ws, &nid, content, content);
+        assert!(h.services.crdt_notes.has_session(&h.ws, &nid));
+    }
+
+    /// A materialized parent write is a surgical content mutation like
+    /// `note.edit`: it drops the parent's cached CRDT session (so the next
+    /// `note.setContent` reseeds from the persisted marker) and schedules its
+    /// line-attribution recompute. Parents left untouched — and the task note
+    /// itself — keep their sessions and schedule nothing.
+    #[tokio::test]
+    async fn materialization_invalidates_parent_crdt_and_schedules_attribution_recompute() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let body = linked("[ ]", "T", T1);
+        let other = linked("[ ]", "Other", T2);
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&note(&h.ws, FRESH, &other))
+            .await
+            .expect("insert other");
+        seed_crdt_session(&h, "spec", &body);
+        seed_crdt_session(&h, FRESH, &other);
+
+        set_status(&h, T1, "complete").await;
+
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        assert!(
+            !h.services.crdt_notes.has_session(&h.ws, &spec_id()),
+            "rewritten parent drops its CRDT session"
+        );
+        assert!(
+            attribution_recompute_scheduled(&h, "spec"),
+            "rewritten parent schedules a line-attribution recompute"
+        );
+        assert!(h
+            .services
+            .crdt_notes
+            .has_session(&h.ws, &intent_core::NoteId::from(FRESH)));
+        assert!(!attribution_recompute_scheduled(&h, FRESH));
+        assert!(!attribution_recompute_scheduled(&h, T1));
+
+        // The marker already matches: no rewrite, so no invalidation either.
+        seed_crdt_session(&h, "spec", &linked("[x]", "T", T1));
+        set_status(&h, T1, "complete").await;
+        assert!(h.services.crdt_notes.has_session(&h.ws, &spec_id()));
+    }
+
+    /// Redirected writes through `task.updateStatus` / `task.update` behave as
+    /// on every other materializing path: the redirect target's parents are
+    /// invalidated too (here the parent is the note the call addressed).
+    #[tokio::test]
+    async fn redirected_write_invalidates_parent_crdt() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = linked("[ ]", "T", T1);
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        seed_crdt_session(&h, "spec", &body);
+
+        h.services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("done".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        assert!(!h.services.crdt_notes.has_session(&h.ws, &spec_id()));
+        assert!(attribution_recompute_scheduled(&h, "spec"));
+    }
+
+    /// A redirected checkbox write from an agent caller carries the same
+    /// provenance as `task.updateNoteStatus`: `task:status-changed` names the
+    /// agent (payload `agentId` + agent actor) and a complete-boundary crossing
+    /// records / removes the agent's flipped-completion pair. A caller-less
+    /// write (FE/RPC front door) carries neither.
+    #[tokio::test]
+    async fn redirected_writes_carry_agent_provenance_and_flipped_completion() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::InProgress).await;
+        insert_task_note(&h, T2, TaskStatus::InProgress).await;
+        let body = format!("{}\n{}", linked("[/]", "T", T1), linked("[/]", "U", T2));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        let agent = AgentId::from("agent-redirect");
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent, &h.ws, "Redirector"))
+            .await
+            .expect("session");
+        let flipped = || async {
+            h.store
+                .list_agent_flipped_completions(&agent)
+                .await
+                .expect("list flipped")
+        };
+        let t1 = intent_core::NoteId::from(T1);
+        let t2 = intent_core::NoteId::from(T2);
+
+        // task.updateStatus → complete: provenance + recorded pair.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_status(
+                h.ws.clone(),
+                spec_id(),
+                "T".into(),
+                "done".into(),
+                Some(agent.clone()),
+            )
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T1);
+        assert_eq!(changed[0]["data"]["newStatus"], "complete");
+        assert_eq!(changed[0]["data"]["agentId"], "agent-redirect");
+        assert_eq!(
+            changed[0]["actor"],
+            json!({ "type": "agent", "id": "agent-redirect", "name": "Redirector" })
+        );
+        assert_eq!(flipped().await, vec![(h.ws.clone(), t1.clone())]);
+
+        // task.update → complete on the second line: same provenance.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                2,
+                None,
+                Some("done".into()),
+                None,
+                Some(agent.clone()),
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T2);
+        assert_eq!(changed[0]["data"]["agentId"], "agent-redirect");
+        assert_eq!(
+            changed[0]["actor"],
+            json!({ "type": "agent", "id": "agent-redirect", "name": "Redirector" })
+        );
+        let mut pairs = flipped().await;
+        pairs.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
+        assert_eq!(
+            pairs,
+            vec![(h.ws.clone(), t1.clone()), (h.ws.clone(), t2.clone())]
+        );
+
+        // Reopening through a redirected write removes the pair.
+        h.services
+            .task_update_status(
+                h.ws.clone(),
+                spec_id(),
+                "T".into(),
+                "todo".into(),
+                Some(agent.clone()),
+            )
+            .await
+            .expect("updateStatus todo");
+        assert_eq!(flipped().await, vec![(h.ws.clone(), t2.clone())]);
+
+        // No caller: system-attributed event, nothing recorded.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
+            .await
+            .expect("updateStatus no caller");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert!(changed[0]["data"].get("agentId").is_none());
+        assert_eq!(changed[0]["actor"]["type"], "system");
+        assert_eq!(flipped().await, vec![(h.ws.clone(), t2)]);
     }
 }
 
@@ -28638,18 +29782,32 @@ mod line_attribution_hooks {
     #[tokio::test]
     async fn task_update_status_schedules_recompute() {
         let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
-        svc.task_update_status(ws.clone(), id.clone(), "beta".into(), "in-progress".into())
-            .await
-            .expect("updateStatus");
+        svc.task_update_status(
+            ws.clone(),
+            id.clone(),
+            "beta".into(),
+            "in-progress".into(),
+            None,
+        )
+        .await
+        .expect("updateStatus");
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
 
     #[tokio::test]
     async fn task_update_schedules_recompute() {
         let (_tmp, svc, ws, id) = setup("- [ ] alpha").await;
-        svc.task_update(ws.clone(), id.clone(), 1, None, Some("done".into()), None)
-            .await
-            .expect("task.update");
+        svc.task_update(
+            ws.clone(),
+            id.clone(),
+            1,
+            None,
+            Some("done".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("task.update");
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
 

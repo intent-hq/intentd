@@ -35,13 +35,13 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS,
-    DEFAULT_MAX_TOP_LEVEL_AGENTS, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
-    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
-    MAX_CONCURRENT_ADAPTERS_LIMIT,
+    ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN, DEFAULT_HOOKS_MAX_PER_AGENT,
+    DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
+    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_POLL_SECONDS,
+    DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT, MAX_CONCURRENT_ADAPTERS_LIMIT,
 };
 use crate::error::{Error, Result};
 
@@ -684,6 +684,16 @@ pub struct AgentsSettings {
     /// positive = budget in MB (changes apply on daemon restart; max
     /// 1,024,000).
     pub memory_budget_mb: Option<u32>,
+    /// `agents.acpNodeMaxOldSpaceMb` — V8 `--max-old-space-size` cap in MB
+    /// injected via `NODE_OPTIONS` into Node/Electron ACP provider processes.
+    /// Absent (`None`, the default) = [`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB`]
+    /// (8192); an explicit value must lie within
+    /// [`ACP_NODE_MAX_OLD_SPACE_MB_MIN`]–[`ACP_NODE_MAX_OLD_SPACE_MB_MAX`].
+    /// Applies to newly started agent processes; the
+    /// `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var overrides it.
+    ///
+    /// [`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB`]: crate::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB
+    pub acp_node_max_old_space_mb: Option<u32>,
     /// `agents.maxConcurrentAdapters` — daemon-wide cap on concurrently live
     /// ephemeral ACP adapters (one-shot `agent.completeOnce` completions and
     /// model probes; changes apply on daemon restart; range 1–64). Unlike
@@ -726,6 +736,7 @@ impl Default for AgentsSettings {
         Self {
             max_concurrent: 0,
             memory_budget_mb: None,
+            acp_node_max_old_space_mb: None,
             max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
             max_top_level_agents: DEFAULT_MAX_TOP_LEVEL_AGENTS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
@@ -1256,6 +1267,17 @@ impl SettingsFile {
                 ));
             }
         }
+        if let Some(mb) = self.agents.acp_node_max_old_space_mb {
+            if !(ACP_NODE_MAX_OLD_SPACE_MB_MIN..=ACP_NODE_MAX_OLD_SPACE_MB_MAX).contains(&mb) {
+                return Err(bad(
+                    "agents.acpNodeMaxOldSpaceMb",
+                    &format!(
+                        "must be absent (default {}) or between {ACP_NODE_MAX_OLD_SPACE_MB_MIN} and {ACP_NODE_MAX_OLD_SPACE_MB_MAX}, got {mb}",
+                        crate::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB
+                    ),
+                ));
+            }
+        }
         // No `0` escape hatch here (unlike maxOutstandingRpcs): an unbounded
         // adapter spawn is the monorepo#2062 failure itself, so a hand-edited
         // config.toml cannot boot without a ceiling.
@@ -1582,6 +1604,11 @@ maxConcurrent = 0
 # workload grows (a test suite) is never re-checked and can carry the tree
 # past the budget by itself.
 # memoryBudgetMb = 8192
+# ACP Node heap limit (MB) -- V8 --max-old-space-size cap injected via
+# NODE_OPTIONS into Node/Electron ACP provider processes (1024-65536; applies
+# to newly started agent processes). Absent (the default, as in this file) =
+# 8192. The INTENTD_ACP_NODE_MAX_OLD_SPACE_MB env var overrides it.
+# acpNodeMaxOldSpaceMb = 8192
 # Max concurrent adapters -- daemon-wide cap on concurrently live ephemeral ACP
 # adapters (one-shot completions and model probes). Each costs ~610 MB and
 # holds no agent slot; over-limit calls queue and fail with "adapter-busy" if
@@ -2633,6 +2660,48 @@ mod tests {
             SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 1024000\n").is_ok(),
             "the upper bound itself is legal"
         );
+    }
+
+    /// The `agents.acpNodeMaxOldSpaceMb` parse matrix: an absent key is the
+    /// default (`None`, resolved to 8192 by the spawn path), an in-range value
+    /// is an explicit MB cap, both bounds are legal, and out-of-range values
+    /// are rejected naming the key.
+    #[test]
+    fn acp_node_max_old_space_mb_absent_default_in_range_explicit() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.agents.acp_node_max_old_space_mb, None,
+            "absent key = default"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TEMPLATE.contains("\nacpNodeMaxOldSpaceMb ="),
+            "the template for new installs must not write the key (default)"
+        );
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("# acpNodeMaxOldSpaceMb = 8192"),
+            "the template documents the key as a commented-out example"
+        );
+
+        let overridden = SettingsFile::parse_str("[agents]\nacpNodeMaxOldSpaceMb = 16384\n")
+            .expect("override parses");
+        assert_eq!(overridden.agents.acp_node_max_old_space_mb, Some(16_384));
+
+        for bound in [ACP_NODE_MAX_OLD_SPACE_MB_MIN, ACP_NODE_MAX_OLD_SPACE_MB_MAX] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agents]\nacpNodeMaxOldSpaceMb = {bound}\n"))
+                    .expect("both bounds are legal");
+            assert_eq!(parsed.agents.acp_node_max_old_space_mb, Some(bound));
+        }
+
+        for bad in ["0", "1023", "65537"] {
+            let err = SettingsFile::parse_str(&format!("[agents]\nacpNodeMaxOldSpaceMb = {bad}\n"))
+                .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("agents.acpNodeMaxOldSpaceMb") && msg.contains(bad),
+                "error names the offending key and value: {msg}"
+            );
+        }
     }
 
     /// The ephemeral-adapter bound ships enabled: an empty file and the

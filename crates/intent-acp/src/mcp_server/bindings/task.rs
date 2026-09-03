@@ -62,9 +62,9 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "updateStatus" => update_status(api, ws, args).await,
+        "updateStatus" => update_status(api, ws, caller_agent_id, args).await,
         "updateNoteStatus" => update_note_status(api, ws, caller_agent_id, args).await,
-        "update" => update(api, ws, args).await,
+        "update" => update(api, ws, caller_agent_id, args).await,
         "getMyTask" => get_my_task(api, ws, args).await,
         "markAsTask" => mark_as_task(api, ws, caller_agent_id, args).await,
         "setRelations" => set_relations(api, ws, args).await,
@@ -78,6 +78,7 @@ pub(crate) async fn dispatch(
 async fn update_status(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let note_id = req_str(args, "noteId").map_err(|_| "Note ID is required".to_string())?;
@@ -89,7 +90,13 @@ async fn update_status(
         return Err("Status must be 'done', 'todo', or 'in-progress'".to_string());
     }
     let r = api
-        .task_update_status(ws.clone(), NoteId::from_string(&note_id), task_text, status)
+        .task_update_status(
+            ws.clone(),
+            NoteId::from_string(&note_id),
+            task_text,
+            status,
+            caller_agent_id.cloned(),
+        )
         .await
         .map_err(map_err)?;
     serde_json::to_value(r).map_err(|e| e.to_string())
@@ -125,6 +132,7 @@ async fn update_note_status(
 async fn update(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let note_id = req_str(args, "noteId").map_err(|_| "Note ID is required".to_string())?;
@@ -151,6 +159,7 @@ async fn update(
             text,
             status,
             expected,
+            caller_agent_id.cloned(),
         )
         .await
         .map_err(map_err)?;

@@ -752,7 +752,7 @@ fn v8_runtime_node_options_heap_cap() {
     std::env::remove_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB");
 
     // Default cap is 8192 for every Node/Electron provider.
-    assert_eq!(args::max_old_space_mb(), 8192);
+    assert_eq!(args::max_old_space_mb(None), 8192);
     for id in [
         "auggie",
         "claude-code",
@@ -780,21 +780,77 @@ fn v8_runtime_node_options_heap_cap() {
     // same provider without the signal (resolved native binary) stays
     // untouched (intent-hq/monorepo#1661).
     let codex = find_provider("codex").unwrap();
-    let codex_via_npx = args::build_provider_env_for_spawn(codex, None, None, None, None, true);
+    let codex_via_npx =
+        args::build_provider_env_for_spawn(codex, None, None, None, None, true, None);
     assert_eq!(
         codex_via_npx.get("NODE_OPTIONS").map(String::as_str),
         Some("--max-old-space-size=8192"),
         "codex npx-fallback spawn must get the heap cap"
     );
-    let codex_native = args::build_provider_env_for_spawn(codex, None, None, None, None, false);
+    let codex_native =
+        args::build_provider_env_for_spawn(codex, None, None, None, None, false, None);
     assert!(
         !codex_native.contains_key("NODE_OPTIONS"),
         "codex resolved-binary spawn must not get NODE_OPTIONS"
     );
 
-    // Override seam produces the requested cap for all V8 providers.
+    // `agents.acpNodeMaxOldSpaceMb` setting (no env override): the supplied
+    // cap replaces the default for V8 providers and npx spawns alike, while
+    // native runtimes still get nothing (intent-hq/intent#4330).
+    assert_eq!(args::max_old_space_mb(Some(4096)), 4096);
+    let env_for_spawn = |id: &str, via_npx: bool, cap: Option<u32>| {
+        args::build_provider_env_for_spawn(
+            find_provider(id).unwrap(),
+            None,
+            None,
+            None,
+            None,
+            via_npx,
+            cap,
+        )
+    };
+    for id in [
+        "auggie",
+        "claude-code",
+        "opencode",
+        "unsloth",
+        "cortex",
+        "mock",
+    ] {
+        assert_eq!(
+            env_for_spawn(id, false, Some(4096))
+                .get("NODE_OPTIONS")
+                .map(String::as_str),
+            Some("--max-old-space-size=4096"),
+            "provider {id} should honor the configured setting"
+        );
+    }
+    assert_eq!(
+        env_for_spawn("codex", true, Some(4096))
+            .get("NODE_OPTIONS")
+            .map(String::as_str),
+        Some("--max-old-space-size=4096"),
+        "codex npx-fallback spawn should honor the configured setting"
+    );
+    for id in ["codex", "droid", "grok"] {
+        assert!(
+            !env_for_spawn(id, false, Some(4096)).contains_key("NODE_OPTIONS"),
+            "native provider {id} must not get NODE_OPTIONS even with a setting"
+        );
+    }
+
+    // Override seam produces the requested cap for all V8 providers, and
+    // wins over the setting.
     std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "4096");
-    assert_eq!(args::max_old_space_mb(), 4096);
+    assert_eq!(args::max_old_space_mb(None), 4096);
+    assert_eq!(args::max_old_space_mb(Some(2048)), 4096);
+    assert_eq!(
+        env_for_spawn("mock", false, Some(2048))
+            .get("NODE_OPTIONS")
+            .map(String::as_str),
+        Some("--max-old-space-size=4096"),
+        "env override must win over the configured setting"
+    );
     for id in [
         "auggie",
         "claude-code",
@@ -810,9 +866,11 @@ fn v8_runtime_node_options_heap_cap() {
         );
     }
 
-    // Unparseable override falls back to the default (WARN logged).
+    // Unparseable override falls back to the setting when supplied, else the
+    // default (WARN logged either way).
     std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "not-a-number");
-    assert_eq!(args::max_old_space_mb(), 8192);
+    assert_eq!(args::max_old_space_mb(None), 8192);
+    assert_eq!(args::max_old_space_mb(Some(2048)), 2048);
     std::env::remove_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB");
 
     // Parent NODE_OPTIONS is appended to, not clobbered.

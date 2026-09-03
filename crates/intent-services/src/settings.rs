@@ -1480,6 +1480,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             token_impact: None,
         },
         number(
+            "agents.acpNodeMaxOldSpaceMb",
+            "ACP Node heap limit (MB)",
+            "V8 --max-old-space-size cap in MB injected via NODE_OPTIONS into Node/Electron ACP provider processes (applies to newly started agent processes; the INTENTD_ACP_NODE_MAX_OLD_SPACE_MB env var overrides this setting)",
+            "agents",
+            Some(f64::from(intent_core::config::ACP_NODE_MAX_OLD_SPACE_MB_MIN)),
+            Some(f64::from(intent_core::config::ACP_NODE_MAX_OLD_SPACE_MB_MAX)),
+            f64::from(intent_core::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB),
+        ),
+        number(
             "agents.maxConcurrentAdapters",
             "Max concurrent one-shot adapters",
             "Daemon-wide cap on concurrently live ephemeral ACP adapters (one-shot completions and model probes). Each costs ~610 MB and holds no agent slot; over-limit calls queue and fail with error.data.code \"adapter-busy\" if their own timeout expires first (changes apply on daemon restart)",
@@ -2914,6 +2923,138 @@ mod tests {
             ))
             .expect("a config.toml from a larger seat must still parse, not refuse to boot");
             assert_eq!(parsed.agents.memory_budget_mb, Some(over_ram as u32));
+        }
+    }
+
+    /// `agents.acpNodeMaxOldSpaceMb` is a TOML-backed bounded number (default
+    /// 8192, min 1024, max 65536) whose default is the *absent* key: the
+    /// catalog advertises the default the spawn path resolves to, while the
+    /// registry reads `null` until the key is written. It persists through
+    /// `settings.update` to config.toml (never `SQLite`) and rejects
+    /// out-of-range values.
+    #[tokio::test]
+    #[allow(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
+    async fn agents_acp_node_max_old_space_mb_round_trip_via_registry() {
+        let path = "agents.acpNodeMaxOldSpaceMb";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(min),
+                max: Some(max)
+            } if min == 1024.0 && max == 65_536.0
+        ));
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert_eq!(def.label, "ACP Node heap limit (MB)");
+        assert_eq!(def.default_value, Some(json!(8192.0)));
+        assert_eq!(
+            intent_core::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB,
+            8192,
+            "catalog default must track the shipped constant"
+        );
+        assert!(
+            def.description
+                .contains("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB"),
+            "description names the env override"
+        );
+        assert!(KNOWN_PATHS.contains(&path));
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-acpheap-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-acpheap-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Absent key: `null` value with `default` origin; the catalog default
+        // is what the spawn path resolves to.
+        let got = svc.get(path).await.expect("get default");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+        assert_eq!(got["definition"]["defaultValue"], json!(8192.0));
+        assert_eq!(
+            registry
+                .snapshot()
+                .effective
+                .agents
+                .acp_node_max_old_space_mb,
+            None
+        );
+        let listed = svc.list().await.expect("list");
+        assert!(
+            listed["settings"]
+                .as_array()
+                .expect("list is an array")
+                .iter()
+                .any(|entry| entry["path"] == json!(path)),
+            "settings.list must carry the new path"
+        );
+
+        // An updated cap persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([{ "path": path, "value": 16384 }]))
+            .await
+            .expect("update to 16384");
+        let got = svc.get(path).await.expect("get updated");
+        assert_eq!(got["value"], json!(16_384.0));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("acpNodeMaxOldSpaceMb = 16384"), "{text}");
+        assert_eq!(
+            store.get_setting(path).await.expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .effective
+                .agents
+                .acp_node_max_old_space_mb,
+            Some(16_384)
+        );
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(reloaded.get(path), Some(json!(16_384)));
+
+        // Out-of-range and wrong-type values are rejected.
+        svc.update(&json!([{ "path": path, "value": 65_537 }]))
+            .await
+            .expect_err("over max must be rejected");
+        svc.update(&json!([{ "path": path, "value": 1023 }]))
+            .await
+            .expect_err("under min must be rejected");
+        svc.update(&json!([{ "path": path, "value": 0 }]))
+            .await
+            .expect_err("0 is not an off value here");
+        svc.update(&json!([{ "path": path, "value": "8192" }]))
+            .await
+            .expect_err("non-number must be rejected");
+        let got = svc.get(path).await.expect("get after rejected updates");
+        assert_eq!(
+            got["value"],
+            json!(16_384.0),
+            "rejected writes leave the value untouched"
+        );
+
+        // Reset removes the key and restores the absent default.
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], serde_json::Value::Null);
+        let got = svc.get(path).await.expect("get after reset");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("acpNodeMaxOldSpaceMb"), "{text}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
         }
     }
 

@@ -63,6 +63,12 @@ pub struct SpawnOptions<'a> {
     /// The package spec to pass to npx when `npx_fallback_binary` is set (may
     /// carry a pinned `@<version>` suffix).
     pub npx_fallback_package: Option<&'static str>,
+    /// The `agents.acpNodeMaxOldSpaceMb` setting at spawn time: the V8
+    /// `--max-old-space-size` cap (MB) injected via `NODE_OPTIONS` for
+    /// Node/Electron children (and npx spawns). `None` means unset — the
+    /// built-in 8192 MB default applies. The `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB`
+    /// env var still overrides either. Native runtimes ignore it.
+    pub node_max_old_space_mb: Option<u32>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -95,6 +101,7 @@ impl<'a> SpawnOptions<'a> {
             tools_to_remove: Vec::new(),
             npx_fallback_binary: None,
             npx_fallback_package: None,
+            node_max_old_space_mb: None,
         }
     }
 }
@@ -207,6 +214,7 @@ fn build_command_with_captured_env(
         opts.env_mcp_config,
         opts.unsloth_endpoint,
         via_npx,
+        opts.node_max_old_space_mb,
     );
     for (key, value) in &provider_env {
         cmd.env(key, value);
@@ -836,6 +844,37 @@ mod build_command_tests {
                 "NODE_OPTIONS must carry the heap cap, got: {v}"
             );
         }
+    }
+
+    #[test]
+    fn build_command_threads_configured_heap_cap_into_node_options() {
+        // `agents.acpNodeMaxOldSpaceMb` rides SpawnOptions into the injected
+        // NODE_OPTIONS for a Node-runtime provider (intent-hq/intent#4330).
+        // Skipped when the ambient env pins the cap itself (env var / inherited
+        // NODE_OPTIONS), since both legitimately win over the setting.
+        if std::env::var_os("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB").is_some()
+            || std::env::var("NODE_OPTIONS").is_ok_and(|v| v.contains("--max-old-space-size"))
+        {
+            return;
+        }
+        let provider = intent_providers::find_provider("mock").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.node_max_old_space_mb = Some(4096);
+        let cmd = build_command(&opts);
+        let v = env_value(&cmd, "NODE_OPTIONS").expect("Node provider must set NODE_OPTIONS");
+        assert!(
+            v.contains("--max-old-space-size=4096"),
+            "NODE_OPTIONS must carry the configured cap, got: {v}"
+        );
+
+        // Unset setting keeps the built-in default.
+        let opts = SpawnOptions::new(provider);
+        let cmd = build_command(&opts);
+        let v = env_value(&cmd, "NODE_OPTIONS").expect("Node provider must set NODE_OPTIONS");
+        assert!(
+            v.contains("--max-old-space-size=8192"),
+            "unset setting must fall back to the 8192 default, got: {v}"
+        );
     }
 
     #[test]

@@ -102,6 +102,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agents.maxConcurrentAdapters",
     "agents.maxTopLevelAgents",
     "agents.memoryBudgetMb",
+    "agents.acpNodeMaxOldSpaceMb",
     "agents.idleReapMinutes",
     "agents.reportToParentDebounceSeconds",
     "agents.flushQueuedMessages",

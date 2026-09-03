@@ -35,6 +35,57 @@ impl intent_core::WorkspaceApi for AuggiePathApi {
     }
 }
 
+/// `WorkspaceApi` that returns a fixed JSON value for every `settings_get`,
+/// so the numeric-setting reader can be exercised against the exact wire shape
+/// (`Number` settings arrive as floats, e.g. `4096.0`).
+struct FixedSettingApi(Value);
+
+impl intent_core::WorkspaceApi for FixedSettingApi {
+    fn settings_get(&self, path: String) -> BoxFuture<'_, intent_core::Result<Value>> {
+        let v = json!({ "path": path, "value": self.0 });
+        Box::pin(async move { Ok(v) })
+    }
+}
+
+#[tokio::test]
+async fn read_setting_u32_accepts_float_encoded_whole_numbers() {
+    // Regression: `settings.get` reports `agents.acpNodeMaxOldSpaceMb` as
+    // `4096.0`; an `as_u64` read was always `None`, so the probe silently
+    // fell back to the default cap.
+    let api = FixedSettingApi(json!(4096.0));
+    assert_eq!(
+        read_setting_u32(&api, "agents.acpNodeMaxOldSpaceMb").await,
+        Some(4096)
+    );
+    let api = FixedSettingApi(json!(16384));
+    assert_eq!(
+        read_setting_u32(&api, "agents.acpNodeMaxOldSpaceMb").await,
+        Some(16384)
+    );
+}
+
+#[tokio::test]
+async fn read_setting_u32_rejects_null_fractional_negative_and_out_of_range() {
+    for v in [
+        Value::Null,
+        json!(4096.5),
+        json!(-1.0),
+        json!(f64::from(u32::MAX) + 1.0),
+        json!("4096"),
+    ] {
+        let api = FixedSettingApi(v.clone());
+        assert_eq!(
+            read_setting_u32(&api, "agents.acpNodeMaxOldSpaceMb").await,
+            None,
+            "value {v} must not parse"
+        );
+    }
+    assert_eq!(
+        read_setting_u32(&NoopApi, "agents.acpNodeMaxOldSpaceMb").await,
+        None
+    );
+}
+
 /// An [`ExternalOpener`] that records opened URLs and can be told to fail.
 struct RecordingOpener {
     ok: bool,

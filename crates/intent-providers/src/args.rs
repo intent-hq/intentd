@@ -237,9 +237,12 @@ pub fn apply_codex_config_args(
 /// V8's default old-space cap (~1.7 GB) is too small for long-lived
 /// coordinator sessions, which V8-OOM (SIGABRT, `FatalProcessOutOfMemory`)
 /// mid-turn with no error surfaced (STAB-50). 8 GB gives ample headroom.
-const DEFAULT_MAX_OLD_SPACE_MB: u32 = 8192;
+/// The `agents.acpNodeMaxOldSpaceMb` daemon setting is threaded in by the
+/// spawn caller ([`build_provider_env_for_spawn`]).
+const DEFAULT_MAX_OLD_SPACE_MB: u32 = intent_core::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB;
 
-/// Env seam overriding [`DEFAULT_MAX_OLD_SPACE_MB`].
+/// Env seam overriding both the `agents.acpNodeMaxOldSpaceMb` setting and
+/// [`DEFAULT_MAX_OLD_SPACE_MB`].
 const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 
 /// Build provider-specific environment variables. Port of `buildProviderEnv`.
@@ -297,10 +300,12 @@ pub fn build_provider_env_with_unsloth(
         mcp_config_json,
         unsloth_endpoint,
         false,
+        None,
     )
 }
 
-/// [`build_provider_env_with_unsloth`] plus the spawn-time npx signal.
+/// [`build_provider_env_with_unsloth`] plus the spawn-time npx signal and
+/// the configured heap cap.
 ///
 /// `via_npx` reports that the spawn goes through `npx -y <package>` (the
 /// provider binary did not resolve and a `fallback_npx_package` is set, or
@@ -310,6 +315,10 @@ pub fn build_provider_env_with_unsloth(
 /// cap applies. Codex is the concrete case today: declared `Native` for the
 /// Rust `codex-acp` binary, but its `@agentclientprotocol/codex-acp` npx
 /// fallback is pure Node (intent-hq/monorepo#1661).
+///
+/// `heap_cap_mb` is the caller-supplied `agents.acpNodeMaxOldSpaceMb`
+/// setting (`None` when unset); see [`max_old_space_mb`] for the precedence
+/// against the env seam and the default.
 pub fn build_provider_env_for_spawn(
     config: &ProviderConfig,
     model: Option<&str>,
@@ -317,6 +326,7 @@ pub fn build_provider_env_for_spawn(
     mcp_config_json: Option<&str>,
     unsloth_endpoint: Option<&UnslothEndpoint>,
     via_npx: bool,
+    heap_cap_mb: Option<u32>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     // Effective runtime: an npx spawn always runs a Node child, whatever the
@@ -332,7 +342,7 @@ pub fn build_provider_env_for_spawn(
     ) {
         let parent = std::env::var("NODE_OPTIONS").ok();
         if let Some(node_options) =
-            node_options_with_heap_cap(parent.as_deref(), max_old_space_mb())
+            node_options_with_heap_cap(parent.as_deref(), max_old_space_mb(heap_cap_mb))
         {
             env.insert("NODE_OPTIONS".to_string(), node_options);
         }
@@ -443,29 +453,32 @@ fn unsloth_provider_part(ep: &UnslothEndpoint, effective_model: &str) -> String 
     )
 }
 
-/// Resolve the V8 old-space cap in MB: `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB`
-/// when set and parseable as `u32`, else [`DEFAULT_MAX_OLD_SPACE_MB`]
-/// (with a WARN on unparseable or non-unicode overrides so a misconfigured
-/// value is visible).
-pub(crate) fn max_old_space_mb() -> u32 {
+/// Resolve the V8 old-space cap in MB. Precedence:
+/// `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` when set and parseable as `u32` >
+/// the caller-supplied `agents.acpNodeMaxOldSpaceMb` `setting` >
+/// [`DEFAULT_MAX_OLD_SPACE_MB`]. An unparseable or non-unicode env override
+/// falls through to the setting/default with a WARN so a misconfigured
+/// value is visible.
+pub(crate) fn max_old_space_mb(setting: Option<u32>) -> u32 {
+    let fallback = setting.unwrap_or(DEFAULT_MAX_OLD_SPACE_MB);
     match std::env::var(MAX_OLD_SPACE_ENV) {
         Ok(raw) => raw.trim().parse::<u32>().unwrap_or_else(|_| {
             tracing::warn!(
                 value = %raw,
-                default = DEFAULT_MAX_OLD_SPACE_MB,
-                "invalid {MAX_OLD_SPACE_ENV}; falling back to default"
+                fallback,
+                "invalid {MAX_OLD_SPACE_ENV}; falling back to the configured cap"
             );
-            DEFAULT_MAX_OLD_SPACE_MB
+            fallback
         }),
         Err(std::env::VarError::NotUnicode(raw)) => {
             tracing::warn!(
                 value = ?raw,
-                default = DEFAULT_MAX_OLD_SPACE_MB,
-                "non-unicode {MAX_OLD_SPACE_ENV}; falling back to default"
+                fallback,
+                "non-unicode {MAX_OLD_SPACE_ENV}; falling back to the configured cap"
             );
-            DEFAULT_MAX_OLD_SPACE_MB
+            fallback
         }
-        Err(std::env::VarError::NotPresent) => DEFAULT_MAX_OLD_SPACE_MB,
+        Err(std::env::VarError::NotPresent) => fallback,
     }
 }
 

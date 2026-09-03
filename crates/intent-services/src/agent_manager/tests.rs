@@ -7065,6 +7065,67 @@ async fn hard_stop_clears_stale_persisted_row_without_map_entry() {
     );
 }
 
+/// Batched companion (intent-hq/monorepo#4130): `stop_many` detaches each
+/// agent WITHOUT the per-agent durable sync and clears every swept agent's
+/// `agent_stop_redelivery` row in one batched statement afterwards — so the
+/// sweep must still drop both the in-memory payloads and their durable
+/// mirrors, exactly like N individual hard stops would, while an unswept
+/// agent's armed payload survives untouched.
+#[tokio::test]
+async fn stop_many_clears_persisted_stop_redeliveries_in_batch() {
+    let (_tmp, mgr) = manager().await;
+    let swept: Vec<AgentId> = (0..3)
+        .map(|i| AgentId::from(format!("a-stop-many-{i}")))
+        .collect();
+    let kept = AgentId::from("a-stop-many-kept");
+    for id in swept.iter().chain(std::iter::once(&kept)) {
+        // `seed_agent` inserts the workspace too, so each agent gets its own.
+        let ws = WorkspaceId::from(format!("ws-{}", id.0));
+        arm_redelivery_via_fallback_stop(&mgr, &ws, id).await;
+        // Re-track (the fallback stop removed the handle).
+        track(&mgr, id);
+    }
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert_eq!(
+        rows.len(),
+        4,
+        "every agent armed a durable payload: {rows:?}"
+    );
+
+    let _fence = mgr.stop_many(&swept).await;
+
+    {
+        let map = mgr.stop_redelivery.lock().unwrap();
+        for id in &swept {
+            assert!(
+                !map.contains_key(id),
+                "stop_many drops the in-memory payload for {id:?}"
+            );
+        }
+        assert!(
+            map.contains_key(&kept),
+            "an unswept agent keeps its in-memory payload"
+        );
+    }
+
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert_eq!(
+        rows.iter().map(|r| r.agent_id.clone()).collect::<Vec<_>>(),
+        vec![kept],
+        "stop_many clears exactly the swept agents' persisted payloads: {rows:?}"
+    );
+}
+
 /// Shutdown-capture companion: a graceful daemon shutdown landing while the
 /// live-turn slot is open but EMPTY persists the empty interrupted row
 /// stamped `daemon_shutdown` (every interruption leaves a marker row).

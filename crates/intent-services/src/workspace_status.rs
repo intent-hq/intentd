@@ -555,7 +555,13 @@ pub(crate) struct AttentionSignals {
 /// [`compute_display_status`]. Derived purely from persisted
 /// `state`/`last_snapshot` columns: no forge calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MonitorPrSignals {
+    /// An ACTIVE monitor's last snapshot shows an open (non-draft) PR that
+    /// sits in the forge's merge queue (`requirements.isInMergeQueue`) — the
+    /// `pr_queued` mapping; outranks `ready` (a queued PR is being handled
+    /// by the queue, no action needed).
+    pub(crate) queued: bool,
     /// An ACTIVE monitor's last snapshot shows an open (non-draft) PR whose
     /// full merge-requirements checklist is clear — truly mergeable, not
     /// merely conflict-free (see
@@ -587,13 +593,16 @@ pub(crate) struct MonitorPrSignals {
 ///    ([`Services::workspace_is_waiting`]).
 /// 4. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
-///    `pr_ready` only when truly mergeable (`mergeable == Some(true)` AND
-///    `mergeable_state == "clean"`, not draft), else `pr_open`. GitHub's
-///    `mergeable` flag alone only means "no merge conflicts" — a PR blocked
-///    by required checks or reviews still reports `mergeable: true` — so a
-///    missing/unknown `mergeable_state` conservatively reads `pr_open`.
+///    `pr_queued` when the PR sits in the forge's merge queue
+///    (`mergeable_state == "queued"`, not draft), `pr_ready` only when truly
+///    mergeable (`mergeable == Some(true)` AND `mergeable_state == "clean"`,
+///    not draft), else `pr_open`. GitHub's `mergeable` flag alone only means
+///    "no merge conflicts" — a PR blocked by required checks or reviews
+///    still reports `mergeable: true` — so a missing/unknown
+///    `mergeable_state` conservatively reads `pr_open`.
 ///    An ACTIVE PR monitor whose last snapshot shows an open/draft PR
-///    (`monitor_prs`) is the same rung: `pr_ready` when the snapshot's full
+///    (`monitor_prs`) is the same rung: `pr_queued` when the snapshot's PR
+///    is in the merge queue (not draft), `pr_ready` when the snapshot's full
 ///    merge-requirements checklist is clear and the PR is not draft, else
 ///    `pr_open` — so a workspace watching an open PR (including cross-repo)
 ///    never falls through to `complete`/`idle`. When none of those carries
@@ -669,21 +678,29 @@ fn compute_base_display_status(
     });
     if let Some(pr) = open_pr {
         let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
+        // GitHub reports `mergeable_state: "queued"` for a PR sitting in
+        // the merge queue — it is beyond "ready", the queue is handling it.
+        let queued = pr.mergeable_state.as_deref() == Some("queued");
         // `mergeable` alone only rules out conflicts; only a "clean"
         // `mergeable_state` means the forge would actually accept the merge
         // (blocked/behind/dirty/unstable/unknown/absent all read `pr_open`).
         let clean = pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("clean");
-        return if clean && !draft {
+        return if queued && !draft {
+            WorkspaceDisplayStatus::PrQueued
+        } else if clean && !draft {
             WorkspaceDisplayStatus::PrReady
         } else {
             WorkspaceDisplayStatus::PrOpen
         };
     }
     // Agent-monitored PRs are the same rung as the linked open PR above: an
-    // ACTIVE monitor on an open PR reads `pr_ready`/`pr_open` even when the
-    // PR belongs to another repo and never enters the workspace linkage. A
-    // linked open PR wins first only because it carries richer data; the
-    // mapping is identical.
+    // ACTIVE monitor on an open PR reads `pr_queued`/`pr_ready`/`pr_open`
+    // even when the PR belongs to another repo and never enters the
+    // workspace linkage. A linked open PR wins first only because it carries
+    // richer data; the mapping is identical.
+    if monitor_prs.queued {
+        return WorkspaceDisplayStatus::PrQueued;
+    }
     if monitor_prs.ready {
         return WorkspaceDisplayStatus::PrReady;
     }
@@ -1120,6 +1137,63 @@ mod display_status {
         );
     }
 
+    /// A linked open PR sitting in the merge queue (REST
+    /// `mergeable_state: "queued"`) reads `pr_queued` — regardless of the
+    /// `mergeable` flag, and outranking the `clean` → `pr_ready` mapping —
+    /// while a draft never reads queued.
+    #[test]
+    fn open_active_pr_in_merge_queue_is_pr_queued() {
+        for mergeable in [Some(true), Some(false), None] {
+            let mut queued = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+            queued.mergeable = mergeable;
+            queued.mergeable_state = Some("queued".into());
+            assert_eq!(
+                compute_display_status(
+                    sig(false),
+                    false,
+                    Some(&queued),
+                    &[],
+                    None,
+                    Some(&stats(2, 2, 0))
+                ),
+                WorkspaceDisplayStatus::PrQueued,
+                "mergeable {mergeable:?}"
+            );
+        }
+        // Found via the `pullRequests` scan too, not just the linked PR.
+        let mut queued = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        queued.mergeable_state = Some("queued".into());
+        assert_eq!(
+            compute_display_status(sig(false), false, None, &[queued], None, None),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        // Drafts never read queued.
+        let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
+        draft.mergeable_state = Some("queued".into());
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&draft), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        flagged.mergeable_state = Some("queued".into());
+        flagged.is_draft = Some(true);
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&flagged), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        // Attention axes and a running agent still outrank a queued PR.
+        let mut queued = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        queued.mergeable_state = Some("queued".into());
+        assert_eq!(
+            compute_display_status(sig(true), false, Some(&queued), &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            compute_display_status(sig(false), true, Some(&queued), &[], None, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
     #[test]
     fn merged_pr_never_masks_open_tasks() {
         // Open tasks keep the rollup off pr_merged; without a running agent
@@ -1387,10 +1461,66 @@ mod display_status {
     /// Monitor-signal shorthand for the tests below.
     fn monitors(open: bool, ready: bool, merged: bool) -> MonitorPrSignals {
         MonitorPrSignals {
+            queued: false,
             ready,
             open,
             merged,
         }
+    }
+
+    /// Step 4 via monitors: an ACTIVE monitor on an open PR sitting in the
+    /// merge queue yields `pr_queued`, outranking `ready` on the same rung
+    /// (a queued PR is still checklist-blocked in practice, but a stale
+    /// `ready` never wins over `queued`) — while attention axes, a running
+    /// agent, and a linked open PR keep their precedence.
+    #[test]
+    fn active_monitor_queued_pr_is_pr_queued() {
+        let queued = MonitorPrSignals {
+            queued: true,
+            ..monitors(true, false, false)
+        };
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                None,
+                queued,
+                Some(&stats(2, 2, 0))
+            ),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        let queued_and_ready = MonitorPrSignals {
+            queued: true,
+            ..monitors(true, true, true)
+        };
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                None,
+                queued_and_ready,
+                None
+            ),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        assert_eq!(
+            super::compute_display_status(sig(true), false, None, &[], None, queued, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            super::compute_display_status(sig(false), true, None, &[], None, queued, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+        // A linked open PR wins the shared rung even over a queued monitor.
+        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            super::compute_display_status(sig(false), false, Some(&open), &[], None, queued, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
     }
 
     /// Step 4 via monitors: an ACTIVE monitor on an open PR yields
@@ -2480,6 +2610,7 @@ mod display_status_events {
                 NoteId::from("spec"),
                 2,
                 Some("plain text, link removed".to_string()),
+                None,
                 None,
                 None,
             )
