@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.14] - 2026-09-03
+
+### 🚀 Features
+
+- Add isolated Antigravity ACP provider ([#1665](https://github.com/intent-hq/intentd/pull/1665))
+
+
 ## [0.9.13] - 2026-09-03
 
 ### 🚀 Features
