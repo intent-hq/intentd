@@ -21577,6 +21577,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
         let services = self.clone();
         Box::pin(async move {
+            if let Some(content) = content.as_deref() {
+                note_ops::reject_numbered_read_presentation(content)?;
+            }
             let store = &services.store;
             // Verify the dependent note exists in this workspace.
             match store.get_note(&workspace_id, &dependent_note_id).await {

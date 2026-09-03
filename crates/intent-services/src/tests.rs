@@ -4387,6 +4387,62 @@ async fn set_note_content_rejects_numbered_read_presentation_with_appended_lines
 }
 
 #[tokio::test]
+async fn create_prerequisite_rejects_numbered_read_presentation() {
+    // `task.createPrerequisite` materializes note content outside the
+    // `note.*` surface; its `content` must hit the same guard and a rejected
+    // call must create no child note (monorepo#4299).
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let numbered = numbered_read_presentation(SPEC_MARKDOWN);
+    let before = svc.list_notes(&ws).await.expect("list").len();
+
+    let err = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Copied Step".into(),
+            Some(numbered),
+            None,
+            None,
+        )
+        .await
+        .expect_err("numbered read presentation must be rejected");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "guard surfaces as InvalidParams (-32602): {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("note.read") && msg.contains("rawContent"),
+        "remediation must name note.read and rawContent: {msg}"
+    );
+
+    let notes = svc.list_notes(&ws).await.expect("list");
+    assert_eq!(notes.len(), before, "rejected create must persist nothing");
+    assert!(notes.iter().all(|n| n.title != "Copied Step"));
+
+    // Raw Markdown (and an absent `content`) still create the child.
+    let r = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Raw Step".into(),
+            Some(SPEC_MARKDOWN.into()),
+            None,
+            None,
+        )
+        .await
+        .expect("raw Markdown content is accepted");
+    let child = svc
+        .get_note(ws.clone(), r.prerequisite_note_id)
+        .await
+        .expect("child");
+    assert_eq!(child.content, SPEC_MARKDOWN);
+    svc.create_prerequisite(ws, id, "Bare Step".into(), None, None, None)
+        .await
+        .expect("absent content is accepted");
+}
+
+#[tokio::test]
 async fn write_without_task_block_reports_zero_conversions() {
     let (_tmp, svc, ws, id) = setup("body").await;
     let r = svc
