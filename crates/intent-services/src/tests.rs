@@ -10461,6 +10461,330 @@ mod change_event_parity {
             .iter()
             .any(|e| e["data"]["noteId"] == "spec"));
     }
+
+    // -----------------------------------------------------------------------
+    // Checkbox-level writes on linked lines redirect to the task note
+    // (intent-hq/intent#4255): `task.updateStatus` / `task.update` write the
+    // task's metadata status, the char follows via materialization.
+    // -----------------------------------------------------------------------
+
+    async fn task_status(h: &Harness, id: &str) -> TaskStatus {
+        h.store
+            .get_note(&h.ws, &intent_core::NoteId::from(id))
+            .await
+            .expect("get task note")
+            .metadata
+            .task
+            .expect("task metadata")
+            .status
+    }
+
+    fn spec_updates(events: &[Value]) -> usize {
+        of_type(events, "note:updated")
+            .iter()
+            .filter(|e| e["data"]["noteId"] == "spec")
+            .count()
+    }
+
+    fn spec_id() -> intent_core::NoteId {
+        intent_core::NoteId::from("spec")
+    }
+
+    #[tokio::test]
+    async fn update_status_on_linked_line_redirects_to_task_note() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = |m: &str| format!("# Spec\n{}\n- [ ] plain", linked(m, "T", T1));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]")))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into())
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(r.task_text, "T");
+        assert_eq!(r.note_id, spec_id());
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, body("[x]"));
+        assert_eq!(rev, rev_before + 1, "exactly one parent write");
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T1);
+        assert_eq!(changed[0]["data"]["previousStatus"], "not_started");
+        assert_eq!(changed[0]["data"]["newStatus"], "complete");
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+
+        // The unlinked line on the same note keeps the raw path: no task write.
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(
+                h.ws.clone(),
+                spec_id(),
+                "plain".into(),
+                "in-progress".into(),
+            )
+            .await
+            .expect("updateStatus plain");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(r.status, "in-progress");
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            format!("# Spec\n{}\n- [/] plain", linked("[x]", "T", T1))
+        );
+        assert!(of_type(&events, "task:status-changed").is_empty());
+        assert_eq!(spec_updates(&events), 1);
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn task_update_on_linked_line_redirects_status_to_task_note() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+        let link = format!("[T](intent://local/task/{T1})");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("in-progress".into()),
+                Some(link.clone()),
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "in-progress");
+        assert_eq!(r.line_number, 1);
+        assert_eq!(r.previous_text, link);
+        assert_eq!(r.new_text, link);
+        assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T1);
+        assert_eq!(changed[0]["data"]["newStatus"], "in_progress");
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+
+        // `expected` mismatch still conflicts before anything is written.
+        let err = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("done".into()),
+                Some("stale".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, intent_core::Error::Internal(ref m) if m.contains("Conflict detected"))
+        );
+        assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+    }
+
+    #[tokio::test]
+    async fn task_update_text_and_status_on_linked_line_writes_parent_once() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(
+                &h.ws,
+                "spec",
+                &format!("{}\n- [ ] plain", linked("[ ]", "T", T1)),
+            ))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+        let new_text = format!("[Renamed](intent://local/task/{T1}) more");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                Some(new_text.clone()),
+                Some("done".into()),
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(r.previous_text, format!("[T](intent://local/task/{T1})"));
+        assert_eq!(r.new_text, new_text);
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, format!("- [x] {new_text}\n- [ ] plain"));
+        assert_eq!(
+            rev,
+            rev_before + 1,
+            "text edit and materialized char land in one parent write"
+        );
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+        assert_eq!(of_type(&events, "task:status-changed").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn todo_on_linked_line_preserves_detailed_task_status() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::Blocked).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into())
+            .await
+            .expect("updateStatus todo");
+        let r2 = h
+            .services
+            .task_update(h.ws.clone(), spec_id(), 1, None, Some("todo".into()), None)
+            .await
+            .expect("task.update todo");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "todo");
+        assert_eq!(r2.status, "todo");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Blocked);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, linked("[ ]", "T", T1));
+        assert_eq!(
+            rev, rev_before,
+            "no parent write when the char already projects the status"
+        );
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 0, "{events:?}");
+
+        // From a status projecting a different char, `todo` reopens to not_started.
+        set_status(&h, T1, "complete").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into())
+            .await
+            .expect("updateStatus reopen");
+        assert_eq!(r.status, "todo");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::NotStarted);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+
+        set_status(&h, T1, "in_progress").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        let r = h
+            .services
+            .task_update(h.ws.clone(), spec_id(), 1, None, Some("todo".into()), None)
+            .await
+            .expect("task.update reopen");
+        assert_eq!(r.status, "todo");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::NotStarted);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+    }
+
+    #[tokio::test]
+    async fn linked_line_write_heals_a_diverged_char() {
+        // The task is already complete but the line still reads `[ ]`: `done`
+        // is a no-op on the task and rewrites the char via materialization.
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::Complete).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into())
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn dangling_task_link_keeps_the_raw_checkbox_write() {
+        let h = harness().await;
+        // FRESH exists but is not a task; `d4d4` does not exist at all.
+        h.store
+            .insert_note(&note(&h.ws, FRESH, "body"))
+            .await
+            .expect("insert fresh");
+        let body =
+            |a: &str, b: &str| format!("{}\n{}", linked(a, "F", FRESH), linked(b, "G", "d4d4"));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]", "[ ]")))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_status(h.ws.clone(), spec_id(), "F".into(), "done".into())
+            .await
+            .expect("updateStatus");
+        h.services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                2,
+                None,
+                Some("in-progress".into()),
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(note_content(&h, "spec").await.0, body("[x]", "[/]"));
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 2, "{events:?}");
+        let fresh = h
+            .store
+            .get_note(&h.ws, &intent_core::NoteId::from(FRESH))
+            .await
+            .expect("get fresh");
+        assert!(fresh.metadata.task.is_none());
+    }
 }
 
 /// End-to-end §6.8 "one impl, two front doors": an agent (via the in-process MCP

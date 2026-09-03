@@ -475,6 +475,42 @@ pub(crate) fn set_linked_checkbox(content: &str, task_id: &str, checkbox: &str) 
     changed.then(|| out.join("\n"))
 }
 
+/// Status word (`todo` / `in-progress` / `done`) a task-note status projects
+/// to on a linked checkbox line — the word form of [`checkbox_for_task_status`].
+pub(crate) fn status_word_for_task_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Complete => "done",
+        TaskStatus::InProgress => "in-progress",
+        _ => "todo",
+    }
+}
+
+/// Task note id linked by the line `task.updateStatus` would rewrite for
+/// `task_text`: the first exact-match checkbox line, else the first checkbox
+/// line containing the text (the same priority as [`apply_task_status`]).
+/// `None` when no line matches or the matched line carries no task link.
+pub(crate) fn linked_task_for_text(content: &str, task_text: &str) -> Option<String> {
+    let normalized = task_text.trim();
+    let lines = || {
+        content
+            .split('\n')
+            .filter_map(|line| parse_dash_checkbox(line).map(|(_, after_idx, _)| (line, after_idx)))
+    };
+    let exact = lines().find(|(line, after_idx)| line[*after_idx..].trim() == normalized);
+    let (line, after_idx) =
+        exact.or_else(|| lines().find(|(line, _)| line.contains(normalized)))?;
+    find_task_link(&line[after_idx..]).map(|(_, id)| id)
+}
+
+/// Task note id linked by checkbox line `line` (1-based); `None` when the
+/// line is out of range, not a checkbox line, or carries no task link.
+pub(crate) fn linked_task_at_line(content: &str, line: i64) -> Option<String> {
+    let index = usize::try_from(line.checked_sub(1)?).ok()?;
+    let current = content.split('\n').nth(index)?;
+    let (_, after_idx, _) = parse_dash_checkbox(current)?;
+    find_task_link(&current[after_idx..]).map(|(_, id)| id)
+}
+
 /// Map a checkbox character to its status word (TS `currentStatus` mapping).
 fn status_word_from_cb(c: char) -> &'static str {
     match c {
@@ -2028,6 +2064,34 @@ mod tests {
             set_linked_checkbox("- [ ] [T](intent://local/task/a10)", "a1", "[x]"),
             None
         );
+    }
+
+    #[test]
+    fn linked_task_resolvers_follow_the_apply_matching_rules() {
+        let content = "# H\n- [ ] [T](intent://local/task/a1)\n- [ ] plain\n\
+                       - [/] alpha [O](intent://local/task/b2)\n- [x] alpha\nnot a task";
+        // Exact match wins over an earlier containing line.
+        assert_eq!(linked_task_for_text(content, "alpha"), None);
+        assert_eq!(
+            linked_task_for_text(content, "alpha [O](intent://local/task/b2)"),
+            Some("b2".to_string())
+        );
+        // Fallback: first checkbox line containing the text.
+        assert_eq!(linked_task_for_text(content, "T"), Some("a1".to_string()));
+        assert_eq!(
+            linked_task_for_text(content, "  T  "),
+            Some("a1".to_string())
+        );
+        assert_eq!(linked_task_for_text(content, "plain"), None);
+        assert_eq!(linked_task_for_text(content, "missing"), None);
+
+        assert_eq!(linked_task_at_line(content, 2), Some("a1".to_string()));
+        assert_eq!(linked_task_at_line(content, 3), None);
+        assert_eq!(linked_task_at_line(content, 4), Some("b2".to_string()));
+        assert_eq!(linked_task_at_line(content, 1), None);
+        assert_eq!(linked_task_at_line(content, 6), None);
+        assert_eq!(linked_task_at_line(content, 7), None);
+        assert_eq!(linked_task_at_line(content, 0), None);
     }
 
     #[test]

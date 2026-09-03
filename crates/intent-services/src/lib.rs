@@ -8377,6 +8377,132 @@ impl Services {
         }
     }
 
+    /// Write a task note's metadata status — the single implementation behind
+    /// `task.updateNoteStatus` and the checkbox-level writes (`task.updateStatus`
+    /// / `task.update`) redirected from a linked line (intent-hq/intent#4255).
+    /// On an actual transition it emits `task:status-changed`, recomputes the
+    /// ready-task set, re-announces dependents across the complete boundary
+    /// and probes the displayStatus rollup; either way it then materializes
+    /// the status char onto every line linking the task.
+    pub(crate) async fn set_task_note_status(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        new_status: TaskStatus,
+        expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
+    ) -> Result<TaskUpdateNoteStatusResult> {
+        let store = &self.store;
+        let bus = self.event_bus.as_ref();
+        let mut note = fetch_note(store, workspace_id, note_id).await?;
+        let Some(mut task) = note.metadata.task.clone() else {
+            return Err(Error::Internal(
+                "Note is not a task. Use markAsTask() first.".to_string(),
+            ));
+        };
+        let previous_status = task.status;
+        let now = now_iso();
+        apply_status_transition(&mut task, new_status, &now);
+        note.metadata.task = Some(task);
+        note.updated_at = now.clone();
+        store.update_note_versioned(&note, expected_version).await?;
+        // Mirror `notes.service.ts`: emit only when the status actually changed.
+        let all = if previous_status == new_status {
+            None
+        } else {
+            // A complete-boundary crossing records/removes the caller's
+            // flipped-completion pair (later stamped as a wake trigger).
+            track_flipped_completion_boundary(
+                store,
+                caller_agent_id.as_ref(),
+                &note.workspace_id,
+                &note.id,
+                previous_status == TaskStatus::Complete,
+                new_status == TaskStatus::Complete,
+                &now,
+            )
+            .await;
+            // LC-1: agent-attributed changes carry provenance — resolve the
+            // caller's display name best-effort for the agent actor.
+            let agent = match &caller_agent_id {
+                Some(agent_id) => Some((
+                    agent_id.0.clone(),
+                    store.get_agent_session(agent_id).await.ok().map(|s| s.name),
+                )),
+                None => None,
+            };
+            publish_event(
+                bus,
+                task_status_changed_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    previous_status,
+                    new_status,
+                    &now,
+                    agent,
+                ),
+            )
+            .await;
+            // Then recompute + broadcast the ready-task set, mirroring the
+            // `emitReadyTasksChanged` call that follows `task:status-changed`.
+            let all = store.list_notes(&note.workspace_id).await?;
+            let ready_task_ids = compute_ready_task_ids(&all);
+            publish_event(
+                bus,
+                ready_tasks_changed_event(
+                    &note.workspace_id,
+                    &ready_task_ids,
+                    &note.id,
+                    previous_status,
+                    new_status,
+                    &now_iso(),
+                ),
+            )
+            .await;
+            // Re-announce dependents only when the transition crosses the
+            // complete boundary — that is the only move that changes their
+            // computed `unmetDependsOn` (monorepo#1979).
+            if (previous_status == TaskStatus::Complete) != (new_status == TaskStatus::Complete) {
+                publish_dependent_note_updates(bus, &note.workspace_id, &note.id, &all).await;
+            }
+            // A task-status transition can move the derived displayStatus
+            // rollup (§6.5): recompute-and-compare, emitting only on an
+            // actual transition.
+            self.maybe_emit_display_status_changed(&note.workspace_id)
+                .await;
+            Some(all)
+        };
+        // Materialize the status char onto the lines linking this task
+        // (parents refetch via their own `note:updated`, after the task's
+        // own emissions above). A transition already listed the workspace
+        // for the ready-task recompute; reuse that list instead of a second
+        // fetch.
+        match all {
+            Some(all) => {
+                materialize_linked_checkboxes_in(
+                    store,
+                    bus,
+                    &note.workspace_id,
+                    &note.id,
+                    new_status,
+                    all,
+                )
+                .await;
+            }
+            None => {
+                materialize_linked_checkboxes(store, bus, &note.workspace_id, &note.id, new_status)
+                    .await;
+            }
+        }
+        Ok(TaskUpdateNoteStatusResult {
+            ok: true,
+            note_id: note.id.clone(),
+            status: new_status,
+            note,
+        })
+    }
+
     /// Drop any cached CRDT session for `(workspace, note)` after a surgical
     /// content mutation (`note.add` / `note.edit` / `note.editLines`,
     /// `task.updateStatus` / `task.update`, `note.restoreVersion`,
@@ -10361,8 +10487,6 @@ async fn materialize_linked_checkboxes(
     task_id: &NoteId,
     status: TaskStatus,
 ) {
-    let checkbox = note_ops::checkbox_for_task_status(status);
-    let needle = format!("(intent://local/task/{})", task_id.as_str());
     let notes = match store.list_notes(workspace_id).await {
         Ok(notes) => notes,
         Err(e) => {
@@ -10370,6 +10494,22 @@ async fn materialize_linked_checkboxes(
             return;
         }
     };
+    materialize_linked_checkboxes_in(store, bus, workspace_id, task_id, status, notes).await;
+}
+
+/// [`materialize_linked_checkboxes`] over an already-fetched workspace note
+/// list (callers that just listed the workspace for the ready-task recompute
+/// pass it through instead of listing twice).
+async fn materialize_linked_checkboxes_in(
+    store: &Store,
+    bus: Option<&EventBus>,
+    workspace_id: &WorkspaceId,
+    task_id: &NoteId,
+    status: TaskStatus,
+    notes: Vec<Note>,
+) {
+    let checkbox = note_ops::checkbox_for_task_status(status);
+    let needle = format!("(intent://local/task/{})", task_id.as_str());
     for mut note in notes {
         if !note.content.contains(&needle) {
             continue;
@@ -10391,6 +10531,38 @@ async fn materialize_linked_checkboxes(
         )
         .await;
     }
+}
+
+/// Resolve the task note a checkbox line links to: `Some((id, status))` when
+/// `task_id` names a task note in `workspace_id`. Dangling links and links to
+/// non-task notes yield `None`, keeping the raw checkbox write.
+async fn resolve_linked_task(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    task_id: &str,
+) -> Option<(NoteId, TaskStatus)> {
+    let id = NoteId::from(task_id);
+    let note = store.get_note(workspace_id, &id).await.ok()?;
+    let status = note.metadata.task.as_ref()?.status;
+    Some((id, status))
+}
+
+/// Task-note status a checkbox word (`todo` / `in-progress` / `done`) written
+/// on a linked line redirects to, or `None` when the task already projects
+/// that word: `done` → `complete`, `in-progress` → `in_progress`, and `todo`
+/// reopens `complete` / `in_progress` to `not_started` while leaving the
+/// detailed statuses that already render as `[ ]` (`blocked`, `waiting`, …)
+/// untouched.
+fn redirected_task_status(word: &str, current: TaskStatus) -> Option<TaskStatus> {
+    let next = match word {
+        "done" => TaskStatus::Complete,
+        "in-progress" => TaskStatus::InProgress,
+        _ => match current {
+            TaskStatus::Complete | TaskStatus::InProgress => TaskStatus::NotStarted,
+            _ => return None,
+        },
+    };
+    (next != current).then_some(next)
 }
 
 /// Build a `task:created` event with the payload
@@ -20960,6 +21132,42 @@ impl WorkspaceApi for Services {
             })?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let normalized = task_text.trim().to_string();
+            let linked = match note_ops::linked_task_for_text(&note.content, &normalized) {
+                Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
+                None => None,
+            };
+            if let Some((task_id, current)) = linked {
+                // The line links a task note: the task's metadata status is
+                // the source of truth and the char is its projection, so the
+                // write goes to the task (events, ready-task recompute) and
+                // the char follows via materialization — which also heals a
+                // line that had drifted from the task's status.
+                match redirected_task_status(&status, current) {
+                    Some(next) => {
+                        services
+                            .set_task_note_status(&note.workspace_id, &task_id, next, None, None)
+                            .await?;
+                    }
+                    None => {
+                        materialize_linked_checkboxes(
+                            &store,
+                            bus.as_ref(),
+                            &note.workspace_id,
+                            &task_id,
+                            current,
+                        )
+                        .await;
+                    }
+                }
+                services.invalidate_crdt_note(&note.workspace_id, &note.id);
+                services.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
+                return Ok(TaskUpdateStatusResult {
+                    ok: true,
+                    note_id: note.id,
+                    task_text: normalized,
+                    status,
+                });
+            }
             let updated = note_ops::apply_task_status(&note.content, &normalized, checkbox)?;
             note.content = updated;
             note.updated_at = now_iso();
@@ -20995,112 +21203,16 @@ impl WorkspaceApi for Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
-        let services = self.clone();
         Box::pin(async move {
             let new_status = parse_task_status_strict(&status)?;
-            let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
-            let Some(mut task) = note.metadata.task.clone() else {
-                return Err(Error::Internal(
-                    "Note is not a task. Use markAsTask() first.".to_string(),
-                ));
-            };
-            let previous_status = task.status;
-            let now = now_iso();
-            apply_status_transition(&mut task, new_status, &now);
-            note.metadata.task = Some(task);
-            note.updated_at = now.clone();
-            store.update_note_versioned(&note, expected_version).await?;
-            // Mirror `notes.service.ts`: emit only when the status actually changed.
-            if previous_status != new_status {
-                // A complete-boundary crossing records/removes the caller's
-                // flipped-completion pair (later stamped as a wake trigger).
-                track_flipped_completion_boundary(
-                    &store,
-                    caller_agent_id.as_ref(),
-                    &note.workspace_id,
-                    &note.id,
-                    previous_status == TaskStatus::Complete,
-                    new_status == TaskStatus::Complete,
-                    &now,
-                )
-                .await;
-                // LC-1: agent-attributed changes carry provenance — resolve the
-                // caller's display name best-effort for the agent actor.
-                let agent = match &caller_agent_id {
-                    Some(agent_id) => Some((
-                        agent_id.0.clone(),
-                        store.get_agent_session(agent_id).await.ok().map(|s| s.name),
-                    )),
-                    None => None,
-                };
-                publish_event(
-                    bus.as_ref(),
-                    task_status_changed_event(
-                        &note.workspace_id,
-                        &note.id,
-                        &note.title,
-                        previous_status,
-                        new_status,
-                        &now,
-                        agent,
-                    ),
-                )
-                .await;
-                // Then recompute + broadcast the ready-task set, mirroring the
-                // `emitReadyTasksChanged` call that follows `task:status-changed`.
-                let all = store.list_notes(&note.workspace_id).await?;
-                let ready_task_ids = compute_ready_task_ids(&all);
-                publish_event(
-                    bus.as_ref(),
-                    ready_tasks_changed_event(
-                        &note.workspace_id,
-                        &ready_task_ids,
-                        &note.id,
-                        previous_status,
-                        new_status,
-                        &now_iso(),
-                    ),
-                )
-                .await;
-                // Re-announce dependents only when the transition crosses the
-                // complete boundary — that is the only move that changes their
-                // computed `unmetDependsOn` (monorepo#1979).
-                if (previous_status == TaskStatus::Complete) != (new_status == TaskStatus::Complete)
-                {
-                    publish_dependent_note_updates(
-                        bus.as_ref(),
-                        &note.workspace_id,
-                        &note.id,
-                        &all,
-                    )
-                    .await;
-                }
-                // A task-status transition can move the derived displayStatus
-                // rollup (§6.5): recompute-and-compare, emitting only on an
-                // actual transition.
-                services
-                    .maybe_emit_display_status_changed(&note.workspace_id)
-                    .await;
-            }
-            // Materialize the status char onto the lines linking this task
-            // (parents refetch via their own `note:updated`, after the task's
-            // own emissions above).
-            materialize_linked_checkboxes(
-                &store,
-                bus.as_ref(),
-                &note.workspace_id,
-                &note.id,
+            self.set_task_note_status(
+                &workspace_id,
+                &note_id,
                 new_status,
+                expected_version,
+                caller_agent_id,
             )
-            .await;
-            Ok(TaskUpdateNoteStatusResult {
-                ok: true,
-                note_id: note.id.clone(),
-                status: new_status,
-                note,
-            })
+            .await
         })
     }
 
@@ -21135,35 +21247,70 @@ impl WorkspaceApi for Services {
                 }
             }
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let linked = match note_ops::linked_task_at_line(&note.content, line) {
+                Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
+                None => None,
+            };
+            // On a linked line the char is a projection of the task note's
+            // status: the status write is redirected to the task and the line
+            // edit carries the word that status projects to.
+            let redirect = match (linked, status.as_deref()) {
+                (Some((task_id, current)), Some(word)) => {
+                    Some((task_id, redirected_task_status(word, current), current))
+                }
+                _ => None,
+            };
+            let line_status = match &redirect {
+                Some((_, next, current)) => Some(note_ops::status_word_for_task_status(
+                    next.unwrap_or(*current),
+                )),
+                None => status.as_deref(),
+            };
             let update = note_ops::apply_task_line_update(
                 &note.content,
                 line,
                 text.as_deref(),
-                status.as_deref(),
+                line_status,
                 expected.as_deref(),
             )?;
-            note.content = update.content;
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
-            services
-                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            publish_event(
-                bus.as_ref(),
-                note_change_event(
-                    &note.workspace_id,
-                    &note.id,
-                    &note.title,
-                    NOTE_UPDATED,
-                    "update",
-                ),
-            )
-            .await;
-            // A spec checkbox-line rewrite can add/remove task links and
-            // move taskStats; non-spec notes skip the probe (§6.5).
-            services
-                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+            // A redirected pure-status write leaves the char to materialization
+            // so the parent's `note:updated` follows the task's own emissions;
+            // a text edit (or a drifted char with nothing to write on the task)
+            // lands in one direct parent write instead.
+            let write_parent = match &redirect {
+                None => true,
+                Some((_, next, _)) => {
+                    text.is_some() || (next.is_none() && update.content != note.content)
+                }
+            };
+            if write_parent {
+                note.content = update.content;
+                note.updated_at = now_iso();
+                store.update_note(&note).await?;
+                publish_event(
+                    bus.as_ref(),
+                    note_change_event(
+                        &note.workspace_id,
+                        &note.id,
+                        &note.title,
+                        NOTE_UPDATED,
+                        "update",
+                    ),
+                )
                 .await;
+                // A spec checkbox-line rewrite can add/remove task links and
+                // move taskStats; non-spec notes skip the probe (§6.5).
+                services
+                    .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                    .await;
+            }
+            if let Some((task_id, Some(next), _)) = redirect {
+                services
+                    .set_task_note_status(&note.workspace_id, &task_id, next, None, None)
+                    .await?;
+            }
+            services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            services.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
             Ok(TaskUpdateResult {
                 ok: true,
                 note_id: note.id,
