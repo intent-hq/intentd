@@ -56,6 +56,29 @@ pub fn resolve_tailcat_bin() -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Map a tailcat spawn failure into an actionable error. `NotFound` means the
+/// sidecar binary is missing entirely (`resolve_tailcat_bin` already probed
+/// every location), which in practice means an intentd installed from a
+/// release archive that predates the bundled sidecar — say so and how to fix
+/// it instead of surfacing the raw OS error. Other spawn failures keep the
+/// underlying error.
+fn tailcat_spawn_error(action: &str, bin: &Path, e: &std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return Error::Internal(format!(
+            "cannot run tailcat {action}: the tailcat sidecar binary was not found \
+             ({}; checked INTENTD_TAILCAT_BIN, libexec/ and the directory next to \
+             the intentd binary, then PATH). Update intentd (`intentd update`) — \
+             releases before v0.9.10 did not bundle the tailcat sidecar \
+             (https://github.com/tailscale/tailcat)",
+            bin.display()
+        ));
+    }
+    Error::Internal(format!(
+        "cannot run tailcat {action} ({}): {e}",
+        bin.display()
+    ))
+}
+
 /// Supervisor for the tailcat sidecar. One instance lives in the composition
 /// root (`DaemonControl`); `start`/`stop` are idempotent and safe to call
 /// from concurrent settings updates (single async Mutex over the state).
@@ -199,12 +222,7 @@ impl TunnelSupervisor {
         let output = genkey_command(&self.bin, &self.key_path, derp_url)
             .output()
             .await
-            .map_err(|e| {
-                Error::Internal(format!(
-                    "cannot run tailcat genkey ({}): {e}",
-                    self.bin.display()
-                ))
-            })?;
+            .map_err(|e| tailcat_spawn_error("genkey", &self.bin, &e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::Internal(format!(
@@ -262,7 +280,7 @@ async fn spawn_and_read_address(
 ) -> Result<(Child, String)> {
     let mut child = serve_command(bin, key_path, ws_port, derp_url)
         .spawn()
-        .map_err(|e| Error::Internal(format!("cannot spawn tailcat ({}): {e}", bin.display())))?;
+        .map_err(|e| tailcat_spawn_error("serve", bin, &e))?;
     // Drain stderr into the daemon log so crash-loop causes (bad DERP map,
     // key parse failure, network errors) are diagnosable, and the child never
     // blocks on a full pipe.
@@ -528,11 +546,39 @@ esac
             .with_address_timeout(Duration::from_secs(2));
         sup.stop().await; // no-op when never started
         let err = sup.start(5181, None).await.unwrap_err();
+        // A missing binary must produce the actionable sidecar-not-found
+        // guidance, not the raw ENOENT (regression: pre-v0.9.10 release
+        // archives shipped without libexec/tailcat).
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("tailcat"),
-            "error should name tailcat: {err}"
+            msg.contains("sidecar binary was not found") && msg.contains("intentd update"),
+            "error should carry the actionable guidance: {err}"
         );
         assert_eq!(sup.address().await, None);
+    }
+
+    #[test]
+    fn tailcat_spawn_error_maps_not_found_to_actionable_guidance() {
+        let bin = Path::new("/opt/intentd/libexec/tailcat");
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = tailcat_spawn_error("genkey", bin, &not_found).to_string();
+        assert!(msg.contains("cannot run tailcat genkey"), "{msg}");
+        assert!(msg.contains("sidecar binary was not found"), "{msg}");
+        assert!(msg.contains("/opt/intentd/libexec/tailcat"), "{msg}");
+        assert!(msg.contains("INTENTD_TAILCAT_BIN"), "{msg}");
+        assert!(msg.contains("intentd update"), "{msg}");
+        assert!(msg.contains("before v0.9.10"), "{msg}");
+        assert!(
+            msg.contains("https://github.com/tailscale/tailcat"),
+            "{msg}"
+        );
+
+        // Any other spawn failure keeps the raw OS error, no guidance.
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = tailcat_spawn_error("serve", bin, &denied).to_string();
+        assert!(msg.contains("cannot run tailcat serve"), "{msg}");
+        assert!(msg.contains(&denied.to_string()), "{msg}");
+        assert!(!msg.contains("intentd update"), "{msg}");
     }
 
     #[tokio::test]
