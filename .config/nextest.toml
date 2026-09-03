@@ -34,6 +34,15 @@
 # pass under NEXTEST_TEST_THREADS=8 + llvm-cov), delay-invariant, not locally
 # reproducible. Mechanism not pinned; serialization removes the load condition.
 #
+# The WSS MCP e2e binaries (e2e_wss_mcp_servers, e2e_wss_mcp_oauth_refresh)
+# also run isolated: each test spawns a real daemon plus node mock-MCP
+# fixtures, and the daemon-side HTTP probe runs against hardcoded production
+# handshake/probe timeouts (10s/15s, mcp_servers.rs) with no test seam. Under
+# full-suite parallel load the localhost fixture/daemon starve past those
+# bounds and the probe reports error/timeout instead of connected/running
+# (monorepo#4231); isolation removes the load condition, same as the
+# daemon-spawning binaries above.
+#
 # e2e_wss_pool_contention_stress also runs isolated: its tests assert
 # read-latency bounds (workspace.list / note.list mid-write-storm), which
 # measure pool behavior, not machine load. Under llvm-cov with 32+ parallel
@@ -45,9 +54,12 @@
 #
 # timing-serial test-group (max-threads = 1): A class of timing-sensitive unit
 # tests — filesystem-watcher tests (specialists/skills/root/registry/config
-# watchers, which use fixed startup sleeps and drain deadlines) and provider
+# watchers, which use fixed startup sleeps and drain deadlines), provider
 # child-spawn tests (auggie/opencode/grok, which shell out to fake binaries with
-# wall-clock budgets) — flakes under nextest's parallel cross-binary load. Unlike
+# wall-clock budgets), and the event-bus idle-flush latency assertion
+# (idle_publish_resolves_without_batch_window_delay, which bounds 20 SQLite
+# commits under 350ms — a measurement of bus behavior, not machine load) —
+# flakes under nextest's parallel cross-binary load. Unlike
 # the in-process mutexes those tests carry (which only serialize within a single
 # test binary, and are kept as a harmless aid to plain `cargo test`), a nextest
 # test-group serializes them GLOBALLY across binaries under nextest's
@@ -62,9 +74,9 @@ slow-timeout = { period = "90s", terminate-after = 2 }
 timing-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all) | binary_id(=intentd::e2e_wss_pool_contention_stress)'
+filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all) | binary_id(=intentd::e2e_wss_pool_contention_stress) | binary_id(=intentd::e2e_wss_mcp_servers) | binary_id(=intentd::e2e_wss_mcp_oauth_refresh)'
 threads-required = 'num-test-threads'
 
 [[profile.default.overrides]]
-filter = 'test(/specialists_watcher::/) | test(/skills_watcher::/) | test(/root_watch::/) | test(/events::registry::/) | test(/config_watcher::/) | test(/run_auggie/) | test(/availability_available_via_fake_binary/) | test(/opencode_cli_timeout/) | test(/opencode_timeout/) | test(/opencode_models_cli_child_path/) | test(/grok_cli_timeout/) | test(/grok_models_cli/)'
+filter = 'test(/specialists_watcher::/) | test(/skills_watcher::/) | test(/root_watch::/) | test(/events::registry::/) | test(/config_watcher::/) | test(/run_auggie/) | test(/availability_available_via_fake_binary/) | test(/opencode_cli_timeout/) | test(/opencode_timeout/) | test(/opencode_models_cli_child_path/) | test(/grok_cli_timeout/) | test(/grok_models_cli/) | test(idle_publish_resolves_without_batch_window_delay)'
 test-group = 'timing-serial'
