@@ -20,6 +20,7 @@ fi
 
 echo "Cleaning coverage data..."
 cargo llvm-cov clean --workspace
+rm -f coverage-summary.txt
 
 echo "Running e2e tests with coverage instrumentation (nextest)..."
 
@@ -32,10 +33,6 @@ echo "Running e2e tests with coverage instrumentation (nextest)..."
 INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p intentd \
     -E 'kind(test) and not binary(intentd) and not binary(auggie_context_e2e)'
 
-echo ""
-echo "Generating coverage report..."
-cargo llvm-cov report --summary-only
-
 # Generate lcov.info if requested (for CI artifact upload)
 # Do this BEFORE the floor check so the artifact is available even on failure
 if [ "${GENERATE_LCOV:-}" = "1" ]; then
@@ -44,10 +41,25 @@ if [ "${GENERATE_LCOV:-}" = "1" ]; then
     cargo llvm-cov report --lcov --output-path lcov.info
 fi
 
-# If a numeric floor is provided as first argument, enforce it
+# One report invocation prints the summary AND enforces the floor (if a numeric
+# floor is provided as first argument) — same consolidation as coverage-all.sh
+# (intent-hq/monorepo#4260). The summary is tee'd to coverage-summary.txt for
+# CI to reuse; `set -o pipefail` keeps a floor failure fatal through the pipe
+# (cargo-llvm-cov exits 1 without a message on a floor miss, hence the explicit
+# diagnostic).
+REPORT_ARGS=(--summary-only)
+FLOOR=""
+echo ""
 if [ $# -gt 0 ]; then
     FLOOR="$1"
-    echo ""
-    echo "Enforcing line coverage floor: ${FLOOR}%"
-    cargo llvm-cov report --fail-under-lines "$FLOOR"
+    echo "Generating coverage report and enforcing line coverage floor: ${FLOOR}%"
+    REPORT_ARGS+=(--fail-under-lines "$FLOOR")
+else
+    echo "Generating coverage report..."
+fi
+if ! cargo llvm-cov report "${REPORT_ARGS[@]}" | tee coverage-summary.txt; then
+    if [ -n "$FLOOR" ]; then
+        echo "ERROR: line coverage is below the ${FLOOR}% floor (see TOTAL above)" >&2
+    fi
+    exit 1
 fi
