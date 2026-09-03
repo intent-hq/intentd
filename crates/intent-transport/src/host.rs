@@ -468,10 +468,14 @@ pub(crate) async fn handle(
             if let Some(p) = read_setting_string(api, "context.auggiePath").await {
                 provider_paths.insert("auggie".to_string(), p);
             }
+            // Live `agents.acpNodeMaxOldSpaceMb` so the probe child carries the
+            // same V8 heap cap a real ACP spawn gets (intent-hq/intent#4330).
+            let node_max_old_space_mb = read_setting_u32(api, "agents.acpNodeMaxOldSpaceMb").await;
             match intent_services::provider_test_prompt::provider_test_prompt(
                 &provider_id,
                 model.as_deref(),
                 &provider_paths,
+                node_max_old_space_mb,
             )
             .await
             {
@@ -726,6 +730,14 @@ async fn read_setting_string(api: &dyn WorkspaceApi, path: &str) -> Option<Strin
     } else {
         Some(s.to_string())
     }
+}
+
+/// Read a single `u32`-valued setting; returns `None` for missing / null /
+/// non-integer / out-of-`u32`-range values, or when the lookup itself fails.
+async fn read_setting_u32(api: &dyn WorkspaceApi, path: &str) -> Option<u32> {
+    let payload = api.settings_get(path.to_string()).await.ok()?;
+    let n = payload.get("value")?.as_u64()?;
+    u32::try_from(n).ok()
 }
 
 /// Opens a URL/file on the daemon host's GUI. Injected so the local path is

@@ -83,7 +83,9 @@ fn failure(reason: &str, message: impl Into<String>) -> Value {
 /// applied exactly like `agent.completeOnce` applies it (launch args or
 /// post-`session/new` config option, provider-dependent); `provider_paths`
 /// carries the `providers.paths` overrides, threaded by the caller like the
-/// discovery/auth-status surfaces (monorepo#1065).
+/// discovery/auth-status surfaces (monorepo#1065); `node_max_old_space_mb`
+/// is the live `agents.acpNodeMaxOldSpaceMb` setting (`None` when unset), so
+/// the probe child gets the same V8 heap cap a real ACP spawn would.
 ///
 /// # Errors
 ///
@@ -94,6 +96,7 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
     provider_id: &str,
     model: Option<&str>,
     provider_paths: &HashMap<String, String, S>,
+    node_max_old_space_mb: Option<u32>,
 ) -> Result<Value, String> {
     let Some(provider) = intent_providers::find_provider(provider_id) else {
         return Err(format!("Unknown providerId: {provider_id}"));
@@ -161,9 +164,15 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
     // cortex's `ELECTRON_RUN_AS_NODE`, opencode's `OPENCODE_CONFIG_CONTENT`,
     // the Node heap cap. No rules file, MCP block, or unsloth endpoint: the
     // probe wants the barest viable session.
-    for (key, value) in
-        intent_providers::build_provider_env_for_spawn(provider, model, None, None, None, via_npx)
-    {
+    for (key, value) in intent_providers::build_provider_env_for_spawn(
+        provider,
+        model,
+        None,
+        None,
+        None,
+        via_npx,
+        node_max_old_space_mb,
+    ) {
         cmd = cmd.env(key, value);
     }
     // codex loads MCP servers from its inherited CODEX_HOME regardless of the
@@ -266,7 +275,9 @@ mod tests {
     #[tokio::test]
     async fn unsupported_provider_returns_structured_unsupported() {
         let paths: HashMap<String, String> = HashMap::new();
-        let v = provider_test_prompt("unsloth", None, &paths).await.unwrap();
+        let v = provider_test_prompt("unsloth", None, &paths, None)
+            .await
+            .unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["reason"], "unsupported");
         assert!(v["message"].as_str().unwrap().contains("unsloth"));
@@ -277,7 +288,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_provider_is_an_error() {
         let paths: HashMap<String, String> = HashMap::new();
-        let err = provider_test_prompt("not-a-provider", None, &paths)
+        let err = provider_test_prompt("not-a-provider", None, &paths, None)
             .await
             .unwrap_err();
         assert!(err.contains("Unknown providerId"), "{err}");
