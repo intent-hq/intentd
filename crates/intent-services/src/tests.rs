@@ -9728,6 +9728,41 @@ mod change_event_parity {
         );
     }
 
+    /// Concurrent `note.list` callers may both observe a missing spec before
+    /// either creates it. Both calls still succeed with the same seeded row,
+    /// while the insert winner alone captures a version and emits the event.
+    #[tokio::test]
+    async fn concurrent_note_lists_reseed_missing_spec_once() {
+        use intent_core::NoteId;
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        let (first, second) =
+            tokio::join!(h.services.list_notes(&h.ws), h.services.list_notes(&h.ws),);
+        for notes in [first.expect("first list"), second.expect("second list")] {
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].id, NoteId::from("spec"));
+            assert_eq!(notes[0].content, "");
+        }
+
+        let event = recv_one(&mut sub).await;
+        assert_envelope(&event, &h.ws.0, "note:created");
+        assert_eq!(event["data"]["noteId"], "spec");
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(quiet.is_err(), "concurrent reseed must emit exactly once");
+
+        let versions = h
+            .store
+            .list_note_versions(&h.ws, &NoteId::from("spec"))
+            .await
+            .expect("versions");
+        assert_eq!(
+            versions.len(),
+            1,
+            "concurrent reseed must capture one version"
+        );
+    }
+
     /// A workspace that already has a `spec` note is untouched by `note.list`:
     /// no spurious `note:created`, no extra version snapshot, no rev bump.
     #[tokio::test]

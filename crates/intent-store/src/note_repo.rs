@@ -78,6 +78,29 @@ impl Store {
         rows.iter().map(map_note_row).collect()
     }
 
+    /// Test whether a workspace owns a note without hydrating its row.
+    ///
+    /// The query runs under [`crate::with_read_retry`] for the same transient
+    /// `SQLITE_BUSY` protection as [`Store::get_note`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when the underlying query fails.
+    pub async fn note_exists(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<bool> {
+        let present = crate::with_read_retry(|| async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM note WHERE id = ? AND workspace_id = ? LIMIT 1",
+            )
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("note existence check failed: {e}")))
+        })
+        .await?;
+        Ok(present.is_some())
+    }
+
     /// Newest `updated_at` across a workspace's notes, or `None` when the
     /// workspace has none — the note half of the `lastActivity` derivation
     /// (`enrich_workspace_aggregates` / `derive_last_activity`) as a single

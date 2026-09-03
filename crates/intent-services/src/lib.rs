@@ -8819,10 +8819,8 @@ async fn ensure_spec_note(
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
     let spec_id = NoteId::from("spec");
-    match fetch_note(store, workspace_id, &spec_id).await {
-        Ok(_) => return Ok(()),
-        Err(Error::NotFound(_)) => {}
-        Err(e) => return Err(e),
+    if store.note_exists(workspace_id, &spec_id).await? {
+        return Ok(());
     }
     // The reseed writes target `note.workspace_id → workspace(id)` (migration
     // 0030), so a deleted/nonexistent workspace has no FK target: verify the
