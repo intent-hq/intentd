@@ -15439,7 +15439,16 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::list(&root, &path)
+            // Containment checks and directory enumeration both touch the
+            // filesystem, so keep the complete synchronous operation off the
+            // async runtime. RPC dispatch tasks are detached from their client
+            // connection, so a disconnect lets this finish and the closed
+            // outbound channel discards its response. If this future is
+            // otherwise dropped, dropping the JoinHandle detaches the already
+            // running blocking task; neither case pins a runtime worker.
+            tokio::task::spawn_blocking(move || file_ops::list(&root, &path))
+                .await
+                .map_err(|e| Error::Internal(format!("file.list task failed: {e}")))?
         })
     }
 
@@ -15571,7 +15580,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             let root = file_ops::resolve_root(&store, &workspace_id, None).await;
-            file_ops::tree(&root, &path)
+            tokio::task::spawn_blocking(move || file_ops::tree(&root, &path))
+                .await
+                .map_err(|e| Error::Internal(format!("file.tree task failed: {e}")))?
         })
     }
 

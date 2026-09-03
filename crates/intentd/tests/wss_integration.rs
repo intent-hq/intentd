@@ -356,6 +356,21 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     }
 }
 
+/// One authenticated WSS round-trip preserving the literal response bytes.
+async fn wss_call_text(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> String {
+    let mut ws = connect_ws(port, cfg).await;
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send");
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => return text.to_string(),
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 /// Send a `chat.subscribe` frame over a fresh WSS connection, wait for both
 /// the `{ subscriptionId }` response (matched on `id`) and the seq-0
 /// `subscription.push` snapshot, and return the snapshot object (§7.1).
@@ -14962,6 +14977,55 @@ async fn wss_file_ops_symlink_escape_rejected() {
     );
     let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_eq!(resp["result"], serde_json::json!("ok"), "{resp}");
+
+    srv.ws.stop().await;
+}
+
+/// Moving `file.list` / `file.tree` to the blocking pool must not alter their
+/// legacy bare-array payloads, field order, or JSON-RPC envelope bytes.
+#[tokio::test]
+async fn wss_file_list_and_tree_preserve_serialized_shape() {
+    let srv = start(WsOptions::default()).await;
+    let dir = test_tempdir("intentd-wss-file-enumeration-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    std::fs::create_dir(root.join("single")).expect("create fixture directory");
+    std::fs::write(root.join("single/only.txt"), "x").expect("write fixture file");
+
+    let ws_id = WorkspaceId::new();
+    let mut workspace = fixture_workspace(&ws_id);
+    workspace.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+
+    let list = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":101,"method":"file.list","params":{{"workspaceId":"{}","path":"single"}}}}"#,
+            ws_id.0
+        ),
+    )
+    .await;
+    assert_eq!(
+        list,
+        r#"{"jsonrpc":"2.0","result":[{"name":"only.txt","type":"file"}],"id":101}"#
+    );
+
+    let tree = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":102,"method":"file.tree","params":{{"workspaceId":"{}","path":"single"}}}}"#,
+            ws_id.0
+        ),
+    )
+    .await;
+    assert_eq!(
+        tree,
+        r#"{"jsonrpc":"2.0","result":[{"path":"single/only.txt","name":"only.txt","isDirectory":false}],"id":102}"#
+    );
 
     srv.ws.stop().await;
 }
