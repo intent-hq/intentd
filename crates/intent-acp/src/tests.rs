@@ -5739,6 +5739,11 @@ mod workspace_api_tool_tests {
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
+        // Pin the unborn HEAD to `main` explicitly so the initial commit
+        // creates the branch itself: force-creating `main` after the commit
+        // fails on hosts whose `init.defaultBranch = main` already made it
+        // the current HEAD (intent-hq/monorepo#4218).
+        repo.set_head("refs/heads/main").unwrap();
         std::fs::write(dir.path().join("README.md"), "test\n").unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(std::path::Path::new("README.md")).unwrap();
@@ -5749,7 +5754,6 @@ mod workspace_api_tool_tests {
             .commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
             .unwrap();
         let commit = repo.find_commit(commit_id).unwrap();
-        repo.branch("main", &commit, true).unwrap();
         repo.branch("feature/ready", &commit, false).unwrap();
         repo.reference_symbolic(
             "refs/remotes/origin/HEAD",
