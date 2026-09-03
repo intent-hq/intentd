@@ -902,8 +902,11 @@ async fn dispatch(
             let note_id = require_note_id(params)?;
             let task_text = require_str_param(params, "taskText")?;
             let status = require_str_param(params, "status")?;
+            // FE/RPC front door: no agent provenance (the MCP path passes the
+            // caller agent so a redirected write's `task:status-changed`
+            // carries `agentId`).
             let result = api
-                .task_update_status(ws, note_id, task_text, status)
+                .task_update_status(ws, note_id, task_text, status, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -932,7 +935,7 @@ async fn dispatch(
             let status = opt_str(params, "status");
             let expected = opt_str(params, "expected");
             let result = api
-                .task_update(ws, note_id, line, text, status, expected)
+                .task_update(ws, note_id, line, text, status, expected, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)

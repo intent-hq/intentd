@@ -1054,14 +1054,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.updateStatus`: flip a checkbox by exact task text (PROTOCOL §5.4).
+    /// `caller_agent_id` attributes a write redirected to a linked task note
+    /// (its `task:status-changed` / flipped-completion) to the calling agent.
     fn task_update_status(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         task_text: String,
         status: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
-        let _ = (workspace_id, note_id, task_text, status);
+        let _ = (workspace_id, note_id, task_text, status, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update_status not implemented".to_string(),
@@ -1098,6 +1101,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.update`: atomic single-line edit with `expected` conflict check (§5.4).
+    /// `caller_agent_id` attributes a write redirected to a linked task note
+    /// (its `task:status-changed` / flipped-completion) to the calling agent.
+    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -1106,8 +1112,17 @@ pub trait WorkspaceApi: Send + Sync {
         text: Option<String>,
         status: Option<String>,
         expected: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
-        let _ = (workspace_id, note_id, line, text, status, expected);
+        let _ = (
+            workspace_id,
+            note_id,
+            line,
+            text,
+            status,
+            expected,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update not implemented".to_string(),

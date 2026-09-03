@@ -8480,9 +8480,7 @@ impl Services {
         // fetch.
         match all {
             Some(all) => {
-                materialize_linked_checkboxes_in(
-                    store,
-                    bus,
+                self.materialize_linked_checkboxes_in(
                     &note.workspace_id,
                     &note.id,
                     new_status,
@@ -8491,7 +8489,7 @@ impl Services {
                 .await;
             }
             None => {
-                materialize_linked_checkboxes(store, bus, &note.workspace_id, &note.id, new_status)
+                self.materialize_linked_checkboxes(&note.workspace_id, &note.id, new_status)
                     .await;
             }
         }
@@ -10474,62 +10472,67 @@ async fn publish_dependent_note_updates(
     }
 }
 
-/// Materialize a task note's status onto every note in the workspace whose
-/// checkbox lines link it (`[label](intent://local/task/{id})`): `complete`
-/// → `[x]`, `in_progress` → `[/]`, else `[ ]`. Notes whose linked lines
-/// already carry the marker are left untouched (no write, no event); each
-/// rewritten note takes a `note:updated`. Best-effort: store failures are
-/// logged, never surfaced to the status write that already succeeded.
-async fn materialize_linked_checkboxes(
-    store: &Store,
-    bus: Option<&EventBus>,
-    workspace_id: &WorkspaceId,
-    task_id: &NoteId,
-    status: TaskStatus,
-) {
-    let notes = match store.list_notes(workspace_id).await {
-        Ok(notes) => notes,
-        Err(e) => {
-            tracing::warn!(note = %task_id.0, error = %e, "materialize linked checkboxes: list notes failed");
-            return;
-        }
-    };
-    materialize_linked_checkboxes_in(store, bus, workspace_id, task_id, status, notes).await;
-}
-
-/// [`materialize_linked_checkboxes`] over an already-fetched workspace note
-/// list (callers that just listed the workspace for the ready-task recompute
-/// pass it through instead of listing twice).
-async fn materialize_linked_checkboxes_in(
-    store: &Store,
-    bus: Option<&EventBus>,
-    workspace_id: &WorkspaceId,
-    task_id: &NoteId,
-    status: TaskStatus,
-    notes: Vec<Note>,
-) {
-    let checkbox = note_ops::checkbox_for_task_status(status);
-    let needle = format!("(intent://local/task/{})", task_id.as_str());
-    for mut note in notes {
-        if !note.content.contains(&needle) {
-            continue;
-        }
-        let Some(content) =
-            note_ops::set_linked_checkbox(&note.content, task_id.as_str(), checkbox)
-        else {
-            continue;
+impl Services {
+    /// Materialize a task note's status onto every note in the workspace whose
+    /// checkbox lines link it (`[label](intent://local/task/{id})`): `complete`
+    /// → `[x]`, `in_progress` → `[/]`, else `[ ]`. Notes whose linked lines
+    /// already carry the marker are left untouched (no write, no event); each
+    /// rewritten note takes a `note:updated` and — like every other surgical
+    /// content mutation — drops its cached CRDT session and schedules its
+    /// line-attribution recompute. Best-effort: store failures are logged,
+    /// never surfaced to the status write that already succeeded.
+    async fn materialize_linked_checkboxes(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_id: &NoteId,
+        status: TaskStatus,
+    ) {
+        let notes = match self.store.list_notes(workspace_id).await {
+            Ok(notes) => notes,
+            Err(e) => {
+                tracing::warn!(note = %task_id.0, error = %e, "materialize linked checkboxes: list notes failed");
+                return;
+            }
         };
-        note.content = content;
-        note.updated_at = now_iso();
-        if let Err(e) = store.update_note(&note).await {
-            tracing::warn!(note = %note.id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: update failed");
-            continue;
+        self.materialize_linked_checkboxes_in(workspace_id, task_id, status, notes)
+            .await;
+    }
+
+    /// [`Self::materialize_linked_checkboxes`] over an already-fetched
+    /// workspace note list (callers that just listed the workspace for the
+    /// ready-task recompute pass it through instead of listing twice).
+    async fn materialize_linked_checkboxes_in(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_id: &NoteId,
+        status: TaskStatus,
+        notes: Vec<Note>,
+    ) {
+        let checkbox = note_ops::checkbox_for_task_status(status);
+        let needle = format!("(intent://local/task/{})", task_id.as_str());
+        for mut note in notes {
+            if !note.content.contains(&needle) {
+                continue;
+            }
+            let Some(content) =
+                note_ops::set_linked_checkbox(&note.content, task_id.as_str(), checkbox)
+            else {
+                continue;
+            };
+            note.content = content;
+            note.updated_at = now_iso();
+            if let Err(e) = self.store.update_note(&note).await {
+                tracing::warn!(note = %note.id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: update failed");
+                continue;
+            }
+            self.invalidate_crdt_note(workspace_id, &note.id);
+            self.schedule_line_attribution_recompute(workspace_id, &note.id);
+            publish_event(
+                self.event_bus.as_ref(),
+                note_change_event(workspace_id, &note.id, &note.title, NOTE_UPDATED, "update"),
+            )
+            .await;
         }
-        publish_event(
-            bus,
-            note_change_event(workspace_id, &note.id, &note.title, NOTE_UPDATED, "update"),
-        )
-        .await;
     }
 }
 
@@ -21117,6 +21120,7 @@ impl WorkspaceApi for Services {
         note_id: NoteId,
         task_text: String,
         status: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -21145,18 +21149,19 @@ impl WorkspaceApi for Services {
                 match redirected_task_status(&status, current) {
                     Some(next) => {
                         services
-                            .set_task_note_status(&note.workspace_id, &task_id, next, None, None)
+                            .set_task_note_status(
+                                &note.workspace_id,
+                                &task_id,
+                                next,
+                                None,
+                                caller_agent_id,
+                            )
                             .await?;
                     }
                     None => {
-                        materialize_linked_checkboxes(
-                            &store,
-                            bus.as_ref(),
-                            &note.workspace_id,
-                            &task_id,
-                            current,
-                        )
-                        .await;
+                        services
+                            .materialize_linked_checkboxes(&note.workspace_id, &task_id, current)
+                            .await;
                     }
                 }
                 services.invalidate_crdt_note(&note.workspace_id, &note.id);
@@ -21216,6 +21221,7 @@ impl WorkspaceApi for Services {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -21224,6 +21230,7 @@ impl WorkspaceApi for Services {
         text: Option<String>,
         status: Option<String>,
         expected: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -21306,7 +21313,7 @@ impl WorkspaceApi for Services {
             }
             if let Some((task_id, Some(next), _)) = redirect {
                 services
-                    .set_task_note_status(&note.workspace_id, &task_id, next, None, None)
+                    .set_task_note_status(&note.workspace_id, &task_id, next, None, caller_agent_id)
                     .await?;
             }
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
@@ -21557,14 +21564,9 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
-            materialize_linked_checkboxes(
-                &store,
-                services.event_bus.as_ref(),
-                &note.workspace_id,
-                &note.id,
-                new_status,
-            )
-            .await;
+            services
+                .materialize_linked_checkboxes(&note.workspace_id, &note.id, new_status)
+                .await;
             match previous_status {
                 // Only a note that was not already a task is "created" as one.
                 None => {
@@ -21928,14 +21930,9 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
-            materialize_linked_checkboxes(
-                &store,
-                bus.as_ref(),
-                &note.workspace_id,
-                &note.id,
-                status_now,
-            )
-            .await;
+            services
+                .materialize_linked_checkboxes(&note.workspace_id, &note.id, status_now)
+                .await;
             if should_update_status {
                 publish_event(
                     bus.as_ref(),

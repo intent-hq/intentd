@@ -2444,6 +2444,7 @@ async fn task_update_atomic_and_conflict() {
             None,
             Some("done".into()),
             Some("do the thing".into()),
+            None,
         )
         .await
         .expect("update");
@@ -2462,6 +2463,7 @@ async fn task_update_atomic_and_conflict() {
             None,
             Some("todo".into()),
             Some("stale text".into()),
+            None,
         )
         .await
         .unwrap_err();
@@ -2472,7 +2474,13 @@ async fn task_update_atomic_and_conflict() {
 async fn task_update_status_and_not_found() {
     let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
     let r = svc
-        .task_update_status(ws.clone(), id.clone(), "beta".into(), "in-progress".into())
+        .task_update_status(
+            ws.clone(),
+            id.clone(),
+            "beta".into(),
+            "in-progress".into(),
+            None,
+        )
         .await
         .expect("updateStatus");
     assert_eq!(r.status, "in-progress");
@@ -2481,7 +2489,7 @@ async fn task_update_status_and_not_found() {
         "- [ ] alpha\n- [/] beta"
     );
     assert!(svc
-        .task_update_status(ws, id, "ghost".into(), "done".into())
+        .task_update_status(ws, id, "ghost".into(), "done".into(), None)
         .await
         .is_err());
 }
@@ -10504,7 +10512,7 @@ mod change_event_parity {
         let mut sub = subscribe(&h);
         let r = h
             .services
-            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into())
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
             .await
             .expect("updateStatus");
         let events = drain_events(&mut sub).await;
@@ -10532,6 +10540,7 @@ mod change_event_parity {
                 spec_id(),
                 "plain".into(),
                 "in-progress".into(),
+                None,
             )
             .await
             .expect("updateStatus plain");
@@ -10566,6 +10575,7 @@ mod change_event_parity {
                 None,
                 Some("in-progress".into()),
                 Some(link.clone()),
+                None,
             )
             .await
             .expect("task.update");
@@ -10593,6 +10603,7 @@ mod change_event_parity {
                 None,
                 Some("done".into()),
                 Some("stale".into()),
+                None,
             )
             .await
             .unwrap_err();
@@ -10628,6 +10639,7 @@ mod change_event_parity {
                 Some(new_text.clone()),
                 Some("done".into()),
                 None,
+                None,
             )
             .await
             .expect("task.update");
@@ -10661,12 +10673,20 @@ mod change_event_parity {
         let mut sub = subscribe(&h);
         let r = h
             .services
-            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into())
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into(), None)
             .await
             .expect("updateStatus todo");
         let r2 = h
             .services
-            .task_update(h.ws.clone(), spec_id(), 1, None, Some("todo".into()), None)
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("todo".into()),
+                None,
+                None,
+            )
             .await
             .expect("task.update todo");
         let events = drain_events(&mut sub).await;
@@ -10691,7 +10711,7 @@ mod change_event_parity {
         assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
         let r = h
             .services
-            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into())
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into(), None)
             .await
             .expect("updateStatus reopen");
         assert_eq!(r.status, "todo");
@@ -10702,7 +10722,15 @@ mod change_event_parity {
         assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
         let r = h
             .services
-            .task_update(h.ws.clone(), spec_id(), 1, None, Some("todo".into()), None)
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("todo".into()),
+                None,
+                None,
+            )
             .await
             .expect("task.update reopen");
         assert_eq!(r.status, "todo");
@@ -10724,7 +10752,7 @@ mod change_event_parity {
         let mut sub = subscribe(&h);
         let r = h
             .services
-            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into())
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
             .await
             .expect("updateStatus");
         let events = drain_events(&mut sub).await;
@@ -10756,7 +10784,7 @@ mod change_event_parity {
 
         let mut sub = subscribe(&h);
         h.services
-            .task_update_status(h.ws.clone(), spec_id(), "F".into(), "done".into())
+            .task_update_status(h.ws.clone(), spec_id(), "F".into(), "done".into(), None)
             .await
             .expect("updateStatus");
         h.services
@@ -10766,6 +10794,7 @@ mod change_event_parity {
                 2,
                 None,
                 Some("in-progress".into()),
+                None,
                 None,
             )
             .await
@@ -10784,6 +10813,211 @@ mod change_event_parity {
             .await
             .expect("get fresh");
         assert!(fresh.metadata.task.is_none());
+    }
+
+    fn attribution_recompute_scheduled(h: &Harness, id: &str) -> bool {
+        h.services
+            .line_attribution_debouncers
+            .lock()
+            .expect("debouncer lock")
+            .contains_key(&(h.ws.clone(), intent_core::NoteId::from(id)))
+    }
+
+    fn seed_crdt_session(h: &Harness, id: &str, content: &str) {
+        let nid = intent_core::NoteId::from(id);
+        h.services
+            .crdt_notes
+            .apply_full_content(&h.ws, &nid, content, content);
+        assert!(h.services.crdt_notes.has_session(&h.ws, &nid));
+    }
+
+    /// A materialized parent write is a surgical content mutation like
+    /// `note.edit`: it drops the parent's cached CRDT session (so the next
+    /// `note.setContent` reseeds from the persisted marker) and schedules its
+    /// line-attribution recompute. Parents left untouched — and the task note
+    /// itself — keep their sessions and schedule nothing.
+    #[tokio::test]
+    async fn materialization_invalidates_parent_crdt_and_schedules_attribution_recompute() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let body = linked("[ ]", "T", T1);
+        let other = linked("[ ]", "Other", T2);
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&note(&h.ws, FRESH, &other))
+            .await
+            .expect("insert other");
+        seed_crdt_session(&h, "spec", &body);
+        seed_crdt_session(&h, FRESH, &other);
+
+        set_status(&h, T1, "complete").await;
+
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        assert!(
+            !h.services.crdt_notes.has_session(&h.ws, &spec_id()),
+            "rewritten parent drops its CRDT session"
+        );
+        assert!(
+            attribution_recompute_scheduled(&h, "spec"),
+            "rewritten parent schedules a line-attribution recompute"
+        );
+        assert!(h
+            .services
+            .crdt_notes
+            .has_session(&h.ws, &intent_core::NoteId::from(FRESH)));
+        assert!(!attribution_recompute_scheduled(&h, FRESH));
+        assert!(!attribution_recompute_scheduled(&h, T1));
+
+        // The marker already matches: no rewrite, so no invalidation either.
+        seed_crdt_session(&h, "spec", &linked("[x]", "T", T1));
+        set_status(&h, T1, "complete").await;
+        assert!(h.services.crdt_notes.has_session(&h.ws, &spec_id()));
+    }
+
+    /// Redirected writes through `task.updateStatus` / `task.update` behave as
+    /// on every other materializing path: the redirect target's parents are
+    /// invalidated too (here the parent is the note the call addressed).
+    #[tokio::test]
+    async fn redirected_write_invalidates_parent_crdt() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = linked("[ ]", "T", T1);
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        seed_crdt_session(&h, "spec", &body);
+
+        h.services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("done".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        assert!(!h.services.crdt_notes.has_session(&h.ws, &spec_id()));
+        assert!(attribution_recompute_scheduled(&h, "spec"));
+    }
+
+    /// A redirected checkbox write from an agent caller carries the same
+    /// provenance as `task.updateNoteStatus`: `task:status-changed` names the
+    /// agent (payload `agentId` + agent actor) and a complete-boundary crossing
+    /// records / removes the agent's flipped-completion pair. A caller-less
+    /// write (FE/RPC front door) carries neither.
+    #[tokio::test]
+    async fn redirected_writes_carry_agent_provenance_and_flipped_completion() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::InProgress).await;
+        insert_task_note(&h, T2, TaskStatus::InProgress).await;
+        let body = format!("{}\n{}", linked("[/]", "T", T1), linked("[/]", "U", T2));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        let agent = AgentId::from("agent-redirect");
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent, &h.ws, "Redirector"))
+            .await
+            .expect("session");
+        let flipped = || async {
+            h.store
+                .list_agent_flipped_completions(&agent)
+                .await
+                .expect("list flipped")
+        };
+        let t1 = intent_core::NoteId::from(T1);
+        let t2 = intent_core::NoteId::from(T2);
+
+        // task.updateStatus → complete: provenance + recorded pair.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_status(
+                h.ws.clone(),
+                spec_id(),
+                "T".into(),
+                "done".into(),
+                Some(agent.clone()),
+            )
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T1);
+        assert_eq!(changed[0]["data"]["newStatus"], "complete");
+        assert_eq!(changed[0]["data"]["agentId"], "agent-redirect");
+        assert_eq!(
+            changed[0]["actor"],
+            json!({ "type": "agent", "id": "agent-redirect", "name": "Redirector" })
+        );
+        assert_eq!(flipped().await, vec![(h.ws.clone(), t1.clone())]);
+
+        // task.update → complete on the second line: same provenance.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                2,
+                None,
+                Some("done".into()),
+                None,
+                Some(agent.clone()),
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T2);
+        assert_eq!(changed[0]["data"]["agentId"], "agent-redirect");
+        assert_eq!(
+            changed[0]["actor"],
+            json!({ "type": "agent", "id": "agent-redirect", "name": "Redirector" })
+        );
+        let mut pairs = flipped().await;
+        pairs.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
+        assert_eq!(
+            pairs,
+            vec![(h.ws.clone(), t1.clone()), (h.ws.clone(), t2.clone())]
+        );
+
+        // Reopening through a redirected write removes the pair.
+        h.services
+            .task_update_status(
+                h.ws.clone(),
+                spec_id(),
+                "T".into(),
+                "todo".into(),
+                Some(agent.clone()),
+            )
+            .await
+            .expect("updateStatus todo");
+        assert_eq!(flipped().await, vec![(h.ws.clone(), t2.clone())]);
+
+        // No caller: system-attributed event, nothing recorded.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
+            .await
+            .expect("updateStatus no caller");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert!(changed[0]["data"].get("agentId").is_none());
+        assert_eq!(changed[0]["actor"]["type"], "system");
+        assert_eq!(flipped().await, vec![(h.ws.clone(), t2)]);
     }
 }
 
@@ -29226,18 +29460,32 @@ mod line_attribution_hooks {
     #[tokio::test]
     async fn task_update_status_schedules_recompute() {
         let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
-        svc.task_update_status(ws.clone(), id.clone(), "beta".into(), "in-progress".into())
-            .await
-            .expect("updateStatus");
+        svc.task_update_status(
+            ws.clone(),
+            id.clone(),
+            "beta".into(),
+            "in-progress".into(),
+            None,
+        )
+        .await
+        .expect("updateStatus");
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
 
     #[tokio::test]
     async fn task_update_schedules_recompute() {
         let (_tmp, svc, ws, id) = setup("- [ ] alpha").await;
-        svc.task_update(ws.clone(), id.clone(), 1, None, Some("done".into()), None)
-            .await
-            .expect("task.update");
+        svc.task_update(
+            ws.clone(),
+            id.clone(),
+            1,
+            None,
+            Some("done".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("task.update");
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
 
