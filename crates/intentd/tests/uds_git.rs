@@ -25,8 +25,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 fn git(repo: &Path, args: &[&str]) {
+    // The harness may inherit GIT_AUTHOR_*/GIT_COMMITTER_* (agent-spawned
+    // shells do, post-#4142); env outranks the repo-local user.* config these
+    // tests seed, so strip the identity vars to keep commits deterministic
+    // (intent-hq/monorepo#4191).
     let ok = Command::new("git")
         .current_dir(repo)
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
         .args(args)
         .status()
         .expect("run git")

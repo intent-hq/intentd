@@ -7600,8 +7600,14 @@ async fn wss_git_commit_details_round_trip() {
     let repo_dir = test_tempdir("intentd-wssgit-");
     let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
+        // Strip inherited GIT_AUTHOR_*/GIT_COMMITTER_* so the repo-local
+        // user.* config below wins (env outranks config; monorepo#4191).
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
             .args(args)
             .status()
             .expect("run git")
@@ -8333,8 +8339,14 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     let repo_dir = test_tempdir("intentd-wssacgs-");
     let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
+        // Strip inherited GIT_AUTHOR_*/GIT_COMMITTER_* so the repo-local
+        // user.* config below wins (env outranks config; monorepo#4191).
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
             .args(args)
             .status()
             .expect("run git")

@@ -1679,9 +1679,18 @@ mod tests {
 
     /// #4142: a script spawned inside a repo with a configured identity
     /// carries the four `GIT_*` identity vars; the script's own env still
-    /// wins (applied after) and an absent cwd exports none.
+    /// wins (applied after) and an absent cwd exports none. The four vars are
+    /// unset for the test's lifetime: the harness itself may inherit them
+    /// (agent-spawned shells do, post-#4142), and `commit_identity_env`
+    /// correctly gap-fills nothing then (intent-hq/monorepo#4191).
     #[test]
     fn spawn_overlay_injects_commit_identity_script_env_wins() {
+        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+            ("GIT_AUTHOR_NAME", None),
+            ("GIT_AUTHOR_EMAIL", None),
+            ("GIT_COMMITTER_NAME", None),
+            ("GIT_COMMITTER_EMAIL", None),
+        ]);
         let dir =
             std::env::temp_dir().join(format!("intentd-script-identity-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -1096,9 +1096,18 @@ mod tests {
     /// intent-hq/intent#4142: the combined injection carries the four
     /// commit-identity `GIT_*` vars when the spawn cwd's repository resolves
     /// an identity — ungated (no settings registry needed) — and none when
-    /// the cwd is absent.
+    /// the cwd is absent. The four vars are unset for the test's lifetime:
+    /// the harness itself may inherit them (agent-spawned shells do,
+    /// post-#4142), and `commit_identity_env` correctly gap-fills nothing
+    /// then (intent-hq/monorepo#4191).
     #[test]
     fn injected_git_env_carries_commit_identity_ungated() {
+        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+            ("GIT_AUTHOR_NAME", None),
+            ("GIT_AUTHOR_EMAIL", None),
+            ("GIT_COMMITTER_NAME", None),
+            ("GIT_COMMITTER_EMAIL", None),
+        ]);
         let dir =
             std::env::temp_dir().join(format!("intentd-term-identity-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2030,9 +2039,19 @@ mod tests {
     /// intent-hq/intent#4142: a `terminal/create` that omits `cwd` falls back
     /// to the agent session's cwd for both the spawn directory and the git
     /// env resolution, so the commit identity resolved from the session's
-    /// repository still reaches the child.
+    /// repository still reaches the child. The four `GIT_*` identity vars are
+    /// unset for the test's lifetime: the harness itself may inherit them
+    /// (agent-spawned shells do, post-#4142), injection is gap-filling only,
+    /// and the PTY child would print the inherited value instead
+    /// (intent-hq/monorepo#4191).
     #[tokio::test]
     async fn acp_create_without_cwd_falls_back_to_session_cwd_with_identity() {
+        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+            ("GIT_AUTHOR_NAME", None),
+            ("GIT_AUTHOR_EMAIL", None),
+            ("GIT_COMMITTER_NAME", None),
+            ("GIT_COMMITTER_EMAIL", None),
+        ]);
         let dir =
             std::env::temp_dir().join(format!("intentd-acp-session-cwd-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
