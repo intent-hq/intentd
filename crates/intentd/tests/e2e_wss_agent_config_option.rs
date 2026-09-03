@@ -1164,6 +1164,199 @@ async fn codex_rejection_invalidates_child_on_recreated_sessions() {
     assert_codex_rejection_and_recovery(false).await;
 }
 
+/// A real stdout closure during model setup must enter the existing spawn
+/// retry path. Only a fresh, successfully configured child may run the prompt.
+async fn assert_codex_config_transport_recovery(advertise_load: bool) {
+    let Some(script) = gate() else { return };
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config.jsonl");
+    let session_log = data_dir.join("sessions.jsonl");
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let attempts = data_dir.join("attempts");
+    let behavior = json!({
+        "advertiseLoadSession": advertise_load,
+        "exitOnModelConfigForAttempts": 2,
+        "modelSelection": {
+            "defaultModel": "vega-alpha",
+            "models": ["vega-alpha", "gpt-5.5"],
+        },
+    })
+    .to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "1,1"),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL_STRIPS_EFFORT", "1"),
+        ("MOCK_AGENT_CONFIG_LOG", config_log.to_str().unwrap()),
+        ("MOCK_AGENT_SESSION_LOG", session_log.to_str().unwrap()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log.to_str().unwrap()),
+        ("MOCK_AGENT_ATTEMPT_FILE", attempts.to_str().unwrap()),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({
+            "title": "Codex transport recovery", "noPrompt": true,
+        }),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["agent:*"], "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Transport recovery", "provider": "mock",
+            "model": "gpt-5.5[low]",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap();
+    let sent = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id, "content": "recover configured model",
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+
+    let mut retries = 0;
+    let mut ended = false;
+    let mut idle = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:failed") => panic!("transport should recover automatically: {event}"),
+            Some("agent:stream:status") if event["data"]["phase"] == "spawn-retry" => {
+                retries += 1;
+                assert!(
+                    event["data"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("stdout closed"),
+                    "{event}"
+                );
+            }
+            Some("agent:stream:end") => {
+                assert_eq!(retries, 2, "both dropped connections must be retried");
+                ended = true;
+            }
+            Some("agent:status-changed") if event["data"]["status"] == "idle" => idle = true,
+            Some("agent:message") => assert!(
+                !event.to_string().contains("model_changed"),
+                "no successful switch notice for failed setups: {event}"
+            ),
+            _ => {}
+        }
+        if ended && idle {
+            break;
+        }
+    }
+    assert!(ended && idle, "recovered turn completes and becomes idle");
+    let sessions = read_config_log(&session_log);
+    assert_eq!(
+        sessions.len(),
+        3,
+        "two failed children and one recovery: {sessions:?}"
+    );
+    for (i, session) in sessions.iter().enumerate() {
+        assert_eq!(
+            session["method"],
+            if i > 0 && advertise_load {
+                "session/load"
+            } else {
+                "session/new"
+            }
+        );
+        assert!(
+            sessions[..i]
+                .iter()
+                .all(|prior| prior["pid"] != session["pid"]),
+            "each retry must use a fresh child: {sessions:?}"
+        );
+    }
+    let configs = read_config_log(&config_log);
+    let models: Vec<_> = configs
+        .iter()
+        .filter(|config| config["configId"] == "model")
+        .collect();
+    assert_eq!(
+        models.len(),
+        3,
+        "model config must be retried on every child: {configs:?}"
+    );
+    assert!(models.iter().all(|config| config["value"] == "gpt-5.5"));
+    let prompts = read_config_log(&prompt_log);
+    assert_eq!(
+        prompts.len(),
+        1,
+        "failed setups must not send a prompt: {prompts:?}"
+    );
+    assert_eq!(prompts[0]["effectiveModel"], "gpt-5.5");
+    assert_eq!(prompts[0]["effectiveEffort"], "low");
+    let conversation = wss_rpc(
+        &mut rpc,
+        5,
+        "agent.getConversation",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id,
+        }),
+    )
+    .await;
+    let rendered = conversation.to_string();
+    assert!(
+        rendered.contains("effective-model=gpt-5.5 effort=low"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("effective-model=vega-alpha"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Select a supported model"), "{rendered}");
+}
+
+#[tokio::test]
+async fn codex_model_config_transport_failure_retries_loaded_session() {
+    assert_codex_config_transport_recovery(true).await;
+}
+
+#[tokio::test]
+async fn codex_model_config_transport_failure_retries_recreated_session() {
+    assert_codex_config_transport_recovery(false).await;
+}
+
 /// A rejected `session/set_model` (e.g. an unknown model id) is best-effort:
 /// the daemon logs a warning, the provider keeps its default model, and the
 /// turn still completes.

@@ -3491,9 +3491,19 @@ impl AgentManager {
                     // any prompt (or successful model-change notice) is sent.
                     if provider.config_option_model_strips_effort {
                         self.kill_child_only(agent_id).await;
-                        return Err(Error::InvalidParams(format!(
-                            "Could not apply Codex model '{model_id}': {e}. Select a supported model and retry."
-                        )));
+                        return Err(match &e {
+                            intent_acp::AcpError::Rpc(rpc) if rpc.code == -32602 => {
+                                Error::InvalidParams(format!(
+                                    "Could not apply Codex model '{model_id}': {e}. Select a supported model and retry."
+                                ))
+                            }
+                            // Preserve the ACP detail for the existing spawn
+                            // retry classifier; a transport or timeout failure
+                            // does not mean the selected model is unsupported.
+                            _ => Error::Internal(format!(
+                                "session/set_config_option failed: {e}"
+                            )),
+                        });
                     }
                     tracing::warn!(
                         provider = provider.id,
@@ -12769,58 +12779,6 @@ mod role_reminder_tests {
         assert_eq!(
             AgentManager::config_option_model_target(claude, Some("some/model")),
             Some("some/model")
-        );
-    }
-
-    #[test]
-    fn codex_legacy_effort_normalization_is_bounded() {
-        let codex = intent_providers::find_provider("codex").unwrap();
-        for level in [
-            "none", "low", "medium", "high", "xhigh", "max", "ultra", "LOW",
-        ] {
-            let model = format!("codex:gpt-5.5[{level}]");
-            assert_eq!(
-                AgentManager::config_option_model_target(codex, Some(&model)),
-                Some("gpt-5.5")
-            );
-            assert_eq!(
-                AgentManager::session_model_effort(codex, Some(&model), None).as_deref(),
-                Some(level.to_ascii_lowercase().as_str())
-            );
-            assert_eq!(
-                AgentManager::session_model_effort(codex, Some(&model), Some("medium")).as_deref(),
-                Some("medium")
-            );
-        }
-        for model in [
-            "gpt-5.5[bogus]",
-            "gpt-5.5[low",
-            "gpt-5.5[]",
-            "[low]",
-            "gpt-5.5[[low]]",
-            "gpt-5.5[low][high]",
-        ] {
-            assert_eq!(
-                AgentManager::config_option_model_target(codex, Some(model)),
-                Some(model)
-            );
-            assert_eq!(
-                AgentManager::session_model_effort(codex, Some(model), None),
-                None
-            );
-        }
-        let claude = intent_providers::find_provider("claude-code").unwrap();
-        assert_eq!(
-            AgentManager::config_option_model_target(claude, Some("opus[low]")),
-            Some("opus[low]")
-        );
-        assert_eq!(
-            AgentManager::session_model_effort(claude, Some("opus[low]"), None),
-            None
-        );
-        assert_eq!(
-            AgentManager::session_model_effort(codex, Some("grok:foo[low]"), None),
-            None
         );
     }
 

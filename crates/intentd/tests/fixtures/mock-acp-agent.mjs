@@ -988,6 +988,12 @@ async function dispatch(msg) {
           log(`config log write failed: ${err.message}`);
         }
       }
+      // Close the actual ACP pipe before accepting the model on the first
+      // N child launches. The shared attempt file lets a fresh child recover.
+      if (msg.params?.configId === 'model' && behavior.exitOnModelConfigForAttempts > 0) {
+        const attempt = getAndIncrementAttempt();
+        if (attempt <= behavior.exitOnModelConfigForAttempts) process.exit(1);
+      }
       // Deterministic failure mode: reject the call (invalid params, e.g. an
       // unknown model id) so tests can assert the daemon logs a warning and
       // the turn still completes on the provider's default model.
