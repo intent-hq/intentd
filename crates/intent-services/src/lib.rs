@@ -19918,6 +19918,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            if let Some(content) = input.content.as_deref() {
+                note_ops::reject_numbered_read_presentation(content)?;
+            }
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             with_idempotency(
@@ -19999,6 +20002,9 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            if let Some(content) = input.content.as_deref() {
+                note_ops::reject_numbered_read_presentation(content)?;
+            }
             let expected_version = input.expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.

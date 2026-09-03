@@ -203,15 +203,22 @@ pub(crate) fn clean_set_content(content: &str) -> Result<String> {
 /// numbered body and its metadata footer.
 const TASK_METADATA_TRAILER: &str = "\n\n--- Task Metadata ---\n";
 
+/// Field width of the `{:>4}` line-number column in `note.read` output.
+const READ_NUMBER_WIDTH: usize = 4;
+
 /// Line number of a `note.read` display line (`{:>4} | {line}`); `None` when
-/// the line is not in that shape. A blank source line renders as `   N | `,
-/// so a bare `N |` (trailing space trimmed by the caller) also counts.
+/// the line is not in that shape. The number column is exactly the
+/// right-aligned 4-wide field the binding renders (wider only once the number
+/// itself outgrows it), so an indented code block such as `    1 | x` does
+/// not qualify. A blank source line renders as `   N | `, so a bare `N |`
+/// (trailing space trimmed by the caller) also counts.
 fn numbered_read_line(line: &str) -> Option<u64> {
     let rest = line.trim_start_matches(' ');
+    let pad = line.len() - rest.len();
     let digits_end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
-    if digits_end == 0 {
+    if digits_end == 0 || pad + digits_end != READ_NUMBER_WIDTH.max(digits_end) {
         return None;
     }
     let after = &rest[digits_end..];
@@ -222,32 +229,27 @@ fn numbered_read_line(line: &str) -> Option<u64> {
     }
 }
 
-/// True when `content` is the line-numbered *display* presentation that
-/// `ws.note.read` returns in `content` (as opposed to `rawContent`): every
-/// line carries a `   N | ` prefix with consecutive `N`, blank lines
-/// included, optionally followed by a task note's metadata footer. Requires
-/// at least two lines so a lone `N | text` line is never mistaken for it;
-/// ordered lists, tables and fenced listings do not match (monorepo#4208).
+/// True when `content` is (or starts as) the line-numbered *display*
+/// presentation that `ws.note.read` returns in `content` (as opposed to
+/// `rawContent`): the content opens with at least two lines carrying
+/// consecutive `   N | ` prefixes, blank lines included — whatever follows is
+/// irrelevant, so `read.content + "\n- [ ] new item"` is caught too. A task
+/// note's read that carries only the metadata footer (empty body) also
+/// counts. A lone `N | text` line, ordered lists, tables, indented code and
+/// fenced listings do not match (monorepo#4208).
 #[must_use]
 pub fn is_numbered_read_presentation(content: &str) -> bool {
-    let body = content
+    let (body, has_trailer) = content
         .split_once(TASK_METADATA_TRAILER)
-        .map_or(content, |(body, _)| body)
-        .trim_end_matches('\n');
+        .map_or((content, false), |(body, _)| (body, true));
+    if has_trailer && body.is_empty() {
+        return true;
+    }
     let mut lines = body.split('\n');
     let Some(first) = lines.next().and_then(numbered_read_line) else {
         return false;
     };
-    let mut expected = first;
-    let mut count = 1;
-    for line in lines {
-        expected += 1;
-        if numbered_read_line(line) != Some(expected) {
-            return false;
-        }
-        count += 1;
-    }
-    count >= 2
+    lines.next().and_then(numbered_read_line) == Some(first + 1)
 }
 
 /// Write-path guard for every content-accepting `ws.note.*` mutation: reject
@@ -257,7 +259,7 @@ pub fn is_numbered_read_presentation(content: &str) -> bool {
 pub(crate) fn reject_numbered_read_presentation(content: &str) -> Result<()> {
     if is_numbered_read_presentation(content) {
         return Err(Error::InvalidParams(
-            "Content looks like the line-numbered display returned by note.read (every line is prefixed with `   N | `). Writing it back would corrupt the note's Markdown, so it was rejected and the note is unchanged. Use the `rawContent` field from note.read (or remove the `   N | ` prefixes) and retry; wrap intentionally numbered text in a code fence.".to_string(),
+            "Content looks like the line-numbered display returned by note.read (lines prefixed with `   N | `). Writing it back would corrupt the note's Markdown, so it was rejected and the note is unchanged. Use the `rawContent` field from note.read (or remove the `   N | ` prefixes) and retry; wrap intentionally numbered text in a code fence.".to_string(),
         ));
     }
     Ok(())
@@ -1837,6 +1839,18 @@ mod tests {
         assert!(is_numbered_read_presentation(
             "   1 | # T\n   2 | body\n\n--- Task Metadata ---\nStatus: in_progress"
         ));
+        // Empty task note: the read is only the metadata trailer.
+        assert!(is_numbered_read_presentation(
+            "\n\n--- Task Metadata ---\nStatus: not_started"
+        ));
+        // The incident shape: `read.content + "\n- [ ] new item"` — the
+        // appended raw line must not launder the numbered body.
+        assert!(is_numbered_read_presentation(
+            "   1 | # Spec\n   2 | \n   3 | - [ ] item\n- [ ] new item"
+        ));
+        assert!(is_numbered_read_presentation(
+            "   1 | # Spec\n   2 | body\n\n## Added section\nprose"
+        ));
     }
 
     #[test]
@@ -1852,15 +1866,28 @@ mod tests {
         assert!(!is_numbered_read_presentation(
             "```text\n   1 | listing\n   2 | example\n```"
         ));
-        // Only some lines numbered, or non-consecutive numbering.
+        // Indented (4-space) code block: wider than the `{:>4}` column.
+        assert!(!is_numbered_read_presentation(
+            "    1 | listing\n    2 | example"
+        ));
+        assert!(!is_numbered_read_presentation(" 10000 | a\n 10001 | b"));
+        // Prose before a numbered run, or a non-consecutive opening pair.
+        assert!(!is_numbered_read_presentation("intro\n   1 | a\n   2 | b"));
         assert!(!is_numbered_read_presentation("   1 | a\nplain\n   3 | c"));
         assert!(!is_numbered_read_presentation("   1 | a\n   3 | c"));
         assert!(!is_numbered_read_presentation("   2 | a\n   1 | b"));
         // A single line is too little signal to reject.
         assert!(!is_numbered_read_presentation("   1 | only"));
+        assert!(!is_numbered_read_presentation("   1 | only\nplain"));
         assert!(!is_numbered_read_presentation(""));
-        // `N|x` without the surrounding spaces is not the read shape.
+        // `N|x` without the surrounding spaces is not the read shape, nor are
+        // unpadded GFM table body rows without a leading pipe.
         assert!(!is_numbered_read_presentation("1|a\n2|b"));
+        assert!(!is_numbered_read_presentation("1 | Alice\n2 | Bob"));
+        // A task-style trailer after a real body is ordinary Markdown.
+        assert!(!is_numbered_read_presentation(
+            "# T\n\n--- Task Metadata ---\nStatus: x"
+        ));
     }
 
     #[test]
