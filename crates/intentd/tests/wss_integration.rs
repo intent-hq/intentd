@@ -6296,6 +6296,163 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
     srv.ws.stop().await;
 }
 
+/// Like [`fake_acp_adapter_script`] but the wrapper also points the fixture's
+/// `MOCK_AGENT_SESSION_LOG` seam at `session_log`, so the test can read back
+/// the `NODE_OPTIONS` the daemon handed the child (the fixture records it on
+/// every `session/new`).
+#[cfg(unix)]
+fn fake_acp_adapter_script_with_session_log(
+    tag: &str,
+    behavior: &str,
+    session_log: &Path,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = format!(
+        "{}/tests/fixtures/mock-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let dir = test_tempdir(&format!("intentd-wss-acp-{tag}-"));
+    let bin = dir.path().join("opencode");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nMOCK_AGENT_BEHAVIOR='{behavior}' MOCK_AGENT_SESSION_LOG={:?} exec node {fixture:?} \"$@\"\n",
+            session_log.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, bin)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_acp_node_max_old_space_mb_setting_reaches_provider_test_prompt_child() {
+    // `agents.acpNodeMaxOldSpaceMb` (§5.12, intent-hq/intent#4330) over the
+    // real wire: the unset key reads back as `null` with the catalog default
+    // (8192) on the definition, an out-of-range update is `-32602`, and an
+    // in-range update lands as `NODE_OPTIONS=
+    // --max-old-space-size=<MB>` on the NEXT provider child — observed here
+    // via host.providerTestPrompt against a Node-runtime provider (opencode)
+    // pinned to the mock fixture, which records its inherited NODE_OPTIONS on
+    // `session/new`. This pins the wire shape end to end: `settings.get`
+    // reports Number settings as floats, so the host-side reader must parse
+    // `4096.0` — an integer-only read silently kept the default.
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping acpNodeMaxOldSpaceMb e2e: node not on PATH");
+        return;
+    }
+    let log_dir = test_tempdir("intentd-wss-heapcap-log-");
+    let session_log = log_dir.path().join("sessions.txt");
+    let (_adapter_dir, bin) = fake_acp_adapter_script_with_session_log(
+        "heap-cap",
+        r#"{"response":"hello"}"#,
+        &session_log,
+    );
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "opencode": bin.to_string_lossy() }),
+    );
+
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":80,"method":"settings.get","params":{"path":"agents.acpNodeMaxOldSpaceMb"}}"#,
+    )
+    .await;
+    assert_eq!(got["id"], 80);
+    assert_eq!(
+        got["result"]["value"],
+        Value::Null,
+        "unset key reads null (the spawn path resolves the catalog default): {got}"
+    );
+    assert_eq!(got["result"]["origin"], "default", "{got}");
+    assert_eq!(
+        got["result"]["definition"]["defaultValue"],
+        serde_json::json!(8192.0),
+        "catalog default on the wire: {got}"
+    );
+
+    let rejected = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":81,"method":"settings.update","params":{"changes":[{"path":"agents.acpNodeMaxOldSpaceMb","value":512}]}}"#,
+    )
+    .await;
+    assert_eq!(rejected["id"], 81);
+    assert_eq!(
+        rejected["error"]["code"], -32602,
+        "below the 1024 MB floor is invalid params: {rejected}"
+    );
+
+    let applied = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":82,"method":"settings.update","params":{"changes":[{"path":"agents.acpNodeMaxOldSpaceMb","value":4096}]}}"#,
+    )
+    .await;
+    assert_eq!(applied["id"], 82);
+    assert_eq!(
+        applied["result"]["applied"][0]["path"], "agents.acpNodeMaxOldSpaceMb",
+        "applied: {applied}"
+    );
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":83,"method":"settings.get","params":{"path":"agents.acpNodeMaxOldSpaceMb"}}"#,
+    )
+    .await;
+    assert_eq!(
+        got["result"]["value"],
+        serde_json::json!(4096.0),
+        "updated cap reads back as a float: {got}"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":84,"method":"host.providerTestPrompt","params":{"providerId":"opencode"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 84);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "ok": true }),
+        "the probe turn against the mock passes: {resp}"
+    );
+
+    let raw = std::fs::read_to_string(&session_log).expect("mock session log written");
+    let lines: Vec<Value> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("session log line json"))
+        .collect();
+    assert_eq!(lines.len(), 1, "one session/new for the probe: {lines:?}");
+    assert_eq!(lines[0]["method"], "session/new");
+    // Both the env override and an inherited `NODE_OPTIONS` that already caps
+    // the heap legitimately win over the setting (the daemon never clobbers a
+    // parent cap), so the child-side assertion only holds in a clean env —
+    // same guard as the intent-acp spawn tests.
+    let parent_caps_heap = std::env::var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB").is_ok()
+        || std::env::var("NODE_OPTIONS").is_ok_and(|v| v.contains("--max-old-space-size"));
+    if parent_caps_heap {
+        eprintln!(
+            "skipping NODE_OPTIONS assertion: parent env already caps the heap ({:?})",
+            lines[0]["nodeOptions"]
+        );
+    } else {
+        let node_options = lines[0]["nodeOptions"]
+            .as_str()
+            .expect("probe child inherited NODE_OPTIONS");
+        assert!(
+            node_options.contains("--max-old-space-size=4096"),
+            "probe child NODE_OPTIONS carries the configured cap, got {node_options:?}"
+        );
+    }
+    srv.ws.stop().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
