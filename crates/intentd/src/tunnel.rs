@@ -56,6 +56,49 @@ pub fn resolve_tailcat_bin() -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Map a tailcat spawn failure into an actionable error. `NotFound` means the
+/// sidecar binary is missing entirely (`resolve_tailcat_bin` already probed
+/// every location), which in practice means an intentd installed from a
+/// release archive that predates the bundled sidecar — say so and how to fix
+/// it instead of surfacing the raw OS error. The exception is an
+/// `INTENTD_TAILCAT_BIN` override: it short-circuits the probe, so a missing
+/// override path is the override's fault, not a stale install. Other spawn
+/// failures keep the underlying error.
+fn tailcat_spawn_error(action: &str, bin: &Path, e: &std::io::Error) -> Error {
+    let overridden = std::env::var("INTENTD_TAILCAT_BIN").is_ok_and(|p| !p.is_empty());
+    tailcat_spawn_error_impl(action, bin, e, overridden)
+}
+
+fn tailcat_spawn_error_impl(
+    action: &str,
+    bin: &Path,
+    e: &std::io::Error,
+    overridden: bool,
+) -> Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        if overridden {
+            return Error::Internal(format!(
+                "cannot run tailcat {action}: the INTENTD_TAILCAT_BIN override points \
+                 at a missing binary ({}); fix or unset INTENTD_TAILCAT_BIN (when it \
+                 is set, no other location is probed)",
+                bin.display()
+            ));
+        }
+        return Error::Internal(format!(
+            "cannot run tailcat {action}: the tailcat sidecar binary was not found \
+             ({}; checked libexec/ and the directory next to the intentd binary, \
+             then PATH). Update intentd (`intentd update`) — releases before \
+             v0.9.10 did not bundle the tailcat sidecar \
+             (https://github.com/tailscale/tailcat)",
+            bin.display()
+        ));
+    }
+    Error::Internal(format!(
+        "cannot run tailcat {action} ({}): {e}",
+        bin.display()
+    ))
+}
+
 /// Supervisor for the tailcat sidecar. One instance lives in the composition
 /// root (`DaemonControl`); `start`/`stop` are idempotent and safe to call
 /// from concurrent settings updates (single async Mutex over the state).
@@ -199,12 +242,7 @@ impl TunnelSupervisor {
         let output = genkey_command(&self.bin, &self.key_path, derp_url)
             .output()
             .await
-            .map_err(|e| {
-                Error::Internal(format!(
-                    "cannot run tailcat genkey ({}): {e}",
-                    self.bin.display()
-                ))
-            })?;
+            .map_err(|e| tailcat_spawn_error("genkey", &self.bin, &e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::Internal(format!(
@@ -262,7 +300,7 @@ async fn spawn_and_read_address(
 ) -> Result<(Child, String)> {
     let mut child = serve_command(bin, key_path, ws_port, derp_url)
         .spawn()
-        .map_err(|e| Error::Internal(format!("cannot spawn tailcat ({}): {e}", bin.display())))?;
+        .map_err(|e| tailcat_spawn_error("serve", bin, &e))?;
     // Drain stderr into the daemon log so crash-loop causes (bad DERP map,
     // key parse failure, network errors) are diagnosable, and the child never
     // blocks on a full pipe.
@@ -521,18 +559,65 @@ esac
         sup.stop().await;
     }
 
+    /// Serializes tests that touch the process-global `INTENTD_TAILCAT_BIN`
+    /// env var with tests whose error path reads it (`tailcat_spawn_error`).
+    static TAILCAT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn stop_is_idempotent_and_start_fails_on_missing_binary() {
+        let _env = TAILCAT_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let sup = TunnelSupervisor::new(dir.path().join("no-such-tailcat"), dir.path())
             .with_address_timeout(Duration::from_secs(2));
         sup.stop().await; // no-op when never started
         let err = sup.start(5181, None).await.unwrap_err();
+        // A missing binary must produce the actionable sidecar-not-found
+        // guidance, not the raw ENOENT (regression: pre-v0.9.10 release
+        // archives shipped without libexec/tailcat).
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("tailcat"),
-            "error should name tailcat: {err}"
+            msg.contains("sidecar binary was not found") && msg.contains("intentd update"),
+            "error should carry the actionable guidance: {err}"
         );
         assert_eq!(sup.address().await, None);
+    }
+
+    #[test]
+    fn tailcat_spawn_error_maps_not_found_to_actionable_guidance() {
+        let bin = Path::new("/opt/intentd/libexec/tailcat");
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = tailcat_spawn_error_impl("genkey", bin, &not_found, false).to_string();
+        assert!(msg.contains("cannot run tailcat genkey"), "{msg}");
+        assert!(msg.contains("sidecar binary was not found"), "{msg}");
+        assert!(msg.contains("/opt/intentd/libexec/tailcat"), "{msg}");
+        assert!(msg.contains("intentd update"), "{msg}");
+        assert!(msg.contains("before v0.9.10"), "{msg}");
+        assert!(
+            msg.contains("https://github.com/tailscale/tailcat"),
+            "{msg}"
+        );
+        // The probe skips INTENTD_TAILCAT_BIN when it is unset, so the message
+        // must not claim it was checked.
+        assert!(!msg.contains("INTENTD_TAILCAT_BIN"), "{msg}");
+
+        // An INTENTD_TAILCAT_BIN override short-circuits the probe: blame the
+        // override, not a stale install ("intentd update" would not fix it).
+        let msg =
+            tailcat_spawn_error_impl("genkey", Path::new("/custom/tailcat"), &not_found, true)
+                .to_string();
+        assert!(msg.contains("cannot run tailcat genkey"), "{msg}");
+        assert!(msg.contains("INTENTD_TAILCAT_BIN override"), "{msg}");
+        assert!(msg.contains("/custom/tailcat"), "{msg}");
+        assert!(msg.contains("fix or unset INTENTD_TAILCAT_BIN"), "{msg}");
+        assert!(!msg.contains("intentd update"), "{msg}");
+        assert!(!msg.contains("checked libexec/"), "{msg}");
+
+        // Any other spawn failure keeps the raw OS error, no guidance.
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = tailcat_spawn_error_impl("serve", bin, &denied, false).to_string();
+        assert!(msg.contains("cannot run tailcat serve"), "{msg}");
+        assert!(msg.contains(&denied.to_string()), "{msg}");
+        assert!(!msg.contains("intentd update"), "{msg}");
     }
 
     #[tokio::test]
@@ -612,6 +697,7 @@ esac
     fn resolve_tailcat_bin_prefers_env_override() {
         // Serialized by cargo's per-test process? No — env is process-global.
         // Use a unique var read + restore to stay hermetic.
+        let _env = TAILCAT_ENV_LOCK.blocking_lock();
         let prev = std::env::var("INTENTD_TAILCAT_BIN").ok();
         std::env::set_var("INTENTD_TAILCAT_BIN", "/custom/tailcat");
         assert_eq!(resolve_tailcat_bin(), PathBuf::from("/custom/tailcat"));

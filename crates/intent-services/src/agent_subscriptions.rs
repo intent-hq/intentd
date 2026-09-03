@@ -74,8 +74,18 @@ pub(crate) struct CompletionWatch {
     /// of an explicit registration.
     pub wake_on_attention: bool,
     /// Ask-only watches wait strictly for terminal completion. Attention
-    /// requests do not consume or wake this watch, and it may coexist with an
-    /// unrelated grouped watch for the same parent/child pair.
+    /// requests do not consume or wake this watch, and monitoring-idle
+    /// advisories (child idle while only hooks / PR monitors are active) are
+    /// skipped for it too — the parent hears nothing until settlement, even
+    /// if the child parks on a TTL-less PR monitor (intent-hq/intent#4254
+    /// design). It may coexist with an unrelated grouped watch for the same
+    /// parent/child pair. The flag is set only on watches the ask path
+    /// CREATES: `register_completion_watch_strict_durable` reuses an
+    /// existing non-strict ungrouped watch as-is, and any later non-ask
+    /// registration adopting an ask-only watch CLEARS the flag (upgrade to
+    /// a full watch — the explicit watcher expects advisories; see
+    /// `insert_watch_in_memory`). The skip therefore holds exactly while the
+    /// ask registration is the pair's only ungrouped interest.
     pub completion_only: bool,
     /// Identity (`completion_report.timestamp`) of the child report whose
     /// report-time wake was SENT toward this parent (monorepo#4026): stamped
@@ -299,8 +309,8 @@ impl Services {
     /// regardless of the `wake_on_attention` flag (monorepo#3443); the flag
     /// is kept as the persisted record of an explicit registration.
     /// Adoption strengthens an existing watch for the pair
-    /// (`wake_on_attention` set) — grouped watches keep their group but gain
-    /// the flag.
+    /// (`wake_on_attention` set, `completion_only` cleared) — grouped watches
+    /// keep their group but gain the flag.
     pub(crate) async fn register_agent_watch_durable(
         &self,
         parent_workspace_id: &WorkspaceId,
@@ -372,6 +382,11 @@ impl Services {
     /// - `wake_on_attention` is strengthen-only: an explicit `agent.watch`
     ///   sets it on the adopted watch; a later auto registration never
     ///   clears it.
+    /// - `completion_only` is cleared: every registration through this path
+    ///   is a full (non-ask) watch, so adopting an ask-only watch upgrades it
+    ///   to hear monitoring-idle advisories (PR #1686 review). The ask path
+    ///   (`register_completion_watch_strict_durable`) never adopts through
+    ///   here, so it cannot re-narrow a full watch.
     #[allow(clippy::too_many_arguments)]
     fn insert_watch_in_memory(
         &self,
@@ -396,6 +411,7 @@ impl Services {
                     existing.group_id = Some(gid);
                 }
                 existing.wake_on_attention = existing.wake_on_attention || wake_on_attention;
+                existing.completion_only = false;
                 // monorepo#2532: adoption expresses fresh interest in the
                 // child's NEXT completion — clear the report-time disarm so
                 // a re-armed watch fires on the next `agent:idle` (mirrors

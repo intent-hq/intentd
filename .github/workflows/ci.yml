@@ -804,7 +804,14 @@ jobs:
           echo "## E2E Coverage Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
+          # The script tees its summary to coverage-summary.txt; re-running
+          # the report (~30s) is only a fallback for a run that died before
+          # reporting (intent-hq/monorepo#4260).
+          if [[ -s coverage-summary.txt ]]; then
+            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
+          else
+            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
+          fi
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
       # Non-fatal + short retention: the lcov artifact is a debugging aid
       # only, and an org artifact-quota outage must not fail the required
@@ -999,7 +1006,12 @@ jobs:
           echo "## Combined Coverage Report (all tests)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
+          # Same reuse-or-fallback as coverage-e2e's summary step.
+          if [[ -s coverage-summary.txt ]]; then
+            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
+          else
+            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
+          fi
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
       # Non-fatal + short retention — same rationale as coverage-e2e's
       # upload step (monorepo#1163).

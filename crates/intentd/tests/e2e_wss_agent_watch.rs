@@ -25,10 +25,10 @@
 //!    already-idle-but-waiting target) — and delivers exactly once when the
 //!    chain settles;
 //!  - monitoring-idle advisory: a child idling with only active hooks / PR
-//!    monitors delivers ONE advisory wake that consumes the ungrouped watch
-//!    (`watchStillArmed: false`, re-arm instruction); a re-armed watch stays
-//!    silent through later monitoring idles and fires at the genuine
-//!    completion.
+//!    monitors delivers ONE advisory wake per waiting period that leaves the
+//!    ungrouped watch armed (`watchStillArmed: true`, `ws.agent.unwatch`
+//!    opt-out; intent-hq/intent#4254); the SAME watch stays silent for the
+//!    rest of the period and fires exactly once at the genuine completion.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 //!
@@ -1210,6 +1210,125 @@ async fn agent_watch_wakes_on_target_terminal_failure_over_wss() {
         text.contains("\"watchStillArmed\":false"),
         "failure wake metadata tags watchStillArmed=false: {text}"
     );
+    // agent:failed stays terminal under the persistent-advisory contract
+    // (intent-hq/intent#4254): the registry drops the watch and exactly one
+    // failure wake lands.
+    await_watch_count(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        &fx.target,
+        0,
+        budget.step(60),
+    )
+    .await;
+    await_conversation_settled(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        budget.step(60),
+    )
+    .await;
+    let wakes = wake_row_count(
+        &mut fx.setup.rpc,
+        fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        "failed.",
+    )
+    .await;
+    fx.req_id += 1;
+    assert_eq!(wakes, 1, "exactly one terminal failure wake");
+}
+
+/// WATCH-2e: the target's deletion (`agent.delete`) stays terminal under the
+/// persistent-advisory contract (intent-hq/intent#4254) — the watcher hears
+/// exactly ONE "was deleted" wake carrying the retirement NOTE (with the
+/// cannot-be-re-watched pointer replacement — a deleted agent is rejected by
+/// `agent.watch`) and `watchStillArmed: false`, and the registry drops the
+/// watch.
+#[tokio::test]
+async fn agent_watch_wakes_on_target_deletion_over_wss() {
+    let Some(script) = gate("WSS agent.watch deletion-wake E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+    let mut fx = boot_watch_lifecycle(&script, budget).await;
+
+    // The fixture's watch must still be live going in.
+    await_watch_count(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        &fx.target,
+        1,
+        budget.step(30),
+    )
+    .await;
+    let deleted = wss_rpc(
+        &mut fx.setup.rpc,
+        63,
+        "agent.delete",
+        json!({ "workspaceId": fx.ws_id, "agentId": fx.target }),
+    )
+    .await;
+    assert_eq!(deleted["success"], true, "agent.delete ok: {deleted}");
+    let text = await_conversation_contains(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        "was deleted",
+        budget.step(90),
+    )
+    .await;
+    assert!(
+        text.contains("Watched agent WatchTarget"),
+        "deletion wake names the target by its session name: {text}"
+    );
+    assert!(
+        text.contains("the watch is now retired"),
+        "deletion wake states the watch retirement: {text}"
+    );
+    assert!(
+        text.contains("cannot be re-watched"),
+        "deletion wake notes a deleted agent has no next completion: {text}"
+    );
+    assert!(
+        text.contains("\"watchStillArmed\":false"),
+        "deletion wake metadata tags watchStillArmed=false: {text}"
+    );
+    await_watch_count(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        &fx.target,
+        0,
+        budget.step(60),
+    )
+    .await;
+    await_conversation_settled(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        budget.step(60),
+    )
+    .await;
+    let wakes = wake_row_count(
+        &mut fx.setup.rpc,
+        fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        "was deleted",
+    )
+    .await;
+    fx.req_id += 1;
+    assert_eq!(wakes, 1, "exactly one terminal deletion wake");
 }
 
 /// Number of the agent's persisted wake rows (user rows framed with
@@ -2491,24 +2610,27 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
 }
 
 #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
-/// Monitoring-idle advisory + re-arm flow: a child that goes idle while only
-/// externally monitoring (an active background hook here — the cheapest
-/// external wait to arrange hermetically; PR monitors share the same
-/// classification) no longer parks its ungrouped watcher silently:
+/// Monitoring-idle advisory persistence (intent-hq/intent#4254): a child
+/// that goes idle while only externally monitoring (an active background
+/// hook here — the cheapest external wait to arrange hermetically; PR
+/// monitors share the same classification) advises its ungrouped watcher
+/// WITHOUT consuming the watch:
 ///  - the parent receives exactly ONE advisory wake naming the hook, with
-///    `watchStillArmed: false` + `childExternallyWaiting: true` +
-///    `waitingOnHooks` metadata and the re-arm instruction — the advisory
-///    consumes the one-shot watch;
-///  - the parent re-arms `ws.agent.watch`; the registration-time reconcile
-///    defers silently under the standing once-per-period marker (no second
-///    advisory in the SAME waiting period, watch stays armed);
+///    `watchStillArmed: true` + `childExternallyWaiting: true` +
+///    `waitingOnHooks` metadata; the text says the watch stays armed (no
+///    re-arm needed) and names `ws.agent.unwatch` as the opt-out — the
+///    watch stays listed;
+///  - a redundant `ws.agent.watch` re-arm is idempotent adoption: the
+///    registration-time reconcile defers silently under the standing
+///    once-per-period marker (no second advisory in the SAME waiting
+///    period, still exactly one watch);
 ///  - a poke drives the child through a REAL turn — the turn start ends the
 ///    waiting period (clears the marker) — and its next monitoring idle
-///    opens a NEW period: the re-armed watch hears a SECOND advisory instead
-///    of parking silently (the settlement-only clear regression);
-///  - the parent re-arms once more, the hook's terminal dispatch settles the
-///    child, and the re-armed watch delivers the genuine completion wake
-///    exactly once (`watchStillArmed: false`, no advisory flag).
+///    opens a NEW period: the SAME still-armed watch hears a SECOND
+///    advisory instead of parking silently;
+///  - the hook's terminal dispatch settles the child, and that same watch
+///    delivers the genuine completion wake exactly once
+///    (`watchStillArmed: false`, no advisory flag) and only then retires.
 ///
 /// Exercises the monorepo#1297 busy-slot advisory race end-to-end: the
 /// child's `agent:idle` is published while its worker still holds the busy
@@ -2520,7 +2642,7 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
 /// provenance and runs the advisory-ALLOWED delivery variant, so the owed
 /// advisory still arrives exactly once per waiting episode.
 #[tokio::test]
-async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_wss() {
+async fn monitoring_idle_advisories_leave_watch_armed_until_genuine_completion_over_wss() {
     const SPAWN_GO: &str = "WATCH8_SPAWN_GO";
     const CHILD_GO: &str = "WATCH8_CHILD_GO";
     const REARM_GO: &str = "WATCH8_REARM_GO";
@@ -2627,9 +2749,9 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
         "child idle is stamped hook-waiting: {child_idle}"
     );
 
-    // The advisory wake delivers: it names the hook, carries the disarm +
-    // externally-waiting metadata, instructs re-arming, and consumed the
-    // auto watch.
+    // The advisory wake delivers: it names the hook, carries the
+    // still-armed + externally-waiting metadata, names the unwatch opt-out,
+    // and leaves the auto watch armed.
     await_conversation_contains(
         &mut setup.rpc,
         &mut req_id,
@@ -2650,16 +2772,20 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
         "advisory names the active hook: {advisory}"
     );
     assert!(
-        advisory.contains("consumed your one-shot watch"),
-        "advisory says the one-shot watch was consumed: {advisory}"
+        advisory.contains("stays armed") && advisory.contains("no re-arm needed"),
+        "advisory says the watch stays armed: {advisory}"
     );
     assert!(
-        advisory.contains("re-arm with ws.agent.watch") && advisory.contains(&child),
-        "advisory instructs re-arming a watch on the child: {advisory}"
+        advisory.contains(&format!("ws.agent.unwatch(\\\"{child}\\\")")),
+        "advisory names the unwatch opt-out for the child: {advisory}"
     );
     assert!(
-        advisory.contains("\"watchStillArmed\":false"),
-        "advisory metadata tags watchStillArmed=false: {advisory}"
+        !advisory.contains("consumed your one-shot watch"),
+        "advisory must not claim the watch was consumed: {advisory}"
+    );
+    assert!(
+        advisory.contains("\"watchStillArmed\":true"),
+        "advisory metadata tags watchStillArmed=true: {advisory}"
     );
     assert!(
         advisory.contains("\"childExternallyWaiting\":true"),
@@ -2669,20 +2795,15 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
         advisory.contains("waitingOnHooks"),
         "advisory metadata lists the active hooks: {advisory}"
     );
-    await_watch_count(
-        &mut setup.rpc,
-        &mut req_id,
-        &ws_id,
-        &parent,
-        &child,
-        0,
-        budget.step(60),
-    )
-    .await;
+    // The advisory did NOT consume the watch: it is still listed.
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
+    req_id += 1;
+    assert_eq!(n, 1, "the advisory leaves the ungrouped watch armed");
 
-    // The parent re-arms. The registration-time reconcile on the still
-    // idle-and-monitoring child defers silently (no-advisory variant): the
-    // fresh watch stays armed and no second advisory fires.
+    // A redundant re-arm is idempotent adoption. The registration-time
+    // reconcile on the still idle-and-monitoring child defers silently
+    // under the standing period marker: still one watch, no second advisory
+    // in the SAME waiting period.
     let sent = wss_rpc(
         &mut setup.rpc,
         30,
@@ -2711,10 +2832,17 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
     )
     .await;
 
+    let advisories = wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, ADVISORY_NEEDLE).await;
+    req_id += 1;
+    assert_eq!(
+        advisories, 1,
+        "no second advisory in the same waiting period"
+    );
+
     // Poke the child through a REAL turn: the turn start ends the waiting
-    // period, so its next monitoring idle opens a NEW period — the re-armed
-    // watch hears a SECOND advisory (consumed again); still no completion
-    // wake while the hook stays active.
+    // period, so its next monitoring idle opens a NEW period — the SAME
+    // still-armed watch hears a SECOND advisory; still no completion wake
+    // while the hook stays active.
     let sent = wss_rpc(
         &mut setup.rpc,
         40,
@@ -2750,31 +2878,15 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
         !text.contains("completed."),
         "no completion wake while the child still monitors: {text}"
     );
-    // The second advisory consumed the re-armed watch too: re-arm once more
-    // so the genuine completion below has a watch to deliver to. The
-    // period-2 marker stands, so this registration reconciles silently — no
-    // third advisory.
-    let sent = wss_rpc(
-        &mut setup.rpc,
-        45,
-        "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": parent, "content": REARM_GO }),
-    )
-    .await;
-    assert_eq!(sent["success"], true, "second re-arm send ok: {sent}");
-    await_watch_count(
-        &mut setup.rpc,
-        &mut req_id,
-        &ws_id,
-        &parent,
-        &child,
-        1,
-        budget.step(60),
-    )
-    .await;
+    // The second advisory left the SAME watch armed — no re-arm needed for
+    // the genuine completion below.
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
+    req_id += 1;
+    assert_eq!(n, 1, "the second advisory leaves the same watch armed");
 
     // Fire the hook (its terminal one-shot dispatch): the child's wake turn
-    // ends in its GENUINE completion — the re-armed watch delivers it.
+    // ends in its GENUINE completion — the still-armed watch delivers it
+    // and only then retires.
     let listed = wss_rpc(
         &mut setup.rpc,
         50,
@@ -2828,8 +2940,9 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
     )
     .await;
 
-    // Final per-row audit: one advisory, one genuine completion (disarming,
-    // without the advisory flag) — nothing else.
+    // Final per-row audit: one still-armed advisory per waiting period, one
+    // genuine completion (disarming, without the advisory flag) — nothing
+    // else.
     let rows = wake_rows_serialized(&mut setup.rpc, req_id, &ws_id, &parent).await;
     let terminal = rows
         .iter()
@@ -2853,4 +2966,10 @@ async fn monitoring_idle_advisory_then_rearm_delivers_genuine_completion_over_ws
         2,
         "exactly one advisory wake per waiting period — two periods: {rows:?}"
     );
+    for advisory in rows.iter().filter(|r| r.contains(ADVISORY_NEEDLE)) {
+        assert!(
+            advisory.contains("\"watchStillArmed\":true"),
+            "every advisory leaves the watch armed: {advisory}"
+        );
+    }
 }

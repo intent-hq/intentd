@@ -9230,6 +9230,98 @@ async fn wss_note_set_content_non_ascii_merge_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Regression for monorepo#4208 over the real WSS wire: writing the
+/// line-numbered `note.read` display presentation (`   N | line`) back via
+/// `note.setContent` must be rejected with -32602 and leave the note
+/// untouched, while the same Markdown without the prefixes still persists.
+#[tokio::test]
+async fn wss_note_set_content_rejects_numbered_read_presentation() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Numbered Guard"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let seed = "# Spec\n\n## Goal\n- [ ] item";
+    let numbered = "   1 | # Spec\n   2 | \n   3 | ## Goal\n   4 | - [ ] item";
+    let raw_edit = "# Spec\n\n## Goal\n- [ ] item\n- [ ] new item";
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"note.create",
+            "params":{"workspaceId":ws_id,"title":"Guarded","content":seed}})
+            .to_string(),
+        ],
+    )
+    .await;
+    let note_id = sess[0]["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"note.setContent",
+                "params":{"workspaceId":ws_id,"noteId":note_id,"content":numbered}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"note.get",
+                "params":{"workspaceId":ws_id,"noteId":note_id}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":5,"method":"note.setContent",
+                "params":{"workspaceId":ws_id,"noteId":note_id,"content":raw_edit}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":6,"method":"note.get",
+                "params":{"workspaceId":ws_id,"noteId":note_id}})
+            .to_string(),
+        ],
+    )
+    .await;
+    for (i, resp) in sess.iter().enumerate() {
+        assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+        assert_eq!(
+            resp["id"].as_i64(),
+            Some(i64::try_from(i).expect("value fits in i64") + 3),
+            "envelope: {resp}"
+        );
+    }
+    assert_eq!(
+        sess[0]["error"]["code"], -32602,
+        "numbered presentation is rejected as invalid params: {}",
+        sess[0]
+    );
+    let msg = sess[0]["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("note.read") && msg.contains("rawContent"),
+        "error names the remediation: {msg}"
+    );
+    assert_eq!(
+        sess[1]["result"]["note"]["content"], seed,
+        "rejected write leaves the note unchanged: {}",
+        sess[1]
+    );
+    assert!(
+        sess[2].get("error").is_none(),
+        "raw Markdown write succeeds: {}",
+        sess[2]
+    );
+    assert_eq!(
+        sess[3]["result"]["note"]["content"], raw_edit,
+        "raw Markdown persisted verbatim: {}",
+        sess[3]
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `git.showFile` over WSS (PROTOCOL §5.6 extensions): file content at a
 /// revision (`HEAD` / `HEAD^`), the empty-content fallback for a path missing
 /// at the ref, and -32603 for an unresolvable ref.
