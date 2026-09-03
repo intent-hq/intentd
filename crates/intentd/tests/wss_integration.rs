@@ -249,9 +249,19 @@ async fn start_with_auggie(opts: WsOptions, auggie_bin: Option<std::path::PathBu
 /// [`start_with_auggie`] with an optional persisted models-cache dir so
 /// `models.list` cache-fallback tests (§5.30) can seed a last-good entry.
 async fn start_with_auggie_and_models_cache(
+    opts: WsOptions,
+    auggie_bin: Option<std::path::PathBuf>,
+    models_cache_dir: Option<std::path::PathBuf>,
+) -> Server {
+    start_with_control(opts, auggie_bin, models_cache_dir, None).await
+}
+
+/// Build + start a WSS listener with an optional system control implementation.
+async fn start_with_control(
     mut opts: WsOptions,
     auggie_bin: Option<std::path::PathBuf>,
     models_cache_dir: Option<std::path::PathBuf>,
+    system_control: Option<Arc<dyn SystemControl>>,
 ) -> Server {
     let (api, bus, store, registry, dir) = make_services(auggie_bin, models_cache_dir).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
@@ -270,7 +280,7 @@ async fn start_with_auggie_and_models_cache(
         &token_store,
         opts,
         reverse_registry.clone(),
-        None,
+        system_control,
     )
     .expect("server");
     let cfg = client_config(&tls.fingerprint256);
@@ -15027,5 +15037,99 @@ async fn wss_file_list_and_tree_preserve_serialized_shape() {
         r#"{"jsonrpc":"2.0","result":[{"path":"single/only.txt","name":"only.txt","isDirectory":false}],"id":102}"#
     );
 
+    srv.ws.stop().await;
+}
+
+/// Disconnecting during a blocking-pool traversal detaches that work without
+/// pinning an async worker or retaining the dead WSS connection.
+#[tokio::test]
+async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
+    let control: Arc<dyn SystemControl> = Arc::new(WatchHealthControl {
+        health: WatchHealth::default(),
+    });
+    let srv = start_with_control(WsOptions::default(), None, None, Some(control)).await;
+    let dir = test_tempdir("intentd-wss-file-disconnect-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let heavy = root.join("heavy");
+    std::fs::create_dir(&heavy).expect("create heavy fixture directory");
+    for index in 0..20_000 {
+        std::fs::write(heavy.join(format!("file-{index:05}.txt")), "x")
+            .expect("write heavy fixture file");
+    }
+
+    let ws_id = WorkspaceId::new();
+    let mut workspace = fixture_workspace(&ws_id);
+    workspace.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+
+    let mut enumeration = connect_ws(srv.port, srv.cfg.clone()).await;
+    let mut status = connect_ws(srv.port, srv.cfg.clone()).await;
+    enumeration
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":201,"method":"file.tree","params":{{"workspaceId":"{}","path":"heavy"}}}}"#,
+                ws_id.0
+            )
+            .into(),
+        ))
+        .await
+        .expect("send heavy file.tree request");
+
+    // Give dispatch time to enter the blocking traversal, then simulate an
+    // abrupt client disconnect rather than waiting for its large response.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    drop(enumeration);
+
+    let started = std::time::Instant::now();
+    status
+        .send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":202,"method":"system.status"}"#
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send system.status");
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match status.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let response: Value = serde_json::from_str(&text).expect("status json");
+                    if response["id"] == 202 {
+                        break response;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected system.status response, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("system.status stayed responsive during detached traversal");
+    assert!(response["result"].is_object(), "system.status: {response}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "system.status was delayed by file.tree"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while srv.ws.client_count() > 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        srv.ws.client_count(),
+        1,
+        "disconnected enumeration client must be reclaimed"
+    );
+
+    status.close(None).await.expect("close status client");
+    drop(status);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while srv.ws.client_count() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(srv.ws.client_count(), 0, "all clients must be reclaimed");
     srv.ws.stop().await;
 }
