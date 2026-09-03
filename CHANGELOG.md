@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.12] - 2026-09-03
+
+### 🐛 Bug Fixes
+
+- *(services)* Guard task.createPrerequisite content against numbered note.read paste ([#1698](https://github.com/intent-hq/intentd/pull/1698))
+
+
 ## [0.9.11] - 2026-09-03
 
 ### 🚀 Features
