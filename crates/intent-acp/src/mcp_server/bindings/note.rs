@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use intent_core::{
-    AgentId, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, WorkspaceApi,
-    WorkspaceId,
+    asset_extension_from_mime, AgentId, NoteAddInput, NoteCreate, NoteEditInput,
+    NoteEditLinesInput, NoteId, WorkspaceApi, WorkspaceId, SUPPORTED_ASSET_MIME_TYPES,
 };
 use serde_json::{json, Value};
 
@@ -247,8 +247,13 @@ async fn save_asset(
 ) -> Result<Value, String> {
     let data = req_str(args, "data")?;
     let mime_type = req_str(args, "mimeType")?;
-    if !mime_type.starts_with("image/") && !mime_type.starts_with("video/") {
-        return Err("mimeType must be an image/* or video/* type".to_string());
+    if asset_extension_from_mime(&mime_type).is_none() {
+        let supported = SUPPORTED_ASSET_MIME_TYPES
+            .iter()
+            .map(|(mime, _)| *mime)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("mimeType must be one of: {supported}"));
     }
     let result = api
         .save_asset(ws.clone(), data, mime_type, opt_str(args, "originalName"))

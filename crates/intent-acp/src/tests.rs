@@ -7759,6 +7759,30 @@ mod wsapi3_bindings_tests {
     }
 
     #[tokio::test]
+    async fn note_save_asset_rejects_unsupported_and_parameterized_mime_types() {
+        let (srv, api) = server();
+        for mime_type in ["video/quicktime", "video/mp4; codecs=avc1"] {
+            let resp = call(
+                &srv,
+                &format!(
+                    "return await ws.note.saveAsset({{ data: 'AAAA', mimeType: '{mime_type}' }});"
+                ),
+            )
+            .await;
+            assert_eq!(resp["result"]["isError"], json!(true));
+            assert!(
+                text(&resp).contains("mimeType must be one of"),
+                "unexpected error for {mime_type}: {}",
+                text(&resp)
+            );
+        }
+        assert!(
+            api.save_asset_calls.lock().unwrap().is_empty(),
+            "invalid MIME types must be rejected before persistence"
+        );
+    }
+
+    #[tokio::test]
     async fn note_set_content_threads_confirm_replacement_true() {
         let (srv, api) = server();
         let resp = call(

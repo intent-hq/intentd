@@ -869,8 +869,10 @@ mod tests {
         assert!(!out.contains("ws.agent.reportBlocker"));
         assert!(!out.contains("ws.agent.requestDiscussion"));
         // Neighboring sections survive intact, with clean separation.
-        assert!(out.contains("## Note Editing"));
-        assert!(out.contains("(which replaces everything).\n\n## Waiting on External Conditions"));
+        assert!(out.contains("(which replaces everything).\n\n## Show media"));
+        assert!(
+            out.contains("for the workspace card screenshot.\n\n## Waiting on External Conditions")
+        );
         // The ungated reportToParent guidance elsewhere in common survives.
         assert!(out.contains("ws.agent.reportToParent"));
     }
