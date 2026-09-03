@@ -40,11 +40,23 @@ pub(crate) struct WorkspaceAggregateCache {
     /// `intent_git::cow_probe`'s own process-wide cache: a hit here skips the
     /// `tokio::spawn` + probe-gate + `spawn_blocking` round-trip entirely.
     cow: Mutex<HashMap<PathBuf, bool>>,
-    /// Roots with a probe currently in flight (single-flight guard).
-    cow_in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Shared result receivers for roots with a probe currently in flight.
+    cow_in_flight: Arc<Mutex<HashMap<PathBuf, tokio::sync::watch::Receiver<Option<bool>>>>>,
     /// Serializes live `CoW` probes (shared `.cow_probe_temp` collision guard).
     cow_probe_gate: tokio::sync::Mutex<()>,
     budget: Duration,
+}
+
+/// Removes a completed or cancelled `CoW` probe from the shared flight map.
+struct CowInFlightGuard {
+    flights: Arc<Mutex<HashMap<PathBuf, tokio::sync::watch::Receiver<Option<bool>>>>>,
+    key: PathBuf,
+}
+
+impl Drop for CowInFlightGuard {
+    fn drop(&mut self) {
+        self.flights.lock().unwrap().remove(&self.key);
+    }
 }
 
 /// RAII guard for a single-flight key: removes the key on drop, including on
@@ -80,14 +92,14 @@ impl WorkspaceAggregateCache {
     pub(crate) fn new() -> Self {
         Self {
             cow: Mutex::new(HashMap::new()),
-            cow_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            cow_in_flight: Arc::new(Mutex::new(HashMap::new())),
             cow_probe_gate: tokio::sync::Mutex::new(()),
             budget: AGGREGATE_BUDGET,
         }
     }
 
-    /// Cache-only read used by every RPC path. A miss omits immediately; only
-    /// [`Self::prewarm_cow_supported`] is allowed to start a live probe.
+    /// Cache-only read used by workspace list/get paths. A miss omits
+    /// immediately without starting or awaiting filesystem work.
     pub(crate) fn cached_cow_supported(&self, workspaces_root: &PathBuf) -> Option<bool> {
         self.cow.lock().unwrap().get(workspaces_root).copied()
     }
@@ -117,68 +129,81 @@ impl WorkspaceAggregateCache {
         if let Some(v) = self.cow.lock().unwrap().get(&key) {
             return Some(*v);
         }
-        // Single-flight per root: while a probe is in flight, concurrent
-        // callers omit the field instead of queueing duplicate detached tasks
-        // behind the probe gate.
-        let guard = try_begin(&self.cow_in_flight, key.clone())?;
-        let cache = Arc::clone(self);
-        let handle = tokio::spawn(async move {
-            let _in_flight = guard;
-            // Serialize live probes: concurrent probes into the same
-            // workspaces_root collide on the shared `.cow_probe_temp` name.
-            let _gate = cache.cow_probe_gate.lock().await;
-            if let Some(v) = cache.cow.lock().unwrap().get(&key) {
-                return Some(*v);
+        // Share one detached probe per root. Unlike workspace list/get, the
+        // on-demand system capability RPC joins an existing startup prewarm so
+        // a cold request cannot race it and observe an empty capability object.
+        let mut receiver = {
+            let mut flights = self.cow_in_flight.lock().unwrap();
+            if let Some(receiver) = flights.get(&key) {
+                receiver.clone()
+            } else {
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                flights.insert(key.clone(), receiver.clone());
+                let cache = Arc::clone(self);
+                let flight_key = key.clone();
+                tokio::spawn(async move {
+                    let _in_flight = CowInFlightGuard {
+                        flights: Arc::clone(&cache.cow_in_flight),
+                        key: flight_key,
+                    };
+                    // Serialize live probes: concurrent probes into the same
+                    // workspaces_root collide on the shared `.cow_probe_temp` name.
+                    let _gate = cache.cow_probe_gate.lock().await;
+                    if let Some(v) = cache.cow.lock().unwrap().get(&key) {
+                        sender.send_replace(Some(*v));
+                        return;
+                    }
+                    let started = Instant::now();
+                    let root = key.clone();
+                    // A fresh configured `workspaces.root` may not exist yet; the
+                    // probe needs the directory to write its temp file into.
+                    let result = match tokio::task::spawn_blocking(move || {
+                        std::fs::create_dir_all(&root).map_err(|e| {
+                            intent_core::Error::Internal(format!("create workspaces root: {e}"))
+                        })?;
+                        intent_git::cow_probe(&root, &root)
+                    })
+                    .await
+                    {
+                        Ok(Ok(support)) => {
+                            let supported = matches!(support, intent_git::CowSupport::Supported);
+                            cache.cow.lock().unwrap().insert(key, supported);
+                            tracing::debug!(
+                                supported,
+                                total_ms = u64::try_from(started.elapsed().as_millis())
+                                    .unwrap_or(u64::MAX),
+                                "workspace aggregates: cow probe"
+                            );
+                            Some(supported)
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!(
+                                workspaces_root = %key.display(),
+                                error = %e,
+                                "workspace aggregates: cow probe failed; will retry on a later call"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                workspaces_root = %key.display(),
+                                error = %e,
+                                "workspace aggregates: cow probe blocking task failed"
+                            );
+                            None
+                        }
+                    };
+                    sender.send_replace(result);
+                });
+                receiver
             }
-            let started = Instant::now();
-            let root = key.clone();
-            // A fresh configured `workspaces.root` may not exist yet; the
-            // probe needs the directory to write its temp file into.
-            match tokio::task::spawn_blocking(move || {
-                std::fs::create_dir_all(&root).map_err(|e| {
-                    intent_core::Error::Internal(format!("create workspaces root: {e}"))
-                })?;
-                intent_git::cow_probe(&root, &root)
-            })
-            .await
-            {
-                Ok(Ok(support)) => {
-                    let supported = matches!(support, intent_git::CowSupport::Supported);
-                    cache.cow.lock().unwrap().insert(key, supported);
-                    tracing::debug!(
-                        supported,
-                        total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        "workspace aggregates: cow probe"
-                    );
-                    Some(supported)
-                }
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        workspaces_root = %key.display(),
-                        error = %e,
-                        "workspace aggregates: cow probe failed; will retry on a later call"
-                    );
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        workspaces_root = %key.display(),
-                        error = %e,
-                        "workspace aggregates: cow probe blocking task failed"
-                    );
-                    None
-                }
-            }
-        });
-        match tokio::time::timeout(self.budget, handle).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    error = %e,
-                    "workspace aggregates: cow probe task failed; omitting cowSupported"
-                );
-                None
-            }
+        };
+        if let Some(value) = *receiver.borrow() {
+            return Some(value);
+        }
+        match tokio::time::timeout(self.budget, receiver.changed()).await {
+            Ok(Ok(())) => *receiver.borrow_and_update(),
+            Ok(Err(_)) => *receiver.borrow(),
             Err(_) => {
                 // Over budget: the detached probe keeps running and backfills
                 // the cache for the next poll.
@@ -233,5 +258,25 @@ mod tests {
         let result = cache.cow_supported(root.clone()).await;
         assert!(result.is_some(), "probe should create the missing root");
         assert!(root.exists());
+    }
+
+    #[tokio::test]
+    async fn cow_supported_joins_in_flight_prewarm() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let cache = Arc::new(WorkspaceAggregateCache::new());
+        let gate = cache.cow_probe_gate.lock().await;
+        cache.prewarm_cow_supported(root.clone());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cache.cow_in_flight.lock().unwrap().contains_key(&root) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prewarm should enter shared flight");
+        let waiter_cache = Arc::clone(&cache);
+        let waiter = tokio::spawn(async move { waiter_cache.cow_supported(root).await });
+        drop(gate);
+        assert!(waiter.await.unwrap().is_some());
     }
 }

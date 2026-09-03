@@ -24775,7 +24775,7 @@ mod worktree_provisioning {
                 prior: std::env::var_os("INTENTD_WORKSPACES_DIR"),
             };
             std::env::set_var("INTENTD_WORKSPACES_DIR", &root.0);
-            svc.compute_cow_supported()
+            svc.probe_cow_supported().await
         };
         assert!(
             result.is_some(),

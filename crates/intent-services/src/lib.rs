@@ -2926,6 +2926,19 @@ impl Services {
             .cached_cow_supported(&workspaces_root)
     }
 
+    /// Probe `CoW` support on a cache miss, or join the shared startup prewarm.
+    /// This is reserved for the on-demand machine capability RPC; workspace
+    /// list/get paths use [`Self::compute_cow_supported`] and remain cache-only.
+    async fn probe_cow_supported(&self) -> Option<bool> {
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .or_else(try_default_workspaces_root)?;
+        self.workspace_aggregates
+            .cow_supported(workspaces_root)
+            .await
+    }
+
     /// Prewarm the machine-level `CoW` capability off the RPC read path.
     /// Idempotent and single-flight per resolved workspaces root.
     pub fn prewarm_cow_supported(&self) {
@@ -14625,7 +14638,7 @@ impl WorkspaceApi for Services {
             // (§5.1); it is included as true/false when the probe ran and
             // omitted when it could not run (presence-detected by clients).
             let mut caps = serde_json::Map::new();
-            if let Some(cow_supported) = self.compute_cow_supported() {
+            if let Some(cow_supported) = self.probe_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
             Ok(serde_json::Value::Object(caps))
