@@ -59,7 +59,7 @@ If you can’t map it, it’s probably ❌ MISSING.
 ### 2) Execute verification
 - Prefer running the Verification Plan commands exactly.
 - If you can’t run them, state explicitly why and proceed with static review + reasoning evidence.
-- To show a failure is pre-existing, do not rebuild the base commit. Cite the CI result for the base SHA (`git merge-base HEAD origin/main`) via `gh run list --commit <sha>` or check-runs; if the failing test is not covered by CI on that SHA, say so and stop. A detached-worktree rebuild is a last resort and must be reported as such.
+- To show a failure is pre-existing, do not rebuild the base commit. Use the base SHA supplied by the PR context note; if it is missing, derive it from the PR’s actual base ref (for example, query `gh pr view --json baseRefName` and run `git merge-base HEAD origin/<base-ref>`) rather than assuming `main`. Cite its CI result via `gh run list --commit <sha>` or check-runs; if the failing test is not covered by CI on that SHA, say so and stop. A detached-worktree rebuild is a last resort and must be reported as such.
 
 ### 3) Edge-case checks (risk-based)
 Pick checks based on what changed:

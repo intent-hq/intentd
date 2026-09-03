@@ -2686,66 +2686,74 @@ mod tests {
     #[test]
     fn verifier_prompt_mentions_update_note_task_status_and_marking_complete() {
         let dir = TempSpecialistsDir::new();
-        let svc = service_over(&dir);
-        let got = svc
-            .get("verifier", None)
-            .expect("embedded verifier resolves");
-        let body = got["specialist"]["behaviorPrompt"]
-            .as_str()
-            .expect("prompt body");
+        for bundle in [EMBEDDED_BUNDLED_V1, EMBEDDED_BUNDLED_V1_1] {
+            let svc = service_over(&dir).with_embedded(bundle);
+            let got = svc
+                .get("verifier", None)
+                .expect("embedded verifier resolves");
+            let body = got["specialist"]["behaviorPrompt"]
+                .as_str()
+                .expect("prompt body");
 
-        // Assert the prompt contains the `update_note_task_status` tool.
-        assert!(
-            body.contains("update_note_task_status"),
-            "verifier.md must mention update_note_task_status tool"
-        );
+            // Assert the prompt contains the `update_note_task_status` tool.
+            assert!(
+                body.contains("update_note_task_status"),
+                "verifier.md must mention update_note_task_status tool"
+            );
 
-        // Assert the prompt uses object-style call syntax with placeholder noteId value.
-        assert!(
-            body.contains(
-                r#"update_note_task_status({ noteId: "<task-note-id>", status: "complete" })"#
-            ),
-            "verifier.md must show complete object-style call with placeholder noteId"
-        );
+            // Assert the prompt uses object-style call syntax with placeholder noteId value.
+            assert!(
+                body.contains(
+                    r#"update_note_task_status({ noteId: "<task-note-id>", status: "complete" })"#
+                ),
+                "verifier.md must show complete object-style call with placeholder noteId"
+            );
 
-        // Assert the prompt instructs marking verified tasks complete with the exact phrase.
-        assert!(
-            body.contains("mark each verified task note `complete`"),
-            "verifier.md must instruct marking verified tasks complete"
-        );
+            // Assert the prompt instructs marking verified tasks complete with the exact phrase.
+            assert!(
+                body.contains("mark each verified task note `complete`"),
+                "verifier.md must instruct marking verified tasks complete"
+            );
 
-        // Assert the prompt specifies the APPROVED → complete policy and that
-        // tasks with DEVIATION/MISSING stay in review_required.
-        assert!(
-            (body.contains("APPROVED") || body.contains("✅ APPROVED"))
-                && (body.contains("DEVIATION") || body.contains("⚠️ DEVIATION"))
-                && (body.contains("MISSING") || body.contains("❌ MISSING")),
-            "verifier.md must specify APPROVED/DEVIATION/MISSING completion policy"
-        );
+            // Assert the prompt specifies the APPROVED → complete policy and that
+            // tasks with DEVIATION/MISSING stay in review_required.
+            assert!(
+                (body.contains("APPROVED") || body.contains("✅ APPROVED"))
+                    && (body.contains("DEVIATION") || body.contains("⚠️ DEVIATION"))
+                    && (body.contains("MISSING") || body.contains("❌ MISSING")),
+                "verifier.md must specify APPROVED/DEVIATION/MISSING completion policy"
+            );
 
-        assert!(body.contains("PR Context — <branch>") && body.contains("pr-context"));
-        assert!(body.contains("re-derive only fields missing from the note"));
-        assert!(body.contains("do not rebuild the base commit"));
-        assert!(body.contains("gh run list --commit <sha>"));
-        assert!(body.contains("Verifier findings"));
+            assert!(body.contains("PR Context — <branch>") && body.contains("pr-context"));
+            assert!(body.contains("re-derive only fields missing from the note"));
+            assert!(body.contains("do not rebuild the base commit"));
+            assert!(body.contains("base SHA supplied by the PR context note"));
+            assert!(body.contains("gh run list --commit <sha>"));
+            assert!(body.contains("Verifier findings"));
+        }
     }
 
     #[test]
     fn collaboration_prompts_share_pr_context_note() {
         let dir = TempSpecialistsDir::new();
-        let svc = service_over(&dir);
-        let implementor = svc.get("implementor", None).unwrap();
-        let implementor_body = implementor["specialist"]["behaviorPrompt"]
-            .as_str()
-            .unwrap();
-        assert!(implementor_body.contains("PR Context — <branch>"));
-        assert!(implementor_body.contains("known pre-existing failures"));
+        for bundle in [EMBEDDED_BUNDLED_V1, EMBEDDED_BUNDLED_V1_1] {
+            let svc = service_over(&dir).with_embedded(bundle);
+            let implementor = svc.get("implementor", None).unwrap();
+            let implementor_body = implementor["specialist"]["behaviorPrompt"]
+                .as_str()
+                .unwrap();
+            assert!(implementor_body.contains("PR Context — <branch>"));
+            assert!(implementor_body.contains("known pre-existing failures"));
+            assert!(implementor_body.contains("add_to_note"));
+            assert!(implementor_body.contains("rather than creating a duplicate"));
 
-        let coordinator = svc.get("spec-writer", None).unwrap();
-        let coordinator_body = coordinator["specialist"]["behaviorPrompt"]
-            .as_str()
-            .unwrap();
-        assert!(coordinator_body.contains("PR Context — <branch>"));
+            let coordinator = svc.get("spec-writer", None).unwrap();
+            let coordinator_body = coordinator["specialist"]["behaviorPrompt"]
+                .as_str()
+                .unwrap();
+            assert!(coordinator_body.contains("PR Context — <branch>"));
+            assert!(coordinator_body.contains("before any implementor delegation"));
+        }
     }
 
     #[test]
