@@ -12867,6 +12867,22 @@ async fn wss_file_attachment_upload_round_trip() {
 /// a pending session idempotently.
 #[tokio::test]
 async fn wss_workspace_import_lifecycle() {
+    let own = env!("CARGO_PKG_VERSION");
+    let parsed = semver::Version::parse(own).unwrap();
+    let mut versions = vec![own.to_string()];
+    if parsed.pre.is_empty() {
+        versions.extend([
+            format!("{}.{}.0", parsed.major, parsed.minor),
+            format!("{}.{}.{}", parsed.major, parsed.minor, parsed.patch + 1),
+        ]);
+    }
+    for version in versions {
+        wss_workspace_import_lifecycle_from_version(&version).await;
+    }
+}
+
+#[allow(clippy::similar_names)] // deliberate parallel naming across lifecycle responses
+async fn wss_workspace_import_lifecycle_from_version(source_version: &str) {
     use base64::Engine as _;
     use std::io::Write as _;
 
@@ -12874,16 +12890,17 @@ async fn wss_workspace_import_lifecycle() {
     let ws_id = "ws-wss-imported";
     let t = "2026-08-11T00:00:00Z";
 
-    // Manifest must carry the exact intentd version (workspace-synchronized
-    // crate versions make CARGO_PKG_VERSION valid here).
+    // Exact and patch-different producers carry identical real workspace,
+    // note and session data through the production WSS import path.
     let manifest = serde_json::json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "creatingIntentdVersion": source_version,
+        "exporterLabel": "optional metadata must remain compatible",
         "workspaceId": ws_id,
         "createdAt": t,
         "tables": [],
         "assets": [],
-        "git": { "hasRepository": false, "dirtyFiles": [], "sandboxBranches": [] }
+        "git": { "hasRepository": false, "dirtyFiles": [], "sandboxBranches": [], "displayLabel": "optional" }
     });
 
     // Fixture archive: manifest.json + rows/{workspace,agent_session}.jsonl.
@@ -12906,6 +12923,17 @@ async fn wss_workspace_import_lifecycle() {
         .as_bytes(),
     )
     .expect("workspace row");
+    zip.start_file("rows/note.jsonl", options).expect("notes");
+    zip.write_all(
+        serde_json::json!({
+            "id": "note-patch", "workspace_id": ws_id, "title": "Keep me",
+            "content": "Patch-compatible transfer preserves this note.",
+            "created_at": t, "updated_at": t
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .expect("note row");
     zip.start_file("rows/agent_session.jsonl", options)
         .expect("rows");
     zip.write_all(
@@ -13018,6 +13046,34 @@ async fn wss_workspace_import_lifecycle() {
     );
     assert!(committed["result"]["importedRows"].as_u64().unwrap() >= 2);
 
+    let note = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 60, "method": "note.get",
+            "params": {"workspaceId": ws_id, "noteId": "note-patch"}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(note["jsonrpc"], "2.0", "{note}");
+    assert_eq!(note["id"], 60);
+    assert_eq!(
+        note["result"]["note"]["content"], "Patch-compatible transfer preserves this note.",
+        "{note}"
+    );
+
+    // Version widening must leave the workspace-id collision gate intact.
+    let collision = wss_call(srv.port, srv.cfg.clone(), &serde_json::json!({
+        "jsonrpc": "2.0", "id": 61, "method": "workspace.import.begin",
+        "params": {"manifest": manifest, "archiveSizeBytes": archive.len(), "archiveSha256": sha}
+    }).to_string()).await;
+    assert_eq!(collision["error"]["code"], -32602, "{collision}");
+    assert!(collision["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("already exists"));
+
     // The commit's `workspace:created` event reaches the subscriber (§6.3).
     let evt = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -13126,6 +13182,40 @@ async fn wss_workspace_import_lifecycle() {
         "error names both versions: {msg}"
     );
 
+    // Unsupported formats, major/minor changes, prereleases and malformed
+    // versions are rejected before any staging id can be returned.
+    let mut incompatible_pre = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    incompatible_pre.pre =
+        semver::Prerelease::new(&format!("other{}", incompatible_pre.pre)).unwrap();
+    for (field, value) in [
+        ("formatVersion", serde_json::json!(999)),
+        ("creatingIntentdVersion", serde_json::json!("99.0.0")),
+        ("creatingIntentdVersion", serde_json::json!("0.99.0")),
+        (
+            "creatingIntentdVersion",
+            serde_json::json!(incompatible_pre.to_string()),
+        ),
+        ("creatingIntentdVersion", serde_json::json!("not-semver")),
+    ] {
+        let mut invalid = manifest.clone();
+        invalid["workspaceId"] = serde_json::json!("ws-invalid-patch");
+        invalid[field] = value;
+        let rejected = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 62, "method": "workspace.import.begin",
+                "params": {"manifest": invalid, "archiveSizeBytes": 10, "archiveSha256": sha}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(rejected["jsonrpc"], "2.0");
+        assert_eq!(rejected["id"], 62);
+        assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+        assert!(rejected.get("result").is_none(), "{rejected}");
+    }
+
     // abort: pending session → true, retired/unknown → false (idempotent).
     let mut ok = manifest.clone();
     ok["workspaceId"] = serde_json::json!("ws-abortable");
@@ -13157,6 +13247,108 @@ async fn wss_workspace_import_lifecycle() {
     .await;
     assert_eq!(again["result"]["aborted"], false, "{again}");
 
+    srv.ws.stop().await;
+}
+
+/// A patch-compatible header must not bypass payload/schema or checksum
+/// checks. Failed imports remain invisible and can be explicitly aborted.
+#[tokio::test]
+async fn wss_workspace_import_patch_rejects_incompatible_data() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+
+    let srv = start(WsOptions::default()).await;
+    let mut version = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    if version.pre.is_empty() {
+        version.patch += 1;
+    }
+    let source_version = version.to_string();
+    let ws_id = "ws-wss-patch-rejected";
+    let manifest = serde_json::json!({
+        "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
+        "creatingIntentdVersion": source_version, "workspaceId": ws_id,
+        "createdAt": "2026-08-11T00:00:00Z", "tables": [], "assets": [],
+        "git": {"hasRepository": false, "dirtyFiles": [], "sandboxBranches": []}
+    });
+    for (case, expected) in [
+        ("table", "future_state"),
+        ("column", "future_column"),
+        ("scope", "outside workspace"),
+        ("checksum", "checksum mismatch"),
+    ] {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let mut row = serde_json::json!({
+            "id": ws_id, "title": "Do not import partially", "branch": "main", "status": "Active",
+            "created_at": "2026-08-11T00:00:00Z", "updated_at": "2026-08-11T00:00:00Z"
+        });
+        if case == "column" {
+            row["future_column"] = serde_json::json!("keep me");
+        }
+        if case == "scope" {
+            row["id"] = serde_json::json!("smuggled-workspace");
+        }
+        for (name, value) in [("manifest.json", &manifest), ("rows/workspace.jsonl", &row)] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(value.to_string().as_bytes()).unwrap();
+        }
+        if case == "table" {
+            zip.start_file("rows/future_state.jsonl", options).unwrap();
+            zip.write_all(b"{\"data\":\"keep me\"}").unwrap();
+        }
+        let archive = zip.finish().unwrap().into_inner();
+        let sha = if case == "checksum" {
+            "0".repeat(64)
+        } else {
+            sha256_hex(&archive)
+        };
+        let begin = wss_call(srv.port, srv.cfg.clone(), &serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"workspace.import.begin",
+            "params":{"manifest":manifest, "archiveSizeBytes":archive.len(), "archiveSha256":sha}
+        }).to_string()).await;
+        let id = begin["result"]["importId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{begin}"));
+        let chunk = wss_call(srv.port, srv.cfg.clone(), &serde_json::json!({
+            "jsonrpc":"2.0", "id":2, "method":"workspace.import.chunk",
+            "params":{"importId":id, "seq":0, "data":base64::engine::general_purpose::STANDARD.encode(&archive)}
+        }).to_string()).await;
+        assert_eq!(chunk["result"]["receivedBytes"], archive.len(), "{chunk}");
+        let rejected = wss_call(srv.port, srv.cfg.clone(), &serde_json::json!({
+            "jsonrpc":"2.0", "id":3, "method":"workspace.import.commit", "params":{"importId":id}
+        }).to_string()).await;
+        assert_eq!(rejected["jsonrpc"], "2.0");
+        assert_eq!(rejected["id"], 3);
+        assert_eq!(rejected["error"]["code"], -32602, "{case}: {rejected}");
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "{rejected}"
+        );
+        let list = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            r#"{"jsonrpc":"2.0","id":4,"method":"workspace.list","params":{}}"#,
+        )
+        .await;
+        assert!(!list["result"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == ws_id || row["id"] == "smuggled-workspace"));
+        let aborted = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc":"2.0", "id":5, "method":"workspace.import.abort", "params":{"importId":id}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(aborted["result"]["aborted"], true);
+    }
     srv.ws.stop().await;
 }
 
@@ -13985,6 +14177,7 @@ impl SystemControl for WatchHealthControl {
                 failed_roots: s.failed_roots,
             }),
             update_supported: false,
+            exact_version_update_supported: false,
         }
     }
     fn request_shutdown(&self) {}

@@ -344,12 +344,14 @@
 //! clears it, test-prompt promotion preserves it) and absent for providers
 //! without identity. No method-catalog change — 298 router methods,
 //! 39 fast-path, 339 total.
+//! Version 9.5 adds system.requestUpdateVersion and the sitter-negotiated
+//! exactVersionUpdateSupported status capability: 40 fast-path, 340 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.4";
+pub const PROTOCOL_VERSION: &str = "9.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

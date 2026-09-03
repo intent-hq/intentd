@@ -12,6 +12,25 @@ use crate::ids::WorkspaceId;
 /// whose format version it does not understand.
 pub const TRANSFER_FORMAT_VERSION: u32 = 1;
 
+/// Released versions (including numeric releases distributed on alpha) may
+/// transfer across patches within one major/minor pair. Prereleases require
+/// an exact string match, including build metadata. Malformed versions fail
+/// closed even when the strings are identical. Archive/schema validation is
+/// still required: a compatible version is not proof of compatible data.
+#[must_use]
+pub fn transfer_versions_compatible(source: &str, target: &str) -> bool {
+    let (Ok(source_version), Ok(target_version)) = (
+        semver::Version::parse(source),
+        semver::Version::parse(target),
+    ) else {
+        return false;
+    };
+    if !source_version.pre.is_empty() || !target_version.pre.is_empty() {
+        return source == target;
+    }
+    source_version.major == target_version.major && source_version.minor == target_version.minor
+}
+
 /// Per-table row statistics for one workspace-scoped table included in a
 /// transfer (`event` is deliberately absent: event history stays on the
 /// source). `approx_bytes` is the summed byte length of every column value
@@ -65,8 +84,8 @@ pub struct TransferGitSummary {
 
 /// The versioned transfer manifest embedded in every export archive.
 /// `creating_intentd_version` is the exact daemon version that produced it
-/// (`CARGO_PKG_VERSION`); the import side rejects on mismatch (exact-match
-/// gating, spec "Resolved Design Decisions" #5).
+/// (`CARGO_PKG_VERSION`); import applies [`transfer_versions_compatible`]
+/// in addition to archive-format and row-schema validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferManifest {
@@ -76,10 +95,9 @@ pub struct TransferManifest {
     pub created_at: String,
     pub tables: Vec<TransferTableStat>,
     pub assets: Vec<TransferAsset>,
-    /// Attachment-registry entries (additive to format v1: exact intentd
-    /// version gating means no pre-attachments archive can be imported by a
-    /// daemon that expects this field, so `default` tolerance is enough — no
-    /// format-version bump).
+    /// Attachment-registry entries, additive to format v1. Older archives
+    /// without attachment support omit this list. Registry rows and archive
+    /// files are validated independently; unknown payloads must not be dropped.
     #[serde(default)]
     pub attachments: Vec<TransferAttachment>,
     pub git: TransferGitSummary,
@@ -111,4 +129,46 @@ pub struct TransferPlan {
     pub attachment_bytes: u64,
     pub estimated_git_bundle_bytes: u64,
     pub warnings: Vec<TransferWarning>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transfer_versions_compatible;
+
+    #[test]
+    fn transfer_version_policy() {
+        for (source, target) in [
+            ("0.9.1", "0.9.6"),
+            ("0.9.6", "0.9.1"),
+            ("1.2.0", "1.2.999"),
+            ("1.2.3+alpha-build", "1.2.4+other"),
+            ("1.2.3-rc.1+build", "1.2.3-rc.1+build"),
+        ] {
+            assert!(
+                transfer_versions_compatible(source, target),
+                "{source} -> {target}"
+            );
+        }
+        for (source, target) in [
+            ("0.9.6", "0.10.0"),
+            ("1.2.3", "2.2.3"),
+            ("1.2.3-rc.1", "1.2.3"),
+            ("1.2.3", "1.2.3-rc.1"),
+            ("1.2.3-rc.1", "1.2.4-rc.1"),
+            ("1.2.3-rc.1", "1.2.3-rc.2"),
+            ("1.2.3-rc.1+a", "1.2.3-rc.1+b"),
+        ] {
+            assert!(
+                !transfer_versions_compatible(source, target),
+                "{source} -> {target}"
+            );
+        }
+        for invalid in [
+            "", "v1.2.3", "1.2", "01.2.3", "1.2.3-01", "1.2.3 ", "1.2.3+",
+        ] {
+            assert!(!transfer_versions_compatible(invalid, invalid));
+            assert!(!transfer_versions_compatible(invalid, "1.2.3"));
+            assert!(!transfer_versions_compatible("1.2.3", invalid));
+        }
+    }
 }

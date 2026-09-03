@@ -374,6 +374,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "system.gitCredential",
     "system.importLegacy",
     "system.requestUpdate",
+    "system.requestUpdateVersion",
     "system.shutdown",
     "system.status",
 ];

@@ -3365,6 +3365,7 @@ impl SystemControl for DaemonControl {
             // pidfile read + one single-process sysinfo refresh, never a
             // signal, so status stays cheap and side-effect free.
             update_supported: sitter_update_supported(&self.sitter_pid_path),
+            exact_version_update_supported: exact_sitter_socket(&self.sitter_pid_path).is_some(),
         }
     }
 
@@ -3376,6 +3377,26 @@ impl SystemControl for DaemonControl {
 
     fn request_update(&self) -> Result<(), String> {
         signal_sitter_update(&self.sitter_pid_path)
+    }
+
+    fn request_update_version(
+        &self,
+        version: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            // Never downgrade a running daemon, even if state.json is stale.
+            let running = env!("CARGO_PKG_VERSION");
+            let current =
+                semver::Version::parse(running).map_err(|_| "running daemon version is invalid")?;
+            let target =
+                semver::Version::parse(&version).map_err(|_| "invalid requested version")?;
+            if current > target {
+                return Err(format!(
+                    "refusing to downgrade running intentd {running} to {version}"
+                ));
+            }
+            request_exact_sitter_update(&self.sitter_pid_path, &version).await
+        })
     }
 
     fn import_legacy(
@@ -4079,6 +4100,72 @@ fn sitter_update_supported(pid_path: &Path) -> bool {
 #[cfg(not(unix))]
 fn sitter_update_supported(_pid_path: &Path) -> bool {
     false
+}
+
+/// The marker is emitted only after a v1 listener is bound. Match it to the
+/// verified parent PID: merely installing a newer daemon is not sufficient.
+#[cfg(unix)]
+fn exact_sitter_socket(pid_path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::FileTypeExt;
+    let pid = supervising_sitter_pid(pid_path, std::os::unix::process::parent_id())?;
+    let marker = std::env::var("INTENTD_SITTER_EXACT_UPDATE_PID")
+        .ok()?
+        .parse::<u32>()
+        .ok()?;
+    if marker != pid {
+        return None;
+    }
+    let socket = pid_path.parent()?.join(format!("exact-update-{pid}.sock"));
+    std::fs::symlink_metadata(&socket)
+        .ok()?
+        .file_type()
+        .is_socket()
+        .then_some(socket)
+}
+
+#[cfg(not(unix))]
+fn exact_sitter_socket(_pid_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+async fn request_exact_sitter_update(pid_path: &Path, version: &str) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let socket = exact_sitter_socket(pid_path).ok_or_else(||
+        "exact-version updates are unsupported by the supervising sitter; upgrade/reinstall the sitter and restart the service manually".to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|e| e.to_string())?;
+        let request = format!("{}\n", serde_json::json!({"protocol":1,"version":version}));
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut response = String::new();
+        BufReader::new(stream.take(4096))
+            .read_line(&mut response)
+            .await
+            .map_err(|e| e.to_string())?;
+        let response: Value = serde_json::from_str(&response).map_err(|e| e.to_string())?;
+        if response == serde_json::json!({"ok":true,"accepted":true,"version":version}) {
+            Ok(())
+        } else {
+            Err(response["error"]
+                .as_str()
+                .unwrap_or("invalid exact-update sitter acknowledgement")
+                .to_string())
+        }
+    })
+    .await
+    .map_err(|_| {
+        "exact-update sitter handoff timed out; verify running version before retrying".to_string()
+    })?
+}
+
+#[cfg(not(unix))]
+async fn request_exact_sitter_update(_pid_path: &Path, _version: &str) -> Result<(), String> {
+    Err("exact-version updates are unsupported on this platform".into())
 }
 
 /// Local-transport liveness probe: a successful connect means a daemon is

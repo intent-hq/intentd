@@ -512,6 +512,8 @@ fn serve_release_with_archive_hook(
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let manifest = manifest_json(version, &base_url, &asset, &sha);
     let archive_path = format!("/{asset}");
+    let exact_archive_path = format!("/v{version}/{asset}");
+    let sidecar_path = format!("{exact_archive_path}.sha256");
 
     let hook = std::sync::Mutex::new(Some(on_archive_request));
     thread::spawn(move || {
@@ -532,7 +534,9 @@ fn serve_release_with_archive_hook(
             let path = request_line.split_whitespace().nth(1).unwrap_or("/");
             let (status, body) = if path == "/channel-stable/stable.json" {
                 ("200 OK", manifest.clone())
-            } else if path == archive_path {
+            } else if path == sidecar_path {
+                ("200 OK", sha.as_bytes().to_vec())
+            } else if path == archive_path || path == exact_archive_path {
                 if let Some(hook) = hook.lock().unwrap().take() {
                     hook();
                 }
@@ -628,4 +632,153 @@ fn with_base_url_means_exactly_one_base_and_never_falls_back() {
         other => panic!("expected HttpStatus, got {other:?}"),
     }
     assert!(installed_versions(&paths).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_release_uses_immutable_artifacts_and_preserves_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.2.1", Channel::Alpha);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let archive = make_tar_xz(b"requested B");
+    let mut routes = HashMap::new();
+    routes.insert(
+        format!("/v1.2.2/{asset}.sha256"),
+        format!("{}  {asset}\n", sha256_hex(&archive)).into_bytes(),
+    );
+    routes.insert(format!("/v1.2.2/{asset}"), archive);
+    routes.insert(
+        "/channel-alpha/alpha.json".into(),
+        manifest_json("1.2.3", &base, "latest.tar.xz", "bad"),
+    );
+    let updater = Updater::with_base_url(paths.clone(), serve_on(listener, routes)).unwrap();
+    assert!(
+        matches!(updater.install_exact("1.2.2").unwrap(), UpdateOutcome::Installed { version, .. } if version == "1.2.2")
+    );
+    assert_eq!(
+        fs::read(paths.daemon_binary("1.2.2")).unwrap(),
+        b"requested B"
+    );
+    assert_eq!(state::load(&paths.state_path).channel, Channel::Alpha);
+    assert!(!paths.daemon_binary("1.2.3").exists());
+    assert!(matches!(
+        updater.install_exact("1.2.1"),
+        Err(UpdateError::Downgrade { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_failures_never_install_or_fall_back_to_latest() {
+    for failure in ["missing", "checksum", "invalid-sidecar", "missing-archive"] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        preinstall(&paths, "1.2.1", Channel::Alpha);
+        let before = fs::read(&paths.state_path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+        let archive = make_tar_xz(b"B");
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/channel-alpha/alpha.json".into(),
+            manifest_json("1.2.3", &base, &asset, &sha256_hex(&archive)),
+        );
+        routes.insert(format!("/{asset}"), archive.clone());
+        if failure != "missing" {
+            let checksum = if failure == "checksum" {
+                "0".repeat(64)
+            } else if failure == "invalid-sidecar" {
+                "garbage".into()
+            } else {
+                sha256_hex(&archive)
+            };
+            routes.insert(format!("/v1.2.2/{asset}.sha256"), checksum.into_bytes());
+        }
+        if failure != "missing-archive" {
+            routes.insert(format!("/v1.2.2/{asset}"), archive);
+        }
+        let updater = Updater::with_base_url(paths.clone(), serve_on(listener, routes)).unwrap();
+        assert!(updater.install_exact("1.2.2").is_err(), "{failure}");
+        assert_eq!(fs::read(&paths.state_path).unwrap(), before, "{failure}");
+        assert_eq!(installed_versions(&paths), ["1.2.1"], "{failure}");
+    }
+}
+
+#[test]
+fn invalid_exact_version_does_not_create_updater_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let updater = Updater::with_base_url(paths.clone(), "http://127.0.0.1:1").unwrap();
+    for version in [
+        "",
+        "../bad",
+        "v1.2.3",
+        "1.2.3-01",
+        "1.2.3-",
+        "1.2.3-beta..1",
+        "1.2.3-beta.01",
+        "1.2.3-beta_1",
+        "1.2.3-beta/1",
+        "1.2.3+sha",
+        "01.2.3",
+        "latest",
+    ] {
+        assert!(matches!(
+            updater.install_exact(version),
+            Err(UpdateError::InvalidExactVersion)
+        ));
+    }
+    assert!(!paths.sitter_dir.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn in_flight_channel_download_rejects_exact_request_before_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.2.1", Channel::Stable);
+    let requester_paths = paths.clone();
+    let base = serve_release_with_archive_hook("1.2.3", b"channel C", move || {
+        let exact = Updater::with_base_url(requester_paths.clone(), "http://127.0.0.1:1").unwrap();
+        assert!(matches!(
+            exact.install_exact("1.2.2"),
+            Err(UpdateError::Busy)
+        ));
+        assert_eq!(
+            state::load(&requester_paths.state_path)
+                .current_version
+                .as_deref(),
+            Some("1.2.1")
+        );
+        assert!(!requester_paths.daemon_binary("1.2.2").exists());
+    });
+    let automatic = Updater::with_base_url(paths, base).unwrap();
+    assert!(
+        matches!(automatic.check_and_install(Channel::Stable).unwrap(), UpdateOutcome::Installed { version, .. } if version == "1.2.3")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_install_never_reports_a_noncooperating_newer_winner_as_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.2.1", Channel::Stable);
+    let writer_paths = paths.clone();
+    let base = serve_release_with_archive_hook("1.2.2", b"B", move || {
+        // Models an old external installer that does not know the new lock.
+        preinstall(&writer_paths, "1.2.3", Channel::Stable);
+    });
+    let updater = Updater::with_base_url(paths.clone(), base).unwrap();
+    assert!(
+        matches!(updater.install_exact("1.2.2"), Err(UpdateError::Downgrade { installed, requested }) if installed == "1.2.3" && requested == "1.2.2")
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("1.2.3")
+    );
 }

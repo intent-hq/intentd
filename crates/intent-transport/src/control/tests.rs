@@ -56,6 +56,7 @@ impl FakeControl {
                     failed_roots: 0,
                 }),
                 update_supported: true,
+                exact_version_update_supported: true,
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
@@ -94,6 +95,12 @@ impl SystemControl for FakeControl {
             Some(message) => Err(message.clone()),
             None => Ok(()),
         }
+    }
+    fn request_update_version(
+        &self,
+        _version: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { self.request_update() })
     }
     fn import_legacy(
         &self,
@@ -171,6 +178,7 @@ fn status_json_local_vs_remote_locality() {
     // present, so a client can gate its update affordance without probing
     // system.requestUpdate.
     assert_eq!(local["updateSupported"], true);
+    assert_eq!(local["exactVersionUpdateSupported"], true);
 
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
@@ -216,6 +224,7 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         workspaces_disk_total_bytes: None,
         file_watch: None,
         update_supported: false,
+        exact_version_update_supported: false,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -250,6 +259,7 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     // Unsupervised daemon ⇒ updateSupported is PRESENT and false — a plain
     // boolean, never absent or null.
     assert_eq!(v["updateSupported"], false);
+    assert_eq!(v["exactVersionUpdateSupported"], false);
 }
 
 /// The descendant-tree fields ride `system.status` so a debug
@@ -572,4 +582,44 @@ async fn git_credential_remote_rejects_with_uds_only_error() {
     );
     // The resolver must never run for a remote caller.
     assert_eq!(*control.credential_pid.lock().unwrap(), None);
+}
+
+#[tokio::test]
+async fn exact_update_validates_params_before_control_and_acknowledges_acceptance() {
+    let control = FakeControl::new();
+    for params in [
+        json!(null),
+        json!({}),
+        json!({"version":42}),
+        json!({"version":"1.2.3","extra":true}),
+        json!({"version":"v1.2.3"}),
+        json!({"version":"1.2.3-01"}),
+        json!({"version":"1.2.3-beta..1"}),
+        json!({"version":"1.2.3-beta.01"}),
+        json!({"version":"1.2.3+build"}),
+        json!({"version":"01.2.3"}),
+        json!({"version":"1.2"}),
+        json!({"version":"../1.2.3"}),
+    ] {
+        let req = classify(
+            &json!({"jsonrpc":"2.0","id":1,"method":"system.requestUpdateVersion","params":params}),
+        )
+        .unwrap();
+        let response: Value =
+            serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], -32602, "{params}: {response}");
+        assert!(!control.update_called.load(Ordering::SeqCst));
+    }
+    let req = classify(&json!({"jsonrpc":"2.0","id":2,"method":"system.requestUpdateVersion","params":{"version":"1.2.3"}})).unwrap();
+    let response: Value =
+        serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+    assert_eq!(
+        response,
+        json!({"jsonrpc":"2.0","id":2,"result":{"ok":true,"accepted":true,"version":"1.2.3"}})
+    );
+    let control = FakeControl::with_update_error("old sitter");
+    let req = classify(&json!({"jsonrpc":"2.0","id":3,"method":"system.requestUpdateVersion","params":{"version":"1.2.3"}})).unwrap();
+    let response: Value =
+        serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+    assert_eq!(response["error"]["code"], -32603);
 }

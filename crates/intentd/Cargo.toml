@@ -9,6 +9,7 @@ homepage.workspace = true
 description = "Intent backend daemon — local-first JSON-RPC daemon for the Intent domain model"
 
 [dependencies]
+semver = "1"
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
