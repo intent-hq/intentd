@@ -1435,19 +1435,26 @@ mod tests {
     /// overwrite the authoritative hard `false` with its older outcome:
     /// `store_probe` drops the store when the demotion epoch moved (PR
     /// #1650 review). A probe with an unmoved epoch still stores normally.
+    /// Unique cache key (cache-level seams take any key) so the
+    /// process-global mutation cannot race parallel tests; the public
+    /// `demote_auth_verdict` composition over `auth_cache_key` is covered by
+    /// the demotion test above.
     #[test]
     fn stale_probe_outcome_cannot_overwrite_runtime_demotion() {
-        // "pi" for parallel-test hygiene — see the demotion test above.
-        let prior = cache().fresh("pi");
+        let key = "test-stale-probe-demote";
 
         // Probe captured its epoch, then a demotion landed mid-flight. The
         // superseded probe hands back the authoritative demoted verdict —
         // what every joined `providerAuthStatus` caller must serve — instead
         // of its own stale outcome.
-        let epoch = cache().demotion_epoch("pi");
-        cache().demote("pi");
-        let served = cache().store_probe("pi", AuthVerdict::plain(Some(true)), epoch);
-        assert_eq!(cached_auth_verdict("pi"), Some(false), "stale probe stored");
+        let epoch = cache().demotion_epoch(key);
+        cache().demote(key);
+        let served = cache().store_probe(key, AuthVerdict::plain(Some(true)), epoch);
+        assert_eq!(
+            cache().fresh(key),
+            Some(AuthVerdict::plain(Some(false))),
+            "stale probe stored"
+        );
         assert_eq!(
             served,
             AuthVerdict::plain(Some(false)),
@@ -1455,32 +1462,33 @@ mod tests {
         );
 
         // A fresh probe (epoch captured after the demotion) stores normally.
-        let epoch = cache().demotion_epoch("pi");
-        let served = cache().store_probe("pi", AuthVerdict::plain(Some(true)), epoch);
-        assert_eq!(cached_auth_verdict("pi"), Some(true));
+        let epoch = cache().demotion_epoch(key);
+        let served = cache().store_probe(key, AuthVerdict::plain(Some(true)), epoch);
+        assert_eq!(cache().fresh(key), Some(AuthVerdict::plain(Some(true))));
         assert_eq!(served, AuthVerdict::plain(Some(true)));
-
-        cache().store("pi", prior.unwrap_or_default());
     }
 
-    /// A live test-prompt success hardens the verdict to `true` under the
-    /// same canonical key as demotion, and its epoch bump supersedes a probe
-    /// already in flight — the mirror image of the demotion test above.
+    /// A live test-prompt success hardens the verdict to `true`, and its
+    /// epoch bump supersedes a probe already in flight — the mirror image of
+    /// the demotion test above. Unique cache key for the same parallel-test
+    /// hygiene; `promote_auth_verdict` is the one-line composition of
+    /// [`AuthStatusCache::promote`] over `auth_cache_key`, pinned above.
     #[test]
     fn promote_auth_verdict_hardens_verdict_and_supersedes_inflight_probe() {
-        // "pi" for parallel-test hygiene — see the demotion test above.
-        let prior = cache().fresh("pi");
+        let key = "test-stale-probe-promote";
 
-        let epoch = cache().demotion_epoch("pi");
-        promote_auth_verdict("pi");
-        assert_eq!(cached_auth_verdict("pi"), Some(true));
+        let epoch = cache().demotion_epoch(key);
+        cache().promote(key);
+        assert_eq!(cache().fresh(key), Some(AuthVerdict::plain(Some(true))));
         // The stale probe (epoch captured before the promotion) is dropped,
         // and the superseded probe serves the authoritative hard `true`.
-        let served = cache().store_probe("pi", AuthVerdict::plain(Some(false)), epoch);
-        assert_eq!(cached_auth_verdict("pi"), Some(true), "stale probe stored");
+        let served = cache().store_probe(key, AuthVerdict::plain(Some(false)), epoch);
+        assert_eq!(
+            cache().fresh(key),
+            Some(AuthVerdict::plain(Some(true))),
+            "stale probe stored"
+        );
         assert_eq!(served, AuthVerdict::plain(Some(true)), "stale probe served");
-
-        cache().store("pi", prior.unwrap_or_default());
     }
 
     /// Promotion never revives identity metadata past the cache TTL: an
