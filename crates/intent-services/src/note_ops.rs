@@ -9,7 +9,7 @@
 //! [`Error::InvalidParams`] (`-32602`) so clients see the actionable message
 //! directly.
 
-use intent_core::{Error, NoteTaskRow, Result};
+use intent_core::{Error, NoteTaskRow, Result, TaskStatus};
 use std::fmt::Write as _;
 
 /// JS `\s` (ASCII subset): space, tab, the line terminators, FF and VT.
@@ -408,6 +408,71 @@ pub(crate) fn checkbox_for(word: &str) -> Option<&'static str> {
         "done" => Some("[x]"),
         _ => None,
     }
+}
+
+/// Checkbox marker a task-note status materializes as on the lines linking
+/// it: `complete` → `[x]`, `in_progress` → `[/]`, every other status → `[ ]`.
+pub(crate) fn checkbox_for_task_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Complete => "[x]",
+        TaskStatus::InProgress => "[/]",
+        _ => "[ ]",
+    }
+}
+
+/// Byte span of the `[c]` checkbox on a `match_task_line`-shaped line:
+/// `(box_start, after_bracket, checkbox_char)`.
+fn checkbox_span(line: &str) -> Option<(usize, usize, char)> {
+    let mut it = line.char_indices().peekable();
+    while matches!(it.peek(), Some((_, c)) if is_js_space_char(*c)) {
+        it.next();
+    }
+    match it.next() {
+        Some((_, '-' | '*')) => {}
+        _ => return None,
+    }
+    while matches!(it.peek(), Some((_, c)) if is_js_space_char(*c)) {
+        it.next();
+    }
+    let (box_start, '[') = it.next()? else {
+        return None;
+    };
+    let (_, cb @ (' ' | 'x' | 'X' | '/')) = it.next()? else {
+        return None;
+    };
+    let (close, ']') = it.next()? else {
+        return None;
+    };
+    Some((box_start, close + 1, cb))
+}
+
+/// Set the checkbox of every checkbox line whose first task link names
+/// `task_id` (`[label](intent://local/task/{task_id})`) to `checkbox`
+/// (a bracket marker such as `[x]`). Lines already carrying the marker
+/// (`[X]` counts as `[x]`), unlinked lines and lines linking other tasks are
+/// left as-is. Returns `None` when no line changed.
+pub(crate) fn set_linked_checkbox(content: &str, task_id: &str, checkbox: &str) -> Option<String> {
+    let target = checkbox.chars().nth(1)?;
+    let mut changed = false;
+    let out: Vec<String> = content
+        .split('\n')
+        .map(|line| {
+            let Some((box_start, after_idx, cb)) = checkbox_span(line) else {
+                return line.to_string();
+            };
+            if cb.eq_ignore_ascii_case(&target) {
+                return line.to_string();
+            }
+            match find_task_link(&line[after_idx..]) {
+                Some((_, id)) if id == task_id => {
+                    changed = true;
+                    format!("{}{}{}", &line[..box_start], checkbox, &line[after_idx..])
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect();
+    changed.then(|| out.join("\n"))
 }
 
 /// Map a checkbox character to its status word (TS `currentStatus` mapping).
@@ -1930,6 +1995,55 @@ mod tests {
         let content = "- [ ] alpha beta gamma";
         let out = apply_task_status(content, "beta", "[x]").unwrap();
         assert_eq!(out, "- [x] alpha beta gamma");
+    }
+
+    #[test]
+    fn set_linked_checkbox_rewrites_only_lines_linking_the_task() {
+        let body = |a: &str, b: &str| {
+            format!(
+                "# H\n- {a} [T](intent://local/task/a1)\n- [ ] plain\n\
+                 - [ ] [O](intent://local/task/b2)\n  * {b} [T2](intent://local/task/a1) tail\n\
+                 not a task [x](intent://local/task/a1)"
+            )
+        };
+        let content = body("[ ]", "[/]");
+        let out = set_linked_checkbox(&content, "a1", "[x]").expect("changed");
+        assert_eq!(out, body("[x]", "[x]"));
+        // Every linked line already carries the marker → no change.
+        assert_eq!(set_linked_checkbox(&out, "a1", "[x]"), None);
+        // `[X]` counts as already-done for the `[x]` marker.
+        assert_eq!(
+            set_linked_checkbox("- [X] [T](intent://local/task/a1)", "a1", "[x]"),
+            None
+        );
+        // No line links the task → no change.
+        assert_eq!(set_linked_checkbox(&content, "d9", "[x]"), None);
+        // Reverse: `[x]` → `[/]` → `[ ]`.
+        let back = set_linked_checkbox(&out, "a1", "[/]").expect("changed");
+        assert_eq!(back, body("[/]", "[/]"));
+        let open = set_linked_checkbox(&back, "a1", "[ ]").expect("changed");
+        assert_eq!(open, body("[ ]", "[ ]"));
+        // A partial-id prefix is not a link to the task.
+        assert_eq!(
+            set_linked_checkbox("- [ ] [T](intent://local/task/a10)", "a1", "[x]"),
+            None
+        );
+    }
+
+    #[test]
+    fn checkbox_for_task_status_mapping() {
+        assert_eq!(checkbox_for_task_status(TaskStatus::Complete), "[x]");
+        assert_eq!(checkbox_for_task_status(TaskStatus::InProgress), "[/]");
+        for status in [
+            TaskStatus::NotStarted,
+            TaskStatus::Waiting,
+            TaskStatus::Blocked,
+            TaskStatus::DiscussionNeeded,
+            TaskStatus::ReviewRequired,
+            TaskStatus::Cancelled,
+        ] {
+            assert_eq!(checkbox_for_task_status(status), "[ ]", "{status:?}");
+        }
     }
 
     #[test]

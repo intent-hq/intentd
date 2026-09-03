@@ -964,6 +964,14 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!(task_id),
         "assign updated: {evt}"
     );
+    // The in_progress status materializes onto the parent's linked checkbox
+    // line (`[ ]` → `[/]`), which takes its own `note:updated`.
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(parent_id),
+        "parent materialized: {evt}"
+    );
 
     let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
     assert_eq!(evt["data"]["noteId"], json!(task_id));
@@ -1003,6 +1011,17 @@ async fn task_block_author_list_assign_flow_over_wss() {
     )
     .await;
     assert_eq!(got["task"]["status"], json!("in_progress"), "task: {got}");
+
+    // The parent's linked row now reads the materialized in-progress char.
+    let tasks = wss_rpc(
+        &mut rpc,
+        6,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    assert_eq!(tasks[0]["status"], json!("in-progress"), "rows: {tasks}");
+    assert_eq!(tasks[0]["taskNoteId"], json!(task_id));
 }
 
 /// End-to-end `task:created` over WSS (docs/protocol/06-events.md §6.5): every path where a
