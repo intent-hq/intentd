@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.11] - 2026-09-03
+
+### 🚀 Features
+
+- Expose note saveAsset to agents ([#1682](https://github.com/intent-hq/intentd/pull/1682))
+- Capture Claude CLI identity in provider auth status ([#1685](https://github.com/intent-hq/intentd/pull/1685))
+- Monitoring-idle advisories never consume agent watches ([#1686](https://github.com/intent-hq/intentd/pull/1686))
+
+### 🐛 Bug Fixes
+
+- *(intentd)* Actionable error when the tailcat sidecar is missing ([#1687](https://github.com/intent-hq/intentd/pull/1687))
+- Honor legacy Codex model selections and prevent silent fallback ([#1675](https://github.com/intent-hq/intentd/pull/1675))
+- Reject numbered note.read presentation on note write paths ([#1688](https://github.com/intent-hq/intentd/pull/1688))
+
+
 ## [0.9.10] - 2026-09-03
 
 ### 🐛 Bug Fixes
