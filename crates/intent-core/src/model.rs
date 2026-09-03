@@ -145,12 +145,14 @@ pub enum NoteVisibility {
 /// in `error`) > `Blocked` (a top-level pending `blocker` attention
 /// request) > `NeedsAttention` (discussion requests, pending structured
 /// questions, or the `review_required` attention flag) > `InProgress`
-/// (running agent) > the PR/task rollup. The dismissible `unread` attention
-/// flag (`Workspace.attention`, §9.9) never feeds the derivation — unread
-/// is the flag's own contract, not a display status. Without a running
-/// agent, a task-stage rollup (`InProgress`/`NotStarted`) demotes to `Idle`
-/// — so `NotStarted` and the task-derived `InProgress` never reach the wire
-/// on their own.
+/// (running agent) > the PR/task rollup. Within the open-PR rung,
+/// `PrQueued` (the PR sits in the forge's merge queue) outranks `PrReady`
+/// (mergeable, action needed), which outranks `PrOpen`. The dismissible
+/// `unread` attention flag (`Workspace.attention`, §9.9) never feeds the
+/// derivation — unread is the flag's own contract, not a display status.
+/// Without a running agent, a task-stage rollup (`InProgress`/`NotStarted`)
+/// demotes to `Idle` — so `NotStarted` and the task-derived `InProgress`
+/// never reach the wire on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDisplayStatus {
@@ -161,6 +163,7 @@ pub enum WorkspaceDisplayStatus {
     Blocked,
     Idle,
     Complete,
+    PrQueued,
     PrReady,
     PrOpen,
     PrMerged,

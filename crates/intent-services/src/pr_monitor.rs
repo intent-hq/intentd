@@ -297,9 +297,11 @@ fn requirements_ready(req: &MergeRequirements) -> bool {
 
 /// Fold a workspace's monitor rows into the displayStatus PR signals
 /// (§6.5): an ACTIVE row whose persisted `last_snapshot` shows the PR
-/// open/draft raises `open` — and `ready` only when the snapshot's full
-/// merge-requirements checklist is clear ([`requirements_ready`]; truly
-/// mergeable, not just conflict-free) — while the LATEST
+/// open/draft raises `open` — `queued` when the PR is open (not draft) and
+/// sits in the merge queue (`isInMergeQueue`), and `ready` only when the
+/// snapshot's full merge-requirements checklist is clear
+/// ([`requirements_ready`]; truly mergeable, not just conflict-free — which
+/// already excludes queued PRs) — while the LATEST
 /// (most recently updated) COMPLETED row raises `merged` when its final
 /// snapshot shows `merged` — matching linked-PR step-6 "latest" semantics,
 /// so an older merged monitor never shadows a newer closed-unmerged one.
@@ -325,6 +327,9 @@ pub(crate) fn fold_monitor_pr_signals(monitors: &[PrMonitor]) -> MonitorPrSignal
                 let req = &snapshot.requirements;
                 if matches!(req.state.as_str(), "open" | "draft") {
                     signals.open = true;
+                    if req.state == "open" && !req.is_draft && req.is_in_merge_queue == Some(true) {
+                        signals.queued = true;
+                    }
                     if requirements_ready(req) {
                         signals.ready = true;
                     }
@@ -4990,8 +4995,52 @@ mod tests {
         assert_eq!(
             fold_monitor_pr_signals(std::slice::from_ref(&ready)),
             MonitorPrSignals {
+                queued: false,
                 open: true,
                 ready: true,
+                merged: false
+            }
+        );
+        // Active + open + in the merge queue + not draft → open and queued
+        // (never ready: `requirements_ready` excludes queued PRs, even on
+        // an otherwise clear checklist).
+        let queued = mk(
+            PrMonitorState::Active,
+            snap(|s| s.requirements.is_in_merge_queue = Some(true)),
+        );
+        let queued_clear = mk(
+            PrMonitorState::Active,
+            snap(|s| {
+                ready_requirements(&mut s.requirements);
+                s.requirements.is_in_merge_queue = Some(true);
+            }),
+        );
+        for m in [&queued, &queued_clear] {
+            assert_eq!(
+                fold_monitor_pr_signals(std::slice::from_ref(m)),
+                MonitorPrSignals {
+                    queued: true,
+                    open: true,
+                    ready: false,
+                    merged: false
+                }
+            );
+        }
+        // A draft never reads queued, whatever the flag says.
+        let queued_draft = mk(
+            PrMonitorState::Active,
+            snap(|s| {
+                s.requirements.state = "draft".into();
+                s.requirements.is_draft = true;
+                s.requirements.is_in_merge_queue = Some(true);
+            }),
+        );
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&queued_draft)),
+            MonitorPrSignals {
+                queued: false,
+                open: true,
+                ready: false,
                 merged: false
             }
         );
@@ -5040,6 +5089,7 @@ mod tests {
             assert_eq!(
                 fold_monitor_pr_signals(std::slice::from_ref(m)),
                 MonitorPrSignals {
+                    queued: false,
                     open: true,
                     ready: false,
                     merged: false
@@ -5054,6 +5104,7 @@ mod tests {
         assert_eq!(
             fold_monitor_pr_signals(std::slice::from_ref(&merged)),
             MonitorPrSignals {
+                queued: false,
                 open: false,
                 ready: false,
                 merged: true
@@ -5077,8 +5128,9 @@ mod tests {
         );
         // Signals aggregate across rows.
         assert_eq!(
-            fold_monitor_pr_signals(&[ready, merged.clone()]),
+            fold_monitor_pr_signals(&[ready, queued, merged.clone()]),
             MonitorPrSignals {
+                queued: true,
                 open: true,
                 ready: true,
                 merged: true
@@ -5116,6 +5168,7 @@ mod tests {
         assert_eq!(
             fold_monitor_pr_signals(&[older_closed, newer_merged]),
             MonitorPrSignals {
+                queued: false,
                 open: false,
                 ready: false,
                 merged: true
