@@ -10,10 +10,10 @@
 //!   session secret, so it rides the generic exit-code arm where stdout and
 //!   stderr are discarded — never captured, logged, or surfaced.
 //! - **claude-code** — two-stage (intent-hq/intent#3941): the real `claude`
-//!   CLI with its registry `auth_check_args` (exit 0 ⇒ authenticated, no
-//!   adapter spawn); any non-confirming CLI outcome falls back to an ACP
-//!   probe via the pinned claude-agent-acp npx adapter — `claude auth
-//!   status` has known false negatives (anthropics/claude-code#76168). The
+//!   CLI with its registry `auth_check_args`: an explicit JSON `loggedIn`
+//!   boolean is authoritative, regardless of the auth command's exit code,
+//!   and skips the adapter. Only inconclusive CLI outcomes fall back to an
+//!   ACP probe via the pinned claude-agent-acp npx adapter. The
 //!   fallback can only demote or stay unknown: explicit auth-required error
 //!   ⇒ `false`; anything else — including a served model catalog, which the
 //!   adapter returns without credentials — ⇒ unknown. Only the CLI probe
@@ -41,7 +41,7 @@
 //! simplified); `force` bypasses the cache read but still joins any in-flight
 //! probe.
 //!
-//! `intentd doctor` shares [`check_provider_auth_cli`] (the exit-code + grok
+//! `intentd doctor` shares [`check_provider_auth_cli`] (the exit-code + JSON/model
 //! CLI probe) so the doctor report and the RPC cannot drift. claude-code's
 //! ACP fallback lives only here, above that shared helper — no doctor drift
 //! is possible because doctor never prints an auth annotation for npx-only
@@ -84,13 +84,12 @@ const AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
 /// `null`/unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliAuthProbe {
-    /// The CLI reported an authenticated state (exit 0, or grok markers).
+    /// The CLI reported an authenticated state (provider-specific signal).
     Authenticated,
-    /// The CLI reported an unauthenticated state (non-zero exit, or grok
-    /// markers).
+    /// The CLI reported an unauthenticated state (provider-specific signal).
     NotAuthenticated,
-    /// The probe ran but produced no auth signal (grok: exit 0, no markers,
-    /// no models).
+    /// The probe ran but produced no auth signal (e.g. missing JSON boolean
+    /// or grok: exit 0, no markers, no models).
     StatusUnknown,
     /// The CLI could not be spawned, or ran but failed outright.
     Failed,
@@ -112,8 +111,9 @@ impl CliAuthProbe {
 
 /// Best-effort CLI authentication probe for an installed provider: run its
 /// `auth_check_args` with a short timeout. Most providers signal auth via the
-/// exit code (0 ⇒ authenticated); grok's `models` probe exits 0 in both auth
-/// states, so its stdout is parsed for the explicit auth markers instead; and
+/// exit code (0 ⇒ authenticated); Claude's JSON `loggedIn` boolean is trusted
+/// instead, with missing/malformed output left unknown. grok's `models` probe
+/// exits 0 in both auth states, so its stdout is parsed for explicit auth markers; and
 /// opencode's `models` probe requires at least one `provider/model` stdout
 /// line beyond exit 0 (credentials may come from `opencode auth login`, env
 /// vars, or a project `.env`). Shared by `intentd doctor` and
@@ -135,6 +135,35 @@ pub async fn check_provider_auth_cli(
     auth_check_args: &[&str],
 ) -> CliAuthProbe {
     match provider_id {
+        "claude-code" => {
+            let mut cmd = probe_command(program);
+            cmd.args(auth_check_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.output()).await {
+                Ok(Ok(output))
+                    if could_not_run(output.status) || output.status.code().is_none() =>
+                {
+                    CliAuthProbe::Failed
+                }
+                Ok(Ok(output)) => {
+                    // Never log the payload: auth status may include account details.
+                    let logged_in = serde_json::from_slice::<Value>(&output.stdout)
+                        .ok()
+                        .and_then(|value| value.get("loggedIn").and_then(Value::as_bool));
+                    match logged_in {
+                        Some(true) => CliAuthProbe::Authenticated,
+                        Some(false) => CliAuthProbe::NotAuthenticated,
+                        None if output.status.success() => CliAuthProbe::StatusUnknown,
+                        None => CliAuthProbe::Failed,
+                    }
+                }
+                Ok(Err(_)) => CliAuthProbe::Failed,
+                Err(_) => CliAuthProbe::TimedOut,
+            }
+        }
         "grok" => {
             let mut cmd = probe_command(program);
             cmd.args(auth_check_args)
@@ -298,15 +327,14 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
     }
 }
 
-/// Two-stage claude-code auth verdict (intent-hq/intent#3941). Fast path: a
-/// CLI probe that CONFIRMS auth (`claude auth status` exit 0) is trusted
-/// as-is — cheap, no false positives, no adapter spawn. Any non-confirming
-/// outcome (`NotAuthenticated` / `StatusUnknown` / `Failed` / `TimedOut`) consults
+/// Two-stage claude-code auth verdict (intent-hq/intent#3941). An explicit
+/// `loggedIn` boolean from `claude auth status` is trusted as-is, without
+/// spawning the adapter. Unlike the original #3941 fallback, a reported
+/// logout is not hidden to accommodate suspected CLI false negatives; the
+/// explicit live provider test can establish working authentication instead.
+/// Only inconclusive outcomes (`StatusUnknown` / `Failed` / `TimedOut`) consult
 /// `acp_fallback` — [`crate::provider_models::probe_claude_code_auth`], the
-/// pinned claude-agent-acp adapter probe — because `claude auth status` is
-/// known to report logged-out even when a working CLI credential exists
-/// (interactive `/login` sessions, account switches —
-/// anthropics/claude-code#76168). The fallback can only demote to
+/// pinned claude-agent-acp adapter probe. The fallback can only demote to
 /// `Some(false)` (the adapter's explicit auth-required error) or stay
 /// unknown — never confirm `Some(true)`, because the adapter serves its
 /// model catalog without credentials and there is no cheap auth-exercising
@@ -319,10 +347,10 @@ where
 {
     match cli {
         CliAuthProbe::Authenticated => Some(true),
-        CliAuthProbe::NotAuthenticated
-        | CliAuthProbe::StatusUnknown
-        | CliAuthProbe::Failed
-        | CliAuthProbe::TimedOut => acp_fallback().await,
+        CliAuthProbe::NotAuthenticated => Some(false),
+        CliAuthProbe::StatusUnknown | CliAuthProbe::Failed | CliAuthProbe::TimedOut => {
+            acp_fallback().await
+        }
     }
 }
 
@@ -763,6 +791,104 @@ mod tests {
         }
     }
 
+    /// Claude's JSON boolean wins over both conventional and contradictory
+    /// auth exit codes. Invalid output never turns process success into login.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_code_cli_parses_explicit_auth_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("claude-json");
+        let args = intent_providers::find_provider("claude-code")
+            .unwrap()
+            .auth_check_args
+            .unwrap();
+        assert_eq!(args, &["auth", "status"]);
+        let payloads = [
+            (
+                r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#,
+                Some(false),
+            ),
+            (r#"{ "loggedIn": true }"#, Some(true)),
+            ("", None),
+            ("not json", None),
+            (r#"{"loggedIn":false"#, None),
+            (r#"{"authMethod":"oauth","apiProvider":"firstParty"}"#, None),
+            (r#"{"loggedIn":"false"}"#, None),
+            (r#"{"loggedIn":"true"}"#, None),
+            (r#"{"loggedIn":null}"#, None),
+            (r#"{"loggedIn":1}"#, None),
+            (r#"[{"loggedIn":true}]"#, None),
+            ("true", None),
+        ];
+        for (index, (payload, logged_in)) in payloads.iter().enumerate() {
+            for exit in [0, 1] {
+                let stub = dir.path().join(format!("claude-{index}-{exit}"));
+                std::fs::write(
+                    &stub,
+                    format!(
+                        "#!/bin/sh\n[ \"$*\" = 'auth status' ] || exit 127\nprintf '%s\\n' '{payload}'\nexit {exit}\n"
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let probe = check_provider_auth_cli("claude-code", stub.as_os_str(), args).await;
+                assert_eq!(probe.auth_status(), *logged_in, "case {index}, exit {exit}");
+                if logged_in.is_some() {
+                    let verdict = claude_code_auth_verdict(probe, || async {
+                        panic!("explicit CLI status must not invoke the adapter")
+                    })
+                    .await;
+                    assert_eq!(verdict, *logged_in);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_code_cli_execution_failures_are_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("claude-failure");
+        let stub = dir.path().join("claude");
+        let args = &["auth", "status"];
+        let missing = check_provider_auth_cli("claude-code", stub.as_os_str(), args).await;
+        assert_eq!(missing, CliAuthProbe::Failed);
+        assert_eq!(missing.auth_status(), None);
+
+        // Even a boolean printed before a command-resolution failure or signal
+        // cannot establish that the CLI completed its auth check.
+        for end in ["exit 127", "kill -TERM $$"] {
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\necho '{{\"loggedIn\":true}}'\n{end}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let probe = check_provider_auth_cli("claude-code", stub.as_os_str(), args).await;
+            assert_eq!(probe, CliAuthProbe::Failed);
+            assert_eq!(probe.auth_status(), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_code_cli_timeout_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("claude-timeout");
+        let stub = dir.path().join("claude");
+        // exec avoids leaving a shell child behind when kill_on_drop fires.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho '{\"loggedIn\":true}'\nexec sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe =
+            check_provider_auth_cli("claude-code", stub.as_os_str(), &["auth", "status"]).await;
+        assert_eq!(probe, CliAuthProbe::TimedOut);
+        assert_eq!(probe.auth_status(), None);
+    }
+
     /// monorepo#1863 regression: the probe child's PATH must carry the
     /// resolved binary's own directory so an nvm-installed CLI's
     /// `#!/usr/bin/env node` shebang resolves the sibling `node`. The stub
@@ -855,21 +981,17 @@ mod tests {
         assert!(!opencode_models_ready("no models configured\n"));
     }
 
-    /// intent-hq/intent#3941 regression: a claude-code CLI probe reporting
-    /// `NotAuthenticated` used to be a hard `Some(false)` on the wire — the FE
-    /// then showed "Log in" to users whose CLI credentials actually work
-    /// (anthropics/claude-code#76168). Every non-confirming CLI outcome now
-    /// consults the ACP fallback, whose verdict (or unknown) is what ships.
+    /// Only inconclusive CLI results consult ACP. A served model catalog
+    /// supplies no auth evidence, so the fallback stays unknown in that case.
     #[tokio::test]
-    async fn claude_code_non_confirming_cli_consults_acp_fallback() {
+    async fn claude_code_inconclusive_cli_consults_acp_fallback() {
         use std::sync::atomic::{AtomicBool, Ordering};
         for cli in [
-            CliAuthProbe::NotAuthenticated,
             CliAuthProbe::StatusUnknown,
             CliAuthProbe::Failed,
             CliAuthProbe::TimedOut,
         ] {
-            for fallback in [Some(true), Some(false), None] {
+            for fallback in [Some(false), None] {
                 let called = AtomicBool::new(false);
                 let verdict = claude_code_auth_verdict(cli, || async {
                     called.store(true, Ordering::SeqCst);
@@ -885,22 +1007,16 @@ mod tests {
         }
     }
 
-    /// The fast path: a confirming CLI probe (exit 0) is trusted without
-    /// spawning the adapter.
+    /// Explicit login AND logout skip ACP, regardless of its possible outcome.
     #[tokio::test]
-    async fn claude_code_confirming_cli_skips_acp_fallback() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let called = AtomicBool::new(false);
-        let verdict = claude_code_auth_verdict(CliAuthProbe::Authenticated, || async {
-            called.store(true, Ordering::SeqCst);
-            None
-        })
-        .await;
-        assert!(
-            !called.load(Ordering::SeqCst),
-            "a confirming CLI probe must not spawn the adapter"
-        );
-        assert_eq!(verdict, Some(true));
+    async fn claude_code_explicit_cli_status_skips_acp_fallback() {
+        for cli in [CliAuthProbe::Authenticated, CliAuthProbe::NotAuthenticated] {
+            let verdict = claude_code_auth_verdict(cli, || async {
+                panic!("explicit login/logout must not spawn the adapter")
+            })
+            .await;
+            assert_eq!(verdict, cli.auth_status());
+        }
     }
 
     #[tokio::test]
