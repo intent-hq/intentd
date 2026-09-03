@@ -611,16 +611,20 @@ fn build_bind_choices(interfaces: &[(String, std::net::Ipv4Addr)]) -> Vec<BindCh
 /// choice (e.g. a tailnet IP whose interface was not discovered, or an IPv6
 /// address) ahead of the all-interfaces entry, labeled as currently
 /// configured — so the multi-select can always pre-check the persisted set
-/// faithfully. Loopback entries are skipped: loopback is not selectable
-/// (always bound — [`ensure_loopback_bind`]), so an explicit loopback
-/// selection persisted by older versions never resurrects a loopback row.
-/// Pure so the merged list shape is unit-testable.
+/// faithfully. Exactly `127.0.0.1` is skipped: that is the one address the
+/// daemon binds unconditionally ([`ensure_loopback_bind`]), so an explicit
+/// selection persisted by older versions never resurrects its row. Other
+/// loopback addresses (`::1`, `127.0.0.2`) are NOT covered by the guarantee
+/// and keep their currently-configured rows — dropping them from the picker
+/// would make Enter rewrite the setting and silently remove their
+/// listeners. Pure so the merged list shape is unit-testable.
 fn merge_current_into_bind_choices(
     mut choices: Vec<BindChoice>,
     current: &[std::net::IpAddr],
 ) -> Vec<BindChoice> {
+    let unconditional = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
     for addr in current {
-        if addr.is_loopback() || choices.iter().any(|c| c.addr == *addr) {
+        if *addr == unconditional || choices.iter().any(|c| c.addr == *addr) {
             continue;
         }
         // Keep the exclusive all-interfaces entry last.
@@ -677,7 +681,7 @@ fn parse_bind_multi_selection(
         }
     }
     if indices.is_empty() {
-        return Err("select at least one address".to_string());
+        return Err("select at least one number, or 'none' for loopback only".to_string());
     }
     Ok(indices)
 }
@@ -748,7 +752,9 @@ fn resolve_listen_selection(
 /// diffed against the current state so unchanged values are not rewritten:
 /// - the chosen addresses → `server.bindAddress` (a tailcat-only selection
 ///   pins loopback explicitly, so a later `server.tunnel.only = false` never
-///   resurrects a stale wide bind);
+///   resurrects a stale wide bind); a persisted `127.0.0.1` — whose picker
+///   row is gone (always bound) — is carried forward into any selection it
+///   can legally join, so Enter on a mixed set never rewrites the setting;
 /// - tailcat selected ⇔ `server.tunnel.enabled`;
 /// - ONLY tailcat selected ⇔ `server.tunnel.only`.
 ///
@@ -762,18 +768,44 @@ fn listen_selection_changes(
     tunnel_only: bool,
 ) -> Vec<serde_json::Value> {
     let mut changes = Vec::new();
-    let effective_addrs: Vec<std::net::IpAddr> = if selection.addresses.is_empty() {
-        vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]
-    } else {
-        selection.addresses.clone()
-    };
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let mut effective_addrs = selection.addresses.clone();
+    // The picker no longer surfaces the unconditionally bound 127.0.0.1, so
+    // a persisted entry (mixed sets like [127.0.0.1, lan] written by older
+    // versions) is carried forward — otherwise Enter would diff non-empty,
+    // rewrite the setting, and restart the listener. Skipped for the
+    // exclusive all-interfaces selection, which cannot combine with specific
+    // IPs (the server.bindAddress validation).
+    if current_addrs.contains(&loopback)
+        && !effective_addrs.contains(&loopback)
+        && !effective_addrs.iter().any(std::net::IpAddr::is_unspecified)
+    {
+        effective_addrs.push(loopback);
+    }
+    // `none` / tunnel-only: no additional endpoints — pin loopback alone.
+    if effective_addrs.is_empty() {
+        effective_addrs.push(loopback);
+    }
     if !same_addr_set(&effective_addrs, current_addrs) {
         changes.push(json!({
             "path": "server.bindAddress",
             "value": bind_addresses_value(&effective_addrs),
         }));
     }
-    let only_new = selection.tailcat && selection.addresses.is_empty();
+    // With the loopback row gone, an empty-addresses + tailcat selection is
+    // ambiguous: it is the tunnel-only posture, but ALSO the picker default
+    // for a "127.0.0.1 bind + tunnel enabled" state (whose loopback address
+    // pre-checks nothing). When the selection merely re-states the current
+    // state — same effective addresses, same tunnel switch — keep the
+    // current flag, so Enter never silently flips server.tunnel.only; an
+    // actual change of addresses or tunnel still infers it.
+    let unchanged =
+        same_addr_set(&effective_addrs, current_addrs) && selection.tailcat == tunnel_enabled;
+    let only_new = if unchanged {
+        tunnel_only
+    } else {
+        selection.tailcat && selection.addresses.is_empty()
+    };
     if only_new != tunnel_only {
         changes.push(json!({ "path": "server.tunnel.only", "value": only_new }));
     }
@@ -802,11 +834,12 @@ async fn current_bool_setting(socket: &Path, path: &str) -> anyhow::Result<bool>
 /// too would make Enter ("keep current selection") resolve to
 /// loopback+tailcat, silently writing `server.tunnel.only = false` and
 /// restarting the listener. Otherwise: the current non-loopback addresses,
-/// plus the tailcat entry when the tunnel is enabled. Loopback entries in
-/// `current` match no choice (loopback is not selectable — always bound),
-/// so an empty or loopback-only persisted set pre-checks nothing and Enter
-/// round-trips to the unchanged loopback bind. Pure so the round-trip is
-/// unit-testable.
+/// plus the tailcat entry when the tunnel is enabled. A persisted
+/// `127.0.0.1` matches no choice (its row is gone — always bound), so an
+/// empty or `127.0.0.1`-only persisted set pre-checks nothing and Enter
+/// round-trips to the unchanged loopback bind; other persisted loopback
+/// addresses (`::1`) keep merged rows and pre-check normally. Pure so the
+/// round-trip is unit-testable.
 fn listen_default_indices(
     choices: &[BindChoice],
     current: &[std::net::IpAddr],
@@ -6455,13 +6488,15 @@ mod tests {
             "100.64.0.7".parse::<std::net::IpAddr>().unwrap(),
         ];
         let merged = merge_current_into_bind_choices(base, &current);
-        // A persisted loopback entry (older versions offered the row) is
-        // skipped — loopback is not selectable; the unknown tailnet IP is
-        // inserted ahead of the trailing all-interfaces entry.
+        // A persisted 127.0.0.1 entry (older versions offered the row) is
+        // skipped — it is always bound; the unknown tailnet IP is inserted
+        // ahead of the trailing all-interfaces entry.
         assert_eq!(merged.len(), 3);
         assert!(
-            !merged.iter().any(|c| c.addr.is_loopback()),
-            "persisted loopback must not resurrect a loopback row"
+            !merged
+                .iter()
+                .any(|c| c.addr == "127.0.0.1".parse::<std::net::IpAddr>().unwrap()),
+            "persisted 127.0.0.1 must not resurrect its row"
         );
         assert_eq!(
             merged[0].addr,
@@ -6473,6 +6508,28 @@ mod tests {
         );
         assert!(merged[1].label.contains("currently configured"));
         assert!(merged[2].addr.is_unspecified());
+    }
+
+    #[test]
+    fn merge_current_into_bind_choices_keeps_other_loopback_addresses() {
+        // Only 127.0.0.1 is covered by the unconditional-bind guarantee;
+        // other persisted loopback addresses (::1) keep their
+        // currently-configured rows so the picker never silently drops
+        // their listeners on save.
+        let v6_lo: std::net::IpAddr = "::1".parse().unwrap();
+        let base =
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]);
+        let merged = merge_current_into_bind_choices(base, &[v6_lo]);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].addr, v6_lo);
+        assert!(merged[1].label.contains("currently configured"));
+        assert!(merged[2].addr.is_unspecified());
+
+        // And it pre-checks + round-trips like any configured address.
+        let defaults = listen_default_indices(&merged, &[v6_lo], false, false);
+        assert_eq!(defaults, vec![1]);
+        let sel = resolve_listen_selection(&merged, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[v6_lo], false, false).is_empty());
     }
 
     #[test]
@@ -6541,6 +6598,29 @@ mod tests {
         assert_eq!(defaults, Vec::<usize>::new());
         let sel = resolve_listen_selection(&choices, &defaults).unwrap();
         assert!(listen_selection_changes(&sel, &[lo], false, false).is_empty());
+
+        // Mixed persisted set the previous selector could write
+        // ([127.0.0.1, lan]): only the LAN row pre-checks, and Enter still
+        // round-trips clean — the hidden 127.0.0.1 is carried forward by
+        // listen_selection_changes instead of being diffed away.
+        let defaults = listen_default_indices(&choices, &[lo, lan], false, false);
+        assert_eq!(defaults, vec![lan_pos]);
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lo, lan], false, false).is_empty());
+
+        // A persisted ::1 (alone or mixed) keeps a merged currently-configured
+        // row, pre-checks it, and round-trips clean.
+        let v6_lo: std::net::IpAddr = "::1".parse().unwrap();
+        let merged = merge_current_into_bind_choices(
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]),
+            &[v6_lo, lan],
+        );
+        for current in [vec![v6_lo], vec![v6_lo, lan]] {
+            let defaults = listen_default_indices(&merged, &current, false, false);
+            assert_eq!(defaults.len(), current.len());
+            let sel = resolve_listen_selection(&merged, &defaults).unwrap();
+            assert!(listen_selection_changes(&sel, &current, false, false).is_empty());
+        }
     }
 
     #[test]
@@ -6591,11 +6671,27 @@ mod tests {
         };
         assert!(listen_selection_changes(&sel, &[lan], false, false).is_empty());
 
-        // New address set: bindAddress only.
+        // New address set: bindAddress only — the persisted 127.0.0.1 (whose
+        // picker row is gone) is carried forward, not silently dropped.
         let changes = listen_selection_changes(&sel, &[lo], false, false);
         assert_eq!(
             changes,
-            vec![json!({ "path": "server.bindAddress", "value": "192.168.1.5" })]
+            vec![json!({
+                "path": "server.bindAddress",
+                "value": ["192.168.1.5", "127.0.0.1"],
+            })]
+        );
+
+        // `none` on a mixed persisted set still narrows to the loopback pin:
+        // an explicit empty selection means "no additional endpoints".
+        let none_sel = ListenSelection {
+            addresses: Vec::new(),
+            tailcat: false,
+        };
+        let changes = listen_selection_changes(&none_sel, &[lo, lan], false, false);
+        assert_eq!(
+            changes,
+            vec![json!({ "path": "server.bindAddress", "value": "127.0.0.1" })]
         );
 
         // Tunnel newly selected alongside an unchanged address: value key
@@ -6628,6 +6724,12 @@ mod tests {
         // Same tunnel-only selection already in effect: nothing to write.
         assert!(listen_selection_changes(&sel, &[lo], true, true).is_empty());
 
+        // The ambiguous empty-addresses + tailcat selection is ALSO the
+        // picker default for a "127.0.0.1 bind + tunnel enabled (not only)"
+        // state — a plain Enter re-states the current state and must not
+        // silently flip server.tunnel.only.
+        assert!(listen_selection_changes(&sel, &[lo], true, false).is_empty());
+
         // Deselecting the tunnel from tunnel-only mode: both flags drop, the
         // loopback bind persists unchanged.
         let sel = ListenSelection {
@@ -6643,7 +6745,8 @@ mod tests {
             ]
         );
 
-        // Adding a LAN address while the tunnel stays on: tunnel.only drops.
+        // Adding a LAN address while the tunnel stays on: tunnel.only drops,
+        // and the persisted loopback pin rides along.
         let sel = ListenSelection {
             addresses: vec![lan],
             tailcat: true,
@@ -6652,9 +6755,24 @@ mod tests {
         assert_eq!(
             changes,
             vec![
-                json!({ "path": "server.bindAddress", "value": "192.168.1.5" }),
+                json!({
+                    "path": "server.bindAddress",
+                    "value": ["192.168.1.5", "127.0.0.1"],
+                }),
                 json!({ "path": "server.tunnel.only", "value": false }),
             ]
+        );
+
+        // The exclusive all-interfaces selection cannot legally carry the
+        // persisted loopback (bindAddress validation): 0.0.0.0 replaces it.
+        let sel = ListenSelection {
+            addresses: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)],
+            tailcat: false,
+        };
+        let changes = listen_selection_changes(&sel, &[lo, lan], false, false);
+        assert_eq!(
+            changes,
+            vec![json!({ "path": "server.bindAddress", "value": "0.0.0.0" })]
         );
     }
 
