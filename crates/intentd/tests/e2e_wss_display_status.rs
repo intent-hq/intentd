@@ -146,10 +146,24 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 
 /// Stub forge: `get_pr` reports the linked PR (#42, head `feature`) as merged;
 /// when `open_pr_number` is set, `list_prs` offers that open PR on the same
-/// head ref.
+/// head ref, carrying `open_pr_mergeable_state` when set (default `clean`).
 #[derive(Default)]
 struct StubForge {
     open_pr_number: Option<u64>,
+    open_pr_mergeable_state: Option<&'static str>,
+}
+
+impl StubForge {
+    fn open_pr(&self, number: u64) -> PullRequest {
+        let mut pr = sample_pr();
+        pr.number = number;
+        pr.url = format!("https://github.com/o/r/pull/{number}");
+        pr.state = PrState::Open;
+        if let Some(state) = self.open_pr_mergeable_state {
+            pr.mergeable_state = Some(state.into());
+        }
+        pr
+    }
 }
 
 fn sample_pr() -> PullRequest {
@@ -222,23 +236,14 @@ impl SourceControl for StubForge {
         unimplemented!()
     }
     async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
-        let mut pr = sample_pr();
         if Some(number) == self.open_pr_number {
-            pr.number = number;
-            pr.url = format!("https://github.com/o/r/pull/{number}");
-            pr.state = PrState::Open;
+            return Ok(self.open_pr(number));
         }
-        Ok(pr)
+        Ok(sample_pr())
     }
     async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
         let items = match self.open_pr_number {
-            Some(n) => {
-                let mut pr = sample_pr();
-                pr.number = n;
-                pr.url = format!("https://github.com/o/r/pull/{n}");
-                pr.state = PrState::Open;
-                vec![pr]
-            }
+            Some(n) => vec![self.open_pr(n)],
             None => vec![],
         };
         Ok(Page {
@@ -626,6 +631,7 @@ async fn pr_linkage_transition_over_wss() {
     let fx = boot(
         StubForge {
             open_pr_number: Some(300),
+            open_pr_mergeable_state: None,
         },
         true,
         None,
@@ -695,6 +701,70 @@ async fn pr_linkage_transition_over_wss() {
     .await;
     assert_eq!(again["outcome"], "unchanged", "second refresh: {again}");
     assert_no_display_status_event(&mut sub).await;
+}
+
+/// Merge-queue rung over the wire: the discovered open PR reports
+/// `mergeable_state: "queued"` (GitHub's merge-queue state), so the linkage
+/// flips the rollup to `pr_queued` — not `pr_ready` — on the
+/// `workspace:displayStatus-changed` event and the `workspace.get` read path.
+#[tokio::test]
+async fn pr_in_merge_queue_is_pr_queued_over_wss() {
+    let fx = boot(
+        StubForge {
+            open_pr_number: Some(300),
+            open_pr_mergeable_state: Some("queued"),
+        },
+        true,
+        None,
+    )
+    .await;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "idle");
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let refreshed = wss_rpc(
+        &mut rpc,
+        2,
+        "pr.refresh",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(refreshed["outcome"], "linked", "refresh: {refreshed}");
+
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "pr_queued" })
+    );
+
+    let after = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(after["workspace"]["displayStatus"], "pr_queued");
 }
 
 /// Persisted-column-only derivation over the wire: a workspace whose
