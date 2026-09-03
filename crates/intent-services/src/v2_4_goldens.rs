@@ -33,11 +33,12 @@ const AUTO_COMMIT_CLAUSE: &str = " Auto-commit is enabled; do not include prompt
     committing or reviewing changes before committing.";
 
 #[test]
-fn current_harness_version_is_v2_4() {
-    assert_eq!(intent_core::model::CURRENT_HARNESS_VERSION, "2.4");
+fn v2_4_remains_resolvable_after_bump() {
+    let entry = crate::harness::resolve_entry("2.4");
+    assert_eq!(entry.version, "2.4");
     assert_eq!(
-        crate::harness::resolve_entry(intent_core::model::CURRENT_HARNESS_VERSION).version,
-        "2.4"
+        entry.harness.suggested_next_steps_block(false),
+        NEXT_STEPS_OFF
     );
 }
 
