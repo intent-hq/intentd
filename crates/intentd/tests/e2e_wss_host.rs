@@ -516,7 +516,10 @@ async fn host_provider_auth_status_over_wss() {
 /// A Claude Desktop sign-in cannot override the CLI's explicit logout.
 /// Override the daemon child's PATH, not providers.paths.claude-code (which
 /// names the adapter), and use only isolated fixtures. Forced checks must
-/// observe login/logout while ordinary reads retain the cached verdict.
+/// observe login/logout while ordinary reads retain the cached verdict, and
+/// a logged-in report's identity metadata (email / orgName /
+/// subscriptionType) rides the response — including cache-served reads —
+/// while logged-out entries carry no identity object.
 #[tokio::test]
 async fn host_claude_auth_status_honors_cli_json_and_force_over_wss() {
     use std::os::unix::fs::PermissionsExt;
@@ -578,18 +581,17 @@ exit "$code"
         (5, false, 1, true, false, 3),
         (6, false, 0, true, false, 4),
     ] {
-        std::fs::write(
-            data_dir.join("status.json"),
-            format!(
-                "{}\n",
-                json!({
-                    "loggedIn": logged_in,
-                    "authMethod": if logged_in { "oauth" } else { "none" },
-                    "apiProvider": "firstParty"
-                })
-            ),
-        )
-        .unwrap();
+        let mut status = json!({
+            "loggedIn": logged_in,
+            "authMethod": if logged_in { "oauth" } else { "none" },
+            "apiProvider": "firstParty"
+        });
+        if logged_in {
+            status["email"] = json!("dev@example.com");
+            status["orgName"] = json!("Example Org");
+            status["subscriptionType"] = json!("max");
+        }
+        std::fs::write(data_dir.join("status.json"), format!("{status}\n")).unwrap();
         std::fs::write(data_dir.join("exit-code"), format!("{exit}\n")).unwrap();
         let result = wss_rpc(
             &mut ws,
@@ -598,9 +600,19 @@ exit "$code"
             json!({ "providerId": "claude-code", "force": force }),
         )
         .await;
+        let mut expected_entry = json!({ "id": "claude-code", "authenticated": expected });
+        if expected {
+            // Identity rides every authenticated read — the probe-backed one
+            // AND the cache-served one — and never a logged-out entry.
+            expected_entry["identity"] = json!({
+                "email": "dev@example.com",
+                "orgName": "Example Org",
+                "subscriptionType": "max"
+            });
+        }
         assert_eq!(
             result,
-            json!({ "providers": [{ "id": "claude-code", "authenticated": expected }] }),
+            json!({ "providers": [expected_entry] }),
             "step {id}: explicit CLI status and cache refresh"
         );
         assert_eq!(
