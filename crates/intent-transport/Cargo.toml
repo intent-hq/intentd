@@ -1,6 +1,6 @@
 [package]
 name = "intent-transport"
-version = "0.9.10"
+version = "0.9.11"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,8 +8,8 @@ license.workspace = true
 description = "UDS/TCP/TLS listeners, JSON-RPC router, auth, heartbeat, lifecycle (§16)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.10" }
-intent-services = { path = "../intent-services", version = "0.9.10" }
+intent-core = { path = "../intent-core", version = "0.9.11" }
+intent-services = { path = "../intent-services", version = "0.9.11" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
