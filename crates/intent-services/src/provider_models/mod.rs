@@ -126,7 +126,17 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
 /// Native official ACP discovery. No generic authenticate call, prompt,
 /// global configuration, npm fallback, or automatic browser login.
 pub(crate) async fn fetch_antigravity_models(explicit_path: Option<&str>) -> ProviderModelsFetch {
-    let Some(bin) = find_provider_binary("antigravity", "antigravity-acp", explicit_path) else {
+    fetch_antigravity_models_at(find_provider_binary(
+        "antigravity",
+        "antigravity-acp",
+        explicit_path,
+    ))
+    .await
+}
+
+/// Probe the executable already resolved for this request's cache identity.
+pub(crate) async fn fetch_antigravity_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    let Some(bin) = binary else {
         return ProviderModelsFetch::unavailable("antigravity", "antigravity-acp binary not found");
     };
     finish(

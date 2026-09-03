@@ -3309,6 +3309,42 @@ impl AgentManager {
             }
         }
 
+        // Antigravity requires mode/model confirmation before a candidate
+        // becomes resumable. A failed attempt leaves the prior stored ID and
+        // transcript intact, including across a daemon restart.
+        if provider.id == "antigravity" {
+            let prepared = self
+                .services
+                .prepare_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
+                .await?;
+            self.maybe_apply_session_model(
+                conn.as_ref(),
+                agent_id,
+                provider,
+                &prepared.response.session_id.0,
+                stored_model.as_deref(),
+            )
+            .await?;
+            let opened = self
+                .services
+                .commit_antigravity_acp_session(prepared, stored_id.as_deref())
+                .await?;
+            self.force_recreate.lock().unwrap().remove(agent_id);
+            if stored_id.is_some() {
+                self.recreated.lock().unwrap().insert(agent_id.clone());
+            }
+            self.arm_first_turn_prepend(agent_id, provider);
+            self.install_and_apply_thought_level(
+                conn.as_ref(),
+                agent_id,
+                &opened.session_id,
+                opened.thought_level.clone(),
+                stored_effort.as_deref(),
+            )
+            .await;
+            return Ok(opened.session_id);
+        }
+
         // 2) Resume impossible but a session existed → recreate + flag for resend.
         // The fresh `session/new` runs on the child just spawned for this turn
         // (the lost session's child, if any, was already reaped before the
@@ -3525,8 +3561,10 @@ impl AgentManager {
         if provider.id == "antigravity" {
             intent_acp::handshake::set_session_mode(conn, acp_session_id, "default")
                 .await
-                .map_err(|_| {
-                    Error::InvalidInput(
+                .map_err(|error| {
+                    antigravity_setup_error(
+                        "session/set_mode",
+                        &error,
                         "Antigravity could not enter default permission mode; no prompt was sent"
                             .into(),
                     )
@@ -3540,7 +3578,7 @@ impl AgentManager {
                 Error::InvalidInput("Invalid Antigravity model ID. Refresh models and select an available Antigravity model.".into())
             })?;
             let result = intent_acp::session::set_session_config_option_response(conn, acp_session_id, "model", model)
-                .await.map_err(|_| Error::InvalidInput(format!(
+                .await.map_err(|error| antigravity_setup_error("session/set_config_option", &error, format!(
                     "Antigravity rejected model {model}. Refresh models and select an available model; no prompt was sent."
                 )))?;
             let confirmed = result
@@ -7719,9 +7757,9 @@ impl AgentManager {
             Ok(id) => id,
             Err(error) => {
                 if resolved.provider.id == "antigravity" {
-                    // Setup may already have persisted an ACP id before a
-                    // mode/model rejection. Never let the next turn reuse a
-                    // live but unverified session through the fast path.
+                    // Never let the next turn reuse an unverified child
+                    // through the fast path. Fresh candidates are not committed
+                    // until confirmation; a failed load keeps its prior ID.
                     self.kill_child_only(agent_id).await;
                 }
                 return Err(error);
@@ -10640,6 +10678,32 @@ fn persist_retry_backoff_ms() -> Vec<u64> {
     )
 }
 
+fn antigravity_setup_error(method: &str, error: &intent_acp::AcpError, rejection: String) -> Error {
+    use intent_acp::AcpError;
+    // Do not forward provider-controlled error text into logs, public errors,
+    // or the string-based spawn retry classifier.
+    match error {
+        AcpError::Timeout(_) => Error::Internal(format!(
+            "Antigravity {method} timed out; no prompt was sent"
+        )),
+        AcpError::Transport(_) => Error::Internal(format!(
+            "Antigravity setup transport closed: {method}; no prompt was sent"
+        )),
+        // The local ACP reader emits this exact sentinel when stdout closes.
+        AcpError::Rpc(rpc)
+            if rpc.code == 0 && rpc.message == "agent stdout closed" && rpc.data.is_none() =>
+        {
+            Error::Internal(format!(
+                "Antigravity {method}: agent stdout closed; no prompt was sent"
+            ))
+        }
+        AcpError::Auth(_) => Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+            "antigravity",
+        )),
+        _ => Error::InvalidParams(rejection),
+    }
+}
+
 /// Classify whether an error from `ensure_started` is retryable. Retryable
 /// errors include session/new or session/load timeouts and handshake failures
 /// (e.g., "agent stdout closed" when the child dies immediately). Non-retryable
@@ -10663,6 +10727,7 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
         || msg.contains("handshake failed")
         || msg.contains("agent stdout closed")
         || msg.contains("timed out")
+        || msg.starts_with("internal error: Antigravity setup transport closed:")
     {
         return true;
     }
@@ -12787,6 +12852,93 @@ mod role_reminder_tests {
         );
     }
 
+    #[test]
+    fn antigravity_setup_errors_preserve_safe_retry_classification() {
+        use intent_acp::{AcpError, JsonRpcError};
+        for method in ["session/set_mode", "session/set_config_option"] {
+            for (error, retryable) in [
+                (AcpError::Timeout("secret-url".into()), true),
+                (AcpError::Transport("secret-url".into()), true),
+                (
+                    AcpError::Rpc(JsonRpcError {
+                        code: 0,
+                        message: "agent stdout closed".into(),
+                        data: None,
+                    }),
+                    true,
+                ),
+                (
+                    AcpError::Rpc(JsonRpcError {
+                        code: -32602,
+                        message: "secret-url timed out".into(),
+                        data: None,
+                    }),
+                    false,
+                ),
+                (
+                    AcpError::Rpc(JsonRpcError {
+                        code: -32603,
+                        message: "secret-url agent stdout closed".into(),
+                        data: None,
+                    }),
+                    false,
+                ),
+                (AcpError::Auth("secret-url".into()), false),
+                (AcpError::Protocol("secret-url timed out".into()), false),
+            ] {
+                let mapped = antigravity_setup_error(
+                    method,
+                    &error,
+                    "Selection was rejected; no prompt was sent".into(),
+                );
+                assert_eq!(is_retryable_spawn_error(&mapped), retryable, "{mapped}");
+                assert!(!mapped.to_string().contains("secret-url"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_mode_and_model_connection_timeouts_are_retryable() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        tokio::time::pause();
+        for stalled_method in ["session/set_mode", "session/set_config_option"] {
+            let (client_write, agent_read) = tokio::io::duplex(4096);
+            let (mut agent_write, client_read) = tokio::io::duplex(4096);
+            let responder = tokio::spawn(async move {
+                let mut lines = BufReader::new(agent_read).lines();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    if request["method"] == stalled_method {
+                        // Keep stdout open: this must be a timeout, not EOF.
+                        std::future::pending::<()>().await;
+                    }
+                    let response = json!({"jsonrpc":"2.0","id":request["id"],"result":{}});
+                    agent_write
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            });
+            let conn = Connection::new(client_write, client_read, None, ConnectionHooks::default());
+            let error = mgr
+                .maybe_apply_session_model(
+                    &conn,
+                    &agent_id,
+                    intent_providers::provider_config("antigravity"),
+                    "candidate",
+                    Some("model-a"),
+                )
+                .await
+                .unwrap_err();
+            assert!(is_retryable_spawn_error(&error));
+            assert!(error
+                .to_string()
+                .contains(&format!("{stalled_method} timed out")));
+            responder.abort();
+        }
+    }
+
     #[tokio::test]
     async fn antigravity_session_setup_requires_default_mode_and_exact_model_ack() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -12870,7 +13022,8 @@ mod role_reminder_tests {
                     let mode = call["method"] == "session/set_mode";
                     let mut response = json!({"jsonrpc":"2.0", "id":call["id"]});
                     if (mode && mode_error) || (!mode && model_reply.is_null()) {
-                        response["error"] = json!({"code":-32602,"message":"rejected"});
+                        response["error"] =
+                            json!({"code":-32602,"message":"rejected: timed out secret-url"});
                     } else {
                         response["result"] = if mode { json!({}) } else { model_reply.clone() };
                     }
@@ -12899,6 +13052,12 @@ mod role_reminder_tests {
                 succeeds,
                 "{provider_id}/{model}: {outcome:?}"
             );
+            if provider_id == "antigravity" {
+                if let Err(error) = &outcome {
+                    assert!(!is_retryable_spawn_error(error));
+                    assert!(!error.to_string().contains("secret-url"));
+                }
+            }
             let calls = responder.await.unwrap();
             if provider_id == "antigravity" {
                 assert_eq!(calls[0]["method"], "session/set_mode");

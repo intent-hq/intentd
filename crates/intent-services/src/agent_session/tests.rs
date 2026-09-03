@@ -3190,6 +3190,53 @@ async fn stale_anonymous_tool_update_is_dropped_not_persisted() {
 }
 
 #[tokio::test]
+async fn antigravity_candidate_commit_preserves_concurrent_session_and_metadata() {
+    for expected_old in [None, Some("stale-id")] {
+        let (_tmp, services, bus, agent_id, ws) = setup().await;
+        if let Some(old) = expected_old {
+            bus.store()
+                .set_acp_session_id(&ws, &agent_id, old)
+                .await
+                .unwrap();
+        }
+        let (conn, _rx, _agent) =
+            connect_with_session_result(claude_shaped_thought_level_session_result());
+        let prepared = services
+            .prepare_acp_session(&conn, &agent_id, "/tmp/ws", Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            bus.store()
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            expected_old,
+            "session/new alone must not persist a candidate"
+        );
+        bus.store()
+            .replace_acp_session_id(&ws, &agent_id, expected_old.unwrap_or(""), "winner-id")
+            .await
+            .unwrap();
+        let winner_levels = vec!["low".to_string(), "high".to_string()];
+        bus.store()
+            .set_agent_effort_levels(&ws, &agent_id, Some(&winner_levels), &now_iso())
+            .await
+            .unwrap();
+        let before = bus.store().get_agent_session(&agent_id).await.unwrap();
+        let result = services
+            .commit_antigravity_acp_session(prepared, expected_old)
+            .await;
+        assert!(matches!(result, Err(intent_core::Error::Conflict { .. })));
+        let after = bus.store().get_agent_session(&agent_id).await.unwrap();
+        assert_eq!(after.acp_session_id.as_deref(), Some("winner-id"));
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.effort_levels, Some(winner_levels));
+    }
+}
+
+#[tokio::test]
 async fn open_acp_session_persists_id() {
     let (_tmp, services, bus, agent_id, _ws) = setup().await;
     let (conn, _rx, _agent) = connect();

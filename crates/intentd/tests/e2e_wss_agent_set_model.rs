@@ -215,12 +215,117 @@ fn gate() -> Option<String> {
 
 /// Exercise the real Antigravity registry/launch/session path with the existing
 /// deterministic ACP fixture, including both cold load and recreation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn antigravity_catalog_override_change_and_restart_use_current_executable_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(script) = gate() else { return };
+    let node = intent_providers::resolve_on_path("node").unwrap();
+    let data_dir = temp_data_dir();
+    let mut wrappers = Vec::new();
+    for model in ["model-a", "model-b"] {
+        let wrapper = data_dir.join(model);
+        let catalog = json!({"configOptions":[{
+            "id":"model", "name":"Model", "type":"select",
+            "currentValue":model, "options":[{"value":model,"name":model}]
+        }]});
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexport MOCK_AGENT_SESSION_RESULT='{}'\nexec '{}' '{}'\n",
+                catalog,
+                node.display(),
+                script,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        wrappers.push(wrapper);
+    }
+    let env = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    for (index, expected) in [(0, "model-a"), (1, "model-b"), (0, "model-a")] {
+        wss_rpc(
+            &mut rpc,
+            1,
+            "settings.update",
+            json!({"changes":[{"path":"providers.paths","value":{"antigravity":wrappers[index]}}]}),
+        )
+        .await;
+        let response = wss_rpc(
+            &mut rpc,
+            2,
+            "models.list",
+            json!({"providerId":"antigravity"}),
+        )
+        .await;
+        assert_eq!(response["source"], "antigravity");
+        assert_eq!(response["models"][0]["id"], expected);
+    }
+    // Persist B's setting while the last saved catalog still belongs to A.
+    wss_rpc(
+        &mut rpc,
+        3,
+        "settings.update",
+        json!({"changes":[{"path":"providers.paths","value":{"antigravity":wrappers[1]}}]}),
+    )
+    .await;
+    drop(rpc);
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon.child = spawn_serve(&data_dir, "both", &env);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let response = wss_rpc(
+        &mut rpc,
+        4,
+        "models.list",
+        json!({"providerId":"antigravity"}),
+    )
+    .await;
+    assert_eq!(response["models"][0]["id"], "model-b");
+    assert_eq!(response["models"][0]["isDefault"], true, "{response}");
+    let workspace = wss_rpc(
+        &mut rpc,
+        5,
+        "workspace.create",
+        json!({"title":"Antigravity cache identity", "noPrompt":true}),
+    )
+    .await;
+    let created = wss_rpc(&mut rpc, 6, "agent.create", json!({"workspaceId":workspace["workspace"]["id"],"name":"Cached default", "provider":"antigravity"})).await;
+    assert_eq!(created["agent"]["model"], "model-b", "{created}");
+}
+
 #[tokio::test]
 async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss() {
     use std::os::unix::fs::PermissionsExt;
     let Some(script) = gate() else { return };
     let node = intent_providers::resolve_on_path("node").unwrap();
-    for (load, reject_model) in [(true, false), (false, false), (true, true)] {
+    for (load, reject_model, dropped_setups) in [
+        (true, false, 0),
+        (false, false, 0),
+        (true, true, 0),
+        (true, false, 2),
+        (true, false, 9),
+    ] {
+        let should_fail = reject_model || dropped_setups == 9;
         let data_dir = temp_data_dir();
         let wrapper = data_dir.join("antigravity-fixture");
         std::fs::write(
@@ -238,8 +343,9 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
         )
         .unwrap();
         let log = data_dir.join("acp-rpc.jsonl");
+        let attempt_file = data_dir.join("config-attempts");
         let behavior =
-            json!({"advertiseLoadSession":load,"rejectSetConfigOption":reject_model,"response":"antigravity fixture complete"})
+            json!({"advertiseLoadSession":load,"rejectSetConfigOption":reject_model,"exitOnModelConfigForAttempts":dropped_setups,"response":"antigravity fixture complete"})
                 .to_string();
         let catalog = json!({"models":{"currentModelId":"gemini-3.7-flash-low","availableModels":[
             {"modelId":"gemini-3.7-flash-low","name":"Gemini 3.7 Flash (Low)"},
@@ -258,6 +364,8 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
                 ("MOCK_AGENT_SESSION_RESULT", &catalog),
                 ("MOCK_AGENT_RPC_LOG", log.to_str().unwrap()),
+                ("MOCK_AGENT_ATTEMPT_FILE", attempt_file.to_str().unwrap()),
+                ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "1,1"),
             ],
         );
         let _daemon = Daemon {
@@ -322,7 +430,7 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
         let created = wss_rpc(&mut rpc, 11, "agent.create", json!({"workspaceId":workspace_id,"name":"Antigravity fixture","provider":"antigravity","model":"gemini-3.7-flash-low"})).await;
         let agent = created["agent"]["id"].as_str().unwrap();
         for (turn, model) in [(0, "gemini-3.7-flash-low"), (1, "gemini-3.6-flash-medium")] {
-            if turn == 1 && !reject_model {
+            if turn == 1 && !should_fail {
                 wss_rpc(&mut rpc, 12, "agent.setModel", json!({"workspaceId":workspace_id,"agentId":agent,"providerId":"antigravity","modelId":model})).await;
             }
             wss_rpc(&mut rpc, 20 + turn, "agent.sendMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":format!("test turn {turn}")})).await;
@@ -333,12 +441,16 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
                         let event = &frame["params"]["event"];
                         if event["data"]["agentId"] == agent {
                             if event["type"] == "agent:failed" {
-                                assert!(reject_model, "session error: {event}");
-                                assert!(event.to_string().contains("rejected model"));
+                                assert!(should_fail, "session error: {event}");
+                                assert!(event.to_string().contains(if reject_model {
+                                    "rejected model"
+                                } else {
+                                    "stdout closed"
+                                }));
                                 break;
                             }
                             if event["type"] == "agent:idle" {
-                                assert!(!reject_model, "rejected model must not run a prompt");
+                                assert!(!should_fail, "failed setup must not run a prompt");
                                 break;
                             }
                         }
@@ -347,7 +459,7 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             })
             .await
             .expect("Antigravity turn must finish");
-            if reject_model {
+            if should_fail {
                 // Let the terminal failure's queue/status publication finish
                 // before redriving the same model on the next user message.
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -362,7 +474,7 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             .iter()
             .filter(|call| call["method"] == "session/prompt")
             .collect();
-        if reject_model {
+        if should_fail {
             assert!(
                 prompts.is_empty(),
                 "a failed setup never reaches session/prompt"
@@ -373,8 +485,8 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
                 .collect();
             assert_eq!(
                 attempts.len(),
-                2,
-                "each redrive reapplies the rejected model"
+                if reject_model { 2 } else { 6 },
+                "each redrive is terminal or bounded to three attempts"
             );
             assert_ne!(
                 attempts[0]["pid"], attempts[1]["pid"],
@@ -382,6 +494,13 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             );
             continue;
         }
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "session/set_config_option")
+                .count(),
+            2 + dropped_setups
+        );
         assert_eq!(prompts.len(), 2, "one prompt per turn: {calls:?}");
         assert_ne!(
             prompts[0]["pid"], prompts[1]["pid"],
