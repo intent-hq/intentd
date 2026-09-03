@@ -56,7 +56,9 @@ else
     echo "Generating coverage report..."
 fi
 if ! cargo llvm-cov report "${REPORT_ARGS[@]}" | tee coverage-summary.txt; then
-    if [ -n "$FLOOR" ]; then
+    # Only a floor miss leaves a rendered summary behind; other report failures
+    # (profdata merge, missing llvm-tools) already print their own error.
+    if [ -n "$FLOOR" ] && grep -q '^TOTAL' coverage-summary.txt; then
         echo "ERROR: line coverage is below the ${FLOOR}% floor (see TOTAL above)" >&2
     fi
     exit 1
