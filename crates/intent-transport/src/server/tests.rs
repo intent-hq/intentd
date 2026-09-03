@@ -38,6 +38,7 @@ impl TokenStore for MemoryStore {
 /// Mock pairing info provider for tests.
 struct MockPairingInfo {
     port: Option<u16>,
+    bind_addresses: Option<Vec<std::net::IpAddr>>,
     tc_address: Option<String>,
     data_dir: PathBuf,
     token_store: crate::AsyncTokenStore,
@@ -46,11 +47,12 @@ struct MockPairingInfo {
 impl ServerPairingInfo for MockPairingInfo {
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>> {
         let port = self.port;
+        let bind_addresses = self.bind_addresses.clone();
         let tc_address = self.tc_address.clone();
         Box::pin(async move {
             PairingSnapshot {
                 port,
-                bind_addresses: None,
+                bind_addresses,
                 tc_address,
             }
         })
@@ -106,6 +108,7 @@ async fn handle_pairing_info_local_success() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        bind_addresses: None,
         tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store,
@@ -127,6 +130,9 @@ async fn handle_pairing_info_local_success() {
     assert_eq!(result["path"], "/ws");
     assert!(result["certFingerprint"].is_string());
     assert!(result["localIps"].is_array());
+    // availableIps is always present and is exactly the bind-candidate
+    // enumeration (machine-dependent contents, so compare against the source).
+    assert_eq!(result["availableIps"], json!(collect_local_ips()));
     assert!(result["hostname"].is_string());
     assert!(
         !result["prettyHostname"]
@@ -137,6 +143,52 @@ async fn handle_pairing_info_local_success() {
     );
     // No tunnel in the snapshot: tcAddress is ABSENT, not null.
     assert!(result.get("tcAddress").is_none());
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+#[tokio::test]
+async fn handle_pairing_info_available_ips_ignore_loopback_bind() {
+    // A loopback-only bind advertises no pairing host (localIps is empty),
+    // but availableIps still lists every bind candidate — the FE's bind
+    // picker needs the candidates precisely when the daemon is locked to
+    // loopback. Loopback itself is never in the candidate list.
+    use std::env;
+    let tmpdir = env::temp_dir().join(format!(
+        "intentd-test-{}-{}",
+        std::process::id(),
+        "pairing_info_available_ips"
+    ));
+    std::fs::create_dir_all(&tmpdir).unwrap();
+    let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
+    let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
+        port: Some(5181),
+        bind_addresses: Some(vec!["127.0.0.1".parse().unwrap()]),
+        tc_address: None,
+        data_dir: tmpdir.clone(),
+        token_store: store,
+    });
+
+    let req = ServerRequest {
+        method: ServerMethod::PairingInfo,
+        id_present: true,
+        id_echo: json!(1),
+    };
+
+    let resp = handle(req, &provider, true).await.unwrap();
+    let parsed: Value = serde_json::from_str(&resp).unwrap();
+    let result = &parsed["result"];
+    assert_eq!(result["localIps"], json!([]));
+    assert_eq!(result["availableIps"], json!(collect_local_ips()));
+    let available = result["availableIps"].as_array().unwrap();
+    assert!(
+        available.iter().all(|v| !v
+            .as_str()
+            .unwrap()
+            .parse::<std::net::IpAddr>()
+            .unwrap()
+            .is_loopback()),
+        "availableIps never contains loopback: {available:?}"
+    );
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
@@ -152,6 +204,7 @@ async fn handle_pairing_info_includes_tc_address_when_tunnel_up() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        bind_addresses: None,
         tc_address: Some("tc7f2a91.tailcat.net".to_string()),
         data_dir: tmpdir.clone(),
         token_store: store,
@@ -181,6 +234,7 @@ async fn handle_pairing_info_remote_rejects() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::default()));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        bind_addresses: None,
         tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store,
@@ -228,6 +282,7 @@ async fn handle_rotate_token_local_success() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("old-token")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        bind_addresses: None,
         tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store.clone(),
@@ -246,6 +301,8 @@ async fn handle_rotate_token_local_success() {
     let new_token = parsed["result"]["token"].as_str().unwrap();
     assert_ne!(new_token, "old-token");
     assert_eq!(new_token.len(), 64);
+    // Same shape as server.pairingInfo: the additive bind-candidate set rides along.
+    assert_eq!(parsed["result"]["availableIps"], json!(collect_local_ips()));
 
     let _ = std::fs::remove_dir_all(&tmpdir);
     // _guard drops here, restoring the original env var value
