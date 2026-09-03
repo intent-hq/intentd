@@ -22,7 +22,7 @@ use intent_acp::{
 };
 use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
-use intent_pty::{PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
+use intent_pty::{LineSnapshot, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -301,12 +301,13 @@ pub(crate) fn get_buffer(
     max_bytes: Option<i64>,
 ) -> Result<Value> {
     let id = resolve(terminal_id)?;
-    let mut bytes = pty.scrollback(id)?;
-    if let Some(max) = max_bytes.and_then(|n| usize::try_from(n).ok()) {
-        if bytes.len() > max {
-            bytes = bytes.split_off(bytes.len() - max);
-        }
-    }
+    // Omitted (and legacy negative) bounds retain full-history semantics. A
+    // usable bound takes the ring tail directly, without cloning its prefix.
+    let bytes = if let Some(max) = max_bytes.and_then(|n| usize::try_from(n).ok()) {
+        pty.scrollback_tail(id, max)?
+    } else {
+        pty.scrollback(id)?
+    };
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(json!({ "terminalId": terminal_id, "data": data }))
 }
@@ -376,44 +377,72 @@ pub(crate) fn read_output(
         ));
     }
 
-    let bytes = pty.scrollback(id)?;
-    let raw = String::from_utf8_lossy(&bytes);
-
     // TA-2 / §5.5 opt-in pagination: when engaged, return the historical
     // scrollback as a `{ items, nextToken }` envelope of ANSI-stripped lines
     // ordered newest→oldest, with an opaque append-stable continuation token.
     // Absent the opt-in, preserve the legacy bare formatted string verbatim.
     if paginate || page_token.is_some() {
-        return Ok(crate::pagination::paginate_text_lines(
-            &strip_ansi(&raw),
-            max_lines,
-            page_token.map(std::string::String::as_str),
-        ));
+        let limit = crate::pagination::clamp_limit(max_lines);
+        let token = page_token.map(std::string::String::as_str);
+        let boundary = token.and_then(crate::pagination::backward_page_boundary);
+
+        let (snapshot, lines, effective_total, window_token) = if boundary.is_some() {
+            let snapshot = pty.scrollback_lines(id, limit, boundary)?;
+            let lines = decoded_snapshot_lines(&snapshot);
+            let total = snapshot.total_lines;
+            (snapshot, lines, total, token)
+        } else {
+            // The historical helper trims blank lines at the newest end before
+            // paging. Probe backward in bounded chunks so even an ANSI-only
+            // blank suffix does not require cloning the complete scrollback.
+            let mut probe_end = None;
+            let effective_end = loop {
+                let probe = pty.scrollback_lines(id, limit, probe_end)?;
+                let probe_lines = decoded_snapshot_lines(&probe);
+                if let Some(last_content) =
+                    probe_lines.iter().rposition(|line| !line.trim().is_empty())
+                {
+                    break probe.start_line + last_content + 1;
+                }
+                if probe.start_line == 0 {
+                    break 0;
+                }
+                probe_end = Some(probe.start_line);
+            };
+            let snapshot = pty.scrollback_lines(id, limit, Some(effective_end))?;
+            let lines = decoded_snapshot_lines(&snapshot);
+            (snapshot, lines, effective_end, None)
+        };
+
+        let window = crate::pagination::page_window(effective_total, max_lines, window_token);
+        debug_assert_eq!(
+            (snapshot.start_line, snapshot.end_line),
+            (window.start, window.end)
+        );
+        return Ok(json!({
+            "items": lines.into_iter().rev().collect::<Vec<_>>(),
+            "nextToken": window.next_token,
+        }));
     }
 
-    if raw.trim().is_empty() {
+    let max_line_count =
+        usize::try_from(max_lines.unwrap_or(200).clamp(1, 10000)).expect("value fits in usize");
+    let snapshot = pty.scrollback_lines(id, max_line_count, None)?;
+    if !snapshot.retained_has_non_whitespace {
         return Ok(Value::String("Terminal has no output yet.".to_string()));
     }
 
-    let clean = strip_ansi(&raw);
-    let lines: Vec<&str> = clean.split('\n').collect();
-    let max_line_count =
-        usize::try_from(max_lines.unwrap_or(200).clamp(1, 10000)).expect("value fits in usize");
-    let mut output_lines: Vec<&str> = if lines.len() > max_line_count {
-        lines[lines.len() - max_line_count..].to_vec()
-    } else {
-        lines.clone()
-    };
+    let mut output_lines = decoded_snapshot_lines(&snapshot);
     while output_lines.last().is_some_and(|l| l.trim().is_empty()) {
         output_lines.pop();
     }
 
-    let truncated = lines.len() > max_line_count;
+    let truncated = snapshot.total_lines > max_line_count;
     let cwd = info.cwd.unwrap_or_default();
     let header = if truncated {
         format!(
             "Terminal {terminal_id} (cwd: {cwd}) [showing last {max_line_count} of {} lines]",
-            lines.len()
+            snapshot.total_lines
         )
     } else {
         format!("Terminal {terminal_id} (cwd: {cwd})")
@@ -423,6 +452,21 @@ pub(crate) fn read_output(
         "{header}\n{separator}\n{}",
         output_lines.join("\n")
     )))
+}
+
+/// Decode and ANSI-strip only the raw lines copied by `scrollback_lines`.
+/// The ring includes the newline after a window that ends before the live tail;
+/// `take(line_count)` excludes the synthetic split item after that delimiter.
+fn decoded_snapshot_lines(snapshot: &LineSnapshot) -> Vec<String> {
+    let raw = String::from_utf8_lossy(&snapshot.bytes);
+    let clean = strip_ansi(&raw);
+    let mut lines: Vec<String> = clean
+        .split('\n')
+        .take(snapshot.line_count())
+        .map(str::to_string)
+        .collect();
+    lines.resize(snapshot.line_count(), String::new());
+    lines
 }
 
 /// Strip ANSI escape sequences from terminal output, mirroring the TS
@@ -1023,6 +1067,18 @@ mod tests {
     fn strip_ansi_removes_sequences_and_keeps_unicode() {
         let input = "\u{1b}[31mred\u{1b}[0m \u{1b}[?25lhide \u{1b}]0;title\u{07}é✓😀";
         assert_eq!(strip_ansi(input), "red hide é✓😀");
+    }
+
+    #[test]
+    fn bounded_line_decode_tolerates_utf8_and_ansi_split_edges() {
+        let snapshot = LineSnapshot {
+            bytes: b"\xa9prefix\x1b[31mred\x1b[0m\x1b[32".to_vec(),
+            total_lines: 1,
+            start_line: 0,
+            end_line: 1,
+            retained_has_non_whitespace: true,
+        };
+        assert_eq!(decoded_snapshot_lines(&snapshot), ["�prefixred"]);
     }
 
     // ---- credential injection helpers (no spawn) ----
@@ -1775,7 +1831,23 @@ mod tests {
         assert!(contains_sub(&full, b"buffer-test"));
 
         let capped = get_buffer(pty.as_ref(), &id, Some(4)).unwrap();
-        assert!(decode(capped["data"].as_str().unwrap()).len() <= 4);
+        assert_eq!(
+            decode(capped["data"].as_str().unwrap()),
+            full[full.len() - 4..]
+        );
+        let zero = get_buffer(pty.as_ref(), &id, Some(0)).unwrap();
+        assert!(decode(zero["data"].as_str().unwrap()).is_empty());
+        let exact = get_buffer(
+            pty.as_ref(),
+            &id,
+            Some(i64::try_from(full.len()).expect("test buffer length fits in i64")),
+        )
+        .unwrap();
+        assert_eq!(decode(exact["data"].as_str().unwrap()), full);
+        let oversized = get_buffer(pty.as_ref(), &id, Some(i64::MAX)).unwrap();
+        assert_eq!(decode(oversized["data"].as_str().unwrap()), full);
+        let legacy_negative = get_buffer(pty.as_ref(), &id, Some(-1)).unwrap();
+        assert_eq!(decode(legacy_negative["data"].as_str().unwrap()), full);
 
         kill(pty.as_ref(), &id).await.unwrap();
     }
@@ -1940,6 +2012,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_output_reports_exact_line_total_after_exit() {
+        let pty = host();
+        let mut spec = SpawnSpec::new("ws-1", "sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "printf '\x1b[31mone\x1b[0m\\ntwo\\nthree'".to_string(),
+        ];
+        let id = pty.spawn(spec).unwrap();
+        pty.wait(id).await.unwrap();
+
+        let text = poll_until(
+            || {
+                let value = read_output(
+                    pty.as_ref(),
+                    &ws("ws-1"),
+                    &id.to_string(),
+                    Some(2),
+                    false,
+                    None,
+                )
+                .ok()?;
+                let text = value.as_str()?.to_string();
+                text.contains("three").then_some(text)
+            },
+            TIMEOUT,
+        )
+        .await
+        .expect("post-exit output drains into scrollback");
+        assert!(text.contains("[showing last 2 of 3 lines]"), "{text}");
+        assert!(text.ends_with("two\r\nthree") || text.ends_with("two\nthree"));
+        assert!(!text.contains('\u{1b}'));
+
+        kill(pty.as_ref(), &id.to_string()).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn read_output_paginates_with_token() {
         let pty = host();
         let res = create(
@@ -1976,9 +2084,29 @@ mod tests {
         .expect("first page with continuation token");
 
         let token = page1["nextToken"].as_str().unwrap().to_string();
+        write(
+            pty.as_ref(),
+            &id,
+            &base64::engine::general_purpose::STANDARD.encode(b"new-tail\n"),
+        )
+        .unwrap();
+        poll_until(
+            || {
+                let bytes = pty.scrollback(PtyId::parse(&id)?).ok()?;
+                contains_sub(&bytes, b"new-tail").then_some(())
+            },
+            TIMEOUT,
+        )
+        .await
+        .expect("concurrent append reaches scrollback");
         let page2 =
             read_output(pty.as_ref(), &ws("ws-1"), &id, Some(2), false, Some(&token)).unwrap();
         assert!(!page2["items"].as_array().unwrap().is_empty());
+        assert!(page2["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| !item.as_str().unwrap_or_default().contains("new-tail")));
 
         kill(pty.as_ref(), &id).await.unwrap();
     }
