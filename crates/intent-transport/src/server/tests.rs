@@ -182,6 +182,7 @@ async fn handle_pairing_info_available_ips_ignore_loopback_bind() {
         tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store,
+        host_environment: host_environment(Some("server")),
     });
 
     let req = ServerRequest {
