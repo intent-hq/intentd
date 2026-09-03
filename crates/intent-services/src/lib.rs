@@ -5709,7 +5709,23 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true)
+        self.deliver_completion_to_watches_inner(child_id, event, true, true)
+            .await
+    }
+
+    /// [`Services::deliver_completion_to_watches`] for a child whose
+    /// advisory-wake period markers the caller has ALREADY cleared in one
+    /// batched statement (`clear_advisory_wake_deliveries_for_children`):
+    /// the workspace-delete sweep settles every session of the workspace in
+    /// one pass, and the per-child clear inside the delivery would cost one
+    /// statement per agent (intent-hq/monorepo#4130). Delivery semantics are
+    /// otherwise identical.
+    pub(crate) async fn deliver_completion_to_watches_markers_precleared(
+        &self,
+        child_id: &AgentId,
+        event: &Event,
+    ) -> CompletionIdleClassification {
+        self.deliver_completion_to_watches_inner(child_id, event, true, false)
             .await
     }
 
@@ -5726,7 +5742,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, false)
+        self.deliver_completion_to_watches_inner(child_id, event, false, true)
             .await
     }
 
@@ -5735,6 +5751,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
         advisory_allowed: bool,
+        clear_advisory_markers: bool,
     ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
@@ -5889,18 +5906,24 @@ impl Services {
             // and the leaked marker would suppress the NEXT period's
             // advisory for the pair (the turn-start clear in `AgentManager`
             // is the other period boundary). Best-effort: a failed clear
-            // only suppresses one future advisory, never a real wake.
+            // only suppresses one future advisory, never a real wake. The
+            // durable clear is skipped when the caller batch-cleared the
+            // markers up front (the workspace-delete sweep —
+            // `deliver_completion_to_watches_markers_precleared`); the
+            // in-memory clear is free and always runs.
             self.clear_advisory_wake_periods_in_memory_for_child(child_id);
-            if let Err(e) = self
-                .store
-                .clear_advisory_wake_deliveries_for_child(child_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    child = %child_id.0,
-                    "failed to clear advisory-wake period markers at settlement"
-                );
+            if clear_advisory_markers {
+                if let Err(e) = self
+                    .store
+                    .clear_advisory_wake_deliveries_for_child(child_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        child = %child_id.0,
+                        "failed to clear advisory-wake period markers at settlement"
+                    );
+                }
             }
         }
         let failure_error_text = (event.event_type == AGENT_FAILED).then(|| {
@@ -17903,12 +17926,17 @@ impl WorkspaceApi for Services {
             // sessions, drop each session's runtime state, then emit
             // `agent:deleted` per session so subscribers see the tear-down
             // before the terminal `workspace:deleted`.
-            // Fail fast on a transient `list_agent_sessions` error: skipping
-            // the sweep here but still deleting the workspace row leaves ghost
+            // Fail fast on a transient session-list error: skipping the
+            // sweep here but still deleting the workspace row leaves ghost
             // workers, live-turn slots, queued messages, and completion
             // watches with no owning workspace — a client can retry the
             // delete, but silent partial success cannot recover.
-            let sessions = store.list_agent_sessions(&id).await?;
+            // Summaries only (intent-hq/monorepo#4130): the sweep reads just
+            // `id` + `name`, and the full `list_agent_sessions` hydrated
+            // every session's transcript (2 statements per agent) for rows
+            // the cascade below is about to drop.
+            let sessions = store.list_agent_session_summaries(&id).await?;
+            let session_ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
             // Cascade interaction (§5.5): the workspace delete — immediate
             // or committed-from-pending — supersedes any pending agent
             // deletions inside it. Abort their timers without per-agent
@@ -17929,10 +17957,7 @@ impl WorkspaceApi for Services {
             // replacement child during the shared grace wait and leave it
             // running as a ghost process after the rows are gone.
             let _teardown_fence = match manager.as_ref() {
-                Some(manager) => {
-                    let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
-                    Some(manager.stop_many(&ids).await)
-                }
+                Some(manager) => Some(manager.stop_many(&session_ids).await),
                 None => None,
             };
             for session in &sessions {
@@ -18015,6 +18040,21 @@ impl WorkspaceApi for Services {
             // `deliver_completion_to_watches` makes the bus loop's later
             // processing of the published event a no-op — no duplicate wake —
             // and `record_group_child_completion` is idempotent.
+            // The settlement clear of each child's advisory-wake period
+            // markers runs ONCE for the whole sweep (one `IN`-list statement)
+            // instead of inside every delivery (intent-hq/monorepo#4130);
+            // best-effort on the same terms as the per-child clear — the
+            // cascade below drops the rows regardless.
+            if let Err(e) = store
+                .clear_advisory_wake_deliveries_for_children(&session_ids)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    workspace = %id.as_str(),
+                    "failed to clear advisory-wake period markers for deleted workspace"
+                );
+            }
             for session in &sessions {
                 let event = Event {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -18032,7 +18072,7 @@ impl WorkspaceApi for Services {
                     }),
                 };
                 services
-                    .deliver_completion_to_watches(&session.id, &event)
+                    .deliver_completion_to_watches_markers_precleared(&session.id, &event)
                     .await;
             }
             // Backstop sweep: grouped watches survive delivery (group

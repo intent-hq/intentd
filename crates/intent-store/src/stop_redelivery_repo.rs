@@ -64,6 +64,33 @@ impl Store {
         Ok(())
     }
 
+    /// Batched [`Store::clear_stop_redelivery`]: delete the persisted payloads
+    /// of every agent in `agent_ids` in ONE `IN`-list statement per 32 000
+    /// ids (the `stop_many` sweep — intent-hq/monorepo#4130 — replaces a
+    /// per-agent DELETE loop so a workspace delete stays at a bounded
+    /// statement count). No-op on an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_stop_redeliveries(&self, agent_ids: &[AgentId]) -> Result<()> {
+        const IDS_PER_STATEMENT: usize = 32_000;
+        for chunk in agent_ids.chunks(IDS_PER_STATEMENT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql =
+                format!("DELETE FROM agent_stop_redelivery WHERE agent_id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(&id.0);
+            }
+            query
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("clear stop redeliveries failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Load every persisted stop-redelivery payload for startup rehydration.
     /// Joined against `agent_session` so rows whose session no longer exists
     /// are skipped (defensive; the FK cascade should already have removed
