@@ -1158,14 +1158,16 @@ async fn runtime_bind_address_change_restarts_listener() {
         .to_string();
     let cfg = client_config(&fingerprint);
 
-    // Default loopback bind: pairing advertises exactly 127.0.0.1, and
-    // system.status localIps agrees (same bind-aware semantics — never the
-    // full interface enumeration for a loopback-only listener).
+    // Default loopback bind: pairing advertises NO hosts (loopback is never
+    // dialable from another device, so it is filtered even when bound),
+    // while system.status localIps — the diagnostic surface — reports
+    // exactly 127.0.0.1 (never the full interface enumeration for a
+    // loopback-only listener).
     let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
     assert_eq!(
         info["result"]["hosts"],
-        json!(["127.0.0.1"]),
-        "loopback bind advertises exactly 127.0.0.1: {info}"
+        json!([]),
+        "loopback bind advertises no pairing hosts: {info}"
     );
     let status = uds_rpc(&socket, 102, "system.status", json!({})).await;
     assert_eq!(
@@ -1248,8 +1250,8 @@ async fn runtime_bind_address_change_restarts_listener() {
     let info = uds_rpc(&socket, 6, "pairing.getInfo", json!({})).await;
     assert_eq!(
         info["result"]["hosts"],
-        json!(["127.0.0.1"]),
-        "loopback bind advertises exactly 127.0.0.1 again: {info}"
+        json!([]),
+        "loopback bind advertises no pairing hosts again: {info}"
     );
     let status = uds_rpc(&socket, 106, "system.status", json!({})).await;
     assert_eq!(
@@ -1365,13 +1367,14 @@ async fn runtime_bind_address_list_applies_and_validates() {
         "list form persists and reads back as an array: {get}"
     );
 
-    // Pairing advertises exactly the configured set (specific addresses),
-    // and system.status localIps mirrors it (same bind-aware semantics).
+    // Pairing filters loopback out of the configured set — both entries here
+    // are loopback-family, so it advertises nothing — while system.status
+    // localIps (diagnostic surface) reports exactly the configured set.
     let info = uds_rpc(&socket, 4, "pairing.getInfo", json!({})).await;
     assert_eq!(
         info["result"]["hosts"],
-        json!(["127.0.0.1", "::1"]),
-        "list bind advertises exactly its entries: {info}"
+        json!([]),
+        "loopback-family list bind advertises no pairing hosts: {info}"
     );
     let status = uds_rpc(&socket, 104, "system.status", json!({})).await;
     assert_eq!(
@@ -1415,10 +1418,12 @@ async fn runtime_bind_address_list_applies_and_validates() {
 }
 
 /// Tunnel-only advertisement: with `server.tunnel.only = true` the listener
-/// binds loopback regardless of a wide `server.bindAddress`, and both
-/// `pairing.getInfo` hosts and `system.status` localIps advertise exactly
-/// 127.0.0.1 — never the machine's interface enumeration, whose routes are
-/// all dead in this posture (direct LAN connects are refused).
+/// binds loopback regardless of a wide `server.bindAddress`. `system.status`
+/// localIps (diagnostic) advertises exactly 127.0.0.1 — never the machine's
+/// interface enumeration, whose routes are all dead in this posture (direct
+/// LAN connects are refused) — and `pairing.getInfo` advertises no hosts at
+/// all (loopback is never dialable from another device; the tunnel address
+/// carries the reachable route).
 #[tokio::test]
 async fn tunnel_only_advertises_loopback_only() {
     let data_dir = temp_data_dir();
@@ -1450,8 +1455,8 @@ async fn tunnel_only_advertises_loopback_only() {
     let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
     assert_eq!(
         info["result"]["hosts"],
-        json!(["127.0.0.1"]),
-        "tunnel-only: pairing advertises exactly loopback: {info}"
+        json!([]),
+        "tunnel-only: pairing advertises no hosts (loopback filtered): {info}"
     );
 }
 

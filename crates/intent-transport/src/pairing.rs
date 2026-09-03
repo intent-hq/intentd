@@ -148,10 +148,19 @@ async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let port = snapshot.port.ok_or(Error::ListenerDown)?;
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
-    // Bind-aware hosts: a specific bind (loopback included) advertises exactly
-    // that address; only an unspecified/unknown bind enumerates local IPs.
+    // Bind-aware hosts: a specific bind advertises exactly its non-loopback
+    // addresses (loopback is never dialable from another device, so it is
+    // filtered even when bound); only an unspecified/unknown bind enumerates
+    // local IPs. An empty set from a SPECIFIC bind (loopback-only listener)
+    // still pairs — the tunnel/local routes carry it — but an empty
+    // enumeration means the machine has no network at all, so pairing is
+    // impossible.
     let hosts = pairing_hosts(&snapshot);
-    if hosts.is_empty() {
+    let enumerated = snapshot
+        .bind_addresses
+        .as_deref()
+        .is_none_or(|a| a.is_empty() || a.iter().any(std::net::IpAddr::is_unspecified));
+    if hosts.is_empty() && enumerated {
         return Err(Error::Unsupported(
             "no non-loopback IPv4 address found — connect this machine to a network before pairing"
                 .to_string(),

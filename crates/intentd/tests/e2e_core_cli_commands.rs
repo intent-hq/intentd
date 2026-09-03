@@ -745,6 +745,11 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
         "should show the multi-select picker: {stderr}"
     );
     assert!(
+        stderr.contains("https://github.com/tailscale/tailcat"),
+        "tailcat picker entry should carry the explanatory note with the \
+         project URL: {stderr}"
+    );
+    assert!(
         stderr.contains("listening on 127.0.0.1"),
         "should report the new effective bind: {stderr}"
     );

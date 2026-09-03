@@ -262,9 +262,32 @@ async fn handle_get_info_no_tcp_listener_errors() {
 
 #[tokio::test]
 async fn handle_get_info_specific_bind_advertises_only_that_host() {
-    // A listener bound to a specific address (loopback here) is reachable
-    // only there, so the payload must advertise exactly that host — never
-    // LAN IPs the listener does not answer on (monorepo#2900).
+    // A listener bound to a specific address is reachable only there, so the
+    // payload must advertise exactly that host — never LAN IPs the listener
+    // does not answer on (monorepo#2900).
+    let token = "abababababababababababababababababababababababababababababababab";
+    let bind: std::net::IpAddr = "192.168.1.23".parse().unwrap();
+    let (provider, tmpdir) =
+        provider_with_bind(Some(5181), Some(vec![bind]), "pairing_bind_specific", token);
+    let req = PairingRequest {
+        id_present: true,
+        id_echo: json!(1),
+    };
+    let resp = handle(req, &provider, true).await.unwrap();
+    let parsed: Value = serde_json::from_str(&resp).unwrap();
+    let hosts: Vec<String> = serde_json::from_value(parsed["result"]["hosts"].clone()).unwrap();
+    assert_eq!(hosts, vec!["192.168.1.23".to_string()]);
+    let fp = parsed["result"]["fingerprint"].as_str().unwrap();
+    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, None);
+    assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+#[tokio::test]
+async fn handle_get_info_loopback_bind_advertises_no_hosts() {
+    // Loopback is never advertised to pairing clients — it is not dialable
+    // from another device even when bound, so a loopback-only bind yields an
+    // empty host list (and a `host=`-less route set in the URI).
     let token = "abababababababababababababababababababababababababababababababab";
     let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
     let (provider, tmpdir) =
@@ -276,7 +299,7 @@ async fn handle_get_info_specific_bind_advertises_only_that_host() {
     let resp = handle(req, &provider, true).await.unwrap();
     let parsed: Value = serde_json::from_str(&resp).unwrap();
     let hosts: Vec<String> = serde_json::from_value(parsed["result"]["hosts"].clone()).unwrap();
-    assert_eq!(hosts, vec!["127.0.0.1".to_string()]);
+    assert_eq!(hosts, Vec::<String>::new());
     let fp = parsed["result"]["fingerprint"].as_str().unwrap();
     let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, None);
     assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);

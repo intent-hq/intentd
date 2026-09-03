@@ -364,9 +364,10 @@ async fn pairing_get_info_over_uds() {
     assert!(result["hosts"].is_array());
 
     // Fresh config (no server.bindAddress): the listener binds the loopback
-    // default (monorepo#2900), so the payload advertises exactly that host.
+    // default (monorepo#2900), and loopback is never advertised to pairing
+    // clients (not dialable from another device), so the host list is empty.
     let hosts: Vec<String> = serde_json::from_value(result["hosts"].clone()).unwrap();
-    assert_eq!(hosts, vec!["127.0.0.1".to_string()]);
+    assert_eq!(hosts, Vec::<String>::new());
 
     // The uri field is consistent with the component fields
     let expected_uri = format!(
