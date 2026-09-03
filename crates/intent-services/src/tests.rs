@@ -10380,6 +10380,81 @@ mod change_event_parity {
             .any(|e| e["data"]["noteId"] == "spec"));
     }
 
+    /// The workspace list a status write hands to materialization only selects
+    /// candidate parents; each parent is rewritten from a fresh, versioned
+    /// read. A snapshot that predates another task's materialized `[x]` and an
+    /// editor save must not revert either (lost-update race from the #1696
+    /// review).
+    #[tokio::test]
+    async fn materialization_writes_from_a_fresh_read_not_the_stale_snapshot() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let body = |a: &str, b: &str| format!("{}\n{}", linked(a, "A", T1), linked(b, "B", T2));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]", "[ ]")))
+            .await
+            .expect("insert spec");
+
+        // B's status write lists the workspace before A's parent write lands.
+        let stale = h.store.list_notes(&h.ws).await.expect("list");
+        set_status(&h, T1, "complete").await;
+        // An editor save lands in the same window.
+        let mut edited = h.store.get_note(&h.ws, &spec_id()).await.expect("get spec");
+        edited.content = format!("{}\n- [ ] added by editor", body("[x]", "[ ]"));
+        h.store.update_note(&edited).await.expect("editor save");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .materialize_linked_checkboxes_in(
+                &h.ws,
+                &intent_core::NoteId::from(T2),
+                TaskStatus::Complete,
+                stale,
+            )
+            .await;
+        let events = drain_events(&mut sub).await;
+
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(
+            content,
+            format!("{}\n- [ ] added by editor", body("[x]", "[x]")),
+            "A's marker and the editor's line survive B's materialization"
+        );
+        assert_eq!(rev, rev_before + 1, "exactly one versioned parent write");
+        assert!(of_type(&events, "note:updated")
+            .iter()
+            .any(|e| e["data"]["noteId"] == "spec"));
+    }
+
+    /// Two linked tasks in one parent completing concurrently (the
+    /// `after_all` delegation-group case) both end up materialized.
+    #[tokio::test]
+    async fn concurrent_status_writes_in_one_parent_both_materialize() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let body = |a: &str, b: &str| format!("{}\n{}", linked(a, "A", T1), linked(b, "B", T2));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]", "[ ]")))
+            .await
+            .expect("insert spec");
+
+        tokio::join!(
+            set_status(&h, T1, "complete"),
+            set_status(&h, T2, "complete")
+        );
+
+        assert_eq!(note_content(&h, "spec").await.0, body("[x]", "[x]"));
+        let rows = h
+            .services
+            .list_note_tasks(h.ws.clone(), spec_id())
+            .await
+            .expect("listTasks");
+        assert!(rows.iter().all(|r| r.status == "done"), "{rows:?}");
+    }
+
     #[tokio::test]
     async fn mark_as_task_materializes_linked_checkbox() {
         let h = harness().await;

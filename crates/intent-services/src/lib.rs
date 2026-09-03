@@ -10479,8 +10479,11 @@ impl Services {
     /// already carry the marker are left untouched (no write, no event); each
     /// rewritten note takes a `note:updated` and — like every other surgical
     /// content mutation — drops its cached CRDT session and schedules its
-    /// line-attribution recompute. Best-effort: store failures are logged,
-    /// never surfaced to the status write that already succeeded.
+    /// line-attribution recompute. Every parent write is versioned against a
+    /// fresh read (retried on conflict), so a concurrent status write on a
+    /// sibling task or an editor save landing in the window is never reverted.
+    /// Best-effort: store failures are logged, never surfaced to the status
+    /// write that already succeeded.
     async fn materialize_linked_checkboxes(
         &self,
         workspace_id: &WorkspaceId,
@@ -10500,7 +10503,9 @@ impl Services {
 
     /// [`Self::materialize_linked_checkboxes`] over an already-fetched
     /// workspace note list (callers that just listed the workspace for the
-    /// ready-task recompute pass it through instead of listing twice).
+    /// ready-task recompute pass it through instead of listing twice). The
+    /// list only selects candidate parents by link marker; the write itself
+    /// goes through [`Self::materialize_linked_checkbox_in_note`].
     async fn materialize_linked_checkboxes_in(
         &self,
         workspace_id: &WorkspaceId,
@@ -10510,20 +10515,55 @@ impl Services {
     ) {
         let checkbox = note_ops::checkbox_for_task_status(status);
         let needle = format!("(intent://local/task/{})", task_id.as_str());
-        for mut note in notes {
+        for note in notes {
             if !note.content.contains(&needle) {
                 continue;
             }
+            self.materialize_linked_checkbox_in_note(workspace_id, task_id, &note.id, checkbox)
+                .await;
+        }
+    }
+
+    /// Rewrite the lines linking `task_id` in one candidate parent: read the
+    /// note fresh, patch the marker, write it back versioned against the rev
+    /// just read, and re-read on `Conflict` (bounded) so a write racing with
+    /// this one is merged into rather than overwritten. A parent that already
+    /// carries the marker (or lost its link) after the fresh read is left
+    /// untouched.
+    async fn materialize_linked_checkbox_in_note(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_id: &NoteId,
+        note_id: &NoteId,
+        checkbox: &str,
+    ) {
+        const MAX_ATTEMPTS: usize = 3;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let mut note = match self.store.get_note(workspace_id, note_id).await {
+                Ok(note) => note,
+                Err(e) => {
+                    tracing::warn!(note = %note_id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: read failed");
+                    return;
+                }
+            };
             let Some(content) =
                 note_ops::set_linked_checkbox(&note.content, task_id.as_str(), checkbox)
             else {
-                continue;
+                return;
             };
             note.content = content;
             note.updated_at = now_iso();
-            if let Err(e) = self.store.update_note(&note).await {
-                tracing::warn!(note = %note.id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: update failed");
-                continue;
+            match self
+                .store
+                .update_note_versioned(&note, Some(note.rev))
+                .await
+            {
+                Ok(()) => {}
+                Err(Error::Conflict { .. }) if attempt < MAX_ATTEMPTS => continue,
+                Err(e) => {
+                    tracing::warn!(note = %note.id.0, task = %task_id.0, attempt, error = %e, "materialize linked checkboxes: update failed");
+                    return;
+                }
             }
             self.invalidate_crdt_note(workspace_id, &note.id);
             self.schedule_line_attribution_recompute(workspace_id, &note.id);
@@ -10532,6 +10572,7 @@ impl Services {
                 note_change_event(workspace_id, &note.id, &note.title, NOTE_UPDATED, "update"),
             )
             .await;
+            return;
         }
     }
 }
@@ -10560,10 +10601,15 @@ fn redirected_task_status(word: &str, current: TaskStatus) -> Option<TaskStatus>
     let next = match word {
         "done" => TaskStatus::Complete,
         "in-progress" => TaskStatus::InProgress,
-        _ => match current {
+        "todo" => match current {
             TaskStatus::Complete | TaskStatus::InProgress => TaskStatus::NotStarted,
             _ => return None,
         },
+        // Callers validate the word via `checkbox_for` before resolving.
+        _ => {
+            debug_assert!(false, "unvalidated checkbox word {word:?}");
+            return None;
+        }
     };
     (next != current).then_some(next)
 }
@@ -21146,6 +21192,8 @@ impl WorkspaceApi for Services {
                 // write goes to the task (events, ready-task recompute) and
                 // the char follows via materialization — which also heals a
                 // line that had drifted from the task's status.
+                // Materialization invalidates the CRDT session and schedules
+                // the attribution recompute of every parent it rewrites.
                 match redirected_task_status(&status, current) {
                     Some(next) => {
                         services
@@ -21164,8 +21212,6 @@ impl WorkspaceApi for Services {
                             .await;
                     }
                 }
-                services.invalidate_crdt_note(&note.workspace_id, &note.id);
-                services.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
                 return Ok(TaskUpdateStatusResult {
                     ok: true,
                     note_id: note.id,
@@ -21316,8 +21362,12 @@ impl WorkspaceApi for Services {
                     .set_task_note_status(&note.workspace_id, &task_id, next, None, caller_agent_id)
                     .await?;
             }
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
-            services.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
+            // A parent materialization rewrites already invalidates and
+            // schedules; only the direct write here needs it.
+            if write_parent {
+                services.invalidate_crdt_note(&note.workspace_id, &note.id);
+                services.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
+            }
             Ok(TaskUpdateResult {
                 ok: true,
                 note_id: note.id,

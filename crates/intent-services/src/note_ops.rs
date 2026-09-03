@@ -486,9 +486,11 @@ pub(crate) fn status_word_for_task_status(status: TaskStatus) -> &'static str {
 }
 
 /// Task note id linked by the line `task.updateStatus` would rewrite for
-/// `task_text`: the first exact-match checkbox line, else the first checkbox
-/// line containing the text (the same priority as [`apply_task_status`]).
-/// `None` when no line matches or the matched line carries no task link.
+/// `task_text`: the first exact-match checkbox line, else the first linked
+/// line whose link label equals the text (what `note.listTasks` returns as a
+/// linked row's `text`), else the first checkbox line containing the text
+/// ([`apply_task_status`]'s fallback). `None` when no line matches or the
+/// matched line carries no task link.
 pub(crate) fn linked_task_for_text(content: &str, task_text: &str) -> Option<String> {
     let normalized = task_text.trim();
     let lines = || {
@@ -497,8 +499,14 @@ pub(crate) fn linked_task_for_text(content: &str, task_text: &str) -> Option<Str
             .filter_map(|line| parse_dash_checkbox(line).map(|(_, after_idx, _)| (line, after_idx)))
     };
     let exact = lines().find(|(line, after_idx)| line[*after_idx..].trim() == normalized);
-    let (line, after_idx) =
-        exact.or_else(|| lines().find(|(line, _)| line.contains(normalized)))?;
+    let label = || {
+        lines().find(|(line, after_idx)| {
+            find_task_link(&line[*after_idx..]).is_some_and(|(label, _)| label.trim() == normalized)
+        })
+    };
+    let (line, after_idx) = exact
+        .or_else(label)
+        .or_else(|| lines().find(|(line, _)| line.contains(normalized)))?;
     find_task_link(&line[after_idx..]).map(|(_, id)| id)
 }
 
@@ -2092,6 +2100,35 @@ mod tests {
         assert_eq!(linked_task_at_line(content, 6), None);
         assert_eq!(linked_task_at_line(content, 7), None);
         assert_eq!(linked_task_at_line(content, 0), None);
+    }
+
+    /// `note.listTasks` returns a linked row's link label as its `text`, so a
+    /// label match must beat the `contains` fallback: two linked lines whose
+    /// labels share a substring each resolve to their own task.
+    #[test]
+    fn linked_task_for_text_prefers_a_label_match_over_the_contains_fallback() {
+        let content = "- [ ] [Ship It](intent://local/task/b2)\n\
+                       - [ ] [Ship](intent://local/task/a1)\n\
+                       - [ ] [Ship](intent://local/task/c3)";
+        assert_eq!(
+            linked_task_for_text(content, "Ship"),
+            Some("a1".to_string())
+        );
+        assert_eq!(
+            linked_task_for_text(content, " Ship "),
+            Some("a1".to_string())
+        );
+        assert_eq!(
+            linked_task_for_text(content, "Ship It"),
+            Some("b2".to_string())
+        );
+        // An exact line match still wins over a label match.
+        assert_eq!(
+            linked_task_for_text(content, "[Ship](intent://local/task/c3)"),
+            Some("c3".to_string())
+        );
+        // No label matches: the contains fallback still applies.
+        assert_eq!(linked_task_for_text(content, "Shi"), Some("b2".to_string()));
     }
 
     #[test]
