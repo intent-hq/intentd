@@ -6,7 +6,8 @@
 //!
 //! Skips silently (debug-level log) when the workspace has `git.autoCommit`
 //! off (`assert_agent_commit_allowed` rejection), the worktree has no uncommitted
-//! changes, the session opted out via `skip_auto_commit`, or the
+//! changes, a merge is pending (scoped commits are refused mid-merge,
+//! monorepo#4223), the session opted out via `skip_auto_commit`, or the
 //! `agent:idle` finish reason is non-normal (`error`/`cancelled`/
 //! `provider_stopped`/`refusal`).
 
@@ -14,7 +15,7 @@ use std::path::PathBuf;
 
 use intent_core::events::AGENT_IDLE;
 use intent_core::{AgentId, AgentSession, Error, Event, NoteId, WorkspaceApi};
-use intent_git::commit::CLEAN_TREE_ERROR;
+use intent_git::commit::{CLEAN_TREE_ERROR, PARTIAL_MERGE_COMMIT_ERROR};
 
 use crate::events::SubscriptionFilter;
 use crate::instructions::get_instruction_with_common_for;
@@ -290,7 +291,8 @@ impl Services {
             Err(Error::Internal(msg))
                 if msg.contains(AUTO_COMMIT_DISABLED_MARK)
                     || msg.contains(NO_CHANGES_MARK)
-                    || msg.contains(CLEAN_TREE_ERROR) =>
+                    || msg.contains(CLEAN_TREE_ERROR)
+                    || msg.contains(PARTIAL_MERGE_COMMIT_ERROR) =>
             {
                 tracing::debug!(
                     agent = %agent_id.0,

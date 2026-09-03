@@ -29,8 +29,9 @@ pub const CLEAN_TREE_ERROR: &str = "nothing to commit, working tree clean";
 /// cannot represent the merge, and committing it single-parent would silently
 /// discard the incoming parent.
 pub const PARTIAL_MERGE_COMMIT_ERROR: &str = "cannot do a partial commit during a merge: \
-     commit without an explicit `files` list to complete the merge with all staged \
-     changes, or abort it with `git merge --abort`";
+     run a user-requested commit without an explicit `files` list (staged-only \
+     checkpoint) to complete the merge with all staged changes, or abort it with \
+     `git merge --abort`";
 
 /// The commits named by `MERGE_HEAD` when a merge is pending — the extra
 /// parents `git commit` would record. Empty when no merge is in progress.
@@ -101,8 +102,13 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
         .map_err(map_git_err)?;
     if !merge_parents.is_empty() {
         // Drop MERGE_HEAD/MERGE_MSG etc. so the repo leaves the merging
-        // state, exactly like `git commit` finishing a merge.
-        repo.cleanup_state().map_err(map_git_err)?;
+        // state, exactly like `git commit` finishing a merge. The merge
+        // commit is already written and HEAD advanced at this point, so a
+        // cleanup failure must not fail the call — log and return the
+        // outcome instead.
+        if let Err(e) = repo.cleanup_state() {
+            tracing::warn!(error = %e, "merge state cleanup failed after merge commit");
+        }
     }
 
     let files = changed_files(&repo, parent.as_ref(), &tree)?;
