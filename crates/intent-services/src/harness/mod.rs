@@ -8,8 +8,9 @@
 //! `agent_manager::v1_turn_envelope_goldens`; [`v1_1`] reuses v1's text
 //! surfaces and swaps in its own doctrine, byte-pinned by
 //! `crate::v1_1_goldens`; [`v2`] builds on v1.1 doctrine with scoped sibling
-//! workspace handoffs; [`v2_1`] adds the Vulnerability Scanner specialist).
-//! Call sites carry typed data
+//! workspace handoffs; [`v2_1`] adds the Vulnerability Scanner specialist;
+//! [`v2_2`] rewrites the workspace status-message guidance to one short
+//! plain sentence). Call sites carry typed data
 //! into the harness and never format doctrine/envelope text themselves, so a
 //! future version can reword or reorder surfaces without touching managers.
 //! A new version starts as `pub use` re-exports of the prior version's
@@ -25,7 +26,7 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, or `"2.1"`) to the
+//! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, or `"2.2"`) to the
 //! pair, so a session keeps assembling the exact doctrine it was created with
 //! even after the binary ships a newer set. All past versions stay bundled.
 
@@ -33,6 +34,7 @@ pub(crate) mod v1;
 pub(crate) mod v1_1;
 pub(crate) mod v2;
 pub(crate) mod v2_1;
+pub(crate) mod v2_2;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -403,7 +405,13 @@ pub(crate) const LATEST_VERSION: &str = intent_core::CURRENT_HARNESS_VERSION;
 /// bundled so an old session keeps resolving the doctrine it was created
 /// with. Adding a version = a `resources/**/<ver>/` directory + a module +
 /// one row here.
-static REGISTRY: &[&HarnessEntry] = &[&v1::ENTRY, &v1_1::ENTRY, &v2::ENTRY, &v2_1::ENTRY];
+static REGISTRY: &[&HarnessEntry] = &[
+    &v1::ENTRY,
+    &v1_1::ENTRY,
+    &v2::ENTRY,
+    &v2_1::ENTRY,
+    &v2_2::ENTRY,
+];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
 /// exists; the tail fallback is unreachable and only avoids a panic path.
@@ -583,5 +591,31 @@ mod tests {
             v2_1.doctrine.specialists,
             crate::specialists::EMBEDDED_BUNDLED_V2_1
         );
+    }
+
+    /// v2.2 swaps only the two workspace instruction bodies; the specialist
+    /// bundle, text surfaces, and every other instruction body are v2.1's.
+    #[test]
+    fn v2_2_rewrites_only_workspace_status_guidance() {
+        let v2_1 = resolve_entry("2.1");
+        let v2_2 = resolve_entry("2.2");
+        assert_eq!(v2_1.doctrine.specialists, v2_2.doctrine.specialists);
+        let (a, b) = (v2_1.doctrine.instructions, v2_2.doctrine.instructions);
+        assert_ne!(a.workspace, b.workspace);
+        assert_ne!(a.workspace_agent, b.workspace_agent);
+        assert_eq!(a.chat, b.chat);
+        assert_eq!(a.common, b.common);
+        assert_eq!(a.debug, b.debug);
+        assert_eq!(a.setup_script_generator, b.setup_script_generator);
+        assert_eq!(a.task_breakdown, b.task_breakdown);
+        assert_eq!(a.task_debug, b.task_debug);
+        assert_eq!(a.task_focused, b.task_focused);
+        assert_eq!(a.task_loop, b.task_loop);
+        assert_eq!(a.ralph_loop, b.ralph_loop);
+        assert_eq!(a.notes_system_guide, b.notes_system_guide);
+        assert_eq!(a.code_review, b.code_review);
+        assert_eq!(a.code_walkthrough, b.code_walkthrough);
+        assert_eq!(a.commit_message, b.commit_message);
+        assert_eq!(a.pr_description, b.pr_description);
     }
 }
