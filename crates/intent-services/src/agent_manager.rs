@@ -2714,6 +2714,17 @@ impl AgentManager {
             mcp_config_path.as_deref(),
             env_mcp_config.as_deref(),
         );
+        // `agents.acpNodeMaxOldSpaceMb` is read live per spawn (not pinned at
+        // boot), so a settings change applies to the next spawned/respawned
+        // provider process without a daemon restart (intent-hq/intent#4330).
+        // A caller-supplied cap (tests / embedders) still wins.
+        if spawn_opts.node_max_old_space_mb.is_none() {
+            spawn_opts.node_max_old_space_mb = self
+                .services
+                .effective_settings()
+                .agents
+                .acp_node_max_old_space_mb;
+        }
         if let Some(delivery) = &pi_extension {
             delivery.apply_spawn_env(&mut spawn_opts.extra_env, bridge.connect_addr());
         }
@@ -8942,6 +8953,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.mcp_config_file = mcp_config_path;
     spawn_opts.env_mcp_config = env_mcp_config;
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
+    spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
     spawn_opts
 }
 
@@ -13736,6 +13748,7 @@ mod rebuild_spawn_opts_tests {
         opts.provider_binary = Some(&binary);
         opts.extra_env = BTreeMap::from([("K".to_string(), "V".to_string())]);
         opts.tools_to_remove = vec!["shell"];
+        opts.node_max_old_space_mb = Some(4096);
 
         let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
         assert_eq!(rebuilt.model, Some("gpt-5"));
@@ -13747,6 +13760,7 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(rebuilt.rules_file, Some("/tmp/rules.md"));
         assert_eq!(rebuilt.mcp_config_file, Some("/tmp/mcp.json"));
         assert_eq!(rebuilt.env_mcp_config, None);
+        assert_eq!(rebuilt.node_max_old_space_mb, Some(4096));
     }
 
     #[test]

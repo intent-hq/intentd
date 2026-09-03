@@ -40,6 +40,22 @@ pub const MAX_CONCURRENT_ADAPTERS_LIMIT: u32 = 64;
 /// unlimited value.
 pub const DEFAULT_MAX_TOP_LEVEL_AGENTS: u32 = 20;
 
+/// Default V8 `--max-old-space-size` cap in MB (`agents.acpNodeMaxOldSpaceMb`)
+/// injected via `NODE_OPTIONS` into Node/Electron ACP provider processes.
+/// V8's own default (~1.7 GB) is too small for long-lived coordinator
+/// sessions, which V8-OOM mid-turn with no error surfaced (STAB-50); 8 GB
+/// gives ample headroom. The `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var
+/// overrides the setting. Applies to newly started agent processes only.
+pub const DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB: u32 = 8192;
+
+/// Lower bound accepted for `agents.acpNodeMaxOldSpaceMb`: below 1 GB the
+/// cap is smaller than V8's own default and would only make the STAB-50
+/// OOM more likely.
+pub const ACP_NODE_MAX_OLD_SPACE_MB_MIN: u32 = 1024;
+
+/// Upper bound accepted for `agents.acpNodeMaxOldSpaceMb` (64 GB).
+pub const ACP_NODE_MAX_OLD_SPACE_MB_MAX: u32 = 65_536;
+
 /// Default grace window in seconds (`agents.reportToParentDebounceSeconds`)
 /// before an ungrouped child's `reportToParent` wake is delivered to the
 /// parent, giving the child time to finish its turn so the parent receives
