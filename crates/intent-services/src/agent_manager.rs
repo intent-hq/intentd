@@ -4116,10 +4116,13 @@ impl AgentManager {
     /// arming after the teardown (the previous shape) lost that race.
     ///
     /// `sync_store` controls the durable stop-redelivery mirror
-    /// (intent-hq/monorepo#1899): `true` (every hard-stop path) writes the
-    /// in-memory outcome through to `agent_stop_redelivery`; `false` (the
-    /// graceful-shutdown sweep) leaves the persisted row untouched so an
-    /// armed payload survives the restart and is rehydrated at next boot.
+    /// (intent-hq/monorepo#1899): `true` (every single-agent hard-stop path)
+    /// writes the in-memory outcome through to `agent_stop_redelivery`;
+    /// `false` leaves the persisted row untouched — the graceful-shutdown
+    /// sweep relies on that so an armed payload survives the restart and is
+    /// rehydrated at next boot, while [`Self::stop_many`] uses it to skip the
+    /// per-agent round trip and clears every swept agent's row in ONE batched
+    /// statement after the detach loop (intent-hq/monorepo#4130).
     async fn detach_with_redelivery(
         &self,
         agent_id: &AgentId,
