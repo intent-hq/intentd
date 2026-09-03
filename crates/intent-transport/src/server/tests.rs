@@ -301,6 +301,8 @@ async fn handle_rotate_token_local_success() {
     let new_token = parsed["result"]["token"].as_str().unwrap();
     assert_ne!(new_token, "old-token");
     assert_eq!(new_token.len(), 64);
+    // Same shape as server.pairingInfo: the additive bind-candidate set rides along.
+    assert_eq!(parsed["result"]["availableIps"], json!(collect_local_ips()));
 
     let _ = std::fs::remove_dir_all(&tmpdir);
     // _guard drops here, restoring the original env var value
