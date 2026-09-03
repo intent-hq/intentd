@@ -17,7 +17,20 @@ use std::time::{Duration, Instant};
 /// up. Deliberately shorter than install.sh's 300s first-install
 /// verification budget: an update restarts an already-configured daemon,
 /// which answers within seconds when healthy.
+///
+/// The budget covers the whole restart, so it must stay above the
+/// supervisor's [`crate::supervisor::SupervisorConfig::kill_timeout`] (30s
+/// — how long a graceful stop waits before force-killing the old daemon)
+/// plus new-daemon startup: a SIGTERM-slow old daemon eats that much of it
+/// first. Revisit this constant if `kill_timeout` grows.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Test-only env override (integer milliseconds) for [`DEFAULT_TIMEOUT`],
+/// matching the `INTENTD_SITTER_*_MS` convention of
+/// [`crate::supervisor::SupervisorConfig::from_env`], so integration tests
+/// can exercise the timeout arm without waiting a minute. Production never
+/// sets it.
+pub const TIMEOUT_ENV: &str = "INTENTD_SITTER_READINESS_TIMEOUT_MS";
 
 /// Pause between readiness probes.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -29,6 +42,20 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// probe is killed and counts as "no answer"; the overall wait can thus
 /// overshoot its deadline by at most this much.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// [`DEFAULT_TIMEOUT`] with any [`TIMEOUT_ENV`] override applied.
+#[must_use]
+pub fn timeout_from_env() -> Duration {
+    timeout_from_lookup(|name| std::env::var(name).ok())
+}
+
+/// [`timeout_from_env`] with an injectable lookup so tests never mutate
+/// process state. Unset, empty, or unparseable values keep the default.
+fn timeout_from_lookup(get: impl Fn(&str) -> Option<String>) -> Duration {
+    get(TIMEOUT_ENV)
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(DEFAULT_TIMEOUT, Duration::from_millis)
+}
 
 /// Result of [`wait_for_version`].
 #[derive(Debug, PartialEq, Eq)]
@@ -191,6 +218,23 @@ mod tests {
     fn times_out_with_no_answer_at_all() {
         let outcome = wait_for_version("0.9.10", Duration::from_millis(30), FAST, || None);
         assert_eq!(outcome, WaitOutcome::TimedOut { last_seen: None });
+    }
+
+    #[test]
+    fn timeout_override_applies_only_for_a_parseable_value() {
+        assert_eq!(
+            timeout_from_lookup(|_| Some("250".to_string())),
+            Duration::from_millis(250)
+        );
+        assert_eq!(timeout_from_lookup(|_| None), DEFAULT_TIMEOUT);
+        assert_eq!(
+            timeout_from_lookup(|_| Some(String::new())),
+            DEFAULT_TIMEOUT
+        );
+        assert_eq!(
+            timeout_from_lookup(|_| Some("soon".to_string())),
+            DEFAULT_TIMEOUT
+        );
     }
 
     #[test]

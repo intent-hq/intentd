@@ -182,7 +182,11 @@ fn run_channel_command(
 /// from the channel the running service follows (config pin > stable
 /// default — service definitions pass no flag or env): silently restarting
 /// a stable-pinned service onto a beta binary would put it on the wrong
-/// channel.
+/// channel. After a restart the command blocks until the new daemon answers
+/// on the socket (see [`wait_for_restarted_daemon`]) and exits nonzero if it
+/// does not within the readiness budget — the install itself has already
+/// succeeded at that point, so scripts must read a nonzero exit as "not
+/// confirmed up", not "not installed".
 fn run_update_command(
     check: bool,
     args: &SitterArgs,
@@ -298,7 +302,7 @@ fn apply_installed_update(paths: &SitterPaths, version: &str) -> i32 {
 /// down). Nonzero with guidance on timeout.
 #[cfg(unix)]
 fn wait_for_restarted_daemon(paths: &SitterPaths, version: &str) -> i32 {
-    let timeout = readiness::DEFAULT_TIMEOUT;
+    let timeout = readiness::timeout_from_env();
     println!(
         "waiting for the daemon to respond (up to {}s)...",
         timeout.as_secs()
@@ -317,9 +321,12 @@ fn wait_for_restarted_daemon(paths: &SitterPaths, version: &str) -> i32 {
                 None => String::new(),
             };
             eprintln!(
-                "intentd-sitter: the daemon did not come back as intentd {version} \
-                 within {}s{still}; check `intentd status` and the service \
-                 (`systemctl --user status intentd` / `brew services info intentd`)",
+                "intentd-sitter: intentd {version} was installed and the restart \
+                 was requested, but the daemon has not come back as intentd \
+                 {version} within {}s{still}; the install is done — re-running \
+                 `intentd update` will not help. Check `intentd status` and the \
+                 service (`systemctl --user status intentd` / \
+                 `brew services info intentd`)",
                 timeout.as_secs()
             );
             1
