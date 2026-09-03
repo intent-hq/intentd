@@ -6706,6 +6706,14 @@ impl Services {
         // Marker read fails CLOSED (skip, watch stays armed): the advisory is
         // a courtesy; a missed one only restores the pre-advisory silent
         // deferral, while a duplicate would spam the parent every idle.
+        // The marker read below and the marker write after the durable send
+        // are NOT atomic and there is no per-child delivery lock: the
+        // once-per-period guarantee assumes the turn lifecycle serializes
+        // idle emits per child (one in-flight delivery at a time). Two
+        // distinct same-period idle events processed concurrently would both
+        // pass the read and both deliver under different event ids — an
+        // accepted low-risk duplicate; a change that parallelizes delivery
+        // must add a real mutex, the marker alone is not one.
         let already_advised = self
             .store
             .has_advisory_wake_delivery(&watch.parent_agent_id, child_id)

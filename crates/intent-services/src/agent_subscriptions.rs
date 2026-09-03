@@ -74,8 +74,17 @@ pub(crate) struct CompletionWatch {
     /// of an explicit registration.
     pub wake_on_attention: bool,
     /// Ask-only watches wait strictly for terminal completion. Attention
-    /// requests do not consume or wake this watch, and it may coexist with an
-    /// unrelated grouped watch for the same parent/child pair.
+    /// requests do not consume or wake this watch, and monitoring-idle
+    /// advisories (child idle while only hooks / PR monitors are active) are
+    /// skipped for it too — the parent hears nothing until settlement, even
+    /// if the child parks on a TTL-less PR monitor (intent-hq/intent#4254
+    /// design). It may coexist with an unrelated grouped watch for the same
+    /// parent/child pair. The flag is set only on watches the ask path
+    /// CREATES: `register_completion_watch_strict_durable` reuses an
+    /// existing non-strict ungrouped watch as-is (and a later ordinary
+    /// registration adopting an ask-only watch leaves the flag set), so the
+    /// advisory skip is reliable only when the ask registration is the first
+    /// ungrouped watch for the pair.
     pub completion_only: bool,
     /// Identity (`completion_report.timestamp`) of the child report whose
     /// report-time wake was SENT toward this parent (monorepo#4026): stamped
