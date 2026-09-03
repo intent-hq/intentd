@@ -2612,6 +2612,7 @@ mod display_status_events {
                 Some("plain text, link removed".to_string()),
                 None,
                 None,
+                None,
             )
             .await
             .expect("rewrite checkbox line");
