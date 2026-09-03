@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.13] - 2026-09-03
+
+### 🚀 Features
+
+- *(settings)* Add agents.acpNodeMaxOldSpaceMb and plumb it into ACP spawn env ([#1701](https://github.com/intent-hq/intentd/pull/1701))
+
+
 ## [0.9.12] - 2026-09-03
 
 ### 🐛 Bug Fixes
