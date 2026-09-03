@@ -20189,7 +20189,17 @@ async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
 
     // Durable variant: a restarted daemon classifies from persisted rows
     // BEFORE the watch registry loads, so it must honor the column too.
-    let store = Store::open(&tmp.path).await.expect("reopen store");
+    // A SEPARATE TempDb isolates this phase: the live phase's best-effort
+    // spawned persists (`persist_completion_watch`'s upsert of the `bc` row
+    // with `report_delivered: false` and `mark_watch_report_delivered`'s
+    // later sync) race each other, so a stray `bc` row could otherwise land
+    // in the shared DB mid-assertion and misclassify B as waiting
+    // (intent-hq/monorepo#4204).
+    let durable_tmp = TempDb::new();
+    let store = Store::open(&durable_tmp.path)
+        .await
+        .expect("open durable-phase store");
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let restarted = Services::new(store);
     let row = |report_delivered: bool| intent_store::PersistedCompletionWatch {
         id: "watch-1643".to_string(),
