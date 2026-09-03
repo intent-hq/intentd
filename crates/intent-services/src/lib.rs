@@ -20656,6 +20656,11 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<SaveAssetResult>> {
         let assets_root = self.assets_root.clone();
         Box::pin(async move {
+            if intent_core::asset_extension_from_mime(&mime_type).is_none() {
+                return Err(Error::InvalidParams(format!(
+                    "unsupported asset MIME type: {mime_type}"
+                )));
+            }
             let root = assets_root
                 .ok_or_else(|| Error::Internal("asset storage is not configured".to_string()))?;
             let base64_data = note_ops::strip_data_url_prefix(&data);

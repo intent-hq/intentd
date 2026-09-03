@@ -1564,6 +1564,30 @@ pub struct ReadAssetResult {
     pub size_kb: i64,
 }
 
+/// MIME types accepted by `note.saveAsset`, paired with their persisted file
+/// extensions. Callers must reject values absent from this table so a later
+/// `note.readAsset` call can recover the correct MIME type from the asset ID.
+pub const SUPPORTED_ASSET_MIME_TYPES: &[(&str, &str)] = &[
+    ("image/png", ".png"),
+    ("image/jpeg", ".jpg"),
+    ("image/jpg", ".jpg"),
+    ("image/gif", ".gif"),
+    ("image/webp", ".webp"),
+    ("image/svg+xml", ".svg"),
+    ("image/bmp", ".bmp"),
+    ("image/tiff", ".tiff"),
+    ("video/mp4", ".mp4"),
+    ("video/webm", ".webm"),
+];
+
+/// Return the persisted extension for a supported asset MIME type.
+#[must_use]
+pub fn asset_extension_from_mime(mime_type: &str) -> Option<&'static str> {
+    SUPPORTED_ASSET_MIME_TYPES
+        .iter()
+        .find_map(|(supported, extension)| (*supported == mime_type).then_some(*extension))
+}
+
 /// Result of `note.saveAsset` (PROTOCOL §5.2 — additive asset write). `path`
 /// is the absolute on-disk location under the workspace assets root; `url` is
 /// the `workspace-asset://<workspaceId>/<assetId>` form the FE embeds in note
