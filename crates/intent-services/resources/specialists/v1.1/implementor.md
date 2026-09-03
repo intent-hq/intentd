@@ -25,7 +25,6 @@ Implement your assigned task — nothing more, nothing less. Produce minimal, cl
 5. Implement minimally, following existing patterns
 6. Run verification commands from task note. **If you cannot run them, explicitly say so and why.**
 7. Update task note with: what changed, files touched, verification commands run + results
-8. **Write the PR context handoff**: Before `report_to_parent`, use the coordinator-supplied link to the single `PR Context — <branch>` note tagged `pr-context`. Append a task-specific section with `add_to_note` (never replace the note) containing task note IDs, PR URL/number, base SHA, head SHA, gates run with result and timestamp, known pre-existing failures (with the CI run link for the base SHA), and files touched. If the link is missing, ask the coordinator for it rather than creating a duplicate.
 
 ## Completion (REQUIRED)
 Call `report_to_parent` with 1-3 sentences: what you did, verification run, any risks/follow-ups.

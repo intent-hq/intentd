@@ -11,12 +11,13 @@
 //! workspace handoffs; [`v2_1`] adds the Vulnerability Scanner specialist;
 //! [`v2_2`] rewrites the workspace status-message guidance to one short
 //! plain sentence; [`v2_3`] rewords the `## Suggested Next Steps` prompt
-//! hint so suggestions are levers on the plan, not a restatement of it,
-//! byte-pinned by `crate::v2_3_goldens`). Call sites carry typed data
+//! hint so suggestions are levers on the plan, not a restatement of it;
+//! [`v2_4`] adds PR-context handoffs to three specialist definitions
+//! (byte-pinned by `crate::v2_3_goldens` and `crate::v2_4_goldens`). Call sites carry typed data
 //! into the harness and never format doctrine/envelope text themselves, so a
 //! future version can reword or reorder surfaces without touching managers.
 //! A new version that changes no text surface reuses the prior version's
-//! harness singleton and swaps only its doctrine (as [`v1_1`]–[`v2_2`] do);
+//! harness singleton and swaps only its doctrine (as [`v1_1`]–[`v2_2`] and [`v2_4`] do);
 //! one that rewords a surface adds a unit struct whose [`Harness`] impl
 //! forwards every method to the prior implementation and overrides only
 //! what changed (as [`v2_3`] does) — the v(N)→v(N+1) diff is exactly the
@@ -32,7 +33,7 @@
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
 //! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, `"2.2"`,
-//! or `"2.3"`) to the pair, so a session keeps assembling the exact doctrine
+//! `"2.3"`, or `"2.4"`) to the pair, so a session keeps assembling the exact doctrine
 //! it was created with even after the binary ships a newer set. All past
 //! versions stay bundled.
 
@@ -42,6 +43,7 @@ pub(crate) mod v2;
 pub(crate) mod v2_1;
 pub(crate) mod v2_2;
 pub(crate) mod v2_3;
+pub(crate) mod v2_4;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -419,6 +421,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2_1::ENTRY,
     &v2_2::ENTRY,
     &v2_3::ENTRY,
+    &v2_4::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -475,7 +478,7 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "2.3");
+        assert_eq!(entry.version, "2.4");
         assert_eq!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
         assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));
     }
@@ -661,6 +664,24 @@ mod tests {
         assert_eq!(
             v2_2.harness.commit_policy_clause(),
             v2_3.harness.commit_policy_clause()
+        );
+    }
+
+    /// v2.4 keeps v2.3's text surfaces and instructions while swapping only
+    /// the specialist bundle for the PR-context handoff definitions.
+    #[test]
+    fn v2_4_versions_only_pr_context_specialists() {
+        let v2_3 = resolve_entry("2.3");
+        let v2_4 = resolve_entry("2.4");
+        assert_eq!(next_steps(v2_3.harness), next_steps(v2_4.harness));
+        assert!(std::ptr::eq(
+            v2_3.doctrine.instructions,
+            v2_4.doctrine.instructions
+        ));
+        assert_ne!(v2_3.doctrine.specialists, v2_4.doctrine.specialists);
+        assert_eq!(
+            v2_4.doctrine.specialists,
+            crate::specialists::EMBEDDED_BUNDLED_V2_4
         );
     }
 }

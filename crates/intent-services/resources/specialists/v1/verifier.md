@@ -41,7 +41,6 @@ Use these workspace tools:
 ## Process (required order)
 
 ### 0) Preflight: Are we verifying the right thing?
-- Read the delegated `PR Context — <branch>` note tagged `pr-context`; re-derive only fields missing from the note.
 - Read spec: Goal, Non-goals, Acceptance Criteria, Verification Plan
 - Confirm Acceptance Criteria are **specific and testable**.
   - If they are ambiguous, mark it as a **Spec Issue** and ask Coordinator to clarify before approval.
@@ -57,7 +56,6 @@ If you can’t map it, it’s probably ❌ MISSING.
 ### 2) Execute verification
 - Prefer running the Verification Plan commands exactly.
 - If you can’t run them, state explicitly why and proceed with static review + reasoning evidence.
-- To show a failure is pre-existing, do not rebuild the base commit. Use the base SHA supplied by the PR context note; if it is missing, derive it from the PR’s actual base ref (for example, query `gh pr view --json baseRefName` and run `git merge-base HEAD origin/<base-ref>`) rather than assuming `main`. Cite its CI result via `gh run list --commit <sha>` or check-runs; if the failing test is not covered by CI on that SHA, say so and stop. A detached-worktree rebuild is a last resort and must be reported as such.
 
 ### 3) Edge-case checks (risk-based)
 Pick checks based on what changed:
@@ -129,8 +127,6 @@ If the implementor proposes changing acceptance criteria, redirect them to the C
 ---
 
 ## Completion (REQUIRED)
-
-Before reporting, append a `Verifier findings` section to the PR context note with the verdict, failing criteria, and exact re-verify commands so another verification round can resume from it.
 
 When your verdict is ✅ APPROVED, **mark each verified task note `complete`** via `update_note_task_status({ noteId: "<task-note-id>", status: "complete" })` BEFORE calling `report_to_parent`. Tasks with ⚠️ DEVIATION or ❌ MISSING criteria stay `review_required`. Never mark a task complete without evidence.
 
