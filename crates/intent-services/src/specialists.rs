@@ -2722,6 +2722,30 @@ mod tests {
                 && (body.contains("MISSING") || body.contains("❌ MISSING")),
             "verifier.md must specify APPROVED/DEVIATION/MISSING completion policy"
         );
+
+        assert!(body.contains("PR Context — <branch>") && body.contains("pr-context"));
+        assert!(body.contains("re-derive only fields missing from the note"));
+        assert!(body.contains("do not rebuild the base commit"));
+        assert!(body.contains("gh run list --commit <sha>"));
+        assert!(body.contains("Verifier findings"));
+    }
+
+    #[test]
+    fn collaboration_prompts_share_pr_context_note() {
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        let implementor = svc.get("implementor", None).unwrap();
+        let implementor_body = implementor["specialist"]["behaviorPrompt"]
+            .as_str()
+            .unwrap();
+        assert!(implementor_body.contains("PR Context — <branch>"));
+        assert!(implementor_body.contains("known pre-existing failures"));
+
+        let coordinator = svc.get("spec-writer", None).unwrap();
+        let coordinator_body = coordinator["specialist"]["behaviorPrompt"]
+            .as_str()
+            .unwrap();
+        assert!(coordinator_body.contains("PR Context — <branch>"));
     }
 
     #[test]
