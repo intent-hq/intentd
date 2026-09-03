@@ -8480,16 +8480,11 @@ impl Services {
         // fetch.
         match all {
             Some(all) => {
-                self.materialize_linked_checkboxes_in(
-                    &note.workspace_id,
-                    &note.id,
-                    new_status,
-                    all,
-                )
-                .await;
+                self.materialize_linked_checkboxes_in(&note.workspace_id, &note.id, all)
+                    .await;
             }
             None => {
-                self.materialize_linked_checkboxes(&note.workspace_id, &note.id, new_status)
+                self.materialize_linked_checkboxes(&note.workspace_id, &note.id)
                     .await;
             }
         }
@@ -10473,23 +10468,22 @@ async fn publish_dependent_note_updates(
 }
 
 impl Services {
-    /// Materialize a task note's status onto every note in the workspace whose
-    /// checkbox lines link it (`[label](intent://local/task/{id})`): `complete`
-    /// → `[x]`, `in_progress` → `[/]`, else `[ ]`. Notes whose linked lines
-    /// already carry the marker are left untouched (no write, no event); each
+    /// Materialize a task note's current status onto every note in the
+    /// workspace whose checkbox lines link it
+    /// (`[label](intent://local/task/{id})`): `complete` → `[x]`,
+    /// `in_progress` → `[/]`, else `[ ]`. Notes whose linked lines already
+    /// carry the marker are left untouched (no write, no event); each
     /// rewritten note takes a `note:updated` and — like every other surgical
     /// content mutation — drops its cached CRDT session and schedules its
     /// line-attribution recompute. Every parent write is versioned against a
     /// fresh read (retried on conflict), so a concurrent status write on a
     /// sibling task or an editor save landing in the window is never reverted.
-    /// Best-effort: store failures are logged, never surfaced to the status
-    /// write that already succeeded.
-    async fn materialize_linked_checkboxes(
-        &self,
-        workspace_id: &WorkspaceId,
-        task_id: &NoteId,
-        status: TaskStatus,
-    ) {
+    /// The marker is derived from the task note re-read on each attempt — not
+    /// from a status the caller captured — so two transitions of the same task
+    /// racing always leave the last one's projection. Best-effort: store
+    /// failures are logged, never surfaced to the status write that already
+    /// succeeded.
+    async fn materialize_linked_checkboxes(&self, workspace_id: &WorkspaceId, task_id: &NoteId) {
         let notes = match self.store.list_notes(workspace_id).await {
             Ok(notes) => notes,
             Err(e) => {
@@ -10497,7 +10491,7 @@ impl Services {
                 return;
             }
         };
-        self.materialize_linked_checkboxes_in(workspace_id, task_id, status, notes)
+        self.materialize_linked_checkboxes_in(workspace_id, task_id, notes)
             .await;
     }
 
@@ -10510,32 +10504,31 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         task_id: &NoteId,
-        status: TaskStatus,
         notes: Vec<Note>,
     ) {
-        let checkbox = note_ops::checkbox_for_task_status(status);
         let needle = format!("(intent://local/task/{})", task_id.as_str());
         for note in notes {
             if !note.content.contains(&needle) {
                 continue;
             }
-            self.materialize_linked_checkbox_in_note(workspace_id, task_id, &note.id, checkbox)
+            self.materialize_linked_checkbox_in_note(workspace_id, task_id, &note.id)
                 .await;
         }
     }
 
     /// Rewrite the lines linking `task_id` in one candidate parent: read the
-    /// note fresh, patch the marker, write it back versioned against the rev
-    /// just read, and re-read on `Conflict` (bounded) so a write racing with
-    /// this one is merged into rather than overwritten. A parent that already
-    /// carries the marker (or lost its link) after the fresh read is left
-    /// untouched.
+    /// note fresh, then the task note (its status at this moment is the
+    /// marker), patch the marker, write it back versioned against the parent
+    /// rev just read, and re-read both on `Conflict` (bounded) so a write
+    /// racing with this one — including a later transition of the same task
+    /// — is merged into rather than overwritten. A parent that already carries
+    /// the marker (or lost its link) after the fresh read is left untouched,
+    /// as is one whose task note is gone or no longer a task.
     async fn materialize_linked_checkbox_in_note(
         &self,
         workspace_id: &WorkspaceId,
         task_id: &NoteId,
         note_id: &NoteId,
-        checkbox: &str,
     ) {
         const MAX_ATTEMPTS: usize = 3;
         for attempt in 1..=MAX_ATTEMPTS {
@@ -10546,6 +10539,18 @@ impl Services {
                     return;
                 }
             };
+            let status = match self.store.get_note(workspace_id, task_id).await {
+                Ok(task) => match task.metadata.task.as_ref() {
+                    Some(task) => task.status,
+                    None => return,
+                },
+                Err(Error::NotFound(_)) => return,
+                Err(e) => {
+                    tracing::warn!(note = %note_id.0, task = %task_id.0, error = %e, "materialize linked checkboxes: task read failed");
+                    return;
+                }
+            };
+            let checkbox = note_ops::checkbox_for_task_status(status);
             let Some(content) =
                 note_ops::set_linked_checkbox(&note.content, task_id.as_str(), checkbox)
             else {
@@ -21208,7 +21213,7 @@ impl WorkspaceApi for Services {
                     }
                     None => {
                         services
-                            .materialize_linked_checkboxes(&note.workspace_id, &task_id, current)
+                            .materialize_linked_checkboxes(&note.workspace_id, &task_id)
                             .await;
                     }
                 }
@@ -21300,19 +21305,31 @@ impl WorkspaceApi for Services {
                 }
             }
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let linked = match note_ops::linked_task_at_line(&note.content, line) {
+            // The link is resolved from the POST-edit line: `text` may retarget
+            // it (A → B), and it is the task the line links after this write
+            // whose status the char projects.
+            let post_edit = note_ops::apply_task_line_update(
+                &note.content,
+                line,
+                text.as_deref(),
+                None,
+                expected.as_deref(),
+            )?;
+            let linked = match note_ops::linked_task_at_line(&post_edit.content, line) {
                 Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
                 None => None,
             };
             // On a linked line the char is a projection of the task note's
             // status: the status write is redirected to the task and the line
-            // edit carries the word that status projects to.
-            let redirect = match (linked, status.as_deref()) {
-                (Some((task_id, current)), Some(word)) => {
-                    Some((task_id, redirected_task_status(word, current), current))
-                }
-                _ => None,
-            };
+            // edit carries the word that status projects to — with no status
+            // word, the task's current one (a text-only retarget renders the
+            // new target's marker).
+            let redirect = linked.map(|(task_id, current)| {
+                let next = status
+                    .as_deref()
+                    .and_then(|word| redirected_task_status(word, current));
+                (task_id, next, current)
+            });
             let line_status = match &redirect {
                 Some((_, next, current)) => Some(note_ops::status_word_for_task_status(
                     next.unwrap_or(*current),
@@ -21615,7 +21632,7 @@ impl WorkspaceApi for Services {
             )
             .await;
             services
-                .materialize_linked_checkboxes(&note.workspace_id, &note.id, new_status)
+                .materialize_linked_checkboxes(&note.workspace_id, &note.id)
                 .await;
             match previous_status {
                 // Only a note that was not already a task is "created" as one.
@@ -21960,7 +21977,6 @@ impl WorkspaceApi for Services {
             if should_update_status {
                 apply_status_transition(&mut task, TaskStatus::InProgress, &now);
             }
-            let status_now = task.status;
             note.metadata.task = Some(task);
             note.updated_at = now.clone();
             store.update_note(&note).await?;
@@ -21981,7 +21997,7 @@ impl WorkspaceApi for Services {
             )
             .await;
             services
-                .materialize_linked_checkboxes(&note.workspace_id, &note.id, status_now)
+                .materialize_linked_checkboxes(&note.workspace_id, &note.id)
                 .await;
             if should_update_status {
                 publish_event(

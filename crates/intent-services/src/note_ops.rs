@@ -265,11 +265,11 @@ pub(crate) fn reject_numbered_read_presentation(content: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_hex_or_dash(b: u8) -> bool {
-    b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-'
-}
-
 /// First `[label](intent://local/task/<id>)` link; returns `(label, id)`.
+///
+/// The id is everything up to the closing `)` — the same alphabet as
+/// `intent_core::extract_spec_task_ids` (the materialization prefilter):
+/// `NoteId` is an arbitrary string, so `t1` / `task-a` link like UUIDs do.
 fn find_task_link(s: &str) -> Option<(String, String)> {
     const PREFIX: &str = "](intent://local/task/";
     let bytes = s.as_bytes();
@@ -283,12 +283,13 @@ fn find_task_link(s: &str) -> Option<(String, String)> {
             }
             if j < bytes.len() && j > label_start && s[j..].starts_with(PREFIX) {
                 let id_start = j + PREFIX.len();
-                let mut k = id_start;
-                while k < bytes.len() && is_hex_or_dash(bytes[k]) {
-                    k += 1;
-                }
-                if k > id_start && k < bytes.len() && bytes[k] == b')' {
-                    return Some((s[label_start..j].to_string(), s[id_start..k].to_string()));
+                if let Some(len) = s[id_start..].find(')') {
+                    if len > 0 {
+                        return Some((
+                            s[label_start..j].to_string(),
+                            s[id_start..id_start + len].to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -2072,6 +2073,33 @@ mod tests {
             set_linked_checkbox("- [ ] [T](intent://local/task/a10)", "a1", "[x]"),
             None
         );
+    }
+
+    #[test]
+    fn task_link_ids_share_the_prefilter_alphabet() {
+        // `NoteId` is an arbitrary string: every id `extract_spec_task_ids`
+        // (the materialization prefilter) yields is one the rewriter and the
+        // redirect resolvers accept too — not just hex/dash UUID shapes.
+        for id in ["t1", "task-a", "Task_A.v2", "ZZ"] {
+            let line = format!("- [ ] [T](intent://local/task/{id})");
+            let ids = intent_core::extract_spec_task_ids(&line);
+            assert!(ids.contains(id), "prefilter yields {id}");
+            assert_eq!(
+                find_task_link(&line),
+                Some(("T".to_string(), id.to_string())),
+                "{id}"
+            );
+            assert_eq!(
+                set_linked_checkbox(&line, id, "[x]").as_deref(),
+                Some(format!("- [x] [T](intent://local/task/{id})").as_str()),
+                "{id}"
+            );
+            assert_eq!(linked_task_at_line(&line, 1).as_deref(), Some(id));
+            assert_eq!(linked_task_for_text(&line, "T").as_deref(), Some(id));
+        }
+        // An empty id or an unterminated link is still no link.
+        assert_eq!(find_task_link("[T](intent://local/task/)"), None);
+        assert_eq!(find_task_link("[T](intent://local/task/t1"), None);
     }
 
     #[test]
