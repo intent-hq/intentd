@@ -69,6 +69,16 @@ fn classify_macos(
     }
 }
 
+fn resolve_macos_product_name(
+    sysctl_product: Option<String>,
+    ioreg_product_name: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match sysctl_product {
+        Some(product) if classify_macos(Some(&product), None).is_some() => Some(product),
+        opaque_product => ioreg_product_name().or(opaque_product),
+    }
+}
+
 fn classify_linux(inputs: DeviceKindInputs<'_>) -> &'static str {
     let vendor = inputs.sys_vendor.unwrap_or_default().to_ascii_lowercase();
     let product = inputs.product_name.unwrap_or_default().to_ascii_lowercase();
@@ -141,8 +151,10 @@ pub fn detect_host_environment() -> HostEnvironment {
     let pretty_hostname = pretty_hostname();
     let (product_name, hardware_model, sys_vendor, chassis_type, hypervisor_type, is_container) =
         if cfg!(target_os = "macos") {
-            let product = command_output("/usr/sbin/sysctl", &["-n", "hw.product"])
-                .or_else(ioreg_product_name);
+            let product = resolve_macos_product_name(
+                command_output("/usr/sbin/sysctl", &["-n", "hw.product"]),
+                ioreg_product_name,
+            );
             let model = command_output("/usr/sbin/sysctl", &["-n", "hw.model"]);
             (product, model, None, None, None, false)
         } else if cfg!(target_os = "linux") {
@@ -369,6 +381,25 @@ mod tests {
             );
         }
         assert_eq!(classify_device_kind(inputs("macos")), None);
+    }
+
+    #[test]
+    fn macos_opaque_sysctl_identifier_uses_ioreg_product_name() {
+        for model in ["Mac13,1", "Mac14,13"] {
+            let product_name = resolve_macos_product_name(Some(model.to_string()), || {
+                Some("Mac Studio".to_string())
+            });
+
+            assert_eq!(product_name.as_deref(), Some("Mac Studio"));
+            assert_eq!(
+                classify_device_kind(DeviceKindInputs {
+                    product_name: product_name.as_deref(),
+                    hardware_model: Some(model),
+                    ..inputs("macos")
+                }),
+                Some("macStudio")
+            );
+        }
     }
 
     #[test]
