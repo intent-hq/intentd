@@ -7,7 +7,7 @@
 //! than an allowlist, so new tools are denied by default for restricted agents.
 
 /// File modification tools — agents with these can edit the codebase.
-pub(crate) const FILE_WRITE_TOOLS: &[&str] = &[
+pub const FILE_WRITE_TOOLS: &[&str] = &[
     // Built-in auggie tools
     "str-replace-editor",
     "save-file",
@@ -75,7 +75,7 @@ pub(crate) const UNIFIED_WORKSPACE_TOOLS: &[&str] =
     &["workspace_api", "workspace_api_workspace-mcp"];
 
 /// Process/command execution tools.
-pub(crate) const EXECUTION_TOOLS: &[&str] = &["launch-process", "execute_command"];
+pub const EXECUTION_TOOLS: &[&str] = &["launch-process", "execute_command"];
 
 /// External communication tools.
 pub(crate) const EXTERNAL_TOOLS: &[&str] = &["web-fetch", "web-search", "github-api"];

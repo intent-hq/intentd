@@ -424,7 +424,7 @@ pub(crate) enum DefaultModelSource {
     /// Step 3 — the settings chain ([`resolve_default_model_from_settings`]).
     Settings,
     /// Step 4 — the cached provider catalog's `isDefault` row
-    /// ([`crate::model_catalog::ModelCatalogCache::cached_default_model`]).
+    /// ([`crate::model_catalog::ModelCatalogReader::cached_default_model`]).
     /// Not a settings default: the settings default reasoning effort does
     /// NOT apply to it.
     CatalogDefault,
@@ -529,7 +529,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // needed. Pinning it to session.model freezes the model for the
     // session's lifetime even if the provider later changes its default.
     if let Some(m) =
-        effective_provider.and_then(|p| services.models_catalog.cached_default_model(p))
+        effective_provider.and_then(|p| services.cached_models().cached_default_model(p))
     {
         return (Some(m), DefaultModelSource::CatalogDefault);
     }
@@ -560,7 +560,7 @@ fn default_model_belongs_to_provider(
     };
     ensure_bare_model_matches_provider(
         "agent.create",
-        &services.models_catalog,
+        &services.cached_models(),
         effective_provider,
         model,
     )
@@ -605,7 +605,7 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 ///   spawn would actually run, not as the raw alias string.
 pub(crate) fn ensure_bare_model_matches_provider(
     method: &str,
-    cache: &crate::model_catalog::ModelCatalogCache,
+    cache: &crate::model_catalog::ModelCatalogReader<'_>,
     provider_id: &str,
     model_id: &str,
 ) -> Result<()> {
@@ -634,7 +634,7 @@ pub(crate) fn ensure_bare_model_matches_provider(
 /// Reject a `reasoningEffort` level the resolved model provably does not
 /// support with `-32602` (`InvalidParams`), naming the valid values. Evidence is
 /// the cached model catalog's `effortLevels` for `model_id`
-/// ([`crate::model_catalog::ModelCatalogCache::cached_effort_levels`]) — the
+/// ([`crate::model_catalog::ModelCatalogReader::cached_effort_levels`]) — the
 /// same probe-free, read-only rule as the bare-model ownership guard: with no
 /// evidence (no model, no cached row, or a row declaring no levels) the value
 /// passes through unvalidated, since providers own the effort vocabulary
@@ -642,7 +642,7 @@ pub(crate) fn ensure_bare_model_matches_provider(
 /// caller's spelling.
 fn ensure_effort_supported_by_model(
     method: &str,
-    cache: &crate::model_catalog::ModelCatalogCache,
+    cache: &crate::model_catalog::ModelCatalogReader<'_>,
     model_id: Option<&str>,
     effort: &str,
 ) -> Result<()> {
@@ -691,7 +691,7 @@ fn resolve_settings_default_reasoning_effort(
         .filter(|l| !l.is_empty())?;
     match ensure_effort_supported_by_model(
         "agent.create",
-        &services.models_catalog,
+        &services.cached_models(),
         resolved_model,
         level,
     ) {
@@ -3757,7 +3757,7 @@ impl Services {
                 .expect("guarded above: provider or derived default present");
             match ensure_bare_model_matches_provider(
                 "agent.create",
-                &self.models_catalog,
+                &self.cached_models(),
                 effective,
                 m,
             ) {
@@ -3817,7 +3817,7 @@ impl Services {
         if let Some(effort) = reasoning_effort.as_deref() {
             ensure_effort_supported_by_model(
                 "agent.create",
-                &self.models_catalog,
+                &self.cached_models(),
                 resolved_model.as_deref(),
                 effort,
             )?;
@@ -4082,7 +4082,7 @@ impl Services {
             // runs the intended binary (monorepo#1657).
             ensure_bare_model_matches_provider(
                 "agent.setModel",
-                &self.models_catalog,
+                &self.cached_models(),
                 &pid,
                 &model_id,
             )?;
@@ -4109,7 +4109,7 @@ impl Services {
             };
             ensure_bare_model_matches_provider(
                 "agent.setModel",
-                &self.models_catalog,
+                &self.cached_models(),
                 effective,
                 &model_id,
             )?;
@@ -5318,14 +5318,36 @@ impl Services {
                 &format!("no dynamic model discovery for provider '{provider_id}'"),
             ));
         };
-        let version_key = (source.version_key)();
+        let antigravity = (source.provider_id == "antigravity").then(|| {
+            crate::model_catalog::AntigravityModelSource::resolve(
+                self.effective_settings()
+                    .providers
+                    .paths
+                    .get("antigravity")
+                    .map(String::as_str),
+            )
+        });
+        let version_key = antigravity
+            .as_ref()
+            .map_or_else(|| (source.version_key)(), |s| s.version_key.clone());
         let resolved = crate::model_catalog::resolve_with_cache(
             &self.models_catalog,
             &provider_id,
             &version_key,
             force_refresh,
             crate::model_catalog::ModelCatalogCache::now_ms(),
-            source.fetch,
+            move || {
+                if let Some(antigravity) = antigravity {
+                    Box::pin(async move {
+                        crate::model_catalog::from_provider_fetch(
+                            crate::provider_models::fetch_antigravity_models_at(antigravity.binary)
+                                .await,
+                        )
+                    })
+                } else {
+                    (source.fetch)()
+                }
+            },
         )
         .await;
         match resolved.models {
@@ -8362,7 +8384,7 @@ impl Services {
         if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.delegate",
-                &self.models_catalog,
+                &self.cached_models(),
                 effective_model.as_deref(),
                 effort,
             )?;
@@ -11981,7 +12003,7 @@ impl Services {
         if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.wakeOrCreate",
-                &self.models_catalog,
+                &self.cached_models(),
                 effort_model.as_deref(),
                 effort,
             )?;

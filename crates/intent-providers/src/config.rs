@@ -249,6 +249,7 @@ pub struct ProviderConfig {
     /// by onboarding to verify the provider actually answers. `false` for
     /// unsloth — its first prompt can trigger a very long model
     /// download/load cycle, so a bounded probe would time out spuriously.
+    /// Antigravity also opts out because it requires a private guarded profile.
     pub supports_test_prompt: bool,
 }
 
@@ -590,6 +591,21 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // `AgentArgs`). Orchestrator restrictions on grok are prompt-only;
         // MCP-side filtering (§6.8) still covers workspace tools.
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
+    },
+    ProviderConfig {
+        short_name: "Antigravity",
+        can_be_disabled: true,
+        // Generic one-shot probes bypass the private Antigravity profile.
+        supports_test_prompt: false,
+        supports_config_option_model: true,
+        supports_session_mcp_servers: true,
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        auth_error_patterns: Some(&["authentication required", "intent_acp_auth_required"]),
+        login_command_hint: Some("intentd provider login antigravity"),
+        login_docs_url: Some("https://antigravity.google/docs/ide/extensions"),
+        // Saved personal OAuth is reused by session/new. Do not send the
+        // generic authenticate method "none", or map AllowAll to yolo.
+        ..ProviderConfig::empty("antigravity", "Google Antigravity", "antigravity-acp")
     },
     ProviderConfig {
         runtime: ProviderRuntime::Node,

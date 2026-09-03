@@ -1468,6 +1468,7 @@ fn mock_handle() -> AgentHandle {
         _mcp_config: None,
         _rules_config: None,
         _pi_extension: None,
+        antigravity_profile: None,
         session_mcp_servers: Vec::new(),
         spawned_model: None,
         spawned_provider: "auggie".to_string(),
@@ -3750,6 +3751,7 @@ fn track_mock_agent_inner(
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
@@ -3866,6 +3868,7 @@ fn track_mock_agent_prompt_rpc_error(
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
@@ -4198,6 +4201,223 @@ async fn seed_agent_with_task_graph(
         .insert_agent_session_with_task_graph(&session, task_graph_enabled)
         .await
         .expect("insert session");
+}
+
+#[tokio::test]
+async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_context() {
+    for prior_session in [None, Some("lost-id")] {
+        for rejection in ["session/set_mode", "session/set_config_option"] {
+            let (tmp, mgr) = manager().await;
+            let (ws, id) = (
+                WorkspaceId::from("ws-1"),
+                AgentId::from("antigravity-setup"),
+            );
+            seed_agent(&mgr, &ws, &id).await;
+            let mut row = mgr.services.store.get_agent_session(&id).await.unwrap();
+            row.provider = Some("antigravity".into());
+            row.model = Some("model-a".into());
+            row.system_prompt = Some("Required Antigravity instruction".into());
+            row.name_explicitly_set = true;
+            row.effort_levels = Some(vec!["preserved".into()]);
+            mgr.services
+                .store
+                .update_agent_session(&ws, &row)
+                .await
+                .unwrap();
+            if let Some(prior) = prior_session {
+                mgr.services
+                    .store
+                    .set_acp_session_id(&ws, &id, prior)
+                    .await
+                    .unwrap();
+            }
+            row.acp_session_id = prior_session.map(String::from);
+            mgr.services
+                .store
+                .set_agent_effort_levels(&ws, &id, row.effort_levels.as_deref(), &now_iso())
+                .await
+                .unwrap();
+            if prior_session.is_some() {
+                for (role, text) in [
+                    ("user", "Earlier question"),
+                    ("assistant", "Earlier answer"),
+                ] {
+                    mgr.services
+                        .store
+                        .append_agent_message(
+                            &id,
+                            role,
+                            &json!([{"type":"text","text":text}]),
+                            &now_iso(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            mgr.services
+                .store
+                .append_agent_message(
+                    &id,
+                    "user",
+                    &json!([{"type":"text","text":"Current request"}]),
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+            let provider = intent_providers::provider_config("antigravity");
+            let (agent, calls) = track_antigravity_setup(&mgr, &id, Some(rejection));
+            let error = mgr
+                .start_session(&id, PathBuf::from("/tmp/ws"), provider)
+                .await
+                .unwrap_err();
+            assert!(!super::is_retryable_spawn_error(&error));
+            let failed = mgr.services.store.get_agent_session(&id).await.unwrap();
+            assert_eq!(failed.acp_session_id, row.acp_session_id);
+            assert_eq!(failed.model, row.model);
+            assert_eq!(failed.effort_levels, row.effort_levels);
+            assert!(!calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, _)| method == "session/prompt"));
+            drop(mgr);
+            agent.abort();
+
+            // Reopen the durable store with a new manager, not merely a new child.
+            let store = Store::open(&tmp.path).await.unwrap();
+            let bus = EventBus::new(store.clone());
+            let services = Services::new(store).with_event_bus(bus.clone());
+            let mgr = AgentManager::new(services, Arc::new(BusEventSink::new(bus)), 8);
+            let (agent, calls) = track_antigravity_setup(&mgr, &id, None);
+            assert_eq!(
+                mgr.start_session(&id, PathBuf::from("/tmp/ws"), provider)
+                    .await
+                    .unwrap(),
+                MGR_ACP_SID
+            );
+            let methods: Vec<String> = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(m, _)| m.clone())
+                .collect();
+            assert_eq!(
+                methods.iter().any(|m| m == "session/load"),
+                prior_session.is_some()
+            );
+            let prompt = mgr
+                .build_turn_prompt(&id, &ws, "Current request", &super::TurnOptions::default())
+                .await;
+            let text = serde_json::to_value(prompt).unwrap()[0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(text.matches("Required Antigravity instruction").count(), 1);
+            assert_eq!(
+                text.matches("Earlier question").count(),
+                usize::from(prior_session.is_some())
+            );
+            assert_eq!(
+                text.matches("Earlier answer").count(),
+                usize::from(prior_session.is_some())
+            );
+            let next = mgr
+                .build_turn_prompt(&id, &ws, "Next request", &super::TurnOptions::default())
+                .await;
+            assert_eq!(
+                serde_json::to_value(next).unwrap()[0]["text"],
+                "Next request"
+            );
+            drop(mgr);
+            agent.abort();
+
+            // A genuinely established session resumes without replaying the prefix.
+            let store = Store::open(&tmp.path).await.unwrap();
+            let bus = EventBus::new(store.clone());
+            let mgr = AgentManager::new(
+                Services::new(store).with_event_bus(bus.clone()),
+                Arc::new(BusEventSink::new(bus)),
+                8,
+            );
+            let (agent, calls) = track_antigravity_setup(&mgr, &id, None);
+            assert_eq!(
+                mgr.start_session(&id, PathBuf::from("/tmp/ws"), provider)
+                    .await
+                    .unwrap(),
+                MGR_ACP_SID
+            );
+            assert!(!calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, _)| method == "session/new"));
+            let resumed = mgr
+                .build_turn_prompt(&id, &ws, "Resumed request", &super::TurnOptions::default())
+                .await;
+            assert_eq!(
+                serde_json::to_value(resumed).unwrap()[0]["text"],
+                "Resumed request"
+            );
+            agent.abort();
+        }
+    }
+}
+
+/// Exercise setup through the real ACP connection, without a provider process.
+fn track_antigravity_setup(
+    mgr: &AgentManager,
+    id: &AgentId,
+    reject_method: Option<&'static str>,
+) -> (JoinHandle<()>, MockCallLog) {
+    let (client_write, agent_read) = tokio::io::duplex(16 * 1024);
+    let (agent_write, client_read) = tokio::io::duplex(16 * 1024);
+    let calls: MockCallLog = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let agent = tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_read).lines();
+        let mut writer = agent_write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let (Some(id), Some(method)) = (request.get("id"), request["method"].as_str()) else {
+                continue;
+            };
+            let params = &request["params"];
+            recorded
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params.clone()));
+            let response = if reject_method == Some(method)
+                || (method == "session/load" && params["sessionId"] == "lost-id")
+            {
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"rejected"}})
+            } else {
+                let result = match method {
+                    "initialize" => {
+                        json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true}})
+                    }
+                    "session/new" => json!({"sessionId":MGR_ACP_SID}),
+                    "session/set_config_option" => {
+                        json!({"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":params["value"],"options":[{"value":"model-a","name":"Model A"}]}]})
+                    }
+                    _ => json!({}),
+                };
+                json!({"jsonrpc":"2.0","id":id,"result":result})
+            };
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+        }
+    });
+    track(mgr, id);
+    mgr.handles.lock().unwrap().get_mut(id).unwrap().connection = Arc::new(Connection::new(
+        client_write,
+        client_read,
+        None,
+        ConnectionHooks::default(),
+    ));
+    (agent, calls)
 }
 
 #[tokio::test]
@@ -6063,6 +6283,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
@@ -15283,6 +15504,7 @@ mod harness_wake_tests {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),

@@ -249,6 +249,12 @@ fn transient_prompt_retry_base_ms() -> u64 {
     1000
 }
 
+/// A candidate session that has not changed the canonical stored ACP identity.
+pub(crate) struct PreparedAcpSession {
+    pub response: session::NewSessionResponse,
+    stored: AgentSession,
+}
+
 /// Result of opening or resuming an ACP session: the canonical `acpSessionId`
 /// (persisted on `AgentSession`) plus the modes the provider advertised in the
 /// same response, so the caller can pick a permissive `session/set_mode` target
@@ -2245,17 +2251,13 @@ impl Services {
         self.session_specialist_is_orchestrator(stored, workspace_path.as_deref())
     }
 
-    /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
-    /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
-    /// modes the provider advertised in `session/new` (used by the caller to
-    /// pick a permissive `session/set_mode` target from `availableModes`).
-    pub(crate) async fn open_acp_session(
+    pub(crate) async fn prepare_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
-    ) -> Result<AcpSessionOpened> {
+    ) -> Result<PreparedAcpSession> {
         // Load the session up front so the store write is scoped to the owning
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
@@ -2292,6 +2294,86 @@ impl Services {
         let resp = session::new_session(conn, cwd, mcp_servers, meta)
             .await
             .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        Ok(PreparedAcpSession {
+            response: resp,
+            stored,
+        })
+    }
+
+    /// Commit only a confirmed Antigravity candidate. A concurrent winner is
+    /// never used with this candidate's configuration or first-turn context.
+    pub(crate) async fn commit_antigravity_acp_session(
+        &self,
+        prepared: PreparedAcpSession,
+        expected_old: Option<&str>,
+    ) -> Result<AcpSessionOpened> {
+        let PreparedAcpSession {
+            response: resp,
+            stored,
+        } = prepared;
+        let candidate = resp.session_id.0.to_string();
+        if candidate.is_empty() {
+            return Err(Error::InvalidParams(
+                "Antigravity returned an empty session ID".into(),
+            ));
+        }
+        let workspace_id = &stored.workspace_id;
+        let agent_id = &stored.id;
+        // Use the existing transactional CAS even for first-set: an empty
+        // expected id cannot match a valid established session, while the
+        // store's None branch atomically initializes an unclaimed session.
+        let canonical = self
+            .store
+            .replace_acp_session_id(
+                workspace_id,
+                agent_id,
+                expected_old.unwrap_or(""),
+                &candidate,
+            )
+            .await?;
+        if canonical != candidate {
+            return Err(Error::Conflict {
+                current: json!({"acpSessionId": canonical}),
+            });
+        }
+        if expected_old.is_some() {
+            self.clear_context_usage(agent_id);
+        }
+        self.persist_effective_model(
+            workspace_id,
+            agent_id,
+            stored.model.as_deref(),
+            resp.config_options.as_deref(),
+        )
+        .await;
+        let thought_level = discover_thought_level(resp.config_options.as_deref());
+        self.persist_session_effort_levels(workspace_id, agent_id, thought_level.as_ref())
+            .await;
+        Ok(AcpSessionOpened {
+            session_id: candidate,
+            modes: resp.modes,
+            thought_level,
+        })
+    }
+
+    /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
+    /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
+    /// modes the provider advertised in `session/new` (used by the caller to
+    /// pick a permissive `session/set_mode` target from `availableModes`).
+    pub(crate) async fn open_acp_session(
+        &self,
+        conn: &Connection,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<AcpSessionOpened> {
+        let PreparedAcpSession {
+            response: resp,
+            stored,
+        } = self
+            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
+            .await?;
+        let workspace_id = stored.workspace_id.clone();
         let acp_session_id = resp.session_id.0.to_string();
         self.store
             .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
@@ -2331,39 +2413,13 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<AcpSessionOpened> {
-        // Load the session up front so the CAS replace is scoped to the owning
-        // workspace (see [`open_acp_session`]).
-        let stored = self.store.get_agent_session(agent_id).await?;
+        let PreparedAcpSession {
+            response: resp,
+            stored,
+        } = self
+            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
+            .await?;
         let workspace_id = stored.workspace_id.clone();
-        // Resolve provider using the same precedence as spawn path, then build
-        // provider-specific _meta for system-prompt injection (recreate path sends
-        // the same prompt as new/load). Same loud fall-through as
-        // [`open_acp_session`] (monorepo#3044).
-        let provider_id = resolve_provider_id(
-            stored.provider.as_deref(),
-            derived_default_provider(&self.effective_settings()).as_deref(),
-        )
-        .ok_or_else(|| no_default_provider_error("session/new"))?;
-        let is_orchestrator = self
-            .resolve_session_is_orchestrator(&provider_id, &stored)
-            .await;
-        let meta = build_session_meta(
-            &provider_id,
-            stored.system_prompt.as_deref(),
-            Some(&stored.name),
-            is_orchestrator,
-        );
-        self.publish_status_event(
-            &workspace_id,
-            agent_id,
-            "session-create",
-            "Creating session\u{2026}",
-            "info",
-        )
-        .await;
-        let resp = session::new_session(conn, cwd, mcp_servers, meta)
-            .await
-            .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
         let new_acp_session_id = resp.session_id.0.to_string();
         let canonical = self
             .store

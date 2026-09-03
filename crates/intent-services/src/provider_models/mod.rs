@@ -113,6 +113,7 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
     match provider_id {
         "claude-code" => fetch_claude_code_models().await,
         "codex" => fetch_codex_models().await,
+        "antigravity" => fetch_antigravity_models(None).await,
         "pi" => fetch_pi_models().await,
         "droid" => fetch_droid_models().await,
         "opencode" => fetch_opencode_models().await,
@@ -120,6 +121,85 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
         "unsloth" => fetch_unsloth_models().await,
         other => ProviderModelsFetch::unavailable(other, "no dynamic model source"),
     }
+}
+
+/// Native official ACP discovery. No generic authenticate call, prompt,
+/// global configuration, npm fallback, or automatic browser login.
+pub(crate) async fn fetch_antigravity_models(explicit_path: Option<&str>) -> ProviderModelsFetch {
+    fetch_antigravity_models_at(find_provider_binary(
+        "antigravity",
+        "antigravity-acp",
+        explicit_path,
+    ))
+    .await
+}
+
+/// Probe the executable already resolved for this request's cache identity.
+pub(crate) async fn fetch_antigravity_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    let Some(bin) = binary else {
+        return ProviderModelsFetch::unavailable("antigravity", "antigravity-acp binary not found");
+    };
+    finish(
+        "antigravity",
+        antigravity_probe(bin, false, |value| {
+            parse::parse_acp_models(value, "antigravity")
+        })
+        .await,
+    )
+}
+
+pub(crate) async fn probe_antigravity_auth(bin: PathBuf) -> Option<bool> {
+    // A valid session proves authentication even when its catalog is empty.
+    // Ignore notifications: they cannot prove a successful session/new.
+    antigravity_auth_outcome(
+        antigravity_probe(bin, true, |value| {
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(|_| vec![Value::Bool(true)])
+                .unwrap_or_default()
+        })
+        .await,
+    )
+}
+
+fn antigravity_auth_outcome(outcome: Result<Vec<Value>, ProbeError>) -> Option<bool> {
+    match outcome {
+        Ok(rows) if !rows.is_empty() => Some(true),
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+async fn antigravity_probe<F>(
+    bin: PathBuf,
+    session_only: bool,
+    extract: F,
+) -> Result<Vec<Value>, ProbeError>
+where
+    F: Fn(&Value) -> Vec<Value>,
+{
+    let helper = std::env::current_exe().map_err(|err| ProbeError::Spawn(err.to_string()))?;
+    let profile = crate::antigravity::probe_profile(&helper)
+        .map_err(|err| ProbeError::Spawn(format!("isolated Antigravity configuration: {err}")))?;
+    let mut cmd = AcpProbeCommand::binary(bin, Vec::new())
+        .cwd(profile.path().to_path_buf())
+        .auth_required_marker(crate::antigravity::AUTH_REQUIRED_MARKER);
+    for (key, value) in crate::antigravity::unattended_env(profile.path(), &helper)
+        .map_err(|err| ProbeError::Spawn(err.to_string()))?
+    {
+        cmd = cmd.env(key, value);
+    }
+    let outcome = if session_only {
+        probe::run_acp_session_probe(cmd, extract).await
+    } else {
+        run_acp_probe(cmd, extract).await
+    };
+    drop(profile);
+    outcome
 }
 
 /// claude-code: ACP probe via the pinned npx adapter. Models arrive in the

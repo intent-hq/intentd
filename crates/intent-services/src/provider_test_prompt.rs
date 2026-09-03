@@ -15,9 +15,9 @@
 //! *completion* matters — so any adapter a live session can use, the probe
 //! can exercise. Providers outside the completeOnce set are intentionally
 //! best-effort: a provider whose adapter cannot complete a bare one-shot
-//! turn surfaces a structured failure, never a wire error. `unsloth` alone
-//! opts out (`supports_test_prompt: false`) — its first prompt can trigger
-//! a very long model download/load cycle.
+//! turn surfaces a structured failure, never a wire error. `unsloth` opts
+//! out because its first prompt can trigger a long model download/load cycle.
+//! Antigravity opts out because it requires a private guarded profile.
 //!
 //! Result contract (never a wire error once the provider id is known):
 //! success is `{ ok: true }`; failure is `{ ok: false, reason, message }`
@@ -269,18 +269,20 @@ mod tests {
         );
     }
 
-    /// unsloth opts out (`supports_test_prompt: false`): the RPC answers the
+    /// Opted-out providers (`supports_test_prompt: false`): the RPC answers the
     /// structured `unsupported` result, never a wire error, and without
     /// resolving or spawning anything.
     #[tokio::test]
     async fn unsupported_provider_returns_structured_unsupported() {
         let paths: HashMap<String, String> = HashMap::new();
-        let v = provider_test_prompt("unsloth", None, &paths, None)
-            .await
-            .unwrap();
-        assert_eq!(v["ok"], false);
-        assert_eq!(v["reason"], "unsupported");
-        assert!(v["message"].as_str().unwrap().contains("unsloth"));
+        for provider in ["unsloth", "antigravity"] {
+            let v = provider_test_prompt(provider, None, &paths, None)
+                .await
+                .unwrap();
+            assert_eq!(v["ok"], false);
+            assert_eq!(v["reason"], "unsupported");
+            assert!(v["message"].as_str().unwrap().contains(provider));
+        }
     }
 
     /// An unknown provider id is the caller's `-32602`, mirroring

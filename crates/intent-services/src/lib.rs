@@ -58,6 +58,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+pub mod antigravity;
 mod attachment_upload;
 mod auggie_cli;
 mod auto_commit;
@@ -13572,7 +13573,7 @@ impl Services {
                 .as_deref()
                 .is_none_or(|v| v.trim().is_empty())
         {
-            if let Some(m) = self.models_catalog.cached_default_or_first_model(provider) {
+            if let Some(m) = self.cached_models().cached_default_or_first_model(provider) {
                 // Legacy catalog row ids may be compound (`provider:model`);
                 // only a prefix naming the owning provider is trusted — a
                 // foreign-prefixed row is not an ownership claim
@@ -13621,7 +13622,7 @@ impl Services {
     /// a foreign model id. Append a re-resolved `model.default`
     /// to the batch so it applies atomically with the provider change:
     /// the new provider's cached catalog default-or-first model
-    /// ([`ModelCatalogCache::cached_default_or_first_model`], cache-only —
+    /// ([`model_catalog::ModelCatalogReader::cached_default_or_first_model`], cache-only —
     /// never a probe) as a bare id, else — when a model is currently
     /// stored — a blank value clearing it (the next call that needs a
     /// default then fails loudly, monorepo#3044, instead of silently
@@ -13678,7 +13679,7 @@ impl Services {
             Some(_) => {}
         }
         let resolved = self
-            .models_catalog
+            .cached_models()
             .cached_default_or_first_model(&provider)
             .and_then(|m| match m.split_once(':') {
                 // Legacy catalog row ids may be compound, but only a prefix

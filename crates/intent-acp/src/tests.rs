@@ -89,6 +89,45 @@ async fn handshake_completes() {
 }
 
 #[tokio::test]
+async fn antigravity_auth_marker_fails_pending_and_future_requests_without_url() {
+    let (client_write, mut agent_read) = tokio::io::duplex(4096);
+    let (mut agent_write, client_read) = tokio::io::duplex(4096);
+    let conn = Connection::new(
+        client_write,
+        client_read,
+        None,
+        ConnectionHooks {
+            auth_required_stdout_marker: Some("INTENT_ACP_AUTH_REQUIRED"),
+            ..Default::default()
+        },
+    );
+    let server = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = [0u8; 4096];
+        assert!(agent_read.read(&mut buffer).await.unwrap() > 0);
+        agent_write
+            .write_all(b"INTENT_ACP_AUTH_REQUIRED\nhttps://accounts.google.com/secret-oauth-url\n")
+            .await
+            .unwrap();
+    });
+    let result = conn
+        .request("session/new", json!({}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(result.contains("Authentication required"));
+    assert!(!result.contains("secret-oauth-url"));
+    server.await.unwrap();
+    assert!(conn
+        .request("session/new", json!({}))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Authentication required"));
+    assert_eq!(conn.pending_len(), 0);
+}
+
+#[tokio::test]
 async fn concurrent_writes_do_not_interleave() {
     let (conn, responder, _stderr) = connect_mock(ConnectionHooks::default());
     let conn = std::sync::Arc::new(conn);
@@ -124,6 +163,7 @@ async fn routes_requests_and_notifications() {
         notifications: Some(note_tx),
         auth_error_patterns: Vec::new(),
         stderr_log_dir: None,
+        auth_required_stdout_marker: None,
     };
 
     let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
@@ -982,6 +1022,66 @@ mod session_tests {
             panic!("expected tool call");
         };
         assert_eq!(tc.status, "error");
+    }
+
+    #[test]
+    fn antigravity_captured_tool_frames_keep_native_names_and_generic_mcp_mapping() {
+        let frame = json!({"sessionUpdate":"tool_call","toolCallId":"mcp-1","title":"workspace-mcp_workspace_api","kind":"other","status":"pending","rawInput":{"arguments":{"code":"return await ws.workspace.getDetails();"}},"_meta":{"is_mcp_tool_call":true,"mcp":{"tool":"workspace_api","server":"workspace-mcp"}}});
+        let update: SessionUpdate = serde_json::from_value(frame.clone()).unwrap();
+        let Some(MappedUpdate::ToolCall(call)) = session::map_session_update(&update) else {
+            panic!("tool call expected")
+        };
+        assert_eq!(call.tool_name, "workspace_api");
+        assert_eq!(
+            call.input["code"],
+            "return await ws.workspace.getDetails();"
+        );
+        let mut unrelated = frame;
+        unrelated.as_object_mut().unwrap().remove("_meta");
+        let Some(MappedUpdate::ToolCall(call)) =
+            session::map_session_update(&serde_json::from_value(unrelated).unwrap())
+        else {
+            panic!("tool call expected")
+        };
+        assert!(
+            call.input.get("arguments").is_some(),
+            "other provider inputs remain unchanged"
+        );
+        for (title, input, name) in [
+            (
+                "Running client_view_file",
+                json!({"absolute_path":"/workspace/seed.txt"}),
+                "client_view_file",
+            ),
+            (
+                "Run client_create_file?",
+                json!({"target_file":"/workspace/created.txt","code_content":"ACP_FILE_OK"}),
+                "client_create_file",
+            ),
+            (
+                "printf ACP_DENIED > denied.txt",
+                json!({"CommandLine":"printf ACP_DENIED > denied.txt","Cwd":"/workspace","WaitMsBeforeAsync":10000}),
+                "run_command",
+            ),
+            (
+                "workspace-mcp_intent_echo",
+                json!({"arguments":{}}),
+                "intent_echo",
+            ),
+        ] {
+            assert_eq!(session::derive_tool_name(title, Some(&input)), name);
+        }
+        assert_eq!(
+            session::derive_tool_name("Running client_view_file", Some(&json!({}))),
+            "Running client_view_file"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Some other tool",
+                Some(&json!({"target_file":"a","code_content":"b"}))
+            ),
+            "Some other tool"
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ mod client;
 mod git_credential;
 mod import;
 mod legacy_import;
+mod provider;
 mod rpc_profile;
 mod suspend;
 mod tunnel;
@@ -52,6 +53,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Provider authentication and internal ACP launch helpers.
+    Provider {
+        #[command(subcommand)]
+        command: provider::ProviderCommand,
+    },
     /// Start the daemon and serve JSON-RPC. The UDS listener always serves;
     /// the HTTPS+WSS listener (0.0.0.0, port from `server.wsApi.port` /
     /// `INTENTD_TCP_PORT`, default 5181) boot-starts iff the effective
@@ -260,6 +266,14 @@ fn main() -> ExitCode {
 
 #[tokio::main]
 async fn async_main(cli: Cli) -> ExitCode {
+    let command = match cli.command {
+        Command::Provider { command } if command.is_internal_helper() => {
+            // These subprocesses only emit a policy decision or safe auth
+            // signal. Do not initialize file logging or touch daemon state.
+            return provider::run(command).await;
+        }
+        command => command,
+    };
     init_tracing();
     install_panic_hook();
     // Rust starts with SIGPIPE ignored, so `println!` to a pipe whose reader
@@ -272,13 +286,11 @@ async fn async_main(cli: Cli) -> ExitCode {
     // daemon's clients, the MCP bridge) must keep surfacing EPIPE as plain
     // errors — e.g. `stop` falls back to SIGTERM/SIGKILL escalation when the
     // control RPC fails — rather than kill the process mid-write.
-    if !matches!(
-        cli.command,
-        Command::Serve { .. } | Command::McpBridge { .. }
-    ) {
+    if !matches!(command, Command::Serve { .. } | Command::McpBridge { .. }) {
         ONE_SHOT_CLI.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    match cli.command {
+    match command {
+        Command::Provider { command } => provider::run(command).await,
         Command::Serve {
             mode,
             insecure,
@@ -1751,6 +1763,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         // STAB-53: capture each spawned child's stderr under
         // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
         .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
+        .with_antigravity_state_root(config.data_dir.join("antigravity"))
         // Per-agent generated config files (`--mcp-config`, `--rules`,
         // pi-extension delivery) are written under the daemon-owned
         // `<data_dir>/agent-configs` instead of the global OS temp dir
@@ -6788,6 +6801,47 @@ mod tests {
         );
         assert_eq!(bind_value_display(&json!([])), None);
         assert_eq!(bind_value_display(&json!(true)), None);
+    }
+
+    #[test]
+    fn antigravity_login_cli_is_explicit_and_personal_only() {
+        let cli = Cli::try_parse_from([
+            "intentd",
+            "provider",
+            "login",
+            "antigravity",
+            "--path",
+            "/custom/antigravity-acp",
+        ])
+        .unwrap();
+        let Command::Provider { command } = cli.command else {
+            panic!("provider command")
+        };
+        assert!(!command.is_internal_helper());
+        let provider::ProviderCommand::Login { provider, path } = command else {
+            panic!("login command")
+        };
+        assert_eq!(provider, "antigravity");
+        assert_eq!(path, Some(PathBuf::from("/custom/antigravity-acp")));
+        assert!(Cli::try_parse_from(["intentd", "provider", "login", "oauth-business"]).is_err());
+        assert!(Cli::try_parse_from(["intentd", "provider", "login"]).is_err());
+    }
+
+    #[test]
+    fn antigravity_internal_helpers_skip_daemon_logging() {
+        for helper in ["antigravity-browser-guard", "antigravity-login-url"] {
+            let cli = Cli::try_parse_from([
+                "intentd",
+                "provider",
+                helper,
+                "https://accounts.google.com/o/oauth2/v2/auth?state=fixture",
+            ])
+            .unwrap();
+            let Command::Provider { command } = cli.command else {
+                panic!("provider command")
+            };
+            assert!(command.is_internal_helper());
+        }
     }
 
     #[test]

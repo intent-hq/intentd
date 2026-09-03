@@ -562,8 +562,9 @@ async fn droid_source_serves_gated_empty_list_by_default() {
 }
 
 #[test]
-fn registry_covers_all_nine_providers() {
+fn registry_covers_dynamic_providers() {
     for provider in [
+        "antigravity",
         "auggie",
         "cortex",
         "claude-code",
@@ -827,20 +828,37 @@ fn cached_catalog_claims_matches_bare_and_compound_row_ids() {
     );
     // Exact bare id and the bare part of a self-prefixed compound row id
     // both claim.
-    assert_eq!(cache.cached_catalog_claims("auggie", "fable-5"), Some(true));
-    assert_eq!(cache.cached_catalog_claims("auggie", "fable-6"), Some(true));
+    assert_eq!(
+        cache
+            .reader(None)
+            .cached_catalog_claims("auggie", "fable-5"),
+        Some(true)
+    );
+    assert_eq!(
+        cache
+            .reader(None)
+            .cached_catalog_claims("auggie", "fable-6"),
+        Some(true)
+    );
     // A foreign-prefixed row id is not an ownership claim.
     assert_eq!(
-        cache.cached_catalog_claims("auggie", "foreign-model"),
+        cache
+            .reader(None)
+            .cached_catalog_claims("auggie", "foreign-model"),
         Some(false)
     );
     // Present catalog without the id is affirmative disproof.
     assert_eq!(
-        cache.cached_catalog_claims("auggie", "grok-4-fast"),
+        cache
+            .reader(None)
+            .cached_catalog_claims("auggie", "grok-4-fast"),
         Some(false)
     );
     // Prefix/substring must not match.
-    assert_eq!(cache.cached_catalog_claims("auggie", "fable"), Some(false));
+    assert_eq!(
+        cache.reader(None).cached_catalog_claims("auggie", "fable"),
+        Some(false)
+    );
 }
 
 #[test]
@@ -857,30 +875,41 @@ fn cached_effort_levels_reads_matching_row() {
         1_000,
     );
     assert_eq!(
-        cache.cached_effort_levels("fable-5"),
+        cache.reader(None).cached_effort_levels("fable-5"),
         Some(vec!["low".to_string(), "high".to_string()])
     );
     // A compound id scopes the search to its provider and matches the bare part.
     assert_eq!(
-        cache.cached_effort_levels("auggie:fable-5"),
+        cache.reader(None).cached_effort_levels("auggie:fable-5"),
         Some(vec!["low".to_string(), "high".to_string()])
     );
     // A row that declares no levels, an unknown id, and a foreign-scoped
     // compound id all carry no evidence.
-    assert_eq!(cache.cached_effort_levels("fable-6"), None);
-    assert_eq!(cache.cached_effort_levels("unknown-model"), None);
-    assert_eq!(cache.cached_effort_levels("grok:fable-5"), None);
+    assert_eq!(cache.reader(None).cached_effort_levels("fable-6"), None);
+    assert_eq!(
+        cache.reader(None).cached_effort_levels("unknown-model"),
+        None
+    );
+    assert_eq!(
+        cache.reader(None).cached_effort_levels("grok:fable-5"),
+        None
+    );
 }
 
 #[test]
 fn cached_catalog_claims_none_without_usable_entry() {
     let cache = ModelCatalogCache::new(None);
     // No entry at all → no evidence.
-    assert_eq!(cache.cached_catalog_claims("grok", "fable-5"), None);
+    assert_eq!(
+        cache.reader(None).cached_catalog_claims("grok", "fable-5"),
+        None
+    );
     // Unregistered provider id → no evidence.
     cache.store("not-a-provider", "", rows("fable-5"), 1_000);
     assert_eq!(
-        cache.cached_catalog_claims("not-a-provider", "fable-5"),
+        cache
+            .reader(None)
+            .cached_catalog_claims("not-a-provider", "fable-5"),
         None
     );
     // Version-key mismatch (stale pin) → the entry is not evidence.
@@ -890,7 +919,10 @@ fn cached_catalog_claims_none_without_usable_entry() {
         vec![json!({ "id": "fable-5", "name": "x", "provider": "codex" })],
         1_000,
     );
-    assert_eq!(cache.cached_catalog_claims("codex", "fable-5"), None);
+    assert_eq!(
+        cache.reader(None).cached_catalog_claims("codex", "fable-5"),
+        None
+    );
 }
 
 #[test]
@@ -907,7 +939,7 @@ fn cached_default_model_reads_is_default_row() {
         1_000,
     );
     assert_eq!(
-        cache.cached_default_model("auggie"),
+        cache.reader(None).cached_default_model("auggie"),
         Some("sonnet5".to_string())
     );
 }
@@ -916,7 +948,7 @@ fn cached_default_model_reads_is_default_row() {
 fn cached_default_model_none_without_usable_entry() {
     let cache = ModelCatalogCache::new(None);
     // No entry at all → None.
-    assert_eq!(cache.cached_default_model("auggie"), None);
+    assert_eq!(cache.reader(None).cached_default_model("auggie"), None);
     // Catalog without an isDefault row (including an explicit false) → None.
     cache.store(
         "auggie",
@@ -928,7 +960,7 @@ fn cached_default_model_none_without_usable_entry() {
         ],
         1_000,
     );
-    assert_eq!(cache.cached_default_model("auggie"), None);
+    assert_eq!(cache.reader(None).cached_default_model("auggie"), None);
     // Unregistered provider id → None.
     cache.store(
         "not-a-provider",
@@ -939,7 +971,10 @@ fn cached_default_model_none_without_usable_entry() {
         ],
         1_000,
     );
-    assert_eq!(cache.cached_default_model("not-a-provider"), None);
+    assert_eq!(
+        cache.reader(None).cached_default_model("not-a-provider"),
+        None
+    );
     // Version-key mismatch (stale pin) → the entry is not usable.
     cache.store(
         "codex",
@@ -948,13 +983,16 @@ fn cached_default_model_none_without_usable_entry() {
                      "isDefault": true })],
         1_000,
     );
-    assert_eq!(cache.cached_default_model("codex"), None);
+    assert_eq!(cache.reader(None).cached_default_model("codex"), None);
 }
 
 #[test]
 fn providers_claiming_model_cached_walks_registry() {
     let cache = ModelCatalogCache::new(None);
-    assert!(cache.providers_claiming_model_cached("fable-5").is_empty());
+    assert!(cache
+        .reader(None)
+        .providers_claiming_model_cached("fable-5")
+        .is_empty());
     cache.store(
         "auggie",
         AUGGIE_CATALOG_VERSION,
@@ -968,11 +1006,130 @@ fn providers_claiming_model_cached_walks_registry() {
         1_000,
     );
     assert_eq!(
-        cache.providers_claiming_model_cached("fable-5"),
+        cache
+            .reader(None)
+            .providers_claiming_model_cached("fable-5"),
         vec!["auggie".to_string()]
     );
     assert_eq!(
-        cache.providers_claiming_model_cached("grok-4-fast"),
+        cache
+            .reader(None)
+            .providers_claiming_model_cached("grok-4-fast"),
         vec!["grok".to_string()]
     );
+}
+
+#[cfg(unix)]
+fn antigravity_executables() -> (tempfile::TempDir, String, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = ["provider-a", "provider-b"]
+        .into_iter()
+        .map(|name| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 99\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path.to_str().unwrap().to_string()
+        })
+        .collect();
+    (dir, paths[0].clone(), paths[1].clone())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_identity_scopes_persisted_fallback_and_cache_only_evidence() {
+    let (dir, a, b) = antigravity_executables();
+    let key_a = AntigravityModelSource::resolve(Some(&a)).version_key;
+    let key_b = AntigravityModelSource::resolve(Some(&b)).version_key;
+    assert_ne!(key_a, key_b);
+    let path = dir.path().join("models.json");
+    let cache = Arc::new(ModelCatalogCache::new(Some(path.clone())));
+    let models = vec![json!({"id":"model-a", "isDefault":true, "effortLevels":["high"]})];
+    cache.store("antigravity", "", models.clone(), 1);
+    assert_eq!(
+        cache
+            .reader(Some(a.clone()))
+            .cached_default_model("antigravity"),
+        None
+    );
+    cache.store("antigravity", &key_a, models, 1);
+    let a_reader = cache.reader(Some(a.clone()));
+    assert_eq!(
+        a_reader.cached_default_model("antigravity").as_deref(),
+        Some("model-a")
+    );
+    assert_eq!(
+        a_reader.cached_catalog_claims("antigravity", "model-a"),
+        Some(true)
+    );
+    assert_eq!(
+        a_reader.cached_effort_levels("antigravity:model-a"),
+        Some(vec!["high".into()])
+    );
+    assert!(a_reader
+        .providers_claiming_model_cached("model-a")
+        .contains(&"antigravity".into()));
+    let cache = Arc::new(ModelCatalogCache::new(Some(path)));
+    let reader = cache.reader(Some(b));
+    assert_eq!(reader.cached_default_model("antigravity"), None);
+    assert_eq!(reader.cached_default_or_first_model("antigravity"), None);
+    assert_eq!(reader.cached_catalog_claims("antigravity", "model-a"), None);
+    assert_eq!(reader.cached_effort_levels("antigravity:model-a"), None);
+    assert!(!reader
+        .providers_claiming_model_cached("model-a")
+        .contains(&"antigravity".into()));
+    let failed = resolve_with_cache(&cache, "antigravity", &key_b, false, 2, failing_fetch()).await;
+    assert!(
+        failed.models.is_none(),
+        "A cannot be B's last-good fallback"
+    );
+    let fresh =
+        resolve_with_cache(&cache, "antigravity", &key_a, false, 2, panicking_fetch()).await;
+    assert_eq!(fresh.models.unwrap()[0]["id"], "model-a");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_inflight_and_negative_results_cannot_cross_executables() {
+    let (_dir, a, b) = antigravity_executables();
+    let key_a = AntigravityModelSource::resolve(Some(&a)).version_key;
+    let key_b = AntigravityModelSource::resolve(Some(&b)).version_key;
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let other = cache.clone();
+    let old_key = key_a.clone();
+    let pending = tokio::spawn(async move {
+        resolve_with_cache(&other, "antigravity", &old_key, false, 1, || {
+            Box::pin(async {
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                ModelFetchResult {
+                    models: Some(rows("model-a")),
+                    warning: None,
+                }
+            })
+        })
+        .await
+    });
+    started_rx.await.unwrap();
+    let b_result =
+        resolve_with_cache(&cache, "antigravity", &key_b, false, 1, ok_fetch("model-b")).await;
+    assert_eq!(b_result.models.unwrap()[0]["id"], "model-b");
+    finish_tx.send(()).unwrap();
+    assert_eq!(pending.await.unwrap().models.unwrap()[0]["id"], "model-a");
+    let b_result =
+        resolve_with_cache(&cache, "antigravity", &key_b, false, 2, ok_fetch("model-b")).await;
+    assert_eq!(b_result.models.unwrap()[0]["id"], "model-b");
+    let _ = resolve_with_cache(&cache, "antigravity", &key_a, true, 3, failing_fetch()).await;
+    let b_result = resolve_with_cache(
+        &cache,
+        "antigravity",
+        &key_b,
+        true,
+        3,
+        ok_fetch("model-b-new"),
+    )
+    .await;
+    assert_eq!(b_result.models.unwrap()[0]["id"], "model-b-new");
 }

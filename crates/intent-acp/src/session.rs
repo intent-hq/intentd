@@ -308,10 +308,25 @@ pub async fn set_session_config_option(
     config_id: &str,
     value: &str,
 ) -> AcpResult<()> {
+    set_session_config_option_response(conn, session_id, config_id, value).await?;
+    Ok(())
+}
+
+/// Apply a config option and retain the response for providers that require
+/// confirmation of the exact selected value before a prompt may run.
+///
+/// # Errors
+///
+/// Propagates the transport/RPC error if the request fails.
+pub async fn set_session_config_option_response(
+    conn: &Connection,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) -> AcpResult<Value> {
     let params =
         serde_json::json!({ "sessionId": session_id, "configId": config_id, "value": value });
-    conn.request("session/set_config_option", params).await?;
-    Ok(())
+    conn.request("session/set_config_option", params).await
 }
 
 /// `session/cancel` to interrupt the current turn (fire-and-forget notification;
@@ -504,7 +519,36 @@ fn unwrap_codex_mcp_input(raw_input: Option<&Value>) -> Option<(Value, String)> 
 /// yields `read_note` while other servers keep the `{server}_{tool}` name.
 /// Otherwise the input passes through verbatim and the name derives from the
 /// ACP `title`.
-fn resolve_input_and_name(title: &str, raw_input: Option<&Value>) -> (Value, String) {
+fn resolve_input_and_name(
+    title: &str,
+    raw_input: Option<&Value>,
+    meta: Option<&serde_json::Map<String, Value>>,
+) -> (Value, String) {
+    // Antigravity wraps MCP arguments and identifies the tool in ACP metadata.
+    // Require both captured markers and the matching title to avoid unwrapping
+    // an unrelated provider's legitimate `arguments` parameter.
+    if let Some(meta) = meta.filter(|meta| meta.get("is_mcp_tool_call") == Some(&Value::Bool(true)))
+    {
+        if let (Some(server), Some(tool), Some(arguments)) = (
+            meta.get("mcp")
+                .and_then(|m| m.get("server"))
+                .and_then(Value::as_str),
+            meta.get("mcp")
+                .and_then(|m| m.get("tool"))
+                .and_then(Value::as_str),
+            raw_input
+                .and_then(|v| v.get("arguments"))
+                .and_then(Value::as_object),
+        ) {
+            if title == format!("{server}_{tool}") {
+                let mut input = arguments.clone();
+                if let Some(acp_title) = raw_input.and_then(|v| v.get("_acpTitle")) {
+                    input.insert("_acpTitle".into(), acp_title.clone());
+                }
+                return (Value::Object(input), strip_workspace_mcp_affix(title));
+            }
+        }
+    }
     if let Some((input, rewritten)) = unwrap_codex_mcp_input(raw_input) {
         let name = derive_tool_name(&rewritten, Some(&input));
         return (input, name);
@@ -516,7 +560,11 @@ fn resolve_input_and_name(title: &str, raw_input: Option<&Value>) -> (Value, Str
 /// Map a fresh `tool_call` (status defaults to "started").
 fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
     let title = tool_call.title.clone();
-    let (input, tool_name) = resolve_input_and_name(&title, tool_call.raw_input.as_ref());
+    let (input, tool_name) = resolve_input_and_name(
+        &title,
+        tool_call.raw_input.as_ref(),
+        tool_call.meta.as_ref(),
+    );
     MappedToolCall {
         tool_call_id: tool_call.tool_call_id.0.to_string(),
         tool_kind: tool_kind_word(tool_call.kind, &tool_name),
@@ -532,7 +580,8 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
 fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
     let fields = &update.fields;
     let title = fields.title.clone().unwrap_or_default();
-    let (input, tool_name) = resolve_input_and_name(&title, fields.raw_input.as_ref());
+    let (input, tool_name) =
+        resolve_input_and_name(&title, fields.raw_input.as_ref(), update.meta.as_ref());
     MappedToolCall {
         tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
         // A bare progress update (no status) is still mid-flight → "started".
@@ -637,6 +686,22 @@ pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
 /// first match wins.
 fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
     let obj = input.as_object()?;
+    // Official Antigravity ACP frames. Require the captured input shapes;
+    // do not infer tool identity from arbitrary prose titles.
+    if is_non_empty_string(obj.get("CommandLine")) && is_non_empty_string(obj.get("Cwd")) {
+        return Some("run_command".to_string());
+    }
+    if title == "Running client_view_file" && is_non_empty_string(obj.get("absolute_path")) {
+        return Some("client_view_file".to_string());
+    }
+    if matches!(
+        title,
+        "Run client_create_file?" | "Running client_create_file"
+    ) && is_non_empty_string(obj.get("target_file"))
+        && obj.get("code_content").and_then(Value::as_str).is_some()
+    {
+        return Some("client_create_file".to_string());
+    }
     // command ∈ {str_replace, insert, create} → str-replace-editor
     if let Some(cmd) = obj.get("command").and_then(Value::as_str) {
         if matches!(cmd, "str_replace" | "insert" | "create") {

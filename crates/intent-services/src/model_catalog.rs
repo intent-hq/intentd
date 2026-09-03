@@ -114,6 +114,41 @@ fn no_version() -> String {
     String::new()
 }
 
+/// Resolve once so the cache key and probe refer to the same executable.
+/// No provider process is started by this lookup or by cache-only readers.
+pub(crate) struct AntigravityModelSource {
+    pub binary: Option<PathBuf>,
+    pub version_key: String,
+}
+
+impl AntigravityModelSource {
+    pub(crate) fn resolve(explicit_path: Option<&str>) -> Self {
+        use sha2::{Digest, Sha256};
+        let binary =
+            intent_providers::find_provider_binary("antigravity", "antigravity-acp", explicit_path);
+        let version_key = binary.as_ref().map_or_else(
+            || "antigravity-executable-v1:missing".to_string(),
+            |path| {
+                use std::fmt::Write;
+                Sha256::digest(path.as_os_str().as_encoded_bytes())
+                    .iter()
+                    .fold("antigravity-executable-v1:".to_string(), |mut key, byte| {
+                        let _ = write!(key, "{byte:02x}");
+                        key
+                    })
+            },
+        );
+        Self {
+            binary,
+            version_key,
+        }
+    }
+}
+
+fn antigravity_version_key() -> String {
+    AntigravityModelSource::resolve(None).version_key
+}
+
 /// Auggie catalog wire-shape version. Bump when daemon-side filtering or
 /// metadata projection changes so persisted rows from the old shape cannot be
 /// served indefinitely by the last-good cache.
@@ -172,7 +207,9 @@ fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
 /// Adapt a completed [`crate::provider_models`] fetch into the cache's fetch
 /// result (same `Option<rows>` + warning semantics, so a probe failure flows
 /// into the cache's last-good/stale fallback).
-fn from_provider_fetch(fetched: crate::provider_models::ProviderModelsFetch) -> ModelFetchResult {
+pub(crate) fn from_provider_fetch(
+    fetched: crate::provider_models::ProviderModelsFetch,
+) -> ModelFetchResult {
     ModelFetchResult {
         models: fetched.models,
         warning: fetched.warning,
@@ -268,6 +305,11 @@ fn unsloth_fetch() -> BoxFuture<'static, ModelFetchResult> {
 /// The provider→source registry: every provider with a daemon-side model
 /// source.
 static SOURCES: &[ModelSource] = &[
+    ModelSource {
+        provider_id: "antigravity",
+        version_key: antigravity_version_key,
+        fetch: || provider_models_fetch("antigravity"),
+    },
     ModelSource {
         provider_id: "auggie",
         version_key: auggie_catalog_version,
@@ -375,7 +417,198 @@ pub(crate) struct ModelCatalogCache {
     refresh_permits: tokio::sync::Semaphore,
 }
 
+/// A probe-free catalog view using a snapshot of the effective provider settings.
+pub(crate) struct ModelCatalogReader<'a> {
+    cache: &'a ModelCatalogCache,
+    antigravity_path: Option<String>,
+}
+
+impl crate::Services {
+    pub(crate) fn cached_models(&self) -> ModelCatalogReader<'_> {
+        self.models_catalog.reader(
+            self.effective_settings()
+                .providers
+                .paths
+                .get("antigravity")
+                .cloned(),
+        )
+    }
+}
+
+impl ModelCatalogReader<'_> {
+    fn version_key(&self, source: &ModelSource) -> String {
+        if source.provider_id == "antigravity" {
+            AntigravityModelSource::resolve(self.antigravity_path.as_deref()).version_key
+        } else {
+            (source.version_key)()
+        }
+    }
+
+    /// Cached-catalog ownership evidence for one provider (monorepo#607):
+    /// `Some(claims)` when `provider_id` holds an in-memory last-good entry
+    /// under its **current** registry version key ([`source_for`]), `None`
+    /// when there is no usable entry (unregistered provider, no entry, or a
+    /// version-key mismatch — stale-pin entries are not evidence).
+    /// Synchronous and read-only: no probe, no negative-cache interaction —
+    /// the bare-model ownership guard must never block on or trigger a fetch.
+    /// Trade-off of consulting entries regardless of age: a `Some(false)`
+    /// disproof can outlive the provider's real catalog (e.g. a model added
+    /// upstream after the last fetch keeps being rejected until the entry
+    /// ages past [`MODELS_STALE_AFTER`] and a `models.list` read — or a
+    /// forced refresh — replaces it); a stale entry is repaired by the next
+    /// catalog refresh, so callers are never wedged for good.
+    pub(crate) fn cached_catalog_claims(&self, provider_id: &str, bare_id: &str) -> Option<bool> {
+        let source = source_for(provider_id)?;
+        let version_key = self.version_key(source);
+        let entries = self
+            .cache
+            .entries
+            .lock()
+            .expect("model catalog cache poisoned");
+        let entry = entries.get(provider_id)?;
+        (entry.version_key == version_key)
+            .then(|| rows_claim_model(provider_id, &entry.models, bare_id))
+    }
+
+    /// The cached catalog's default-model id for `provider_id` (PROTOCOL
+    /// §5.5 "Creation-time default-model resolution", catalog-default rung):
+    /// the `id` of the row marked `isDefault: true` in the provider's
+    /// last-good entry under its **current** registry version key
+    /// ([`source_for`]). Synchronous, read-only, and probe-free like
+    /// [`Self::cached_catalog_claims`]: the creation path must never block on
+    /// or trigger a fetch — an unregistered provider, cold cache, stale-pin
+    /// entry, or a catalog with no marked row all return `None` (the provider
+    /// CLI default applies). The registry version-key function runs only when
+    /// a cached entry with a marked row exists — for codex it resolves the
+    /// `codex-acp` binary (an enhanced-PATH scan whose first call can block on
+    /// the login-shell PATH capture), a cost the cold-cache fall-through must
+    /// not pay; it also runs outside the cache lock so a slow first capture
+    /// never stalls other cache readers.
+    pub(crate) fn cached_default_model(&self, provider_id: &str) -> Option<String> {
+        let source = source_for(provider_id)?;
+        let (entry_version_key, default_id) = {
+            let entries = self
+                .cache
+                .entries
+                .lock()
+                .expect("model catalog cache poisoned");
+            let entry = entries.get(provider_id)?;
+            let default_id = entry
+                .models
+                .iter()
+                .find(|row| row.get("isDefault").and_then(Value::as_bool) == Some(true))
+                .and_then(|row| row.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            (entry.version_key.clone(), default_id)
+        };
+        (entry_version_key == self.version_key(source)).then_some(default_id)
+    }
+
+    /// The cached catalog's default-model id for `provider_id`, falling back
+    /// to the FIRST row of the provider's last-good entry when no row is
+    /// marked `isDefault` (default-provider self-heal, monorepo#3044). Same
+    /// synchronous, read-only, probe-free contract as
+    /// [`Self::cached_default_model`]: an unregistered provider, cold cache,
+    /// stale-pin entry, or an empty catalog all return `None` (the caller
+    /// then persists the provider without a model).
+    pub(crate) fn cached_default_or_first_model(&self, provider_id: &str) -> Option<String> {
+        if let Some(m) = self.cached_default_model(provider_id) {
+            return Some(m);
+        }
+        let source = source_for(provider_id)?;
+        let (entry_version_key, first_id) = {
+            let entries = self
+                .cache
+                .entries
+                .lock()
+                .expect("model catalog cache poisoned");
+            let entry = entries.get(provider_id)?;
+            let first_id = entry
+                .models
+                .first()
+                .and_then(|row| row.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            (entry.version_key.clone(), first_id)
+        };
+        (entry_version_key == self.version_key(source)).then_some(first_id)
+    }
+
+    /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).
+    /// `model_id` is a bare id (searched across every registered provider in
+    /// registry order); a legacy compound `provider:model` value from an old
+    /// session row still restricts the search to its named provider.
+    /// Returns the first non-empty `effortLevels` list found
+    /// on a matching cached row, or `None` when there is no evidence — no
+    /// cached entry, no matching row, or a row that declares no levels.
+    /// Synchronous, read-only, and probe-free like
+    /// [`Self::cached_catalog_claims`]: the delegation effort guard must never
+    /// block on a catalog fetch, and absence of evidence is never a rejection.
+    pub(crate) fn cached_effort_levels(&self, model_id: &str) -> Option<Vec<String>> {
+        let (scoped_provider, bare_id) = match model_id.split_once(':') {
+            Some((prefix, bare)) if source_for(prefix).is_some() => (Some(prefix), bare),
+            _ => (None, model_id),
+        };
+        let entries = self
+            .cache
+            .entries
+            .lock()
+            .expect("model catalog cache poisoned");
+        for source in SOURCES {
+            if scoped_provider.is_some_and(|p| p != source.provider_id) {
+                continue;
+            }
+            let Some(entry) = entries.get(source.provider_id) else {
+                continue;
+            };
+            if entry.version_key != self.version_key(source) {
+                continue;
+            }
+            let levels = entry
+                .models
+                .iter()
+                .find(|row| {
+                    row.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| row_id_matches(source.provider_id, id, bare_id))
+                })
+                .and_then(|row| row.get("effortLevels"))
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<String>>()
+                })
+                .filter(|levels| !levels.is_empty());
+            if levels.is_some() {
+                return levels;
+            }
+        }
+        None
+    }
+
+    /// Provider ids whose cached catalog claims `bare_id` (see
+    /// [`Self::cached_catalog_claims`]), in registry order.
+    pub(crate) fn providers_claiming_model_cached(&self, bare_id: &str) -> Vec<String> {
+        SOURCES
+            .iter()
+            .filter(|s| self.cached_catalog_claims(s.provider_id, bare_id) == Some(true))
+            .map(|s| s.provider_id.to_string())
+            .collect()
+    }
+}
+
 impl ModelCatalogCache {
+    pub(crate) fn reader(&self, antigravity_path: Option<String>) -> ModelCatalogReader<'_> {
+        ModelCatalogReader {
+            cache: self,
+            antigravity_path,
+        }
+    }
+
     /// Build the cache, seeding from `persist_path` when it holds a readable
     /// current-version snapshot (corrupt/old files are ignored, not errors).
     pub(crate) fn new(persist_path: Option<PathBuf>) -> Self {
@@ -425,152 +658,12 @@ impl ModelCatalogCache {
             .then(|| entry.models.clone())
     }
 
-    /// Cached-catalog ownership evidence for one provider (monorepo#607):
-    /// `Some(claims)` when `provider_id` holds an in-memory last-good entry
-    /// under its **current** registry version key ([`source_for`]), `None`
-    /// when there is no usable entry (unregistered provider, no entry, or a
-    /// version-key mismatch — stale-pin entries are not evidence).
-    /// Synchronous and read-only: no probe, no negative-cache interaction —
-    /// the bare-model ownership guard must never block on or trigger a fetch.
-    /// Trade-off of consulting entries regardless of age: a `Some(false)`
-    /// disproof can outlive the provider's real catalog (e.g. a model added
-    /// upstream after the last fetch keeps being rejected until the entry
-    /// ages past [`MODELS_STALE_AFTER`] and a `models.list` read — or a
-    /// forced refresh — replaces it); a stale entry is repaired by the next
-    /// catalog refresh, so callers are never wedged for good.
-    pub(crate) fn cached_catalog_claims(&self, provider_id: &str, bare_id: &str) -> Option<bool> {
-        let source = source_for(provider_id)?;
-        let version_key = (source.version_key)();
-        let entries = self.entries.lock().expect("model catalog cache poisoned");
-        let entry = entries.get(provider_id)?;
-        (entry.version_key == version_key)
-            .then(|| rows_claim_model(provider_id, &entry.models, bare_id))
-    }
-
-    /// The cached catalog's default-model id for `provider_id` (PROTOCOL
-    /// §5.5 "Creation-time default-model resolution", catalog-default rung):
-    /// the `id` of the row marked `isDefault: true` in the provider's
-    /// last-good entry under its **current** registry version key
-    /// ([`source_for`]). Synchronous, read-only, and probe-free like
-    /// [`Self::cached_catalog_claims`]: the creation path must never block on
-    /// or trigger a fetch — an unregistered provider, cold cache, stale-pin
-    /// entry, or a catalog with no marked row all return `None` (the provider
-    /// CLI default applies). The registry version-key function runs only when
-    /// a cached entry with a marked row exists — for codex it resolves the
-    /// `codex-acp` binary (an enhanced-PATH scan whose first call can block on
-    /// the login-shell PATH capture), a cost the cold-cache fall-through must
-    /// not pay; it also runs outside the cache lock so a slow first capture
-    /// never stalls other cache readers.
-    pub(crate) fn cached_default_model(&self, provider_id: &str) -> Option<String> {
-        let source = source_for(provider_id)?;
-        let (entry_version_key, default_id) = {
-            let entries = self.entries.lock().expect("model catalog cache poisoned");
-            let entry = entries.get(provider_id)?;
-            let default_id = entry
-                .models
-                .iter()
-                .find(|row| row.get("isDefault").and_then(Value::as_bool) == Some(true))
-                .and_then(|row| row.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)?;
-            (entry.version_key.clone(), default_id)
-        };
-        (entry_version_key == (source.version_key)()).then_some(default_id)
-    }
-
-    /// The cached catalog's default-model id for `provider_id`, falling back
-    /// to the FIRST row of the provider's last-good entry when no row is
-    /// marked `isDefault` (default-provider self-heal, monorepo#3044). Same
-    /// synchronous, read-only, probe-free contract as
-    /// [`Self::cached_default_model`]: an unregistered provider, cold cache,
-    /// stale-pin entry, or an empty catalog all return `None` (the caller
-    /// then persists the provider without a model).
-    pub(crate) fn cached_default_or_first_model(&self, provider_id: &str) -> Option<String> {
-        if let Some(m) = self.cached_default_model(provider_id) {
-            return Some(m);
-        }
-        let source = source_for(provider_id)?;
-        let (entry_version_key, first_id) = {
-            let entries = self.entries.lock().expect("model catalog cache poisoned");
-            let entry = entries.get(provider_id)?;
-            let first_id = entry
-                .models
-                .first()
-                .and_then(|row| row.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)?;
-            (entry.version_key.clone(), first_id)
-        };
-        (entry_version_key == (source.version_key)()).then_some(first_id)
-    }
-
-    /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).
-    /// `model_id` is a bare id (searched across every registered provider in
-    /// registry order); a legacy compound `provider:model` value from an old
-    /// session row still restricts the search to its named provider.
-    /// Returns the first non-empty `effortLevels` list found
-    /// on a matching cached row, or `None` when there is no evidence — no
-    /// cached entry, no matching row, or a row that declares no levels.
-    /// Synchronous, read-only, and probe-free like
-    /// [`Self::cached_catalog_claims`]: the delegation effort guard must never
-    /// block on a catalog fetch, and absence of evidence is never a rejection.
-    pub(crate) fn cached_effort_levels(&self, model_id: &str) -> Option<Vec<String>> {
-        let (scoped_provider, bare_id) = match model_id.split_once(':') {
-            Some((prefix, bare)) if source_for(prefix).is_some() => (Some(prefix), bare),
-            _ => (None, model_id),
-        };
-        let entries = self.entries.lock().expect("model catalog cache poisoned");
-        for source in SOURCES {
-            if scoped_provider.is_some_and(|p| p != source.provider_id) {
-                continue;
-            }
-            let Some(entry) = entries.get(source.provider_id) else {
-                continue;
-            };
-            if entry.version_key != (source.version_key)() {
-                continue;
-            }
-            let levels = entry
-                .models
-                .iter()
-                .find(|row| {
-                    row.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| row_id_matches(source.provider_id, id, bare_id))
-                })
-                .and_then(|row| row.get("effortLevels"))
-                .and_then(Value::as_array)
-                .map(|levels| {
-                    levels
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<String>>()
-                })
-                .filter(|levels| !levels.is_empty());
-            if levels.is_some() {
-                return levels;
-            }
-        }
-        None
-    }
-
     /// Seed a cache entry from tests in other modules (the real
     /// [`Self::store`] is module-private). No persistence side effects: the
     /// snapshot write is skipped when no `persist_path` is configured.
     #[cfg(test)]
     pub(crate) fn store_for_test(&self, provider_id: &str, version_key: &str, models: Vec<Value>) {
         self.store(provider_id, version_key, models, Self::now_ms());
-    }
-
-    /// Provider ids whose cached catalog claims `bare_id` (see
-    /// [`Self::cached_catalog_claims`]), in registry order.
-    pub(crate) fn providers_claiming_model_cached(&self, bare_id: &str) -> Vec<String> {
-        SOURCES
-            .iter()
-            .filter(|s| self.cached_catalog_claims(s.provider_id, bare_id) == Some(true))
-            .map(|s| s.provider_id.to_string())
-            .collect()
     }
 
     /// Record a successful fetch and best-effort persist the snapshot. The

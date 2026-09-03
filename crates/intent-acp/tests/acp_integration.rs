@@ -449,6 +449,7 @@ fn build_inner(
     let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
     let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
     let hooks = ConnectionHooks {
+        auth_required_stdout_marker: None,
         requests: Some(req_tx),
         notifications: Some(note_tx),
         auth_error_patterns: auth_patterns,

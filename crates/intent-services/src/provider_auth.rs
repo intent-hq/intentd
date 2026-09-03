@@ -67,6 +67,7 @@ pub(crate) const AUTH_PROBE_PROVIDERS: &[&str] = &[
     "droid",
     "grok",
     "pi",
+    "antigravity",
 ];
 
 /// Timeout for one CLI auth probe (`auth status` / `login status` /
@@ -458,6 +459,9 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
             AuthVerdict::plain(crate::provider_models::probe_droid_auth(program.into()).await)
         }
         "pi" => AuthVerdict::plain(crate::provider_models::probe_pi_auth().await),
+        "antigravity" => {
+            AuthVerdict::plain(crate::provider_models::probe_antigravity_auth(program.into()).await)
+        }
         _ => AuthVerdict::default(),
     }
 }
@@ -553,6 +557,7 @@ fn resolve_probe_binary(
         "droid" => "droid",
         "grok" => "grok",
         "pi" => "pi",
+        "antigravity" => "antigravity-acp",
         _ => return None,
     };
     let override_applies =
@@ -1326,10 +1331,12 @@ mod tests {
     #[test]
     fn valid_override_resolves_install_gate() {
         let dir = unique_temp_dir("valid-override");
-        let bin = dir.path().join("droid");
-        make_executable(&bin);
-        let resolved = resolve_probe_binary("droid", Some(bin.to_str().unwrap()));
-        assert_eq!(resolved, Some(bin.into_os_string()));
+        for provider in ["droid", "antigravity"] {
+            let bin = dir.path().join(provider);
+            make_executable(&bin);
+            let resolved = resolve_probe_binary(provider, Some(bin.to_str().unwrap()));
+            assert_eq!(resolved, Some(bin.into_os_string()));
+        }
     }
 
     /// An invalid override (missing / relative / non-executable) keeps the

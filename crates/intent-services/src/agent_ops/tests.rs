@@ -12698,27 +12698,49 @@ fn effort_guard_rejects_only_against_cached_evidence() {
         ],
     );
     // Evidence present and the level is listed (case-insensitively) → pass.
-    assert!(
-        ensure_effort_supported_by_model("agent.delegate", &cache, Some("fable-5"), "high").is_ok()
-    );
-    assert!(
-        ensure_effort_supported_by_model("agent.delegate", &cache, Some("fable-5"), "HIGH").is_ok()
-    );
+    assert!(ensure_effort_supported_by_model(
+        "agent.delegate",
+        &cache.reader(None),
+        Some("fable-5"),
+        "high"
+    )
+    .is_ok());
+    assert!(ensure_effort_supported_by_model(
+        "agent.delegate",
+        &cache.reader(None),
+        Some("fable-5"),
+        "HIGH"
+    )
+    .is_ok());
     // Evidence present and the level is absent → -32602 naming valid values.
-    let err = ensure_effort_supported_by_model("agent.delegate", &cache, Some("fable-5"), "xhigh")
-        .expect_err("unsupported level rejected");
+    let err = ensure_effort_supported_by_model(
+        "agent.delegate",
+        &cache.reader(None),
+        Some("fable-5"),
+        "xhigh",
+    )
+    .expect_err("unsupported level rejected");
     let msg = err.to_string();
     assert!(msg.contains("xhigh") && msg.contains("low, high"), "{msg}");
     // No evidence (row without levels, unknown model, no model) → pass through.
+    assert!(ensure_effort_supported_by_model(
+        "agent.delegate",
+        &cache.reader(None),
+        Some("sonnet5"),
+        "xhigh"
+    )
+    .is_ok());
+    assert!(ensure_effort_supported_by_model(
+        "agent.delegate",
+        &cache.reader(None),
+        Some("unknown"),
+        "xhigh"
+    )
+    .is_ok());
     assert!(
-        ensure_effort_supported_by_model("agent.delegate", &cache, Some("sonnet5"), "xhigh")
+        ensure_effort_supported_by_model("agent.delegate", &cache.reader(None), None, "xhigh")
             .is_ok()
     );
-    assert!(
-        ensure_effort_supported_by_model("agent.delegate", &cache, Some("unknown"), "xhigh")
-            .is_ok()
-    );
-    assert!(ensure_effort_supported_by_model("agent.delegate", &cache, None, "xhigh").is_ok());
 }
 
 /// `agent.create` applies the same effort guard as `agent.delegate` /

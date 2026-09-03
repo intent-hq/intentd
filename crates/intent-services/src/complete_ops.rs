@@ -93,7 +93,7 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
 /// (monorepo#1729).
 fn resolve_quick_action_model(
     settings: &intent_core::settings_file::SettingsFile,
-    catalog: &crate::model_catalog::ModelCatalogCache,
+    catalog: &crate::model_catalog::ModelCatalogReader<'_>,
     quick_action_type: Option<&str>,
     effective_provider: Option<&str>,
 ) -> Option<(String, Option<String>)> {
@@ -277,7 +277,7 @@ impl Services {
             },
             None => match resolve_quick_action_model(
                 &settings,
-                &self.models_catalog,
+                &self.cached_models(),
                 quick_action_type.as_deref(),
                 effective_provider.as_deref(),
             ) {
@@ -996,32 +996,52 @@ rl.on('line', (line) => {
         let catalog = empty_catalog();
         let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "haiku4.5")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("commit"), Some("auggie")),
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("commit"),
+                Some("auggie")
+            ),
             on("auggie", "haiku4.5")
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("pr"), Some("auggie")),
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("pr"),
+                Some("auggie")
+            ),
             on("auggie", "sonnet4.5")
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("not-a-type"), Some("auggie")),
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("not-a-type"),
+                Some("auggie")
+            ),
             on("auggie", "sonnet4.5")
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
+            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
             on("auggie", "sonnet4.5")
         );
 
         let blank = quick_action_settings(Some("  "), &[("commit", "")]);
         assert_eq!(
-            resolve_quick_action_model(&blank, &catalog, Some("commit"), Some("auggie")),
+            resolve_quick_action_model(
+                &blank,
+                &catalog.reader(None),
+                Some("commit"),
+                Some("auggie")
+            ),
             cli_default("auggie"),
             "blank values read as unset, not as an empty model id"
         );
         assert_eq!(
             resolve_quick_action_model(
                 &intent_core::settings_file::SettingsFile::default(),
-                &catalog,
+                &catalog.reader(None),
                 Some("commit"),
                 Some("auggie")
             ),
@@ -1037,12 +1057,12 @@ rl.on('line', (line) => {
         let catalog = empty_catalog();
         let settings = quick_action_settings(Some("auggie:sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
+            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
             on("auggie", "sonnet4.5")
         );
         let settings = quick_action_settings(Some("codex:gpt-5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
+            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
             on("codex", "gpt-5"),
             "a foreign registered prefix routes the one-shot to that provider"
         );
@@ -1056,20 +1076,20 @@ rl.on('line', (line) => {
         let catalog = empty_catalog();
         let compound = quick_action_settings(Some("codex:gpt-5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&compound, &catalog, None, None),
+            resolve_quick_action_model(&compound, &catalog.reader(None), None, None),
             on("codex", "gpt-5"),
             "a decidable compound rung must open the gate on its own"
         );
         let bare = quick_action_settings(Some("sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&bare, &catalog, None, None),
+            resolve_quick_action_model(&bare, &catalog.reader(None), None, None),
             None,
             "a bare rung with no effective provider must close the gate"
         );
         assert_eq!(
             resolve_quick_action_model(
                 &intent_core::settings_file::SettingsFile::default(),
-                &catalog,
+                &catalog.reader(None),
                 None,
                 None
             ),
@@ -1092,7 +1112,7 @@ rl.on('line', (line) => {
         ] {
             let settings = quick_action_settings(Some(legacy), &[]);
             assert_eq!(
-                resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
+                resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
                 cli_default("auggie"),
                 "{legacy} must fall through to the CLI default"
             );
@@ -1109,12 +1129,12 @@ rl.on('line', (line) => {
         for legacy in ["grok:m", "droid:m", "opencode:m"] {
             let settings = quick_action_settings(Some(legacy), &[]);
             assert_eq!(
-                resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
+                resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
                 cli_default("auggie"),
                 "{legacy} must fall through to the CLI default"
             );
             assert_eq!(
-                resolve_quick_action_model(&settings, &catalog, None, None),
+                resolve_quick_action_model(&settings, &catalog.reader(None), None, None),
                 None,
                 "{legacy} with no effective provider must close the gate"
             );
@@ -1122,7 +1142,7 @@ rl.on('line', (line) => {
         // The dropped override still falls to a capable default rung.
         let settings = quick_action_settings(Some("codex:gpt-5"), &[("commit", "grok:m")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("commit"), None),
+            resolve_quick_action_model(&settings, &catalog.reader(None), Some("commit"), None),
             on("codex", "gpt-5"),
             "a dropped non-one-shot override must fall to the default-model rung"
         );
@@ -1138,7 +1158,12 @@ rl.on('line', (line) => {
         let settings =
             quick_action_settings(Some("sonnet4.5"), &[("commit", "not-a-provider:haiku")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("commit"), Some("auggie")),
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("commit"),
+                Some("auggie")
+            ),
             on("auggie", "sonnet4.5"),
             "a dropped override must fall to the default-model rung"
         );
@@ -1146,7 +1171,12 @@ rl.on('line', (line) => {
         let settings =
             quick_action_settings(Some("bogus:gpt-5"), &[("commit", "not-a-provider:haiku")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("commit"), Some("auggie")),
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("commit"),
+                Some("auggie")
+            ),
             cli_default("auggie")
         );
     }
@@ -1159,7 +1189,12 @@ rl.on('line', (line) => {
         // while another provider claims it.
         let settings = quick_action_settings(Some("grok-4"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &empty_catalog(), None, Some("auggie")),
+            resolve_quick_action_model(
+                &settings,
+                &empty_catalog().reader(None),
+                None,
+                Some("auggie")
+            ),
             on("auggie", "grok-4"),
             "no cached evidence must not drop a bare id"
         );
@@ -1177,13 +1212,13 @@ rl.on('line', (line) => {
             vec![serde_json::json!({ "id": "grok-4", "provider": "grok" })],
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, Some("auggie")),
+            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
             cli_default("auggie"),
             "a bare id the effective provider's catalog disproves is dropped"
         );
         let owned = quick_action_settings(Some("sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&owned, &catalog, None, Some("auggie")),
+            resolve_quick_action_model(&owned, &catalog.reader(None), None, Some("auggie")),
             on("auggie", "sonnet4.5")
         );
         // The ownership guard applies to a compound rung's own pair too: a
@@ -1201,7 +1236,7 @@ rl.on('line', (line) => {
         );
         let foreign = quick_action_settings(Some("codex:sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&foreign, &catalog, None, Some("auggie")),
+            resolve_quick_action_model(&foreign, &catalog.reader(None), None, Some("auggie")),
             cli_default("auggie"),
             "a split pair failing its own provider's ownership guard drops"
         );

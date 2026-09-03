@@ -287,6 +287,15 @@ impl WorkspaceMcpServer {
         features
     }
 
+    /// Names exposed to this caller, for provider-native policy configuration.
+    #[must_use]
+    pub fn available_tool_names(&self) -> Vec<&'static str> {
+        self.available_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
+
     /// The tool definitions exposed to this agent (full registry minus denylist).
     pub(crate) fn available_tools(&self) -> Vec<&'static ToolDef> {
         tools::all_tools(self.is_chief)
