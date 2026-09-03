@@ -9159,9 +9159,12 @@ fn note_to_workspace_task(
 /// liveness). `agentIds` lists the same agents (forward-compat TS parity).
 /// `parentAgentId` (v2.9) carries the session's delegation parent (the value
 /// surfaced as `metadata.createdByAgentId` on full agent loads), omitted for
-/// root agents. Soft-deleted sessions (`AgentStatus::Deleted`) are excluded
-/// from `count`/`agents`/`agentIds` so clients never render deleted rows
-/// (mirrors the `workspace_attention_signals` filter).
+/// root agents. `isBackground` (monorepo#3789) carries the session's persisted
+/// `is_background` flag (the value surfaced as `metadata.isBackground` on
+/// full agent loads), omitted for foreground agents. Soft-deleted sessions
+/// (`AgentStatus::Deleted`) are excluded from `count`/`agents`/`agentIds` so
+/// clients never render deleted rows (mirrors the
+/// `workspace_attention_signals` filter).
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let live: Vec<&AgentSession> = sessions
         .iter()
@@ -9178,6 +9181,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             is_streaming: false,
             is_responding: false,
             parent_agent_id: s.parent_agent_id.clone(),
+            is_background: s.is_background,
         })
         .collect();
     let agent_ids: Vec<_> = live.iter().map(|s| s.id.clone()).collect();

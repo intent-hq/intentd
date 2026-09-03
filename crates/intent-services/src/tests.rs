@@ -388,10 +388,13 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         ))
         .await
         .unwrap();
-    // agent-2 is delegated by agent-1: `agentSummary` surfaces the session's
-    // delegation parent as `parentAgentId` (v2.9, additive).
+    // agent-2 is delegated by agent-1 and runs in the background:
+    // `agentSummary` surfaces the session's delegation parent as
+    // `parentAgentId` (v2.9, additive) and its persisted `is_background` flag
+    // as `isBackground` (monorepo#3789, additive).
     let mut delegated = mk_agent("agent-2", "Verifier", None, "2026-01-01T00:00:02Z");
     delegated.parent_agent_id = Some(AgentId::from("agent-1"));
+    delegated.is_background = true;
     store.insert_agent_session(&delegated).await.unwrap();
 
     // Hermetic root: the get/list enrichment probes the workspaces root for
@@ -411,10 +414,13 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         && a.specialist.as_deref() == Some("implementor")
         && !a.is_streaming
         && !a.is_responding
-        && a.parent_agent_id.is_none()));
-    // The delegated agent carries its parent's id (root agents omit it).
+        && a.parent_agent_id.is_none()
+        && !a.is_background));
+    // The delegated agent carries its parent's id (root agents omit it) and
+    // its background flag (foreground agents omit it).
     assert!(summary.agents.iter().any(|a| a.name == "Verifier"
-        && a.parent_agent_id.as_ref().map(AgentId::as_str) == Some("agent-1")));
+        && a.parent_agent_id.as_ref().map(AgentId::as_str) == Some("agent-1")
+        && a.is_background));
     // `agentIds` mirrors the agents used to build `agents` (forward-compat).
     let summary_ids: Vec<_> = summary.agent_ids.iter().map(|i| i.0.clone()).collect();
     let agent_ids: Vec<_> = summary.agents.iter().map(|a| a.id.0.clone()).collect();
@@ -436,6 +442,10 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         .get("parentAgentId")
         .is_none());
     assert_eq!(v["agentSummary"]["agents"][1]["parentAgentId"], "agent-1");
+    // `isBackground` wire shape (monorepo#3789): omitted (not false) on
+    // foreground agents, camelCased `true` on background ones.
+    assert!(v["agentSummary"]["agents"][0].get("isBackground").is_none());
+    assert_eq!(v["agentSummary"]["agents"][1]["isBackground"], true);
     assert_eq!(v["agentSummary"]["agentIds"][0], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"].as_array().unwrap().len(), 2);
     assert!(v.get("diffSummary").is_none());

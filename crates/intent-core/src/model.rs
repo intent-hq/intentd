@@ -808,6 +808,12 @@ pub struct WorkspaceAgentInfo {
     pub is_responding: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_agent_id: Option<AgentId>,
+    /// The session's persisted `is_background` flag (the same value served
+    /// as `metadata.isBackground` on `agent.list`/`agent.get`, §5.5), so
+    /// clients can gate background agents from the summary alone. Additive
+    /// (monorepo#3789): omitted when `false`, never `false` on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_background: bool,
 }
 
 /// `Workspace.agentSummary` card aggregate. The iOS coverflow reads the richer
@@ -5157,6 +5163,7 @@ mod tests {
             is_streaming: false,
             is_responding: false,
             parent_agent_id: Some(AgentId::from("agent-root")),
+            is_background: true,
         };
         let summary = WorkspaceAgentSummary {
             count: 1,
@@ -5192,6 +5199,9 @@ mod tests {
         assert_eq!(v["agents"][0]["isResponding"], false);
         // `parentAgentId` (v2.9): the delegating agent, camelCased on the wire.
         assert_eq!(v["agents"][0]["parentAgentId"], "agent-root");
+        // `isBackground` (monorepo#3789): present only when the session is
+        // background, camelCased on the wire.
+        assert_eq!(v["agents"][0]["isBackground"], true);
         // `agentIds` is emitted alongside `agents` (forward-compat TS parity).
         assert_eq!(v["agentIds"][0], "agent-1");
         assert_eq!(v["agentIds"].as_array().unwrap().len(), 1);
@@ -5606,8 +5616,10 @@ mod tests {
     }
 
     /// `WorkspaceAgentInfo` omits the optional `specialist`/`lastActivity`/
-    /// `parentAgentId` keys when absent (not `null`), while the non-optional
-    /// flags stay present.
+    /// `parentAgentId` keys when absent (not `null`) and the additive
+    /// `isBackground` flag when `false` (monorepo#3789), while the
+    /// non-optional flags stay present; a pre-#3789 payload without the key
+    /// deserializes as foreground.
     #[test]
     fn workspace_agent_info_optionals_absent() {
         let agent = WorkspaceAgentInfo {
@@ -5619,14 +5631,18 @@ mod tests {
             is_streaming: false,
             is_responding: false,
             parent_agent_id: None,
+            is_background: false,
         };
         let v = serde_json::to_value(&agent).unwrap();
         assert!(v.get("specialist").is_none());
         assert!(v.get("lastActivity").is_none());
         assert!(v.get("parentAgentId").is_none());
+        assert!(v.get("isBackground").is_none());
         assert_eq!(v["status"], "pending");
         assert_eq!(v["isStreaming"], false);
         assert_eq!(v["isResponding"], false);
+        let back: WorkspaceAgentInfo = serde_json::from_value(v).unwrap();
+        assert!(!back.is_background);
     }
 
     /// `AgentLite` carries the nested `metadata` object (`isBackground`/

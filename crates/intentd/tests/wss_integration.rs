@@ -1959,7 +1959,9 @@ async fn wss_agent_list_caps_previews_get_serves_full() {
 /// `tokenUsage` entirely (absent, never null) and archived rows additionally
 /// omit `agentSummary`, while active rows keep it; the `workspace.subscribe`
 /// seq-0 snapshot rows omit `tokenUsage` the same way; `workspace.get` keeps
-/// both fields for detail reads, archived included.
+/// both fields for detail reads, archived included. The active row's
+/// `agentSummary.agents[]` also carries the additive `isBackground` flag
+/// (monorepo#3789): `true` for a background session, omitted for foreground.
 #[tokio::test]
 async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     use std::collections::BTreeMap;
@@ -2065,6 +2067,12 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         .insert_agent_session(&mk_session("agent-slim-b", &ws_archived))
         .await
         .expect("insert archived-workspace session");
+    let mut background = mk_session("agent-slim-bg", &ws_active);
+    background.is_background = true;
+    srv.store
+        .insert_agent_session(&background)
+        .await
+        .expect("insert background active-workspace session");
 
     // workspace.list (includeArchived): tokenUsage absent on every row;
     // agentSummary absent on the archived row, present on the active one.
@@ -2100,6 +2108,27 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert!(
         row_archived.get("agentSummary").is_none(),
         "archived list rows omit agentSummary (monorepo#3041): {row_archived}"
+    );
+    // `isBackground` on agentSummary rows (monorepo#3789): present `true` for
+    // the background session, absent (never `false`) for the foreground one.
+    let summary_agents = row_active["agentSummary"]["agents"]
+        .as_array()
+        .expect("agentSummary.agents array");
+    let fg = summary_agents
+        .iter()
+        .find(|a| a["id"] == "agent-slim-a")
+        .expect("foreground agent row");
+    let bg = summary_agents
+        .iter()
+        .find(|a| a["id"] == "agent-slim-bg")
+        .expect("background agent row");
+    assert!(
+        fg.get("isBackground").is_none(),
+        "foreground agentSummary row omits isBackground: {fg}"
+    );
+    assert_eq!(
+        bg["isBackground"], true,
+        "background agentSummary row carries isBackground: {bg}"
     );
 
     // workspace.get keeps both fields for detail reads — archived included.
