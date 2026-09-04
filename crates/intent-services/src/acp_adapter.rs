@@ -254,6 +254,11 @@ impl AcpAdapterCommand {
     }
 
     #[cfg(test)]
+    pub(crate) fn program(&self) -> &std::path::Path {
+        &self.program
+    }
+
+    #[cfg(test)]
     pub(crate) fn env_vars(&self) -> &[(String, OsString)] {
         &self.envs
     }

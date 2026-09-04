@@ -48,7 +48,7 @@ pub(crate) use config::{
 pub use discover::{
     discover_providers_with_overrides, find_auggie_candidates, find_npx, find_pi_cli,
     find_provider_binary, gated_reason, gated_reason_with_env, not_installed_detail, probe_npx,
-    provider_availability_for, resolve_on_path, ProviderAvailability,
+    provider_availability_for, resolve_npx_only_override, resolve_on_path, ProviderAvailability,
 };
 #[cfg(test)]
 pub(crate) use models::{

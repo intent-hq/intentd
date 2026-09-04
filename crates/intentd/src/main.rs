@@ -5754,7 +5754,24 @@ async fn report_provider_availability(config: &Config) {
         // npx-only providers (claude-code, pi) never resolve a local binary;
         // report npx availability instead (the auth probe would need a package
         // download, so it is skipped — auth is the external `claude` CLI).
+        // A valid `providers.paths` adapter override (claude-code opts in,
+        // monorepo#4352) is exec'd directly, so it is reported in place of
+        // npx — matching discovery's `installed` and the session spawn.
         if let Some(pkg) = provider.npx_only_package {
+            let adapter_override = intent_providers::find_provider(provider.id).and_then(|cfg| {
+                intent_providers::resolve_npx_only_override(
+                    cfg,
+                    provider_paths.get(provider.id).map(String::as_str),
+                )
+            });
+            if let Some(adapter) = adapter_override {
+                println!(
+                    "  [ok] {} via providers.paths override: {}",
+                    provider.id,
+                    adapter.display()
+                );
+                continue;
+            }
             match &provider.resolved_path {
                 Some(npx) => {
                     // pi additionally requires the `pi` CLI (which the pi-acp

@@ -114,9 +114,7 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         .get(provider.primary_binary_provider_id())
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
-    let resolved_bin = if provider.npx_only_package.is_some() {
-        None
-    } else if provider_id == "auggie" {
+    let resolved_bin = if provider_id == "auggie" {
         // auggie rides the version-gated candidate walk real ACP spawns use
         // (monorepo#1045): probe `--version` down the candidate list and pick
         // the first one new enough — a stale PATH/override hit must not fail
@@ -139,15 +137,13 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
             }
         }
     } else {
-        intent_providers::find_provider_binary(
-            provider.primary_binary_provider_id(),
-            provider.command,
-            explicit_path.as_deref(),
-        )
+        // npx-only providers honor only a valid adapter override
+        // (monorepo#4352); everything else walks the discovery tiers.
+        crate::complete_ops::resolve_one_shot_binary(provider, explicit_path.as_deref())
     };
     // An npx launch runs a Node child whatever the provider's declared
     // runtime — thread the signal into the env builder (STAB-50 heap cap).
-    let via_npx = provider.npx_only_package.is_some() || resolved_bin.is_none();
+    let via_npx = resolved_bin.is_none();
     let npx = intent_providers::find_npx();
     let Some(mut cmd) = crate::complete_ops::one_shot_launch(provider, resolved_bin, npx, model)
     else {

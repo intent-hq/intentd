@@ -708,18 +708,38 @@ mod build_command_tests {
             args,
             vec![
                 "-y".to_string(),
-                format!(
-                    "@agentclientprotocol/claude-agent-acp@{}",
-                    intent_providers::CLAUDE_AGENT_ACP_VERSION
-                ),
-            ]
+                "@agentclientprotocol/claude-agent-acp@0.73.0".to_string(),
+            ],
+            "bumping the adapter pin is a deliberate change — update this literal with it"
+        );
+        assert_eq!(intent_providers::CLAUDE_AGENT_ACP_VERSION, "0.73.0");
+    }
+
+    #[test]
+    fn claude_code_override_binary_spawns_directly_without_npx() {
+        // monorepo#4352: a validated `providers.paths["claude-code"]` override
+        // arrives as `provider_binary` with the npx fields unset — the argv is
+        // the override alone, no `npx -y <pinned>`.
+        let provider = intent_providers::find_provider("claude-code").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let adapter = PathBuf::from(
+            "/opt/lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js",
+        );
+        opts.provider_binary = Some(&adapter);
+        let cmd = build_command(&opts);
+        assert_eq!(cmd.as_std().get_program(), adapter.as_os_str());
+        assert!(!opts.via_npx());
+        let args = build_args(&opts);
+        assert!(
+            args.is_empty(),
+            "no npx args on the override path: {args:?}"
         );
     }
 
     #[test]
     fn build_command_prefers_provider_binary_over_npx_fallback() {
-        // Uses codex (a fallback-npx provider) — claude-code is npx-only and
-        // never resolves a provider binary.
+        // Uses codex (a fallback-npx provider) — claude-code only resolves a
+        // provider binary from an explicit override (monorepo#4352).
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let provider_binary = PathBuf::from("/custom/codex-acp");

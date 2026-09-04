@@ -157,11 +157,14 @@ fn resolve_quick_action_model(
         .or_else(|| effective_provider.map(|p| (p.to_string(), None)))
 }
 
-/// Pick the one-shot launch for `provider`, mirroring the model probe's
-/// precedent (`provider_models`): an `npx_only_package` provider always runs
-/// the pinned package via `npx -y`, otherwise the `resolved_bin` wins with the
-/// pinned `fallback_npx_package` as the fallback. `None` when nothing resolves
-/// — the caller turns that into `{ available: false, reason }`.
+/// Pick the one-shot launch for `provider`, mirroring `resolve_spawn`: a
+/// `resolved_bin` wins — for an `npx_only_package` provider that is ONLY the
+/// validated `providers.paths` adapter override
+/// ([`intent_providers::resolve_npx_only_override`], monorepo#4352), with the
+/// pinned package via `npx -y` otherwise; for other providers it is the
+/// discovered binary, with the pinned `fallback_npx_package` as the fallback.
+/// `None` when nothing resolves — the caller turns that into
+/// `{ available: false, reason }`.
 ///
 /// `resolved_bin` / `npx` are the caller's discovery results (parameterized so
 /// the precedence is unit-testable without an install). The provider's own
@@ -181,11 +184,11 @@ pub(crate) fn one_shot_launch(
         ..Default::default()
     };
     let args = intent_providers::build_provider_args(provider, &inputs);
-    if let Some(pkg) = provider.npx_only_package {
-        return npx.map(|npx| OneShotCommand::npx(npx, pkg).args(args));
-    }
     if let Some(bin) = resolved_bin {
         return Some(OneShotCommand::binary(bin, args));
+    }
+    if let Some(pkg) = provider.npx_only_package {
+        return npx.map(|npx| OneShotCommand::npx(npx, pkg).args(args));
     }
     let pkg = provider.fallback_npx_package?;
     // The daemon-managed npx fallback: keep a stray env override from
@@ -196,6 +199,28 @@ pub(crate) fn one_shot_launch(
             .env_remove("CODEX_PATH")
             .env_remove("CODEX_CONFIG")
     })
+}
+
+/// Resolve the adapter binary a one-shot launch (`agent.completeOnce`, the
+/// live test prompt) runs for `provider`, matching `resolve_spawn`'s
+/// precedence: an npx-only provider honors ONLY a valid `providers.paths`
+/// adapter override, and only when it opts in (never auto-discovery —
+/// monorepo#4352; pi resolves nothing), any other provider walks
+/// `find_provider_binary`'s tiers. `explicit_path` is the raw
+/// `providers.paths[primary_binary_provider_id]` value (blank = unset).
+pub(crate) fn resolve_one_shot_binary(
+    provider: &intent_providers::ProviderConfig,
+    explicit_path: Option<&str>,
+) -> Option<PathBuf> {
+    if provider.npx_only_package.is_some() {
+        intent_providers::resolve_npx_only_override(provider, explicit_path)
+    } else {
+        intent_providers::find_provider_binary(
+            provider.primary_binary_provider_id(),
+            provider.command,
+            explicit_path,
+        )
+    }
 }
 
 /// The model to apply post-`session/new` via `session/set_config_option`:
@@ -393,15 +418,7 @@ impl Services {
             .get(provider.primary_binary_provider_id())
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty());
-        let resolved_bin = (provider.npx_only_package.is_none())
-            .then(|| {
-                intent_providers::find_provider_binary(
-                    provider.primary_binary_provider_id(),
-                    provider.command,
-                    explicit_path.as_deref(),
-                )
-            })
-            .flatten();
+        let resolved_bin = resolve_one_shot_binary(provider, explicit_path.as_deref());
         // npx discovery honors the test seam (`one_shot_npx`): `Some(inner)`
         // pins the result so the unresolvable branch below is reachable
         // hermetically on hosts where npx is installed.
@@ -791,11 +808,18 @@ rl.on('line', (line) => {
         let npx = PathBuf::from("/usr/bin/npx");
         let bin = PathBuf::from("/opt/bin/codex-acp");
 
-        // npx-only (claude-code, pi): the pinned package always wins, and no
-        // npx means no launch at all.
+        // npx-only (claude-code, pi): a resolved binary (the validated
+        // adapter override — monorepo#4352) wins even without npx; otherwise
+        // the pinned package runs via npx, and no npx means no launch at all.
         let claude = intent_providers::find_provider("claude-code").unwrap();
-        assert!(one_shot_launch(claude, Some(bin.clone()), Some(npx.clone()), None).is_some());
-        assert!(one_shot_launch(claude, Some(bin.clone()), None, None).is_none());
+        let adapter = PathBuf::from("/opt/lib/claude-agent-acp/dist/index.js");
+        let launch = one_shot_launch(claude, Some(adapter.clone()), Some(npx.clone()), None)
+            .expect("override launches");
+        assert_eq!(launch.program(), adapter.as_path());
+        assert!(one_shot_launch(claude, Some(adapter), None, None).is_some());
+        let launch = one_shot_launch(claude, None, Some(npx.clone()), None).expect("npx launches");
+        assert_eq!(launch.program(), npx.as_path());
+        assert!(one_shot_launch(claude, None, None, None).is_none());
 
         // codex: resolved binary first, pinned npx fallback second, nothing
         // when neither resolves (the `{ available: false }` path).
@@ -803,6 +827,36 @@ rl.on('line', (line) => {
         assert!(one_shot_launch(codex, Some(bin), None, None).is_some());
         assert!(one_shot_launch(codex, None, Some(npx), None).is_some());
         assert!(one_shot_launch(codex, None, None, None).is_none());
+    }
+
+    /// monorepo#4352: an npx-only provider resolves ONLY a valid adapter
+    /// override — never a PATH/managed-bin hit — so one-shots and the live
+    /// test prompt run the same adapter `resolve_spawn` would.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_one_shot_binary_npx_only_honors_only_valid_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = dir.path().join("claude-agent-acp");
+        std::fs::write(&adapter, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_one_shot_binary(claude, Some(adapter.to_str().unwrap())),
+            Some(adapter.clone())
+        );
+        assert_eq!(resolve_one_shot_binary(claude, None), None);
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            resolve_one_shot_binary(claude, Some(missing.to_str().unwrap())),
+            None
+        );
+        let pi = intent_providers::find_provider("pi").unwrap();
+        assert_eq!(
+            resolve_one_shot_binary(pi, Some(adapter.to_str().unwrap())),
+            None,
+            "pi does not opt in: a valid override still resolves nothing"
+        );
     }
 
     #[cfg(unix)]

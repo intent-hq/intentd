@@ -10,7 +10,7 @@
 /// one-line code change here.
 macro_rules! claude_agent_acp_version {
     () => {
-        "0.66.0"
+        "0.73.0"
     };
 }
 
@@ -208,11 +208,26 @@ pub struct ProviderConfig {
     /// package via `npx -y <package>`. Only set for providers shipped as npm
     /// packages (e.g. codex's `@agentclientprotocol/codex-acp`).
     pub fallback_npx_package: Option<&'static str>,
-    /// When set, the provider is ALWAYS spawned via `npx -y <package>` with a
-    /// version pinned by us — local binary discovery (settings path, managed
-    /// bin, PATH scan) is skipped entirely, so the adapter version is under our
-    /// release cadence (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
+    /// When set, the provider is spawned via `npx -y <package>` with a
+    /// version pinned by us — auto-discovery (managed bin, PATH scan) is
+    /// skipped entirely, so the adapter version is under our release cadence
+    /// (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]). The one exception is
+    /// an explicit `providers.paths[id]` override for providers that opt in
+    /// via [`Self::npx_only_honors_path_override`].
     pub npx_only_package: Option<&'static str>,
+    /// For npx-only providers ([`Self::npx_only_package`]): whether a valid
+    /// (absolute, executable) `providers.paths[id]` override is exec'd
+    /// directly in place of the pinned npx spawn — on every surface (ACP
+    /// session spawn, discovery `installed`, one-shot / test-prompt launches,
+    /// the ACP auth fallback probe) — so users can track the adapter
+    /// themselves (intent-hq/monorepo#4352). An invalid override contributes
+    /// nothing and the pinned spawn applies. Opt-in per provider: claude-code
+    /// (a self-contained adapter). pi stays pinned-npx-only — its adapter
+    /// additionally routes through the version-gated real `pi` CLI and the
+    /// extension wrapper, and its auth probe runs the pinned package, so an
+    /// override there would advertise `installed` for a spawn that still
+    /// fails the `pi` CLI gate.
+    pub npx_only_honors_path_override: bool,
     /// When set, discovery (`discover_providers`) only reports this provider
     /// as `installed` when BOTH `command` AND this secondary CLI resolve.
     /// Unsloth rides the `opencode` binary as its ACP runtime (`command`) but
@@ -294,6 +309,7 @@ impl ProviderConfig {
             login_docs_url: None,
             fallback_npx_package: None,
             npx_only_package: None,
+            npx_only_honors_path_override: false,
             requires_secondary_binary: None,
             terminal_requires_shell: false,
             truncates_tool_descriptions: false,
@@ -388,6 +404,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
         ),
         npx_only_package: Some(CLAUDE_AGENT_ACP_NPX_PACKAGE),
+        npx_only_honors_path_override: true,
         short_name: "Claude Code",
         // Claude Code silently truncates MCP tool descriptions at ~2k chars
         // (anthropics/claude-code#53933): serve the compact `workspace_api`
