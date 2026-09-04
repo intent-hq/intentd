@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.18] - 2026-09-04
+
+### 🚀 Features
+
+- *(github)* Add github.issues.get and issue author/timestamps ([#1716](https://github.com/intent-hq/intentd/pull/1716))
+- *(workspace)* Add workspace.localChanges RPC ([#1717](https://github.com/intent-hq/intentd/pull/1717))
+
+### 🐛 Bug Fixes
+
+- *(agent)* Emit normal-completion stream:end when an interrupt races a persisted turn ([#1720](https://github.com/intent-hq/intentd/pull/1720))
+- *(antigravity)* Classify authenticate RPC timeout as login timeout ([#1721](https://github.com/intent-hq/intentd/pull/1721))
+- Honor providers.paths override for claude-code and bump adapter pin to 0.73.0 ([#1714](https://github.com/intent-hq/intentd/pull/1714))
+
+
 ## [0.9.17] - 2026-09-04
 
 ### 🚀 Features
