@@ -13973,6 +13973,8 @@ impl SystemControl for WatchHealthControl {
             tc_address: None,
             hostname: "test".to_string(),
             pretty_hostname: "test".to_string(),
+            device_kind: None,
+            hardware_model: None,
             cpu_percent: 0.0,
             memory_bytes: 0,
             child_processes: None,
@@ -13989,6 +13991,14 @@ impl SystemControl for WatchHealthControl {
                 failed_roots: s.failed_roots,
             }),
             update_supported: false,
+        }
+    }
+    fn host_environment(&self) -> intent_transport::HostEnvironment {
+        intent_transport::HostEnvironment {
+            hostname: "test".to_string(),
+            pretty_hostname: "test".to_string(),
+            device_kind: None,
+            hardware_model: None,
         }
     }
     fn request_shutdown(&self) {}

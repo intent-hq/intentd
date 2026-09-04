@@ -110,6 +110,15 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     assert!(r["host"]["os"].is_string());
     assert!(r["host"]["arch"].is_string());
     assert!(r["host"]["hasDisplay"].is_boolean());
+    if std::env::consts::OS == "linux" {
+        assert!(r["host"]["deviceKind"].is_string(), "deviceKind: {resp}");
+    }
+    assert!(
+        r["host"]
+            .get("deviceKind")
+            .is_none_or(|value| !value.is_null()),
+        "deviceKind is omitted, never null"
+    );
     assert_eq!(r["agents"], 0);
     // New fields: maxAgents, version, uptimeSeconds.
     assert!(
@@ -145,6 +154,22 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
         "prettyHostname non-empty"
     );
     assert!(h["hasDisplay"].is_boolean());
+    assert_eq!(h.get("deviceKind"), r["host"].get("deviceKind"));
+    assert_eq!(h.get("hardwareModel"), r["host"].get("hardwareModel"));
+    if let Some(kind) = h.get("deviceKind").and_then(Value::as_str) {
+        assert!(
+            [
+                "macMini",
+                "macStudio",
+                "laptop",
+                "desktop",
+                "server",
+                "cloudVm"
+            ]
+            .contains(&kind),
+            "known deviceKind: {host}"
+        );
+    }
 
     // `intentd stop` issues the graceful control RPC then escalates if needed.
     // Run it in a blocking thread while we concurrently reap the daemon: the

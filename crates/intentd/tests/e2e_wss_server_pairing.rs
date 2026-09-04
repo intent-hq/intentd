@@ -306,6 +306,18 @@ async fn server_pairing_info_over_uds() {
             .is_empty(),
         "prettyHostname non-empty"
     );
+    if std::env::consts::OS == "linux" {
+        assert!(result["deviceKind"].is_string(), "deviceKind: {response}");
+    }
+    assert!(
+        result
+            .get("deviceKind")
+            .is_none_or(|value| !value.is_null()),
+        "deviceKind is omitted, never null"
+    );
+    if let Some(model) = result.get("hardwareModel") {
+        assert!(model.is_string(), "hardwareModel: {response}");
+    }
 
     daemon.child.kill().ok();
 }

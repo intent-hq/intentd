@@ -74,6 +74,10 @@ pub struct SystemStatus {
     /// hostname when unavailable (same source as `server.pairingInfo` /
     /// `host.status`).
     pub pretty_hostname: String,
+    /// Detected device category, omitted from the host block when unknown.
+    pub device_kind: Option<String>,
+    /// Raw hardware product/model name, omitted from the host block when unknown.
+    pub hardware_model: Option<String>,
     /// CPU usage of the daemon process, raw `sysinfo` convention: 100 = one
     /// full core, so values may exceed 100 on multi-core hosts. The first
     /// sample after startup may legitimately read 0.
@@ -171,6 +175,8 @@ pub type GitCredential = (String, String);
 pub trait SystemControl: Send + Sync {
     /// Snapshot the current daemon state.
     fn status(&self) -> SystemStatus;
+    /// Cached host identity, refreshed by the composition root off the RPC path.
+    fn host_environment(&self) -> crate::host_env::HostEnvironment;
     /// Request a graceful shutdown (idempotent). Returns immediately; the daemon
     /// tears the listeners down asynchronously.
     fn request_shutdown(&self);
@@ -326,6 +332,16 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         },
     });
     let obj = v.as_object_mut().expect("status_json literal is an object");
+    let host = obj
+        .get_mut("host")
+        .and_then(Value::as_object_mut)
+        .expect("status_json host literal is an object");
+    if let Some(device_kind) = &status.device_kind {
+        host.insert("deviceKind".into(), device_kind.clone().into());
+    }
+    if let Some(hardware_model) = &status.hardware_model {
+        host.insert("hardwareModel".into(), hardware_model.clone().into());
+    }
     if let Some(tc) = &status.tc_address {
         obj.insert("tcAddress".into(), tc.clone().into());
     }

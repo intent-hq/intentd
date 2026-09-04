@@ -17,7 +17,9 @@ use intent_services::EventBus;
 use serde_json::{json, Map, Value};
 
 use crate::events::{error_frame, success_frame};
-use crate::host_env::{detect_display_server, detect_has_display, local_hostname, pretty_hostname};
+use crate::host_env::{
+    detect_display_server, detect_has_display, local_hostname, pretty_hostname, HostEnvironment,
+};
 use crate::host_ops;
 use crate::reverse::{ReverseChannel, DEFAULT_REVERSE_TIMEOUT};
 
@@ -154,6 +156,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
 /// prettyHostname, hasDisplay, locality, displayServer? }`. `displayServer` is
 /// omitted when no display server is detected. Pure (inputs injected) so it is
 /// unit-testable.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn host_status_json(
     os: &str,
     arch: &str,
@@ -161,6 +164,8 @@ pub(crate) fn host_status_json(
     pretty_hostname: &str,
     has_display: bool,
     display_server: Option<&str>,
+    device_kind: Option<&str>,
+    hardware_model: Option<&str>,
     is_local: bool,
 ) -> Value {
     let mut result = json!({
@@ -173,6 +178,12 @@ pub(crate) fn host_status_json(
     });
     if let Some(ds) = display_server {
         result["displayServer"] = json!(ds);
+    }
+    if let Some(kind) = device_kind {
+        result["deviceKind"] = json!(kind);
+    }
+    if let Some(model) = hardware_model {
+        result["hardwareModel"] = json!(model);
     }
     result
 }
@@ -193,10 +204,22 @@ pub(crate) fn host_status_json(
 /// values); `findApp` / `listInstalledEditors` return only app names + paths.
 /// `reverse` is the connection's reverse-RPC channel, consumed by the
 /// client-called `openInEditor` trigger on a remote connection.
+#[cfg(test)]
 pub(crate) async fn handle(
     req: HostRequest,
     api: &dyn WorkspaceApi,
     bus: Option<&EventBus>,
+    is_local: bool,
+    reverse: &ReverseChannel,
+) -> Option<String> {
+    handle_with_host_environment(req, api, bus, None, is_local, reverse).await
+}
+
+pub(crate) async fn handle_with_host_environment(
+    req: HostRequest,
+    api: &dyn WorkspaceApi,
+    bus: Option<&EventBus>,
+    host_environment: Option<HostEnvironment>,
     is_local: bool,
     reverse: &ReverseChannel,
 ) -> Option<String> {
@@ -208,13 +231,25 @@ pub(crate) async fn handle(
     } = req;
     let frame = match method {
         HostMethod::Status => {
+            let hostname = host_environment
+                .as_ref()
+                .map_or_else(local_hostname, |host| host.hostname.clone());
+            let pretty_hostname = host_environment
+                .as_ref()
+                .map_or_else(pretty_hostname, |host| host.pretty_hostname.clone());
             let result = host_status_json(
                 std::env::consts::OS,
                 std::env::consts::ARCH,
-                &local_hostname(),
-                &pretty_hostname(),
+                &hostname,
+                &pretty_hostname,
                 detect_has_display(),
                 detect_display_server().as_deref(),
+                host_environment
+                    .as_ref()
+                    .and_then(|host| host.device_kind.as_deref()),
+                host_environment
+                    .as_ref()
+                    .and_then(|host| host.hardware_model.as_deref()),
                 is_local,
             );
             success_frame(&id_echo, &result)
