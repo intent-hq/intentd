@@ -1390,6 +1390,62 @@ mod tests {
         assert_no_config_mentions(&out.checkout_dir.join(".git"), staging.to_str().unwrap());
     }
 
+    /// A sandbox still re-provisions (`CoW` or plain clone of the checkout)
+    /// after the checkout's submodule was hydrated: the sandbox lands on its
+    /// branch at its bundled tip with its WIP unwound, the workspace
+    /// checkout keeps the hydrated submodule, and no config under the
+    /// workspace dir mentions the staging bundle.
+    #[test]
+    fn sandbox_provisions_after_submodule_hydration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sup, origin) = superproject_with_submodule(tmp.path());
+        let sub = sup.join("sub");
+        fgit(&sub, &["checkout", "-q", "main"]);
+        let sha = local_commit(&sub, "wip.txt");
+
+        let ws = superproject_workspace(&sup);
+        let agent = AgentId::new();
+        let branch = format!("sb/{}", agent.0);
+        let sb_src = tmp.path().join("sandbox");
+        make_sandbox_clone(&sup, &sb_src, &branch);
+        let sb_tip = commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
+        fs::write(sb_src.join("sb-wip.txt"), "sandbox wip\n").unwrap();
+        let sb_fingerprint = status_fingerprint(&sb_src);
+        let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
+
+        let staging = tmp.path().join("staging");
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
+        assert_eq!(refs.submodules.len(), 1, "{refs:?}");
+
+        let target = tempfile::tempdir().unwrap();
+        let out = materialize_workspace_git_blocking(
+            &bundle_path,
+            &refs,
+            &ws,
+            std::slice::from_ref(&sb),
+            target.path(),
+        )
+        .unwrap();
+
+        assert_eq!(repo_head(&out.checkout_dir.join("sub")), sha);
+        assert_eq!(
+            fgit(&out.checkout_dir, &["config", "submodule.sub.url"]),
+            origin.to_str().unwrap()
+        );
+        assert_eq!(out.sandboxes.len(), 1);
+        let msb = &out.sandboxes[0];
+        assert_eq!(head_branch(&msb.path), branch);
+        assert_eq!(repo_head(&msb.path), sb_tip, "WIP unwound");
+        assert_eq!(status_fingerprint(&msb.path), sb_fingerprint);
+        assert_eq!(
+            fs::read_to_string(msb.path.join("sb-wip.txt")).unwrap(),
+            "sandbox wip\n"
+        );
+        assert_no_config_mentions(&target.path().join(&ws.id.0), staging.to_str().unwrap());
+    }
+
     /// (c) A corrupt submodule bundle fails the materialization with an
     /// error naming the submodule path, and the rollback leaves nothing
     /// behind under the target root.
