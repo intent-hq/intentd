@@ -494,6 +494,11 @@ fn find_provider_binary_with_home_and_dirs(
 ) -> Option<PathBuf> {
     // 1. Explicit setting wins (must be executable and absolute)
     if let Some(path) = explicit_path {
+        // An Antigravity custom path is an explicit choice, including when its
+        // official bundle is incomplete. Do not silently replace that choice.
+        if provider_id == "antigravity" && !path.trim().is_empty() {
+            return resolve_explicit_path(provider_id, path);
+        }
         if let Some(pb) = resolve_explicit_path(provider_id, path) {
             return Some(pb);
         }
@@ -528,12 +533,24 @@ fn find_provider_binary_with_home_and_dirs(
         }
     }
 
-    // 5. Preserve existing installations before considering our managed bridge.
-    find_in_dirs(enhanced_dirs, command).or_else(|| {
-        (provider_id == "antigravity" && crate::antigravity::supported_host())
-            .then(|| home.and_then(crate::antigravity::managed_binary))
-            .flatten()
-    })
+    // 5. Preserve complete existing installations before our managed bridge.
+    // A stale launcher must not hide a later PATH hit or the recovered runtime.
+    if provider_id == "antigravity" {
+        return enhanced_dirs
+            .iter()
+            .flat_map(|dir| {
+                name_candidates(command)
+                    .into_iter()
+                    .map(|name| dir.join(name))
+            })
+            .find(|path| crate::antigravity::is_complete_candidate(path))
+            .or_else(|| {
+                crate::antigravity::supported_host()
+                    .then(|| home.and_then(crate::antigravity::managed_binary))
+                    .flatten()
+            });
+    }
+    find_in_dirs(enhanced_dirs, command)
 }
 
 /// The explicit-override tier ALONE for an npx-only provider
@@ -578,9 +595,17 @@ pub fn resolve_explicit_path(provider_id: &str, path: &str) -> Option<PathBuf> {
     }
     let pb = PathBuf::from(trimmed);
     if pb.is_absolute() && is_executable_file(&pb) {
+        if provider_id == "antigravity" && !crate::antigravity::is_complete_candidate(&pb) {
+            tracing::warn!(configured_path = trimmed, "Antigravity custom path has missing or non-executable runtime files; repair the custom installation");
+            return None;
+        }
         return Some(pb);
     }
-    // Warn when explicit setting points to missing/non-executable/relative file
+    if provider_id == "antigravity" {
+        tracing::warn!(configured_path = trimmed, "Antigravity custom path must be absolute and executable; repair or clear the custom path before setup can continue");
+        return None;
+    }
+    // Other providers retain their existing fallback policy for invalid paths.
     tracing::warn!(
         provider_id = provider_id,
         configured_path = trimmed,
@@ -815,6 +840,25 @@ mod find_provider_binary_tests {
         fs::write(path, "exit 0").unwrap();
     }
 
+    #[cfg(unix)]
+    fn make_antigravity_bundle(home: &std::path::Path) -> PathBuf {
+        use crate::antigravity::{install_root, ARCHIVE_SHA256, FILES, VERSION};
+        let version = install_root(home).join(VERSION);
+        fs::create_dir_all(&version).unwrap();
+        for (name, bytes, _) in FILES {
+            let path = version.join(name);
+            make_executable(&path);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+        }
+        fs::write(version.join("ready"), ARCHIVE_SHA256).unwrap();
+        version
+    }
+
     #[test]
     fn find_provider_binary_returns_none_when_absent() {
         let nanos = std::time::SystemTime::now()
@@ -838,22 +882,10 @@ mod find_provider_binary_tests {
     #[cfg(unix)]
     #[test]
     fn antigravity_managed_discovery_requires_a_complete_activated_bundle() {
-        use crate::antigravity::{
-            install_root, managed_binary, ARCHIVE_SHA256, FILES, HARNESS, SERVER, VERSION,
-        };
+        use crate::antigravity::{managed_binary, ARCHIVE_SHA256, HARNESS, SERVER};
         let home = unique_temp_dir("antigravity-managed");
-        let version = install_root(home.path()).join(VERSION);
-        fs::create_dir_all(&version).unwrap();
-        for (name, bytes, _) in FILES {
-            let path = version.join(name);
-            make_executable(&path);
-            fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_len(bytes)
-                .unwrap();
-        }
+        let version = make_antigravity_bundle(home.path());
+        fs::remove_file(version.join("ready")).unwrap();
         assert_eq!(
             managed_binary(home.path()),
             None,
@@ -872,7 +904,7 @@ mod find_provider_binary_tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn antigravity_cli_is_not_acp_and_custom_installations_keep_precedence() {
-        use crate::antigravity::{install_root, ARCHIVE_SHA256, FILES, SERVER, VERSION};
+        use crate::antigravity::SERVER;
         let home = unique_temp_dir("antigravity-precedence");
         let bin = home.path().join("bin");
         fs::create_dir(&bin).unwrap();
@@ -887,19 +919,7 @@ mod find_provider_binary_tests {
             )
         };
         assert_eq!(find(None), None);
-        let version = install_root(home.path()).join(VERSION);
-        fs::create_dir_all(&version).unwrap();
-        for (name, bytes, _) in FILES {
-            let path = version.join(name);
-            make_executable(&path);
-            fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_len(bytes)
-                .unwrap();
-        }
-        fs::write(version.join("ready"), ARCHIVE_SHA256).unwrap();
+        let version = make_antigravity_bundle(home.path());
         assert_eq!(find(None), Some(version.join(SERVER)));
         let on_path = bin.join("antigravity-acp");
         make_executable(&on_path);
@@ -907,6 +927,154 @@ mod find_provider_binary_tests {
         let custom = home.path().join("custom");
         make_executable(&custom);
         assert_eq!(find(custom.to_str()), Some(custom));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn antigravity_deleted_runtime_does_not_shadow_recovered_managed_bundle() {
+        use crate::antigravity::{HARNESS, SERVER};
+        let home = unique_temp_dir("antigravity-deleted-runtime");
+        let bin = home.path().join("bin");
+        let old = home.path().join("old install");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&old).unwrap();
+        let server = old.join(SERVER);
+        make_executable(&server);
+        make_executable(&old.join(HARNESS));
+        let wrapper = bin.join("antigravity-acp");
+        let script = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", server.display());
+        make_executable(&wrapper);
+        fs::write(&wrapper, &script).unwrap();
+        let find = |explicit| {
+            find_provider_binary_with_home_and_dirs(
+                "antigravity",
+                "antigravity-acp",
+                explicit,
+                Some(home.path()),
+                std::slice::from_ref(&bin),
+            )
+        };
+        assert_eq!(find(None), Some(wrapper.clone()));
+        fs::remove_file(&server).unwrap();
+        assert_eq!(
+            find(None),
+            None,
+            "Connect must enter the missing-runtime installer branch"
+        );
+        let managed = make_antigravity_bundle(home.path()).join(SERVER);
+        assert_eq!(
+            find(None),
+            Some(managed),
+            "every shared resolver caller must use the recovered bundle"
+        );
+        assert_eq!(
+            find(wrapper.to_str()),
+            None,
+            "a broken explicit override must not fall through"
+        );
+        assert_eq!(fs::read_to_string(&wrapper).unwrap(), script);
+        assert!(
+            !server.exists(),
+            "recovery must not rewrite the user's old bundle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_skips_incomplete_path_launchers_but_keeps_later_candidates() {
+        use crate::antigravity::{HARNESS, SERVER};
+        let home = unique_temp_dir("antigravity-path-candidates");
+        let first = home.path().join("first");
+        let second = home.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let server = home.path().join(SERVER);
+        make_executable(&server);
+        let broken = first.join("antigravity-acp");
+        make_executable(&broken);
+        fs::write(
+            &broken,
+            format!("#!/bin/sh\nexec {} \"$@\"\n", server.display()),
+        )
+        .unwrap();
+        let later = second.join("antigravity-acp");
+        make_executable(&later);
+        let dirs = [first, second];
+        let find = || {
+            find_provider_binary_with_home_and_dirs(
+                "antigravity",
+                "antigravity-acp",
+                None,
+                Some(home.path()),
+                &dirs,
+            )
+        };
+        assert_eq!(
+            find(),
+            Some(later),
+            "missing companion must also skip a wrapper"
+        );
+        make_executable(&home.path().join(HARNESS));
+        assert_eq!(
+            find(),
+            Some(broken),
+            "healthy existing installation keeps precedence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_direct_and_symlinked_servers_require_the_companion() {
+        use crate::antigravity::{is_complete_candidate, HARNESS, SERVER};
+        let home = unique_temp_dir("antigravity-symlink");
+        let server = home.path().join(SERVER);
+        make_executable(&server);
+        let link = home.path().join("antigravity-acp");
+        std::os::unix::fs::symlink(&server, &link).unwrap();
+        assert!(!is_complete_candidate(&server));
+        assert!(!is_complete_candidate(&link));
+        make_executable(&home.path().join(HARNESS));
+        assert!(is_complete_candidate(&link));
+        fs::remove_file(server).unwrap();
+        assert!(!is_complete_candidate(&link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_literal_wrapper_checks_are_bounded_and_never_execute_scripts() {
+        use crate::antigravity::{is_complete_candidate, SERVER};
+        let home = unique_temp_dir("antigravity-literal-launcher");
+        let wrapper = home.path().join("antigravity-acp");
+        make_executable(&wrapper);
+        let missing = home.path().join(SERVER);
+        for target in [
+            missing.display().to_string(),
+            format!("'{}'", missing.display()),
+            format!("\"{}\"", missing.display()),
+        ] {
+            fs::write(&wrapper, format!("#!/bin/sh\nexec {target} \"$@\"\n")).unwrap();
+            assert!(!is_complete_candidate(&wrapper));
+        }
+        // Unknown custom commands are not classified as missing runtimes, even
+        // if they would fail authentication or need their own environment.
+        let marker = home.path().join("must-not-run");
+        for body in [
+            format!("touch '{}'\nexit 42", marker.display()),
+            "exec \"$HOME/agy_acp_server.par\" \"$@\"".into(),
+            "exec \"$(resolve_runtime)/agy_acp_server.par\" \"$@\"".into(),
+            format!("exec {} \"$@\"\nexit 42", missing.display()),
+            format!("exec {} \"$@\"\n#{}", missing.display(), "x".repeat(4096)),
+        ] {
+            fs::write(&wrapper, format!("#!/bin/sh\n{body}\n")).unwrap();
+            assert!(
+                is_complete_candidate(&wrapper),
+                "opaque command must retain custom-adapter semantics"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "discovery must not execute even a small script"
+        );
     }
 
     #[test]

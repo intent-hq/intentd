@@ -86,3 +86,31 @@ fn status_contains_only_safe_fields_and_camel_case_wire_states() {
         serde_json::json!({"phase":"connected","modelCount":3})
     );
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+async fn deleted_runtime_at_custom_path_is_a_repair_error_not_an_install_request() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let wrapper = home.path().join("antigravity-acp");
+    let script = format!(
+        "#!/bin/sh\nexec {} \"$@\"\n",
+        home.path().join(runtime::SERVER).display()
+    );
+    std::fs::write(&wrapper, &script).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!status(wrapper.to_str()).runtime_installed);
+    let op = operation(Phase::Checking);
+    assert_eq!(
+        connect(
+            &op.shared,
+            &op.cancel,
+            home.path().to_owned(),
+            wrapper.to_str().map(str::to_owned)
+        )
+        .await,
+        Err(Failure::Setup(SetupError::InvalidCustomPath))
+    );
+    assert!(!runtime::install_root(home.path()).exists());
+    assert_eq!(std::fs::read_to_string(wrapper).unwrap(), script);
+}
