@@ -125,6 +125,51 @@ fn redact_config(config: &Value) -> Value {
     c
 }
 
+/// Merge a client-supplied config that may echo the redaction placeholder
+/// back over the stored one: for each `env`/`headers` key, the placeholder
+/// means "keep the stored value" (dropped when the stored config has no such
+/// key), a literal value replaces it, and an omitted key is deleted.
+fn merge_redacted_secrets(mut incoming: Value, stored: &Value) -> Value {
+    for key in ["env", "headers"] {
+        let Some(obj) = incoming.get_mut(key).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let stored_obj = stored.get(key).and_then(Value::as_object);
+        obj.retain(|k, val| {
+            if val.as_str() != Some(REDACTED_PLACEHOLDER) {
+                return true;
+            }
+            match stored_obj.and_then(|s| s.get(k)) {
+                Some(real) => {
+                    *val = real.clone();
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+    incoming
+}
+
+/// Reject a config whose `env`/`headers` carry the redaction placeholder —
+/// there is no stored value for `create` to resolve it against.
+fn reject_redacted_secrets(config: &Value) -> Result<()> {
+    for key in ["env", "headers"] {
+        if let Some(obj) = config.get(key).and_then(Value::as_object) {
+            if let Some(k) = obj
+                .iter()
+                .find(|(_, v)| v.as_str() == Some(REDACTED_PLACEHOLDER))
+                .map(|(k, _)| k)
+            {
+                return Err(Error::InvalidParams(format!(
+                    "{key}.{k} must not be the redaction placeholder"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fill defaults + validate a wire `McpServerConfig` (§5.22). `forced_id` pins
 /// the id (update); otherwise an absent id is generated. stdio requires a
 /// `command`; http/sse require a `url`.
@@ -1360,8 +1405,11 @@ impl<'a> McpServersService<'a> {
     }
 
     /// `mcp.servers.create` → persist a new definition; `{ server }` (redacted).
+    /// An `env`/`headers` value equal to the redaction placeholder is rejected
+    /// with `InvalidParams` — there is no stored secret to keep.
     pub(crate) async fn create(&self, config: Value) -> Result<Value> {
         let normalized = normalize_config(config, None)?;
+        reject_redacted_secrets(&normalized)?;
         let id = config_id(&normalized);
         let mut configs = read_configs(self.secrets).await;
         if configs.contains_key(&id) {
@@ -1376,14 +1424,20 @@ impl<'a> McpServersService<'a> {
 
     /// `mcp.servers.update` → replace an existing definition; `{ server }`
     /// (redacted). A running server is restarted to apply the new config.
+    ///
+    /// `env`/`headers` values equal to the redaction placeholder (what `list`
+    /// returns) keep the stored secret for that key; a placeholder for a key
+    /// not in storage is dropped; a literal value replaces the stored one;
+    /// an omitted key is deleted. The merged config is what gets persisted
+    /// and handed to the hub restart.
     pub(crate) async fn update(&self, server_id: &str, config: Value) -> Result<Value> {
         let mut configs = read_configs(self.secrets).await;
-        if !configs.contains_key(server_id) {
+        let Some(stored) = configs.get(server_id) else {
             return Err(Error::NotFound(format!(
                 "mcp server not found: {server_id}"
             )));
-        }
-        let normalized = normalize_config(config, Some(server_id))?;
+        };
+        let normalized = merge_redacted_secrets(normalize_config(config, Some(server_id))?, stored);
         configs.insert(server_id.to_string(), normalized.clone());
         write_configs(self.secrets, &configs).await?;
         // Apply live: any tracked server (running, or a remote in `error`)
@@ -1832,6 +1886,35 @@ mod tests {
     // -- normalize_config branches ----------------------------------------
 
     #[test]
+    fn merge_redacted_secrets_keeps_replaces_and_drops() {
+        let stored = json!({ "env": { "A": "a", "B": "b" }, "headers": { "H": "h" } });
+        let incoming = json!({
+            "env": { "A": REDACTED_PLACEHOLDER, "B": "new-b", "X": REDACTED_PLACEHOLDER },
+            "headers": { "Z": REDACTED_PLACEHOLDER },
+        });
+        let merged = merge_redacted_secrets(incoming, &stored);
+        assert_eq!(merged["env"], json!({ "A": "a", "B": "new-b" }));
+        assert_eq!(merged["headers"], json!({}));
+    }
+
+    #[test]
+    fn merge_redacted_secrets_noop_without_env_or_headers() {
+        let stored = json!({ "env": { "A": "a" } });
+        let incoming = json!({ "command": "x", "env": "not-an-object" });
+        assert_eq!(merge_redacted_secrets(incoming.clone(), &stored), incoming);
+    }
+
+    #[test]
+    fn reject_redacted_secrets_flags_placeholder_values_only() {
+        assert!(reject_redacted_secrets(&json!({ "env": { "K": "v" } })).is_ok());
+        assert!(reject_redacted_secrets(&json!({ "command": "x" })).is_ok());
+        let err = reject_redacted_secrets(&json!({ "headers": { "H": REDACTED_PLACEHOLDER } }))
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(format!("{err}").contains("headers.H"));
+    }
+
+    #[test]
     fn normalize_config_rejects_non_object() {
         let err = normalize_config(json!("nope"), None).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
@@ -2223,6 +2306,123 @@ mod tests {
         assert_eq!(out["server"]["id"], json!("u1"));
         assert_eq!(out["server"]["name"], json!("renamed"));
         assert_eq!(out["server"]["env"]["K"], json!(REDACTED_PLACEHOLDER));
+    }
+
+    #[tokio::test]
+    async fn update_with_redacted_placeholder_keeps_stored_secrets() {
+        // Regression (intent#1181): list → edit the redacted config → update
+        // must keep the real stored env/headers values, not persist `********`.
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(json!({
+            "id": "p1", "transport": "http", "url": "http://x",
+            "env": { "TOKEN": "real-env" },
+            "headers": { "Authorization": "Bearer real-hdr" },
+        }))
+        .await
+        .unwrap();
+
+        let listed = s.list(None).await.unwrap();
+        let mut echoed = listed["servers"][0].clone();
+        assert_eq!(echoed["env"]["TOKEN"], json!(REDACTED_PLACEHOLDER));
+        echoed["url"] = json!("http://y");
+
+        let out = s.update("p1", echoed).await.unwrap();
+        assert_eq!(out["server"]["url"], json!("http://y"));
+        assert_eq!(out["server"]["env"]["TOKEN"], json!(REDACTED_PLACEHOLDER));
+        assert_eq!(
+            out["server"]["headers"]["Authorization"],
+            json!(REDACTED_PLACEHOLDER)
+        );
+
+        let stored = read_configs(&secrets).await;
+        assert_eq!(stored["p1"]["url"], json!("http://y"));
+        assert_eq!(stored["p1"]["env"]["TOKEN"], json!("real-env"));
+        assert_eq!(
+            stored["p1"]["headers"]["Authorization"],
+            json!("Bearer real-hdr")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_placeholder_for_unknown_key_is_dropped() {
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(json!({
+            "id": "p2", "transport": "stdio", "command": "x",
+            "env": { "A": "a" },
+        }))
+        .await
+        .unwrap();
+
+        s.update(
+            "p2",
+            json!({
+                "transport": "stdio", "command": "x",
+                "env": { "A": REDACTED_PLACEHOLDER, "NEW": REDACTED_PLACEHOLDER },
+                "headers": { "H": REDACTED_PLACEHOLDER },
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stored = read_configs(&secrets).await;
+        assert_eq!(stored["p2"]["env"], json!({ "A": "a" }));
+        assert_eq!(stored["p2"]["headers"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn update_literal_value_replaces_and_omitted_key_deletes() {
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(json!({
+            "id": "p3", "transport": "stdio", "command": "x",
+            "env": { "KEEP": "old-keep", "GONE": "old-gone", "SET": "old-set" },
+        }))
+        .await
+        .unwrap();
+
+        s.update(
+            "p3",
+            json!({
+                "transport": "stdio", "command": "x",
+                "env": { "KEEP": REDACTED_PLACEHOLDER, "SET": "new-set" },
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stored = read_configs(&secrets).await;
+        assert_eq!(
+            stored["p3"]["env"],
+            json!({ "KEEP": "old-keep", "SET": "new-set" })
+        );
+
+        // Omitting `env` entirely deletes every key.
+        s.update("p3", json!({ "transport": "stdio", "command": "x" }))
+            .await
+            .unwrap();
+        assert!(read_configs(&secrets).await["p3"].get("env").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_rejects_redacted_placeholder_value() {
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        for cfg in [
+            json!({ "id": "c1", "transport": "stdio", "command": "x",
+                    "env": { "K": REDACTED_PLACEHOLDER } }),
+            json!({ "id": "c2", "transport": "http", "url": "http://x",
+                    "headers": { "H": REDACTED_PLACEHOLDER } }),
+        ] {
+            let err = s.create(cfg).await.unwrap_err();
+            assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        }
+        assert!(read_configs(&secrets).await.is_empty());
     }
 
     #[tokio::test]
@@ -3068,6 +3268,52 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(h.status("r-upd")["state"], json!("running"));
+    }
+
+    #[tokio::test]
+    async fn update_restart_receives_merged_secrets_not_placeholder() {
+        // The hub restart on update must get the merged (real-secret) config:
+        // a redacted echo of `headers` would otherwise probe with `********`.
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let resp = ok_json_response(body);
+        let leaked: &'static str = Box::leak(resp.into_boxed_str());
+        let (url, _guard) = http_stub(leaked).await;
+
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(json!({
+            "id": "r-merge", "transport": "http", "url": url, "enabled": true,
+            "headers": { "Authorization": "Bearer real" },
+        }))
+        .await
+        .unwrap();
+        let out = s.toggle("r-merge", true).await.unwrap();
+        assert_eq!(out["status"]["state"], json!("running"));
+
+        s.update(
+            "r-merge",
+            json!({
+                "transport": "http", "url": url, "enabled": true,
+                "headers": { "Authorization": REDACTED_PLACEHOLDER },
+            }),
+        )
+        .await
+        .unwrap();
+
+        let tracked = h
+            .inner
+            .servers
+            .lock()
+            .unwrap()
+            .get("r-merge")
+            .map(|rs| rs.config.clone())
+            .expect("server stays tracked after update");
+        assert_eq!(
+            tracked["headers"]["Authorization"],
+            json!("Bearer real"),
+            "hub restart must receive the merged config"
+        );
     }
 
     // -- mcp.testConnection (§5.22.2) ----------------------------------------
