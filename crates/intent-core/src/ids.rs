@@ -73,6 +73,10 @@ id_newtype!(
     /// Identifier for a workspace.
     WorkspaceId
 );
+id_newtype!(
+    /// Identifier for a durable workspace draft.
+    WorkspaceDraftId
+);
 
 /// Reserved workspace id for the daemon-known virtual "Chief of Staff"
 /// workspace (TS `CHIEF_WORKSPACE_ID` in `shared/types/branded-ids.ts`). Chief

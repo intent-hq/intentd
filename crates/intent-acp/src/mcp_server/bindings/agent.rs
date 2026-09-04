@@ -2051,6 +2051,7 @@ mod tests {
                         scope: None,
                         skip_worktree: false,
                         setup_script: None,
+                        setup_result: None,
                         is_remote: false,
                         default_model: None,
                         pr_number: None,
