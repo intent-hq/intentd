@@ -347,13 +347,14 @@ fn golden_supervisor_history_wrapper() {
          The previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\n\
          Do NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\
          \n\
-         Note on this replay: tool inputs and tool outputs below are abbreviated by the recovery replay. \
-         Each tool_use input and tool_result output is middle-truncated to at most 4000 characters \
-         (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" \
-         original_chars=\"N\" attribute on the element), and older exchanges may be omitted entirely. \
-         Truncation here does NOT mean the tool failed or returned empty output; the original call \
-         completed with its full result. If you genuinely need one specific full output, re-run that \
-         ONE call once. Do not re-fetch the same inputs repeatedly.\n\
+         Note on this replay: some tool inputs and tool outputs below are abbreviated by the recovery \
+         replay. Any tool_use input or tool_result output longer than 4000 characters is \
+         middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a \
+         truncated=\"true\" original_chars=\"N\" attribute on the element); blocks without that \
+         attribute are complete. Older exchanges may be omitted entirely. Truncation here does NOT \
+         mean the tool failed or returned empty output; the original call ran and its full result was \
+         delivered at the time. If you genuinely need one specific full output, re-run that ONE call \
+         once. Do not re-fetch the same inputs repeatedly.\n\
          \n\
          <exchange>\n\
          \x20 <user_request_or_tool_results>\n\
@@ -1513,14 +1514,15 @@ fn golden_supervisor_history_truncation_markers() {
         ),
     ];
     // intent#3696: the preamble includes the truncation-hint paragraph.
-    let hint = "Note on this replay: tool inputs and tool outputs below are abbreviated by the \
-                recovery replay. Each tool_use input and tool_result output is middle-truncated \
-                to at most 4000 characters (marked by an inline \"... [N characters truncated] \
-                ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the \
-                element), and older exchanges may be omitted entirely. Truncation here does NOT \
-                mean the tool failed or returned empty output; the original call completed with \
-                its full result. If you genuinely need one specific full output, re-run that ONE \
-                call once. Do not re-fetch the same inputs repeatedly.\n\n";
+    let hint = "Note on this replay: some tool inputs and tool outputs below are abbreviated by \
+                the recovery replay. Any tool_use input or tool_result output longer than 4000 \
+                characters is middle-truncated (marked by an inline \"... [N characters \
+                truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on \
+                the element); blocks without that attribute are complete. Older exchanges may be \
+                omitted entirely. Truncation here does NOT mean the tool failed or returned empty \
+                output; the original call ran and its full result was delivered at the time. If \
+                you genuinely need one specific full output, re-run that ONE call once. Do not \
+                re-fetch the same inputs repeatedly.\n\n";
     let preamble_len = "<supervisor>\nThe previous ACP session was lost. Below is the full \
                         conversation history from the prior session so you can continue \
                         seamlessly.\nDo NOT mention session recovery to the user. Just \

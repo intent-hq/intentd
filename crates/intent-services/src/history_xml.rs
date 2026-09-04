@@ -1,12 +1,17 @@
 //! Conversation-history → `<supervisor>` XML formatter for session recovery
-//! (faithful port of `acp-provider.ts` `formatHistoryAsXml` +
+//! (ported from `acp-provider.ts` `formatHistoryAsXml` +
 //! `sanitizeMessagesForHistory`).
 //!
 //! When the resume-impossible fallback creates a fresh `session/new`, the new
 //! ACP session has no prior context. This renders the persisted `agent_message`
-//! log into the same `<supervisor>`-wrapped exchange XML the TS provider sends so
-//! the agent continues seamlessly. Operates on the stored JSON content blocks
-//! (`serde_json::Value`) rather than typed blocks, mirroring the persisted shape.
+//! log into `<supervisor>`-wrapped exchange XML so the agent continues
+//! seamlessly. Operates on the stored JSON content blocks (`serde_json::Value`)
+//! rather than typed blocks, mirroring the persisted shape.
+//!
+//! Sanitization, grouping, budgets and escaping match the TS original; the
+//! output deliberately diverges from it in two places (intent#3696): the
+//! preamble carries a truncation-hint paragraph, and over-cap tool blocks carry
+//! a `truncated="true" original_chars="N"` element attribute.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -25,7 +30,7 @@ const MAX_TOOL_NAME_CHARS: usize = 200;
 /// the model that abbreviated tool blocks are a replay artefact, not broken or
 /// empty tool output, so it does not loop re-fetching the same inputs. The
 /// literal `4000` must track `MAX_TOOL_CONTENT_CHARS` (asserted below).
-const SUPERVISOR_PREAMBLE: &str = "<supervisor>\nThe previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\nDo NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\nNote on this replay: tool inputs and tool outputs below are abbreviated by the recovery replay. Each tool_use input and tool_result output is middle-truncated to at most 4000 characters (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element), and older exchanges may be omitted entirely. Truncation here does NOT mean the tool failed or returned empty output; the original call completed with its full result. If you genuinely need one specific full output, re-run that ONE call once. Do not re-fetch the same inputs repeatedly.\n\n";
+const SUPERVISOR_PREAMBLE: &str = "<supervisor>\nThe previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\nDo NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\nNote on this replay: some tool inputs and tool outputs below are abbreviated by the recovery replay. Any tool_use input or tool_result output longer than 4000 characters is middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element); blocks without that attribute are complete. Older exchanges may be omitted entirely. Truncation here does NOT mean the tool failed or returned empty output; the original call ran and its full result was delivered at the time. If you genuinely need one specific full output, re-run that ONE call once. Do not re-fetch the same inputs repeatedly.\n\n";
 const _: () = assert!(
     MAX_TOOL_CONTENT_CHARS == 4000,
     "SUPERVISOR_PREAMBLE names the per-block cap literally; update both together"
@@ -69,6 +74,11 @@ pub(crate) fn truncate_middle_content(text: &str, max_chars: usize) -> String {
 /// abbreviated (intent#3696), or `""` when it fit whole. Shared by the
 /// history replay's tool blocks and the restart-resume tail recap's
 /// segments so both recovery prompts carry the same marker convention.
+///
+/// Counts chars here and again inside `truncate_middle_content` (two walks of
+/// an over-cap block; negligible at the 4k/8k caps in use). For
+/// `max_chars < 62` the inline marker is not emitted but the attribute still
+/// is; unreachable with the current caps.
 pub(crate) fn truncate_marked(text: &str, max_chars: usize) -> (String, String) {
     let original_chars = text.chars().count();
     if original_chars <= max_chars {

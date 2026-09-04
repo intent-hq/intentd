@@ -159,9 +159,12 @@ fn preamble_carries_truncation_hint_paragraph() {
         .split_once("<exchange>")
         .expect("preamble before exchanges");
     assert!(preamble.contains("The previous ACP session was lost."));
-    assert!(preamble.contains("abbreviated by the recovery replay"));
-    assert!(preamble.contains("at most 4000 characters"));
-    assert!(preamble.contains("older exchanges may be omitted"));
+    assert!(preamble.contains(
+        "some tool inputs and tool outputs below are abbreviated by the recovery replay"
+    ));
+    assert!(preamble.contains("longer than 4000 characters is middle-truncated"));
+    assert!(preamble.contains("blocks without that attribute are complete"));
+    assert!(preamble.contains("Older exchanges may be omitted"));
     assert!(preamble.contains("does NOT mean the tool failed or returned empty output"));
     assert!(preamble.contains("re-run that ONE call once"));
     assert!(preamble.contains("Do not re-fetch the same inputs repeatedly"));
@@ -181,6 +184,24 @@ fn oversized_tool_result_carries_truncated_attribute_and_marker() {
         "<tool_result tool_use_id=\"t\" is_error=\"false\" truncated=\"true\" original_chars=\"10000\">"
     ));
     assert!(xml.contains("\n... [6060 characters truncated] ...\n"));
+}
+
+/// intent#3696: `original_chars` and the inline marker count chars, not bytes
+/// (a 2-byte `é` repeated 5000 times is 10000 bytes but 5000 chars).
+#[test]
+fn truncated_attribute_and_marker_count_chars_not_bytes() {
+    let multibyte = "é".repeat(5_000);
+    assert_eq!(multibyte.len(), 10_000);
+    let messages = vec![msg(
+        "user",
+        json!([{ "type": "tool_result", "tool_use_id": "t", "output": multibyte }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(xml.contains(
+        "<tool_result tool_use_id=\"t\" is_error=\"false\" truncated=\"true\" original_chars=\"5000\">"
+    ));
+    // 5000 - 2 * 1970 kept chars.
+    assert!(xml.contains("\n... [1060 characters truncated] ...\n"));
 }
 
 /// intent#3696: an under-cap `tool_result` renders exactly as before — no
