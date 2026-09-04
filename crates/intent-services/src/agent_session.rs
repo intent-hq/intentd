@@ -3012,7 +3012,7 @@ impl Services {
         // left to today's behavior: root/user-facing agents and taskless
         // agents (WARN + advisory only, per the issue's guard scope),
         // question-bearing turns (the redrive would bury the pending Q&A
-        // behind the question hold's back), and turns with a ready-to-send
+        // the user has not yet answered), and turns with a ready-to-send
         // queue entry (the imminent drain is itself the nudge). The counter
         // clears on any clean (non-truncated) completion — the stall
         // episode is over.

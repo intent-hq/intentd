@@ -4276,16 +4276,19 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
     );
 }
 
+/// Pending questions on the target no longer park a Chief send: the
+/// automatic send persists directly with its attribution, and the target's
+/// pending-questions marker survives.
 #[tokio::test]
-async fn app_agents_send_preserves_chief_attribution_through_queue_drain() {
+async fn app_agents_send_delivers_despite_target_pending_questions() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
     let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
-    let target = create_agent(&svc, &target_ws, "Held target").await;
+    let target = create_agent(&svc, &target_ws, "Asking target").await;
     let source = svc
         .agent_send_message_op(
             chief.clone(),
-            "Queue a request for the held target".into(),
+            "Send a request to the asking target".into(),
             None,
             None,
             None,
@@ -4298,11 +4301,11 @@ async fn app_agents_send_preserves_chief_attribution_through_queue_drain() {
         .store()
         .append_agent_message(&target, "assistant", &question_blocks(), &now_iso())
         .await
-        .expect("append held question");
+        .expect("append question");
     assert!(
         svc.record_pending_questions_marker(&target_ws, &target, &question.id)
             .await,
-        "real question row must arm the hold"
+        "real question row must set the marker"
     );
 
     let result = svc
@@ -4310,17 +4313,17 @@ async fn app_agents_send_preserves_chief_attribution_through_queue_drain() {
             chief_ws.clone(),
             chief.clone(),
             target.clone(),
-            "Wait until the questions are resolved".into(),
+            "Not parked behind the questions".into(),
             Some("normal".into()),
         )
         .await
-        .expect("queued Chief send");
-    assert_eq!(result["queued"], true);
-    assert_eq!(result["heldForQuestions"], true);
-    let queued_id = result["queuedMessage"]["id"]
-        .as_str()
-        .expect("queued id")
-        .to_string();
+        .expect("Chief send");
+    assert_eq!(result["queued"], false, "{result}");
+    assert!(result.get("heldForQuestions").is_none(), "{result}");
+    assert!(
+        svc.questions_pending(&target).await,
+        "an automatic send does not resolve the pending Q&A"
+    );
     let source_url = format!(
         "intent://local/{}/agent/{}/message/{source_id}",
         chief_ws.0, chief.0
@@ -4333,14 +4336,6 @@ async fn app_agents_send_preserves_chief_attribution_through_queue_drain() {
         "sourceMessageId": source_id,
         "sourceUrl": source_url,
     });
-    assert_eq!(
-        result["queuedMessage"]["messageMetadata"],
-        expected_metadata
-    );
-
-    svc.agent_send_queued_message_now_op(target.clone(), queued_id)
-        .await
-        .expect("drain queued Chief message");
     let target_session = svc
         .store()
         .get_agent_session(&target)
@@ -4350,7 +4345,7 @@ async fn app_agents_send_preserves_chief_attribution_through_queue_drain() {
         target_session
             .messages
             .last()
-            .expect("drained row")
+            .expect("persisted row")
             .metadata,
         Some(expected_metadata)
     );
@@ -4576,12 +4571,16 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
     assert_eq!(wakes, 1, "one ask must produce exactly one completion wake");
 }
 
+/// Pending questions on the target do not park the ask (it persists
+/// directly), and queued work on the target keeps the ask's completion watch
+/// armed through an interim idle until the queue drains and the target
+/// genuinely completes.
 #[tokio::test]
-async fn app_agents_ask_keeps_a_queued_delivery_armed_until_completion() {
+async fn app_agents_ask_keeps_watch_armed_while_target_has_queued_work() {
     let (_t, svc, target_ws) = setup().await;
     let chief_ws = WorkspaceId::chief();
     let chief = create_agent(&svc, &chief_ws, "Chief thread").await;
-    let target = create_agent(&svc, &target_ws, "Held target").await;
+    let target = create_agent(&svc, &target_ws, "Asking target").await;
     svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
         .await
         .expect("persist source");
@@ -4589,7 +4588,7 @@ async fn app_agents_ask_keeps_a_queued_delivery_armed_until_completion() {
         .store()
         .append_agent_message(&target, "assistant", &question_blocks(), &now_iso())
         .await
-        .expect("append held question");
+        .expect("append question");
     assert!(
         svc.record_pending_questions_marker(&target_ws, &target, &question.id)
             .await
@@ -4600,19 +4599,27 @@ async fn app_agents_ask_keeps_a_queued_delivery_armed_until_completion() {
             chief_ws,
             chief.clone(),
             target.clone(),
-            "answer after the hold".into(),
+            "not parked behind the questions".into(),
             Some("normal".into()),
         )
         .await
-        .expect("queued ask");
-    assert_eq!(asked["send"]["queued"], true);
-    assert_eq!(asked["send"]["heldForQuestions"], true);
-    let queued_message_id = asked["send"]["queuedMessage"]["id"]
-        .as_str()
-        .expect("queued message id")
-        .to_string();
+        .expect("Chief ask");
+    assert_eq!(asked["send"]["queued"], false, "{asked}");
+    assert!(asked["send"].get("heldForQuestions").is_none(), "{asked}");
+    assert!(svc.questions_pending(&target).await, "marker survives");
     assert_eq!(svc.list_watches_for_parent(&chief).len(), 1);
 
+    // Queued work on the target (an automatic wake parked by a busy race)
+    // makes a bare idle event interim.
+    let (queued, _) = svc.enqueue_message(
+        &target,
+        "parked wake".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
     svc.handle_completion_event(&completion_event(
         &target_ws,
         AGENT_IDLE,
@@ -4626,17 +4633,14 @@ async fn app_agents_ask_keeps_a_queued_delivery_armed_until_completion() {
         "queued work makes the idle event interim"
     );
 
-    svc.agent_dismiss_questions_op(target_ws.clone(), target.clone(), question.id)
+    svc.agent_send_queued_message_now_op(target.clone(), queued.id)
         .await
-        .expect("release question hold and drain queued ask");
-    svc.agent_send_queued_message_now_op(target.clone(), queued_message_id)
-        .await
-        .expect("drain queued ask on store-only test path");
+        .expect("drain queued entry on store-only test path");
     let queue = svc
         .agent_get_queue_op(target.clone(), Some(target_ws.clone()))
         .await
-        .expect("queue after hold release");
-    assert_eq!(queue["queue"], json!([]), "queued ask must drain");
+        .expect("queue after drain");
+    assert_eq!(queue["queue"], json!([]), "queue must drain");
     svc.handle_completion_event(&completion_event(
         &target_ws,
         AGENT_IDLE,
@@ -10524,12 +10528,17 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
 }
 
 /// The immediate (debounce = 0) path: the report wake never enters a hold —
-/// it is enqueued directly by the busy-parent fallback (here: an active
-/// question hold), so the queued entry carries NO `child_agent_id` stamp and
-/// only its `event_notification` metadata identifies it. Settlement must
-/// still retract it and fold the report into the single terminal wake —
-/// this pins the metadata-based matching that a stamp-based matcher would
-/// miss.
+/// on a busy parent it is enqueued by the generic busy-parent fallback, so
+/// the queued entry carries NO `child_agent_id` stamp and only its
+/// `event_notification` metadata identifies it. Settlement must still
+/// retract it and fold the report into the single terminal wake — this pins
+/// the metadata-based matching that a stamp-based matcher would miss.
+///
+/// The store-only path has no busy-parent park (pending questions no longer
+/// park automatic deliveries either), so the test delivers the immediate
+/// wake for real (it appends), then re-parks a stamp-less queue entry
+/// carrying that wake's real metadata — the shape the busy-parent fallback
+/// enqueues under a manager.
 #[tokio::test]
 async fn debounce_zero_report_wake_retracted_at_settlement() {
     let (_t, svc, ws) = setup().await;
@@ -10551,46 +10560,53 @@ async fn debounce_zero_report_wake_retracted_at_settlement() {
         .expect("delegate");
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
-    // Arm a question hold on the parent so the immediate wake takes the
-    // enqueue branch of `deliver_parent_wake_with_id` instead of appending.
-    let question = svc
-        .store()
-        .append_agent_message(&parent, "assistant", &question_blocks(), &now_iso())
-        .await
-        .expect("append held question");
-    assert!(
-        svc.record_pending_questions_marker(&ws, &parent, &question.id)
-            .await,
-        "real question row must arm the hold"
-    );
     let baseline = parent_message_count(&svc, &parent).await;
 
     let report = "immediate progress";
     svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
         .await
         .expect("report");
-    let parked = svc.queue_snapshot(&parent);
-    assert_eq!(
-        parked.len(),
-        1,
-        "immediate wake parked by the question hold: {parked:?}"
+    assert!(
+        svc.queue_snapshot(&parent).is_empty(),
+        "store-only immediate wake appends instead of parking"
     );
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "immediate wake appended"
+    );
+
+    // Re-park the immediate wake's real metadata as a stamp-less queue entry
+    // (the busy-parent fallback shape).
+    let immediate = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session")
+        .messages
+        .last()
+        .expect("immediate wake")
+        .clone();
+    let metadata = immediate.metadata.clone().expect("immediate wake metadata");
+    assert_eq!(metadata["type"], json!("event_notification"), "{metadata}");
+    svc.enqueue_message(
+        &parent,
+        immediate.content.to_string(),
+        None,
+        None,
+        Some(metadata),
+        None,
+        false,
+    );
+    let parked = svc.queue_snapshot(&parent);
+    assert_eq!(parked.len(), 1, "{parked:?}");
     assert!(
         parked[0]["holdKind"].is_null() && parked[0]["childAgentId"].is_null(),
         "debounce=0 entry has neither hold nor child stamp: {parked:?}"
     );
-    assert_eq!(
-        parent_message_count(&svc, &parent).await,
-        baseline,
-        "immediate wake was parked, not appended"
-    );
 
-    // Release the hold (dismissal does not drain the queue on the
-    // store-only test path), then settle the child: the parked entry is
-    // retracted and folded into the single terminal wake.
-    svc.agent_dismiss_questions_op(ws.clone(), parent.clone(), question.id)
-        .await
-        .expect("dismiss questions");
+    // Settle the child: the parked entry is retracted and folded into the
+    // single terminal wake.
     let before_settlement = parent_message_count(&svc, &parent).await;
     svc.handle_completion_event(&completion_event(
         &ws,
@@ -12452,7 +12468,7 @@ async fn send_message_op_preserves_attachments_on_auto_queue() {
 /// The auto-queue fallback must preserve `message_metadata` too: an answer
 /// queued after a failed append keeps its `question_answers` tag, so the later
 /// drain persist can still clear the pending-questions marker instead of
-/// wedging the hold forever.
+/// leaving the Q&A pending forever.
 #[tokio::test]
 async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
     let (_t, svc, ws) = setup().await;
@@ -12462,7 +12478,7 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .await
         .expect("append question");
     let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
-    assert!(svc.question_hold_active(&id).await, "hold armed");
+    assert!(svc.questions_pending(&id).await, "questions pending");
 
     svc.agent_send_message_op(
         id.clone(),
@@ -12489,8 +12505,8 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
     assert_eq!(r["queued"], true);
     assert_eq!(r["queuedMessage"]["messageMetadata"], metadata);
     assert!(
-        svc.question_hold_active(&id).await,
-        "hold stays until the queued answer actually persists"
+        svc.questions_pending(&id).await,
+        "marker stays until the queued answer actually persists"
     );
 
     let queued_id = r["queuedMessage"]["id"]
@@ -12501,8 +12517,8 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .await
         .expect("drain queued answer");
     assert!(
-        !svc.question_hold_active(&id).await,
-        "the drained answer must clear the hold"
+        !svc.questions_pending(&id).await,
+        "the drained answer must clear the marker"
     );
 }
 
@@ -14485,8 +14501,9 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         "unparseable queuedAt must not be flagged: {result}"
     );
 
-    // An active question hold parks automatic entries by design (PROTOCOL
-    // §5.5): the old non-user-origin entry is expected to wait, no risk.
+    // Pending questions no longer park automatic entries (protocol 9.5): an
+    // old non-user-origin entry on an idle asker is a genuine stuck risk,
+    // flagged exactly as on an agent with no questions pending.
     {
         let mut guard = svc.agent_queues.lock().unwrap();
         guard.get_mut(&target).expect("queue")[0].queued_at = "2020-01-01T00:00:00Z".into();
@@ -14495,14 +14512,14 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         .store()
         .append_agent_message(&target, "assistant", &question_blocks(), &now_iso())
         .await
-        .expect("append held question");
+        .expect("append question");
     assert!(
         svc.record_pending_questions_marker(&ws, &target, &question.id)
             .await,
-        "real question row must arm the hold"
+        "real question row must arm the pending marker"
     );
     // The marker write bumps the session's `updated_at` — re-mark the agent
-    // idle so the phases below exercise the hold logic, not the
+    // idle so the phases below exercise the stale check, not the
     // actively-responding skip.
     let mut s = svc
         .store()
@@ -14517,18 +14534,21 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, None, None)
         .await
-        .expect("diagnostics question hold");
-    assert!(
-        result["diagnostics"]["stuckRisks"]
-            .as_array()
-            .expect("stuckRisks")
-            .iter()
-            .all(|r| r["type"] != json!("stale-queue-entry")),
-        "question-hold-parked automatic entry must not be flagged: {result}"
-    );
+        .expect("diagnostics pending questions");
+    let risk = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("stale-queue-entry"))
+        .unwrap_or_else(|| {
+            panic!("stale automatic entry under pending questions must be flagged: {result}")
+        })
+        .clone();
+    assert_eq!(risk["entryId"], json!(entry_id), "risk: {risk}");
+    assert_eq!(risk["count"], json!(1), "risk: {risk}");
 
-    // The hold never blocks user-origin entries — a stale one is a genuine
-    // risk, flagged even under the hold and counted alone.
+    // A stale user-origin entry is a genuine risk too — counted alongside the
+    // automatic one, the oldest named.
     svc.enqueue_message_with_origin(
         &target,
         "user answer".into(),
@@ -14543,22 +14563,22 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         let mut guard = svc.agent_queues.lock().unwrap();
         let q = guard.get_mut(&target).expect("queue");
         let m = q.iter_mut().find(|m| m.user_origin).expect("user entry");
-        m.queued_at = "2020-01-01T00:00:00Z".into();
+        m.queued_at = "2019-01-01T00:00:00Z".into();
         m.id.clone()
     };
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, None, None)
         .await
-        .expect("diagnostics user-origin under hold");
+        .expect("diagnostics user-origin under pending questions");
     let risk = result["diagnostics"]["stuckRisks"]
         .as_array()
         .expect("stuckRisks")
         .iter()
         .find(|r| r["type"] == json!("stale-queue-entry"))
-        .unwrap_or_else(|| panic!("stale user-origin entry under hold must be flagged: {result}"))
+        .unwrap_or_else(|| panic!("stale user-origin entry must be flagged: {result}"))
         .clone();
     assert_eq!(risk["entryId"], json!(user_entry_id), "risk: {risk}");
-    assert_eq!(risk["count"], json!(1), "risk: {risk}");
+    assert_eq!(risk["count"], json!(2), "risk: {risk}");
 
     // An archived workspace affirmatively parks every queue until unarchive:
     // nothing is flagged, user-origin or not.
@@ -31277,7 +31297,7 @@ async fn empty_wake_recovery_skips_on_ready_queue_and_pending_attention() {
 }
 
 // ---------------------------------------------------------------------------
-// Question hold: `question_hold_active` derivation + `agent.dismissQuestions`
+// Pending questions: `questions_pending` derivation + `agent.dismissQuestions`
 // ---------------------------------------------------------------------------
 
 /// A persisted assistant content-block array ending with one question
@@ -32173,7 +32193,7 @@ async fn resolve_proposal_resolutions_map_evicts_oldest_past_cap() {
 
 /// Pre-upgrade fallback coverage: these rows are appended straight through the
 /// store, so the session never gets a pending-questions marker and
-/// `question_hold_active` exercises the legacy transcript tail walk (the
+/// `questions_pending` exercises the legacy transcript tail walk (the
 /// upgrade path that keeps a live hold from being lost). A hold derived that
 /// way is MATERIALIZED as a marker on the spot, so the very next plain user
 /// row cannot make it disappear — the tail walk alone would stop seeing the
@@ -32184,7 +32204,7 @@ async fn question_hold_tail_fallback_materializes_marker_and_survives_user_row()
     let id = create_agent(&svc, &ws, "Asker").await;
 
     // Empty transcript → no hold, and nothing materialized.
-    assert!(!svc.question_hold_active(&id).await);
+    assert!(!svc.questions_pending(&id).await);
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert!(!session.pending_questions_marker_written());
 
@@ -32198,7 +32218,7 @@ async fn question_hold_tail_fallback_materializes_marker_and_survives_user_row()
         )
         .await
         .expect("append plain");
-    assert!(!svc.question_hold_active(&id).await);
+    assert!(!svc.questions_pending(&id).await);
 
     // Trailing question resource blocks on the LAST assistant message → hold,
     // materialized as the pending-questions marker.
@@ -32207,7 +32227,7 @@ async fn question_hold_tail_fallback_materializes_marker_and_survives_user_row()
         .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
         .await
         .expect("append question");
-    assert!(svc.question_hold_active(&id).await);
+    assert!(svc.questions_pending(&id).await);
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
@@ -32227,7 +32247,7 @@ async fn question_hold_tail_fallback_materializes_marker_and_survives_user_row()
         .await
         .expect("append user");
     assert!(
-        svc.question_hold_active(&id).await,
+        svc.questions_pending(&id).await,
         "a materialized legacy hold must survive a plain user row"
     );
 
@@ -32235,7 +32255,7 @@ async fn question_hold_tail_fallback_materializes_marker_and_survives_user_row()
     svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
         .await
         .expect("dismiss");
-    assert!(!svc.question_hold_active(&id).await);
+    assert!(!svc.questions_pending(&id).await);
 }
 
 /// Regression: a trailing `system` row (e.g. the resume-interruption marker
@@ -32271,7 +32291,7 @@ async fn question_hold_survives_trailing_system_row() {
         .await
         .expect("append system marker");
     assert!(
-        svc.question_hold_active(&id).await,
+        svc.questions_pending(&id).await,
         "trailing system row must not defeat the hold"
     );
 
@@ -32288,7 +32308,7 @@ async fn question_hold_survives_trailing_system_row() {
         .await
         .expect("dismiss");
     assert!(
-        !svc.question_hold_active(&id).await,
+        !svc.questions_pending(&id).await,
         "dismissal past the system row must release the hold"
     );
 }
@@ -32328,7 +32348,7 @@ async fn question_hold_survives_many_trailing_system_rows() {
             .expect("append system marker");
     }
     assert!(
-        svc.question_hold_active(&id).await,
+        svc.questions_pending(&id).await,
         "hold must survive 25 trailing system rows"
     );
 
@@ -32337,7 +32357,7 @@ async fn question_hold_survives_many_trailing_system_rows() {
         .await
         .expect("dismiss");
     assert!(
-        !svc.question_hold_active(&id).await,
+        !svc.questions_pending(&id).await,
         "dismissal past many system rows must release the hold"
     );
 }
@@ -32878,7 +32898,7 @@ async fn pending_marker_written_overwritten_and_survives_later_rows() {
         session.pending_questions_message_id(),
         Some(asked_id.as_str())
     );
-    assert!(svc.question_hold_active(&id).await, "hold armed by marker");
+    assert!(svc.questions_pending(&id).await, "hold armed by marker");
 
     // A plain (untagged) user row does NOT resolve the questions.
     svc.agent_append_message_op(
@@ -32890,7 +32910,7 @@ async fn pending_marker_written_overwritten_and_survives_later_rows() {
     .await
     .expect("append plain user");
     assert!(
-        svc.question_hold_active(&id).await,
+        svc.questions_pending(&id).await,
         "a plain user row must not release the hold"
     );
 
@@ -32922,7 +32942,7 @@ async fn pending_marker_written_overwritten_and_survives_later_rows() {
         Some(reask_id.as_str()),
         "newer question set supersedes the older marker"
     );
-    assert!(svc.question_hold_active(&id).await);
+    assert!(svc.questions_pending(&id).await);
 }
 
 /// A user row tagged `question_answers` for EXACTLY the marked message clears
@@ -32948,7 +32968,7 @@ async fn pending_marker_cleared_by_matching_answer_only() {
     .await
     .expect("append stale answer");
     assert!(
-        svc.question_hold_active(&id).await,
+        svc.questions_pending(&id).await,
         "a stale answer id must not release the hold"
     );
 
@@ -32965,7 +32985,7 @@ async fn pending_marker_cleared_by_matching_answer_only() {
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
     assert!(session.pending_questions_marker_written());
-    assert!(!svc.question_hold_active(&id).await);
+    assert!(!svc.questions_pending(&id).await);
 }
 
 /// `agent.dismissQuestions` neutralizes the marker without clearing it: the
@@ -32980,7 +33000,7 @@ async fn dismissal_neutralizes_pending_marker() {
         .await
         .expect("append question");
     let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
-    assert!(svc.question_hold_active(&id).await);
+    assert!(svc.questions_pending(&id).await);
 
     svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_id.clone())
         .await
@@ -32991,13 +33011,13 @@ async fn dismissal_neutralizes_pending_marker() {
         Some(asked_id.as_str()),
         "dismissal neutralizes rather than clears the pending marker"
     );
-    assert!(!svc.question_hold_active(&id).await);
+    assert!(!svc.questions_pending(&id).await);
 
     // A newer question set re-arms the hold past the stale dismissal.
     svc.agent_append_message_op(id.clone(), "assistant".to_string(), question_blocks(), None)
         .await
         .expect("append re-ask");
-    assert!(svc.question_hold_active(&id).await);
+    assert!(svc.questions_pending(&id).await);
 }
 
 /// `agent.editAndRegenerate` truncation re-mints row ids, so the marker is
@@ -33028,7 +33048,7 @@ async fn edit_truncate_reconciles_pending_marker() {
         .await
         .expect("append second user");
     let target_id = target["message"]["id"].as_str().expect("id").to_string();
-    assert!(svc.question_hold_active(&id).await, "hold armed");
+    assert!(svc.questions_pending(&id).await, "hold armed");
 
     // Truncating at the LAST user row keeps the question message, so the
     // re-derived marker names its new (re-minted) id and the hold stays armed.
@@ -33047,7 +33067,7 @@ async fn edit_truncate_reconciles_pending_marker() {
         Some(question_id.as_str()),
         "marker re-derived against the re-minted row id"
     );
-    assert!(svc.question_hold_active(&id).await);
+    assert!(svc.questions_pending(&id).await);
 
     // Truncating past the question row drops it: the marker clears and the
     // hold releases (never a dangling marker).
@@ -33057,7 +33077,7 @@ async fn edit_truncate_reconciles_pending_marker() {
         .expect("truncate to empty");
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
-    assert!(!svc.question_hold_active(&id).await);
+    assert!(!svc.questions_pending(&id).await);
 }
 
 /// Re-derivation answer matching: a tag naming a row still present in the
@@ -33098,7 +33118,7 @@ async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
         Some(q1.as_str()),
         "an answer naming a still-present OTHER question set must not release the newer one"
     );
-    assert!(svc.question_hold_active(&id).await);
+    assert!(svc.questions_pending(&id).await);
 
     // Dangling reference (the swap re-minted ids) → resolves Q1.
     rows[2].metadata = Some(answer_metadata("dropped-by-the-swap"));
@@ -33106,7 +33126,7 @@ async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
         .await;
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
-    assert!(!svc.question_hold_active(&id).await);
+    assert!(!svc.questions_pending(&id).await);
 
     // Exact match → resolves Q1 too.
     rows[2].metadata = Some(answer_metadata(&q1));
@@ -33647,12 +33667,12 @@ async fn dismiss_questions_interleaved_redismissal_sends_no_duplicate_notice() {
     assert!(svc.queue_snapshot(&id).is_empty(), "nothing queued either");
 }
 
-/// A NEWER pending question keeps holding automatic deliveries after an
-/// older message's dismissal — the notice parks instead of delivering, and
-/// is promoted to the FRONT of the queue (ahead of previously parked
-/// entries), exposing the metadata on the `agent.getQueue` wire shape.
+/// A NEWER pending question does not park an older message's dismissal
+/// notice: the notice delivers directly (a user row lands), previously
+/// parked entries stay where they are, and the newer question's marker
+/// survives — it is still the FE's sticky pending state.
 #[tokio::test]
-async fn dismiss_questions_notice_parks_front_of_queue_when_still_held() {
+async fn dismiss_questions_notice_delivers_despite_newer_pending_question() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
     let asked_old = svc
@@ -33674,75 +33694,66 @@ async fn dismiss_questions_notice_parks_front_of_queue_when_still_held() {
         .await
         .expect("append newer question");
     assert!(
-        svc.question_hold_active(&id).await,
-        "hold armed by the newer question"
+        svc.questions_pending(&id).await,
+        "newer question is pending"
     );
 
     svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_old.id.clone())
         .await
         .expect("dismiss older");
 
-    // Still held (the marker names the OLDER message), so no user row landed.
+    // The marker names the NEWER message and survives the dismissal of the
+    // older one.
     assert!(
-        svc.question_hold_active(&id).await,
-        "newer question still holds"
+        svc.questions_pending(&id).await,
+        "newer question still pending"
     );
     let messages = svc
         .store()
         .get_agent_messages(&id, None)
         .await
         .expect("messages");
+    let notice = messages
+        .iter()
+        .find(|m| m.role == "user")
+        .expect("notice row landed despite the newer pending question");
     assert!(
-        messages.iter().all(|m| m.role != "user"),
-        "notice must not reach the transcript while held"
-    );
-
-    // The notice parked at the FRONT, ahead of the earlier entry, with the
-    // metadata (and the front-promotion marker) on the wire shape.
-    let queue = svc.queue_snapshot(&id);
-    assert_eq!(
-        queue.len(),
-        2,
-        "notice + previously parked entry: {queue:?}"
-    );
-    assert!(
-        queue[0]["content"]
+        notice.content[0]["text"]
             .as_str()
             .is_some_and(|t| t.starts_with("User dismissed your 1 question")),
-        "notice drains first: {queue:?}"
+        "{notice:?}"
     );
-    assert_eq!(
-        queue[0]["messageMetadata"],
-        dismissal_metadata(&asked_old.id),
-        "queue entry exposes the questions_dismissed metadata: {queue:?}"
-    );
-    assert_eq!(queue[0]["interruptPriority"], json!(true));
-    assert_eq!(queue[1]["content"], json!("parked wake"));
+    assert_eq!(notice.metadata, Some(dismissal_metadata(&asked_old.id)));
+
+    // The previously parked entry is untouched by the notice delivery.
+    let queue = svc.queue_snapshot(&id);
+    assert_eq!(queue.len(), 1, "{queue:?}");
+    assert_eq!(queue[0]["content"], json!("parked wake"));
 }
 
 // ---------------------------------------------------------------------------
-// Question hold: automatic deliveries and drains are gated (Task 2)
+// Pending questions do NOT gate automatic deliveries (store-only wiring)
 // ---------------------------------------------------------------------------
 
-/// Seed an active question hold: append an assistant message whose trailing
+/// Seed a pending question: append an assistant message whose trailing
 /// blocks carry a pending question resource.
-async fn arm_question_hold(svc: &Services, id: &AgentId) {
+async fn seed_pending_question(svc: &Services, id: &AgentId) {
     svc.store()
         .append_agent_message(id, "assistant", &question_blocks(), &now_iso())
         .await
         .expect("append question");
-    assert!(svc.question_hold_active(id).await, "hold must be armed");
+    assert!(svc.questions_pending(id).await, "questions must be pending");
 }
 
-/// Store-only `agent_send_message` (Automatic origin) is held: no user row is
-/// appended, the message parks in the queue with `heldForQuestions: true`.
-/// A User-origin send passes through, but an UNTAGGED one leaves the hold
-/// armed — only a `question_answers` tag (or a dismissal) retires it.
+/// Store-only `agent_send_message` (Automatic origin) persists directly while
+/// questions are pending — no queue park, no `heldForQuestions` — and the
+/// marker survives it. An UNTAGGED user send leaves the marker too: only a
+/// `question_answers` tag (or a dismissal) retires it.
 #[tokio::test]
-async fn hold_gates_store_only_automatic_send_but_not_user_send() {
+async fn pending_questions_do_not_gate_store_only_automatic_send() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
-    arm_question_hold(&svc, &id).await;
+    seed_pending_question(&svc, &id).await;
 
     let r = svc
         .agent_send_message(
@@ -33760,19 +33771,21 @@ async fn hold_gates_store_only_automatic_send_but_not_user_send() {
             intent_core::MessageOrigin::Automatic,
         )
         .await
-        .expect("held send succeeds");
-    assert_eq!(r["queued"], json!(true));
-    assert_eq!(r["heldForQuestions"], json!(true));
+        .expect("automatic send succeeds");
+    assert_eq!(r["queued"], json!(false), "{r}");
+    assert!(r.get("heldForQuestions").is_none(), "{r}");
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(
         session.messages.len(),
-        1,
-        "no user row appended while held (only the question message)"
+        2,
+        "question message + the delivered automatic row"
     );
-    assert_eq!(svc.queue_snapshot(&id).len(), 1, "message parked in queue");
+    assert!(svc.queue_snapshot(&id).is_empty(), "nothing parked");
+    assert!(
+        svc.questions_pending(&id).await,
+        "an automatic row must not resolve the questions"
+    );
 
-    // User origin passes through, but an untagged row does not resolve the
-    // questions — that is the persistence this contract adds.
     let r = svc
         .agent_send_message(
             ws.clone(),
@@ -33790,61 +33803,64 @@ async fn hold_gates_store_only_automatic_send_but_not_user_send() {
         )
         .await
         .expect("user send succeeds");
-    assert_eq!(r["queued"], json!(false), "user send is never held");
+    assert_eq!(r["queued"], json!(false));
     assert!(
-        svc.question_hold_active(&id).await,
+        svc.questions_pending(&id).await,
         "an untagged user row must not supersede the questions"
     );
 }
 
-/// Store-only `agent_send_to_task_op` (automatic by definition) is held.
+/// Store-only `agent_send_to_task_op` (automatic by definition) delivers
+/// while questions are pending.
 #[tokio::test]
-async fn hold_gates_store_only_send_to_task() {
+async fn pending_questions_do_not_gate_store_only_send_to_task() {
     let (_t, svc, ws) = setup().await;
-    let agent_id = create_agent(&svc, &ws, "HeldTaskRecv").await;
-    let note_id = seed_task(&svc, &ws, "held task").await;
+    let agent_id = create_agent(&svc, &ws, "TaskRecv").await;
+    let note_id = seed_task(&svc, &ws, "pending task").await;
     svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone(), None)
         .await
         .expect("assign");
-    arm_question_hold(&svc, &agent_id).await;
+    seed_pending_question(&svc, &agent_id).await;
 
     let r = svc
         .agent_send_to_task_op(ws.clone(), note_id, "task follow-up".into(), None, None)
         .await
         .expect("send_to_task");
     assert_eq!(r["ok"], true);
-    assert_eq!(r["result"]["heldForQuestions"], json!(true));
+    assert_eq!(r["result"]["queued"], json!(false), "{r}");
+    assert!(r["result"].get("heldForQuestions").is_none(), "{r}");
     let session = svc
         .store()
         .get_agent_session(&agent_id)
         .await
         .expect("session");
-    assert_eq!(session.messages.len(), 1, "no user row appended while held");
-    assert_eq!(svc.queue_snapshot(&agent_id).len(), 1);
-    assert!(svc.question_hold_active(&agent_id).await, "hold survives");
+    assert_eq!(session.messages.len(), 2, "user row appended");
+    assert!(svc.queue_snapshot(&agent_id).is_empty());
+    assert!(svc.questions_pending(&agent_id).await, "marker survives");
 }
 
 /// Store-only `deliver_parent_wake` (reportToParent / completion-watch /
-/// event-subscription wakes) is held.
+/// event-subscription wakes) delivers while questions are pending.
 #[tokio::test]
-async fn hold_gates_store_only_parent_wake() {
+async fn pending_questions_do_not_gate_store_only_parent_wake() {
     let (_t, svc, ws) = setup().await;
-    let parent = create_agent(&svc, &ws, "HeldParent").await;
-    arm_question_hold(&svc, &parent).await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    seed_pending_question(&svc, &parent).await;
 
     let r = svc
         .deliver_parent_wake(&ws, parent.clone(), "child done".into(), None)
         .await
         .expect("wake");
-    assert_eq!(r["queued"], json!(true));
-    assert_eq!(r["heldForQuestions"], json!(true));
+    assert_eq!(r["queued"], json!(false), "{r}");
+    assert!(r.get("heldForQuestions").is_none(), "{r}");
     let session = svc
         .store()
         .get_agent_session(&parent)
         .await
         .expect("session");
-    assert_eq!(session.messages.len(), 1, "no wake row appended while held");
-    assert_eq!(svc.queue_snapshot(&parent).len(), 1);
+    assert_eq!(session.messages.len(), 2, "wake row appended");
+    assert!(svc.queue_snapshot(&parent).is_empty());
+    assert!(svc.questions_pending(&parent).await, "marker survives");
 }
 
 /// Interrupt-priority insertion: interrupts enter ahead of normal entries but
@@ -35318,12 +35334,13 @@ async fn dequeue_ready_batch_returns_none_below_min_ready() {
     );
 }
 
-/// Under an active question hold the flush fires only when a user-origin
-/// entry is ready, and then carries EVERY ready entry — parked automatic
-/// entries ride the user-led combined turn in FIFO order instead of being
-/// bypassed by the newer user message (monorepo#1791).
+/// Under the archived-workspace drain exemption (`require_user_origin`) the
+/// flush fires only when a user-origin entry is ready, and then carries EVERY
+/// ready entry — parked automatic entries ride the user-led combined turn in
+/// FIFO order instead of being bypassed by the newer user message
+/// (monorepo#1791).
 #[tokio::test]
-async fn dequeue_ready_batch_under_hold_carries_automatic_entries_with_user_entry() {
+async fn dequeue_ready_batch_user_led_carries_automatic_entries_with_user_entry() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "BatchHold").await;
 
@@ -35355,11 +35372,11 @@ async fn dequeue_ready_batch_under_hold_carries_automatic_entries_with_user_entr
     );
 }
 
-/// With NO user-origin entry ready the hold keeps every automatic entry
-/// parked — the batch dequeue is a no-op (an automatic entry alone must not
-/// start a turn over the pending Q&A).
+/// With NO user-origin entry ready the user-led requirement keeps every
+/// automatic entry parked — the batch dequeue is a no-op (an automatic entry
+/// alone must not resurrect an archived workspace).
 #[tokio::test]
-async fn dequeue_ready_batch_under_hold_without_user_entry_is_noop() {
+async fn dequeue_ready_batch_user_led_without_user_entry_is_noop() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "BatchHoldAuto").await;
 
@@ -37762,7 +37779,7 @@ async fn group_wake_includes_flipped_completion_triggers() {
     }
 }
 
-/// The no-manager `agent.sendQueuedMessageNow` path (question-hold park →
+/// The no-manager `agent.sendQueuedMessageNow` path (a parked entry →
 /// explicit send with no `AgentManager` attached) resolves the unblocked
 /// section at persist time — parity with the manager path and the store-only
 /// `deliver_parent_wake` branch.
@@ -37780,7 +37797,7 @@ async fn no_manager_send_now_resolves_unblocked_section() {
         .expect("complete done");
 
     // A parked completion wake carrying only the trigger stamp (as the
-    // question-hold branch of `deliver_parent_wake` enqueues it).
+    // busy-parent / archived-park fallbacks enqueue it).
     let mut metadata = json!({ "type": "event_notification" });
     crate::agent_ops::ready_delta::stamp_trigger_tasks(
         &mut metadata,

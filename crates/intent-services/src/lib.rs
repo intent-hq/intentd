@@ -7827,37 +7827,6 @@ impl Services {
                 )
                 .await
         } else {
-            // Question hold (PROTOCOL §5.5): parent wakes are automatic —
-            // an active hold parks the wake in the queue instead of
-            // appending a user row that would bury the pending Q&A
-            // (mirrors the manager path's `send_message` gate).
-            if self.question_hold_active(&parent_agent_id).await {
-                let (queued, position) = self.enqueue_message_with_id_and_origin(
-                    &parent_agent_id,
-                    message_id,
-                    content,
-                    None,
-                    None,
-                    message_metadata,
-                    None,
-                    false,
-                    false,
-                );
-                let result = serde_json::json!({
-                    "success": true,
-                    "queued": true,
-                    "heldForQuestions": true,
-                    "queuedMessage": queued.to_value(position),
-                });
-                self.publish_queue_updated(&parent_agent_id).await;
-                // Race close (hold-check → enqueue vs a concurrent
-                // `dismissQuestions`/answer): this branch is only taken
-                // when no `AgentManager` is attached (see the `match`
-                // above), so there is no drain to kick here — a manager
-                // attaching later re-derives the hold on its own next
-                // trigger.
-                return Ok(result);
-            }
             // Delivery-time unblocked hints (monorepo#2044): the
             // store-only persist IS this path's delivery, so the section
             // is resolved here — matching the manager path's direct-send
@@ -25235,46 +25204,6 @@ impl WorkspaceApi for Services {
                         .await
                 }
             } else {
-                // Question hold (PROTOCOL §5.5): the store-only fallback
-                // must honor the automatic-delivery gate too — the row it
-                // persists would bury the pending Q&A. User-originated
-                // sends pass through (never held; only an answer-tagged
-                // row or `agent.dismissQuestions` releases the hold).
-                if !origin.is_user() && self.question_hold_active(&agent_id).await {
-                    self.require_agent_session(&agent_id).await?;
-                    // A2A sender header (intent-hq/intent#3721, monorepo#1015): this hold-park
-                    // bypasses `agent_send_message_op`'s prepend, so the
-                    // queued entry is annotated here — the drain persist
-                    // then inherits it.
-                    let mut content = content;
-                    crate::agent_ops::annotate_sender_attribution(
-                        &mut content,
-                        message_metadata.as_ref(),
-                    );
-                    let (queued, position) = self.enqueue_message(
-                        &agent_id,
-                        content,
-                        image_blocks,
-                        file_blocks,
-                        message_metadata,
-                        None,
-                        crate::agent_ops::is_interrupt_priority(priority.as_deref()),
-                    );
-                    let result = serde_json::json!({
-                        "success": true,
-                        "queued": true,
-                        "heldForQuestions": true,
-                        "queuedMessage": queued.to_value(position),
-                        "turnId": queued.turn_id,
-                    });
-                    self.publish_queue_updated(&agent_id).await;
-                    // Race close (hold-check → enqueue vs a concurrent
-                    // `dismissQuestions`/answer): this `None` arm only
-                    // runs with no `AgentManager` attached, so there is
-                    // no drain to kick here — same as the other
-                    // store-only fallbacks.
-                    return Ok(result);
-                }
                 // Read-only fallback (no `agent_manager` wired): plumb
                 // `messageMetadata` through the store-only append so the
                 // persisted row matches the production

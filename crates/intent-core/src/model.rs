@@ -2768,23 +2768,23 @@ pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 /// [`AgentSession::sponsor_agent_id`].
 pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
 
-/// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
-/// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
-/// user-originated entry point — which always delivers immediately; it
-/// bypasses the hold but does NOT release it (only an answer-tagged row or
-/// `agent.dismissQuestions` does). Everything else (MCP front-door sends,
-/// reportToParent / completion-watch / event-subscription wakes,
-/// `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations) is
-/// `Automatic` and is held in the queue while the target agent's question
-/// hold is active. `Automatic` is the `Default` so unmarked internal paths
-/// fail closed (held) rather than burying a pending Q&A.
+/// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5).
+/// `User` marks the FE `agent.sendMessage` RPC — the ONLY user-originated
+/// entry point — which is an explicit user action: it revives an archived
+/// workspace and retires a pending attention request. Everything else (MCP
+/// front-door sends, reportToParent / completion-watch / event-subscription
+/// wakes, `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations)
+/// is `Automatic`: parked in the queue while the target's workspace is
+/// archived (intent-hq/monorepo#2732) and never treated as user attention.
+/// Pending questions gate NEITHER origin — a pending Q&A is resolved only by
+/// an answer-tagged row, `agent.dismissQuestions`, or a newer question turn,
+/// never by delivery order. `Automatic` is the `Default` so unmarked internal
+/// paths fail closed (never mistaken for a user action).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageOrigin {
-    /// FE-originated `agent.sendMessage` (typed message or wizard answers):
-    /// never held by the question hold.
+    /// FE-originated `agent.sendMessage` (typed message or wizard answers).
     User,
-    /// System/agent-originated delivery: held while the question hold is
-    /// active.
+    /// System/agent-originated delivery.
     #[default]
     Automatic,
 }

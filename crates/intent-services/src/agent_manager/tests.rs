@@ -16092,15 +16092,11 @@ mod harness_wake_tests {
     }
 
     /// Perf (PR review): with no notification buffered, the tick returns via
-    /// the non-consuming peek without ever reaching `question_hold_active` —
-    /// verified indirectly by arming a hold that would otherwise be a no-op
-    /// gate (the tick is a no-op regardless, so this pins the "empty →
-    /// short-circuit before any store read" contract by construction: an
-    /// armed hold plus an empty channel must behave identically to no hold
-    /// at all, and must not itself require a `question_hold_active` read to
-    /// report that).
+    /// the non-consuming peek before any store read — pinned with a pending
+    /// question set on the session, which must be left untouched (the tick
+    /// is a no-op regardless of pending questions).
     #[tokio::test]
-    async fn tick_with_no_buffered_notification_short_circuits_even_with_hold_armed() {
+    async fn tick_with_no_buffered_notification_short_circuits_with_questions_pending() {
         let (_tmp, mgr, _bus, id, ws, _note_tx) = wake_setup().await;
         mgr.services
             .store
@@ -16123,24 +16119,29 @@ mod harness_wake_tests {
             )
             .await
             .expect("append question");
-        assert!(mgr.services.question_hold_active(&id).await, "hold armed");
+        assert!(
+            mgr.services.questions_pending(&id).await,
+            "questions pending"
+        );
 
         // No notification sent: the tick must short-circuit on the peek and
-        // leave the channel and hold state untouched.
+        // leave the channel and pending state untouched.
         assert!(mgr.wake_listener_tick(&id, &ws).await);
         assert!(!mgr.is_busy(&id), "peek-only tick never claims the slot");
         assert!(
-            mgr.services.question_hold_active(&id).await,
-            "hold unaffected by the no-op tick"
+            mgr.services.questions_pending(&id).await,
+            "pending questions unaffected by the no-op tick"
         );
     }
 
-    /// The hold still gates the tick once a notification IS buffered (the
-    /// peek passes, and the existing `question_hold_active` check then
-    /// blocks the implicit turn as before).
+    /// Pending questions do NOT gate the tick: once a notification is
+    /// buffered the implicit harness-wake turn opens as usual, and the
+    /// pending-questions marker stays set (the FE wizard stays sticky on
+    /// `pendingQuestionsMessageId`; only an answer or dismissal resolves it).
     #[tokio::test]
-    async fn tick_with_buffered_notification_still_gated_by_hold() {
-        let (_tmp, mgr, _bus, id, ws, note_tx) = wake_setup().await;
+    async fn tick_with_buffered_notification_opens_turn_despite_pending_questions() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
         mgr.services
             .store
             .append_agent_message(
@@ -16162,22 +16163,32 @@ mod harness_wake_tests {
             )
             .await
             .expect("append question");
-        assert!(mgr.services.question_hold_active(&id).await, "hold armed");
+        assert!(
+            mgr.services.questions_pending(&id).await,
+            "questions pending"
+        );
 
         note_tx.send(chunk_note("auto wake output")).unwrap();
-        assert!(mgr.wake_listener_tick(&id, &ws).await);
-        assert!(!mgr.is_busy(&id), "hold blocks the implicit turn");
-
-        // The buffered notification is left untouched (same contract as the
-        // wake-gate-paused case) so it is not silently dropped.
-        let notes = {
-            let map = mgr.handles.lock().unwrap();
-            map.get(&id).unwrap().notifications.clone()
-        };
-        let mut guard = notes.try_lock().expect("receiver not held");
+        let tick_mgr = mgr.clone();
+        let (tick_id, tick_ws) = (id.clone(), ws.clone());
+        let tick =
+            tokio::spawn(async move { tick_mgr.wake_listener_tick(&tick_id, &tick_ws).await });
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:start")
+        })
+        .await;
         assert!(
-            guard.try_recv().is_ok(),
-            "notification left buffered for a later tick past the hold"
+            events.iter().any(|e| e.event_type == "agent:stream:start"),
+            "implicit wake turn opens despite pending questions"
+        );
+        assert!(tick.await.unwrap(), "tick keeps the listener alive");
+        let _ = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:end")
+        })
+        .await;
+        assert!(
+            mgr.services.questions_pending(&id).await,
+            "pending-questions marker survives the wake turn"
         );
     }
 
@@ -16550,10 +16561,12 @@ mod model_change_notice_tests {
     }
 }
 
-/// Question hold (PROTOCOL §5.5): the runtime delivery/drain gates. Uses the
-/// manager without spawning provider turns — an active hold short-circuits
-/// BEFORE `try_begin`, so no provider is needed for the held paths.
-mod question_hold_gates {
+/// Pending questions (PROTOCOL §5.5) no longer gate delivery: automatic
+/// sends, interrupts, and queue drains proceed while a question block is
+/// pending. Only the marker lifecycle (answer / dismissal) is exercised here —
+/// the marker is the FE wizard's stickiness signal and the `needs_attention`
+/// source, not a delivery gate.
+mod pending_questions_no_gate {
     use super::*;
     use crate::agent_manager::TurnOptions;
     use intent_core::MessageOrigin;
@@ -16575,10 +16588,8 @@ mod question_hold_gates {
     }
 
     /// Appends the trailing question-block assistant row AND persists the
-    /// pending-questions marker for it (the stored-on-write contract the
-    /// turn-end persist follows), returning its message id — for
-    /// `agent_dismiss_questions_op` calls and answer-metadata tags.
-    async fn arm_hold(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) -> String {
+    /// pending-questions marker for it, returning its message id.
+    async fn mark_pending(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) -> String {
         let asked = mgr
             .services
             .store
@@ -16588,12 +16599,11 @@ mod question_hold_gates {
         mgr.services
             .record_pending_questions_marker(ws, id, &asked.id)
             .await;
-        assert!(mgr.services.question_hold_active(id).await);
+        assert!(mgr.services.questions_pending(id).await);
         asked.id
     }
 
-    /// The `messageMetadata` tag the wizard's answer carries — the only user
-    /// row shape that resolves a pending Q&A (spec §Decisions 3).
+    /// The `messageMetadata` tag the wizard's answer carries.
     fn answer_metadata(asked_id: &str) -> Value {
         json!({
             "type": "question_answers",
@@ -16601,30 +16611,54 @@ mod question_hold_gates {
         })
     }
 
-    /// Automatic `send_message` parks in the queue with `heldForQuestions`
-    /// and never claims the in-flight slot; a User send passes through the
-    /// hold gate — and since monorepo#1791 a user send arriving while the
-    /// hold has PARKED entries converts to a user-origin enqueue + drain
-    /// kick, so the parked automatic backlog rides the user-led combined
-    /// flush turn FIFO instead of being bypassed. A plain user send still
-    /// does not RELEASE the hold (no answer tag): later automatic sends
-    /// keep parking until the answer-tagged send clears the marker.
+    async fn mock_agent(mgr: &Arc<AgentManager>, ws: &str, id: &str) -> (WorkspaceId, AgentId) {
+        let (ws, id) = (WorkspaceId::from(ws), AgentId::from(id));
+        seed_agent(mgr, &ws, &id).await;
+        set_session_provider(mgr, &ws, &id, "mock").await;
+        (ws, id)
+    }
+
+    /// Waits until no turn is live, no worker is registered, and the queue
+    /// has nothing ready to send.
+    async fn settle(mgr: &Arc<AgentManager>, id: &AgentId) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !mgr.is_busy(id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent settles");
+    }
+
+    fn user_row_idx(messages: &[intent_core::AgentMessage], needle: &str) -> Option<usize> {
+        messages.iter().position(|m| {
+            m.role == "user"
+                && m.content.as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
+                })
+        })
+    }
+
+    /// An automatic `send_message` on an idle agent with pending questions
+    /// delivers DIRECTLY (claims the slot, no `heldForQuestions`, not
+    /// queued), and the pending-questions marker survives the turn — only
+    /// the answer-tagged user row clears it.
     #[tokio::test]
-    async fn automatic_send_held_user_send_not() {
+    async fn automatic_send_delivers_despite_pending_questions() {
         let script = mock_agent_script();
         let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
         let (_tmp, mgr, _bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
-        let (ws, id) = (WorkspaceId::from("ws-qh-send"), AgentId::from("a-qh-send"));
-        seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
-        session.provider = Some("mock".to_string());
-        mgr.services
-            .store
-            .update_agent_session(&ws, &session)
-            .await
-            .expect("set mock provider");
-        let asked = arm_hold(&mgr, &ws, &id).await;
+        let (ws, id) = mock_agent(&mgr, "ws-pq-send", "a-pq-send").await;
+        let asked = mark_pending(&mgr, &ws, &id).await;
 
         let r = mgr
             .clone()
@@ -16636,111 +16670,49 @@ mod question_hold_gates {
                 TurnOptions::default(),
             )
             .await
-            .expect("held send");
-        assert_eq!(r["queued"], json!(true));
-        assert_eq!(r["heldForQuestions"], json!(true));
-        assert!(!mgr.is_busy(&id), "held send never claims the slot");
-        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
-
-        // Hold still active (no user row was appended).
-        assert!(mgr.services.question_hold_active(&id).await);
-
-        // A PLAIN user-origin send is NOT held — but with a parked backlog
-        // it converts to a user-origin enqueue + drain kick (monorepo#1791):
-        // the batch flush delivers the parked automatic entry FIFO in the
-        // SAME combined turn as the user message instead of bypassing it.
-        // No answer tag rode along, so the pending-questions marker
-        // survives the combined turn.
-        let plain = TurnOptions {
-            origin: MessageOrigin::User,
-            ..TurnOptions::default()
-        };
-        let r = mgr
-            .clone()
-            .send_message(
-                id.clone(),
-                ws.clone(),
-                "unrelated aside".to_string(),
-                None,
-                plain,
-            )
-            .await
-            .expect("plain user send");
+            .expect("automatic send");
+        assert_eq!(r["queued"], json!(false), "delivered directly, not parked");
         assert_eq!(
             r.get("heldForQuestions"),
             None,
-            "user sends bypass the hold gate"
+            "no hold marker on the wire"
         );
-        assert_eq!(
-            r["queued"],
-            json!(true),
-            "user send with a parked backlog converts to enqueue + flush"
-        );
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("combined flush turn completes");
-        assert!(
-            mgr.services.question_hold_active(&id).await,
-            "a plain user message does not resolve the pending Q&A"
-        );
+        settle(&mgr, &id).await;
         assert!(
             mgr.services.queue_snapshot(&id).is_empty(),
-            "the parked automatic entry rode the user-led flush turn"
+            "nothing left parked"
         );
-        // FIFO: the older parked wake's user row precedes the newer user
-        // message's row in the transcript.
         let messages = mgr
             .services
             .store
             .get_agent_messages(&id, None)
             .await
-            .expect("messages");
-        let row_idx = |needle: &str| {
-            messages.iter().position(|m| {
-                m.role == "user"
-                    && m.content.as_array().is_some_and(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
-                    })
-            })
-        };
-        let wake_idx = row_idx("auto wake").expect("parked wake row landed");
-        let aside_idx = row_idx("unrelated aside").expect("user row landed");
+            .unwrap();
         assert!(
-            wake_idx < aside_idx,
-            "older parked wake drains FIFO ahead of the newer user message: \
-             wake={wake_idx} aside={aside_idx}"
+            user_row_idx(&messages, "auto wake").is_some(),
+            "wake row landed"
+        );
+        assert!(
+            mgr.services.questions_pending(&id).await,
+            "an automatic delivery does not resolve the pending Q&A"
         );
 
-        // A LATER automatic send still parks — the hold is armed until the
-        // answer or dismissal.
-        let r = mgr
-            .clone()
-            .send_message(
-                id.clone(),
-                ws.clone(),
-                "auto wake 2".to_string(),
-                None,
-                TurnOptions::default(),
-            )
+        // A plain user send also delivers and also leaves the marker alone.
+        let plain = TurnOptions {
+            origin: MessageOrigin::User,
+            ..TurnOptions::default()
+        };
+        mgr.clone()
+            .send_message(id.clone(), ws.clone(), "aside".to_string(), None, plain)
             .await
-            .expect("second held send");
-        assert_eq!(r["heldForQuestions"], json!(true));
-        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+            .expect("plain user send");
+        settle(&mgr, &id).await;
+        assert!(
+            mgr.services.questions_pending(&id).await,
+            "a plain user message does not resolve the pending Q&A"
+        );
 
-        // The ANSWER releases the hold; with a parked backlog it converts to
-        // the same enqueue + flush, draining the parked wake alongside it.
+        // The answer-tagged send clears the marker.
         let answer = TurnOptions {
             origin: MessageOrigin::User,
             message_metadata: Some(answer_metadata(&asked)),
@@ -16750,246 +16722,44 @@ mod question_hold_gates {
             .send_message(id.clone(), ws.clone(), "answer".to_string(), None, answer)
             .await
             .expect("answer send");
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("answer turn + released drain complete");
-        assert!(
-            !mgr.services.question_hold_active(&id).await,
-            "hold cleared"
-        );
+        settle(&mgr, &id).await;
+        assert!(!mgr.services.questions_pending(&id).await, "marker cleared");
     }
 
-    /// monorepo#1791 regression: an automatic `after_all` settlement wake
-    /// parked by the hold on an IDLE agent must not be bypassed by a newer
-    /// plain user message — the user send converts to a user-origin enqueue
-    /// and the flush delivers the wake FIFO in the same combined turn.
+    /// `try_drain_queue` drains a parked automatic entry while questions are
+    /// pending, and the marker survives both the drain and a later
+    /// question-free assistant turn until dismissed.
     #[tokio::test]
-    async fn parked_settlement_wake_drains_with_newer_user_message() {
+    async fn drain_proceeds_despite_pending_questions() {
         let script = mock_agent_script();
         let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
         let (_tmp, mgr, _bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
-        let (ws, id) = (WorkspaceId::from("ws-qh-1791"), AgentId::from("a-qh-1791"));
-        seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
-        session.provider = Some("mock".to_string());
+        let (ws, id) = mock_agent(&mgr, "ws-pq-drain", "a-pq-drain").await;
+
         mgr.services
-            .store
-            .update_agent_session(&ws, &session)
-            .await
-            .expect("set mock provider");
-        arm_hold(&mgr, &ws, &id).await;
+            .enqueue_message(&id, "parked".to_string(), None, None, None, None, false);
+        let asked = mark_pending(&mgr, &ws, &id).await;
 
-        // The settlement wake (automatic) parks at position 0 on the idle
-        // agent — the monorepo#1791 incident shape.
-        let wake = "[WORKSPACE EVENTS] All 3 delegated child agent(s) settled";
-        let r = mgr
-            .clone()
-            .send_message(
-                id.clone(),
-                ws.clone(),
-                wake.to_string(),
-                None,
-                TurnOptions::default(),
-            )
-            .await
-            .expect("wake send");
-        assert_eq!(r["heldForQuestions"], json!(true));
-
-        // The user's later "check" must NOT run past the parked wake.
-        let r = mgr
-            .clone()
-            .send_message(
-                id.clone(),
-                ws.clone(),
-                "check".to_string(),
-                None,
-                TurnOptions {
-                    origin: MessageOrigin::User,
-                    ..TurnOptions::default()
-                },
-            )
-            .await
-            .expect("check send");
-        assert_eq!(r["queued"], json!(true), "converted to enqueue + flush");
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("combined turn completes");
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        settle(&mgr, &id).await;
         assert!(
             mgr.services.queue_snapshot(&id).is_empty(),
-            "settlement wake no longer stuck in the queue"
+            "the drain delivers the parked entry"
         );
         let messages = mgr
             .services
             .store
             .get_agent_messages(&id, None)
             .await
-            .expect("messages");
-        let row_idx = |needle: &str| {
-            messages.iter().position(|m| {
-                m.role == "user"
-                    && m.content.as_array().is_some_and(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
-                    })
-            })
-        };
-        let wake_idx = row_idx("delegated child agent(s) settled").expect("wake row landed");
-        let check_idx = row_idx("check").expect("check row landed");
+            .unwrap();
         assert!(
-            wake_idx < check_idx,
-            "settlement wake delivered FIFO ahead of the newer user message: \
-             wake={wake_idx} check={check_idx}"
-        );
-    }
-
-    /// The monorepo#1791 conversion requires the `all` flush mode: without
-    /// batching no combined turn exists to carry the parked entries, so a
-    /// user send under hold stays a DIRECT send (documented bypass) and the
-    /// parked automatic entry stays parked — the pre-fix contract, pinned
-    /// here for the non-default `off` mode.
-    #[tokio::test]
-    async fn user_send_under_hold_stays_direct_when_flush_mode_off() {
-        let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
-        let tmp = TempDb::new();
-        let store = Store::open(&tmp.path).await.expect("open store");
-        let bus = EventBus::new(store.clone());
-        let config_dir = tempfile::tempdir().expect("temp config dir");
-        let registry = Arc::new(
-            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
-                .expect("load registry"),
-        );
-        registry
-            .apply(&[("agents.flushQueuedMessages".to_string(), json!("off"))])
-            .expect("disable flush");
-        let services = Services::new(store)
-            .with_event_bus(bus.clone())
-            .with_settings_registry(registry);
-        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-        let mgr = Arc::new(AgentManager::new(services, sink, 8));
-        let (ws, id) = (
-            WorkspaceId::from("ws-qh-1791-off"),
-            AgentId::from("a-qh-1791-off"),
-        );
-        seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
-        session.provider = Some("mock".to_string());
-        mgr.services
-            .store
-            .update_agent_session(&ws, &session)
-            .await
-            .expect("set mock provider");
-        arm_hold(&mgr, &ws, &id).await;
-
-        let r = mgr
-            .clone()
-            .send_message(
-                id.clone(),
-                ws.clone(),
-                "auto wake".to_string(),
-                None,
-                TurnOptions::default(),
-            )
-            .await
-            .expect("wake send");
-        assert_eq!(r["heldForQuestions"], json!(true));
-
-        let r = mgr
-            .clone()
-            .send_message(
-                id.clone(),
-                ws.clone(),
-                "check".to_string(),
-                None,
-                TurnOptions {
-                    origin: MessageOrigin::User,
-                    ..TurnOptions::default()
-                },
-            )
-            .await
-            .expect("check send");
-        assert_eq!(
-            r["queued"],
-            json!(false),
-            "no combined turn exists in `off` mode — the direct send stands"
-        );
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("direct turn completes");
-        let snapshot = mgr.services.queue_snapshot(&id);
-        assert_eq!(
-            snapshot.len(),
-            1,
-            "the automatic entry stays parked under the hold (no batch to ride)"
-        );
-        assert_eq!(snapshot[0]["content"], json!("auto wake"));
-    }
-
-    /// `try_drain_queue` refuses to drain while the hold is active, and
-    /// drains normally once the questions are dismissed.
-    #[tokio::test]
-    async fn drain_gated_until_dismiss() {
-        let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
-        let (_tmp, mgr, _bus) = manager_with_bus().await;
-        let mgr = Arc::new(mgr);
-        let (ws, id) = (
-            WorkspaceId::from("ws-qh-drain"),
-            AgentId::from("a-qh-drain"),
-        );
-        seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
-        session.provider = Some("mock".to_string());
-        mgr.services
-            .store
-            .update_agent_session(&ws, &session)
-            .await
-            .expect("set mock provider");
-
-        mgr.services
-            .enqueue_message(&id, "parked".to_string(), None, None, None, None, false);
-        let asked = arm_hold(&mgr, &ws, &id).await;
-
-        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        assert!(!mgr.is_busy(&id), "hold blocks the drain");
-        assert_eq!(
-            mgr.services.queue_snapshot(&id).len(),
-            1,
-            "entry stays parked"
+            user_row_idx(&messages, "parked").is_some(),
+            "parked row landed"
         );
 
-        // A later question-FREE assistant turn does not release the hold —
-        // the entry is still parked (pendingness survives the agent's own
-        // turns until answered or dismissed).
+        // Neither the drain nor a question-free assistant tail resolves the
+        // pending Q&A (pendingness survives the agent's own turns).
         mgr.services
             .store
             .append_agent_message(
@@ -17000,51 +16770,26 @@ mod question_hold_gates {
             )
             .await
             .expect("append question-free tail");
-        assert!(mgr.services.question_hold_active(&id).await);
-        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        assert!(!mgr.is_busy(&id), "hold survives a question-free turn");
-        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+        assert!(mgr.services.questions_pending(&id).await);
 
-        // Dismiss → drain proceeds (mirrors the RPC's dismiss-then-kick).
         mgr.services
-            .agent_dismiss_questions_op(ws.clone(), id.clone(), asked.clone())
+            .agent_dismiss_questions_op(ws.clone(), id.clone(), asked)
             .await
             .expect("dismiss");
-        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("dismissed queue drains");
+        assert!(!mgr.services.questions_pending(&id).await, "dismiss clears");
     }
 
-    /// Automatic interrupt priority: held like any automatic delivery, and
-    /// parked at the FRONT of the queue with the persisted marker.
+    /// Automatic interrupt priority on an idle agent with pending questions
+    /// delivers directly — it is never parked front-of-queue.
     #[tokio::test]
-    async fn automatic_interrupt_held_front_of_queue() {
+    async fn automatic_interrupt_delivers_despite_pending_questions() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
         let (_tmp, mgr, _bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
-        let (ws, id) = (WorkspaceId::from("ws-qh-int"), AgentId::from("a-qh-int"));
-        seed_agent(&mgr, &ws, &id).await;
-        arm_hold(&mgr, &ws, &id).await;
+        let (ws, id) = mock_agent(&mgr, "ws-pq-int", "a-pq-int").await;
+        mark_pending(&mgr, &ws, &id).await;
 
-        mgr.services.enqueue_message(
-            &id,
-            "earlier normal".to_string(),
-            None,
-            None,
-            None,
-            None,
-            false,
-        );
         let r = mgr
             .interrupt_send_message(
                 id.clone(),
@@ -17054,43 +16799,38 @@ mod question_hold_gates {
                 TurnOptions::default(),
             )
             .await
-            .expect("held interrupt");
-        assert_eq!(r["queued"], json!(true));
-        assert_eq!(r["heldForQuestions"], json!(true));
-        assert!(!mgr.is_busy(&id), "held interrupt never preempts/claims");
-
-        let snapshot = mgr.services.queue_snapshot(&id);
-        assert_eq!(snapshot.len(), 2);
-        assert_eq!(snapshot[0]["content"], json!("urgent"));
-        assert_eq!(snapshot[0]["interruptPriority"], json!(true));
-        assert_eq!(snapshot[1]["content"], json!("earlier normal"));
+            .expect("interrupt");
+        assert_eq!(r["queued"], json!(false), "delivered, not parked");
+        assert_eq!(r.get("heldForQuestions"), None);
+        settle(&mgr, &id).await;
+        assert!(mgr.services.queue_snapshot(&id).is_empty());
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert!(
+            user_row_idx(&messages, "urgent").is_some(),
+            "interrupt row landed"
+        );
+        assert!(
+            mgr.services.questions_pending(&id).await,
+            "marker survives the interrupt turn"
+        );
     }
 
-    /// PR review regression: held interrupts still record the dedup marker.
-    /// A duplicate `message_id` arriving while the hold is active must be
-    /// deduplicated (not double-enqueued), and a replay of that same id
-    /// arriving after the hold releases must also be deduplicated — the
-    /// held interrupt keeps the same at-most-once contract as one that
-    /// streamed immediately.
+    /// Interrupt dedup is unaffected by pending questions: a duplicate
+    /// `message_id` is deduplicated both while the marker is set and after
+    /// it is dismissed.
     #[tokio::test]
-    async fn held_interrupt_records_dedup_marker() {
+    async fn interrupt_dedup_unaffected_by_pending_questions() {
         let script = mock_agent_script();
         let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
         let (_tmp, mgr, _bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
-        let (ws, id) = (
-            WorkspaceId::from("ws-qh-int-dedup"),
-            AgentId::from("a-qh-int-dedup"),
-        );
-        seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
-        session.provider = Some("mock".to_string());
-        mgr.services
-            .store
-            .update_agent_session(&ws, &session)
-            .await
-            .expect("set mock provider");
-        let asked = arm_hold(&mgr, &ws, &id).await;
+        let (ws, id) = mock_agent(&mgr, "ws-pq-int-dedup", "a-pq-int-dedup").await;
+        let asked = mark_pending(&mgr, &ws, &id).await;
 
         let r1 = mgr
             .interrupt_send_message(
@@ -17101,12 +16841,9 @@ mod question_hold_gates {
                 TurnOptions::default(),
             )
             .await
-            .expect("first held interrupt");
-        assert_eq!(r1["queued"], json!(true));
-        assert_eq!(r1["heldForQuestions"], json!(true));
+            .expect("first interrupt");
+        assert_eq!(r1.get("deduplicated"), None);
 
-        // A duplicate with the SAME message_id while still held must be
-        // deduplicated, not enqueued a second time.
         let r2 = mgr
             .interrupt_send_message(
                 id.clone(),
@@ -17116,16 +16853,10 @@ mod question_hold_gates {
                 TurnOptions::default(),
             )
             .await
-            .expect("duplicate held interrupt");
+            .expect("duplicate interrupt");
         assert_eq!(r2["deduplicated"], json!(true));
-        assert_eq!(
-            mgr.services.queue_snapshot(&id).len(),
-            1,
-            "no double-enqueue"
-        );
+        settle(&mgr, &id).await;
 
-        // Dismiss releases the hold; a replay of the SAME id must still be
-        // deduplicated (the marker survived the hold window).
         mgr.services
             .agent_dismiss_questions_op(ws.clone(), id.clone(), asked)
             .await
@@ -17139,206 +16870,51 @@ mod question_hold_gates {
                 TurnOptions::default(),
             )
             .await
-            .expect("post-release replay");
-        assert_eq!(
-            r3["deduplicated"],
-            json!(true),
-            "replay after release is still deduplicated"
-        );
-    }
-
-    /// PR review regression: the hold-check → enqueue race against a
-    /// concurrent `dismissQuestions`. Simulated by dismissing the questions
-    /// AFTER `question_hold_active` would have observed `true` but the
-    /// message is enqueued with the hold already cleared by the time the
-    /// re-check inside `send_message` runs — the re-check must self-heal by
-    /// kicking the drain instead of stranding the entry.
-    #[tokio::test]
-    async fn held_send_self_heals_when_dismissed_during_enqueue() {
-        let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
-        let (_tmp, mgr, _bus) = manager_with_bus().await;
-        let mgr = Arc::new(mgr);
-        let (ws, id) = (
-            WorkspaceId::from("ws-qh-race2"),
-            AgentId::from("a-qh-race2"),
-        );
-        seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
-        session.provider = Some("mock".to_string());
-        mgr.services
-            .store
-            .update_agent_session(&ws, &session)
-            .await
-            .expect("set mock provider");
-        let asked = arm_hold(&mgr, &ws, &id).await;
-
-        // Dismiss BEFORE the send: `question_hold_active` inside
-        // `send_message` now observes `false`, so this exercises the
-        // "already resolved" side, not the raw hold gate — the real value of
-        // this test is asserting `try_drain_queue`'s own re-derivation is
-        // safe to call twice in a row (once from the RPC's dismiss kick,
-        // once from send's own post-enqueue re-check) without duplicating
-        // delivery.
-        mgr.services
-            .agent_dismiss_questions_op(ws.clone(), id.clone(), asked)
-            .await
-            .expect("dismiss");
-
-        let r = mgr
-            .clone()
-            .send_message(
-                id.clone(),
-                ws.clone(),
-                "auto wake".to_string(),
-                None,
-                TurnOptions::default(),
-            )
-            .await
-            .expect("send after dismiss");
-        assert_eq!(
-            r.get("heldForQuestions"),
-            None,
-            "hold already cleared before send"
-        );
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("message delivered, no stranding");
-    }
-
-    /// Race regression (the WSS Q&A e2e flake): a USER answer that lands
-    /// while the asking turn's worker still holds the in-flight slot is
-    /// parked by the busy race — the worker's end-of-turn drain then sees
-    /// the hold active (its own turn asked the questions). The parked
-    /// user-origin entry must drain anyway (it IS the hold release);
-    /// without the user-origin bypass the answer deadlocks: the hold waits
-    /// for a user row while the user row waits in the queue.
-    #[tokio::test]
-    async fn user_send_parked_by_busy_race_drains_despite_hold() {
-        let (_tmp, mgr, _bus) = manager_with_bus().await;
-        let mgr = Arc::new(mgr);
-        let (ws, id) = (WorkspaceId::from("ws-qh-race"), AgentId::from("a-qh-race"));
-        seed_agent(&mgr, &ws, &id).await;
-        arm_hold(&mgr, &ws, &id).await;
-
-        // The user answer lost the busy race against the asking turn and
-        // parked with the user-origin marker (send_message's busy branch).
-        let opts = TurnOptions {
-            origin: MessageOrigin::User,
-            ..TurnOptions::default()
-        };
-        mgr.services.enqueue_message_with_origin(
-            &id,
-            "Q: Which scope?\nA: workspace".to_string(),
-            None,
-            None,
-            None,
-            opts.queued_prepend(),
-            opts.interrupt_priority,
-            opts.origin.is_user(),
-        );
-        // An automatic wake parked ahead of it must stay held.
-        mgr.services.enqueue_message(
-            &id,
-            "auto report".to_string(),
-            None,
-            None,
-            None,
-            None,
-            false,
-        );
-        assert!(mgr.services.question_hold_active(&id).await);
-        assert!(mgr.services.has_user_origin_ready(&id));
-
-        // The drain (kicked at the asking worker's turn end) proceeds for
-        // the user entry ONLY: pops it despite the hold, leaves the
-        // automatic entry parked.
-        let popped = mgr
+            .expect("post-dismiss replay");
+        assert_eq!(r3["deduplicated"], json!(true), "replay still deduplicated");
+        settle(&mgr, &id).await;
+        let messages = mgr
             .services
-            .dequeue_user_origin_message(&id)
-            .expect("user-origin entry drains under the hold");
-        assert_eq!(popped.content, "Q: Which scope?\nA: workspace");
-        assert!(popped.user_origin);
-        let snapshot = mgr.services.queue_snapshot(&id);
-        assert_eq!(snapshot.len(), 1, "automatic entry stays parked");
-        assert_eq!(snapshot[0]["content"], json!("auto report"));
-
-        // With no user entry left, the hold gate suspends the drain again.
-        assert!(!mgr.services.has_user_origin_ready(&id));
-        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        assert!(!mgr.is_busy(&id), "hold still blocks automatic entries");
-        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert!(user_row_idx(&messages, "urgent").is_some());
+        assert!(
+            user_row_idx(&messages, "duplicate").is_none()
+                && user_row_idx(&messages, "replay").is_none(),
+            "deduplicated interrupts never land"
+        );
     }
 
-    /// Answer-driven release (the persistent-pendingness contract): a parked
-    /// automatic entry survives a plain user turn and only drains once a user
-    /// row tagged `question_answers` for the marked message clears the
-    /// pending-questions marker.
+    /// Answer resolution (the persistent-pendingness contract) is unchanged:
+    /// a FOREIGN answer tag is a no-op, the matching tag clears the marker.
     #[tokio::test]
-    async fn drain_gated_until_answer_metadata() {
-        let script = mock_agent_script();
-        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    async fn answer_metadata_resolution_unchanged() {
         let (_tmp, mgr, _bus) = manager_with_bus().await;
         let mgr = Arc::new(mgr);
         let (ws, id) = (
-            WorkspaceId::from("ws-qh-answer"),
-            AgentId::from("a-qh-answer"),
+            WorkspaceId::from("ws-pq-answer"),
+            AgentId::from("a-pq-answer"),
         );
         seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
-        session.provider = Some("mock".to_string());
-        mgr.services
-            .store
-            .update_agent_session(&ws, &session)
-            .await
-            .expect("set mock provider");
+        let asked = mark_pending(&mgr, &ws, &id).await;
 
-        mgr.services
-            .enqueue_message(&id, "parked".to_string(), None, None, None, None, false);
-        let asked = arm_hold(&mgr, &ws, &id).await;
+        assert!(
+            !mgr.services
+                .resolve_pending_questions_for_answer(&ws, &id, Some(&answer_metadata("other-msg")))
+                .await,
+            "foreign answer is a no-op"
+        );
+        assert!(mgr.services.questions_pending(&id).await);
 
-        // A FOREIGN answer tag (naming a message the marker does not point
-        // at) is a no-op: the hold stays armed and the entry stays parked.
-        mgr.services
-            .resolve_pending_questions_for_answer(&ws, &id, Some(&answer_metadata("other-msg")))
-            .await;
-        assert!(mgr.services.question_hold_active(&id).await);
-        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        assert!(!mgr.is_busy(&id), "stale answer never releases the hold");
-        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
-
-        // The matching answer clears the marker, and the drain proceeds.
         assert!(
             mgr.services
                 .resolve_pending_questions_for_answer(&ws, &id, Some(&answer_metadata(&asked)))
                 .await,
             "matching answer clears the marker"
         );
-        assert!(!mgr.services.question_hold_active(&id).await);
-        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("answered queue drains");
+        assert!(!mgr.services.questions_pending(&id).await);
     }
 }
 

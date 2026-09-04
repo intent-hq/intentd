@@ -343,13 +343,23 @@
 //! `claude auth status` JSON report, riding the cached verdict (demotion
 //! clears it, test-prompt promotion preserves it) and absent for providers
 //! without identity. No method-catalog change — 298 router methods,
-//! 39 fast-path, 339 total.
+//! 39 fast-path, 339 total. Version 9.5 retires the question-hold delivery
+//! gate (§5.5): pending questions no longer park automatic deliveries —
+//! agent-to-agent sends, `agent.sendToTask`, parent/subscription wakes and
+//! the queue drain all proceed while `pendingQuestionsMessageId` is set, so
+//! the `heldForQuestions: true` result flag (and the MCP `ws.agent.send` /
+//! `ws.agent.sendToTask` `delivery: "held"` outcome) is never produced and
+//! is removed from the wire. The pending-question marker lifecycle
+//! (set/clear, `agent.dismissQuestions` + its system notice, the
+//! `needs_attention` derivation and `agent:updated` projections) is
+//! unchanged. No method-catalog change — 298 router methods, 39 fast-path,
+//! 339 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.4";
+pub const PROTOCOL_VERSION: &str = "9.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

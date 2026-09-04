@@ -9754,24 +9754,6 @@ mod wsapi4_bindings_tests {
         assert_eq!(v["delivery"], json!("queued"));
     }
 
-    /// Self-describing success: a held-for-questions park reports
-    /// `delivery: "held"`.
-    #[tokio::test]
-    async fn agent_send_held_shape_carries_delivery_field() {
-        let (srv, api) = server();
-        *api.agent_send_result.lock().unwrap() = Some(json!({
-            "success": true,
-            "queued": true,
-            "heldForQuestions": true,
-            "queuedMessage": { "id": "qmsg-1" },
-        }));
-        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let v = body(&resp);
-        assert_eq!(v["ok"], json!(true));
-        assert_eq!(v["delivery"], json!("held"));
-    }
-
     /// `sendToTask` classifies the nested `result` envelope the op returns.
     #[tokio::test]
     async fn agent_send_to_task_delivery_field_reads_nested_result() {
@@ -9784,12 +9766,12 @@ mod wsapi4_bindings_tests {
         *api.agent_send_to_task_result.lock().unwrap() = Some(json!({
             "ok": true,
             "agentId": "agent-assignee",
-            "result": { "success": true, "queued": true, "heldForQuestions": true },
+            "result": { "success": true, "queued": true, "queuedMessage": { "id": "qmsg-1" } },
         }));
         let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let v = body(&resp);
-        assert_eq!(v["delivery"], json!("held"));
+        assert_eq!(v["delivery"], json!("queued"));
     }
 
     /// A non-success `sendToTask` result (e.g. no assignee) gains no

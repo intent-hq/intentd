@@ -1736,11 +1736,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// through to the prompt builder for downstream note-image /
     /// context-reference resolution.
     ///
-    /// `origin` marks who originated the delivery (question hold, PROTOCOL
-    /// §5.5): the FE RPC front door passes [`MessageOrigin::User`] (never
-    /// held); the MCP front door and every internal wake/continuation path
-    /// pass [`MessageOrigin::Automatic`], which enqueues instead of starting
-    /// a turn while the target agent's question hold is active.
+    /// `origin` marks who originated the delivery (PROTOCOL §5.5): the FE
+    /// RPC front door passes [`MessageOrigin::User`]; the MCP front door and
+    /// every internal wake/continuation path pass
+    /// [`MessageOrigin::Automatic`], which enqueues instead of starting a
+    /// turn while the target's workspace is archived. Pending questions gate
+    /// neither origin.
     #[allow(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
@@ -1801,7 +1802,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.dismissQuestions`: persist the question-dismissal marker
     /// (`message_id` — the assistant message whose trailing question resource
     /// blocks the user dismissed) on the agent session, emit `agent:updated`,
-    /// and kick the queue drain so messages held by the question hold resume
+    /// deliver the questions-dismissed system notice, and kick the queue
+    /// drain so entries parked for other reasons (busy race) resume
     /// (PROTOCOL §5.5). Idempotent: re-dismissing the same message succeeds.
     fn agent_dismiss_questions(
         &self,

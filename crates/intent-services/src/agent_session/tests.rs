@@ -2577,7 +2577,7 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
         Some(asked_id.as_str()),
         "turn end persists the pending-questions marker"
     );
-    assert!(services.question_hold_active(&agent_id).await);
+    assert!(services.questions_pending(&agent_id).await);
 
     // A question-free turn must NOT clear the marker.
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
@@ -2604,8 +2604,8 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
         "a question-free turn end must not clear the marker"
     );
     assert!(
-        services.question_hold_active(&agent_id).await,
-        "hold survives the agent's later turn"
+        services.questions_pending(&agent_id).await,
+        "pending questions survive the agent's later turn"
     );
 }
 
@@ -2910,7 +2910,7 @@ async fn delayed_question_set_cannot_resurrect_answered_marker() {
         None,
         "delayed set must not resurrect the answered marker"
     );
-    assert!(!services.question_hold_active(&agent_id).await);
+    assert!(!services.questions_pending(&agent_id).await);
     assert!(
         timeout(Duration::from_millis(300), sub.recv())
             .await
@@ -2970,7 +2970,7 @@ async fn append_message_op_answer_row_retires_needs_attention() {
         .await
         .expect("plain appendMessage succeeds");
     assert!(
-        services.question_hold_active(&agent_id).await,
+        services.questions_pending(&agent_id).await,
         "a plain user row must not resolve the pending Q&A"
     );
     assert!(

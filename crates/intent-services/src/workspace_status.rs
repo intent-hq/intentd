@@ -435,7 +435,7 @@ impl Services {
     /// - `blocked` — a top-level pending `blocker` attention request.
     /// - `needs_attention` — a top-level pending non-blocker attention
     ///   request (`discussion`), pending structured questions
-    ///   ([`Services::question_hold_active`] — pending until answered or
+    ///   ([`Services::questions_pending`] — pending until answered or
     ///   dismissed, so a question the user walked away from keeps the
     ///   workspace flagged across the agent's later turns and daemon
     ///   restarts), or the workspace `attention` flag at `review_required`.
@@ -448,10 +448,10 @@ impl Services {
     /// deferred-attention registry does not count either: the workspace
     /// stays `in_progress` until the raising agent's turn-end flush
     /// surfaces the request. The cheap metadata
-    /// checks run over every candidate first, so the per-session hold reads
+    /// checks run over every candidate first, so the per-session pending reads
     /// only happen when `needs_attention` is still undecided. Best-effort: a
     /// store read failure fails open — session-derived signals read `false`
-    /// (and `question_hold_active` fails open itself) so list/get emission
+    /// (and `questions_pending` fails open itself) so list/get emission
     /// is never wedged; the flag-derived signal needs no store read.
     ///
     /// `sessions` — the workspace's session summaries when the caller already
@@ -511,18 +511,18 @@ impl Services {
                 // The summaries already carry the session `metadata`, so a
                 // written pending-questions marker is decided right here with
                 // no extra store read (monorepo#3058) — same derivation as
-                // [`Services::question_hold_active`]. Only pre-upgrade
+                // [`Services::questions_pending`]. Only pre-upgrade
                 // sessions (marker key never written) fall back to the full
                 // per-session probe, which also materializes the marker.
-                let hold = if session.pending_questions_marker_written() {
+                let pending = if session.pending_questions_marker_written() {
                     match session.pending_questions_message_id() {
                         Some(pending) => session.dismissed_questions_message_id() != Some(pending),
                         None => false,
                     }
                 } else {
-                    self.question_hold_active(&session.id).await
+                    self.questions_pending(&session.id).await
                 };
-                if hold {
+                if pending {
                     signals.needs_attention = true;
                     break;
                 }
@@ -2937,7 +2937,7 @@ mod display_status_events {
             .await
             .expect("send plain message");
         assert!(
-            h.services.question_hold_active(&session.id).await,
+            h.services.questions_pending(&session.id).await,
             "a plain user message must not resolve the pending Q&A"
         );
         assert_silent(&mut sub).await;

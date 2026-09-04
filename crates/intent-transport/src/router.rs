@@ -1534,9 +1534,9 @@ async fn dispatch(
             // unconsumed: assistant rows are keyed on the server-minted
             // UUIDv7 id.
             let message_metadata = merge_user_app_message_id(params, message_metadata)?;
-            // Question hold (PROTOCOL §5.5): the FE RPC front door is the
-            // ONLY user-originated entry point — user sends are never held.
-            // They do not release the hold either: only an answer-tagged row
+            // Origin (PROTOCOL §5.5): the FE RPC front door is the ONLY
+            // user-originated entry point. A user send does not by itself
+            // resolve pending questions: only an answer-tagged row
             // (`messageMetadata.type = "question_answers"`) or
             // `agent.dismissQuestions` retires the pending Q&A.
             let result = api
