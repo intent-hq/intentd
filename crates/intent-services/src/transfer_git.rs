@@ -321,9 +321,10 @@ pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
 /// every sandbox, anchor the base commit and each sandbox branch under
 /// temporary `refs/intent/transfer/*` refs in the worktree repo, and run
 /// `git bundle create` + `verify`. Every tracked worktree submodule whose
-/// checked-out commit is unpublished additionally gets its own
-/// self-contained bundle (`<staging>/submodules/<n>.bundle`). Returns the
-/// bundle paths and the ref inventory.
+/// checked-out commit is unpublished — and every published ancestor a
+/// nested one needs — additionally gets its own self-contained bundle
+/// (`<staging>/submodules/<n>.bundle`). Returns the bundle paths and the
+/// ref inventory.
 ///
 /// On success the WIP snapshot commits are left in place (they are what the
 /// bundle refs point at); the caller unwinds them via [`unwind_wip`] once the

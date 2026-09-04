@@ -27,7 +27,8 @@
 //! file was deleted rides the rows payload with NO file entry), and — when
 //! the workspace has a repository — `git/repo.bundle` + `git/refs.json` (the
 //! [`TransferRefsManifest`]) plus one `git/submodules/<n>.bundle` per
-//! unpublished worktree submodule listed in `refs.submodules`.
+//! worktree submodule listed in `refs.submodules` (unpublished ones and the
+//! published ancestors a nested one needs).
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, Write as _};

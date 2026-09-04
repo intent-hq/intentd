@@ -85,8 +85,9 @@ pub struct TransferGitSummary {
     pub branch: Option<String>,
     pub dirty_files: Vec<String>,
     pub sandbox_branches: Vec<String>,
-    /// Submodules pointing at unpublished commits (additive to format v1;
-    /// exact intentd version gating makes `default` tolerance sufficient).
+    /// Submodules pointing at unpublished commits, plus the published
+    /// ancestors bundled for a nested one (additive to format v1; exact
+    /// intentd version gating makes `default` tolerance sufficient).
     #[serde(default)]
     pub submodules: Vec<TransferSubmoduleSummary>,
 }
