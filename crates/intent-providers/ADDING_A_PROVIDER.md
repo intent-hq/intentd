@@ -67,8 +67,12 @@ needs. Fields that matter most:
   `parse_grok_models_command_output` in `crates/intent-providers/src/models.rs`),
   `auth_error_patterns` (stderr matching), `login_command_hint`, `login_docs_url`.
 - **npx fields** — `fallback_npx_package` (spawn `npx -y <pkg>` only when no local binary
-  resolves; codex) vs `npx_only_package` (ALWAYS spawn via npx with a version we pin,
-  skipping local discovery entirely; claude-code). Resolution:
+  resolves; codex) vs `npx_only_package` (spawn via npx with a version we pin, skipping
+  auto-discovery entirely; claude-code, pi). The one npx-only exception is a valid
+  `providers.paths[id]` override (absolute + executable): it is exec'd directly in place
+  of the pinned npx spawn (`resolve_npx_only_override`, intent-hq/monorepo#4352) and the
+  same override drives the one-shot / test-prompt launches and the claude-code ACP auth
+  fallback probe, so every surface runs the same adapter. Resolution:
   `resolve_npx_only` in `crates/intent-services/src/agent_manager.rs` and the
   `npx_fallback_*` fields on `SpawnOptions` (`crates/intent-acp/src/spawn.rs`).
 

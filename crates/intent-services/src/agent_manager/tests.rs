@@ -12553,8 +12553,9 @@ async fn resolve_spawn_drops_effective_display_name_model() {
 
 /// A legacy compound `provider:model` row (pre-wire-rejection) is stripped to
 /// its bare model half; the provider comes from `session.provider`.
-/// claude-code is npx-only, so a successful resolution always carries the
-/// pinned npx package and never a locally-discovered provider binary.
+/// claude-code is npx-only, so without a `providers.paths` override a
+/// successful resolution carries the pinned npx package and never a
+/// locally-discovered provider binary.
 #[tokio::test]
 async fn resolve_spawn_strips_legacy_compound_model_rows() {
     if intent_providers::find_npx().is_none() {
@@ -12570,7 +12571,7 @@ async fn resolve_spawn_strips_legacy_compound_model_rows() {
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
     assert_eq!(
         resolved.provider_binary, None,
-        "claude-code must never spawn a locally-discovered binary"
+        "claude-code must not auto-discover a local binary without an override"
     );
     assert_eq!(
         resolved.npx_fallback_package,

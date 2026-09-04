@@ -422,7 +422,18 @@ fn opencode_models_ready(stdout: &str) -> bool {
 /// identity-capturing [`check_claude_code_auth_cli`] variant of that same
 /// probe, then [`claude_code_auth_verdict`] decides whether the ACP fallback
 /// probe is consulted. Only claude-code can attach identity metadata today.
-async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) -> AuthVerdict {
+///
+/// `override_path` is the raw `providers.paths` value for the provider's
+/// [`override_key`]. `program` (the install-gate binary from
+/// [`resolve_probe_binary`]) already reflects it where it applies; the
+/// claude-code arm additionally resolves it as the ADAPTER override
+/// ([`intent_providers::resolve_npx_only_override`]) so the ACP fallback probe
+/// runs the same adapter binary a session spawn would (monorepo#4352).
+async fn probe_provider(
+    provider_id: &'static str,
+    program: std::ffi::OsString,
+    override_path: Option<&str>,
+) -> AuthVerdict {
     match provider_id {
         "auggie" | "codex" | "opencode" | "grok" => {
             let args = intent_providers::find_provider(provider_id)
@@ -445,10 +456,11 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
                 return AuthVerdict::default();
             }
             let status = check_claude_code_auth_cli(&program, args).await;
-            let authenticated = claude_code_auth_verdict(
-                status.probe,
-                crate::provider_models::probe_claude_code_auth,
-            )
+            let adapter_override =
+                intent_providers::resolve_npx_only_override(provider_id, override_path);
+            let authenticated = claude_code_auth_verdict(status.probe, move || {
+                crate::provider_models::probe_claude_code_auth(adapter_override)
+            })
             .await;
             AuthVerdict {
                 authenticated,
@@ -533,11 +545,12 @@ fn resolve_auggie_override(path: &str) -> Option<std::path::PathBuf> {
 /// command the key describes. The special-case gates (claude-code, codex, pi)
 /// probe a binary that is not their registry primary (`claude-agent-acp`,
 /// `codex-acp`, `pi-acp`), so an adapter override must not shadow or stand in
-/// for the real CLI there; those gates ignore the override, matching spawn
-/// resolution (npx-only warns it away) and discovery (monorepo#1065 skips
-/// npx-only overrides). A valid applied override wins (and is what the probe
-/// spawns — pi never gets here); an invalid one warns and falls through to
-/// the auto-detection tiers. auggie's override is validated with checkAuggie
+/// for the real CLI there; those gates ignore the override for the CLI check
+/// (claude-code's ADAPTER override is applied separately, in
+/// [`probe_provider`]'s ACP fallback — monorepo#4352). A valid applied
+/// override wins (and is what the probe spawns — pi never gets here); an
+/// invalid one warns and falls through to the auto-detection tiers. auggie's
+/// override is validated with checkAuggie
 /// parity instead ([`resolve_auggie_override`]), falling through to
 /// [`crate::auggie_discovery::find_auggie`].
 fn resolve_probe_binary(
@@ -824,7 +837,7 @@ async fn resolve_auth_status(
             // the superseding cached verdict so every joined caller serves
             // the authoritative outcome, not the stale probe result.
             let epoch = cache().demotion_epoch(provider_id);
-            let verdict = probe_provider(provider_id, program).await;
+            let verdict = probe_provider(provider_id, program, override_path.as_deref()).await;
             cache().store_probe(provider_id, verdict, epoch)
         })
         .await

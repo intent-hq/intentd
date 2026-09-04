@@ -461,19 +461,25 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
 }
 
 /// claude-code auth fallback probe (`host.providerAuthStatus`): the same
-/// pinned-adapter ACP probe as [`fetch_claude_code_models`], mapped to auth
-/// semantics by [`claude_code_acp_auth_verdict`]. Consulted only when the
-/// cheap `claude auth status` CLI probe is inconclusive; an explicit
-/// `loggedIn` boolean skips this fallback, including a reported logout. The
-/// fallback can only demote to `Some(false)` (explicit auth-required error) or stay
+/// ACP probe as [`fetch_claude_code_models`], mapped to auth semantics by
+/// [`claude_code_acp_auth_verdict`]. Consulted only when the cheap
+/// `claude auth status` CLI probe is inconclusive; an explicit `loggedIn`
+/// boolean skips this fallback, including a reported logout. The fallback
+/// can only demote to `Some(false)` (explicit auth-required error) or stay
 /// unknown — it can never confirm `Some(true)`, because the adapter serves
 /// its model catalog without credentials (see
 /// [`claude_code_acp_auth_verdict`]). The caller gates on the `claude` CLI
-/// being installed; the probe itself runs the pinned npx adapter
-/// ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
-pub(crate) async fn probe_claude_code_auth() -> Option<bool> {
-    let npx = find_npx()?;
-    let cmd = AcpProbeCommand::npx(npx, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
+/// being installed. The probe runs the SAME adapter a session spawn would
+/// (intent-hq/monorepo#4352): `adapter_override` — the validated
+/// `providers.paths["claude-code"]` binary
+/// ([`intent_providers::resolve_npx_only_override`]) — when set, else the
+/// pinned npx adapter ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]),
+/// so the verdict reflects what sessions actually run.
+pub(crate) async fn probe_claude_code_auth(adapter_override: Option<PathBuf>) -> Option<bool> {
+    let cmd = match adapter_override {
+        Some(bin) => AcpProbeCommand::binary(bin, Vec::new()),
+        None => AcpProbeCommand::npx(find_npx()?, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE),
+    };
     let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "claude-code")).await;
     claude_code_acp_auth_verdict(outcome)
 }

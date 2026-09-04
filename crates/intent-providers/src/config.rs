@@ -10,7 +10,7 @@
 /// one-line code change here.
 macro_rules! claude_agent_acp_version {
     () => {
-        "0.66.0"
+        "0.73.0"
     };
 }
 
@@ -208,10 +208,14 @@ pub struct ProviderConfig {
     /// package via `npx -y <package>`. Only set for providers shipped as npm
     /// packages (e.g. codex's `@agentclientprotocol/codex-acp`).
     pub fallback_npx_package: Option<&'static str>,
-    /// When set, the provider is ALWAYS spawned via `npx -y <package>` with a
-    /// version pinned by us — local binary discovery (settings path, managed
-    /// bin, PATH scan) is skipped entirely, so the adapter version is under our
-    /// release cadence (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
+    /// When set, the provider is spawned via `npx -y <package>` with a
+    /// version pinned by us — auto-discovery (managed bin, PATH scan) is
+    /// skipped entirely, so the adapter version is under our release cadence
+    /// (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]). The one exception is
+    /// an explicit `providers.paths[id]` override: a valid (absolute,
+    /// executable) path is exec'd directly in place of the pinned npx spawn so
+    /// users can track the adapter themselves (intent-hq/monorepo#4352); an
+    /// invalid override contributes nothing and the pinned spawn applies.
     pub npx_only_package: Option<&'static str>,
     /// When set, discovery (`discover_providers`) only reports this provider
     /// as `installed` when BOTH `command` AND this secondary CLI resolve.

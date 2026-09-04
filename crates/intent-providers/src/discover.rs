@@ -257,9 +257,9 @@ fn availability_for(
     // A valid override for the primary binary, keyed by the provider that
     // OWNS it ([`ProviderConfig::primary_binary_provider_id`], matching
     // `resolve_spawn`: unsloth's opencode primary honors the `opencode`
-    // key). npx-only providers ignore overrides — `resolve_spawn` warns and
-    // spawns via the pinned npx package regardless.
-    let primary_override = if gated_off.is_some() || provider.npx_only_package.is_some() {
+    // key). npx-only providers honor the override too — `resolve_spawn`
+    // exec's a valid one in place of the pinned npx spawn (monorepo#4352).
+    let primary_override = if gated_off.is_some() {
         None
     } else {
         let key = provider.primary_binary_provider_id();
@@ -527,12 +527,30 @@ fn find_provider_binary_with_home_and_dirs(
     find_in_dirs(enhanced_dirs, command)
 }
 
+/// The explicit-override tier ALONE for an npx-only provider
+/// ([`ProviderConfig::npx_only_package`]): a valid `providers.paths[id]`
+/// value (absolute, executable) resolves to the adapter binary to exec in
+/// place of the pinned `npx -y <package>` spawn; an absent, blank, or invalid
+/// value yields `None` and the caller keeps the pinned npx spawn. There is
+/// deliberately no auto-discovery fallthrough (managed bin / PATH scan) —
+/// that is what makes the provider npx-only. Shared by the ACP spawn, the
+/// one-shot / test-prompt launches, and the model / auth probes so every
+/// surface runs the same adapter (intent-hq/monorepo#4352).
+#[must_use]
+pub fn resolve_npx_only_override(
+    provider_id: &str,
+    explicit_path: Option<&str>,
+) -> Option<PathBuf> {
+    explicit_path.and_then(|p| resolve_explicit_path(provider_id, p))
+}
+
 /// Validate + resolve an explicit `providers.paths` value: trimmed, absolute,
 /// and executable, or `None` (with a warning naming the provider key — blank
 /// values are treated as unset without warning). Shared by
-/// [`find_provider_binary`]'s explicit tier and the override-aware `installed`
-/// determination in [`discover_providers_with_overrides`], so both sides
-/// accept exactly the same overrides.
+/// [`find_provider_binary`]'s explicit tier, [`resolve_npx_only_override`],
+/// and the override-aware `installed` determination in
+/// [`discover_providers_with_overrides`], so every side accepts exactly the
+/// same overrides.
 fn resolve_explicit_path(provider_id: &str, path: &str) -> Option<PathBuf> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -546,7 +564,7 @@ fn resolve_explicit_path(provider_id: &str, path: &str) -> Option<PathBuf> {
     tracing::warn!(
         provider_id = provider_id,
         configured_path = trimmed,
-        "providers.paths[\"{}\"] must be absolute and executable; falling back to native install dir / managed bin / PATH scan",
+        "providers.paths[\"{}\"] must be absolute and executable; ignoring the override (falling back to native install dir / managed bin / PATH scan, or the pinned npx package)",
         provider_id
     );
     None
@@ -1423,6 +1441,82 @@ mod override_aware_discovery_tests {
             .iter()
             .find(|p| p.id == "auggie")
             .expect("auggie must be registered")
+    }
+
+    fn claude_code_config() -> &'static ProviderConfig {
+        crate::config::ACP_PROVIDERS
+            .iter()
+            .find(|p| p.id == "claude-code")
+            .expect("claude-code must be registered")
+    }
+
+    /// monorepo#4352: a valid `providers.paths["claude-code"]` override
+    /// resolves to the adapter binary the spawn will exec in place of the
+    /// pinned npx package; absent / blank / relative / missing /
+    /// non-executable values contribute nothing (pinned npx applies).
+    #[test]
+    fn resolve_npx_only_override_accepts_only_absolute_executables() {
+        let dir = unique_temp_dir("npx-only-override");
+        let adapter = dir.path().join("claude-agent-acp");
+        make_executable(&adapter);
+        assert_eq!(
+            resolve_npx_only_override("claude-code", Some(adapter.to_str().unwrap())),
+            Some(adapter.clone()),
+            "valid absolute executable resolves"
+        );
+        assert_eq!(resolve_npx_only_override("claude-code", None), None);
+        assert_eq!(resolve_npx_only_override("claude-code", Some("   ")), None);
+        assert_eq!(
+            resolve_npx_only_override("claude-code", Some("relative/claude-agent-acp")),
+            None,
+            "relative paths are rejected"
+        );
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            resolve_npx_only_override("claude-code", Some(missing.to_str().unwrap())),
+            None,
+            "missing files are rejected"
+        );
+        #[cfg(unix)]
+        {
+            let not_exec = dir.path().join("not-exec");
+            fs::write(&not_exec, "x").unwrap();
+            assert_eq!(
+                resolve_npx_only_override("claude-code", Some(not_exec.to_str().unwrap())),
+                None,
+                "non-executable files are rejected"
+            );
+        }
+    }
+
+    /// monorepo#4352: discovery honors the claude-code override for the
+    /// `installed` flag (so the FE sees the provider available whenever the
+    /// spawn would succeed) while `resolved_path` stays the auto-detected
+    /// npx — never the override path.
+    #[test]
+    fn valid_claude_code_override_flips_installed_without_touching_paths() {
+        let dir = unique_temp_dir("override-claude-code");
+        let adapter = dir.path().join("claude-agent-acp");
+        make_executable(&adapter);
+        let overrides = |key: &str| (key == "claude-code").then(|| adapter.display().to_string());
+        let availability = availability_for(claude_code_config(), None, &|_, _| None, &overrides);
+        assert!(availability.installed, "valid override must flip installed");
+        assert_ne!(availability.resolved_path.as_ref(), Some(&adapter));
+        assert_eq!(
+            availability.npx_only_package,
+            Some(crate::config::CLAUDE_AGENT_ACP_NPX_PACKAGE)
+        );
+    }
+
+    /// An invalid claude-code override contributes nothing: `installed`
+    /// tracks npx auto-detection exactly as before.
+    #[test]
+    fn invalid_claude_code_override_does_not_flip_installed() {
+        let dir = unique_temp_dir("override-claude-code-invalid");
+        let missing = dir.path().join("missing");
+        let overrides = |key: &str| (key == "claude-code").then(|| missing.display().to_string());
+        let availability = availability_for(claude_code_config(), None, &|_, _| None, &overrides);
+        assert_eq!(availability.installed, availability.resolved_path.is_some());
     }
 
     /// monorepo#1065: with nothing auto-detected, valid overrides for both

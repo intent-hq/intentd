@@ -8971,16 +8971,32 @@ fn resolve_spawn(
     // never starts the managed server.
     let unsloth_endpoint = None;
 
-    // npx-only providers (claude-code) are spawned exclusively via
-    // `npx -y <pinned package>`; local-binary discovery (settings path /
-    // managed bin / PATH scan) is skipped entirely.
+    // npx-only providers (claude-code, pi) are spawned via
+    // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
+    // skipped entirely. A valid `providers.paths` override (absolute,
+    // executable) is the one exception: it is exec'd directly in place of the
+    // pinned npx spawn (monorepo#4352); an invalid override is ignored.
     if provider.npx_only_package.is_some() {
-        if read_provider_path_setting(settings, &provider_id).is_some() {
-            tracing::warn!(
+        let explicit_path = read_provider_path_setting(settings, &provider_id);
+        if let Some(binary) =
+            intent_providers::resolve_npx_only_override(&provider_id, explicit_path.as_deref())
+        {
+            tracing::info!(
                 provider_id = provider_id,
-                "providers.paths override ignored: {} always spawns via pinned npx",
-                provider_id
+                binary = ?binary,
+                "providers.paths override honored: spawning adapter binary in place of pinned npx"
             );
+            return Ok(ResolvedSpawn {
+                provider,
+                model,
+                reasoning_effort,
+                cwd,
+                provider_binary: Some(binary),
+                extra_env,
+                npx_fallback_binary: None,
+                npx_fallback_package: None,
+                unsloth_endpoint,
+            });
         }
         let (npx_binary, npx_package) = resolve_npx_only(&provider, intent_providers::find_npx())?;
         return Ok(ResolvedSpawn {
@@ -14492,6 +14508,61 @@ mod provider_path_override_tests {
         assert_eq!(
             resolved.provider_binary.as_deref(),
             Some(opencode_stub.as_path())
+        );
+    }
+
+    fn claude_code_session() -> AgentSession {
+        let mut s = session(
+            &AgentId::from("agent-paths-claude-code"),
+            &WorkspaceId::from("ws-1"),
+            None,
+        );
+        s.provider = Some("claude-code".to_string());
+        s
+    }
+
+    /// monorepo#4352: a valid `providers.paths["claude-code"]` override is
+    /// exec'd directly — the resolved spawn carries the override as
+    /// `provider_binary` and NO npx fallback, so `build_command` spawns the
+    /// override instead of `npx -y <pinned>`.
+    #[test]
+    fn claude_code_spawn_honors_valid_path_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter_stub = exec_stub(dir.path(), "claude-agent-acp-override");
+        let settings = settings_with_paths(&[("claude-code", &adapter_stub)]);
+
+        let resolved = resolve_spawn(&claude_code_session(), None, &settings, None).unwrap();
+        assert_eq!(
+            resolved.provider_binary.as_deref(),
+            Some(adapter_stub.as_path()),
+            "a valid claude-code override must be the spawned binary"
+        );
+        assert_eq!(resolved.npx_fallback_binary, None);
+        assert_eq!(resolved.npx_fallback_package, None);
+        let mut opts = SpawnOptions::new(&resolved.provider);
+        opts.provider_binary = resolved.provider_binary.as_deref();
+        let cmd = intent_acp::spawn::build_command(&opts);
+        assert_eq!(cmd.as_std().get_program(), adapter_stub.as_os_str());
+    }
+
+    /// An invalid override (missing file) contributes nothing: claude-code
+    /// keeps the pinned npx spawn exactly as if the key were unset.
+    #[test]
+    fn claude_code_spawn_ignores_invalid_path_override() {
+        if intent_providers::find_npx().is_none() {
+            eprintln!("skipping: npx not available on this host");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-claude-agent-acp");
+        let settings = settings_with_paths(&[("claude-code", &missing)]);
+
+        let resolved = resolve_spawn(&claude_code_session(), None, &settings, None).unwrap();
+        assert_eq!(resolved.provider_binary, None);
+        assert!(resolved.npx_fallback_binary.is_some());
+        assert_eq!(
+            resolved.npx_fallback_package,
+            Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
         );
     }
 }
