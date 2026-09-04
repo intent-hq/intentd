@@ -223,7 +223,7 @@ where
         let mut notifications_open = true;
         loop {
             tokio::select! {
-                result = &mut authenticate => return result.map(|_| ()).map_err(|_| "Antigravity authentication failed; retry the login command"),
+                result = &mut authenticate => return result.map(|_| ()).map_err(|error| authenticate_error(&error)),
                 note = adapter.notifications.recv(), if notifications_open => {
                     match note {
                         Some(note) if note.method == LOGIN_URL_NOTIFICATION => {
@@ -241,10 +241,21 @@ where
     };
     let result = tokio::select! {
         () = &mut cancelled => Err("Antigravity login cancelled"),
-        result = tokio::time::timeout(budget, flow) => result.unwrap_or(Err("Antigravity login timed out; retry the login command")),
+        result = tokio::time::timeout(budget, flow) => result.unwrap_or(Err(LOGIN_TIMED_OUT)),
     };
     reap_child(&mut adapter.child).await;
     result.map_err(str::to_string)
+}
+
+const LOGIN_TIMED_OUT: &str = "Antigravity login timed out; retry the login command";
+
+/// The `authenticate` request shares the login budget with the outer deadline,
+/// so its own timeout can fire first under load; both must read as a timeout.
+pub(crate) fn authenticate_error(error: &intent_acp::AcpError) -> &'static str {
+    match error {
+        intent_acp::AcpError::Timeout(_) => LOGIN_TIMED_OUT,
+        _ => "Antigravity authentication failed; retry the login command",
+    }
 }
 
 /// Create a private probe profile. Its guard denies every tool: discovery

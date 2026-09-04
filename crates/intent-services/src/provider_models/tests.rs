@@ -483,6 +483,23 @@ async fn antigravity_login_timeout_is_bounded_and_removes_profile() {
     }
 }
 
+/// The `authenticate` RPC shares its budget with the outer login deadline, so
+/// either timer may fire first under load; both must classify as a timeout.
+#[test]
+fn antigravity_authenticate_rpc_timeout_reads_as_login_timeout() {
+    use crate::antigravity::authenticate_error;
+    use intent_acp::{AcpError, JsonRpcError};
+    let timeout = authenticate_error(&AcpError::Timeout("authenticate".into()));
+    assert!(timeout.contains("timed out"), "{timeout}");
+    let rejected = authenticate_error(&AcpError::Rpc(JsonRpcError {
+        code: -32000,
+        message: "denied".into(),
+        data: None,
+    }));
+    assert!(rejected.contains("authentication failed"), "{rejected}");
+    assert!(!rejected.contains("timed out"), "{rejected}");
+}
+
 #[cfg(unix)]
 fn antigravity_mock_adapter(dir: &std::path::Path, session_result: &str) -> std::path::PathBuf {
     antigravity_mock_adapter_with_auth(dir, session_result, true)
