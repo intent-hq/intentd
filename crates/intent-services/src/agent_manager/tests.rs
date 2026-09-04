@@ -1891,8 +1891,9 @@ async fn try_begin_drops_a_slot_whose_flush_already_gave_up() {
         )
         .await
         .expect("the pinned slot was there to flush");
-    assert!(
-        flushed.message_id.is_none(),
+    assert_eq!(
+        flushed.outcome,
+        crate::agent_session::InterruptFlushOutcome::Failed,
         "precondition: the store rejected the append, so nothing was persisted"
     );
     let kept = mgr
@@ -6688,6 +6689,206 @@ async fn interrupt_zero_output_persists_empty_interrupted_row_with_message_id() 
         end.data["messageId"], "msg-int-empty",
         "stream:end targets the persisted synthetic row (got {:?})",
         end.data
+    );
+}
+
+/// Regression: an interrupt that lands in the gap between the worker's full-row
+/// persist and its exit must NOT stamp the completed turn as interrupted. The
+/// pinned-slot flush hits the `agent_message.id` UNIQUE collision (the worker
+/// already persisted the full row), so the terminal `agent:stream:end` is
+/// emitted in the normal-completion shape — `messageId` = the completed row,
+/// no `stopReason` / `interruptReason` / `interruptedBy` — instead of an
+/// interrupted terminal with no `messageId` that the FE would pin on the
+/// completed message as a spurious "Stopped" marker.
+#[tokio::test]
+async fn interrupt_after_worker_persisted_full_row_emits_normal_completion_end() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-done"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-done")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    let blocks = vec![json!({ "type": "text", "id": "msg-int-done:0", "text": "All done." })];
+    mgr.services
+        .set_live_turn(&id, "msg-int-done", blocks.clone());
+    // The worker's own append already won: the full assistant row is durable
+    // under the turn's minted id, with normal (non-interrupted) metadata.
+    mgr.services
+        .store
+        .append_agent_message_with_id(
+            &id,
+            "msg-int-done",
+            "assistant",
+            &Value::Array(blocks.clone()),
+            None,
+            &intent_core::now_iso(),
+        )
+        .await
+        .expect("worker append");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(mgr.interrupt(&id).await, "interrupt finds the live agent");
+
+    // The durable row is untouched: exactly one row, no interrupted metadata.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(
+        messages.len(),
+        1,
+        "the completed row survives the race: {messages:?}"
+    );
+    assert_eq!(messages[0].id, "msg-int-done");
+    assert_eq!(messages[0].content, Value::Array(blocks));
+    assert!(
+        messages[0]
+            .metadata
+            .as_ref()
+            .is_none_or(|m| m.get("interrupted").is_none()),
+        "the completed row is not re-tagged as interrupted"
+    );
+    assert!(
+        mgr.services.live_turn(&id).is_none(),
+        "the collision path releases the pinned slot"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let ends: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:end")
+        .collect();
+    assert_eq!(ends.len(), 1, "exactly one terminal stream:end");
+    let end = ends[0];
+    assert_eq!(
+        end.data["messageId"], "msg-int-done",
+        "stream:end names the completed row (got {:?})",
+        end.data
+    );
+    for field in [
+        "stopReason",
+        "interruptReason",
+        "interruptedBy",
+        "trailingBlocks",
+        "finishReason",
+    ] {
+        assert!(
+            end.data.get(field).is_none(),
+            "a completed turn's stream:end carries no `{field}` (got {:?})",
+            end.data
+        );
+    }
+    assert_eq!(
+        end.data["lastAgentResponse"], "All done.",
+        "preview fields are stamped as on any terminal emit (got {:?})",
+        end.data
+    );
+    // The idle choreography after the terminal emit is unchanged.
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:idle"),
+        "agent:idle still follows the terminal emit"
+    );
+}
+
+/// Companion to the above: the UNIQUE collision is NOT proof the turn
+/// completed. When the row under the turn's id was written by a CONCURRENT
+/// interrupt flush (the suspend enrollment persisting caller-held content while
+/// this teardown holds the pin), the terminal `agent:stream:end` must stay
+/// interrupted-shaped — and mirror THAT row's metadata (`system_suspend`),
+/// not misreport the turn as a normal completion.
+#[tokio::test]
+async fn interrupt_colliding_with_suspend_enrollment_row_keeps_interrupted_end() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-susp"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-susp")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    let blocks = vec![json!({ "type": "text", "id": "msg-int-susp:0", "text": "partial…" })];
+    mgr.services
+        .set_live_turn(&id, "msg-int-susp", blocks.clone());
+    // The suspend enrollment's flush won the race: an INTERRUPTED row is
+    // durable under the turn's minted id, tagged with its own reason.
+    mgr.services
+        .store
+        .append_agent_message_with_id(
+            &id,
+            "msg-int-susp",
+            "assistant",
+            &Value::Array(blocks.clone()),
+            Some(&json!({
+                "interrupted": true,
+                "stopReason": "interrupted",
+                "status": "interrupted",
+                "interruptReason": "system_suspend",
+            })),
+            &intent_core::now_iso(),
+        )
+        .await
+        .expect("enrollment append");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(mgr.interrupt(&id).await, "interrupt finds the live agent");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(messages.len(), 1, "no second row: {messages:?}");
+    assert_eq!(messages[0].id, "msg-int-susp");
+    assert!(
+        mgr.services.live_turn(&id).is_none(),
+        "the collision path releases the pinned slot"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let ends: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:end")
+        .collect();
+    assert_eq!(ends.len(), 1, "exactly one terminal stream:end");
+    let end = ends[0];
+    assert_eq!(
+        end.data["stopReason"], "interrupted",
+        "an interrupted row's collision is NOT a completion (got {:?})",
+        end.data
+    );
+    assert_eq!(
+        end.data["interruptReason"], "system_suspend",
+        "the emit mirrors the durable row's reason, not this interrupt's (got {:?})",
+        end.data
+    );
+    assert_eq!(
+        end.data["messageId"], "msg-int-susp",
+        "stream:end names the durable interrupted row (got {:?})",
+        end.data
+    );
+    assert!(
+        end.data.get("interruptedBy").is_none(),
+        "no attribution on a non-preemption row (got {:?})",
+        end.data
+    );
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:idle"),
+        "agent:idle still follows the terminal emit"
     );
 }
 

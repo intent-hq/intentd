@@ -1737,7 +1737,7 @@ async fn interruption_flush_adopts_prestaged_payloads() {
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("pinned slot flushes");
-    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+    assert_eq!(flushed.outcome.appended_message_id(), Some("m1"));
 
     let read = services
         .store
@@ -7044,7 +7044,7 @@ async fn pinned_live_turn_survives_the_guard_drop_until_the_interrupt_flush_clea
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("the pinned slot is still there to flush");
-    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+    assert_eq!(flushed.outcome.appended_message_id(), Some("m1"));
     assert!(
         services.agent_live_turn(agent_id.clone()).is_none(),
         "the flush releases the pin with the slot"
@@ -7127,9 +7127,14 @@ async fn interrupt_flush_releases_the_pin_when_the_worker_already_persisted_the_
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::AgentStopped, None)
         .await
         .expect("the pinned slot is still there to flush");
+    assert_eq!(
+        flushed.outcome,
+        super::InterruptFlushOutcome::AlreadyPersisted("m1".to_string()),
+        "the durable full row won the collision — reported as a completed turn, not an interruption"
+    );
     assert!(
-        flushed.message_id.is_none(),
-        "the durable full row won the collision"
+        flushed.outcome.appended_message_id().is_none(),
+        "no interrupted row was appended"
     );
     assert!(
         services.agent_live_turn(agent_id.clone()).is_none(),
@@ -7197,7 +7202,7 @@ async fn interrupt_flush_persists_the_update_routed_after_the_pin() {
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("the pinned slot is still there to flush");
-    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+    assert_eq!(flushed.outcome.appended_message_id(), Some("m1"));
     assert!(flushed.had_output, "the flushed slot carried blocks");
     assert_eq!(
         flushed.text_blocks,
@@ -7263,7 +7268,7 @@ async fn zero_output_completion_in_the_abort_gap_still_flushes_a_marker_row() {
         "a zero-block turn produced no output — the stop-redelivery arm depends on this"
     );
     assert_eq!(
-        flushed.message_id.as_deref(),
+        flushed.outcome.appended_message_id(),
         Some("m1"),
         "the interrupted marker row is still recorded"
     );
@@ -7343,7 +7348,7 @@ async fn normal_zero_output_turn_end_leaves_the_pinned_slot_to_the_teardown_flus
         .expect("the pinned slot is still there to flush");
     assert!(!flushed.had_output, "a zero-block turn produced no output");
     assert!(
-        flushed.message_id.is_some(),
+        flushed.outcome.appended_message_id().is_some(),
         "the interrupted marker row is recorded"
     );
 }
@@ -7419,8 +7424,8 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
         )
         .await;
     assert_eq!(
-        enrolled.as_deref(),
-        Some("m1"),
+        enrolled,
+        super::InterruptFlushOutcome::Appended("m1".to_string()),
         "the enrollment row is durable"
     );
     assert!(
@@ -7437,9 +7442,28 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("the pinned slot survived to its owner");
+    match &flushed.outcome {
+        super::InterruptFlushOutcome::AlreadyInterrupted {
+            message_id,
+            metadata,
+        } => {
+            assert_eq!(message_id, "m1", "the enrollment row won the collision");
+            assert_eq!(
+                metadata.get("interrupted"),
+                Some(&json!(true)),
+                "the collision is reported as an interrupted row, not a completed turn: {metadata}"
+            );
+            assert_eq!(
+                metadata.get("interruptReason"),
+                Some(&json!("system_suspend")),
+                "the durable row's own reason is surfaced: {metadata}"
+            );
+        }
+        other => panic!("expected AlreadyInterrupted, got {other:?}"),
+    }
     assert!(
-        flushed.message_id.is_none(),
-        "the enrollment row won the collision"
+        flushed.outcome.appended_message_id().is_none(),
+        "this flush appended nothing"
     );
     assert!(flushed.had_output, "the turn really did produce output");
     assert!(
@@ -7494,7 +7518,11 @@ async fn interrupt_flush_records_pending_proposals_from_the_partial_tail() {
             true,
         )
         .await;
-    assert_eq!(flushed.as_deref(), Some("m1"), "the partial row is durable");
+    assert_eq!(
+        flushed,
+        super::InterruptFlushOutcome::Appended("m1".to_string()),
+        "the partial row is durable"
+    );
 
     let session = services
         .store
@@ -7535,8 +7563,9 @@ async fn abandoned_slot_survives_guard_drop_and_turn_end_clear() {
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("the pinned slot was there to flush");
-    assert!(
-        flushed.message_id.is_none(),
+    assert_eq!(
+        flushed.outcome,
+        super::InterruptFlushOutcome::Failed,
         "precondition: the store rejected the append, so nothing was persisted"
     );
     assert!(
