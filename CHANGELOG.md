@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.21] - 2026-09-04
+
+### 🐛 Bug Fixes
+
+- *(services)* Tell the model when recovery replays truncated its tool output ([#1726](https://github.com/intent-hq/intentd/pull/1726))
+
+
 ## [0.9.20] - 2026-09-04
 
 ### 📚 Documentation
