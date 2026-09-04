@@ -339,11 +339,21 @@ fn golden_supervisor_history_wrapper() {
         &[msg("user", "hi <&>"), msg("assistant", "done")],
         crate::history_xml::MAX_HISTORY_CHARS,
     );
+    // intent#3696: the preamble carries the truncation-hint paragraph so the
+    // model does not mistake abbreviated replayed tool blocks for broken tools.
     assert_eq!(
         xml,
         "<supervisor>\n\
          The previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\n\
          Do NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\
+         \n\
+         Note on this replay: tool inputs and tool outputs below are abbreviated by the recovery replay. \
+         Each tool_use input and tool_result output is middle-truncated to at most 4000 characters \
+         (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" \
+         original_chars=\"N\" attribute on the element), and older exchanges may be omitted entirely. \
+         Truncation here does NOT mean the tool failed or returned empty output; the original call \
+         completed with its full result. If you genuinely need one specific full output, re-run that \
+         ONE call once. Do not re-fetch the same inputs repeatedly.\n\
          \n\
          <exchange>\n\
          \x20 <user_request_or_tool_results>\n\
@@ -1502,11 +1512,21 @@ fn golden_supervisor_history_truncation_markers() {
             json!([{ "type": "text", "text": "reply" }]),
         ),
     ];
+    // intent#3696: the preamble includes the truncation-hint paragraph.
+    let hint = "Note on this replay: tool inputs and tool outputs below are abbreviated by the \
+                recovery replay. Each tool_use input and tool_result output is middle-truncated \
+                to at most 4000 characters (marked by an inline \"... [N characters truncated] \
+                ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the \
+                element), and older exchanges may be omitted entirely. Truncation here does NOT \
+                mean the tool failed or returned empty output; the original call completed with \
+                its full result. If you genuinely need one specific full output, re-run that ONE \
+                call once. Do not re-fetch the same inputs repeatedly.\n\n";
     let preamble_len = "<supervisor>\nThe previous ACP session was lost. Below is the full \
                         conversation history from the prior session so you can continue \
                         seamlessly.\nDo NOT mention session recovery to the user. Just \
                         continue naturally as if nothing happened.\n\n"
-        .len();
+        .len()
+        + hint.len();
     let closing_len = "Continue the conversation from this point. Do not mention session \
                        recovery or interruption.\n</supervisor>"
         .len();
@@ -1530,6 +1550,7 @@ fn golden_supervisor_history_truncation_markers() {
              Do NOT mention session recovery to the user. Just continue naturally as if \
              nothing happened.\n\
              \n\
+             {hint}\
              <!-- 1 earlier exchanges omitted due to size limits -->\n\
              {newest_exchange}\
              Continue the conversation from this point. Do not mention session recovery or \
@@ -1539,7 +1560,8 @@ fn golden_supervisor_history_truncation_markers() {
     );
     // Middle-truncation marker: an oversized tool_result is head+tail kept
     // with the exact `... [N characters truncated] ...` line between. Cap is
-    // 4000 chars with 60 reserved for the marker (half-budget 1970).
+    // 4000 chars with 60 reserved for the marker (half-budget 1970). Since
+    // intent#3696 the element also carries `truncated="true" original_chars="N"`.
     let big = "y".repeat(5000);
     let messages = vec![msg(
         "m5",
@@ -1549,11 +1571,27 @@ fn golden_supervisor_history_truncation_markers() {
     let xml =
         crate::history_xml::format_history_as_xml(&messages, crate::history_xml::MAX_HISTORY_CHARS);
     let expected_block = format!(
-        "    <tool_result tool_use_id=\"t1\" is_error=\"false\">\n\
+        "    <tool_result tool_use_id=\"t1\" is_error=\"false\" truncated=\"true\" original_chars=\"5000\">\n\
          \x20     {}\n... [1060 characters truncated] ...\n{}\n\
          \x20   </tool_result>\n",
         "y".repeat(1970),
         "y".repeat(1970),
+    );
+    assert!(xml.contains(&expected_block), "{xml}");
+    // An under-cap tool_result is byte-identical to the pre-#3696 rendering
+    // (no `truncated` attribute, no marker).
+    let messages = vec![msg(
+        "m6",
+        "user",
+        json!([{ "type": "tool_result", "tool_use_id": "t2", "content": "y".repeat(4000) }]),
+    )];
+    let xml =
+        crate::history_xml::format_history_as_xml(&messages, crate::history_xml::MAX_HISTORY_CHARS);
+    let expected_block = format!(
+        "    <tool_result tool_use_id=\"t2\" is_error=\"false\">\n\
+         \x20     {}\n\
+         \x20   </tool_result>\n",
+        "y".repeat(4000),
     );
     assert!(xml.contains(&expected_block), "{xml}");
 }

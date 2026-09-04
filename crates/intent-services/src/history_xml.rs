@@ -21,7 +21,15 @@ const MAX_TOOL_CONTENT_CHARS: usize = 4_000;
 /// Max characters for a tool name (TS `MAX_TOOL_NAME_CHARS`).
 const MAX_TOOL_NAME_CHARS: usize = 200;
 
-const SUPERVISOR_PREAMBLE: &str = "<supervisor>\nThe previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\nDo NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\n";
+/// Recovery-replay preamble. The truncation-hint paragraph (intent#3696) tells
+/// the model that abbreviated tool blocks are a replay artefact, not broken or
+/// empty tool output, so it does not loop re-fetching the same inputs. The
+/// literal `4000` must track `MAX_TOOL_CONTENT_CHARS` (asserted below).
+const SUPERVISOR_PREAMBLE: &str = "<supervisor>\nThe previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\nDo NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\nNote on this replay: tool inputs and tool outputs below are abbreviated by the recovery replay. Each tool_use input and tool_result output is middle-truncated to at most 4000 characters (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element), and older exchanges may be omitted entirely. Truncation here does NOT mean the tool failed or returned empty output; the original call completed with its full result. If you genuinely need one specific full output, re-run that ONE call once. Do not re-fetch the same inputs repeatedly.\n\n";
+const _: () = assert!(
+    MAX_TOOL_CONTENT_CHARS == 4000,
+    "SUPERVISOR_PREAMBLE names the per-block cap literally; update both together"
+);
 const SUPERVISOR_CLOSING: &str =
     "Continue the conversation from this point. Do not mention session recovery or interruption.\n</supervisor>";
 
@@ -54,6 +62,20 @@ pub(crate) fn truncate_middle_content(text: &str, max_chars: usize) -> String {
     let end: String = chars[len - half_budget..].iter().collect();
     let omitted = len - half_budget * 2;
     format!("{start}\n... [{omitted} characters truncated] ...\n{end}")
+}
+
+/// Middle-truncate a tool input/output to `MAX_TOOL_CONTENT_CHARS` and return
+/// the element attribute suffix (` truncated="true" original_chars="N"`) that
+/// marks the block as abbreviated (intent#3696), or `""` when it fit whole.
+fn truncate_tool_content(text: &str) -> (String, String) {
+    let original_chars = text.chars().count();
+    if original_chars <= MAX_TOOL_CONTENT_CHARS {
+        return (text.to_string(), String::new());
+    }
+    (
+        truncate_middle_content(text, MAX_TOOL_CONTENT_CHARS),
+        format!(" truncated=\"true\" original_chars=\"{original_chars}\""),
+    )
 }
 
 /// Stringify a value (TS `safeStringify`): strings pass through; everything else
@@ -251,13 +273,12 @@ fn render_content_blocks(blocks: &[Value], indent: &str) -> String {
                     Some(v) if is_truthy(v) => v.clone(),
                     _ => json!({}),
                 };
-                let input_str = escape_xml(&truncate_middle_content(
-                    &safe_stringify(&raw_input),
-                    MAX_TOOL_CONTENT_CHARS,
-                ));
+                let (input_str, truncated_attrs) =
+                    truncate_tool_content(&safe_stringify(&raw_input));
+                let input_str = escape_xml(&input_str);
                 let _ = writeln!(
                     xml,
-                    "{indent}<tool_use name=\"{tool_name}\" tool_use_id=\"{tool_use_id}\">"
+                    "{indent}<tool_use name=\"{tool_name}\" tool_use_id=\"{tool_use_id}\"{truncated_attrs}>"
                 );
                 let _ = writeln!(xml, "{indent}  {input_str}");
                 let _ = writeln!(xml, "{indent}</tool_use>");
@@ -267,13 +288,12 @@ fn render_content_blocks(blocks: &[Value], indent: &str) -> String {
                 let is_error = bool_field(block, &["is_error", "isError"]);
                 let content = first_truthy(block, &["output", "content"])
                     .unwrap_or(Value::String(String::new()));
-                let content_str = escape_xml(&truncate_middle_content(
-                    &safe_stringify(&content),
-                    MAX_TOOL_CONTENT_CHARS,
-                ));
+                let (content_str, truncated_attrs) =
+                    truncate_tool_content(&safe_stringify(&content));
+                let content_str = escape_xml(&content_str);
                 let _ = writeln!(
                     xml,
-                    "{indent}<tool_result tool_use_id=\"{tool_use_id}\" is_error=\"{is_error}\">"
+                    "{indent}<tool_result tool_use_id=\"{tool_use_id}\" is_error=\"{is_error}\"{truncated_attrs}>"
                 );
                 let _ = writeln!(xml, "{indent}  {content_str}");
                 let _ = writeln!(xml, "{indent}</tool_result>");
