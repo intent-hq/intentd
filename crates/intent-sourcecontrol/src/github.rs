@@ -241,6 +241,21 @@ pub(crate) fn map_issue(value: Value) -> Result<Issue> {
     })
 }
 
+/// [`map_issue`] for `get_issue`'s single-item fetch: GitHub's
+/// `/issues/{number}` endpoint returns a PR's issue-shaped payload when
+/// `number` names a pull request (the REST API models every PR as an issue,
+/// tagged with a `pull_request` key). Reject that case as not-found instead
+/// of mapping it, so `github.issues.get` never leaks a PR as an issue --
+/// callers get the same not-found treatment as a number that doesn't exist.
+pub(crate) fn map_issue_at_number(value: Value, number: u64) -> Result<Issue> {
+    if value.get("pull_request").is_some() {
+        return Err(Error::NotFound(format!(
+            "#{number} is a pull request, not an issue"
+        )));
+    }
+    map_issue(value)
+}
+
 pub(crate) fn map_repo(value: Value) -> Result<Repo> {
     let r: dto::Repo = serde_json::from_value(value)?;
     Ok(Repo {
@@ -1622,7 +1637,7 @@ impl SourceControl for GitHubSourceControl {
     async fn get_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue> {
         let route = Self::repo_path(repo, &format!("/issues/{number}"));
         let v: Value = self.client.get(&route, None::<&()>).await?;
-        map_issue(v)
+        map_issue_at_number(v, number)
     }
 
     async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>> {
@@ -2212,6 +2227,29 @@ mod tests {
         assert_eq!(c.id, "99");
         assert_eq!(c.author, "u");
         assert!(c.path.is_none());
+    }
+
+    #[test]
+    fn get_issue_rejects_pull_request_shaped_payload() {
+        // `/issues/{number}` on a PR number comes back issue-shaped but
+        // carries a `pull_request` key -- must be rejected as not-found,
+        // never mapped as an issue.
+        let err = map_issue_at_number(
+            json!({
+                "number": 42,
+                "title": "Add thing",
+                "pull_request": { "url": "https://api.github.com/repos/o/r/pulls/42" }
+            }),
+            42,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(msg) if msg.contains("#42") && msg.contains("pull request"))
+        );
+
+        // A genuine issue payload (no `pull_request` key) still maps normally.
+        let issue = map_issue_at_number(json!({ "number": 7, "title": "bug" }), 7).unwrap();
+        assert_eq!(issue.number, 7);
     }
 
     #[test]
