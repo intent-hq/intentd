@@ -224,6 +224,56 @@ pub(crate) struct CompletionClassifyPark {
     pub(crate) release: tokio::sync::Notify,
 }
 
+/// Live state of the completion delivery passes over one child
+/// (intent-hq/intent#4367); see [`Services::claim_watch_delivery`]. Evicted
+/// when the last pass exits and no watch claim remains.
+#[derive(Default)]
+struct ChildCompletionPasses {
+    /// Passes currently inside `deliver_completion_to_watches_inner`.
+    passes: usize,
+    /// Ungrouped watch ids whose terminal wake is in flight on some pass.
+    claimed_watches: HashSet<String>,
+    /// The child's flipped-completion triggers, consumed from the store by
+    /// exactly one pass and shared by every pass overlapping it. The store
+    /// take is destructive, so without this a split snapshot (pass 1 claims
+    /// watch A, pass 2 claims watch B) would stamp the flips on one
+    /// parent's terminal wake and lose them on the other's. The cell
+    /// serializes the take itself: a second pass arriving before the first
+    /// take completes awaits it instead of taking an empty set.
+    taken_flip_triggers: Arc<tokio::sync::OnceCell<Vec<(String, String)>>>,
+}
+
+/// Registration of one in-flight delivery pass over `child`; dropping it
+/// exits the pass and evicts the child's shared state once nothing else
+/// holds it.
+struct CompletionPassGuard<'a> {
+    services: &'a Services,
+    child: AgentId,
+}
+
+impl Drop for CompletionPassGuard<'_> {
+    fn drop(&mut self) {
+        self.services.exit_completion_pass(&self.child);
+    }
+}
+
+/// Ownership of one ungrouped watch's in-flight terminal delivery
+/// (intent-hq/intent#4367); see [`Services::claim_watch_delivery`]. Dropping
+/// the guard releases the claim on every exit of the delivering pass —
+/// delivered, retried, or unwound.
+struct WatchDeliveryClaim<'a> {
+    services: &'a Services,
+    child: AgentId,
+    watch_id: String,
+}
+
+impl Drop for WatchDeliveryClaim<'_> {
+    fn drop(&mut self) {
+        self.services
+            .release_watch_delivery(&self.child, &self.watch_id);
+    }
+}
+
 /// Test park for one pending-question marker mutation before it acquires the
 /// per-agent ordering lock. The target is `"set"` or `"clear"`; only the
 /// first matching call parks.
@@ -438,6 +488,23 @@ pub struct Services {
     /// any re-mark that does not re-qualify. In-memory only, like the
     /// parent set.
     advisory_pending_interim_skips: Arc<Mutex<HashSet<AgentId>>>,
+    /// Ungrouped completion watches whose terminal wake is being delivered
+    /// RIGHT NOW by some delivery pass (intent-hq/intent#4367). Two passes
+    /// can settle the same child concurrently — the completion-delivery
+    /// loop handling the live `agent:idle`, and the worker-exit
+    /// `redeliver_completion_after_queue_mutation` synthesizing the same
+    /// completion off a stale interim-skip marker — and each reads the
+    /// watch as still armed before either retires it. The stable wake id
+    /// does not close that window (a direct-send wake is not in the queue
+    /// and not yet persisted while its turn starts), so the parent received
+    /// two terminal wakes. The claim is taken before the "watch still
+    /// armed" check and released when the pass is done with the watch
+    /// (delivered + retired, or handed to the retry task); a pass that
+    /// finds the watch claimed skips it. The same entry shares the child's
+    /// consumed flipped-completion triggers between overlapping passes, so
+    /// a split snapshot never loses them (see [`ChildCompletionPasses`]).
+    /// In-memory only, like the other live delivery state.
+    completion_deliveries_in_flight: Arc<Mutex<HashMap<AgentId, ChildCompletionPasses>>>,
     /// Process-local mirror of the persisted `advisory_wake_delivery`
     /// once-per-period markers: `(parent, child)` pairs whose monitoring-idle
     /// advisory was delivered this waiting period (PR #1686 review). The
@@ -561,6 +628,20 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_classify_park`.
     completion_classify_park: Option<Arc<CompletionClassifyPark>>,
+    /// Test park seam (intent-hq/intent#4367) for the completion-delivery
+    /// claim→send window: parks the ungrouped terminal delivery right after
+    /// it claims the watch and before the durable send, so a concurrent
+    /// delivery pass for the same child landing inside that window is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_completion_claim_park`.
+    completion_claim_park: Option<Arc<CompletionClassifyPark>>,
+    /// Test park seam (intent-hq/intent#4367) for the flipped-completion
+    /// take→publish window: parks the pass that consumed the child's flips
+    /// from the store before it publishes them to the overlapping passes,
+    /// so a concurrent pass reaching the take inside that window is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_completion_flip_take_park`.
+    completion_flip_take_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (monorepo#1481) for the attention mutation race window
     /// — parks `raise_attention` / `mark_seen` / `dismiss_attention`
     /// immediately before their scoped attention write (the site of the
@@ -1018,6 +1099,7 @@ impl Services {
             advisory_wake_periods: Arc::new(Mutex::new(HashSet::new())),
             stale_report_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             advisory_pending_interim_skips: Arc::new(Mutex::new(HashSet::new())),
+            completion_deliveries_in_flight: Arc::new(Mutex::new(HashMap::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -1037,6 +1119,8 @@ impl Services {
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
+            completion_claim_park: None,
+            completion_flip_take_park: None,
             attention_write_park: None,
             wake_archived_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
@@ -1707,6 +1791,31 @@ impl Services {
         park: Arc<CompletionClassifyPark>,
     ) -> Self {
         self.completion_classify_park = Some(park);
+        self
+    }
+
+    /// Test seam (intent-hq/intent#4367): park the ungrouped terminal
+    /// delivery in its claim→send window (after the watch is claimed,
+    /// before the durable wake is sent) so a concurrent delivery pass for
+    /// the same child inside that window is deterministic. Production
+    /// wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_completion_claim_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.completion_claim_park = Some(park);
+        self
+    }
+
+    /// Test seam (intent-hq/intent#4367): park the delivery pass that
+    /// consumed the child's flipped-completion triggers from the store
+    /// between its take and the publish to the overlapping passes, so a
+    /// concurrent pass reaching the take inside that window is
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_completion_flip_take_park(
+        mut self,
+        park: Arc<CompletionClassifyPark>,
+    ) -> Self {
+        self.completion_flip_take_park = Some(park);
         self
     }
 
@@ -5114,6 +5223,111 @@ impl Services {
             .remove(child_id)
     }
 
+    /// Register one delivery pass over `child_id` in the in-flight registry
+    /// (intent-hq/intent#4367) so the child's consumed flip triggers are
+    /// shared with every pass that overlaps this one. The returned guard
+    /// exits the pass on drop.
+    fn enter_completion_pass(&self, child_id: &AgentId) -> CompletionPassGuard<'_> {
+        self.completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned")
+            .entry(child_id.clone())
+            .or_default()
+            .passes += 1;
+        CompletionPassGuard {
+            services: self,
+            child: child_id.clone(),
+        }
+    }
+
+    fn exit_completion_pass(&self, child_id: &AgentId) {
+        let mut registry = self
+            .completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned");
+        if let Some(entry) = registry.get_mut(child_id) {
+            entry.passes = entry.passes.saturating_sub(1);
+            if entry.passes == 0 && entry.claimed_watches.is_empty() {
+                registry.remove(child_id);
+            }
+        }
+    }
+
+    /// Claim the ungrouped watch `watch_id` of `child_id` for terminal
+    /// delivery (intent-hq/intent#4367). `None` when another delivery pass
+    /// already holds it — the caller skips the watch: the owning pass
+    /// either delivers + retires it or hands it to the stable-id retry
+    /// task, so a skipped concurrent pass never strands the watch. The
+    /// returned guard releases the claim on drop.
+    fn claim_watch_delivery(
+        &self,
+        child_id: &AgentId,
+        watch_id: &str,
+    ) -> Option<WatchDeliveryClaim<'_>> {
+        self.completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned")
+            .entry(child_id.clone())
+            .or_default()
+            .claimed_watches
+            .insert(watch_id.to_string())
+            .then(|| WatchDeliveryClaim {
+                services: self,
+                child: child_id.clone(),
+                watch_id: watch_id.to_string(),
+            })
+    }
+
+    fn release_watch_delivery(&self, child_id: &AgentId, watch_id: &str) {
+        let mut registry = self
+            .completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned");
+        if let Some(entry) = registry.get_mut(child_id) {
+            entry.claimed_watches.remove(watch_id);
+            if entry.passes == 0 && entry.claimed_watches.is_empty() {
+                registry.remove(child_id);
+            }
+        }
+    }
+
+    /// The flipped-completion triggers of `child_id` for the calling
+    /// delivery pass: the store take is destructive, so exactly one pass
+    /// takes them and publishes the set in the child's in-flight entry,
+    /// and every overlapping pass awaits and reads that same set
+    /// (intent-hq/intent#4367 review: two ungrouped parents settled by two
+    /// concurrent passes must both stamp the flips). The cell serializes
+    /// the take: a pass arriving while the take is in flight awaits its
+    /// result instead of taking an empty set from the store. The cell is
+    /// cloned out under the registry lock and awaited outside it.
+    async fn shared_flipped_completion_triggers(
+        &self,
+        child_id: &AgentId,
+    ) -> Vec<(String, String)> {
+        let cell = self
+            .completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned")
+            .get(child_id)
+            .map(|entry| entry.taken_flip_triggers.clone())
+            .unwrap_or_default();
+        cell.get_or_init(|| async {
+            let taken = self.take_flipped_completion_triggers(child_id).await;
+            // Test seam: park the consuming pass between its take and the
+            // publish so a concurrent pass reaching the take inside that
+            // window is deterministic.
+            if let Some(park) = &self.completion_flip_take_park {
+                if !taken.is_empty() {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
+            }
+            taken
+        })
+        .await
+        .clone()
+    }
+
     /// Whether `agent_id` is currently idle-but-waiting on OTHER agents: it
     /// holds at least one live outgoing completion watch. The predicate never
     /// probes the target's settlement itself — it relies on the
@@ -6209,8 +6423,12 @@ impl Services {
         // needs them — never up front — so a pass that skips every delivery
         // (deferral, report_delivered retirement, replay dedup) leaves the
         // rows for the wake that actually stamps them; one take is shared by
-        // every watch in this pass so multiple watchers stamp the same set.
-        let mut taken_flip_triggers: Option<Vec<(String, String)>> = None;
+        // every watch in this pass AND by every concurrent pass over the
+        // same child (`shared_flipped_completion_triggers`), so multiple
+        // watchers stamp the same set even when two passes split the
+        // watch snapshot between them. The pass guard keeps the shared set
+        // alive until the last overlapping pass exits.
+        let _pass = self.enter_completion_pass(child_id);
         // intent-hq/intent#3728: set on any ungrouped wake/retirement
         // failure below so the returned classification tells the per-child
         // retry task whether this pass genuinely needs another attempt.
@@ -6312,14 +6530,7 @@ impl Services {
                             triggers.push((s.workspace_id.0.clone(), n.0.clone()));
                         }
                     }
-                    let flips = if let Some(f) = &taken_flip_triggers {
-                        f.clone()
-                    } else {
-                        let f = self.take_flipped_completion_triggers(child_id).await;
-                        taken_flip_triggers = Some(f.clone());
-                        f
-                    };
-                    for pair in flips {
+                    for pair in self.shared_flipped_completion_triggers(child_id).await {
                         if !triggers.contains(&pair) {
                             triggers.push(pair);
                         }
@@ -6540,6 +6751,22 @@ impl Services {
                     continue;
                 }
             }
+            // intent-hq/intent#4367: the live `agent:idle` pass and the
+            // worker-exit synthesized redelivery can settle the same child
+            // concurrently; without a claim both read the watch as armed
+            // below (retirement only lands after the durable send) and the
+            // parent gets two terminal wakes. Claim BEFORE the armed check
+            // so the loser skips; the guard releases on every exit of this
+            // iteration (delivered, retried, or unwound).
+            let Some(_claim) = self.claim_watch_delivery(child_id, &watch.id) else {
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    watch = %watch.id,
+                    "terminal delivery already in flight on a concurrent pass, skipping"
+                );
+                continue;
+            };
             if !self
                 .find_watches_for_child(child_id)
                 .iter()
@@ -6551,6 +6778,13 @@ impl Services {
                     "watch already removed, skipping terminal delivery"
                 );
                 continue;
+            }
+            // Test seam: park in the claim→send window so a test can run a
+            // concurrent delivery pass for the same child while this one
+            // holds the claim.
+            if let Some(park) = &self.completion_claim_park {
+                park.entered.notify_one();
+                park.release.notified().await;
             }
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
@@ -6630,14 +6864,7 @@ impl Services {
                 }
             }
             if event.event_type == AGENT_IDLE && !interim_idle {
-                let flips = if let Some(f) = &taken_flip_triggers {
-                    f.clone()
-                } else {
-                    let f = self.take_flipped_completion_triggers(child_id).await;
-                    taken_flip_triggers = Some(f.clone());
-                    f
-                };
-                for pair in flips {
+                for pair in self.shared_flipped_completion_triggers(child_id).await {
                     if !stamped_triggers.contains(&pair) {
                         stamped_triggers.push(pair);
                     }

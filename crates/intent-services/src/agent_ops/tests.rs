@@ -20051,6 +20051,207 @@ async fn unwatch_in_classify_mark_window_still_settles_watcher() {
     );
 }
 
+/// Concurrent-pass regression (intent-hq/intent#4367): the live `agent:idle`
+/// delivery and the worker-exit synthesized redelivery can settle the same
+/// child at once, and both used to read A's watch as still armed (retirement
+/// only lands after the durable send) — A received two terminal wakes. The
+/// claim park holds the first pass inside its claim→send window; a second
+/// pass for the same completion must skip the claimed watch (no wake, watch
+/// still armed), and the released first pass then delivers exactly once.
+#[tokio::test]
+async fn concurrent_completion_passes_deliver_one_terminal_wake() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let park = Arc::new(crate::CompletionClassifyPark::default());
+    let svc = Services::new(store).with_completion_claim_park(park.clone());
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+
+    // First pass claims A's watch and parks before the durable send.
+    let first = tokio::spawn({
+        let svc = svc.clone();
+        let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
+        async move { svc.handle_completion_event(&event).await }
+    });
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("first pass parked in the claim→send window");
+
+    // Second pass for the same completion inside the window: the watch is
+    // claimed, so it must neither wake A nor retire the watch.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        0,
+        "concurrent pass skips the claimed watch"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&b).len(),
+        1,
+        "concurrent pass leaves the claimed watch armed"
+    );
+
+    park.release.notify_one();
+    timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first pass completes")
+        .expect("first pass task");
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "exactly one terminal wake across both passes"
+    );
+    assert!(
+        svc.find_watches_for_child(&b).is_empty(),
+        "the delivering pass retires A's watch"
+    );
+
+    // The claim is released with the pass: a later, genuinely new completion
+    // on a re-armed watch delivers normally.
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A re-watches B");
+    let second = tokio::spawn({
+        let svc = svc.clone();
+        let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
+        async move { svc.handle_completion_event(&event).await }
+    });
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("re-armed delivery claims the new watch");
+    park.release.notify_one();
+    timeout(Duration::from_secs(5), second)
+        .await
+        .expect("re-armed delivery completes")
+        .expect("re-armed delivery task");
+    assert_eq!(parent_message_count(&svc, &a).await, 2);
+}
+
+/// Split-snapshot regression (intent-hq/intent#4367 review): with two
+/// ungrouped parents on one child, two concurrent passes can each claim one
+/// watch (pass 1 claims A's, pass 2 claims C's). The flipped-completion take
+/// is destructive, so a per-pass memo would stamp the child's flips on only
+/// the first taker's wake and lose them on the other parent's ONLY terminal
+/// wake — and a shared memo that is merely check-then-take still loses them
+/// when pass 2 reaches the take while pass 1's take is in flight (pass 2
+/// takes an empty set). The take is serialized per child and its result
+/// shared across overlapping passes: both wakes carry the flipped task. The
+/// flip-take park forces exactly that interleaving: pass 1 is held between
+/// its take and the publish while pass 2 is released into the take.
+#[tokio::test]
+async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let park = Arc::new(crate::CompletionClassifyPark::default());
+    let flip_park = Arc::new(crate::CompletionClassifyPark::default());
+    let svc = Services::new(store)
+        .with_completion_claim_park(park.clone())
+        .with_completion_flip_take_park(flip_park.clone());
+    let a = create_agent(&svc, &ws, "A").await;
+    let c = create_agent(&svc, &ws, "C").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let flipped = seed_task(&svc, &ws, "Flipped task").await;
+    svc.task_update_note_status(
+        ws.clone(),
+        flipped.clone(),
+        "complete".into(),
+        None,
+        Some(b.clone()),
+    )
+    .await
+    .expect("B flips other task");
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), b.clone(), None)
+        .expect("C watches B");
+
+    // Pass 1 claims the first watch and parks before taking the flips.
+    let first = tokio::spawn({
+        let svc = svc.clone();
+        let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
+        async move { svc.handle_completion_event(&event).await }
+    });
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("first pass parked on its claimed watch");
+    // Pass 2 skips the claimed watch, claims the other one, and parks too:
+    // the snapshot is now split between the two passes.
+    let second = tokio::spawn({
+        let svc = svc.clone();
+        let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
+        async move { svc.handle_completion_event(&event).await }
+    });
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("second pass parked on the other claimed watch");
+
+    // Release pass 1 alone: it consumes the child's flips from the store and
+    // parks before publishing them.
+    park.release.notify_one();
+    timeout(Duration::from_secs(2), flip_park.entered.notified())
+        .await
+        .expect("first pass parked between its flip take and the publish");
+    // Release pass 2 while pass 1 holds that window: it reaches the flip
+    // take with the store already drained and must await pass 1's result
+    // rather than take (and stamp) an empty set.
+    park.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !second.is_finished(),
+        "second pass must not settle its wake before the flips are published"
+    );
+    flip_park.release.notify_one();
+    timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first pass completes")
+        .expect("first pass task");
+    timeout(Duration::from_secs(5), second)
+        .await
+        .expect("second pass completes")
+        .expect("second pass task");
+
+    for parent in [&a, &c] {
+        let session = svc
+            .store()
+            .get_agent_session(parent)
+            .await
+            .expect("parent session");
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "exactly one terminal wake for {}",
+            parent.0
+        );
+        let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata[UNBLOCKED_TRIGGER_TASKS_KEY],
+            json!([{ "workspaceId": ws.0, "taskNoteId": flipped.0 }]),
+            "flipped task stamped on {}'s wake",
+            parent.0
+        );
+    }
+    assert!(svc.find_watches_for_child(&b).is_empty());
+    assert!(svc
+        .store()
+        .list_agent_flipped_completions(&b)
+        .await
+        .expect("list flips")
+        .is_empty());
+}
+
 /// 2-cycle deadlock guard: A⇄B watch each other and both are idle. B's idle
 /// must NOT defer (the mutual-idle pair would deadlock otherwise) — A's watch
 /// on B fires as before.
