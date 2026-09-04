@@ -206,7 +206,9 @@ fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64, bool) {
 
 /// Build the file list from `repo.statuses`, replicating the porcelain
 /// `--untracked-files=all` parse (directories skipped; staged+unstaged split).
-fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
+/// Shared with [`crate::local_changes`] so its `uncommittedCount` covers the
+/// exact entry set `git.status.files` reports.
+pub(crate) fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)

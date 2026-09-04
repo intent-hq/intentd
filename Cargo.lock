@@ -2246,6 +2246,7 @@ dependencies = [
  "git2",
  "intent-core",
  "libc",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
