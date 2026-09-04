@@ -1466,6 +1466,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         protocol = intent_transport::PROTOCOL_VERSION,
         "intentd starting"
     );
+    // Raise the soft descriptor limit before anything opens fds in earnest
+    // (store pool, listeners, agent subprocesses): the macOS default soft limit
+    // is 256, which the daemon exhausts under load (intent-hq/intent#4390).
+    // Never fatal — a failed raise leaves the limit untouched and is logged.
+    fd_limit::raise_at_startup();
     // Insecure dev mode: `--insecure` OR `INTENTD_INSECURE=1` disables TLS and
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
     // provisioning entirely. Dev-only; loudly warned at startup.
@@ -2724,6 +2729,133 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
         }
     });
     usage
+}
+
+/// Process descriptor limit (`RLIMIT_NOFILE`) policy for `serve`
+/// (intent-hq/intent#4390): raise the soft limit as far as the OS allows at
+/// startup, log the result, and keep the sampled soft limit readable for
+/// `system.status`. Unix only; every entry point is a no-op elsewhere.
+mod fd_limit {
+    use std::sync::OnceLock;
+
+    /// macOS `setrlimit` rejects a soft `RLIMIT_NOFILE` above
+    /// `kern.maxfilesperproc` even when the hard limit is `RLIM_INFINITY`;
+    /// `OPEN_MAX` (10240) is the portable ceiling that always succeeds there.
+    /// Linux enforces the finite hard limit itself, so no extra cap applies.
+    #[cfg(target_os = "macos")]
+    pub(crate) const PLATFORM_CAP: Option<u64> = Some(10240);
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) const PLATFORM_CAP: Option<u64> = None;
+
+    /// Soft limit in effect after the startup raise (or the untouched value
+    /// when no raise was needed/possible). Set once by `raise_at_startup`.
+    static SOFT_LIMIT: OnceLock<u64> = OnceLock::new();
+
+    /// The soft `RLIMIT_NOFILE` sampled at startup, for `system.status`
+    /// reporting. `None` before `raise_at_startup` ran or when the limit
+    /// could not be read (non-Unix, `getrlimit` failure).
+    #[allow(dead_code)]
+    pub(crate) fn soft_limit() -> Option<u64> {
+        SOFT_LIMIT.get().copied()
+    }
+
+    /// Pure raise decision: given the current `soft` limit, the `hard` limit
+    /// (`None` = `RLIM_INFINITY`) and the platform cap, return the soft value
+    /// to set, or `None` to leave the limit untouched. The target is the hard
+    /// limit bounded by the cap; an unlimited hard limit with no cap has no
+    /// finite target. The soft limit is never lowered.
+    pub(crate) fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64> {
+        let target = match (hard, cap) {
+            (Some(hard), Some(cap)) => hard.min(cap),
+            (Some(hard), None) => hard,
+            (None, Some(cap)) => cap,
+            (None, None) => return None,
+        };
+        (target > soft).then_some(target)
+    }
+
+    /// Current `(soft, hard)` `RLIMIT_NOFILE`; `hard == None` means unlimited.
+    #[cfg(unix)]
+    pub(crate) fn read() -> std::io::Result<(u64, Option<u64>)> {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `lim` is a valid, writable `rlimit` for the call's duration.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((to_u64(lim.rlim_cur), finite(lim.rlim_max)))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn read() -> std::io::Result<(u64, Option<u64>)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "RLIMIT_NOFILE is not available on this platform",
+        ))
+    }
+
+    /// Render a hard limit for logs/doctor output.
+    pub(crate) fn fmt_hard(hard: Option<u64>) -> String {
+        hard.map_or_else(|| "unlimited".to_string(), |h| h.to_string())
+    }
+
+    /// Raise the soft limit per `target_soft` and log one INFO line with the
+    /// resulting limits. Failures are WARN-only; the limit is left untouched.
+    #[cfg(unix)]
+    pub(crate) fn raise_at_startup() {
+        let (soft, hard) = match read() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read fd limit (getrlimit)");
+                return;
+            }
+        };
+        let mut raised_from = None;
+        if let Some(target) = target_soft(soft, hard, PLATFORM_CAP) {
+            let lim = libc::rlimit {
+                rlim_cur: target as libc::rlim_t,
+                rlim_max: hard.map_or(libc::RLIM_INFINITY, |h| h as libc::rlim_t),
+            };
+            // SAFETY: `lim` is a valid, initialized `rlimit` for the call's duration.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim) } == 0 {
+                raised_from = Some(soft);
+            } else {
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    soft,
+                    target,
+                    hard = %fmt_hard(hard),
+                    "cannot raise fd limit (setrlimit); leaving it unchanged"
+                );
+            }
+        }
+        // Re-read so the logged/stored value is what the kernel actually applied.
+        let (soft, hard) = read().unwrap_or((soft, hard));
+        let _ = SOFT_LIMIT.set(soft);
+        tracing::info!(
+            soft,
+            hard = %fmt_hard(hard),
+            raised_from = %raised_from.map_or_else(|| "none".to_string(), |s| s.to_string()),
+            "fd limit"
+        );
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn raise_at_startup() {}
+
+    #[cfg(unix)]
+    fn finite(v: libc::rlim_t) -> Option<u64> {
+        (v != libc::RLIM_INFINITY).then(|| to_u64(v))
+    }
+
+    /// `rlim_t` is `u64` on the tier-1 Unix targets but not universally.
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)]
+    fn to_u64(v: libc::rlim_t) -> u64 {
+        v as u64
+    }
 }
 
 /// Latest workspaces-root disk sample (`available`, `total` bytes of the
@@ -5489,12 +5621,26 @@ async fn cmd_doctor() -> ExitCode {
     report_github_token();
     report_context_engine().await;
     report_host_capabilities();
+    report_fd_limit();
     report_cow_support(&config);
 
     if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Process descriptor limit (`RLIMIT_NOFILE`), informational only: `serve`
+/// raises the soft limit at startup (intent-hq/intent#4390), so this reports
+/// the limit `doctor` itself inherited, never a failure.
+fn report_fd_limit() {
+    match fd_limit::read() {
+        Ok((soft, hard)) => println!(
+            "[ok] fd limit: soft={soft} hard={}",
+            fd_limit::fmt_hard(hard)
+        ),
+        Err(e) => println!("[--] fd limit: unavailable ({e})"),
     }
 }
 
@@ -6111,6 +6257,59 @@ mod tests {
     #[test]
     fn banner_build_commit_falls_back_to_unknown() {
         assert_eq!(banner_build_commit(None), "unknown");
+    }
+
+    #[test]
+    fn fd_limit_target_raises_soft_to_finite_hard() {
+        assert_eq!(fd_limit::target_soft(256, Some(65536), None), Some(65536));
+    }
+
+    #[test]
+    fn fd_limit_target_uses_platform_cap_when_hard_unlimited() {
+        assert_eq!(fd_limit::target_soft(256, None, Some(10240)), Some(10240));
+    }
+
+    #[test]
+    fn fd_limit_target_is_none_when_hard_unlimited_and_uncapped() {
+        assert_eq!(fd_limit::target_soft(256, None, None), None);
+    }
+
+    #[test]
+    fn fd_limit_target_never_lowers_soft() {
+        // Already at the target.
+        assert_eq!(fd_limit::target_soft(65536, Some(65536), None), None);
+        // Above the target (soft can legitimately exceed the cap).
+        assert_eq!(fd_limit::target_soft(20000, None, Some(10240)), None);
+        assert_eq!(fd_limit::target_soft(20000, Some(65536), Some(10240)), None);
+    }
+
+    #[test]
+    fn fd_limit_target_cap_never_exceeds_hard() {
+        assert_eq!(
+            fd_limit::target_soft(256, Some(4096), Some(10240)),
+            Some(4096)
+        );
+        assert_eq!(
+            fd_limit::target_soft(256, Some(65536), Some(10240)),
+            Some(10240)
+        );
+    }
+
+    /// Raising the real limit is idempotent and never lowers it: a second
+    /// call finds nothing to raise and the recorded soft value is stable.
+    #[cfg(unix)]
+    #[test]
+    fn fd_limit_raise_at_startup_never_lowers_and_records_soft() {
+        let (before_soft, _) = fd_limit::read().unwrap();
+        fd_limit::raise_at_startup();
+        let (after_soft, after_hard) = fd_limit::read().unwrap();
+        assert!(after_soft >= before_soft);
+        if let Some(hard) = after_hard {
+            assert!(after_soft <= hard);
+        }
+        assert_eq!(fd_limit::soft_limit(), Some(after_soft));
+        fd_limit::raise_at_startup();
+        assert_eq!(fd_limit::read().unwrap().0, after_soft);
     }
 
     /// Overwrite regression guard: `write_private` uses `create_new`, so
