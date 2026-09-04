@@ -516,7 +516,9 @@ fn find_provider_binary_with_home_and_dirs(
 
     // 3. ~/.augment/bin (auggie's install location; kept for auggie back-compat)
     if let Some(managed) = managed_binary_path_with_home(command, home) {
-        if is_executable_file(&managed) {
+        if is_executable_file(&managed)
+            && (provider_id != "antigravity" || crate::antigravity::is_complete_candidate(&managed))
+        {
             return Some(managed);
         }
     }
@@ -1020,6 +1022,54 @@ mod find_provider_binary_tests {
             Some(broken),
             "healthy existing installation keeps precedence"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_legacy_install_tier_rejects_incomplete_launchers() {
+        use crate::antigravity::{HARNESS, SERVER};
+        for missing in [SERVER, HARNESS] {
+            let home = unique_temp_dir("antigravity-legacy-tier");
+            let legacy = home.path().join(".augment/bin");
+            let runtime = home.path().join("runtime");
+            let path_dir = home.path().join("path");
+            for dir in [&legacy, &runtime, &path_dir] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            let server = runtime.join(SERVER);
+            make_executable(&server);
+            make_executable(&runtime.join(HARNESS));
+            let wrapper = legacy.join("antigravity-acp");
+            make_executable(&wrapper);
+            let script = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", server.display());
+            fs::write(&wrapper, &script).unwrap();
+            let find = |provider, dirs: &[PathBuf]| {
+                find_provider_binary_with_home_and_dirs(
+                    provider,
+                    "antigravity-acp",
+                    None,
+                    Some(home.path()),
+                    dirs,
+                )
+            };
+            let later = path_dir.join("antigravity-acp");
+            make_executable(&later);
+            let dirs = [path_dir];
+            assert_eq!(find("antigravity", &dirs), Some(wrapper.clone()));
+
+            fs::remove_file(runtime.join(missing)).unwrap();
+            assert_eq!(find("antigravity", &[]), None, "missing {missing}");
+            assert_eq!(find("antigravity", &dirs), Some(later));
+            assert_eq!(find("other", &[]), Some(wrapper.clone()));
+            if crate::antigravity::supported_host() {
+                let managed = make_antigravity_bundle(home.path()).join(SERVER);
+                assert_eq!(find("antigravity", &[]), Some(managed));
+            }
+            assert_eq!(fs::read_to_string(&wrapper).unwrap(), script);
+            // Opaque custom launchers retain the existing legacy-tier precedence.
+            make_executable(&wrapper);
+            assert_eq!(find("antigravity", &dirs), Some(wrapper));
+        }
     }
 
     #[cfg(unix)]

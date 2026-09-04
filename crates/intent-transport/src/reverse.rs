@@ -66,6 +66,22 @@ struct ReverseState {
 
 type Pending = Arc<Mutex<ReverseState>>;
 
+/// Remove the registration even when the caller drops the request future.
+struct PendingRequest<'a> {
+    pending: &'a Mutex<ReverseState>,
+    id: &'a str,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .requests
+            .remove(self.id);
+    }
+}
+
 /// Daemon→client reverse-RPC channel for one connection. Cheap to clone (`Arc`
 /// inside); cloning shares the same pending map and id counter.
 #[derive(Clone)]
@@ -125,12 +141,16 @@ impl ReverseChannel {
             }
             state.requests.insert(id.clone(), tx);
         }
+        let _registration = PendingRequest {
+            pending: &self.pending,
+            id: &id,
+        };
 
         let frame = serde_json::to_string(&json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params,
         }))
         .unwrap_or_default();
-        let result = match tokio::time::timeout(timeout, async {
+        match tokio::time::timeout(timeout, async {
             self.out_tx.send(frame).await.map_err(|_| ReverseError {
                 code: 0,
                 message: "client connection closed".to_string(),
@@ -147,16 +167,7 @@ impl ReverseChannel {
                 code: 0,
                 message: format!("reverse request timed out: {method}"),
             }),
-        };
-        // `route_response` normally removes the entry first. Every other exit
-        // (queue timeout, response timeout, or closed connection) cleans it up
-        // here so a late response cannot address an abandoned request.
-        self.pending
-            .lock()
-            .expect("reverse pending poisoned")
-            .requests
-            .remove(&id);
-        result
+        }
     }
 
     /// Try to route an inbound frame as a response to a pending reverse request.

@@ -174,6 +174,75 @@ async fn request_timeout_includes_outbound_queue_wait() {
 }
 
 #[tokio::test]
+async fn cancelled_login_requests_release_registrations_and_ignore_late_replies() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let reverse = ReverseChannel::new(out_tx);
+    for _ in 0..3 {
+        let mut request = Box::pin(reverse.request(
+            "providers.setup.openLogin",
+            json!({ "operationId": "setup-1", "url": "https://accounts.google.com/o/oauth2/auth" }),
+            Duration::from_secs(30),
+        ));
+        assert!(futures_util::poll!(request.as_mut()).is_pending());
+        let frame: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["method"], "providers.setup.openLogin");
+        assert_eq!(reverse.pending.lock().unwrap().requests.len(), 1);
+
+        drop(request);
+        assert!(reverse.pending.lock().unwrap().requests.is_empty());
+        assert!(!reverse.route_response(&json!({
+            "jsonrpc": "2.0", "id": frame["id"], "result": { "opened": true }
+        })));
+    }
+}
+
+#[tokio::test]
+async fn cancelled_request_during_queue_wait_never_enqueues() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let reverse = ReverseChannel::new(out_tx);
+    reverse.out_tx.send("occupied".to_string()).await.unwrap();
+    let mut request = Box::pin(reverse.request(
+        "providers.setup.openLogin",
+        json!({ "operationId": "setup-1" }),
+        Duration::from_secs(30),
+    ));
+    assert!(futures_util::poll!(request.as_mut()).is_pending());
+    assert_eq!(reverse.pending.lock().unwrap().requests.len(), 1);
+    drop(request);
+
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
+    assert_eq!(out_rx.try_recv().unwrap(), "occupied");
+    assert!(out_rx.try_recv().is_err());
+    assert!(!reverse.route_response(&json!({
+        "jsonrpc": "2.0", "id": "rev-1", "result": { "opened": true }
+    })));
+}
+
+#[tokio::test]
+async fn cancelling_one_request_preserves_an_independent_request() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(2);
+    let reverse = ReverseChannel::new(out_tx);
+    let mut cancelled = Box::pin(reverse.request(
+        "providers.setup.openLogin",
+        json!({}),
+        Duration::from_secs(30),
+    ));
+    let mut retained =
+        Box::pin(reverse.request("host.openExternal", json!({}), Duration::from_secs(30)));
+    assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+    assert!(futures_util::poll!(retained.as_mut()).is_pending());
+    let _: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+    let frame: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+    drop(cancelled);
+    assert_eq!(reverse.pending.lock().unwrap().requests.len(), 1);
+    assert!(reverse.route_response(&json!({
+        "jsonrpc": "2.0", "id": frame["id"], "result": { "opened": true }
+    })));
+    assert_eq!(retained.await.unwrap(), json!({ "opened": true }));
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
+}
+
+#[tokio::test]
 async fn request_fails_when_connection_closed() {
     let (out_tx, out_rx) = mpsc::channel::<String>(8);
     drop(out_rx);
