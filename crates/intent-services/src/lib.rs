@@ -2697,12 +2697,17 @@ impl Services {
     /// deleting the workspace would lose — one row per evaluated root, the
     /// primary worktree first, then every registered secondary root in
     /// `gitRoot.list` order. The primary row is skipped when the workspace is
-    /// remote (no daemon-provisioned checkout) or its worktree is not a git
-    /// repository; secondary roots are always evaluated because registration
-    /// only accepts host-local repository roots. Each root is computed on the
-    /// blocking pool (git I/O never runs on the RPC task); a root that cannot
-    /// be read yields an `error` row with zero counts rather than failing the
-    /// call. An unknown id is `NotFound`.
+    /// remote (no daemon-provisioned checkout), when it skipped worktree
+    /// provisioning (`worktree_path` then falls back to the user's own
+    /// `repository_path`, which archive/delete never removes), or when its
+    /// worktree has no `.git` entry (the same gate as `git.status`); any other
+    /// failure to read it surfaces as an `error` row like a secondary root's.
+    /// Secondary roots are always evaluated because registration only accepts
+    /// host-local repository roots. Roots are scanned concurrently, one
+    /// blocking-pool task each (git I/O never runs on the RPC task), and
+    /// merged back in order; a root that cannot be read — or whose task
+    /// panics — yields an `error` row with zero counts rather than failing
+    /// the call. An unknown id is `NotFound`.
     pub(crate) async fn workspace_local_changes_op(
         &self,
         id: WorkspaceId,
@@ -2710,28 +2715,51 @@ impl Services {
         let ws = self.store.get_workspace(&id).await?;
         let secondary = self.store.list_workspace_git_roots(&id).await?;
 
-        let mut roots: Vec<LocalChangesRow> = Vec::with_capacity(secondary.len() + 1);
-        if !ws.is_remote {
+        // (kind, gitRootId, path, whether a missing `.git` skips the row).
+        let mut targets: Vec<(&'static str, Option<String>, PathBuf, bool)> =
+            Vec::with_capacity(secondary.len() + 1);
+        if !ws.is_remote && !ws.skip_worktree {
             if let Some(primary) = git_ops::worktree_path(&ws) {
-                let row = tokio::task::spawn_blocking(move || {
-                    git2::Repository::open(&primary)
-                        .is_ok()
-                        .then(|| LocalChangesRow::compute("primary", None, &primary))
-                })
-                .await
-                .map_err(|e| Error::Internal(format!("workspace.localChanges task failed: {e}")))?;
-                roots.extend(row);
+                targets.push(("primary", None, primary, true));
             }
         }
         for root in secondary {
-            let path = PathBuf::from(&root.path);
-            let git_root_id = root.id.as_str().to_string();
-            let row = tokio::task::spawn_blocking(move || {
-                LocalChangesRow::compute("secondary", Some(git_root_id), &path)
+            targets.push((
+                "secondary",
+                Some(root.id.as_str().to_string()),
+                PathBuf::from(&root.path),
+                false,
+            ));
+        }
+
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|(kind, git_root_id, path, skip_without_git_dir)| {
+                let kind = *kind;
+                let git_root_id = git_root_id.clone();
+                let path = path.clone();
+                let skip_without_git_dir = *skip_without_git_dir;
+                tokio::task::spawn_blocking(move || {
+                    if skip_without_git_dir && !path.join(".git").exists() {
+                        return None;
+                    }
+                    Some(LocalChangesRow::compute(kind, git_root_id, &path))
+                })
             })
-            .await
-            .map_err(|e| Error::Internal(format!("workspace.localChanges task failed: {e}")))?;
-            roots.push(row);
+            .collect();
+
+        let mut roots: Vec<LocalChangesRow> = Vec::with_capacity(handles.len());
+        for ((kind, git_root_id, path, _), handle) in targets.into_iter().zip(handles) {
+            match handle.await {
+                Ok(Some(row)) => roots.push(row),
+                Ok(None) => {}
+                Err(e) => roots.push(LocalChangesRow::failed(
+                    kind,
+                    git_root_id,
+                    &path,
+                    format!("workspace.localChanges task failed: {e}"),
+                )),
+            }
         }
 
         let has_unpushed_commits = roots.iter().any(|r| r.changes.unpushed_count > 0);
@@ -11540,24 +11568,27 @@ impl LocalChangesRow {
     /// Compute the row for the repository at `path`. Blocking git I/O —
     /// callers run this on the blocking pool.
     fn compute(kind: &'static str, git_root_id: Option<String>, path: &Path) -> Self {
-        let (changes, error) = match intent_git::local_changes(path) {
-            Ok(changes) => (changes, None),
-            Err(e) => (
-                intent_git::LocalChanges {
-                    branch: None,
-                    has_remote_refs: false,
-                    unpushed_count: 0,
-                    uncommitted_count: 0,
-                },
-                Some(e.to_string()),
-            ),
-        };
+        match intent_git::local_changes(path) {
+            Ok(changes) => Self {
+                kind,
+                git_root_id,
+                path: path.to_string_lossy().into_owned(),
+                changes,
+                error: None,
+            },
+            Err(e) => Self::failed(kind, git_root_id, path, e.to_string()),
+        }
+    }
+
+    /// The fail-soft row for a root that could not be evaluated: zeroed
+    /// signals plus `error`.
+    fn failed(kind: &'static str, git_root_id: Option<String>, path: &Path, error: String) -> Self {
         Self {
             kind,
             git_root_id,
             path: path.to_string_lossy().into_owned(),
-            changes,
-            error,
+            changes: intent_git::LocalChanges::default(),
+            error: Some(error),
         }
     }
 }

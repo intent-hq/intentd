@@ -25,7 +25,7 @@ pub const MAX_UNPUSHED_COUNT: u64 = 1000;
 
 /// Per-root local-work signals — the wire row of `workspace.localChanges`
 /// minus the fields the service adds (`kind`, `gitRootId`, `path`, `error`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalChanges {
     /// Checked-out branch; omitted on a detached or unborn `HEAD`.

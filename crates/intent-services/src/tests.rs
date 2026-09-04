@@ -36732,12 +36732,21 @@ mod local_changes {
         worktree: Option<&Path>,
         remote: bool,
     ) -> (TempDb, Services, intent_core::Workspace) {
+        setup_with(worktree, |ws| ws.is_remote = remote).await
+    }
+
+    /// [`setup`] with an arbitrary tweak applied to the workspace before it
+    /// is inserted.
+    async fn setup_with(
+        worktree: Option<&Path>,
+        tweak: impl FnOnce(&mut intent_core::Workspace),
+    ) -> (TempDb, Services, intent_core::Workspace) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_id = WorkspaceId::new();
         let mut ws = workspace(&ws_id);
         ws.worktree_path = worktree.map(|p| p.to_string_lossy().into_owned());
-        ws.is_remote = remote;
+        tweak(&mut ws);
         store.insert_workspace(&ws).await.unwrap();
         let svc = Services::new(store);
         (tmp, svc, ws)
@@ -36819,6 +36828,43 @@ mod local_changes {
         assert_eq!(v["hasUncommittedChanges"], false);
     }
 
+    /// Rows come back in `gitRoot.list` order even though the roots are
+    /// scanned concurrently.
+    #[tokio::test]
+    async fn secondary_rows_preserve_git_root_list_order() {
+        let wt = TempDir::new();
+        empty_repo(&wt.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+        let subs: Vec<TempDir> = (0..4).map(|_| TempDir::new()).collect();
+        for sub in &subs {
+            dirty_repo(&sub.0);
+            let root = git_root(&ws.id, &sub.0);
+            svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        }
+        let listed: Vec<String> = svc
+            .store()
+            .list_workspace_git_roots(&ws.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id.as_str().to_string())
+            .collect();
+        assert_eq!(listed.len(), 4);
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 5, "{v}");
+        assert_eq!(roots[0]["kind"], "primary");
+        let got: Vec<&str> = roots[1..]
+            .iter()
+            .map(|r| r["gitRootId"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, listed);
+        assert!(roots[1..].iter().all(|r| r["unpushedCount"] == 1), "{v}");
+    }
+
+    /// No `.git` entry at all: the workspace has no checkout to lose, so
+    /// there is no primary row (same gate as `git.status`).
     #[tokio::test]
     async fn non_git_primary_worktree_is_skipped() {
         let wt = TempDir::new();
@@ -36828,6 +36874,64 @@ mod local_changes {
         assert_eq!(v["roots"], serde_json::json!([]));
         assert_eq!(v["hasUnpushedCommits"], false);
         assert_eq!(v["hasUncommittedChanges"], false);
+    }
+
+    /// A `.git` entry that exists but cannot be opened (a gitfile pointing
+    /// at a missing gitdir) is a primary row carrying `error`, not a silent
+    /// omission — the same fail-soft shape a secondary root gets.
+    #[tokio::test]
+    async fn unopenable_primary_worktree_yields_error_row() {
+        let wt = TempDir::new();
+        std::fs::write(
+            wt.0.join(".git"),
+            "gitdir: /nonexistent/intentd-lc-gitdir\n",
+        )
+        .unwrap();
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "{v}");
+        assert_eq!(roots[0]["kind"], "primary");
+        assert_eq!(roots[0]["path"], wt.0.to_string_lossy().as_ref());
+        assert!(
+            roots[0]["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{v}"
+        );
+        assert_eq!(roots[0]["unpushedCount"], 0);
+        assert_eq!(roots[0]["uncommittedCount"], 0);
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+    }
+
+    /// `skipWorktree`: `worktree_path` falls back to the user's own
+    /// `repository_path`, which archive/delete never removes, so the primary
+    /// row is skipped exactly like a remote workspace's.
+    #[tokio::test]
+    async fn skip_worktree_workspace_skips_primary_row() {
+        let repo = TempDir::new();
+        dirty_repo(&repo.0);
+        let sub = TempDir::new();
+        dirty_repo(&sub.0);
+        let (_t, svc, ws) = setup_with(None, |ws| {
+            ws.repository_path = Some(repo.0.to_string_lossy().into_owned());
+            ws.skip_worktree = true;
+        })
+        .await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        assert_eq!(v["roots"], serde_json::json!([]), "{v}");
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+
+        let root = git_root(&ws.id, &sub.0);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "{v}");
+        assert_eq!(roots[0]["kind"], "secondary");
+        assert_eq!(roots[0]["gitRootId"], root.id.as_str());
+        assert_eq!(v["hasUnpushedCommits"], true);
     }
 
     #[tokio::test]
