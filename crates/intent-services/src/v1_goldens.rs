@@ -1830,14 +1830,20 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     let v1_layers: Vec<&str> = v1_static.split("\n\n---\n\n").collect();
     let latest_layers: Vec<&str> = latest_static.split("\n\n---\n\n").collect();
     assert_eq!(v1_layers.len(), latest_layers.len());
+    let mut saw_next_steps = false;
     for (a, b) in v1_layers.iter().zip(&latest_layers) {
         if a.starts_with("## Suggested Next Steps") {
+            saw_next_steps = true;
             assert!(b.starts_with("## Suggested Next Steps"));
             assert_ne!(a, b, "latest rewords the next-steps layer");
         } else {
             assert_eq!(a, b, "static layers identical across versions");
         }
     }
+    assert!(
+        saw_next_steps,
+        "top-level assembly carries the next-steps layer"
+    );
     // A stale/corrupt stamp falls back to the latest (never fails a spawn).
     session.harness_version = "9.9".to_string();
     let unknown = assemble(Some(session)).await;

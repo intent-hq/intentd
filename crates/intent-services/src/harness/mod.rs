@@ -15,9 +15,12 @@
 //! byte-pinned by `crate::v2_3_goldens`). Call sites carry typed data
 //! into the harness and never format doctrine/envelope text themselves, so a
 //! future version can reword or reorder surfaces without touching managers.
-//! A new version starts as `pub use` re-exports of the prior version's
-//! surface functions and overrides only what changed — the v(N)→v(N+1) diff
-//! is exactly the changed surfaces.
+//! A new version that changes no text surface reuses the prior version's
+//! harness singleton and swaps only its doctrine (as [`v1_1`]–[`v2_2`] do);
+//! one that rewords a surface adds a unit struct whose [`Harness`] impl
+//! forwards every method to the prior implementation and overrides only
+//! what changed (as [`v2_3`] does) — the v(N)→v(N+1) diff is exactly the
+//! changed surfaces, and the compiler enforces the forwarding set.
 //!
 //! Wake/queue system messages (hook/PR-monitor/watch wakes, dequeue notes,
 //! delegation preamble, notices — H6) live behind the same trait: the
@@ -28,10 +31,10 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, `"2.2"`, or
-//! `"2.3"`) to the
-//! pair, so a session keeps assembling the exact doctrine it was created with
-//! even after the binary ships a newer set. All past versions stay bundled.
+//! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, `"2.2"`,
+//! or `"2.3"`) to the pair, so a session keeps assembling the exact doctrine
+//! it was created with even after the binary ships a newer set. All past
+//! versions stay bundled.
 
 pub(crate) mod v1;
 pub(crate) mod v1_1;
@@ -467,7 +470,7 @@ mod tests {
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
         assert!(std::ptr::eq(
             data_ptr(resolve_entry(intent_core::CURRENT_HARNESS_VERSION).harness),
-            data_ptr(&v1::V1)
+            data_ptr(&v2_3::V2_3)
         ));
     }
 

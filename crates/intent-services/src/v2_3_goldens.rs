@@ -79,11 +79,11 @@ fn v2_3_registry_keeps_v2_2_doctrine() {
 }
 
 /// Every other prompt-layer surface v2.3 exposes is byte-identical to v1
-/// (v2.2's harness), so an existing golden for those bytes stays valid
-/// across the bump.
+/// (the harness every earlier row shares), so an existing golden for those
+/// bytes stays valid across the bump.
 #[test]
 fn v2_3_forwards_other_prompt_surfaces_to_v1() {
-    let v1 = crate::harness::resolve_entry("2.2").harness;
+    let v1 = crate::harness::resolve_entry("1.0").harness;
     let v2_3 = crate::harness::resolve_entry("2.3").harness;
     let parts = vec!["a".to_string(), "b".to_string()];
     assert_eq!(
