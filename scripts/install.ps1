@@ -27,8 +27,10 @@
 #
 # Task setup is refused up front when a daemon is already running and owns the
 # data dir the task would serve: a daemon locks its data dir for its whole
-# lifetime, so a second one on the same dir can only crash-loop. Nothing is
-# registered in that case.
+# lifetime, so a second one on the same dir can only crash-loop. One exception:
+# a daemon running under the "intentd" task itself does not block a re-run -
+# that is an upgrade, and the task is re-registered and restarted onto the new
+# binary. Any other owner refuses the setup and nothing is registered.
 #
 # $env:INTENTD_SERVICE_NAME overrides the task name (testing).
 param(
@@ -216,20 +218,148 @@ if ($serviceMode -eq 'yes') {
         $ownerPid = 0
     }
     if ($ownerPid -gt 0) {
-        # Best-effort image path, so the refusal names the program instead of a
-        # bare number (Get-Process cannot read Path for some processes).
-        $ownerPath = ''
-        try { $ownerPath = (Get-Process -Id $ownerPid -ErrorAction Stop).Path } catch { $ownerPath = '' }
-        $ownerDesc = if ($ownerPath) { "pid $ownerPid ($ownerPath)" } else { "pid $ownerPid" }
-        throw ("install.ps1: an intentd daemon is already running and owns the data dir this task would use:`n" +
-            "  data dir: $dataDir`n" +
-            "  owner:    $ownerDesc`n" +
-            "A daemon locks its data dir for as long as it runs, so a second task on the same dir cannot start - it would only crash-loop. Nothing has been registered.`n" +
-            "Pick one:`n" +
-            "  * keep the daemon that is already running - it serves this data dir now: intentd status`n" +
-            "  * stop it first (quit the app that started it, or stop its task), then re-run this installer`n" +
-            "  * give this task its own data dir: `$env:INTENTD_DATA_DIR = `"`$env:LOCALAPPDATA\intentd\service-data`"`n" +
-            "  * install just the binary, with no task: re-run with `$env:INTENTD_INSTALL_SERVICE = '0'")
+        # One owner is not foreign: the daemon of the very task this installer
+        # manages ('intentd', or $env:INTENTD_SERVICE_NAME). Re-running the
+        # installer then is an upgrade - the registration below stops that
+        # exact task and restarts it onto the new binary - so it proceeds
+        # instead of refusing (the same allowance install.sh makes for its
+        # systemd unit / launchd label).
+        # The owner counts as ours only when ALL of these hold; any query
+        # error or uncertainty along the way falls through to the refusal
+        # below, never to the allowance:
+        #   1. A running task's full Path is exactly "\<task name>".
+        #      Register-ScheduledTask -TaskName always lands the task in the
+        #      root folder, so that path identifies the task this installer
+        #      manages - never IRunningTask.Name, which is only the leaf name
+        #      and which a foreign \other\<name> task shares.
+        #   2. That task's engine process (IRunningTask.EnginePID) is on the
+        #      owner's parent chain: Win32_Process ParentProcessId, walked a
+        #      bounded number of hops, stopping when a parent started after
+        #      its child (that parent pid was reused, so the chain is broken
+        #      there) - and equally when either hop's CreationDate is
+        #      missing, since a start time we cannot read is a reuse we
+        #      cannot rule out (uncertainty refuses).
+        #   3. The walked chain also holds the pid recorded in
+        #      <data_dir>\sitter\sitter.pid - the serve-mode sitter's own
+        #      pidfile (PidFile in crates/intentd-sitter/src/supervisor.rs),
+        #      i.e. the supervisor of the daemon serving *this* data dir.
+        #      EnginePID alone is not enough: it names the Task Scheduler
+        #      engine hosting the task, one engine can host several tasks,
+        #      so "descends from the engine" would also admit a daemon some
+        #      *other* task on a shared engine launched - and an image-path
+        #      witness would too, since a foreign task can run this same
+        #      installed intentd.exe. The sitter pidfile is written per data
+        #      dir, so it ties the chain to the one supervisor of the data
+        #      dir being checked. A missing, malformed or stale file is no
+        #      witness, hence no allowance.
+        #   4. No other running task reports that same EnginePID, and our
+        #      task is running exactly once. Requirements 2 and 3 tie the
+        #      chain to the *engine* and to the *data dir*, but neither ties
+        #      it to the *task*: the foreign task on a shared engine can
+        #      itself be the one serving this data dir - its sitter wrote
+        #      this dir's sitter.pid, its tree hangs off the same engine, so
+        #      2 and 3 both hold - yet restarting our task would not free
+        #      the dir. Any task whose tree an engine hosts reports that
+        #      engine's pid, so "some other running task reports our
+        #      EnginePID" is exactly "the engine hosts trees a restart of
+        #      our task would not touch": the walked ancestry then proves
+        #      nothing, and the allowance is forfeited. Two running
+        #      instances of our own task are indistinguishable the same way
+        #      (which one's tree does the restart replace?), hence equally
+        #      no allowance.
+        # A daemon the task scheduler does not control - a manual `intentd
+        # serve`, another task's tree - keeps being refused below, and so
+        # does everything when the scheduler cannot be asked at all.
+        $taskName = if ($env:INTENTD_SERVICE_NAME) { $env:INTENTD_SERVICE_NAME } else { 'intentd' }
+        $taskEnginePid = 0
+        try {
+            $scheduler = New-Object -ComObject 'Schedule.Service'
+            $scheduler.Connect()
+            # 1 = TASK_ENUM_HIDDEN: include hidden tasks, harmless for ours.
+            $runningTasks = @($scheduler.GetRunningTasks(1))
+            foreach ($runningTask in $runningTasks) {
+                if ($runningTask.Path -eq "\$taskName") {
+                    if ($taskEnginePid -ne 0) {
+                        # A second running instance of our task: requirement 4.
+                        $taskEnginePid = -1
+                        break
+                    }
+                    $taskEnginePid = [int]$runningTask.EnginePID
+                }
+            }
+            if ($taskEnginePid -gt 0) {
+                foreach ($runningTask in $runningTasks) {
+                    if ($runningTask.Path -ne "\$taskName" -and [int]$runningTask.EnginePID -eq $taskEnginePid) {
+                        # A foreign task shares the engine: requirement 4.
+                        $taskEnginePid = 0
+                        break
+                    }
+                }
+            }
+            if ($taskEnginePid -lt 0) { $taskEnginePid = 0 }
+        } catch {
+            # No task scheduler to ask (or access denied): no allowance.
+            $taskEnginePid = 0
+        }
+        # Requirement 3's witness: the pid in <data_dir>\sitter\sitter.pid,
+        # read exactly as the sitter's own read_live_pid reads it (whole
+        # file, trimmed, parsed as u32) and only counted while that pid is
+        # live. Missing, malformed, stale or dead all mean no witness,
+        # hence no allowance.
+        $sitterPid = 0
+        try {
+            $sitterPidFile = Join-Path (Join-Path $dataDir 'sitter') 'sitter.pid'
+            if (Test-Path $sitterPidFile) {
+                $sitterText = [string](Get-Content $sitterPidFile -Raw -ErrorAction Stop)
+                $sitterParsed = [uint32]0
+                if ([uint32]::TryParse($sitterText.Trim(), [ref]$sitterParsed) -and
+                    $sitterParsed -gt 0 -and $sitterParsed -le [int]::MaxValue) {
+                    if (Get-Process -Id ([int]$sitterParsed) -ErrorAction SilentlyContinue) { $sitterPid = [int]$sitterParsed }
+                }
+            }
+        } catch {
+            $sitterPid = 0
+        }
+        $ownedByOurTask = $false
+        if ($taskEnginePid -gt 0 -and $sitterPid -gt 0) {
+            $chainHasSitter = $false
+            $chainPid = $ownerPid
+            $chainRow = $null
+            try { $chainRow = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $chainPid" -ErrorAction Stop)[0] } catch { $chainRow = $null }
+            for ($hop = 0; $hop -lt 12; $hop++) {
+                if ($chainPid -eq $sitterPid) { $chainHasSitter = $true }
+                if ($chainPid -eq $taskEnginePid) { $ownedByOurTask = $chainHasSitter; break }
+                if (-not $chainRow) { break }
+                $parentPid = [int]$chainRow.ParentProcessId
+                if ($parentPid -le 0) { break }
+                $parentRow = $null
+                try { $parentRow = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $parentPid" -ErrorAction Stop)[0] } catch { $parentRow = $null }
+                if (-not $parentRow) { break }
+                if (-not $chainRow.CreationDate -or -not $parentRow.CreationDate) { break }
+                if ($parentRow.CreationDate -gt $chainRow.CreationDate) { break }
+                $chainPid = $parentPid
+                $chainRow = $parentRow
+            }
+        }
+        if ($ownedByOurTask) {
+            Write-Host "install.ps1: the running daemon (pid $ownerPid) belongs to the '$taskName' scheduled task - it will be restarted onto the new binary"
+        } else {
+            # Best-effort image path, so the refusal names the program instead
+            # of a bare number (Get-Process cannot read Path for some
+            # processes).
+            $ownerPath = ''
+            try { $ownerPath = (Get-Process -Id $ownerPid -ErrorAction Stop).Path } catch { $ownerPath = '' }
+            $ownerDesc = if ($ownerPath) { "pid $ownerPid ($ownerPath)" } else { "pid $ownerPid" }
+            throw ("install.ps1: an intentd daemon is already running and owns the data dir this task would use:`n" +
+                "  data dir: $dataDir`n" +
+                "  owner:    $ownerDesc`n" +
+                "A daemon locks its data dir for as long as it runs, so a second task on the same dir cannot start - it would only crash-loop. Nothing has been registered.`n" +
+                "Pick one:`n" +
+                "  * keep the daemon that is already running - it serves this data dir now: intentd status`n" +
+                "  * stop it first (quit the app that started it, or stop its task), then re-run this installer`n" +
+                "  * give this task its own data dir: `$env:INTENTD_DATA_DIR = `"`$env:LOCALAPPDATA\intentd\service-data`"`n" +
+                "  * install just the binary, with no task: re-run with `$env:INTENTD_INSTALL_SERVICE = '0'")
+        }
     }
     # <<< END data-dir-owner-check
     # Auto-resume choice: parameter beats the env var beats the prompt (both

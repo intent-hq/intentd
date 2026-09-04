@@ -297,6 +297,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -389,7 +390,7 @@ async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-WAKE", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-WAKE", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

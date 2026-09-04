@@ -10,8 +10,10 @@ pub use intent_services::Services;
 
 pub use auth::{generate_token, get_or_create_token, AsyncTokenStore, FileTokenStore, TokenStore};
 pub use context::{is_tcp_connection, with_connection_context};
-pub use control::{SystemControl, SystemStatus};
-pub use host_env::{detect_has_display, local_hostname};
+pub use control::{FileWatchStatus, SystemControl, SystemStatus};
+pub use host_env::{
+    detect_has_display, detect_host_environment, local_hostname, pretty_hostname, HostEnvironment,
+};
 #[cfg(windows)]
 pub use listener::pipe_name_for_socket_path;
 pub use listener::{serve_uds, serve_uds_with_reverse};
@@ -19,9 +21,15 @@ pub use protocol::{MAX_INBOUND_MESSAGE_BYTES, MAX_OUTBOUND_MESSAGE_BYTES, PROTOC
 pub use reverse::{PrimaryReverseGuard, PrimaryReverseRegistry, ReverseChannel};
 pub use router::handle_message;
 pub use rpc_limit::RpcLimiter;
-pub use server::{collect_bind_interfaces, collect_local_ips, PairingSnapshot, ServerPairingInfo};
+pub use server::{
+    advertised_hosts, collect_bind_interfaces, collect_local_ips, collect_local_ipv6s,
+    PairingSnapshot, ServerPairingInfo,
+};
 pub use tls::{ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
+
+/// Source commit embedded at build time, when the build environment can identify it.
+pub const BUILD_COMMIT: Option<&str> = option_env!("INTENTD_EMBEDDED_BUILD_COMMIT");
 
 /// Test-only process-global env setup. Runs before `main()` — and therefore
 /// before any test threads exist, making `set_var` race-free. Node children

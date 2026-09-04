@@ -53,6 +53,10 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
     (
+        "agent_message_payload",
+        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
+    ),
+    (
         "agent_queue",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
@@ -125,6 +129,12 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "source-local tombstones guarding workspace-id reuse, not live workspace state",
     ),
     (
+        "workspace_mcp_disabled_server",
+        "rows reference daemon-local MCP server config ids; the `mcp.servers` \
+         setting itself never transfers (settings/mcp_oauth_tokens are excluded), \
+         so the markers would dangle on the target daemon",
+    ),
+    (
         "usage_stats_hourly",
         "daemon-global usage accounting, not workspace-scoped",
     ),
@@ -148,6 +158,14 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          completion wake repeats once on the target",
     ),
     (
+        "advisory_wake_delivery",
+        "per-daemon once-per-episode advisory-wake dedup bookkeeping; its \
+         (parent, child) rows can span workspaces (chief parents) so a \
+         workspace-scoped export could violate the agent_session FKs on import, \
+         and losing a marker fails open — at worst one already-delivered \
+         advisory wake repeats once on the target",
+    ),
+    (
         "agent_message_fts",
         "derived FTS5 index over `agent_message`; the target's insert triggers \
          rebuild it from the imported rows",
@@ -167,6 +185,12 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     (
         "agent_message_fts_idx",
         "FTS5 shadow table of `agent_message_fts` (derived, rebuilt on the target)",
+    ),
+    (
+        "agent_message_search_ctx",
+        "derived ranking-context side table over `agent_message` (0112); the \
+         target's insert triggers rebuild it from the imported rows, same as \
+         the FTS index",
     ),
     (
         "workspace_git_root",
@@ -327,6 +351,14 @@ impl Store {
     /// schema. Nothing is visible unless the whole batch commits. Returns
     /// the number of rows inserted.
     ///
+    /// Invariant the caller owns: `agent_session` rows must arrive with the
+    /// 0103 stats counter columns (`message_count`,
+    /// `assistant_message_count`, `conversation_bytes`) zeroed — the
+    /// `agent_message` inserts in the same batch rebuild them through the
+    /// 0103 triggers, so importing exported values double-counts. The
+    /// production transform (`transfer_import.rs::transform_rows`) does
+    /// this; any new direct caller must too.
+    ///
     /// # Errors
     ///
     /// Returns `Error::InvalidParams` when a row names a table outside the transfer set, is not a JSON object, or carries a key with no matching column; `Error::Internal` if the transaction fails.
@@ -474,8 +506,10 @@ fn bind_json_value<'q>(
 }
 
 /// Minimal standard-alphabet base64 encode (BLOB columns only; keeps
-/// intent-store free of a base64 dependency for a path that in practice
-/// never fires — no transfer table declares a BLOB column today).
+/// intent-store free of a base64 dependency). Fires on every export of a
+/// session with 0108 `agent_message_payload` rows (externalized heavy
+/// bodies / write-time thumbnails, `body` BLOB); other transfer tables
+/// declare no BLOB columns.
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -595,6 +629,7 @@ mod tests {
             format!("INSERT INTO comment (id, thread_id, note_id, workspace_id, kind, content, author, author_type, anchor_json, created_at, updated_at) VALUES ('c-{ws}', 'th', 'n1', '{ws}', 'comment', 'hi', 'u', 'user', '{{}}', '{t}', '{t}')"),
             format!("INSERT INTO draft (workspace_id, agent_id, client_id, text, updated_at) VALUES ('{ws}', '{agent}', '{client}', 'd', '{t}')"),
             format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}')"),
+            format!("INSERT INTO agent_message_payload (message_id, agent_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', '{agent}', 0, 'tool_result_output', 'none', X'227822')"),
             format!("INSERT INTO agent_queue (id, agent_id, position, payload, created_at) VALUES ('q-{ws}', '{agent}', 0, '{{}}', '{t}')"),
             format!("INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) VALUES ('{agent}', '{ws}', 'working', '{t}')"),
             format!("INSERT INTO agent_flipped_completion (agent_id, workspace_id, task_note_id, recorded_at) VALUES ('{agent}', '{ws}', 'n1', '{t}')"),
@@ -659,8 +694,18 @@ mod tests {
     /// `draft` rows are emptied first — drafts FK onto `client`, which is not
     /// part of the transfer set, so the import transform layer drops them
     /// (transient UI state; the owning client never exists on the target).
+    /// The `agent_session` 0103 stats counters are zeroed first for the same
+    /// reason: the transform layer zeroes them so the target's triggers
+    /// rebuild them from the re-inserted `agent_message` rows (importing the
+    /// exported values would double-count); the rebuilt values are asserted
+    /// separately, then normalized out of the losslessness diff.
     #[tokio::test]
     async fn transfer_rows_round_trip_between_stores() {
+        const COUNTERS: [&str; 3] = [
+            "message_count",
+            "assistant_message_count",
+            "conversation_bytes",
+        ];
         let src_db = TempDb::new();
         let src = Store::open(&src_db.path).await.expect("open source");
         seed(&src, "ws-rt").await;
@@ -673,6 +718,13 @@ mod tests {
                 assert_eq!(rows.len(), 1, "seed must have exercised draft export");
                 rows.clear();
             }
+            if table == "agent_session" {
+                for row in rows.iter_mut() {
+                    for counter in COUNTERS {
+                        row[counter] = serde_json::json!(0);
+                    }
+                }
+            }
         }
         let total: usize = exported.iter().map(|(_, rows)| rows.len()).sum();
         assert!(total > 0);
@@ -682,7 +734,23 @@ mod tests {
         let inserted = dst.transfer_import_rows(&exported).await.expect("import");
         assert_eq!(inserted, total);
 
-        let re_exported = dst.transfer_export_rows(&ws).await.expect("re-export");
+        let mut re_exported = dst.transfer_export_rows(&ws).await.expect("re-export");
+        for (table, rows) in &mut re_exported {
+            if table != "agent_session" {
+                continue;
+            }
+            for row in rows.iter_mut() {
+                // Seed appends one user message with content "[]" (2 bytes)
+                // plus one 3-byte agent_message_payload body: the target's
+                // triggers (0103 + 0108) must have rebuilt exactly that.
+                assert_eq!(row["message_count"], 1, "counters rebuilt on target");
+                assert_eq!(row["assistant_message_count"], 0);
+                assert_eq!(row["conversation_bytes"], 5);
+                for counter in COUNTERS {
+                    row[counter] = serde_json::json!(0);
+                }
+            }
+        }
         assert_eq!(exported, re_exported, "round-trip must be lossless");
     }
 
@@ -807,21 +875,22 @@ mod tests {
     /// `transferred_table_columns_match_snapshot` after deciding what the
     /// column change means for transfer (see that test's message).
     const TRANSFERRED_COLUMNS: &str = "\
-workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, execution_environment
+workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, execution_environment
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
 note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes
 agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails
+agent_message_payload: message_id, agent_id, block_ordinal, kind, encoding, body
 agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
 agent_flipped_completion: agent_id, workspace_id, task_note_id, recorded_at
 delegation_group: group_id, workspace_id, parent_agent_id, await_mode, expected_agent_ids, completed_agent_ids, deleted_agent_ids, sealed, delivered, event_summaries, raw_events, created_at, updated_at
-completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, report_delivered, wake_on_attention, created_at
+completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, report_delivered, wake_on_attention, created_at, completion_only
 event_subscription: id, workspace_id, subscriber_agent_id, event_types, exclude_self, batch_window_ms, created_at
-hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, expires_at, perpetual, dispatch_count
+hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, expires_at, perpetual, dispatch_count, cron, run_at
 pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot
 script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running
 task_agent_link: workspace_id, note_id, task_key, task_text, agent_id, created_at

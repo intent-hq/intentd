@@ -438,7 +438,7 @@ async fn codex_session_new_carries_session_title_meta_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": AGENT_NAME,
-            "model": "codex:mock-model",
+            "model": "mock-model", "provider": "codex",
         }),
     )
     .await;

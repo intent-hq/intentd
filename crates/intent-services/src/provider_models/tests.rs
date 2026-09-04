@@ -15,6 +15,586 @@ use super::probe::{exit_attribution, ProbeError};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
+#[test]
+fn antigravity_captured_catalog_preserves_exact_models_and_default() {
+    let payload = serde_json::from_str(include_str!("antigravity-session-new.json")).unwrap();
+    let rows = parse_acp_models(&payload, "antigravity");
+    let expected = [
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        "gemini-3.7-flash-high",
+        "gemini-3.7-flash-medium",
+        "gemini-3.7-flash-low",
+        "gemini-3.6-flash-high",
+        "gemini-3.6-flash-medium",
+        "gemini-3.6-flash-low",
+        "gemini-pro-agent",
+        "gemini-3.1-pro-low",
+    ];
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(rows.iter().all(|row| row.get("effortLevels").is_none()));
+    assert_eq!(
+        rows.iter().filter(|row| row["isDefault"] == true).count(),
+        1
+    );
+    assert_eq!(rows[3]["isDefault"], true);
+    for (row, original) in rows
+        .iter()
+        .zip(payload["models"]["availableModels"].as_array().unwrap())
+    {
+        assert_eq!(row["name"], original["name"]);
+        assert_eq!(row["provider"], "antigravity");
+    }
+    // The server advertises both shapes. Each must preserve the same IDs.
+    let config_only = json!({"configOptions": payload["configOptions"]});
+    assert_eq!(parse_acp_models(&config_only, "antigravity"), rows);
+}
+
+#[test]
+fn antigravity_profile_is_private_and_does_not_copy_global_configuration() {
+    let helper = std::path::Path::new("/Applications/Intent Dev's App/intentd");
+    let profile = crate::antigravity::probe_profile(helper).unwrap();
+    let read = |path: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(profile.path().join(path)).unwrap()).unwrap()
+    };
+    assert_eq!(read("config/mcp_config.json"), json!({"mcpServers": {}}));
+    assert_eq!(
+        read("antigravity-acp/settings.json"),
+        json!({"auth": {"type": "oauth-personal"}})
+    );
+    let hooks = read("config/hooks.json");
+    let command = hooks["intent-provider-policy"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.ends_with(" provider antigravity-tool-guard"));
+    assert!(!command.contains("--allow-tool"), "probes deny every tool");
+    assert_eq!(
+        std::fs::read_dir(profile.path().join("antigravity-acp"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let env = crate::antigravity::unattended_env(profile.path(), helper).unwrap();
+    assert_eq!(env["GEMINI_HOME"], profile.path().to_str().unwrap());
+    assert!(env["BROWSER"].ends_with(" provider antigravity-browser-guard %s"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(profile.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(profile.path().join("config/hooks.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_profile_rejects_configuration_directory_symlinks() {
+    let profile = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), profile.path().join("config")).unwrap();
+    assert!(crate::antigravity::prepare_profile(
+        profile.path(),
+        std::path::Path::new("/intentd"),
+        &[]
+    )
+    .is_err());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn antigravity_guard_denies_native_subagents_and_unknown_or_malformed_calls() {
+    let allowed = vec![
+        "client_view_file".into(),
+        "workspace_api".into(),
+        "start_subagent".into(),
+        "invoke_subagent".into(),
+    ];
+    for name in [
+        "start_subagent",
+        "invoke_subagent",
+        "future_native_tool",
+        "",
+    ] {
+        assert_eq!(
+            crate::antigravity::tool_guard(&json!({"toolCall": {"name": name}}), &allowed)
+                ["allowTool"],
+            false
+        );
+    }
+    assert_eq!(
+        crate::antigravity::tool_guard(&json!(null), &allowed)["allowTool"],
+        false
+    );
+    assert_eq!(
+        crate::antigravity::tool_guard(&json!({"toolCall": {"name": "workspace_api"}}), &allowed)
+            ["allowTool"],
+        true
+    );
+    assert_eq!(
+        crate::antigravity::tool_guard(&json!({"toolCall": {"name": "workspace_api"}}), &[])
+            ["allowTool"],
+        false
+    );
+}
+
+#[test]
+fn antigravity_session_profiles_preserve_history_and_restrict_tools() {
+    use crate::antigravity::SessionProfile;
+    let root = tempfile::tempdir().unwrap();
+    let helper = std::path::Path::new("/Intent's App/intentd");
+    let create = |identity, removed: &[&str]| {
+        SessionProfile::new(
+            root.path(),
+            identity,
+            helper,
+            ["workspace_api".into()],
+            removed,
+        )
+        .unwrap()
+    };
+    let profile = create("workspace-a\0agent-a", &[]);
+    let home = std::path::PathBuf::from(&profile.env().unwrap()["GEMINI_HOME"]);
+    std::fs::write(home.join("conversation-state"), "retained").unwrap();
+    drop(profile);
+    let profile = create(
+        "workspace-a\0agent-a",
+        &["save-file", "execute_command", "write_file"],
+    );
+    assert_eq!(
+        profile.env().unwrap()["GEMINI_HOME"],
+        home.to_str().unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("conversation-state")).unwrap(),
+        "retained"
+    );
+    for identity in [
+        "workspace-a\0agent-b",
+        "workspace-b\0agent-a",
+        "../../outside",
+    ] {
+        let other = create(identity, &[]).env().unwrap();
+        assert_ne!(other["GEMINI_HOME"], home.to_str().unwrap());
+        assert_eq!(
+            std::path::Path::new(&other["GEMINI_HOME"])
+                .parent()
+                .unwrap(),
+            root.path().canonicalize().unwrap()
+        );
+    }
+    profile
+        .configure_servers(&["workspace-mcp".into(), "external-fixture".into()])
+        .unwrap();
+    let hooks: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("config/hooks.json")).unwrap()).unwrap();
+    let command = hooks["intent-provider-policy"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains("--allow-tool 'workspace_api'"));
+    assert!(command.contains("--allow-tool 'client_view_file'"));
+    assert!(!command.contains("--allow-tool 'client_edit_file'"));
+    assert!(!command.contains("--allow-tool 'client_create_file'"));
+    assert!(!command.contains("--allow-tool 'run_command'"));
+    assert!(command.contains("--deny-tool 'write_file'"));
+    assert!(command.contains("--mcp-server 'external-fixture'"));
+    assert!(!command.contains("--mcp-server 'workspace-mcp'"));
+    profile.configure_servers(&[]).unwrap();
+    assert!(!std::fs::read_to_string(home.join("config/hooks.json"))
+        .unwrap()
+        .contains("--mcp-server"));
+}
+
+#[test]
+fn antigravity_mcp_guard_requires_exact_conversation_server_and_schema() {
+    use crate::antigravity::mcp_tool_allowed;
+    let home = tempfile::tempdir().unwrap();
+    let conversation = uuid::Uuid::new_v4().to_string();
+    let dir = home
+        .path()
+        .join("antigravity-acp/brain")
+        .join(&conversation)
+        .join("mcp/external-fixture");
+    std::fs::create_dir_all(&dir).unwrap();
+    let payload = |name: &str| json!({"conversationId": conversation, "toolCall": {"name": name}});
+    let servers = vec!["external-fixture".into()];
+    let schema = dir.join("intent_echo.json");
+    assert!(!mcp_tool_allowed(
+        &payload("intent_echo"),
+        home.path(),
+        &servers
+    ));
+    std::fs::write(&schema, r#"{"name":"intent_echo"}"#).unwrap();
+    assert!(mcp_tool_allowed(
+        &payload("intent_echo"),
+        home.path(),
+        &servers
+    ));
+    assert!(!mcp_tool_allowed(&payload("intent_echo"), home.path(), &[]));
+    assert!(!mcp_tool_allowed(
+        &payload("intent_echo"),
+        home.path(),
+        &["../external-fixture".into()]
+    ));
+    let mut wrong_conversation = payload("intent_echo");
+    wrong_conversation["conversationId"] = json!(uuid::Uuid::new_v4().to_string());
+    assert!(!mcp_tool_allowed(
+        &wrong_conversation,
+        home.path(),
+        &servers
+    ));
+    for name in [
+        "start_subagent",
+        "invoke_subagent",
+        "client_edit_file",
+        "run_command",
+        "view_file",
+    ] {
+        std::fs::write(
+            dir.join(format!("{name}.json")),
+            json!({"name": name}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            !mcp_tool_allowed(&payload(name), home.path(), &servers),
+            "native alias: {name}"
+        );
+    }
+    for name in ["../intent_echo", "/intent_echo", "foo\\intent_echo", ""] {
+        assert!(!mcp_tool_allowed(&payload(name), home.path(), &servers));
+    }
+    for content in [r#"{"name":"different"}"#, "not json"] {
+        std::fs::write(&schema, content).unwrap();
+        assert!(!mcp_tool_allowed(
+            &payload("intent_echo"),
+            home.path(),
+            &servers
+        ));
+    }
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&schema).unwrap();
+        let outside = home.path().join("outside.json");
+        std::fs::write(&outside, r#"{"name":"intent_echo"}"#).unwrap();
+        std::os::unix::fs::symlink(&outside, &schema).unwrap();
+        assert!(!mcp_tool_allowed(
+            &payload("intent_echo"),
+            home.path(),
+            &servers
+        ));
+        std::fs::remove_file(&schema).unwrap();
+        std::fs::rename(&dir, dir.with_file_name("real-server")).unwrap();
+        std::os::unix::fs::symlink(dir.with_file_name("real-server"), &dir).unwrap();
+        assert!(!mcp_tool_allowed(
+            &payload("intent_echo"),
+            home.path(),
+            &servers
+        ));
+    }
+}
+
+#[test]
+fn antigravity_auth_maps_required_unknown_timeout_and_empty_outcomes() {
+    use super::antigravity_auth_outcome;
+    assert_eq!(antigravity_auth_outcome(Ok(vec![json!(true)])), Some(true));
+    assert_eq!(
+        antigravity_auth_outcome(Err(ProbeError::Rpc(intent_acp::JsonRpcError {
+            code: -32000,
+            message: "Authentication required".into(),
+            data: None,
+        }))),
+        Some(false)
+    );
+    for error in [
+        ProbeError::Timeout,
+        ProbeError::Empty,
+        ProbeError::Spawn("missing executable".into()),
+        ProbeError::Transport("malformed response".into()),
+    ] {
+        assert_eq!(antigravity_auth_outcome(Err(error)), None);
+    }
+}
+
+#[test]
+fn antigravity_login_accepts_only_official_https_authorization_urls() {
+    use crate::antigravity::valid_login_url;
+    assert!(valid_login_url(
+        "https://accounts.google.com/o/oauth2/v2/auth?state=fixture"
+    ));
+    for url in [
+        "http://accounts.google.com/o/oauth2/v2/auth",
+        "https://accounts.google.com.evil.test/o/oauth2/v2/auth",
+        "https://user@accounts.google.com/o/oauth2/v2/auth",
+        "https://accounts.google.com:444/o/oauth2/v2/auth",
+        "https://accounts.google.com/logout",
+        "file:///tmp/auth",
+        "not a URL",
+    ] {
+        assert!(!valid_login_url(url));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_login_uses_personal_method_then_verifies_a_fresh_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = antigravity_mock_adapter(
+        dir.path(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"authenticated"}}"#,
+    );
+    crate::antigravity::login(
+        bin,
+        |_| panic!("saved login needs no URL"),
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
+    let requests: Vec<serde_json::Value> =
+        std::fs::read_to_string(dir.path().join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["initialize", "authenticate", "initialize", "session/new"]
+    );
+    assert_eq!(requests[1]["params"]["methodId"], "oauth-personal");
+    assert_eq!(requests[3]["params"]["mcpServers"], json!([]));
+    let homes = std::fs::read_to_string(dir.path().join("homes.txt")).unwrap();
+    let homes: Vec<_> = homes.lines().collect();
+    assert_eq!(homes.len(), 2);
+    assert_ne!(homes[0], homes[1]);
+    assert!(homes
+        .iter()
+        .all(|home| !std::path::Path::new(home).exists()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_login_rejects_missing_personal_method_without_authenticating() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = antigravity_mock_adapter_with_auth(dir.path(), "", false);
+    let error = crate::antigravity::login_session(
+        &bin,
+        std::path::Path::new("/intentd"),
+        |_| {},
+        std::future::pending(),
+        std::time::Duration::from_secs(5),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("does not advertise personal"));
+    let requests = std::fs::read_to_string(dir.path().join("requests.jsonl")).unwrap();
+    assert_eq!(requests.lines().count(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_login_url_delivery_can_cancel_and_clean_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = "https://accounts.google.com/o/oauth2/v2/auth?state=fixture-only";
+    let note = json!({"jsonrpc":"2.0", "method":crate::antigravity::LOGIN_URL_NOTIFICATION,"params":{"url":url}}).to_string();
+    let bin = antigravity_mock_adapter(dir.path(), &note);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    let mut seen = Vec::new();
+    let error = crate::antigravity::login_session(
+        &bin,
+        std::path::Path::new("/intentd"),
+        |url| {
+            seen.push(url.to_owned());
+            tx.take().unwrap().send(()).unwrap();
+        },
+        async {
+            let _ = rx.await;
+        },
+        std::time::Duration::from_secs(5),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(seen, [url]);
+    assert!(error.contains("cancelled"));
+    let home = std::fs::read_to_string(dir.path().join("home.txt")).unwrap();
+    assert!(!std::path::Path::new(home.trim()).exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_login_rejects_bad_urls_without_echoing_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let note = json!({"jsonrpc":"2.0", "method":crate::antigravity::LOGIN_URL_NOTIFICATION,"params":{"url":"https://evil.test/private-value"}}).to_string();
+    let bin = antigravity_mock_adapter(dir.path(), &note);
+    let error = crate::antigravity::login_session(
+        &bin,
+        std::path::Path::new("/intentd"),
+        |_| panic!("bad URL reached terminal"),
+        std::future::pending(),
+        std::time::Duration::from_secs(5),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("unsupported sign-in URL"));
+    assert!(!error.contains("private-value"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_login_timeout_is_bounded_and_removes_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = antigravity_mock_adapter(dir.path(), "");
+    let error = crate::antigravity::login_session(
+        &bin,
+        std::path::Path::new("/intentd"),
+        |_| {},
+        std::future::pending(),
+        std::time::Duration::from_millis(200),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("timed out"), "{error}");
+    if let Ok(home) = std::fs::read_to_string(dir.path().join("home.txt")) {
+        assert!(!std::path::Path::new(home.trim()).exists());
+    }
+}
+
+/// The `authenticate` RPC shares its budget with the outer login deadline, so
+/// either timer may fire first under load; both must classify as a timeout.
+#[test]
+fn antigravity_authenticate_rpc_timeout_reads_as_login_timeout() {
+    use crate::antigravity::authenticate_error;
+    use intent_acp::{AcpError, JsonRpcError};
+    let timeout = authenticate_error(&AcpError::Timeout("authenticate".into()));
+    assert!(timeout.contains("timed out"), "{timeout}");
+    let rejected = authenticate_error(&AcpError::Rpc(JsonRpcError {
+        code: -32000,
+        message: "denied".into(),
+        data: None,
+    }));
+    assert!(rejected.contains("authentication failed"), "{rejected}");
+    assert!(!rejected.contains("timed out"), "{rejected}");
+}
+
+#[cfg(unix)]
+fn antigravity_mock_adapter(dir: &std::path::Path, session_result: &str) -> std::path::PathBuf {
+    antigravity_mock_adapter_with_auth(dir, session_result, true)
+}
+
+#[cfg(unix)]
+fn antigravity_mock_adapter_with_auth(
+    dir: &std::path::Path,
+    session_result: &str,
+    personal: bool,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("configured-antigravity");
+    // Requests are recorded, not interpreted by a shell. A third request
+    // (authenticate or prompt) fails this discovery-only fixture.
+    let script = format!(
+        r#"#!/bin/sh
+IFS= read -r init
+printf '%s\n' "$init" >> '{}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}},"authMethods":{}}}}}'
+IFS= read -r session
+printf '%s\n' "$session" >> '{}'
+printf '%s\n' "$GEMINI_HOME" > '{}'
+printf '%s\n' "$GEMINI_HOME" >> '{}'
+printf '%s\n' '{}'
+if IFS= read -r unexpected; then exit 44; fi
+"#,
+        dir.join("requests.jsonl").display(),
+        if personal {
+            r#"[{"id":"oauth-personal"}]"#
+        } else {
+            "[]"
+        },
+        dir.join("requests.jsonl").display(),
+        dir.join("home.txt").display(),
+        dir.join("homes.txt").display(),
+        session_result.replace('\'', "'\"'\"'")
+    );
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_probe_honors_override_and_reaps_isolated_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(include_str!("antigravity-session-new.json")).unwrap();
+    let response = json!({"jsonrpc": "2.0", "id": 2, "result": payload}).to_string();
+    let bin = antigravity_mock_adapter(dir.path(), &response);
+    let fetched = super::fetch_antigravity_models(bin.to_str()).await;
+    assert_eq!(fetched.models.unwrap().len(), 11, "{:?}", fetched.warning);
+    let requests: Vec<serde_json::Value> =
+        std::fs::read_to_string(dir.path().join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["initialize", "session/new"]
+    );
+    assert_eq!(requests[1]["params"]["mcpServers"], json!([]));
+    let home = std::fs::read_to_string(dir.path().join("home.txt")).unwrap();
+    assert_eq!(requests[1]["params"]["cwd"], home.trim());
+    assert!(
+        !std::path::Path::new(home.trim()).exists(),
+        "temporary profile removed after child exit"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_auth_accepts_valid_empty_catalog_and_detects_browser_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = antigravity_mock_adapter(
+        dir.path(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"authenticated","models":{"availableModels":[]}}}"#,
+    );
+    assert_eq!(super::probe_antigravity_auth(bin).await, Some(true));
+    let bin = antigravity_mock_adapter(dir.path(), crate::antigravity::AUTH_REQUIRED_MARKER);
+    assert_eq!(super::probe_antigravity_auth(bin).await, Some(false));
+    let notification_then_error = format!(
+        "{}\n{}",
+        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"not-yet-ready","update":{}}}),
+        json!({"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}})
+    );
+    let bin = antigravity_mock_adapter(dir.path(), &notification_then_error);
+    assert_eq!(super::probe_antigravity_auth(bin).await, Some(false));
+}
+
 /// Serializes the child-spawning timeout/PID tests against each other and the
 /// rest of the parallel suite. These tests exec a real fake CLI and depend on
 /// the child being scheduled promptly (to write its PID file / hit the injected
@@ -806,6 +1386,42 @@ fn parse_codex_config_options_bare_id_has_no_effort_levels() {
 }
 
 #[test]
+fn parse_codex_models_merge_standard_and_configured_catalogs() {
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-5.6-sol", "name": "GPT-5.6-Sol",
+              "description": "Standard catalog metadata",
+              "supportedEffortLevels": ["medium"] },
+            { "modelId": "gpt-5.6-sol[high]", "name": "GPT-5.6-Sol" },
+            { "modelId": "gpt-5.5", "name": "GPT-5.5" }
+        ] },
+        "configOptions": [
+            { "id": "model", "options": [
+                { "value": "GPT-5.6-SOL/max", "name": "Configured duplicate",
+                  "description": "Must not replace standard metadata" },
+                { "value": "gpt-5.7-pro[ultra]", "name": "GPT-5.7 Pro (ultra)",
+                  "description": "Configured only" },
+                { "value": "gpt-5.4", "name": "GPT-5.4" }
+            ] }
+        ]
+    });
+
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(
+        rows,
+        vec![
+            json!({ "id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "provider": "codex",
+                    "description": "Standard catalog metadata",
+                    "effortLevels": ["medium", "high"] }),
+            json!({ "id": "gpt-5.5", "name": "GPT-5.5", "provider": "codex" }),
+            json!({ "id": "gpt-5.7-pro", "name": "GPT-5.7 Pro", "provider": "codex",
+                    "description": "Configured only" }),
+            json!({ "id": "gpt-5.4", "name": "GPT-5.4", "provider": "codex" }),
+        ]
+    );
+}
+
+#[test]
 fn parse_opencode_models_one_provider_model_per_line() {
     let stdout = "\
 INFO loading providers
@@ -1242,6 +1858,52 @@ async fn acp_probe_child_env_removals_reach_child() {
 
     let recorded = std::fs::read_to_string(&out_file).unwrap();
     assert_eq!(recorded, "UNSET");
+}
+
+/// intent-hq/intent#3941: the claude-code ACP auth fallback's outcome →
+/// tri-state mapping (no adapter spawn). Only the adapter's explicit
+/// auth-required RPC error (intent-hq/intent#3178) may demote to a hard
+/// false; everything else stays unknown — including a NON-EMPTY model
+/// list, because claude-agent-acp serves its catalog uncredentialed (the
+/// auth error only fires at prompt time), so a model list alone is never
+/// proof of auth.
+#[test]
+fn claude_code_acp_auth_verdict_mapping() {
+    use super::claude_code_acp_auth_verdict;
+    let rpc = |code: i64, message: &str| {
+        ProbeError::Rpc(intent_acp::JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        })
+    };
+    // Regression: a non-empty model list must NOT harden into Some(true) —
+    // the adapter returns the full catalog even when logged out.
+    assert_eq!(
+        claude_code_acp_auth_verdict(Ok(vec![json!({"id": "claude-opus-4"})])),
+        None
+    );
+    assert_eq!(
+        claude_code_acp_auth_verdict(Err(rpc(-32000, "Authentication required"))),
+        Some(false)
+    );
+    // is_auth_required_error also matches on a bare 401 code, message aside.
+    assert_eq!(
+        claude_code_acp_auth_verdict(Err(rpc(401, "nope"))),
+        Some(false)
+    );
+    // Inconclusive outcomes must stay unknown — never a hard false.
+    assert_eq!(claude_code_acp_auth_verdict(Ok(Vec::new())), None);
+    assert_eq!(claude_code_acp_auth_verdict(Err(ProbeError::Empty)), None);
+    assert_eq!(claude_code_acp_auth_verdict(Err(ProbeError::Timeout)), None);
+    assert_eq!(
+        claude_code_acp_auth_verdict(Err(ProbeError::Spawn("nope".to_string()))),
+        None
+    );
+    assert_eq!(
+        claude_code_acp_auth_verdict(Err(rpc(-32603, "internal error"))),
+        None
+    );
 }
 
 #[test]

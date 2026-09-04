@@ -5,7 +5,7 @@ workspaces, notes, tasks, comments, agents, git, pull requests, scripts, termina
 and events — and exposes it over a **JSON-RPC 2.0** API. Clients (a desktop UI, a CLI, or an
 agent acting as an MCP client) are thin: all business logic lives in the daemon.
 
-This repo is consumed as a git submodule by [intent-hq/monorepo](https://github.com/intent-hq/monorepo).
+This repo is consumed as a git submodule by [intent-hq/intent](https://github.com/intent-hq/intent).
 
 ## What it is
 
@@ -254,6 +254,14 @@ intentd settings agents.resumeInterruptedOnStart on|off|auto
 
 `intentd serve --resume-all` force-enables the sweep for that single run,
 regardless of the setting.
+
+**Update-triggered restarts always resume**, regardless of the setting: when the
+sitter installs an update and respawns the daemon (periodic mid-run check,
+`intentd update` followed by a restart, or an update adopted during failed-start
+backoff), it marks the respawn with `INTENTD_UPDATE_RESTART=1` and the daemon
+runs the resume sweep so agents interrupted by the update pick up where they
+left off. The setting governs all other starts: `intentd restart` with an
+unchanged version, crash respawns, service restarts, and fresh boots.
 
 ### Channels
 
@@ -614,6 +622,6 @@ The design docs live in the monorepo under `docs/`:
 
 ## Related Repositories
 
-- [intent-hq/monorepo](https://github.com/intent-hq/monorepo) — engineering monorepo
+- [intent-hq/intent](https://github.com/intent-hq/intent) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
 

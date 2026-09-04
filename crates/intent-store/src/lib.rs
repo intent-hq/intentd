@@ -12,6 +12,7 @@ use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
 
+mod advisory_wake_delivery_repo;
 mod agent_flipped_completion_repo;
 mod agent_queue_repo;
 mod agent_repo;
@@ -29,6 +30,7 @@ mod hook_repo;
 mod idempotency_repo;
 mod known_repo_repo;
 mod mcp_oauth_repo;
+mod message_payload;
 mod message_thumbnails;
 mod metrics_repo;
 mod note_line_attribution_repo;
@@ -46,6 +48,7 @@ mod usage_rate_repo;
 mod usage_stats_repo;
 mod workspace_context_repo;
 mod workspace_git_root_repo;
+mod workspace_mcp_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
 
@@ -53,8 +56,8 @@ pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
-    MessageFtsMatch, ReplaceMessage, SessionMessageProjection, UserMessageIndexItem,
-    PROJECTION_TEXT_BLOCK_CAP,
+    ChildAgentCounts, MessageFtsMatch, ReplaceMessage, SessionMessageProjection,
+    UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::AttachmentRecord;
 pub use completion_watch_repo::PersistedCompletionWatch;
@@ -65,7 +68,7 @@ pub use event_subscription_repo::PersistedEventSubscription;
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
-pub use pr_monitor_repo::PrMonitorPollUpdate;
+pub use pr_monitor_repo::{PrMonitorListEntry, PrMonitorPollUpdate};
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use transfer_repo::TRANSFER_TABLES;
@@ -278,6 +281,25 @@ impl Store {
             )),
             _ => Error::Internal(format!("migrations failed: {e}")),
         })?;
+        // Reap `agent_message_payload` rows pre-staged (0109,
+        // intent-hq/intent#3884 part 2) by a turn that died with the daemon
+        // before appending its envelope. Only valid at open, before any turn
+        // runs — a live turn's staged rows are envelope-less by design. The
+        // 0109 stats delete trigger rebalances `conversation_bytes`.
+        let reaped = sqlx::query(
+            "DELETE FROM agent_message_payload WHERE NOT EXISTS \
+             (SELECT 1 FROM agent_message m WHERE m.id = agent_message_payload.message_id)",
+        )
+        .execute(&write_pool)
+        .await
+        .map_err(|e| Error::Internal(format!("orphaned payload sweep failed: {e}")))?
+        .rows_affected();
+        if reaped > 0 {
+            tracing::info!(
+                reaped,
+                "reaped orphaned pre-staged agent_message_payload rows"
+            );
+        }
         Ok(Self {
             write_pool,
             read_pool,

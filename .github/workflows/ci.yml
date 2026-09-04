@@ -1,13 +1,34 @@
 name: CI
 on:
   # Push-to-main runs only the release build matrix (+ deb-packaging + gate).
-  # The main ruleset enforces strict up-to-date required checks and blocks
-  # direct pushes, so every main commit's tree is identical to one the PR CI
-  # just tested — the test jobs (route/check/coverage-e2e/coverage-all) are
-  # push-skipped via their `if`s (CI audit, 2026-08).
+  # The main ruleset routes every merge through the merge queue (see
+  # `merge_group` below) and blocks direct pushes, so every main commit's
+  # tree is identical to one a merge-queue (or, pre-queue, strict-up-to-date
+  # PR) run just tested — the test jobs (route/check/coverage-e2e/
+  # coverage-all) are push-skipped via their `if`s (CI audit, 2026-08).
   push:
     branches: [main]
+  # Fork PRs get no CI: external PRs are not accepted (intent-hq/monorepo#417).
+  # Every job reachable from pull_request carries a same-repo guard
+  # (head.repo.full_name == github.repository) — directly or via the needs
+  # chain — so fork PRs consume zero runner time and can never reach the
+  # self-hosted tinybox; close-fork-prs.yml auto-closes them. Same-repo PRs
+  # are completely unaffected.
   pull_request:
+  # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
+  # merged tree before it lands on main. CI is tiered by event: pull_request
+  # runs the fast feedback jobs (check / build / pr-title / conflict-markers /
+  # deb-packaging / release-scripts); merge_group additionally runs the
+  # instrumented coverage jobs (coverage-e2e / coverage-all), which are
+  # merge_group-ONLY — they no longer run on pull_request, so a PR's ~20 min
+  # coverage wall time is paid once, on the merged tree, instead of on every
+  # push to the PR. The gate is event-aware about this (see the gate
+  # comment): it requires the coverage jobs outright on merge_group and
+  # accepts their skip on pull_request / push. Merge groups are created by
+  # the repo's own ruleset from already-filed PRs, so they need no same-repo
+  # fork guard. pr-title / conflict-markers are PR-metadata checks that stay
+  # pull_request-only — the gate accepts their skip.
+  merge_group:
 
 permissions:
   contents: read
@@ -34,21 +55,29 @@ concurrency:
 
 jobs:
   # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all)
-  # run: the local tinybox runner normally, or GitHub-hosted larger runners
-  # when the tinybox queue is backed up. Runs on a GitHub-hosted runner so
+  # run: the local tinybox runner when it is confirmed healthy, or
+  # GitHub-hosted larger runners otherwise. Runs on a GitHub-hosted runner so
   # the burst decision is independent of the tinybox queue: when the probe
   # ran on tinybox it queued behind the very backlog it measures (and
-  # deadlocked entirely with tinybox offline). The probe fails open to
-  # tinybox on API errors; if the job itself fails (runner outage, timeout),
-  # the routed jobs are skipped and need a re-run — a deliberate trade-off.
-  # The mac build is intentionally not routed — it runs on a GitHub-hosted
-  # macOS runner (see the build job's matrix).
+  # deadlocked entirely with tinybox offline). The probe FAILS OPEN TO BURST:
+  # tinybox is only selected when the probe positively confirms an online
+  # self-hosted Linux runner AND an acceptable queue depth — any API error,
+  # missing permission, or an offline fleet routes to the burst runners, so
+  # CI cannot queue-deadlock when the fleet is down. If the job itself fails
+  # (timeout), the routed jobs are skipped and need a re-run — a deliberate
+  # trade-off. The mac build is intentionally not routed — it runs on a
+  # GitHub-hosted macOS runner (see the build job's matrix).
   route:
     # Skipped on push to main: its only consumers (check / coverage-e2e /
     # coverage-all) are push-skipped as redundant (see the `on: push`
     # comment) and the build matrix is intentionally not routed, so the
     # probe would spend API calls placing jobs that never run.
-    if: github.event_name != 'push'
+    # Also skipped on fork PRs (see the `pull_request` trigger comment):
+    # route's skip cascades over the needs chain, skipping check /
+    # coverage-e2e / coverage-all, so fork PRs can never reach tinybox.
+    # Runs on merge_group (see the trigger comment) — merge groups come from
+    # the repo's own ruleset, so no same-repo guard applies there.
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -72,7 +101,17 @@ jobs:
           # GITHUB_TOKEN is repo-scoped and can only see intentd. Set the
           # CI_QUEUE_READ_TOKEN secret (fine-grained PAT with actions:read
           # on the sibling repos) to enable cross-repo counting; without
-          # it those repos are skipped and contribute 0.
+          # it those repos are skipped and contribute 0. Routing to tinybox
+          # additionally requires the token to list the tinybox fleet: the
+          # runners are registered at the ORG level (shared across the
+          # repos via a runner group), so the token needs the org-level
+          # "Self-hosted runners" read permission for the org list to
+          # succeed. The default GITHUB_TOKEN cannot carry that permission,
+          # so without a suitably-scoped CI_QUEUE_READ_TOKEN the org list
+          # errors and the probe falls back to this repo's own runner list
+          # (fine-grained "Administration" repository permission, read) —
+          # currently empty, so every run bursts (safe: burst is the
+          # fail-open default; it just never uses tinybox).
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
             const tinybox = ["self-hosted", "Linux", "X64"];
@@ -84,30 +123,92 @@ jobs:
             const burst = ["gh-linux-16x"];
             const checkBurst = ["gh-linux-8x"];
             const threshold = parseInt(process.env.THRESHOLD || "8", 10);
-            // Count self-hosted Linux jobs that are queued or running in
-            // queued/in-progress runs: a running job occupies a tinybox
-            // slot just as much as a queued one. GitHub-hosted jobs
-            // — including this route job and bursted heavy jobs — don't
-            // match the self-hosted+Linux label filter, so they never
-            // inflate the depth.
-            const owner = context.repo.owner;
-            const repos = ["intentd", "cloudlands-fe", "monorepo"];
-            let depth = 0;
-            for (const repo of repos) {
+            // FAIL OPEN TO BURST: tinybox is only selected when the probe
+            // positively confirms (a) an online self-hosted Linux runner
+            // visible to this repo (org-level list, or the repo-level
+            // fallback) and (b) a queue depth within the threshold. Any
+            // probe error — including a token that cannot list runners —
+            // routes to burst, so CI cannot queue-deadlock when the fleet
+            // is offline or unreadable.
+            let useBurst = true;
+            let reason = "fail-open default";
+            try {
+              // The tinybox fleet is registered at the ORG level (shared
+              // across the repos via a runner group), so probe the org
+              // runner list first. That call needs the org-level
+              // "Self-hosted runners" read permission on the token (see the
+              // github-token comment above); when it errors, fall back to
+              // the repo-level list, which only sees repo-registered
+              // runners (currently none — the degraded mode keeps
+              // bursting). An empty list still routes to burst by design
+              // (never deadlock on an invisible fleet).
+              // NOTE: the org list is NOT scoped to the runner groups this
+              // repo can access, so the probe assumes every online
+              // self-hosted+Linux+X64 org runner is the tinybox fleet in a
+              // group visible to this repo. Ops invariant: keep the fleet's
+              // group visible to the CI repos, and never register
+              // generically-labeled org runners outside it — a matching but
+              // inaccessible runner would route jobs onto labels nothing
+              // can serve. (Group-scoped listing via the runner-groups API
+              // was considered and rejected: it needs extra calls per group
+              // and fails on plans without runner-group support, which
+              // would silently regress the probe to always-burst.)
+              let runners;
+              let runnerSource = "org";
               try {
-                for (const status of ["queued", "in_progress"]) {
-                  const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
-                  for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
-                    const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
-                    depth += jobs.data.jobs.filter(j => (j.status === "queued" || j.status === "in_progress") && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
+                runners = await github.paginate(
+                  github.rest.actions.listSelfHostedRunnersForOrg,
+                  { org: context.repo.owner, per_page: 100 }
+                );
+              } catch (e) {
+                core.info(`org runner list failed (${e.message}); falling back to repo-level list`);
+                runnerSource = "repo";
+                runners = await github.paginate(
+                  github.rest.actions.listSelfHostedRunnersForRepo,
+                  { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+                );
+              }
+              const online = runners.filter(r =>
+                r.status === "online" &&
+                tinybox.every(l => (r.labels || []).some(x => x.name === l))
+              );
+              if (online.length === 0) {
+                reason = `no online self-hosted Linux runner (${runnerSource} list)`;
+              } else {
+                // Count self-hosted Linux jobs that are queued or running in
+                // queued/in-progress runs: a running job occupies a tinybox
+                // slot just as much as a queued one. GitHub-hosted jobs
+                // — including this route job and bursted heavy jobs — don't
+                // match the self-hosted+Linux label filter, so they never
+                // inflate the depth. Sibling-repo probe failures are the
+                // documented degraded mode (skip, contribute 0); a failure
+                // on this repo's own probe means the depth is unknowable,
+                // so it rethrows into the fail-open burst path.
+                const owner = context.repo.owner;
+                const repos = ["intentd", "cloudlands-fe", "monorepo"];
+                let depth = 0;
+                for (const repo of repos) {
+                  try {
+                    for (const status of ["queued", "in_progress"]) {
+                      const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
+                      for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
+                        const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
+                        depth += jobs.data.jobs.filter(j => (j.status === "queued" || j.status === "in_progress") && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
+                      }
+                    }
+                  } catch (e) {
+                    if (repo === context.repo.repo) throw e;
+                    core.info(`queue probe skipped ${repo}: ${e.message}`);
                   }
                 }
-              } catch (e) {
-                core.info(`queue probe skipped ${repo}: ${e.message}`);
+                useBurst = depth > threshold;
+                reason = `queue depth=${depth} threshold=${threshold} online=${online.length} (${runnerSource} list)`;
               }
+            } catch (e) {
+              useBurst = true;
+              reason = `probe failed (${e.message})`;
             }
-            const useBurst = depth > threshold;
-            core.info(`linux queue depth=${depth} threshold=${threshold} burst=${useBurst}`);
+            core.info(`linux routing: burst=${useBurst} (${reason})`);
             core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
             core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
             core.setOutput("linux_burst", String(useBurst));
@@ -115,8 +216,9 @@ jobs:
   check:
     # Skipped on push to main — redundant re-test of a tree the PR CI already
     # checked (see the `on: push` comment). The expression carries no status
-    # function, so the implicit success() still applies: a route failure
-    # skips this job on pull_request exactly as before.
+    # function, so the implicit success() still applies: a route failure —
+    # or a route skip, as on fork PRs — skips this job on pull_request
+    # exactly as before.
     if: github.event_name != 'push'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
@@ -292,12 +394,13 @@ jobs:
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
       # The full suite is not run here: coverage-all executes it (instrumented,
-      # via cargo llvm-cov nextest) and is the test gate for PRs. Running it
-      # plainly here as well would double the critical path. The exception is
-      # the tests the coverage scripts skip: they are flaky under llvm-cov
-      # instrumentation / heavy parallel load, so they run here instead —
-      # non-instrumented and serially, the conditions under which they pass
-      # reliably — to keep them covered on every PR.
+      # via cargo llvm-cov nextest) and is the test gate in the merge queue
+      # (the coverage jobs are merge_group-only — see the trigger comment).
+      # Running it plainly here as well would double the critical path. The
+      # exception is the tests the coverage scripts skip: they are flaky under
+      # llvm-cov instrumentation / heavy parallel load, so they run here
+      # instead — non-instrumented and serially, the conditions under which
+      # they pass reliably — to keep them covered on every PR.
       #
       # slow_host_exec_does_not_block_fast_workspace_list (STAB-42) is NOT run:
       # it currently fails deterministically even in an isolated, serial,
@@ -307,10 +410,57 @@ jobs:
         run: |
           cargo test -p intent-core --lib capture_login_shell_path_with_fake_shell
           cargo test -p intentd --test wss_integration wss_note_save_asset_round_trip
+      # The install.ps1 guard tests (intentd-sitter's install_ps1_owner.rs)
+      # execute the shipped PowerShell and self-skip when `pwsh` is absent —
+      # which let the suite "pass" in ~0.014s without running a single block
+      # (intent-hq/monorepo#4054). Provision pwsh 7.x here so the tests
+      # actually execute. GitHub-hosted Ubuntu runners (the burst labels)
+      # preinstall pwsh, so this is a no-op there; on tinybox the pinned
+      # tarball is unpacked once into a per-slot dir (keyed on $RUNNER_NAME
+      # like the other per-slot dirs, ~180 MiB, reused across runs — per-slot
+      # so concurrent first-time installs on the 8 shared slots cannot
+      # clobber each other's downloads, the monorepo#1239 failure mode).
+      # The cache probe runs the binary, so an executable-but-broken cache
+      # self-heals by reinstalling, and the whole slot dir is wiped before a
+      # (re)install so a version bump never strands old $version dirs.
+      - name: Provision PowerShell (pwsh) if missing
+        run: |
+          set -euo pipefail
+          if command -v pwsh >/dev/null 2>&1; then
+            echo "pwsh already on PATH: $(command -v pwsh) ($(pwsh --version))"
+            exit 0
+          fi
+          version=7.4.6
+          sha256=6f6015203c47806c5cc444c19d8ed019695e610fbd948154264bf9ca8e157561
+          slotdir="$HOME/ci-pwsh/${RUNNER_NAME:-local}"
+          dest="$slotdir/$version"
+          if ! "$dest/pwsh" --version >/dev/null 2>&1; then
+            rm -rf "$slotdir"
+            tmp=$(mktemp -d)
+            curl -fsSL --retry 3 -o "$tmp/pwsh.tar.gz" \
+              "https://github.com/PowerShell/PowerShell/releases/download/v${version}/powershell-${version}-linux-x64.tar.gz"
+            echo "$sha256  $tmp/pwsh.tar.gz" | sha256sum -c -
+            mkdir -p "$dest"
+            tar -xzf "$tmp/pwsh.tar.gz" -C "$dest"
+            chmod +x "$dest/pwsh"
+            rm -rf "$tmp"
+          fi
+          echo "$dest" >> "$GITHUB_PATH"
+          "$dest/pwsh" --version
+      # INTENTD_CI_EXPECT_PWSH makes a missing pwsh FAIL these tests instead
+      # of skipping (see install_ps1_owner.rs), so a broken provisioning step
+      # above can never quietly turn this suite back into a no-op. The suite
+      # runs here rather than relying on coverage-all, where a pwsh-less
+      # runner would skip it silently.
+      - name: Installer guard tests (install_ps1_owner)
+        env:
+          INTENTD_CI_EXPECT_PWSH: 1
+        run: cargo test -p intentd-sitter --test install_ps1_owner
 
   # Release-PR fast path (intent-hq/monorepo#1374): release-plz PRs change
   # only version strings + changelog, so the compiled code is identical to
-  # what main already tested and the heavy jobs (build matrix, coverage-all,
+  # what main already tested and the heavy jobs (build matrix, and — before
+  # they became merge_group-only, see the trigger comment — coverage-all /
   # coverage-e2e) add no signal — their ~20 min wall time just makes the PR
   # lose the strict up-to-date race against main. This job diffs the PR
   # against its base and emits fast_path=true only when the diff has exactly
@@ -324,18 +474,22 @@ jobs:
   # never gated, and check / pr-title / conflict-markers /
   # deb-packaging still run on every PR. Job names are unchanged, so the
   # required-check ruleset needs no edits — but the gating mechanism differs
-  # by job shape. The non-matrix coverage jobs skip at job level (a skipped
-  # job still reports its required context). The build job CANNOT be skipped
-  # at job level: a job-level skip prevents the matrix from expanding, so
-  # GitHub reports a single skipped check named literally `matrix.name` and
-  # the required per-entry contexts (`build (aarch64-apple-darwin, macos-14)`
-  # etc.) are never reported, leaving release PRs blocked forever (intentd#868).
+  # by job shape. The coverage jobs are no longer consumers of this output:
+  # they are merge_group-only (job-level skipped on every pull_request run,
+  # fast path or not — a skipped job still reports its required context).
+  # The build job CANNOT be skipped at job level: a job-level skip prevents
+  # the matrix from expanding, so GitHub reports a single skipped check named
+  # literally `matrix.name` and the required per-entry contexts
+  # (`build (aarch64-apple-darwin, macos-14)` etc.) are never reported,
+  # leaving release PRs blocked forever (intentd#868).
   # Instead the build job always runs and every step is gated on
   # fast_path != 'true', so on fast-path PRs each matrix entry completes as
   # an all-steps-skipped success under its required name.
   release-fast-path:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
+    # trigger comment).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     outputs:
       fast_path: ${{ steps.decide.outputs.fast_path }}
@@ -370,9 +524,12 @@ jobs:
     # push the fast-path job is skipped and the output is empty, and a
     # fast-path failure leaves it empty too, so both fall back to running
     # the full job. `!cancelled()` keeps the job from being auto-skipped
-    # when its `needs` dependency was skipped (push).
+    # when its `needs` dependency was skipped (push) — which is exactly why
+    # the fork guard must be explicit here: on a fork PR release-fast-path
+    # is skipped, and without the guard `!cancelled()` would still run this
+    # job on the self-hosted macOS/Windows runners.
     needs: release-fast-path
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -449,12 +606,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: gh-build-${{ matrix.target }}
-      # On PRs a cheap `cargo check` proves per-target compilation; the full
-      # `--release` build (the expensive part, esp. on Windows) only runs on
-      # push to main. The "Warm PR check cache" step keeps the persistent
-      # target dir warm for PR checks after main builds.
+      # On PRs and merge-queue runs a cheap `cargo check` proves per-target
+      # compilation; the full `--release` build (the expensive part, esp. on
+      # Windows) only runs on push to main. The "Warm PR check cache" step
+      # keeps the persistent target dir warm for PR checks after main builds.
       - name: Check (PR compilation proof)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'push'
         run: cargo check --workspace --target ${{ matrix.target }}
       # Clippy over macOS-gated code (intent-hq/monorepo#3285): the `check`
       # job lints on Linux, where `#[cfg(target_os = "macos")]` code is never
@@ -471,23 +628,29 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request' && runner.os == 'macOS'
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Build (release)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'pull_request'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
       - name: Warm PR check cache
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    # Skipped at job level when the diff is release-PR-shaped (safe for
-    # non-matrix jobs — a skipped job still reports its required context;
-    # see release-fast-path). Fail-safe: skips only when the output is
-    # exactly 'true'. The route.result guard preserves the pre-existing
-    # behavior that a route failure skips this job. Also skipped on push to
-    # main — redundant re-test (see the `on: push` comment); the route.result
-    # guard would skip it there anyway (route is push-skipped), the explicit
-    # event guard just makes the intent visible.
-    needs: [route, release-fast-path]
-    if: ${{ !cancelled() && github.event_name != 'push' && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    # merge_group-ONLY (see the `merge_group` trigger comment): the
+    # instrumented suite runs once, against the queue's merged tree, and is
+    # job-level skipped on every pull_request and push run — a skipped job
+    # still reports its required context, and the gate is event-aware about
+    # the skip (required outright on merge_group, accepted elsewhere). The
+    # event check makes the intent visible; the route.result guard preserves
+    # the pre-existing behavior that a route failure skips this job (and
+    # would skip it on push / fork PRs anyway, where route itself is
+    # skipped). Nothing here may reference github.event.pull_request — that
+    # context does not exist on merge_group. release-fast-path is no longer a
+    # dependency: it is pull_request-only, so its output is empty on
+    # merge_group and must not be required; the fast-path skip it used to
+    # provide is subsumed by the pull_request skip. Merge groups come from
+    # the repo's own ruleset, so no same-repo fork guard applies.
+    needs: route
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -652,7 +815,14 @@ jobs:
           echo "## E2E Coverage Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
+          # The script tees its summary to coverage-summary.txt; re-running
+          # the report (~30s) is only a fallback for a run that died before
+          # reporting (intent-hq/monorepo#4260).
+          if [[ -s coverage-summary.txt ]]; then
+            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
+          else
+            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
+          fi
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
       # Non-fatal + short retention: the lcov artifact is a debugging aid
       # only, and an org artifact-quota outage must not fail the required
@@ -668,16 +838,14 @@ jobs:
           retention-days: 3
 
   coverage-all:
-    # Skipped at job level when the diff is release-PR-shaped (safe for
-    # non-matrix jobs — a skipped job still reports its required context;
-    # see release-fast-path). Fail-safe: skips only when the output is
-    # exactly 'true'. The route.result guard preserves the pre-existing
-    # behavior that a route failure skips this job. Also skipped on push to
-    # main — redundant re-test (see the `on: push` comment); the route.result
-    # guard would skip it there anyway (route is push-skipped), the explicit
-    # event guard just makes the intent visible.
-    needs: [route, release-fast-path]
-    if: ${{ !cancelled() && github.event_name != 'push' && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    # merge_group-ONLY — same gating and rationale as coverage-e2e (see its
+    # comment and the `merge_group` trigger comment): job-level skipped on
+    # every pull_request and push run, required outright by the gate on
+    # merge_group. No github.event.pull_request reference (absent on
+    # merge_group) and no release-fast-path dependency (pull_request-only,
+    # empty output on merge_group).
+    needs: route
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -841,7 +1009,12 @@ jobs:
           echo "## Combined Coverage Report (all tests)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
+          # Same reuse-or-fallback as coverage-e2e's summary step.
+          if [[ -s coverage-summary.txt ]]; then
+            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
+          else
+            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
+          fi
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
       # Non-fatal + short retention — same rationale as coverage-e2e's
       # upload step (monorepo#1163).
@@ -857,7 +1030,9 @@ jobs:
 
   pr-title:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
+    # trigger comment).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     steps:
       # Intermittent TLS failures reaching api.github.com can kill this action
       # sub-second, before it validates anything — a spurious red that reads
@@ -906,7 +1081,9 @@ jobs:
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
+    # trigger comment).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -951,6 +1128,9 @@ jobs:
   # preinstalled.
   deb-packaging:
     runs-on: ubuntu-latest
+    # Runs on push and same-repo PRs; skipped on fork PRs (see the
+    # `pull_request` trigger comment).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -986,6 +1166,9 @@ jobs:
   # ubuntu-latest.
   release-scripts:
     runs-on: ubuntu-latest
+    # Runs on push and same-repo PRs; skipped on fork PRs (see the
+    # `pull_request` trigger comment).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -1003,19 +1186,31 @@ jobs:
   # the gate, exactly as before); only on push to main, where it is
   # job-skipped as redundant (see the `on: push` comment), does the gate
   # accept skipped — the event-aware branch below keeps the PR semantics
-  # unweakened. coverage-e2e / coverage-all accept success OR skipped — they
-  # are job-level skipped on release-fast-path PRs (fast_path == 'true'), on
-  # a route failure (see release-fast-path above), and on push to main, all
-  # legitimate. pr-title / conflict-markers accept success OR skipped since
+  # unweakened. coverage-e2e / coverage-all are event-aware the other way
+  # round: they are merge_group-only (see the `merge_group` trigger comment),
+  # so on merge_group they must succeed outright — a skip there (e.g. after a
+  # route failure) fails the gate, so the queue can never land a tree whose
+  # coverage run did not happen — while on pull_request and push, where they
+  # are job-level skipped by design, the gate accepts skipped. pr-title /
+  # conflict-markers accept success OR skipped since
   # both carry `if: github.event_name == 'pull_request'` and are legitimately
-  # skipped on push runs — requiring strict success there would fail the
-  # gate outside pull_request events.
+  # skipped on push and merge_group runs (PR-metadata checks, already
+  # validated on the PR) — requiring strict success there would fail the
+  # gate outside pull_request events. Net per event: pull_request requires
+  # check / build / deb-packaging / release-scripts / pr-title /
+  # conflict-markers; merge_group requires check / build / deb-packaging /
+  # release-scripts / coverage-e2e / coverage-all against the queue's merged
+  # tree; push requires build / deb-packaging / release-scripts.
   gate:
     name: CI Gate
     # Seconds-long job: pinned to ubuntu-latest (see pr-title).
     runs-on: ubuntu-latest
     permissions: {}
-    if: always()
+    # The same-repo clause skips the gate on fork PRs along with every other
+    # job (see the `pull_request` trigger comment): without it, always()
+    # would run the gate against all-skipped needs and report a spurious
+    # failure on PRs that get no CI by policy.
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: [check, build, coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging, release-scripts]
     steps:
       - name: Check results
@@ -1041,20 +1236,33 @@ jobs:
             echo "One or more required jobs failed"
             exit 1
           fi
-          case "${{ needs.coverage-e2e.result }}" in
-            success|skipped) ;;
-            *)
-              echo "coverage-e2e did not succeed or skip"
+          # Event-aware on purpose: coverage-e2e / coverage-all are
+          # merge_group-only, so on merge_group they must succeed outright
+          # (a skip must never let the queue land an untested tree); on
+          # pull_request and push they are job-skipped by design and the
+          # gate accepts skipped.
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            if [ "${{ needs.coverage-e2e.result }}" != "success" ] || \
+               [ "${{ needs.coverage-all.result }}" != "success" ]; then
+              echo "coverage-e2e / coverage-all must succeed outright on merge_group"
               exit 1
-              ;;
-          esac
-          case "${{ needs.coverage-all.result }}" in
-            success|skipped) ;;
-            *)
-              echo "coverage-all did not succeed or skip"
-              exit 1
-              ;;
-          esac
+            fi
+          else
+            case "${{ needs.coverage-e2e.result }}" in
+              success|skipped) ;;
+              *)
+                echo "coverage-e2e did not succeed or skip"
+                exit 1
+                ;;
+            esac
+            case "${{ needs.coverage-all.result }}" in
+              success|skipped) ;;
+              *)
+                echo "coverage-all did not succeed or skip"
+                exit 1
+                ;;
+            esac
+          fi
           case "${{ needs.pr-title.result }}" in
             success|skipped) ;;
             *)

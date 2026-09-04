@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::{
     now_iso, ActorType, AgentId, Event, EventActor, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
@@ -71,6 +71,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -118,8 +119,11 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     let registry = Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
     registry
         .apply(&[
-            ("providers.active".into(), json!("auggie")),
+            ("model.defaultProvider".into(), json!("auggie")),
             ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
+            // Goldens assert the legacy immediate report wake — disable the
+            // default 30s report debounce.
+            ("agents.reportToParentDebounceSeconds".into(), json!(0)),
         ])
         .expect("seed default provider");
     let services = Services::new(store).with_settings_registry(registry);
@@ -170,6 +174,35 @@ fn golden_dequeue_wait_note() {
         "[SYSTEM NOTE] This message was queued at 2026-01-02T03:04:05Z and waited 2m 10s \
          before delivery."
     );
+}
+
+/// The A2A sender-attribution header MUST stay single-line and start with
+/// `A2A_SENDER_NOTE_PREFIX`: the FE strips the header line with a
+/// single-line regex keyed on that prefix (same pattern as
+/// `hook-wake-attribution.ts`). The delivery path's idempotency guard is
+/// stricter — it rebuilds and exact-matches the full header — but the
+/// prefix is still the FE-visible contract.
+#[test]
+fn golden_a2a_sender_note() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.a2a_sender_note(Some("Research Agent"), "agent-1234"),
+        "[MESSAGE FROM AGENT Research Agent (agent-1234)]"
+    );
+    assert_eq!(
+        harness.a2a_sender_note(None, "agent-1234"),
+        "[MESSAGE FROM AGENT (agent-1234)]"
+    );
+    for note in [
+        harness.a2a_sender_note(Some("Research Agent"), "agent-1234"),
+        harness.a2a_sender_note(None, "agent-1234"),
+    ] {
+        assert!(
+            note.starts_with(crate::harness::v1::A2A_SENDER_NOTE_PREFIX),
+            "header must start with the idempotency-guard prefix: {note}"
+        );
+        assert!(!note.contains('\n'), "header must be single-line: {note}");
+    }
 }
 
 // Deliberately redundant with the byte-exact table in
@@ -236,6 +269,22 @@ fn golden_empty_wake_attention_reason() {
 #[test]
 fn golden_naming_tool_references() {
     assert_eq!(
+        crate::agent_manager::agent_naming_tool_reference("auggie"),
+        "the `workspace_api_workspace-mcp` tool"
+    );
+    assert_eq!(
+        crate::agent_manager::agent_naming_tool_reference("opencode"),
+        "the `workspace-mcp_workspace_api` tool"
+    );
+    assert_eq!(
+        crate::agent_manager::agent_naming_tool_reference("codex"),
+        crate::agent_manager::GENERIC_AGENT_NAMING_TOOL_REFERENCE
+    );
+    assert_eq!(
+        crate::agent_manager::GENERIC_AGENT_NAMING_TOOL_REFERENCE,
+        "the `workspace_api` tool from the workspace MCP server"
+    );
+    assert_eq!(
         crate::agent_manager::workspace_naming_tool_reference("auggie"),
         "the `set_workspace_title_workspace-mcp` tool"
     );
@@ -250,6 +299,27 @@ fn golden_naming_tool_references() {
     assert_eq!(
         crate::agent_manager::GENERIC_NAMING_TOOL_REFERENCE,
         "the `set_workspace_title` tool from the workspace MCP server"
+    );
+}
+
+#[test]
+fn golden_first_turn_naming_nudges() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.naming_nudge(Some("the `workspace_api_workspace-mcp` tool"), None),
+        "<system>\nThis agent still has a generated name. Early in your first turn, call \
+         `ws.workspace.setAgentName` through the `workspace_api_workspace-mcp` tool with a short 1–5 word \
+         task-specific name. Do this independently of workspace title naming and in parallel \
+         with information-gathering.\n</system>"
+    );
+    assert_eq!(
+        harness.naming_nudge(
+            None,
+            Some("the `set_workspace_title_workspace-mcp` tool"),
+        ),
+        "<system>\nThis workspace needs a title. As your first action, call the \
+         `set_workspace_title_workspace-mcp` tool with a short 3–5 word sentence-case title \
+         describing the task. This can be called in parallel with information-gathering.\n</system>"
     );
 }
 
@@ -299,8 +369,15 @@ fn golden_completion_wake_variants() {
     // Bare idle completion, watch retained (grouped-failure path shape).
     let ev = completion_event(AGENT_IDLE, &child, json!({}));
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, false),
+        crate::format_completion_wake(&child, &ev, None, false, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) completed."
+    );
+    // Non-child watched agent (intent-hq/monorepo#3906): the same wake for a
+    // watcher that is NOT the agent's delegation parent renders "Watched
+    // agent".
+    assert_eq!(
+        crate::format_completion_wake(&child, &ev, None, false, false, false),
+        "[WORKSPACE EVENTS] Watched agent Builder (agent-c1) completed."
     );
     // Report + retired watch note.
     let ev = completion_event(
@@ -309,8 +386,25 @@ fn golden_completion_wake_variants() {
         json!({ "agentName": "Builder", "completionReport": "All done." }),
     );
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, true),
+        crate::format_completion_wake(&child, &ev, None, true, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) completed. Report: All done. \
+         NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
+         retired. Call ws.agent.watch(\"agent-c1\") again to be woken at its next completion."
+    );
+    // Non-child, watch retired: relationship label flips, suffix unchanged.
+    assert_eq!(
+        crate::format_completion_wake(&child, &ev, None, true, false, false),
+        "[WORKSPACE EVENTS] Watched agent Builder (agent-c1) completed. Report: All done. \
+         NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
+         retired. Call ws.agent.watch(\"agent-c1\") again to be woken at its next completion."
+    );
+    // Report already delivered by a report-time wake (monorepo#4026): the
+    // full Report: clause collapses to a short reference; the retirement
+    // suffix is unaffected.
+    assert_eq!(
+        crate::format_completion_wake(&child, &ev, None, true, true, true),
+        "[WORKSPACE EVENTS] Child agent Builder (agent-c1) completed. Its completion \
+         report was already delivered in a previous message (unchanged since). \
          NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
          retired. Call ws.agent.watch(\"agent-c1\") again to be woken at its next completion."
     );
@@ -321,17 +415,26 @@ fn golden_completion_wake_variants() {
         json!({ "lastResponseSummary": "was compiling", "error": "exit 1" }),
     );
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, false),
+        crate::format_completion_wake(&child, &ev, None, false, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) failed. Summary: was compiling \
          Error: exit 1"
     );
     // Deleted: no re-arm pointer.
     let ev = completion_event(AGENT_DELETED, &child, json!({}));
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, None, true),
+        crate::format_completion_wake(&child, &ev, None, true, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) was deleted. NOTE: this wake \
          consumed your one-shot watch on this agent — the watch is now retired. The agent \
          was deleted, so it cannot be re-watched."
+    );
+    // Retired: terminal like deleted — no re-arm pointer, states the agent
+    // cannot be re-watched or woken again.
+    let ev = completion_event(AGENT_RETIRED, &child, json!({}));
+    assert_eq!(
+        crate::format_completion_wake(&child, &ev, None, true, true, false),
+        "[WORKSPACE EVENTS] Child agent Builder (agent-c1) retired. NOTE: this wake \
+         consumed your one-shot watch on this agent — the watch is now retired. The agent \
+         retired and cannot be re-watched or woken again."
     );
     // Stall suspicion appended only without a rendered report.
     let stall = crate::StallSuspicion {
@@ -340,7 +443,7 @@ fn golden_completion_wake_variants() {
     };
     let ev = completion_event(AGENT_IDLE, &child, json!({}));
     assert_eq!(
-        crate::format_completion_wake(&child, &ev, Some(&stall), false),
+        crate::format_completion_wake(&child, &ev, Some(&stall), false, true, false),
         "[WORKSPACE EVENTS] Child agent Builder (agent-c1) completed. No completion report \
          and assigned task \"Port frobnicator\" is still in_progress — the agent may have \
          stalled rather than finished (monorepo#1016). Consider ws.agent.wakeOrCreate to \
@@ -533,14 +636,16 @@ async fn golden_hook_dispatch_wake_bytes() {
         .await
         .expect("schedule");
     assert_eq!(out["dispatched"], json!(true));
+    let hook_id = out["hook"]["hookId"].as_str().expect("hookId").to_string();
     let text = wake_texts_when(&svc, &owner, 1).await;
     assert_eq!(
         text,
-        vec!["[Background hook \"ci-watch\"] CI is green\n\
+        vec![format!(
+            "[Background hook \"ci-watch\"] CI is green\n\
              \n\
-             [This hook is now retired and will not run again — reschedule via \
-             ws.hook.schedule if still needed.]"
-            .to_string()]
+             [This hook is now retired and will not run again — recover its script via \
+             ws.hook.get(\"{hook_id}\") and reschedule via ws.hook.schedule if still needed.]"
+        )]
     );
 }
 
@@ -620,6 +725,8 @@ fn merge_requirements(
         merge_state_status: None,
         merge_blocked_reason: None,
         rules_known: true,
+        is_in_merge_queue: None,
+        merge_queue_ejection: None,
     }
 }
 
@@ -631,6 +738,7 @@ fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         conversation_count: 2,
         review_comment_count: 1,
         requirements: merge_requirements(state, 0, 1),
+        ejection_tracked: true,
     }
 }
 
@@ -722,8 +830,8 @@ fn golden_pr_monitor_diff_lines() {
 }
 
 /// Checklist branch lines beyond the happy path: draft, conflicts, behind,
-/// failing required checks, changes-requested, blocked reason, and the two
-/// rules-unknown renderings. (The per-field diff LINES beyond
+/// merge-queued, failing required checks, changes-requested, blocked reason,
+/// and the two rules-unknown renderings. (The per-field diff LINES beyond
 /// `golden_pr_monitor_diff_lines` are byte-pinned by `pr_monitor::tests::
 /// diff_detects_each_field_class` and companions — exact `assert_eq` on each
 /// line — so they are not re-pinned here.)
@@ -741,6 +849,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
     r.checks.pending_required = vec![];
     r.approvals.changes_requested = 1;
     r.merge_blocked_reason = Some("merge conflicts".to_string());
+    r.is_in_merge_queue = Some(true);
     assert_eq!(
         crate::pr_monitor::render_checklist(&s),
         "- state: open\n\
@@ -750,6 +859,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - unresolved threads: 1 (resolution required to merge)\n\
          - merge conflicts present\n\
          - branch is behind its base\n\
+         - in merge queue\n\
          - blocked: merge conflicts"
     );
     // Rules-unknown: approvals fall back to the bare count, threads drop the
@@ -890,6 +1000,8 @@ async fn golden_hook_expiry_notice_bytes() {
             name: name.to_string(),
             code: "return { dispatch: false };".to_string(),
             delay_ms: 600_000,
+            cron: None,
+            run_at: None,
             state: intent_core::HookState::Scheduled,
             created_at: past.clone(),
             last_run_at: None,
@@ -920,13 +1032,28 @@ async fn golden_hook_expiry_notice_bytes() {
         vec![
             "[Background hook \"one-shot\"] Your background hook \"one-shot\" expired after \
              reaching its TTL (2 runs completed without a dispatch). Schedule a new hook via \
-             ws.hook.schedule if the condition is still worth watching."
+             ws.hook.schedule if the condition is still worth watching — the original script \
+             is retrievable via ws.hook.get(\"hook-exp-1\")."
                 .to_string(),
             "[Background hook \"perpetual\"] Your background hook \"perpetual\" expired after \
              reaching its TTL (1 run, 1 dispatch). Schedule a new hook via ws.hook.schedule \
-             if the condition is still worth watching."
+             if the condition is still worth watching — the original script is retrievable \
+             via ws.hook.get(\"hook-exp-2\")."
                 .to_string(),
         ]
+    );
+}
+
+/// One-shot `runAt` fired notice: exact bytes (fired wording, not the TTL
+/// expiry wording — the fire is the timer's purpose).
+#[test]
+fn golden_hook_run_at_fired_notice_bytes() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.hook_run_at_fired_notice("reminder", "hook-fire-1", "2026-01-02T03:04:05Z"),
+        "Your one-shot timer hook \"reminder\" (scheduled for 2026-01-02T03:04:05Z) fired and \
+         is now retired. Schedule a new hook via ws.hook.schedule if you need another timer — \
+         the original script is retrievable via ws.hook.get(\"hook-fire-1\")."
     );
 }
 
@@ -948,6 +1075,8 @@ async fn golden_hook_eviction_notice_bytes() {
         name: "will-throw".to_string(),
         code: "throw new Error('kaput');".to_string(),
         delay_ms: 600_000,
+        cron: None,
+        run_at: None,
         state: intent_core::HookState::Scheduled,
         created_at: now_iso(),
         last_run_at: None,
@@ -972,7 +1101,8 @@ async fn golden_hook_eviction_notice_bytes() {
             "[Background hook \"will-throw\"] Your background hook \"will-throw\" was \
              evicted after a failed run: Error: kaput\n\
              \n\
-             [This hook will not run again. Schedule a new hook via ws.hook.schedule \
+             [This hook will not run again. Recover its script via \
+             ws.hook.get(\"hook-evict-1\") and schedule a new hook via ws.hook.schedule \
              if the condition is still worth watching.]"
                 .to_string()
         ]
@@ -995,6 +1125,8 @@ async fn golden_hook_eviction_internal_error_notice_bytes() {
         name: "store-victim".to_string(),
         code: "return { dispatch: false };".to_string(),
         delay_ms: 600_000,
+        cron: None,
+        run_at: None,
         state: intent_core::HookState::Scheduled,
         created_at: now_iso(),
         last_run_at: None,
@@ -1018,11 +1150,34 @@ async fn golden_hook_eviction_internal_error_notice_bytes() {
              evicted after an internal error: scheduler stopped after a store error: \
              internal error: db locked\n\
              \n\
-             [This hook will not run again. Schedule a new hook via ws.hook.schedule \
+             [This hook will not run again. Recover its script via \
+             ws.hook.get(\"hook-evict-2\") and schedule a new hook via ws.hook.schedule \
              if the condition is still worth watching.]"
                 .to_string()
         ]
     );
+}
+
+/// The dispatch-retired and evicted state notes MUST stay single-line
+/// `[This hook …]` paragraphs: the FE strips them with the single-line regex
+/// `(?:\n[ \t]*\n|^)\[This hook [^\n]*\]\s*$` (hook-wake-attribution.ts), so
+/// an embedded newline would leak the note into the rendered message.
+#[test]
+fn golden_hook_state_notes_are_single_line_and_embed_hook_id() {
+    let harness = crate::harness::latest();
+    let hook_id = "hook-shape-1";
+    for note in [
+        harness.hook_dispatch_retired_note(hook_id),
+        harness.hook_evicted_state_note(hook_id),
+    ] {
+        assert!(
+            !note.contains('\n'),
+            "state note must be single-line: {note}"
+        );
+        assert!(note.starts_with("[This hook "), "{note}");
+        assert!(note.ends_with(']'), "{note}");
+        assert!(note.contains("ws.hook.get(\"hook-shape-1\")"), "{note}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1230,7 @@ async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     svc.store()
         .insert_agent_session(&session)
@@ -1167,10 +1323,7 @@ async fn golden_report_to_parent_wake_bytes() {
     assert_eq!(
         texts,
         vec![format!(
-            "[WORKSPACE EVENTS] Child agent {child_name} ({id}) reported. Report: Task \
-             finished. NOTE: this report consumed your one-shot watch on this agent — it \
-             will NOT fire again on completion (failure/deletion still deliver). Call \
-             ws.agent.watch(\"{id}\") again to be woken at its next completion.",
+            "[WORKSPACE EVENTS] Child agent {child_name} ({id}) reported. Report: Task finished.",
             id = child.0
         )]
     );
@@ -1414,10 +1567,13 @@ fn golden_supervisor_history_truncation_markers() {
 /// questions, next-steps footer, specialist role wrapper, role-reminder
 /// footer, user-rules wrapper) plus the `\n\n---\n\n` layer separator, pinned
 /// via a hermetic assembly with no workspace path (no rule files, no skills,
-/// no RTK — only the always-on layers).
+/// no RTK — only the always-on layers). Assembled under a session pinned to
+/// `harnessVersion: "1.0"` so the bytes stay frozen as later versions reword
+/// surfaces (v2.3 rewords the next-steps layer; `v2_3_goldens` pins that).
 #[tokio::test]
 async fn golden_assembled_prompt_static_layers() {
-    let (_t, svc, _ws) = setup().await;
+    let (_t, svc, ws) = setup().await;
+    let session = v1_pinned_session(&svc, &ws, "agent-v1-static").await;
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: Some("Implement the task.".to_string()),
         specialist_name: Some("Implementor".to_string()),
@@ -1433,7 +1589,7 @@ async fn golden_assembled_prompt_static_layers() {
         false,
         &intent_core::settings_file::AgentFeaturesSettings::default(),
         None,
-        None,
+        Some(&session),
         None,
     )
     .await
@@ -1498,9 +1654,12 @@ async fn golden_assembled_prompt_static_layers() {
 
 /// Auto-commit flips the next-steps example line and appends the
 /// auto-commit clause; sub-agents skip questions + next-steps entirely.
+/// Assembled under a `"1.0"`-pinned session (see
+/// `golden_assembled_prompt_static_layers`).
 #[tokio::test]
 async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
-    let (_t, svc, _ws) = setup().await;
+    let (_t, svc, ws) = setup().await;
+    let session = v1_pinned_session(&svc, &ws, "agent-v1-variants").await;
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
     let auto_on = crate::rules::assemble_system_prompt(
         svc.store(),
@@ -1512,7 +1671,7 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
         false,
         &features,
         None,
-        None,
+        Some(&session),
         None,
     )
     .await
@@ -1546,7 +1705,7 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
         false,
         &features,
         None,
-        None,
+        Some(&session),
         None,
     )
     .await
@@ -1556,14 +1715,33 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
     assert!(sub_agent.contains("## Commit Policy"));
 }
 
-/// H2 regression: a session stamped `harnessVersion: "1.0"` (every session
-/// H1 has created) resolves the v1 doctrine set and assembles the exact
-/// bytes the pre-versioned layout produced — pinned here as equality with
-/// the session-less (latest) assembly, whose layers are themselves
-/// byte-pinned by the goldens above and the doctrine hashes below. An
-/// unknown/corrupt stamp falls back to the latest instead of failing.
+/// A seeded session re-stamped to `harnessVersion: "1.0"` so assembly
+/// resolves the v1 harness + doctrine regardless of the current version.
+async fn v1_pinned_session(
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &str,
+) -> intent_core::AgentSession {
+    let owner = AgentId::from(id);
+    seed_agent(svc, ws, &owner).await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&owner)
+        .await
+        .expect("session");
+    session.harness_version = "1.0".to_string();
+    session
+}
+
+/// H2 regression: a session stamped `harnessVersion: "1.0"` (every pre-1.1
+/// session) resolves the v1 doctrine set and assembles the exact bytes the
+/// v1 layout produced — its common layer is the v1 body, not the v1.1
+/// or v2 rewrite (the v1 composition stays byte-pinned by the doctrine hashes
+/// below). A current-stamp session assembles byte-identical to the
+/// session-less (latest) assembly, and an unknown/corrupt stamp falls back
+/// to the latest instead of failing.
 #[tokio::test]
-async fn golden_v1_session_assembles_identical_to_latest() {
+async fn golden_v1_session_assembles_v1_doctrine() {
     let (_t, svc, ws) = setup().await;
     let owner = AgentId::from("agent-h2-pin");
     seed_agent(&svc, &ws, &owner).await;
@@ -1572,7 +1750,11 @@ async fn golden_v1_session_assembles_identical_to_latest() {
         .get_agent_session(&owner)
         .await
         .expect("session");
-    assert_eq!(session.harness_version, "1.0", "H1 stamps 1.0");
+    assert_eq!(
+        session.harness_version,
+        intent_core::CURRENT_HARNESS_VERSION,
+        "H1 stamps the current version"
+    );
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: Some("Implement the task.".to_string()),
@@ -1602,8 +1784,67 @@ async fn golden_v1_session_assembles_identical_to_latest() {
         }
     };
     let latest = assemble(None).await;
+    let current = assemble(Some(session.clone())).await;
+    assert_eq!(current, latest, "current stamp == latest assembly");
+    // A "1.0"-stamped session (every pre-1.1 session) keeps assembling the
+    // v1 doctrine: its specialization-rules layer is the v1 composition.
+    session.harness_version = "1.0".to_string();
     let pinned_v1 = assemble(Some(session.clone())).await;
-    assert_eq!(pinned_v1, latest, "1.0 session == pre-change assembly");
+    let v1_rules = crate::instructions::get_instruction_with_common_for(
+        &crate::instructions::V1,
+        "task-loop",
+        &features,
+    );
+    assert!(
+        pinned_v1.starts_with(&format!("{v1_rules}\n\n---\n\n")),
+        "1.0 session leads with the v1 specialization rules"
+    );
+    assert_ne!(
+        pinned_v1, latest,
+        "v1 doctrine differs from latest v2 (common.md)"
+    );
+    assert!(!pinned_v1.contains("ws.workspace.proposeSibling"));
+    assert!(latest.contains("ws.workspace.proposeSibling"));
+    // Only the doctrine layer differs between v1 and v2.2 (the last version
+    // on v1 text surfaces): the static layers after the specialization
+    // rules are byte-identical. Latest (v2.3) additionally rewords the
+    // next-steps layer and nothing else.
+    session.harness_version = "2.2".to_string();
+    let pinned_v2_2 = assemble(Some(session.clone())).await;
+    let v2_2_rules = crate::instructions::get_instruction_with_common_for(
+        crate::harness::resolve_entry("2.2").doctrine.instructions,
+        "task-loop",
+        &features,
+    );
+    let v1_static = pinned_v1.strip_prefix(&v1_rules).expect("v1 prefix");
+    assert_eq!(
+        v1_static,
+        pinned_v2_2.strip_prefix(&v2_2_rules).expect("2.2 prefix"),
+        "static layers identical across v1-surface versions"
+    );
+    let latest_rules = crate::instructions::get_instruction_with_common_for(
+        crate::harness::latest_entry().doctrine.instructions,
+        "task-loop",
+        &features,
+    );
+    let latest_static = latest.strip_prefix(&latest_rules).expect("latest prefix");
+    let v1_layers: Vec<&str> = v1_static.split("\n\n---\n\n").collect();
+    let latest_layers: Vec<&str> = latest_static.split("\n\n---\n\n").collect();
+    assert_eq!(v1_layers.len(), latest_layers.len());
+    let mut saw_next_steps = false;
+    for (a, b) in v1_layers.iter().zip(&latest_layers) {
+        if a.starts_with("## Suggested Next Steps") {
+            saw_next_steps = true;
+            assert!(b.starts_with("## Suggested Next Steps"));
+            assert_ne!(a, b, "latest rewords the next-steps layer");
+        } else {
+            assert_eq!(a, b, "static layers identical across versions");
+        }
+    }
+    assert!(
+        saw_next_steps,
+        "top-level assembly carries the next-steps layer"
+    );
     // A stale/corrupt stamp falls back to the latest (never fails a spawn).
     session.harness_version = "9.9".to_string();
     let unknown = assemble(Some(session)).await;
@@ -1611,9 +1852,11 @@ async fn golden_v1_session_assembles_identical_to_latest() {
 }
 
 /// The bundled doctrine layers are large; pin them by SHA-256 so any change
-/// to the shipped instruction markdown (or the feature-gating composition)
-/// fails here and forces a harness-version decision. The hashes are of
-/// `get_instruction_with_common` output with all-default agent features.
+/// to the shipped v1 instruction markdown (or the feature-gating
+/// composition) fails here and forces a harness-version decision. The
+/// hashes are of the v1-set composition with all-default agent features —
+/// pinned to `instructions::V1` explicitly (NOT the latest set) so the v1
+/// bytes stay frozen across later versions; `v1_1_goldens` pins v1.1.
 #[test]
 fn golden_bundled_doctrine_hashes() {
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
@@ -1631,21 +1874,23 @@ fn golden_bundled_doctrine_hashes() {
             format!(
                 "{}: {}",
                 agent_type,
-                sha256_hex(&crate::instructions::get_instruction_with_common(
-                    agent_type, &features
+                sha256_hex(&crate::instructions::get_instruction_with_common_for(
+                    &crate::instructions::V1,
+                    agent_type,
+                    &features,
                 ))
             )
         })
         .collect();
     let expected = vec![
-        "task-loop: d3f5fea2a32d4f0ce0f73328000220a76715477e705f0fe9a589602ce09ab0e6".to_string(),
-        "interactive: 9e7d181110a999a0f909f80a1382068fd9babfef84d385d8705bd3e8dec18806".to_string(),
-        "workspace-agent: 2c8bc4ee016b66ad2e3c711c026ff76fcb0b3823b054c53058832d8e068975f8"
+        "task-loop: f18d40f5c74b12b45c9f656900665c82398fc5aaa716c5770e22068dd839a560".to_string(),
+        "interactive: 072a355b7c77a499b00701c9e175673a4ff4224c486f51677f7caa23986d5788".to_string(),
+        "workspace-agent: 202521ab3e7055486384e3093fc6d1f2b4f507c0248a9808597cae465a4cb268"
             .to_string(),
-        "task-breakdown: dda39c0f7657024d12da6b3287cedd89d6c7c0f3db8a8603fd01275f4edc4076"
+        "task-breakdown: 55aeb42266161ca997549cfe887bbc807c3511920d6304f5d4508c327fbad3be"
             .to_string(),
-        "common: 8e5d72ad30aa9fe7e1ce5b1ac71ffa832b7171f1743fb16372f46fe5e06c327a".to_string(),
-        "workspace: afeac914c4d5754e46d46ea79ec69eea055f67e1c228352c5b0721149cf75ffd".to_string(),
+        "common: e098afd3a53c2313c8e4207a8c07f011119a5f7767270328f4dfa541cf455185".to_string(),
+        "workspace: fe126c3dc9450fdef98bffc0cffdc170e488b26b926e1e2e137dd6f42702b308".to_string(),
     ];
     assert_eq!(actual, expected);
 }
@@ -1762,6 +2007,7 @@ fn golden_isolation_hints() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,
@@ -1852,19 +2098,38 @@ fn golden_snapshot_full_field_serialization() {
         agent_watches: 2,
         queued_messages: 3,
         event_subscriptions: 4,
-        running_sub_agents: 5,
-        num_questions_asked: 6,
+        active_sub_agents: 5,
+        unsettled_sub_agents: 6,
+        running_sub_agents: 6,
+        num_questions_asked: 7,
         pr_monitors: vec![
             "intent-hq/intentd#7".to_string(),
             "intent-hq/monorepo#8 (changes pending)".to_string(),
         ],
+        prs: Some(crate::agent_ops::AgentSnapshotPrs {
+            draft: vec!["o/r#1".to_string()],
+            blocked: vec!["o/r#2".to_string()],
+            mergeable: vec!["o/r#3".to_string()],
+            unknown: vec!["o/r#4".to_string()],
+        }),
+        tasks: [
+            ("in_progress".to_string(), 2),
+            ("review_required".to_string(), 1),
+        ]
+        .into_iter()
+        .collect(),
         pending_attention: Some("blocker".to_string()),
     };
     assert_eq!(
         serde_json::to_string(&snap).unwrap(),
         "{\"time\":\"2026-01-02T03:04:05Z\",\"hooks\":1,\"agentWatches\":2,\
-         \"queuedMessages\":3,\"eventSubscriptions\":4,\"runningSubAgents\":5,\
-         \"numQuestionsAsked\":6,\"prMonitors\":[\"intent-hq/intentd#7\",\
-         \"intent-hq/monorepo#8 (changes pending)\"],\"pendingAttention\":\"blocker\"}"
+         \"queuedMessages\":3,\"eventSubscriptions\":4,\"activeSubAgents\":5,\
+         \"unsettledSubAgents\":6,\"runningSubAgents\":6,\"numQuestionsAsked\":7,\
+         \"prMonitors\":[\"intent-hq/intentd#7\",\
+         \"intent-hq/monorepo#8 (changes pending)\"],\
+         \"prs\":{\"draft\":[\"o/r#1\"],\"blocked\":[\"o/r#2\"],\
+         \"mergeable\":[\"o/r#3\"],\"unknown\":[\"o/r#4\"]},\
+         \"tasks\":{\"in_progress\":2,\"review_required\":1},\
+         \"pendingAttention\":\"blocker\"}"
     );
 }

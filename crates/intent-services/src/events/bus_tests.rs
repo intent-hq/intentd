@@ -980,7 +980,7 @@ async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
     let mut sub = bus.subscribe(filter);
 
     let capture = Capture::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let _guard = crate::test_tracing::set_capture_default(capture.clone());
 
     for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
         let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));

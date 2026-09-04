@@ -226,12 +226,17 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     let specialists_dir = data_dir.join(".intent").join("specialists");
     std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
     let specialist_content =
-        "---\nmodel: auggie:opus\n---\n# Test Specialist\nTest behavior prompt.";
+        "---\ncodingAgent: auggie\nmodel: opus\n---\n# Test Specialist\nTest behavior prompt.";
     std::fs::write(
         specialists_dir.join("test-specialist.md"),
         specialist_content,
     )
     .expect("write specialist file");
+
+    // Seed a configured default provider: since monorepo#3044 `agent.create`
+    // fails loudly when neither an explicit provider nor a settings-derived
+    // default resolves (the frontmatter model no longer carries a provider).
+    common::seed_default_provider(&data_dir);
 
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -277,8 +282,128 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
 
     // Assert the session's model IS the frontmatter model (make the test fail if resolution is skipped)
     assert_eq!(
-        get_res["agent"]["model"], "auggie:opus",
+        get_res["agent"]["model"], "opus",
         "specialist frontmatter model not resolved"
+    );
+
+    drop(daemon);
+}
+
+/// WSS e2e for specialist aliases (PROTOCOL §5.11): the bundled v1.1
+/// `spec-writer` carries `aliases: ["coordinator"]`, so `agent.create` with
+/// `specialistId: "coordinator"` persists the CANONICAL id (`spec-writer`)
+/// on the session — surfaced as `metadata.specialist` — and resolves the
+/// specialist's display name; `specialist.get` on the alias serves the
+/// canonical resolved view.
+#[tokio::test]
+async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // Pre-seed a workspace (repository_path so project-tier resolution has a
+    // root; the alias itself resolves from the embedded bundled floor).
+    let ws_id = {
+        use intent_core::WorkspaceId;
+        use intent_store::Store;
+        let db_path = data_dir.join("intentd.db");
+        let store = Store::open(&db_path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let mut workspace = workspace_seed(&ws);
+        workspace.repository_path = Some(data_dir.to_string_lossy().to_string());
+        store.insert_workspace(&workspace).await.expect("insert ws");
+        ws.0
+    };
+
+    // Hermetic empty user tier: HOME=data_dir with no specialists written.
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // specialist.get on the alias serves the canonical resolved view.
+    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "coordinator" })).await;
+    assert_eq!(
+        got["specialist"]["id"], "spec-writer",
+        "alias resolves to the canonical def over WSS"
+    );
+    assert_eq!(got["specialist"]["aliases"], json!(["coordinator"]));
+
+    // agent.create with the alias persists the canonical specialist id and
+    // derives the display name from the canonical specialist. The explicit
+    // provider + bare model satisfies provider resolution (the bundled
+    // spec-writer pins no frontmatter model and this hermetic env configures
+    // no default provider) without touching the alias seam under test.
+    let created = wss_rpc(
+        &mut ws,
+        3,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "specialistId": "coordinator",
+            "model": "opus",
+            "provider": "auggie"
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().expect("agent id");
+    assert_eq!(
+        created["agent"]["metadata"]["specialist"], "spec-writer",
+        "alias create persists the canonical id, not the alias"
+    );
+    assert_eq!(created["agent"]["name"], "Coordinator");
+
+    // agent.get round-trips the canonical id from the persisted row.
+    let get_res = wss_rpc(&mut ws, 4, "agent.get", json!({ "agentId": agent_id })).await;
+    assert_eq!(
+        get_res["agent"]["metadata"]["specialist"], "spec-writer",
+        "persisted session carries the canonical id"
+    );
+
+    // An UNKNOWN specialist id is rejected with `-32602` naming the id and
+    // the known catalog ids (monorepo#3497) — no session is created.
+    let rejected = wss_rpc_raw(
+        &mut ws,
+        5,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "specialistId": "no-such-specialist",
+            "model": "opus",
+            "provider": "auggie"
+        }),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"], -32602,
+        "unknown specialist rejects with invalid-params: {rejected}"
+    );
+    let msg = rejected["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        msg.contains("unknown specialist: no-such-specialist"),
+        "error names the id: {msg}"
+    );
+    assert!(
+        msg.contains("known specialists:") && msg.contains("spec-writer"),
+        "error lists the known ids: {msg}"
     );
 
     drop(daemon);
@@ -359,8 +484,8 @@ async fn specialist_hidden_round_trips_over_wss() {
 
 /// WSS e2e for the embedded bundled catalog: with an empty user tier and no
 /// bundled-dir override, `specialist.list` over WSS returns exactly the eight
-/// embedded reference specialists — `pr-shepherd` is gone from the bundled set
-/// (review thread `PRRT_kwDOS9Wxuc6YSV2u`).
+/// catalog-visible embedded reference specialists. Retired Ralph stays directly
+/// resolvable for pinned v1 sessions, while `pr-shepherd` remains gone.
 #[tokio::test]
 async fn embedded_bundled_catalog_over_wss() {
     let data_dir = temp_data_dir();
@@ -403,16 +528,143 @@ async fn embedded_bundled_catalog_over_wss() {
             "developer",
             "implementor",
             "pr-reviewer",
-            "ralph",
             "spec-writer",
             "ui-designer",
             "verifier",
+            "vulnerability-scanner",
         ],
-        "bundled catalog over WSS is exactly the eight embedded ids (no pr-shepherd)"
+        "bundled catalog over WSS is exactly the eight catalog-visible embedded ids"
     );
+    assert!(!ids.contains(&"ralph"), "retired Ralph is not cataloged");
     for spec in specs {
         assert_eq!(spec["source"], "bundled", "{}: embedded tier", spec["id"]);
     }
+
+    let scanner = wss_rpc(
+        &mut ws,
+        3,
+        "specialist.get",
+        json!({ "id": "vulnerability-scanner" }),
+    )
+    .await;
+    let scanner = &scanner["specialist"];
+    assert_eq!(scanner["name"], "Vulnerability Scanner");
+    assert_eq!(
+        scanner["description"],
+        "Finds real, exploitable security vulnerabilities in code"
+    );
+    assert!(scanner.get("codingAgent").is_none());
+    assert!(scanner.get("model").is_none());
+    assert_eq!(scanner["icon"], "pr-reviewer");
+    assert!(scanner["prompt"]
+        .as_str()
+        .is_some_and(|body| body.starts_with("## Vulnerability Scanner\n")));
+
+    let ralph = wss_rpc(&mut ws, 4, "specialist.get", json!({ "id": "ralph" })).await;
+    assert_eq!(ralph["specialist"]["source"], "bundled");
+    assert_eq!(ralph["specialist"]["hidden"], true);
+    assert_eq!(ralph["specialist"]["agentType"], "ralph-loop");
+    assert!(ralph["specialist"]["roleReminder"]
+        .as_str()
+        .unwrap()
+        .starts_with("You are Ralph."));
+
+    drop(daemon);
+}
+
+/// WSS e2e for the base-tier replacement (`INTENTD_SPECIALISTS_DIR`): with the
+/// startup pin set, `specialist.list` over the real WSS transport returns only
+/// the replacement directory's specialists (as `bundled`) plus user-tier
+/// folds — none of the nine embedded ids survive — and the pin surfaces as
+/// the read-only `specialists.dir` setting.
+#[tokio::test]
+async fn specialists_replacement_dir_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // The replacement base tier: a single specialist, nothing else survives.
+    let replacement_dir = data_dir.join("replacement-specialists");
+    std::fs::create_dir_all(&replacement_dir).expect("mkdir replacement dir");
+    std::fs::write(
+        replacement_dir.join("solo.md"),
+        "---\nname: \"Solo\"\ndescription: \"Replacement base\"\n---\n\nSolo body.",
+    )
+    .expect("write replacement solo");
+
+    // A user-tier specialist still folds on top of the replacement.
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
+    std::fs::write(
+        specialists_dir.join("extra.md"),
+        "---\nname: \"Extra\"\ndescription: \"User tier\"\n---\n\nExtra body.",
+    )
+    .expect("write user extra");
+
+    let replacement_dir_str = replacement_dir
+        .to_str()
+        .expect("replacement dir to str")
+        .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+        ("INTENTD_SPECIALISTS_DIR", &replacement_dir_str),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // list — exactly the replacement base + the user fold; no embedded ids.
+    let list = wss_rpc(&mut ws, 2, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().expect("specialists array");
+    let mut ids: Vec<&str> = specs
+        .iter()
+        .map(|s| s["id"].as_str().expect("specialist id"))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["extra", "solo"],
+        "replacement dir excludes every embedded specialist over WSS"
+    );
+    let solo = specs.iter().find(|s| s["id"] == "solo").expect("solo");
+    assert_eq!(solo["source"], "bundled", "replacement is the base tier");
+    let extra = specs.iter().find(|s| s["id"] == "extra").expect("extra");
+    assert_eq!(extra["source"], "user", "user tier folds on top");
+
+    // get — a shipped id not restated in the replacement does not resolve.
+    let missing = wss_rpc_raw(&mut ws, 3, "specialist.get", json!({ "id": "developer" })).await;
+    assert!(
+        missing.get("error").is_some(),
+        "shipped id is gone under replacement: {missing}"
+    );
+
+    // The pin surfaces as the read-only specialists.dir setting.
+    let got = wss_rpc(
+        &mut ws,
+        4,
+        "settings.get",
+        json!({ "path": "specialists.dir" }),
+    )
+    .await;
+    assert_eq!(
+        got["value"],
+        json!(replacement_dir_str),
+        "specialists.dir reports the startup pin over WSS"
+    );
 
     drop(daemon);
 }
@@ -486,13 +738,19 @@ async fn specialist_config_scalars_inherit_over_wss() {
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
-    // get — omitted scalars inherit the bundled values; roleReminder does not.
+    // get — omitted scalars inherit the bundled values; roleReminder does
+    // not. The bundled compound `model` scalar reads as the bare model plus
+    // `codingAgent` set to the prefix (lenient legacy normalization).
     let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
     let def = &got["specialist"];
     assert_eq!(def["source"], "user", "user tier wins the merge");
     assert_eq!(
-        def["model"], "auggie:opus",
-        "omitted model inherits the bundled value on specialist.get over WSS"
+        def["model"], "opus",
+        "omitted model inherits the bundled value (split to the bare id) on specialist.get over WSS"
+    );
+    assert_eq!(
+        def["codingAgent"], "auggie",
+        "the legacy compound's prefix lands on codingAgent over WSS"
     );
     assert_eq!(
         def["agentType"], "zeta-type",
@@ -518,8 +776,8 @@ async fn specialist_config_scalars_inherit_over_wss() {
         .find(|s| s["id"] == "zeta")
         .expect("zeta listed");
     assert_eq!(
-        zeta["model"], "auggie:opus",
-        "omitted model inherits in specialist.list over WSS"
+        zeta["model"], "opus",
+        "omitted model inherits (split to the bare id) in specialist.list over WSS"
     );
     assert_eq!(
         zeta["agentType"], "zeta-type",
@@ -631,7 +889,9 @@ async fn specialist_model_options_round_trip_over_wss() {
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
-    let expected = json!([{ "model": "auggie:opus", "hint": "smart" }]);
+    // The bundled legacy compound entry reads as the provider+model triple
+    // (lenient legacy normalization).
+    let expected = json!([{ "provider": "auggie", "model": "opus", "hint": "smart" }]);
 
     // get — an omitted key inherits the bundled tier's list.
     let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
@@ -672,7 +932,7 @@ async fn specialist_model_options_round_trip_over_wss() {
             "scope": "user",
             "spec": {
                 "id": "sigma", "name": "Sigma", "description": "Authored",
-                "modelOptions": [{ "model": "opencode:kimi-k3", "hint": "cheap" }],
+                "modelOptions": [{ "model": "kimi-k3", "hint": "cheap" }],
                 "prompt": "Sigma body."
             }
         }),
@@ -680,7 +940,7 @@ async fn specialist_model_options_round_trip_over_wss() {
     .await;
     assert_eq!(
         created["specialist"]["modelOptions"],
-        json!([{ "model": "opencode:kimi-k3", "hint": "cheap" }]),
+        json!([{ "model": "kimi-k3", "hint": "cheap" }]),
         "create round-trips modelOptions over WSS"
     );
     let got = wss_rpc(&mut ws, 5, "specialist.get", json!({ "id": "sigma" })).await;
@@ -709,6 +969,163 @@ async fn specialist_model_options_round_trip_over_wss() {
         rejected["error"]["code"], -32602,
         "invalid modelOptions → -32602 over WSS: {rejected}"
     );
+
+    drop(daemon);
+}
+
+/// WSS e2e for the picker-metadata fields (`role`/`teamAgents`/`icon`,
+/// PROTOCOL §5.11): a user-tier override that omits the keys inherits the
+/// bundled tier's values on `specialist.get` and `specialist.list`, `create`
+/// round-trips supplied values and agrees with the following `get`, `edit`
+/// clears them, and invalid wire shapes (out-of-enum `role`, non-string
+/// `icon`, non-array `teamAgents`) are rejected with `-32602`.
+#[tokio::test]
+async fn specialist_picker_metadata_round_trips_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // Bundled tier via the INTENTD_BUNDLED_SPECIALISTS_DIR seam.
+    let bundled_dir = data_dir.join("bundled-specialists");
+    std::fs::create_dir_all(&bundled_dir).expect("mkdir bundled dir");
+    std::fs::write(
+        bundled_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"Bundled\"\nrole: \"orchestrator\"\nicon: \"coordinator\"\nteamAgents: [\"implementor\",\"verifier\"]\n---\n\nBundled body.",
+    )
+    .expect("write bundled zeta");
+
+    // Hermetic user tier: HOME=data_dir so the daemon reads
+    // $HOME/.intent/specialists/. Omits the metadata keys: inherits.
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
+    std::fs::write(
+        specialists_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"User override\"\n---\n\nUser body.",
+    )
+    .expect("write user zeta");
+
+    let bundled_dir_str = bundled_dir
+        .to_str()
+        .expect("bundled dir to str")
+        .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+        ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // get — omitted keys inherit the bundled tier's metadata.
+    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
+    let def = &got["specialist"];
+    assert_eq!(def["source"], "user", "user tier wins the merge");
+    assert_eq!(def["role"], "orchestrator", "role inherits over WSS");
+    assert_eq!(def["icon"], "coordinator", "icon inherits over WSS");
+    assert_eq!(
+        def["teamAgents"],
+        json!(["implementor", "verifier"]),
+        "teamAgents inherits over WSS"
+    );
+
+    // list — the same fold applies to the list projection.
+    let list = wss_rpc(&mut ws, 3, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().expect("specialists array");
+    let zeta = specs
+        .iter()
+        .find(|s| s["id"] == "zeta")
+        .expect("zeta listed");
+    assert_eq!(zeta["role"], "orchestrator", "role in specialist.list");
+    assert_eq!(zeta["icon"], "coordinator", "icon in specialist.list");
+    assert_eq!(
+        zeta["teamAgents"],
+        json!(["implementor", "verifier"]),
+        "teamAgents in specialist.list"
+    );
+
+    // create — supplied metadata round-trips through the write path and
+    // agrees with the following get.
+    let created = wss_rpc(
+        &mut ws,
+        4,
+        "specialist.create",
+        json!({
+            "id": "sigma",
+            "scope": "user",
+            "spec": {
+                "id": "sigma", "name": "Sigma", "description": "Authored",
+                "role": "internal", "icon": "verifier",
+                "teamAgents": ["implementor"],
+                "prompt": "Sigma body."
+            }
+        }),
+    )
+    .await;
+    assert_eq!(created["specialist"]["role"], "internal");
+    assert_eq!(created["specialist"]["icon"], "verifier");
+    assert_eq!(created["specialist"]["teamAgents"], json!(["implementor"]));
+    let got = wss_rpc(&mut ws, 5, "specialist.get", json!({ "id": "sigma" })).await;
+    assert_eq!(
+        got["specialist"]["role"], created["specialist"]["role"],
+        "create response agrees with the following get over WSS"
+    );
+
+    // edit — the explicit clears drop the fields.
+    let edited = wss_rpc(
+        &mut ws,
+        6,
+        "specialist.edit",
+        json!({
+            "id": "sigma",
+            "scope": "user",
+            "spec": {
+                "id": "sigma", "name": "Sigma", "description": "Authored",
+                "role": "", "icon": "", "teamAgents": [],
+                "prompt": "Sigma body."
+            }
+        }),
+    )
+    .await;
+    assert!(edited["specialist"].get("role").is_none(), "role cleared");
+    assert!(edited["specialist"].get("icon").is_none(), "icon cleared");
+    assert!(
+        edited["specialist"].get("teamAgents").is_none(),
+        "teamAgents cleared"
+    );
+
+    // create — invalid wire shapes are rejected with -32602 (PROTOCOL §9).
+    let invalid_specs = [
+        json!({ "id": "tau", "name": "Tau", "description": "Bad", "role": "manager", "prompt": "b" }),
+        json!({ "id": "tau", "name": "Tau", "description": "Bad", "icon": 42, "prompt": "b" }),
+        json!({ "id": "tau", "name": "Tau", "description": "Bad", "teamAgents": "not-an-array", "prompt": "b" }),
+    ];
+    for (i, spec) in invalid_specs.iter().enumerate() {
+        let rejected = wss_rpc_raw(
+            &mut ws,
+            7 + i64::try_from(i).expect("index fits in i64"),
+            "specialist.create",
+            json!({ "id": "tau", "scope": "user", "spec": spec }),
+        )
+        .await;
+        assert_eq!(
+            rejected["error"]["code"], -32602,
+            "invalid picker metadata → -32602 over WSS: {rejected}"
+        );
+    }
 
     drop(daemon);
 }
@@ -746,6 +1163,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,

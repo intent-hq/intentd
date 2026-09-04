@@ -331,7 +331,7 @@ async fn workspace_activity_changed_debounce() {
         &mut rpc,
         2,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "TestAgent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "TestAgent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["result"]["agent"]["id"].as_str().expect("agent id");

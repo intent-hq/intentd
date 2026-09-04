@@ -11,12 +11,12 @@
 # release.yml must fire on the tag push. Provisioning the secret is a manual
 # step (repo Settings → Secrets and variables → Actions).
 #
-# Both jobs run on the self-hosted tinybox runners. They were moved to
-# GitHub-hosted runners while tinybox had a single slot: every push to main
-# triggers this workflow, and queueing behind that slot (shared with CI's
-# heavy jobs) ballooned wall clock to hours (intent-hq/monorepo#1221). With
-# 8 tinybox slots the queue-isolation rationale is gone. See
-# intentd#749/#787/#805 for the runner placement history.
+# Both jobs run on GitHub-hosted gh-linux-16x runners: the release path must
+# not depend on the self-hosted tinybox fleet being online (a fleet outage
+# would silently stall every release). Ephemeral runners have no persistent
+# target dir or sccache disk, so the pr job pairs Swatinem/rust-cache with an
+# actions/cache-backed sccache dir instead. See intentd#749/#787/#805 and
+# intent-hq/monorepo#1221 for the runner placement history.
 
 name: Release-plz
 
@@ -35,11 +35,14 @@ on:
 # `release_always = false`, `release-plz release` only pushes the tag when
 # the *latest* commit is a Release-PR merge, so if a queued merge-commit run
 # were superseded by an ordinary push, the newer run would silently skip the
-# tag. Merge commits are detected by the Release PR's squash title: both
-# release-plz pr_name forms this repo has produced — `chore: release vX.Y.Z`
-# (multi-package version_group cycles, v0.2.10+) and `chore(intentd):
-# release vX.Y.Z` (single-package cycles, v0.2.2–v0.2.9). A false positive
-# only costs coalescing; a false negative would reopen the dropped-tag bug.
+# tag. Merge commits are detected by the Release PR's squash title, in any
+# form release-plz's default pr_name template can produce: `chore: release`
+# with or without a version — the version is omitted when the released
+# packages have different versions, e.g. a mixed intentd + intentd-sitter
+# cycle — and `chore(<package>): release vX.Y.Z` for single-package cycles
+# (intentd: v0.2.2–v0.2.9; intentd-sitter for sitter-only cycles). A false
+# positive only costs coalescing; a false negative would reopen the
+# dropped-tag bug.
 # Two Release-PR merges can't coalesce with each other in practice: the
 # next Release PR only exists after the previous merge's release-pr job has
 # run.
@@ -48,19 +51,19 @@ on:
 # mid-flight on a Release-PR merge commit must never be cancelled between
 # computing the next version and pushing the tag.
 concurrency:
-  group: "release-plz-${{ github.ref }}-${{ (startsWith(github.event.head_commit.message, 'chore: release') || startsWith(github.event.head_commit.message, 'chore(intentd): release')) && 'release-merge' || 'push' }}"
+  group: "release-plz-${{ github.ref }}-${{ (startsWith(github.event.head_commit.message, 'chore: release') || startsWith(github.event.head_commit.message, 'chore(intentd): release') || startsWith(github.event.head_commit.message, 'chore(intentd-sitter): release')) && 'release-merge' || 'push' }}"
   cancel-in-progress: false
 
 jobs:
   # Neither job uses the implicit GITHUB_TOKEN (all steps authenticate with
   # the RELEASE_PLZ_TOKEN PAT), so jobs inherit the top-level `permissions: {}`
   # and the implicit token stays powerless.
-  # Any tinybox slot is plenty: on ordinary commits this job is a ~15s no-op,
-  # and on Release-PR merges it only does git/tag work (releases are
-  # git-tag-only per release-plz.toml — nothing is compiled or published).
+  # On ordinary commits this job is a ~15s no-op, and on Release-PR merges it
+  # only does git/tag work (releases are git-tag-only per release-plz.toml —
+  # nothing is compiled or published).
   release-plz-release:
     name: Release-plz release
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: gh-linux-16x
     if: ${{ github.repository_owner == 'intent-hq' }}
     steps:
       # Pinned to v5: checkout v6+ stores the credential via an includeIf.gitdir
@@ -88,11 +91,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
   # This job runs `cargo package --workspace`, which compiles the whole
-  # workspace — closer to ci.yml's coverage jobs (which also run on tinybox)
-  # than to check's fmt+clippy.
+  # workspace — closer to ci.yml's coverage jobs (which burst to the same
+  # 16-core runner) than to check's fmt+clippy.
   release-plz-pr:
     name: Release-plz PR
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: gh-linux-16x
     # Run after the release job: on a Release-PR merge commit the tag must be
     # pushed before release-pr computes the next version, or it races on tag
     # visibility and can open a spurious Release PR. On ordinary commits the
@@ -119,15 +122,14 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      # openssl-sys needs the OpenSSL headers (found via pkg-config);
-      # tinybox has pkg-config and libssl-dev installed, so this is normally
-      # a no-op — kept as an idempotent guard (ci.yml's guard, extended to
-      # also cover a missing pkg-config; relies on the runner user's
-      # passwordless sudo, same as ci.yml's self-hosted jobs).
-      # Co-tenant jobs on the shared runner race for the apt locks
-      # (monorepo#1515): DPkg::Lock::Timeout makes `install` wait for the
-      # dpkg locks, and the retry loop covers `update`, whose lists lock has
-      # no wait option (Debian bug #1069167).
+      # openssl-sys needs the OpenSSL headers (found via pkg-config); the
+      # GitHub-hosted Ubuntu images ship both pkg-config and libssl-dev, so
+      # this is normally a no-op — kept as an idempotent guard (ci.yml's
+      # guard, extended to also cover a missing pkg-config; passwordless
+      # sudo is standard on GitHub-hosted runners). The apt lock hardening
+      # (monorepo#1515) is harmless here and kept for symmetry with ci.yml:
+      # DPkg::Lock::Timeout makes `install` wait for the dpkg locks, and the
+      # retry loop covers `update` (Debian bug #1069167).
       - name: Install pkg-config/libssl-dev if missing
         run: |
           if ! command -v pkg-config >/dev/null || ! pkg-config --exists openssl; then
@@ -147,6 +149,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
+      # Ephemeral GitHub-hosted runners start cold, so persist the cargo
+      # registry/git caches and the sccache dir (cache-directories) across
+      # runs. Target-dir caching is deliberately off: release-plz's verify
+      # builds re-extract each package and reset mtimes, invalidating
+      # cargo's fingerprints, so a cached target dir is dead weight —
+      # sccache (content-hash keyed) is what actually warms the rebuilds
+      # (see the sccache comment below).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-plz-pr
+          cache-targets: false
+          cache-directories: |
+            ${{ runner.temp }}/sccache
       # All git_only packages run `cargo package --workspace` in separate
       # temporary worktrees; a shared target dir means only the first one
       # compiles cold and the rest reuse the build cache. The path must
@@ -155,17 +170,14 @@ jobs:
       # files from disk instead of re-running `cargo package --list`
       # (which fails for internal path-only dependencies).
       #
-      # Keep the dir OUTSIDE the runner work dir so it survives checkout's
-      # clean across runs (see ci.yml's `check` job comment), making
-      # Swatinem/rust-cache — which only ephemeral GitHub-hosted runners
-      # needed — pure overhead, so it was dropped. Key it on $RUNNER_NAME:
-      # the tinybox slots share one $HOME, and two slots must never write
-      # to the same target dir concurrently. Lives on /raid like ci.yml's
-      # target dirs — $HOME sits on the (much smaller) root volume, which
-      # this job's builds previously helped fill to ENOSPC.
-      - name: Set persistent cargo target dir
+      # The workspace-relative default location would do, but release-plz's
+      # temp worktrees need an ABSOLUTE path to share it, so pin it
+      # explicitly. $GITHUB_WORKSPACE is a fixed path on GitHub-hosted
+      # runners, which also keeps the sccache extraction paths below stable
+      # across runs.
+      - name: Set shared cargo target dir
         shell: bash
-        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/release-plz-pr/target" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target" >> "$GITHUB_ENV"
       # The shared target dir above can't make the verify builds warm:
       # release-plz runs `cargo package` per git_only package, and cargo
       # verifies each one by re-extracting the packaged tarball and building
@@ -181,20 +193,21 @@ jobs:
       # run-over-run: the fixed CARGO_TARGET_DIR keeps each package's
       # extraction path stable across pushes, so run N+1 hits run N's
       # entries, resetting whenever a release bumps versions (the version
-      # is in the path). Crates that invoke the system linker (bins,
-      # dylibs, proc-macros) and build-script runs are never cached, so
-      # expect partial hit rates.
+      # is in the path). Run-over-run persistence on these ephemeral
+      # runners comes from the rust-cache step below, which carries
+      # SCCACHE_DIR alongside the cargo caches. Crates that invoke the
+      # system linker (bins, dylibs, proc-macros) and build-script runs are
+      # never cached, so expect partial hit rates.
       #
-      # Idempotent install guard like the pkg-config one above: install the
-      # pinned, checksum-verified musl binary only if sccache is not already
-      # present. ~/.local/bin is not on the runner's default PATH, so also
-      # check the install destination directly — that keeps repeat runs from
-      # re-downloading. The staged-copy + rename makes the final install
-      # atomic, so concurrent installs from other tinybox slots (shared
-      # $HOME) can't leave a partially written binary. Fail-soft: if
-      # download/checksum/extract fails, warn and continue without sccache —
-      # the job still works, just uncached. (Explicit && chaining, not
-      # `set -e`, because -e is suppressed inside an if condition.)
+      # Idempotent install guard: install the pinned, checksum-verified musl
+      # binary only if sccache is not already present (it is not
+      # preinstalled on the GitHub-hosted images). ~/.local/bin is not
+      # guaranteed to be on PATH, so also check the install destination
+      # directly. The staged-copy + rename keeps the final install atomic.
+      # Fail-soft: if download/checksum/extract fails, warn and continue
+      # without sccache — the job still works, just uncached. (Explicit &&
+      # chaining, not `set -e`, because -e is suppressed inside an if
+      # condition.)
       - name: Install sccache if missing
         shell: bash
         run: |
@@ -225,25 +238,19 @@ jobs:
       # Exported via $GITHUB_ENV instead of static job env so that when the
       # install guard fell through, RUSTC_WRAPPER is simply never set and
       # builds proceed unwrapped. CARGO_INCREMENTAL=0 because sccache does
-      # not cache incremental compilation. Unlike CARGO_TARGET_DIR above,
-      # SCCACHE_DIR is deliberately NOT keyed on $RUNNER_NAME: sccache's
-      # local disk cache is designed for concurrent access, so one cache
-      # shared across the tinybox slots maximizes hit rates. It lives on
-      # /raid like the target dirs — $HOME sits on the much smaller root
-      # volume. SCCACHE_DIR is read by the sccache server when it starts,
-      # and clients reuse an already-running server on the default port, so
-      # any future sccache adoption on these runners must reuse this exact
-      # dir (or set a distinct SCCACHE_SERVER_PORT). SCCACHE_CACHE_SIZE is
-      # set explicitly: the 10 GiB default could thrash via eviction across
-      # the 15 per-package cwd-variants of the workspace dep graph, and
-      # /raid has room to spare.
+      # not cache incremental compilation. SCCACHE_DIR must match the
+      # rust-cache step's cache-directories entry above — that is what
+      # persists the local disk cache across these ephemeral runners.
+      # SCCACHE_CACHE_SIZE stays under the repo's 10 GiB Actions cache
+      # budget (shared with the registry caches) while still holding the
+      # 15 per-package cwd-variants of the workspace dep graph.
       - name: Enable sccache
         shell: bash
         run: |
           if command -v sccache >/dev/null; then
             echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_DIR=/raid/ci-target/intentd/sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_CACHE_SIZE=50G" >> "$GITHUB_ENV"
+            echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_CACHE_SIZE=5G" >> "$GITHUB_ENV"
             echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
           fi
       # The verify builds use the dev profile and nothing ever reads their
@@ -262,14 +269,16 @@ jobs:
       # Surface cache hit rates in the log; `always()` keeps them visible
       # when release-pr fails. Skips cleanly when sccache was never
       # enabled, and never fails the job — this step is observability only
-      # (bash runs with -e, and --show-stats can itself error, e.g. by
-      # auto-starting a server when /raid is momentarily unwritable).
+      # (bash runs with -e, and --show-stats can itself error). It also
+      # stops the sccache server so the cache dir is settled before the
+      # rust-cache post step saves it.
       - name: Show sccache stats
         if: ${{ always() }}
         shell: bash
         run: |
           if [ -n "${RUSTC_WRAPPER:-}" ] && command -v sccache >/dev/null; then
             sccache --show-stats || echo "::warning::sccache stats unavailable"
+            sccache --stop-server >/dev/null 2>&1 || true
           else
             echo "sccache not enabled; skipping stats"
           fi

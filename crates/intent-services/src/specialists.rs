@@ -5,6 +5,9 @@
 //! read-only). Ports `specialist-file-loader.ts` + `specialists.ipc.ts`'s
 //! combined load. Nothing is persisted in `SQLite`; `create`/`edit`/`delete`
 //! write user/project files only and `bundled` definitions are read-only.
+//! [`REPLACEMENT_DIR_ENV`] (startup-pinned) wholesale-replaces the base tier
+//! with an operator-supplied directory, excluding the embedded bundle and the
+//! bundled directory entirely.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +19,15 @@ const SPECIALISTS_FOLDER: &str = "specialists";
 /// Env override for the bundled (read-only) specialists directory; lets the
 /// daemon and tests point at app-shipped resources hermetically.
 const BUNDLED_DIR_ENV: &str = "INTENTD_BUNDLED_SPECIALISTS_DIR";
+/// Startup-pinned env var that wholesale-REPLACES the base specialist tier:
+/// when set to a non-empty path, the embedded bundle and the bundled
+/// directory ([`BUNDLED_DIR_ENV`]/exe-relative) are both excluded and this
+/// directory becomes the sole base (`bundled`, read-only) tier — shipped ids
+/// resolve only if present here or in the user/project tiers, which fold on
+/// top unchanged. A missing or empty directory yields an empty base tier.
+/// Reported as a settings pin (`specialists.dir`) like the other `INTENTD_*`
+/// env pins; the empty string counts as unset (no replacement).
+const REPLACEMENT_DIR_ENV: &str = "INTENTD_SPECIALISTS_DIR";
 
 /// The reference specialist definitions embedded at compile time (PP-2,
 /// byte-identical to the reference bundle, kept under the versioned
@@ -59,11 +71,106 @@ pub(crate) const EMBEDDED_BUNDLED_V1: &[(&str, &str)] = &[
     ),
 ];
 
+/// The v1.1 embedded specialist bundle (`resources/specialists/v1.1/`):
+/// the v1 files with body-identical prompts (the v1→v1.1 doctrine diff is
+/// instruction-only — the feature-section rewrites in `common.md`) plus the
+/// picker-metadata frontmatter keys (`role`/`teamAgents`/`icon`), kept as
+/// a separate directory so each version's resources stay self-contained.
+/// The v1.1 harness doctrine (`crate::harness::v1_1::ENTRY`) points here.
+pub(crate) const EMBEDDED_BUNDLED_V1_1: &[(&str, &str)] = &[
+    (
+        "chief-of-staff",
+        include_str!("../resources/specialists/v1.1/chief-of-staff.md"),
+    ),
+    (
+        "developer",
+        include_str!("../resources/specialists/v1.1/developer.md"),
+    ),
+    (
+        "implementor",
+        include_str!("../resources/specialists/v1.1/implementor.md"),
+    ),
+    (
+        "pr-reviewer",
+        include_str!("../resources/specialists/v1.1/pr-reviewer.md"),
+    ),
+    (
+        "ralph",
+        include_str!("../resources/specialists/v1.1/ralph.md"),
+    ),
+    (
+        "spec-writer",
+        include_str!("../resources/specialists/v1.1/spec-writer.md"),
+    ),
+    (
+        "ui-designer",
+        include_str!("../resources/specialists/v1.1/ui-designer.md"),
+    ),
+    (
+        "verifier",
+        include_str!("../resources/specialists/v1.1/verifier.md"),
+    ),
+];
+
+/// The v2.1 embedded specialist bundle: the frozen v1.1 definitions plus the
+/// bundled Vulnerability Scanner. Unchanged specialist bytes keep reusing the
+/// v1.1 resources; the new definition lives under `resources/specialists/v2.1/`.
+/// Harness 2.0 remains pinned to [`EMBEDDED_BUNDLED_V1_1`], while 2.1 sessions
+/// resolve this extended set.
+pub(crate) const EMBEDDED_BUNDLED_V2_1: &[(&str, &str)] = &[
+    (
+        "chief-of-staff",
+        include_str!("../resources/specialists/v1.1/chief-of-staff.md"),
+    ),
+    (
+        "developer",
+        include_str!("../resources/specialists/v1.1/developer.md"),
+    ),
+    (
+        "implementor",
+        include_str!("../resources/specialists/v1.1/implementor.md"),
+    ),
+    (
+        "pr-reviewer",
+        include_str!("../resources/specialists/v1.1/pr-reviewer.md"),
+    ),
+    (
+        "ralph",
+        include_str!("../resources/specialists/v1.1/ralph.md"),
+    ),
+    (
+        "spec-writer",
+        include_str!("../resources/specialists/v1.1/spec-writer.md"),
+    ),
+    (
+        "ui-designer",
+        include_str!("../resources/specialists/v1.1/ui-designer.md"),
+    ),
+    (
+        "verifier",
+        include_str!("../resources/specialists/v1.1/verifier.md"),
+    ),
+    (
+        "vulnerability-scanner",
+        include_str!("../resources/specialists/v2.1/vulnerability-scanner.md"),
+    ),
+];
+
 /// The embedded bundled floor the specialist 3-tier resolution uses by
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V1;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V2_1;
+
+/// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
+/// base tier: no shipped specialist survives the replacement.
+const EMPTY_BUNDLE: &[(&str, &str)] = &[];
+
+/// Parse a raw [`REPLACEMENT_DIR_ENV`] value: a non-empty path is the
+/// replacement base-tier directory; unset/empty means no replacement.
+fn replacement_dir(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    raw.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+}
 
 /// Resolve an embedded bundled specialist by id from `bundle` (the lowest
 /// tier).
@@ -152,21 +259,39 @@ fn escape_yaml(value: &str) -> String {
         .replace('\t', "\\t")
 }
 
-/// Reverse [`escape_yaml`] for a double-quoted scalar (port of
-/// `unescapeYamlValue`).
+/// Reverse [`escape_yaml`] for a double-quoted scalar. Decoded in a single
+/// left-to-right pass so an escaped backslash never re-combines with the
+/// following character (sequential `replace` calls corrupted `foo\nbar` —
+/// literal backslash + `n` — into backslash + real newline); an unrecognized
+/// escape is carried verbatim (lenient, like the rest of the parser).
 fn unescape_yaml(value: &str) -> String {
-    value
-        .replace("\\\"", "\"")
-        .replace("\\'", "'")
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\\", "\\")
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            // A trailing lone backslash is carried verbatim, like `\\`.
+            Some('\\') | None => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 /// Split optional leading `---`-delimited YAML frontmatter from the markdown
 /// body (port of `parseFrontmatter`). Returns `(frontmatter, body)`; when there
 /// is no valid frontmatter block the whole content is the body.
-fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
+pub(crate) fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
     let norm = content.replace("\r\n", "\n");
     let mut lines = norm.split('\n');
     if lines.next().map(str::trim) != Some("---") {
@@ -215,14 +340,24 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// Optional frontmatter scalar keys carried through `build_def`/`render_file`
 /// verbatim so parse→write→parse round-trips losslessly (port of
 /// `SpecialistFileFrontmatter`'s optional fields: `codingAgent`, `model`,
-/// `roleReminder`, `agentType`, plus `reasoningEffort`).
+/// `roleReminder`, `agentType`, plus `reasoningEffort`, `role` and `icon`).
 ///
 /// NOTE: the config scalars `codingAgent`/`model`/`agentType`/
-/// `reasoningEffort` ([`INHERITED_CONFIG_KEYS`]) resolve with inherit-on-omit
-/// semantics across tiers, like `hidden` (PROTOCOL §5.11,
+/// `reasoningEffort`/`role`/`icon` ([`INHERITED_CONFIG_KEYS`]) resolve with
+/// inherit-on-omit semantics across tiers, like `hidden` (PROTOCOL §5.11,
 /// intent-hq/monorepo#718): an omitted key keeps the lower tiers' effective
 /// value, an explicit empty value (`model: ""`) clears it, and an explicit
 /// non-empty value overrides it.
+/// `role` is the picker-orchestration enum (`orchestrator` | `internal`;
+/// absent = standard) and `icon` names a client-side avatar design. `icon`
+/// is render-only picker metadata; `role` additionally gates the spawn-time
+/// orchestrator tool denylist (§18.4,
+/// [`SpecialistsService::resolve_is_orchestrator`]) but is still never
+/// consulted at delegation time.
+/// `role` is validated on `specialist.create`/`edit` ([`validate_role_spec`])
+/// but read leniently — an out-of-enum on-disk value is normalized to
+/// omitted (which inherits), so `list`/`get` never serve a value the strict
+/// write validation would reject when a client echoes the def back.
 /// `roleReminder` stays winner-takes-all — it is carried through only when
 /// present in the winning file (an omitted key falls back to auto-derivation
 /// from the winning body, so inheriting a lower tier's reminder would pin a
@@ -233,65 +368,201 @@ const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
     "reasoningEffort",
     "roleReminder",
     "agentType",
+    "role",
+    "icon",
 ];
 
 /// The subset of [`OPTIONAL_FRONTMATTER_KEYS`] with inherit-on-omit semantics
 /// across tiers; each key inherits independently.
-const INHERITED_CONFIG_KEYS: &[&str] = &["codingAgent", "model", "reasoningEffort", "agentType"];
+const INHERITED_CONFIG_KEYS: &[&str] = &[
+    "codingAgent",
+    "model",
+    "reasoningEffort",
+    "agentType",
+    "role",
+    "icon",
+];
+
+/// Wire/frontmatter values accepted for the `role` enum on write (PROTOCOL
+/// §5.11): `orchestrator` (powers the team-mode card), `internal` (excluded
+/// from the New Workspace modal's single-agent picker only), or the
+/// explicit-clear empty string.
+const ROLE_VALUES: &[&str] = &["orchestrator", "internal", ""];
+
+/// The tier-folded resolution state of a specialist's `role` frontmatter
+/// ([`SpecialistsService::resolve_role_state`]): the wire def drops the
+/// explicit `role: ""` clear (it folds to an absent key), but the
+/// orchestrator gate needs to tell that deliberate clear apart from a role
+/// that was never set (fail-closed historical-name fallback, §18.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RoleResolution {
+    /// The highest role-bearing tier set a non-empty in-enum role.
+    Role(String),
+    /// The highest role-bearing tier wrote the explicit `role: ""` clear.
+    Cleared,
+    /// The specialist resolves but no tier ever touched the key (an
+    /// out-of-enum on-disk value reads as untouched, like the lenient wire
+    /// normalization in [`build_def_inheriting`]).
+    Absent,
+    /// The id does not resolve to any specialist.
+    Unknown,
+}
+
+/// Fold one tier's raw frontmatter into a role resolution `state`
+/// ([`SpecialistsService::resolve_role_state`]): a valid in-enum `role`
+/// value overrides (empty ⇒ [`RoleResolution::Cleared`], non-empty ⇒
+/// [`RoleResolution::Role`]); an omitted or out-of-enum value leaves the
+/// lower tiers' state untouched — the same per-key inherit-on-omit /
+/// lenient-read semantics as [`build_def_inheriting`].
+fn fold_role_directive(state: &mut RoleResolution, content: &str) {
+    let (fm, _) = parse_frontmatter(content);
+    if let Some(v) = fm
+        .get("role")
+        .and_then(Value::as_str)
+        .filter(|v| ROLE_VALUES.contains(v))
+    {
+        *state = if v.is_empty() {
+            RoleResolution::Cleared
+        } else {
+            RoleResolution::Role(v.to_string())
+        };
+    }
+}
+
+/// The picker/routing-metadata frontmatter keys (PROTOCOL §5.11) — the only
+/// frontmatter allowed to diverge between the v1 and v1.1 bundled specialist
+/// copies (none of them reach assembled prompt bytes, so the v1 doctrine
+/// stays frozen). Consumed only by the cross-version goldens
+/// (`v1_1_goldens`, `harness::tests`), which compare frontmatter modulo this
+/// set — hence the allow: the lib build has no reader.
+#[allow(dead_code)]
+pub(crate) const PICKER_METADATA_KEYS: &[&str] = &["role", "icon", TEAM_AGENTS_KEY, ALIASES_KEY];
+
+/// Strictly validate a wire `role` value (`specialist.create`/`edit` specs):
+/// when present it must be a string in [`ROLE_VALUES`] (`""` is the
+/// explicit clear); anything else → `-32602`. Files are read leniently — an
+/// out-of-enum on-disk value is normalized to omitted by
+/// [`build_def_inheriting`] (like an unparseable `teamAgents`), never served.
+fn validate_role_spec(value: Option<&Value>) -> Result<()> {
+    let Some(value) = value else { return Ok(()) };
+    match value.as_str() {
+        Some(s) if ROLE_VALUES.contains(&s) => Ok(()),
+        _ => Err(Error::InvalidParams(
+            "role must be \"orchestrator\", \"internal\", or \"\"".to_string(),
+        )),
+    }
+}
+
+/// Strictly validate a wire `icon` value (`specialist.create`/`edit` specs):
+/// when present it must be a string (`""` is the explicit clear); any other
+/// JSON type → `-32602`. Icon names are free-form (they name client-side
+/// avatar designs), so no enum is enforced.
+fn validate_icon_spec(value: Option<&Value>) -> Result<()> {
+    match value {
+        None | Some(Value::String(_)) => Ok(()),
+        Some(_) => Err(Error::InvalidParams("icon must be a string".to_string())),
+    }
+}
 
 /// Frontmatter/wire key for the ordered list of delegation model options —
-/// `{ model, hint, reasoningEffort? }` entries a delegating agent can pick
-/// from (PROTOCOL §5.11).
+/// `{ provider?, model, hint, reasoningEffort? }` triples a delegating agent
+/// can pick from (PROTOCOL §5.11). `model` is a BARE model id; an omitted
+/// `provider` means the specialist's own provider (`codingAgent`, else the
+/// settings-derived default).
 /// Encoded in frontmatter as a **single-line JSON-array scalar** (e.g.
-/// `modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap"}]`) so it fits
-/// the line-based parser and round-trips losslessly. Resolution follows the
-/// same inherit-on-omit fold as [`INHERITED_CONFIG_KEYS`]: an omitted key
-/// inherits the lower tiers' effective list, an explicit `[]` clears it, and
-/// a non-empty list overrides it wholesale (entries never merge across tiers).
+/// `modelOptions: [{"provider":"opencode","model":"kimi-k3","hint":"cheap"}]`)
+/// so it fits the line-based parser and round-trips losslessly. Resolution
+/// follows the same inherit-on-omit fold as [`INHERITED_CONFIG_KEYS`]: an
+/// omitted key inherits the lower tiers' effective list, an explicit `[]`
+/// clears it, and a non-empty list overrides it wholesale (entries never
+/// merge across tiers).
 const MODEL_OPTIONS_KEY: &str = "modelOptions";
 
-/// Normalize one `modelOptions` entry to its documented fields, or `None` when
-/// the entry is unusable: `model` must be a non-empty (non-whitespace) string;
-/// `hint` is carried when it is a string and defaults to `""` otherwise;
-/// `reasoningEffort` is carried only when it is a non-empty string (the
-/// per-option effort level, PROTOCOL §5.11) and omitted otherwise.
+/// Normalize one `modelOptions` entry to its documented triple fields, or
+/// `None` when the entry is unusable: `model` must be a non-empty
+/// (non-whitespace) string; `provider` is carried when it is a non-empty
+/// string; `hint` is carried when it is a string and defaults to `""`
+/// otherwise; `reasoningEffort` is carried only when it is a non-empty string
+/// (the per-option effort level, PROTOCOL §5.11) and omitted otherwise.
+///
+/// Legacy compound `model` ids split on read: `provider:model` becomes the
+/// explicit `provider` plus the bare `model` (both halves trimmed), the
+/// prefix winning over an entry-level `provider` field (mirroring the spawn
+/// precedence compound ids had, where the model prefix outranked the provider
+/// column). A compound id with an empty prefix or an empty rest is unusable.
+/// The re-split on every read is safe because bare model ids never contain a
+/// colon — `reject_compound_model` enforces that invariant on every wire
+/// write, so a persisted triple's `model` can never re-split.
 fn normalize_model_option_entry(entry: &Value) -> Option<Value> {
     let obj = entry.as_object()?;
-    let model = obj
+    let raw_model = obj
         .get("model")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())?;
+    let (provider, model) = match raw_model.split_once(':') {
+        Some((prefix, rest)) => {
+            if prefix.trim().is_empty() || rest.trim().is_empty() {
+                return None;
+            }
+            (Some(prefix.trim().to_string()), rest.trim().to_string())
+        }
+        None => (
+            obj.get("provider")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+            raw_model.to_string(),
+        ),
+    };
     let hint = obj.get("hint").and_then(Value::as_str).unwrap_or("");
-    let mut out = json!({ "model": model, "hint": hint });
+    let mut out = Map::new();
+    if let Some(provider) = provider {
+        out.insert("provider".into(), json!(provider));
+    }
+    out.insert("model".into(), json!(model));
+    out.insert("hint".into(), json!(hint));
     if let Some(effort) = obj
         .get("reasoningEffort")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
     {
-        out["reasoningEffort"] = json!(effort);
+        out.insert("reasoningEffort".into(), json!(effort));
     }
-    Some(out)
+    Some(Value::Object(out))
 }
 
 /// Strictly validate a wire `modelOptions` value (`specialist.create`/`edit`
-/// specs): must be a JSON array of `{ model, hint?, reasoningEffort? }`
-/// objects with a non-empty string `model`, a string `hint` (defaulting to
-/// `""` when absent), and — when present — a string `reasoningEffort`.
+/// specs): must be a JSON array of `{ provider?, model, hint?, reasoningEffort? }`
+/// objects with a non-empty string `model`, an optional non-empty string
+/// `provider`, a string `hint` (defaulting to `""` when absent), and — when
+/// present — a string `reasoningEffort`.
 /// Returns the normalized entries in input order (`None` when the key is
-/// absent — the inherit-on-omit case); any invalid shape → `-32602`.
+/// absent — the inherit-on-omit case); any invalid shape → `-32602`. Compound
+/// `provider:model` ids are NOT rejected here — legacy defs re-render through
+/// this path ([`render_file`]) and split into the explicit triple; the
+/// wire-boundary colon guard lives in [`reject_compound_model_options_spec`].
 fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
     let Some(value) = value else { return Ok(None) };
     let Some(arr) = value.as_array() else {
         return Err(Error::InvalidParams(
-            "modelOptions must be an array of { model, hint } objects".to_string(),
+            "modelOptions must be an array of { provider?, model, hint } objects".to_string(),
         ));
     };
     let mut out = Vec::with_capacity(arr.len());
     for entry in arr {
         if !entry.is_object() {
             return Err(Error::InvalidParams(
-                "modelOptions entries must be { model, hint } objects".to_string(),
+                "modelOptions entries must be { provider?, model, hint } objects".to_string(),
             ));
+        }
+        match entry.get("provider") {
+            None => {}
+            Some(Value::String(s)) if !s.trim().is_empty() => {}
+            Some(_) => {
+                return Err(Error::InvalidParams(
+                    "modelOptions entry provider must be a non-empty string".to_string(),
+                ));
+            }
         }
         match entry.get("hint") {
             None | Some(Value::String(_)) => {}
@@ -319,6 +590,23 @@ fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value
     Ok(Some(out))
 }
 
+/// Wire-boundary colon guard for `specialist.create`/`edit` specs (PROTOCOL
+/// §5.5): every `modelOptions` entry's `model` must be a **bare** model id —
+/// compound `provider:model` ids reject with `-32602` naming the offending
+/// entry. Kept separate from [`validate_model_options_spec`] so legacy defs
+/// carrying compound entries still re-render losslessly.
+fn reject_compound_model_options_spec(value: Option<&Value>) -> Result<()> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (i, entry) in entries.iter().enumerate() {
+        if let Some(model) = entry.get("model").and_then(Value::as_str) {
+            crate::reject_compound_model(&format!("modelOptions[{i}].model"), model)?;
+        }
+    }
+    Ok(())
+}
+
 /// Leniently parse a frontmatter `modelOptions` scalar (the single-line
 /// JSON-array string). Files are never rejected on read: an unparseable value
 /// or a non-array yields `None` (treated like an omitted key, which inherits),
@@ -337,6 +625,127 @@ fn parse_model_options_frontmatter(raw: &str) -> Option<Vec<Value>> {
         return None;
     }
     Some(normalized)
+}
+
+/// A lenient frontmatter parser for a single-line JSON-array scalar key
+/// ([`parse_model_options_frontmatter`] / [`parse_team_agents_frontmatter`]).
+type FrontmatterListParser = fn(&str) -> Option<Vec<Value>>;
+
+/// Frontmatter/wire key for the orchestrator's advisory team roster — the
+/// specialist ids it delegates to (PROTOCOL §5.11), used by clients to render
+/// the team-mode card; never enforced at delegation time.
+/// Encoded in frontmatter as a **single-line JSON-array scalar** (e.g.
+/// `teamAgents: ["implementor","verifier"]`) so it fits the line-based
+/// parser and round-trips losslessly. Resolution follows the same
+/// inherit-on-omit fold as [`MODEL_OPTIONS_KEY`]: an omitted key inherits the
+/// lower tiers' effective list, an explicit `[]` clears it, and a non-empty
+/// list overrides it wholesale (entries never merge across tiers).
+const TEAM_AGENTS_KEY: &str = "teamAgents";
+
+/// Strictly validate a wire `teamAgents` value (`specialist.create`/`edit`
+/// specs): must be a JSON array of non-empty (non-whitespace) strings.
+/// Returns the entries in input order (`None` when the key is absent — the
+/// inherit-on-omit case); any invalid shape → `-32602`.
+fn validate_team_agents_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
+    let Some(value) = value else { return Ok(None) };
+    let Some(arr) = value.as_array() else {
+        return Err(Error::InvalidParams(
+            "teamAgents must be an array of specialist-id strings".to_string(),
+        ));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        match entry.as_str() {
+            Some(s) if !s.trim().is_empty() => out.push(json!(s)),
+            _ => {
+                return Err(Error::InvalidParams(
+                    "teamAgents entries must be non-empty strings".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Leniently parse a frontmatter `teamAgents` scalar (the single-line
+/// JSON-array string), mirroring [`parse_model_options_frontmatter`]: an
+/// unparseable value or a non-array yields `None` (treated like an omitted
+/// key, which inherits), and unusable entries (non-strings, empty strings)
+/// are skipped individually. Only a literal `[]` is the explicit clear
+/// (`Some(vec![])`); a non-empty array whose entries are all unusable also
+/// yields `None`, so a bad hand-authored entry does not silently drop an
+/// inherited list.
+fn parse_team_agents_frontmatter(raw: &str) -> Option<Vec<Value>> {
+    let parsed: Value = serde_json::from_str(raw.trim()).ok()?;
+    let arr = parsed.as_array()?;
+    let normalized: Vec<Value> = arr
+        .iter()
+        .filter_map(|e| {
+            e.as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| json!(s))
+        })
+        .collect();
+    if normalized.is_empty() && !arr.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Frontmatter/wire key for a specialist's alternate ids (PROTOCOL §5.11):
+/// spawn/delegation callers may address the specialist by any listed alias,
+/// and resolution maps the alias to this canonical definition — the CANONICAL
+/// id is what gets persisted on created sessions (`metadata.specialist`), so
+/// downstream consumers keying on the id never see an alias. Encoded in
+/// frontmatter as a **single-line JSON-array scalar** (e.g.
+/// `aliases: ["coordinator"]`) so it fits the line-based parser and
+/// round-trips losslessly. Resolution follows the same inherit-on-omit fold
+/// as [`TEAM_AGENTS_KEY`]: an omitted key inherits the lower tiers' effective
+/// list, an explicit `[]` clears it, and a non-empty list overrides it
+/// wholesale.
+///
+/// Collision rules (deterministic):
+/// - A canonical specialist id always wins over any alias — alias lookup only
+///   runs after direct resolution misses, so an alias shadowing a real id is
+///   simply never consulted.
+/// - When multiple specialists claim the same alias, the one with the
+///   lexicographically smallest canonical id wins (ids are scanned in
+///   ascending order).
+const ALIASES_KEY: &str = "aliases";
+
+/// Strictly validate a wire `aliases` value (`specialist.create`/`edit`
+/// specs): must be a JSON array of non-empty (non-whitespace) strings, and —
+/// stricter than `teamAgents` — each entry must itself pass `validate_id`
+/// (aliases are looked up exactly like specialist ids, so an entry
+/// `alias_target` could never match, e.g. `"foo/bar"`, would be a silently
+/// dead alias). Returns the entries in input order (`None` when the key is
+/// absent — the inherit-on-omit case); any invalid shape → `-32602`.
+fn validate_aliases_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
+    let Some(value) = value else { return Ok(None) };
+    let Some(arr) = value.as_array() else {
+        return Err(Error::InvalidParams(
+            "aliases must be an array of specialist-id strings".to_string(),
+        ));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        match entry.as_str() {
+            Some(s) if !s.trim().is_empty() => {
+                validate_id(s).map_err(|_| {
+                    Error::InvalidParams(format!(
+                        "aliases entries must be valid specialist ids: {s:?}"
+                    ))
+                })?;
+                out.push(json!(s));
+            }
+            _ => {
+                return Err(Error::InvalidParams(
+                    "aliases entries must be non-empty strings".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Retired frontmatter/wire keys, tolerated-and-ignored like the retired
@@ -375,6 +784,32 @@ fn effective_hidden(def: &Value) -> bool {
     def.get("hidden").and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Lenient read normalization of a legacy compound frontmatter `model`
+/// scalar (PROTOCOL §5.11): `model: "provider:model"` splits into the bare
+/// `model` plus a `codingAgent` set to the prefix — the prefix WINS over any
+/// `codingAgent` the same file declares, preserving the spawn precedence
+/// compound ids had (the model prefix outranked the provider column). A
+/// compound with an empty prefix or empty rest is unusable and reads as an
+/// omitted key (which inherits). Wire writes of compound `model` values are
+/// rejected up front (`reject_compound_model`), so this only ever fires for
+/// pre-triple on-disk files — a bare model id never contains a colon, which
+/// is what makes the re-split on every read idempotent.
+fn split_compound_model_scalar(fm: &mut Map<String, Value>) {
+    let Some(raw) = fm.get("model").and_then(Value::as_str) else {
+        return;
+    };
+    let Some((prefix, rest)) = raw.split_once(':') else {
+        return;
+    };
+    if prefix.trim().is_empty() || rest.trim().is_empty() {
+        fm.remove("model");
+        return;
+    }
+    let (prefix, rest) = (prefix.trim().to_string(), rest.trim().to_string());
+    fm.insert("model".into(), json!(rest));
+    fm.insert("codingAgent".into(), json!(prefix));
+}
+
 /// Build a wire `SpecialistDef` from one file's `content`. `source` is the
 /// winning tier; `path` is the resolved file (omitted for `bundled`,
 /// PROTOCOL §5.11). `prompt` is the markdown body; the optional frontmatter
@@ -398,9 +833,10 @@ fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
 /// when the effective value is true. The config scalars
 /// ([`INHERITED_CONFIG_KEYS`]) inherit independently per key: an omitted key
 /// keeps the lower tiers' effective value, an explicit empty value clears it,
-/// and an explicit non-empty value overrides it; [`MODEL_OPTIONS_KEY`] follows
-/// the same fold with `[]` as the explicit clear. `roleReminder` does not
-/// inherit — it is emitted only when present in this file.
+/// and an explicit non-empty value overrides it; [`MODEL_OPTIONS_KEY`] and
+/// [`TEAM_AGENTS_KEY`] follow the same fold with `[]` as the explicit clear.
+/// `roleReminder` does not inherit — it is emitted only when present in this
+/// file.
 fn build_def_inheriting(
     id: &str,
     content: &str,
@@ -408,7 +844,8 @@ fn build_def_inheriting(
     path: &Path,
     inherited: Option<&Value>,
 ) -> Value {
-    let (fm, body) = parse_frontmatter(content);
+    let (mut fm, body) = parse_frontmatter(content);
+    split_compound_model_scalar(&mut fm);
     let name = fm
         .get("name")
         .and_then(Value::as_str)
@@ -425,7 +862,15 @@ fn build_def_inheriting(
     def.insert("name".into(), json!(name));
     def.insert("description".into(), json!(description));
     for &key in OPTIONAL_FRONTMATTER_KEYS {
-        match fm.get(key).and_then(Value::as_str) {
+        // Lenient read normalization: an out-of-enum on-disk `role` is
+        // treated like an omitted key (which inherits), mirroring the
+        // unparseable-`teamAgents` case — `list`/`get` must never serve a
+        // value the strict write validation would reject on echo-back.
+        let value = fm
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| key != "role" || ROLE_VALUES.contains(v));
+        match value {
             Some(v) if !v.is_empty() => {
                 def.insert(key.into(), json!(v));
             }
@@ -445,28 +890,32 @@ fn build_def_inheriting(
             Some(_) | None => {}
         }
     }
-    // `modelOptions` (PROTOCOL §5.11): same inherit-on-omit fold as the config
-    // scalars — an omitted key inherits the lower tiers' effective list, an
-    // explicit `[]` clears it, and a non-empty list overrides it wholesale.
-    // Unparseable frontmatter is tolerated like an omitted key (files are
-    // never rejected on read).
-    match fm
-        .get(MODEL_OPTIONS_KEY)
-        .and_then(Value::as_str)
-        .and_then(parse_model_options_frontmatter)
-    {
-        Some(opts) if !opts.is_empty() => {
-            def.insert(MODEL_OPTIONS_KEY.into(), Value::Array(opts));
-        }
-        // Explicit `[]`: clears any inherited list (nothing emitted).
-        Some(_) => {}
-        None => {
-            if let Some(opts) = inherited
-                .and_then(|d| d.get(MODEL_OPTIONS_KEY))
-                .and_then(Value::as_array)
-                .filter(|a| !a.is_empty())
-            {
-                def.insert(MODEL_OPTIONS_KEY.into(), Value::Array(opts.clone()));
+    // `modelOptions` / `teamAgents` / `aliases` (PROTOCOL §5.11): same
+    // inherit-on-omit fold as the config scalars — an omitted key inherits
+    // the lower tiers' effective list, an explicit `[]` clears it, and a
+    // non-empty list overrides it wholesale. Unparseable frontmatter is
+    // tolerated like an omitted key (files are never rejected on read).
+    // `aliases` reuses the `teamAgents` lenient string-array parser.
+    let json_array_keys: [(&str, FrontmatterListParser); 3] = [
+        (MODEL_OPTIONS_KEY, parse_model_options_frontmatter),
+        (TEAM_AGENTS_KEY, parse_team_agents_frontmatter),
+        (ALIASES_KEY, parse_team_agents_frontmatter),
+    ];
+    for (key, parse) in json_array_keys {
+        match fm.get(key).and_then(Value::as_str).and_then(parse) {
+            Some(entries) if !entries.is_empty() => {
+                def.insert(key.into(), Value::Array(entries));
+            }
+            // Explicit `[]`: clears any inherited list (nothing emitted).
+            Some(_) => {}
+            None => {
+                if let Some(entries) = inherited
+                    .and_then(|d| d.get(key))
+                    .and_then(Value::as_array)
+                    .filter(|a| !a.is_empty())
+                {
+                    def.insert(key.into(), Value::Array(entries.clone()));
+                }
             }
         }
     }
@@ -499,9 +948,10 @@ fn build_def_inheriting(
 /// the prompt body. For the config scalars ([`INHERITED_CONFIG_KEYS`]) an
 /// explicit empty string writes `key: ""` — the explicit-clear that stops
 /// inheritance — while an absent key writes nothing (inherits); an empty
-/// `roleReminder` is skipped like an absent one. A supplied
-/// [`MODEL_OPTIONS_KEY`] list is written as a single-line JSON-array scalar
-/// (an explicit `[]` is the clear; an absent key writes nothing). The body is
+/// `roleReminder` is skipped like an absent one. Supplied
+/// [`MODEL_OPTIONS_KEY`] / [`TEAM_AGENTS_KEY`] / [`ALIASES_KEY`] lists are
+/// written as single-line JSON-array scalars (an explicit `[]` is the clear;
+/// an absent key writes nothing). The body is
 /// taken from `prompt`, falling back to the `behaviorPrompt` alias (mirroring
 /// `SpecialistProposalPayload`). Only documented fields are written so
 /// parse→write→parse round-trips losslessly.
@@ -522,13 +972,19 @@ fn render_file(id: &str, spec: &Value) -> String {
             }
         }
     }
-    // `modelOptions` is written as a single-line JSON-array scalar; an
-    // explicit empty array writes `modelOptions: []` — the explicit clear
+    // `modelOptions` / `teamAgents` are written as single-line JSON-array
+    // scalars; an explicit empty array writes `key: []` — the explicit clear
     // that stops inheritance — while an absent key writes nothing (inherits).
-    // `create`/`edit` validate the value before rendering (`-32602` on
+    // `create`/`edit` validate the values before rendering (`-32602` on
     // invalid shapes); `render_file` itself silently skips anything invalid.
     if let Ok(Some(opts)) = validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY)) {
         fm.push(format!("{MODEL_OPTIONS_KEY}: {}", Value::Array(opts)));
+    }
+    if let Ok(Some(agents)) = validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY)) {
+        fm.push(format!("{TEAM_AGENTS_KEY}: {}", Value::Array(agents)));
+    }
+    if let Ok(Some(aliases)) = validate_aliases_spec(spec.get(ALIASES_KEY)) {
+        fm.push(format!("{ALIASES_KEY}: {}", Value::Array(aliases)));
     }
     if let Some(hidden) = hidden_state(spec.get("hidden")) {
         fm.push(format!("hidden: {hidden}"));
@@ -625,17 +1081,50 @@ pub(crate) struct SpecialistsService {
     /// bundle via [`Self::with_embedded`]. The file tiers above it are
     /// user-owned and unversioned.
     embedded: &'static [(&'static str, &'static str)],
+    /// Whether [`REPLACEMENT_DIR_ENV`] replaced the base tier at construction:
+    /// `bundled_dir` is the replacement directory, `embedded` is empty, and
+    /// [`Self::with_embedded`] keeps it that way (session pins never restore
+    /// the shipped bundle behind a startup-pinned replacement).
+    base_replaced: bool,
 }
 
 impl SpecialistsService {
     /// Build the service, resolving any unset directory from the environment
     /// (`~/.intent/specialists/` for user, [`BUNDLED_DIR_ENV`]/exe-relative for
-    /// bundled). Tests inject explicit roots for hermetic 3-tier coverage.
+    /// bundled). When no bundled root is injected and [`REPLACEMENT_DIR_ENV`]
+    /// is set to a non-empty path the base tier is wholesale-replaced instead
+    /// ([`Self::with_base_replacement`]) — an explicitly injected
+    /// `bundled_dir` wins over the env var (matching [`BUNDLED_DIR_ENV`],
+    /// consulted only inside `default_bundled_dir`), so tests that inject
+    /// explicit roots stay hermetic even when the var is exported.
     pub(crate) fn new(user_dir: Option<PathBuf>, bundled_dir: Option<PathBuf>) -> Self {
+        if bundled_dir.is_none() {
+            if let Some(dir) = replacement_dir(std::env::var_os(REPLACEMENT_DIR_ENV)) {
+                return Self::with_base_replacement(user_dir, dir);
+            }
+        }
         Self {
             user_dir: user_dir.or_else(default_user_dir),
             bundled_dir: bundled_dir.or_else(default_bundled_dir),
             embedded: EMBEDDED_BUNDLED,
+            base_replaced: false,
+        }
+    }
+
+    /// Build the service with the base tier wholesale-replaced by `dir`
+    /// (the effective `specialists.dir` setting — [`REPLACEMENT_DIR_ENV`]
+    /// startup pin or config.toml): the embedded bundle and the bundled
+    /// directory are excluded, and `dir` is the sole base (`bundled`,
+    /// read-only) tier — a missing/empty `dir` yields an empty base tier.
+    /// The user/project tiers fold on top unchanged. Split out of
+    /// [`Self::new`] so tests cover replacement hermetically, without
+    /// mutating process-global env.
+    pub(crate) fn with_base_replacement(user_dir: Option<PathBuf>, dir: PathBuf) -> Self {
+        Self {
+            user_dir: user_dir.or_else(default_user_dir),
+            bundled_dir: Some(dir),
+            embedded: EMPTY_BUNDLE,
+            base_replaced: true,
         }
     }
 
@@ -649,8 +1138,14 @@ impl SpecialistsService {
     /// stay latest-bound, so if a future bundle changes a specialist's
     /// scalar, pinned sessions adopt the new behavior while keeping their
     /// pinned prompt text.
+    ///
+    /// No-op when [`REPLACEMENT_DIR_ENV`] replaced the base tier: the
+    /// replacement directory stays the sole base tier, so pinned sessions
+    /// never resurrect shipped bundles the operator excluded at startup.
     pub(crate) fn with_embedded(mut self, bundle: &'static [(&'static str, &'static str)]) -> Self {
-        self.embedded = bundle;
+        if !self.base_replaced {
+            self.embedded = bundle;
+        }
         self
     }
 
@@ -668,7 +1163,22 @@ impl SpecialistsService {
         Some(build_def_inheriting(id, &content, source, &path, inherited))
     }
 
-    /// Resolve a single id through the 3-tier order project > user > bundled.
+    /// Resolve a single id through the 3-tier order project > user > bundled,
+    /// falling back to alias lookup ([`ALIASES_KEY`]) when no specialist
+    /// carries the id directly. A canonical id therefore always wins over an
+    /// alias with the same spelling — the alias scan only runs after direct
+    /// resolution misses. The returned def is the canonical specialist's
+    /// (its `id` field carries the CANONICAL id, never the alias).
+    fn resolve(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
+        if let Some(def) = self.resolve_direct(id, workspace_path) {
+            return Some(def);
+        }
+        let canonical = self.alias_target(id, workspace_path)?;
+        self.resolve_direct(&canonical, workspace_path)
+    }
+
+    /// Resolve a single id through the 3-tier order project > user > bundled
+    /// — direct lookup only, no alias fallback.
     /// Within the bundled tier an on-disk file wins over the embedded copy;
     /// the compile-time embedded set (`self.embedded`, the latest bundle
     /// unless a session pinned one via [`Self::with_embedded`]) is the
@@ -680,7 +1190,7 @@ impl SpecialistsService {
     /// (PROTOCOL §5.11).
     /// SECURITY: validates the id before file access to prevent path traversal
     /// (review thread `PRRT_kwDOS9Wxuc6SIlcV`).
-    fn resolve(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
+    fn resolve_direct(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
         // Validate id before passing to load_from_dir to prevent path traversal
         // attacks on ALL frontmatter lookups (resolve_agent_type, resolve_model,
         // resolve_role_reminder, resolve_prompt_injection).
@@ -699,6 +1209,68 @@ impl SpecialistsService {
             }
         }
         resolved
+    }
+
+    /// Map an alias to the canonical id of the specialist claiming it via
+    /// [`ALIASES_KEY`], or `None` when no resolved specialist does. Scans the
+    /// full resolved catalog ([`Self::collect_catalog`]) in ascending
+    /// canonical-id order, so when multiple specialists claim the same alias
+    /// the lexicographically smallest canonical id wins deterministically.
+    /// Only runs after direct resolution misses (see [`Self::resolve`]), so
+    /// an alias can never shadow a canonical id.
+    fn alias_target(&self, alias: &str, workspace_path: Option<&Path>) -> Option<String> {
+        validate_id(alias).ok()?;
+        let catalog = self.collect_catalog(workspace_path);
+        for (canonical, def) in catalog {
+            let claims = def
+                .get(ALIASES_KEY)
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(alias)));
+            if claims {
+                return Some(canonical);
+            }
+        }
+        None
+    }
+
+    /// Map an id-or-alias to its canonical specialist id: a directly-known
+    /// id returns itself; an alias returns the canonical id of the specialist
+    /// claiming it ([`Self::alias_target`]); an unknown id returns `None`.
+    /// Spawn/delegation seams call this before persisting a session's
+    /// `specialist` so `metadata.specialist` always carries the canonical id
+    /// (e.g. spawning with `"coordinator"` persists `"spec-writer"`).
+    pub(crate) fn canonical_id(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
+        if self.resolve_direct(id, workspace_path).is_some() {
+            return Some(id.to_string());
+        }
+        self.alias_target(id, workspace_path)
+    }
+
+    /// Strict form of [`Self::canonical_id`] for the spawn/update seams
+    /// (monorepo#3497): an unknown id is rejected with `-32602` naming the
+    /// id and the known catalog ids, instead of being persisted verbatim
+    /// with no behavior prompt. The known-id list matches [`Self::list`]
+    /// (retired `ralph` excluded).
+    pub(crate) fn canonical_id_or_err(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Result<String> {
+        // Ralph remains resolvable for existing sessions (inheritance uses
+        // the lenient `canonical_id`), but is retired from new-session
+        // catalogs ([`Self::list`]) — so the strict seams reject it like any
+        // other undiscoverable id.
+        let mut catalog = self.collect_catalog(workspace_path);
+        catalog.remove("ralph");
+        if let Some(canonical) = self.canonical_id(id, workspace_path) {
+            if catalog.contains_key(&canonical) {
+                return Ok(canonical);
+            }
+        }
+        let known = catalog.into_keys().collect::<Vec<_>>().join(", ");
+        Err(Error::InvalidParams(format!(
+            "unknown specialist: {id} (known specialists: {known}; aliases are accepted)"
+        )))
     }
 
     /// The def inherited from the tiers **below** `scope` — the same fold
@@ -747,6 +1319,83 @@ impl SpecialistsService {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         })
+    }
+
+    /// Resolve a specialist's `role` frontmatter enum (PROTOCOL §5.11:
+    /// `orchestrator` | `internal`) through the 3-tier order (project >
+    /// user > bundled). Returns `None` when the specialist is unknown or
+    /// carries no effective role (omitted, explicitly cleared, or
+    /// normalized-out on read); callers that must tell the explicit
+    /// `role: ""` clear apart from omission use [`Self::resolve_role_state`]
+    /// — the sole production reader ([`Self::resolve_is_orchestrator`]) now
+    /// does, leaving this wire-shaped view test-only.
+    #[cfg(test)]
+    pub(crate) fn resolve_role(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
+        match self.resolve_role_state(id, workspace_path) {
+            RoleResolution::Role(role) => Some(role),
+            _ => None,
+        }
+    }
+
+    /// The tier-folded resolution state of a specialist's `role` frontmatter
+    /// (PROTOCOL §5.11), distinguishing the explicit `role: ""` clear from a
+    /// role that was never set. The wire def cannot make that distinction —
+    /// the clear folds to an absent key inside `resolve()` — but the
+    /// orchestrator gate must: an explicit clear is a deliberate opt-out of
+    /// the historical-name fallback, plain omission stays fail-closed
+    /// ([`Self::resolve_is_orchestrator`]). The fold mirrors
+    /// [`build_def_inheriting`]'s per-key inheritance: raw frontmatter is
+    /// read tier by tier from the embedded floor upward, an omitted (or
+    /// out-of-enum, read-leniently) key keeps the lower tiers' state, and
+    /// the highest tier that touches the key decides.
+    pub(crate) fn resolve_role_state(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> RoleResolution {
+        let Some(canonical) = self.canonical_id(id, workspace_path) else {
+            return RoleResolution::Unknown;
+        };
+        let mut state = RoleResolution::Absent;
+        if let Some((_, content)) = self.embedded.iter().find(|(k, _)| *k == canonical) {
+            fold_role_directive(&mut state, content);
+        }
+        let project = workspace_path.map(project_dir);
+        let tiers = [
+            self.bundled_dir.as_deref(),
+            self.user_dir.as_deref(),
+            project.as_deref(),
+        ];
+        for dir in tiers.into_iter().flatten() {
+            if let Ok(content) = std::fs::read_to_string(dir.join(format!("{canonical}.md"))) {
+                fold_role_directive(&mut state, &content);
+            }
+        }
+        state
+    }
+
+    /// Whether a specialist id resolves to the `orchestrator` role — the
+    /// spawn-time gate for the orchestrator tool denylist (§18.4,
+    /// `intent_acp::get_native_tools_to_remove`). An explicitly resolved role
+    /// decides directly, and an explicit `role: ""` clear reads as NOT an
+    /// orchestrator (the user deliberately cleared the inherited role); only
+    /// when no tier ever touched the key — or the id no longer resolves at
+    /// all — do the historical orchestrator ids `spec-writer`/`coordinator`
+    /// fall back to orchestrator by name. The fallback exists because
+    /// sessions can carry those ids without a resolvable role: the v1
+    /// embedded floor predates the `role` key (picker metadata landed in
+    /// v1.1), and a session's specialist may no longer resolve at all
+    /// (deleted custom file, [`REPLACEMENT_DIR_ENV`] base replacement, v1
+    /// floor without the `coordinator` alias) — dropping the restriction
+    /// there would silently hand an orchestrator its file-editing tools back.
+    pub(crate) fn resolve_is_orchestrator(&self, id: &str, workspace_path: Option<&Path>) -> bool {
+        match self.resolve_role_state(id, workspace_path) {
+            RoleResolution::Role(role) => role == "orchestrator",
+            RoleResolution::Cleared => false,
+            RoleResolution::Absent | RoleResolution::Unknown => {
+                matches!(id, "spec-writer" | "coordinator")
+            }
+        }
     }
 
     /// Resolve a specialist's display name (frontmatter `name`, defaulting to
@@ -801,21 +1450,32 @@ impl SpecialistsService {
     }
 
     /// Resolve the `reasoningEffort` declared by the specialist's
-    /// [`MODEL_OPTIONS_KEY`] entry whose `model` equals `model` (PROTOCOL
-    /// §5.11) — the model-option rung of the delegation effort resolution.
+    /// [`MODEL_OPTIONS_KEY`] entry matching the `{ provider, model }` pair
+    /// (PROTOCOL §5.11) — the model-option rung of the delegation effort
+    /// resolution. `model` matches the entry's bare `model`; an entry that
+    /// declares a `provider` additionally requires it to equal the effective
+    /// `provider` (so two providers offering the same bare model id resolve
+    /// their own efforts), while an entry without one matches any provider.
     /// Returns `None` when the specialist is unknown, declares no matching
     /// option, or the matching option carries no effort.
     pub(crate) fn resolve_model_option_effort(
         &self,
         id: &str,
         workspace_path: Option<&Path>,
+        provider: Option<&str>,
         model: &str,
     ) -> Option<String> {
         self.resolve(id, workspace_path).and_then(|def| {
             def.get(MODEL_OPTIONS_KEY)
                 .and_then(Value::as_array)?
                 .iter()
-                .find(|o| o.get("model").and_then(Value::as_str) == Some(model))
+                .find(|o| {
+                    o.get("model").and_then(Value::as_str) == Some(model)
+                        && match o.get("provider").and_then(Value::as_str) {
+                            None => true,
+                            Some(op) => provider == Some(op),
+                        }
+                })
                 .and_then(|o| o.get("reasoningEffort"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
@@ -867,13 +1527,16 @@ impl SpecialistsService {
         }
     }
 
-    /// `specialist.list` → `{ specialists: SpecialistDef[] }` resolved in tier
-    /// order (embedded < bundled dir < user < project), higher tiers overriding
-    /// lower ones for the same id while `hidden` and the config scalars
-    /// inherit across tiers (PROTOCOL §5.11). `workspace_path` adds the
-    /// project tier.
-    #[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
-    pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
+    /// The full resolved catalog in tier order (embedded < bundled dir <
+    /// user < project), higher tiers overriding lower ones for the same id
+    /// while `hidden` and the config scalars inherit across tiers (PROTOCOL
+    /// §5.11). Keyed by id (a `BTreeMap`, so iteration is ascending-id — the
+    /// deterministic order the alias-collision rule relies on). Shared by
+    /// [`Self::list`] and [`Self::alias_target`].
+    fn collect_catalog(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> std::collections::BTreeMap<String, Value> {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in self.embedded {
             acc.insert(
@@ -890,6 +1553,18 @@ impl SpecialistsService {
         if let Some(wp) = workspace_path {
             Self::collect_dir(&project_dir(wp), "project", &mut acc);
         }
+        acc
+    }
+
+    /// `specialist.list` → `{ specialists: SpecialistDef[] }`, the resolved
+    /// catalog ([`Self::collect_catalog`]); `workspace_path` adds the project
+    /// tier.
+    #[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
+    pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
+        let mut acc = self.collect_catalog(workspace_path);
+        // Ralph remains in the pinned v1 doctrine for existing sessions, but
+        // is retired from new-session catalogs (including Settings).
+        acc.remove("ralph");
         let specialists: Vec<Value> = acc.into_values().collect();
         Ok(json!({ "specialists": specialists }))
     }
@@ -1014,7 +1689,15 @@ impl SpecialistsService {
         if !spec.is_object() {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
+        if let Some(model) = spec.get("model").and_then(Value::as_str) {
+            crate::reject_compound_model("model", model)?;
+        }
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
+        reject_compound_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
+        validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
+        validate_aliases_spec(spec.get(ALIASES_KEY))?;
+        validate_role_spec(spec.get("role"))?;
+        validate_icon_spec(spec.get("icon"))?;
         let dir = self.writable_dir(scope, workspace_path)?;
         let path = dir.join(format!("{id}.md"));
         if path.exists() {
@@ -1048,7 +1731,15 @@ impl SpecialistsService {
         if !spec.is_object() {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
+        if let Some(model) = spec.get("model").and_then(Value::as_str) {
+            crate::reject_compound_model("model", model)?;
+        }
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
+        reject_compound_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
+        validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
+        validate_aliases_spec(spec.get(ALIASES_KEY))?;
+        validate_role_spec(spec.get("role"))?;
+        validate_icon_spec(spec.get("icon"))?;
         let dir = self.writable_dir(scope, workspace_path)?;
         let path = dir.join(format!("{id}.md"));
         if !path.exists() {
@@ -1105,20 +1796,20 @@ mod tests {
 
     #[test]
     fn parse_frontmatter_captures_optional_scalars() {
-        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"task-loop\"\n---\n\nYou loop.";
         let (fm, body) = parse_frontmatter(content);
         assert_eq!(fm.get("codingAgent").unwrap(), "claude");
         assert_eq!(fm.get("model").unwrap(), "opus4.5");
         // Retired keys are stripped on parse (RETIRED_FRONTMATTER_KEYS).
         assert!(fm.get("modelTier").is_none());
         assert_eq!(fm.get("roleReminder").unwrap(), "Never stop early");
-        assert_eq!(fm.get("agentType").unwrap(), "ralph-loop");
+        assert_eq!(fm.get("agentType").unwrap(), "task-loop");
         assert_eq!(body, "You loop.");
     }
 
     #[test]
     fn build_def_emits_wire_fields() {
-        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"task-loop\"\n---\n\nYou loop.";
         let def = build_def("ralph", content, "user", Path::new("/tmp/ralph.md"));
         assert_eq!(def["id"], "ralph");
         assert_eq!(def["name"], "Ralph");
@@ -1128,7 +1819,7 @@ mod tests {
         // A retired `modelTier:` frontmatter line is never echoed on the wire.
         assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
-        assert_eq!(def["agentType"], "ralph-loop");
+        assert_eq!(def["agentType"], "task-loop");
         assert_eq!(def["prompt"], "You loop.");
         assert_eq!(def["behaviorPrompt"], "You loop.");
         assert_eq!(def["source"], "user");
@@ -1157,7 +1848,7 @@ mod tests {
             "model": "opus4.5",
             "modelTier": "smart",
             "roleReminder": "Never stop early",
-            "agentType": "ralph-loop",
+            "agentType": "task-loop",
             "prompt": "You loop.\nForever."
         });
         let rendered = render_file("ralph", &spec);
@@ -1168,9 +1859,42 @@ mod tests {
         assert_eq!(def["model"], "opus4.5");
         assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
-        assert_eq!(def["agentType"], "ralph-loop");
+        assert_eq!(def["agentType"], "task-loop");
         assert_eq!(def["prompt"], "You loop.\nForever.");
         assert_eq!(def["behaviorPrompt"], "You loop.\nForever.");
+    }
+
+    #[test]
+    fn escape_yaml_round_trips_backslash_sequences() {
+        // Regression: the sequential-replace unescaper corrupted a literal
+        // backslash followed by `n`/`t`/`\` — `foo\nbar` (backslash + n)
+        // escaped to `foo\\nbar` but decoded back as backslash + newline.
+        // The single-pass decoder round-trips every such value.
+        let cases = [
+            "foo\\nbar",
+            "foo\\\\nbar",
+            "tab\\tstop",
+            "trailing\\",
+            "real\nnewline",
+            "mixed \\n and \n and \\\\ and \"quotes\"",
+        ];
+        for value in cases {
+            assert_eq!(
+                unescape_yaml(&escape_yaml(value)),
+                value,
+                "escape→unescape round-trips {value:?}"
+            );
+        }
+        // The full file path round-trips a description carrying the same
+        // hazard (frontmatter scalars are the consumers of the escaper).
+        let spec = json!({
+            "name": "Z",
+            "description": "path C:\\new\\table",
+            "prompt": "body"
+        });
+        let rendered = render_file("z", &spec);
+        let def = build_def("z", &rendered, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["description"], "path C:\\new\\table");
     }
 
     #[test]
@@ -1314,6 +2038,448 @@ mod tests {
         assert_eq!(def["name"], "File Implementor");
     }
 
+    /// Role-based orchestrator resolution (§18.4): an explicit
+    /// `role: "orchestrator"` on any custom specialist engages the
+    /// orchestrator gate; `internal` and role-less specialists do not.
+    #[test]
+    fn resolve_is_orchestrator_keys_off_role_frontmatter() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "planner",
+            "---\nname: \"Planner\"\ndescription: \"d\"\nrole: \"orchestrator\"\n---\n\nbody",
+        );
+        dir.write(
+            "helper",
+            "---\nname: \"Helper\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        dir.write(
+            "plain",
+            "---\nname: \"Plain\"\ndescription: \"d\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir);
+        assert_eq!(
+            svc.resolve_role("planner", None).as_deref(),
+            Some("orchestrator")
+        );
+        assert!(svc.resolve_is_orchestrator("planner", None));
+        assert!(!svc.resolve_is_orchestrator("helper", None));
+        assert!(!svc.resolve_is_orchestrator("plain", None));
+    }
+
+    /// The bundled orchestrator still resolves as one via its v1.1 `role`
+    /// frontmatter — including through the `coordinator` alias — while the
+    /// bundled internal specialists do not.
+    #[test]
+    fn resolve_is_orchestrator_bundled_spec_writer_and_alias() {
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        assert!(svc.resolve_is_orchestrator("spec-writer", None));
+        assert!(svc.resolve_is_orchestrator("coordinator", None));
+        assert!(!svc.resolve_is_orchestrator("implementor", None));
+    }
+
+    /// Name-based fallback: sessions can carry an orchestrator id without a
+    /// resolvable role — a v1-pinned floor predates the `role` key, and an
+    /// id may no longer resolve at all (no `coordinator` alias in the v1
+    /// floor, deleted custom file). The historical ids stay orchestrators;
+    /// unknown ids do not.
+    #[test]
+    fn resolve_is_orchestrator_name_fallback_when_role_unresolvable() {
+        static V1_LIKE: &[(&str, &str)] = &[(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\n---\n\nbody",
+        )];
+        let empty = TempSpecialistsDir::new();
+        let svc = service_over(&empty).with_embedded(V1_LIKE);
+        // Resolves, but the pinned floor carries no `role` key.
+        assert!(svc.resolve_is_orchestrator("spec-writer", None));
+        // Does not resolve at all (no alias in the pinned floor).
+        assert!(svc.resolve_is_orchestrator("coordinator", None));
+        // Unknown non-orchestrator id takes no fallback.
+        assert!(!svc.resolve_is_orchestrator("mystery", None));
+    }
+
+    /// An explicit non-orchestrator role on a historical orchestrator id
+    /// wins over the name fallback.
+    #[test]
+    fn resolve_is_orchestrator_explicit_role_overrides_name_fallback() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir);
+        assert!(!svc.resolve_is_orchestrator("spec-writer", None));
+    }
+
+    /// An explicit `role: ""` clear is a deliberate opt-out: it reads as
+    /// [`RoleResolution::Cleared`] (not `Absent`) and defeats the
+    /// historical-name orchestrator fallback, while plain omission stays
+    /// fail-closed.
+    #[test]
+    fn resolve_is_orchestrator_explicit_clear_defeats_name_fallback() {
+        let dir = TempSpecialistsDir::new();
+        // A user-tier spec-writer override that explicitly clears the role.
+        dir.write(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\nrole: \"\"\n---\n\nbody",
+        );
+        // A plain override that never touches the key inherits the bundled
+        // v1.1 `role: "orchestrator"` and stays an orchestrator.
+        dir.write(
+            "coordinator-like",
+            "---\nname: \"C\"\ndescription: \"d\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir);
+        assert_eq!(
+            svc.resolve_role_state("spec-writer", None),
+            RoleResolution::Cleared
+        );
+        assert!(!svc.resolve_is_orchestrator("spec-writer", None));
+        // The wire-facing resolve_role still reads the clear as no role.
+        assert_eq!(svc.resolve_role("spec-writer", None), None);
+        assert_eq!(
+            svc.resolve_role_state("coordinator-like", None),
+            RoleResolution::Absent
+        );
+        assert!(!svc.resolve_is_orchestrator("coordinator-like", None));
+    }
+
+    /// The cleared state folds tier by tier like the other config scalars:
+    /// a higher tier that re-sets the role overrides a lower-tier clear, an
+    /// out-of-enum on-disk value is read leniently as untouched, and an
+    /// unknown id reads as [`RoleResolution::Unknown`] (name fallback stays
+    /// fail-closed there).
+    #[test]
+    fn resolve_role_state_folds_across_tiers() {
+        static FLOOR: &[(&str, &str)] = &[(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\nrole: \"orchestrator\"\n---\n\nbody",
+        )];
+        let dir = TempSpecialistsDir::new();
+        // The user/project file re-sets the role above an embedded floor.
+        dir.write(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        // Out-of-enum value: lenient read leaves the floor's state in place.
+        dir.write(
+            "bogus-role",
+            "---\nname: \"B\"\ndescription: \"d\"\nrole: \"captain\"\n---\n\nbody",
+        );
+        let svc = service_over(&dir).with_embedded(FLOOR);
+        assert_eq!(
+            svc.resolve_role_state("spec-writer", None),
+            RoleResolution::Role("internal".to_string())
+        );
+        assert_eq!(
+            svc.resolve_role_state("bogus-role", None),
+            RoleResolution::Absent
+        );
+        assert_eq!(
+            svc.resolve_role_state("missing", None),
+            RoleResolution::Unknown
+        );
+        assert!(!svc.resolve_is_orchestrator("missing", None));
+    }
+
+    /// Alias resolution (PROTOCOL §5.11): an `aliases` entry resolves to the
+    /// claiming specialist's def — the def's `id` carries the CANONICAL id,
+    /// never the alias — and `canonical_id` maps id-or-alias accordingly.
+    #[test]
+    fn aliases_resolve_to_the_canonical_specialist() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\naliases: [\"coordinator\"]\n---\n\ncoordinator body",
+        );
+        let svc = service_over(&dir);
+        // Direct id still resolves.
+        assert_eq!(
+            svc.resolve("spec-writer", None).unwrap()["id"],
+            "spec-writer"
+        );
+        // Alias resolves to the canonical def (id field is canonical).
+        let via_alias = svc.resolve("coordinator", None).expect("alias resolves");
+        assert_eq!(via_alias["id"], "spec-writer");
+        assert_eq!(via_alias["behaviorPrompt"], "coordinator body");
+        assert_eq!(via_alias["aliases"], json!(["coordinator"]));
+        // canonical_id: direct id → itself, alias → canonical, unknown → None.
+        assert_eq!(
+            svc.canonical_id("spec-writer", None).as_deref(),
+            Some("spec-writer")
+        );
+        assert_eq!(
+            svc.canonical_id("coordinator", None).as_deref(),
+            Some("spec-writer")
+        );
+        assert_eq!(svc.canonical_id("nope", None), None);
+        // `specialist.get` serves the alias as the canonical resolved view.
+        let got = svc.get("coordinator", None).unwrap();
+        assert_eq!(got["specialist"]["id"], "spec-writer");
+    }
+
+    /// A canonical id always beats an alias with the same spelling, and
+    /// duplicate alias claims resolve to the lexicographically smallest
+    /// canonical id.
+    #[test]
+    fn alias_collisions_are_deterministic() {
+        let dir = TempSpecialistsDir::new();
+        // `verifier` exists directly AND is claimed as an alias — the direct
+        // definition wins.
+        dir.write(
+            "verifier",
+            "---\nname: \"Verifier\"\ndescription: \"d\"\n---\n\nverifier body",
+        );
+        dir.write(
+            "grabber",
+            "---\nname: \"Grabber\"\ndescription: \"d\"\naliases: [\"verifier\",\"helper\"]\n---\n\ngrabber body",
+        );
+        // Two specialists claim `helper`; `aaa` < `grabber` wins.
+        dir.write(
+            "aaa",
+            "---\nname: \"Aaa\"\ndescription: \"d\"\naliases: [\"helper\"]\n---\n\naaa body",
+        );
+        let svc = service_over(&dir);
+        assert_eq!(svc.resolve("verifier", None).unwrap()["id"], "verifier");
+        assert_eq!(svc.canonical_id("helper", None).as_deref(), Some("aaa"));
+    }
+
+    /// The bundled v1.1 spec-writer carries the `coordinator` alias, so the
+    /// embedded floor alone resolves `coordinator` → `spec-writer`.
+    #[test]
+    fn bundled_coordinator_alias_resolves_to_spec_writer() {
+        let empty = TempSpecialistsDir::new();
+        let svc = service_over(&empty);
+        assert_eq!(
+            svc.canonical_id("coordinator", None).as_deref(),
+            Some("spec-writer")
+        );
+        let def = svc.resolve("coordinator", None).expect("alias resolves");
+        assert_eq!(def["id"], "spec-writer");
+        assert_eq!(def["name"], "Coordinator");
+    }
+
+    /// Strict-seam contract (monorepo#3497): `canonical_id_or_err` accepts
+    /// ids and aliases from the `specialist.list` catalog, and rejects both
+    /// an unknown id and the retired `ralph` — which the lenient
+    /// `canonical_id` still resolves for legacy stored sessions — with a
+    /// `-32602` naming the id and never listing `ralph` among the known ids.
+    #[test]
+    fn canonical_id_or_err_rejects_unknown_and_retired_ralph() {
+        let empty = TempSpecialistsDir::new();
+        let svc = service_over(&empty);
+        assert_eq!(
+            svc.canonical_id_or_err("implementor", None).unwrap(),
+            "implementor"
+        );
+        assert_eq!(
+            svc.canonical_id_or_err("coordinator", None).unwrap(),
+            "spec-writer"
+        );
+        let err = svc.canonical_id_or_err("nope", None).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(err.to_string().contains("unknown specialist: nope"));
+        // Retired: lenient resolution still works (inheritance), strict rejects.
+        assert_eq!(svc.canonical_id("ralph", None).as_deref(), Some("ralph"));
+        let err = svc.canonical_id_or_err("ralph", None).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(err.to_string().contains("unknown specialist: ralph"));
+        assert!(
+            !err.to_string().contains("ralph,") && !err.to_string().contains(", ralph"),
+            "known-id list must not advertise the retired ralph: {err}"
+        );
+    }
+
+    /// `render_file` writes a supplied `aliases` list as a single-line JSON
+    /// array that round-trips through `build_def`, and rejects bad shapes on
+    /// the write path (`validate_aliases_spec`).
+    #[test]
+    fn render_file_round_trips_aliases() {
+        let spec = json!({
+            "name": "Coordinator",
+            "description": "d",
+            "aliases": ["coordinator"],
+            "prompt": "body"
+        });
+        let rendered = render_file("spec-writer", &spec);
+        assert!(rendered.contains("aliases: [\"coordinator\"]"));
+        let def = build_def("spec-writer", &rendered, "user", Path::new("/tmp/s.md"));
+        assert_eq!(def["aliases"], json!(["coordinator"]));
+        // Invalid shapes are -32602 on create/edit.
+        assert!(validate_aliases_spec(Some(&json!("coordinator"))).is_err());
+        assert!(validate_aliases_spec(Some(&json!([""]))).is_err());
+        assert!(validate_aliases_spec(Some(&json!([42]))).is_err());
+        // Entries that could never resolve (fail validate_id) are rejected
+        // too — a stored dead alias would silently never match.
+        assert!(validate_aliases_spec(Some(&json!(["foo/bar"]))).is_err());
+        assert!(validate_aliases_spec(Some(&json!(["foo\\bar"]))).is_err());
+        assert!(validate_aliases_spec(Some(&json!([".."]))).is_err());
+        assert!(validate_aliases_spec(Some(&json!(["ok", "."]))).is_err());
+        assert!(matches!(validate_aliases_spec(None), Ok(None)));
+        assert!(matches!(
+            validate_aliases_spec(Some(&json!([]))),
+            Ok(Some(v)) if v.is_empty()
+        ));
+    }
+
+    /// The base-tier replacement ([`REPLACEMENT_DIR_ENV`]) excludes the
+    /// embedded set wholesale: only ids present in the replacement directory
+    /// exist in the base tier, and shipped ids not restated there are gone.
+    #[test]
+    fn base_replacement_excludes_the_embedded_set() {
+        let user = TempSpecialistsDir::new();
+        let replacement = TempSpecialistsDir::new();
+        replacement.write(
+            "custom",
+            "---\nname: \"Custom\"\ndescription: \"d\"\n---\n\ncustom body",
+        );
+        let svc = SpecialistsService::with_base_replacement(
+            Some(user.path.clone()),
+            replacement.path.clone(),
+        );
+        let listed = svc.list(None).unwrap();
+        let ids: Vec<&str> = listed["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["custom"]);
+        let custom = svc.get("custom", None).unwrap();
+        assert_eq!(custom["specialist"]["source"], "bundled");
+        assert_eq!(custom["specialist"]["prompt"], "custom body");
+        // A shipped id absent from the replacement directory does not exist.
+        assert!(matches!(
+            svc.get("implementor", None),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// A shipped id restated in the replacement directory resolves from there,
+    /// with the replacement's content — never the embedded copy's.
+    #[test]
+    fn base_replacement_restated_shipped_id_uses_replacement_content() {
+        let user = TempSpecialistsDir::new();
+        let replacement = TempSpecialistsDir::new();
+        replacement.write(
+            "implementor",
+            "---\nname: \"Replaced Implementor\"\ndescription: \"d\"\n---\n\nreplaced body",
+        );
+        let svc = SpecialistsService::with_base_replacement(
+            Some(user.path.clone()),
+            replacement.path.clone(),
+        );
+        let def = svc.resolve("implementor", None).expect("resolves");
+        assert_eq!(def["name"], "Replaced Implementor");
+        assert_eq!(def["behaviorPrompt"], "replaced body");
+        assert_eq!(def["source"], "bundled");
+    }
+
+    /// The user tier folds on top of the replacement tier unchanged: it
+    /// overrides same-id entries (inheriting omitted config scalars from the
+    /// replacement) and adds new ids alongside it.
+    #[test]
+    fn user_tier_overrides_the_replacement_tier() {
+        let user = TempSpecialistsDir::new();
+        let replacement = TempSpecialistsDir::new();
+        replacement.write(
+            "custom",
+            "---\nname: \"Custom\"\ndescription: \"d\"\nmodel: \"base-model\"\n---\n\nbase body",
+        );
+        user.write(
+            "custom",
+            "---\nname: \"User Custom\"\ndescription: \"d\"\n---\n\nuser body",
+        );
+        user.write(
+            "extra",
+            "---\nname: \"Extra\"\ndescription: \"d\"\n---\n\nextra body",
+        );
+        let svc = SpecialistsService::with_base_replacement(
+            Some(user.path.clone()),
+            replacement.path.clone(),
+        );
+        let def = svc.resolve("custom", None).expect("resolves");
+        assert_eq!(def["name"], "User Custom");
+        assert_eq!(def["source"], "user");
+        assert_eq!(
+            def["model"], "base-model",
+            "omitted config scalar inherits from the replacement tier"
+        );
+        let listed = svc.list(None).unwrap();
+        let ids: Vec<&str> = listed["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["custom", "extra"]);
+    }
+
+    /// A missing (or empty) replacement directory yields an EMPTY base tier —
+    /// no fallback to the embedded set — while the user tier stays in play.
+    #[test]
+    fn missing_replacement_dir_yields_empty_base_tier() {
+        let user = TempSpecialistsDir::new();
+        user.write(
+            "mine",
+            "---\nname: \"Mine\"\ndescription: \"d\"\n---\n\nmine body",
+        );
+        let missing =
+            std::env::temp_dir().join(format!("intentd-missing-{}", uuid::Uuid::new_v4()));
+        let svc = SpecialistsService::with_base_replacement(Some(user.path.clone()), missing);
+        let listed = svc.list(None).unwrap();
+        let ids: Vec<&str> = listed["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["mine"], "user tier only; no embedded fallback");
+        assert!(matches!(
+            svc.get("implementor", None),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// A session's pinned bundle ([`SpecialistsService::with_embedded`]) never
+    /// resurrects shipped specialists behind a startup-pinned replacement.
+    #[test]
+    fn with_embedded_is_a_no_op_under_base_replacement() {
+        static PINNED: &[(&str, &str)] = &[(
+            "implementor",
+            "---\nname: \"Pinned Implementor\"\ndescription: \"d\"\n---\n\npinned body",
+        )];
+        let user = TempSpecialistsDir::new();
+        let replacement = TempSpecialistsDir::new();
+        replacement.write(
+            "custom",
+            "---\nname: \"Custom\"\ndescription: \"d\"\n---\n\ncustom body",
+        );
+        let svc = SpecialistsService::with_base_replacement(
+            Some(user.path.clone()),
+            replacement.path.clone(),
+        )
+        .with_embedded(PINNED);
+        assert!(matches!(
+            svc.get("implementor", None),
+            Err(Error::NotFound(_))
+        ));
+        assert!(svc.resolve("custom", None).is_some());
+    }
+
+    /// [`replacement_dir`] parsing: unset and empty mean no replacement; a
+    /// non-empty value is the replacement path.
+    #[test]
+    fn replacement_dir_parses_unset_empty_and_set() {
+        assert_eq!(replacement_dir(None), None);
+        assert_eq!(replacement_dir(Some(std::ffi::OsString::new())), None);
+        assert_eq!(
+            replacement_dir(Some(std::ffi::OsString::from("/tmp/specialists"))),
+            Some(PathBuf::from("/tmp/specialists"))
+        );
+    }
+
     #[test]
     fn resolve_role_reminder_uses_explicit_reminder() {
         let dir = TempSpecialistsDir::new();
@@ -1354,8 +2520,8 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    /// The eight reference specialist ids embedded via `include_str!` (PP-2).
-    const EMBEDDED_IDS: [&str; 8] = [
+    /// The nine latest specialist ids embedded via `include_str!` (PP-2).
+    const LATEST_EMBEDDED_IDS: [&str; 9] = [
         "spec-writer",
         "implementor",
         "verifier",
@@ -1364,15 +2530,17 @@ mod tests {
         "ralph",
         "ui-designer",
         "pr-reviewer",
+        "vulnerability-scanner",
     ];
 
     #[test]
-    fn embedded_bundled_resolves_all_eight_with_zero_local_files() {
+    fn embedded_bundled_resolves_all_nine_with_zero_local_files() {
         // Empty user + bundled dirs: every embedded id still resolves through
-        // get()/list()/resolve_agent_type()/resolve_role_reminder().
+        // get()/resolve_agent_type()/resolve_role_reminder(). Ralph is the one
+        // retired id intentionally omitted from list().
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
-        for id in EMBEDDED_IDS {
+        for id in LATEST_EMBEDDED_IDS {
             let got = svc.get(id, None).expect("embedded specialist resolves");
             let def = &got["specialist"];
             assert_eq!(def["source"], "bundled", "{id}");
@@ -1385,9 +2553,11 @@ mod tests {
         }
         let list = svc.list(None).unwrap();
         let specs = list["specialists"].as_array().unwrap();
-        for id in EMBEDDED_IDS {
+        assert_eq!(specs.len(), 8, "Ralph is excluded from the catalog");
+        for id in LATEST_EMBEDDED_IDS.into_iter().filter(|id| *id != "ralph") {
             assert!(specs.iter().any(|s| s["id"] == id), "{id} listed");
         }
+        assert!(!specs.iter().any(|s| s["id"] == "ralph"));
         // The bundled chief-of-staff is flagged hidden; every other embedded
         // definition omits the field (absent ⇒ not hidden).
         for spec in specs {
@@ -1397,15 +2567,97 @@ mod tests {
                 assert!(spec.get("hidden").is_none(), "{}: not hidden", spec["id"]);
             }
         }
-        // Frontmatter-driven resolution works too: ralph declares an agentType,
-        // implementor an explicit roleReminder.
+        // Ralph remains fully resolvable for pinned v1 sessions even though it
+        // is absent from the catalog.
+        let ralph = svc.get("ralph", None).unwrap();
+        assert_eq!(ralph["specialist"]["hidden"], true);
         assert_eq!(
             svc.resolve_agent_type("ralph", None).as_deref(),
             Some("ralph-loop")
         );
+        let (name, reminder) = svc.resolve_role_reminder("ralph", None).unwrap();
+        assert_eq!(name, "Ralph");
+        assert!(reminder.starts_with("You are Ralph."));
+
+        // Implementor also declares an explicit roleReminder.
         let (name, reminder) = svc.resolve_role_reminder("implementor", None).unwrap();
         assert_eq!(name, "Implementor");
         assert!(reminder.starts_with("Stay within task scope."));
+    }
+
+    #[test]
+    fn bundled_vulnerability_scanner_resolves_supplied_definition() {
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        let got = svc
+            .get("vulnerability-scanner", None)
+            .expect("embedded vulnerability scanner resolves");
+        let def = &got["specialist"];
+        assert_eq!(def["id"], "vulnerability-scanner");
+        assert_eq!(def["name"], "Vulnerability Scanner");
+        assert_eq!(
+            def["description"],
+            "Finds real, exploitable security vulnerabilities in code"
+        );
+        assert!(def.get("codingAgent").is_none());
+        assert!(def.get("model").is_none());
+        assert_eq!(def["icon"], "pr-reviewer");
+        assert!(def["prompt"]
+            .as_str()
+            .is_some_and(|body| body.starts_with("## Vulnerability Scanner\n")));
+        assert_eq!(def["source"], "bundled");
+        assert_eq!(def["isCustomized"], false);
+    }
+
+    #[test]
+    fn bundled_chief_prompts_pin_exact_completion_relay_contract() {
+        for (version, bundle) in [("v1", EMBEDDED_BUNDLED_V1), ("v1.1", EMBEDDED_BUNDLED_V1_1)] {
+            let prompt = bundle
+                .iter()
+                .find_map(|(id, content)| (*id == "chief-of-staff").then_some(*content))
+                .expect("bundled Chief prompt exists");
+            assert!(
+                prompt.contains("On the one completion wake"),
+                "{version}: one completion wake"
+            );
+            assert!(
+                prompt.contains("return await ws.app.agents.ask(agentId, message, priority)"),
+                "{version}: ask result is returned without a cross-turn local"
+            );
+            assert!(
+                !prompt.contains("const asked") && !prompt.contains("asked."),
+                "{version}: no ask-local reference survives across executions"
+            );
+            assert!(
+                prompt.contains("ws.app.agents.readConversation(target.workspaceId, target.agentId, { lastN: 20 })"),
+                "{version}: one bounded conversation read"
+            );
+            assert!(
+                prompt.contains("agentId === \"agent-id-from-completion-wake\"")
+                    && prompt.contains("return { target, conversation }")
+                    && prompt.contains("Do not use a variable from the earlier `ask` execution"),
+                "{version}: wake identity and conversation are resolved in one execution"
+            );
+            assert!(
+                prompt.contains("[${conversation.workspaceTitle}](intent://local/${conversation.workspaceId}/agent/${conversation.agentId}/message/${finalAssistant.id})"),
+                "{version}: exact target-message link with title label"
+            );
+            assert!(
+                prompt
+                    .contains("Build this URL only from the one bounded `readConversation` result"),
+                "{version}: link identifiers come from the conversation read"
+            );
+            assert!(
+                prompt.contains(
+                    "Never expose a raw workspace ID or agent ID in relay prose or link text"
+                ),
+                "{version}: raw IDs stay out of user-visible relay text"
+            );
+            assert!(
+                prompt.contains("Relay that assistant message once"),
+                "{version}: one final relay"
+            );
+        }
     }
 
     #[test]
@@ -1739,7 +2991,8 @@ mod tests {
     #[test]
     fn user_override_of_embedded_inherits_scalars_at_spawn() {
         // The embedded floor participates in the fold: a user ralph.md that
-        // omits agentType keeps the embedded value at spawn time.
+        // omits agentType keeps the embedded value at spawn time, but remains
+        // absent from list() as a retired catalog id.
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         user.write(
@@ -1754,6 +3007,12 @@ mod tests {
         );
         let got = svc.get("ralph", None).unwrap();
         assert_eq!(got["specialist"]["source"], "user");
+        assert_eq!(got["specialist"]["hidden"], true);
+        assert!(svc.list(None).unwrap()["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|spec| spec["id"] != "ralph"));
         assert!(
             got["specialist"].get("modelTier").is_none(),
             "modelTier is retired and never emitted"
@@ -1999,19 +3258,21 @@ mod tests {
     fn model_options_round_trip_losslessly() {
         // A wire spec's modelOptions list is written as a single-line
         // JSON-array frontmatter scalar and parses back byte-identical.
+        // A legacy compound `model` splits into the explicit triple on the
+        // first normalization and stays stable from then on.
         let spec = json!({
             "name": "Zeta",
             "description": "d",
             "modelOptions": [
                 { "model": "opencode:kimi-k3", "hint": "cheap & fast" },
-                { "model": "opus4.5", "hint": "smart, \"expensive\"" }
+                { "provider": "auggie", "model": "opus4.5", "hint": "smart, \"expensive\"" }
             ],
             "prompt": "body"
         });
         let rendered = render_file("zeta", &spec);
         assert!(
             rendered.contains(
-                r#"modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap & fast"},{"model":"opus4.5","hint":"smart, \"expensive\""}]"#
+                r#"modelOptions: [{"provider":"opencode","model":"kimi-k3","hint":"cheap & fast"},{"provider":"auggie","model":"opus4.5","hint":"smart, \"expensive\""}]"#
             ),
             "single-line JSON-array scalar is written: {rendered}"
         );
@@ -2019,8 +3280,8 @@ mod tests {
         assert_eq!(
             def["modelOptions"],
             json!([
-                { "model": "opencode:kimi-k3", "hint": "cheap & fast" },
-                { "model": "opus4.5", "hint": "smart, \"expensive\"" }
+                { "provider": "opencode", "model": "kimi-k3", "hint": "cheap & fast" },
+                { "provider": "auggie", "model": "opus4.5", "hint": "smart, \"expensive\"" }
             ]),
             "parse→write→parse round-trips losslessly"
         );
@@ -2177,8 +3438,9 @@ mod tests {
         let got = svc.get("zeta", None).unwrap();
         assert_eq!(
             got["specialist"]["modelOptions"],
-            json!([{ "model": "opencode:kimi-k3", "hint": "cheap" }]),
-            "a non-empty list overrides wholesale, never merges"
+            json!([{ "provider": "opencode", "model": "kimi-k3", "hint": "cheap" }]),
+            "a non-empty list overrides wholesale, never merges \
+             (a legacy compound model splits into the triple on read)"
         );
 
         // Non-empty but all-unusable → inherit, not clear.
@@ -2252,6 +3514,17 @@ mod tests {
             json!({ "name": "Z", "description": "d", "modelOptions": [{ "model": 42 }] }),
             json!({ "name": "Z", "description": "d",
                 "modelOptions": [{ "model": "opus4.5", "hint": 42 }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "provider": 42 }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "provider": "" }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "provider": "   " }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opencode:kimi-k3", "hint": "cheap" }] }),
+            json!({ "name": "Z", "description": "d", "modelOptions": [{ "model": ":kimi-k3" }] }),
+            json!({ "name": "Z", "description": "d", "model": "opencode:kimi-k3" }),
+            json!({ "name": "Z", "description": "d", "model": ":kimi-k3" }),
         ];
         for spec in &invalid_specs {
             let err = svc.create("zeta", spec, Some("user"), None).unwrap_err();
@@ -2272,6 +3545,420 @@ mod tests {
             assert!(
                 matches!(err, Error::InvalidParams(_)),
                 "edit rejects {spec} with InvalidParams, got {err:?}"
+            );
+        }
+        // Positive case: a valid explicit `{provider, model}` triple persists
+        // through the wire edit path and reads back normalized.
+        let paired = json!({
+            "name": "Z", "description": "d", "prompt": "body",
+            "modelOptions": [{ "provider": "opencode", "model": "kimi-k3", "hint": "cheap" }]
+        });
+        let edited = svc.edit("zeta", &paired, "user", None).unwrap();
+        let expected = json!([{ "provider": "opencode", "model": "kimi-k3", "hint": "cheap" }]);
+        assert_eq!(edited["specialist"]["modelOptions"], expected);
+        assert_eq!(
+            svc.get("zeta", None).unwrap()["specialist"]["modelOptions"],
+            expected,
+            "the provider-pinned entry round-trips through the wire write path"
+        );
+    }
+
+    #[test]
+    fn create_and_edit_reject_compound_model_ids() {
+        // Wire-boundary compound-model rejection (PROTOCOL §5.5): the `model`
+        // scalar and every `modelOptions` entry must be BARE model ids —
+        // compound `provider:model` → -32602 naming the offending param;
+        // bare ids stay accepted.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let compound_scalar = json!({
+            "name": "Z", "description": "d", "model": "opencode:kimi-k3", "prompt": "body"
+        });
+        match svc
+            .create("zeta", &compound_scalar, Some("user"), None)
+            .unwrap_err()
+        {
+            Error::InvalidParams(msg) => {
+                assert!(msg.contains("model"), "names the param: {msg}");
+                assert!(msg.contains("bare model id"), "explains the fix: {msg}");
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        let compound_option = json!({
+            "name": "Z", "description": "d", "prompt": "body",
+            "modelOptions": [
+                { "model": "opus4.5", "hint": "ok" },
+                { "model": "opencode:kimi-k3", "hint": "cheap" }
+            ]
+        });
+        match svc
+            .create("zeta", &compound_option, Some("user"), None)
+            .unwrap_err()
+        {
+            Error::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("modelOptions[1].model"),
+                    "names the offending entry: {msg}"
+                );
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        assert!(
+            !user.path.join("zeta.md").exists(),
+            "nothing is written on a rejected create"
+        );
+        let bare = json!({
+            "name": "Z", "description": "d", "model": "opus4.5",
+            "modelOptions": [{ "model": "kimi-k3", "hint": "cheap" }], "prompt": "body"
+        });
+        svc.create("zeta", &bare, Some("user"), None)
+            .expect("bare model ids accepted on create");
+        svc.edit("zeta", &bare, "user", None)
+            .expect("bare model ids accepted on edit");
+    }
+
+    #[test]
+    fn legacy_compound_model_scalar_splits_on_read() {
+        // Lenient read normalization: a pre-triple on-disk file with a
+        // compound `model` scalar reads as the bare model plus `codingAgent`
+        // set to the prefix — the prefix WINS over a `codingAgent` the same
+        // file declares (preserving the spawn precedence compound ids had).
+        let content = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opencode:kimi-k3\"\ncodingAgent: \"claude\"\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["model"], "kimi-k3", "bare model after the split");
+        assert_eq!(
+            def["codingAgent"], "opencode",
+            "the model prefix outranks the file's own codingAgent"
+        );
+        // Without a codingAgent of its own the prefix still lands there.
+        let content =
+            "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opencode:kimi-k3\"\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["model"], "kimi-k3");
+        assert_eq!(def["codingAgent"], "opencode");
+        // A bare model is untouched and the declared codingAgent stands.
+        let content = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"kimi-k3\"\ncodingAgent: \"claude\"\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["model"], "kimi-k3");
+        assert_eq!(def["codingAgent"], "claude");
+        // An unusable compound (empty prefix or rest) reads as omitted.
+        for bad in ["\":kimi-k3\"", "\"opencode:\"", "\" : \""] {
+            let content =
+                format!("---\nname: \"Z\"\ndescription: \"d\"\nmodel: {bad}\n---\n\nbody");
+            let def = build_def("z", &content, "user", Path::new("/tmp/z.md"));
+            assert!(
+                def.get("model").is_none(),
+                "unusable compound {bad} reads as an omitted key"
+            );
+        }
+        // Omitted-after-split behaves like any omitted key: it inherits.
+        let bundled = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \"opus4.5\"\n---\n\nbody";
+        let base = build_def("z", bundled, "bundled", Path::new("/tmp/z.md"));
+        let user_file = "---\nname: \"Z\"\ndescription: \"d\"\nmodel: \":broken\"\n---\n\nbody";
+        let folded =
+            build_def_inheriting("z", user_file, "user", Path::new("/tmp/z.md"), Some(&base));
+        assert_eq!(
+            folded["model"], "opus4.5",
+            "an unusable compound inherits the lower tier's model"
+        );
+    }
+
+    #[test]
+    fn model_option_effort_matches_on_the_provider_model_pair() {
+        // Pair matching (PROTOCOL §5.11): two options sharing a bare model id
+        // under different providers resolve their own efforts; a
+        // provider-less option matches any provider; a provider mismatch on
+        // every candidate resolves nothing.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        user.write(
+            "chooser",
+            "---\nname: \"Chooser\"\ndescription: \"d\"\nmodelOptions: [\
+             {\"provider\":\"opencode\",\"model\":\"kimi-k3\",\"hint\":\"\",\"reasoningEffort\":\"low\"},\
+             {\"provider\":\"auggie\",\"model\":\"kimi-k3\",\"hint\":\"\",\"reasoningEffort\":\"high\"},\
+             {\"model\":\"opus4.5\",\"hint\":\"\",\"reasoningEffort\":\"medium\"}]\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("opencode"), "kimi-k3"),
+            Some("low".to_string())
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("auggie"), "kimi-k3"),
+            Some("high".to_string()),
+            "the same bare model resolves per provider"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("grok"), "kimi-k3"),
+            None,
+            "a provider matching no candidate resolves nothing"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, None, "kimi-k3"),
+            None,
+            "an unknown effective provider never matches a provider-pinned option"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, Some("grok"), "opus4.5"),
+            Some("medium".to_string()),
+            "a provider-less option matches any provider"
+        );
+        assert_eq!(
+            svc.resolve_model_option_effort("chooser", None, None, "opus4.5"),
+            Some("medium".to_string()),
+            "a provider-less option matches an unknown provider too"
+        );
+    }
+
+    #[test]
+    fn role_icon_and_team_agents_round_trip_losslessly() {
+        // The picker-metadata fields write as frontmatter (role/icon as
+        // quoted scalars, teamAgents as a single-line JSON-array scalar) and
+        // parse back byte-identical.
+        let spec = json!({
+            "name": "Zeta",
+            "description": "d",
+            "role": "orchestrator",
+            "icon": "coordinator",
+            "teamAgents": ["implementor", "verifier"],
+            "prompt": "body"
+        });
+        let rendered = render_file("zeta", &spec);
+        assert!(rendered.contains("role: \"orchestrator\""), "{rendered}");
+        assert!(rendered.contains("icon: \"coordinator\""), "{rendered}");
+        assert!(
+            rendered.contains(r#"teamAgents: ["implementor","verifier"]"#),
+            "single-line JSON-array scalar is written: {rendered}"
+        );
+        let def = build_def("zeta", &rendered, "user", Path::new("/tmp/zeta.md"));
+        assert_eq!(def["role"], "orchestrator");
+        assert_eq!(def["icon"], "coordinator");
+        assert_eq!(def["teamAgents"], json!(["implementor", "verifier"]));
+        // A second write of the parsed def is byte-identical (stable order).
+        assert_eq!(render_file("zeta", &def), rendered);
+    }
+
+    #[test]
+    fn role_icon_inherit_across_tiers_with_explicit_clear() {
+        // role/icon fold like the other config scalars: omit → inherit,
+        // explicit empty → clear, non-empty → override.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nrole: \"internal\"\nicon: \"verifier\"\n---\n\nbody",
+        );
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["role"], "internal",
+            "omitted role inherits"
+        );
+        assert_eq!(
+            got["specialist"]["icon"], "verifier",
+            "omitted icon inherits"
+        );
+
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nrole: \"\"\nicon: \"ralph\"\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert!(
+            got["specialist"].get("role").is_none(),
+            "explicit empty clears the inherited role"
+        );
+        assert_eq!(
+            got["specialist"]["icon"], "ralph",
+            "explicit non-empty icon overrides"
+        );
+    }
+
+    #[test]
+    fn team_agents_inherit_across_tiers_with_explicit_clear() {
+        // Inherit-on-omit fold: omit → inherit, explicit `[]` → clear,
+        // non-empty → wholesale override (entries never merge).
+        let bundled_fm = "---\nname: \"Zeta\"\ndescription: \"d\"\nteamAgents: [\"implementor\",\"verifier\"]\n---\n\nbody";
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write("zeta", bundled_fm);
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["teamAgents"],
+            json!(["implementor", "verifier"]),
+            "omitted key inherits the lower tier's list"
+        );
+
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nteamAgents: []\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert!(
+            got["specialist"].get("teamAgents").is_none(),
+            "explicit [] clears the inherited list"
+        );
+
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nteamAgents: [\"reviewer\"]\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["teamAgents"],
+            json!(["reviewer"]),
+            "a non-empty list overrides wholesale, never merges"
+        );
+    }
+
+    #[test]
+    fn role_and_team_agents_frontmatter_are_lenient_on_read() {
+        // Files are never rejected on read: an out-of-enum role is
+        // normalized to omitted (so get→modify→edit never echoes a value the
+        // strict write validation rejects), an unparseable teamAgents is
+        // treated as omitted, and unusable entries are skipped individually
+        // (all-unusable ⇒ omitted, not clear).
+        let content =
+            "---\nname: \"Z\"\ndescription: \"d\"\nrole: \"mystery\"\nteamAgents: not-json\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert!(
+            def.get("role").is_none(),
+            "out-of-enum role is normalized to omitted"
+        );
+        assert!(
+            def.get("teamAgents").is_none(),
+            "unparseable value is treated as omitted"
+        );
+        // An out-of-enum role inherits like an omitted key: the def echoed
+        // by get is always writable back through the strict edit validation.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nrole: \"mystery\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["role"], "internal",
+            "an out-of-enum role inherits the lower tier's value like an omitted key"
+        );
+        let echoed = got["specialist"].clone();
+        svc.edit("zeta", &echoed, "user", None)
+            .expect("a get→edit echo of a def never fails role validation");
+        let mixed = "---\nname: \"Z\"\ndescription: \"d\"\nteamAgents: [\"implementor\", 42, \"\", \"verifier\"]\n---\n\nbody";
+        let def = build_def("z", mixed, "user", Path::new("/tmp/z.md"));
+        assert_eq!(
+            def["teamAgents"],
+            json!(["implementor", "verifier"]),
+            "unusable entries are skipped individually"
+        );
+        let all_bad = "---\nname: \"Z\"\ndescription: \"d\"\nteamAgents: [42, \"\"]\n---\n\nbody";
+        let def = build_def("z", all_bad, "user", Path::new("/tmp/z.md"));
+        assert!(
+            def.get("teamAgents").is_none(),
+            "a non-empty array with only unusable entries is treated as omitted, not a clear"
+        );
+    }
+
+    #[test]
+    fn create_and_edit_reject_invalid_role_and_team_agents() {
+        // Invalid wire shapes → InvalidParams (-32602) for both create and
+        // edit; the valid enum values (and explicit clears) are accepted.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let invalid_specs = [
+            json!({ "name": "Z", "description": "d", "role": "manager" }),
+            json!({ "name": "Z", "description": "d", "role": 42 }),
+            json!({ "name": "Z", "description": "d", "icon": 42 }),
+            json!({ "name": "Z", "description": "d", "icon": ["coordinator"] }),
+            json!({ "name": "Z", "description": "d", "teamAgents": "not-an-array" }),
+            json!({ "name": "Z", "description": "d", "teamAgents": [42] }),
+            json!({ "name": "Z", "description": "d", "teamAgents": [""] }),
+            json!({ "name": "Z", "description": "d", "teamAgents": ["   "] }),
+        ];
+        for spec in &invalid_specs {
+            let err = svc.create("zeta", spec, Some("user"), None).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidParams(_)),
+                "create rejects {spec} with InvalidParams, got {err:?}"
+            );
+            assert!(
+                !user.path.join("zeta.md").exists(),
+                "nothing is written on a rejected create"
+            );
+        }
+        let valid = json!({
+            "name": "Z",
+            "description": "d",
+            "role": "internal",
+            "teamAgents": ["implementor"],
+            "prompt": "body"
+        });
+        let created = svc.create("zeta", &valid, Some("user"), None).unwrap();
+        assert_eq!(created["specialist"]["role"], "internal");
+        assert_eq!(created["specialist"]["teamAgents"], json!(["implementor"]));
+        for spec in &invalid_specs {
+            let err = svc.edit("zeta", spec, "user", None).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidParams(_)),
+                "edit rejects {spec} with InvalidParams, got {err:?}"
+            );
+        }
+        // Explicit clears are valid wire values.
+        let cleared = json!({
+            "name": "Z",
+            "description": "d",
+            "role": "",
+            "teamAgents": [],
+            "prompt": "body"
+        });
+        let edited = svc.edit("zeta", &cleared, "user", None).unwrap();
+        assert!(edited["specialist"].get("role").is_none());
+        assert!(edited["specialist"].get("teamAgents").is_none());
+    }
+
+    #[test]
+    fn embedded_bundle_carries_picker_metadata() {
+        // The latest embedded bundle resolves the picker-metadata fields:
+        // spec-writer is the orchestrator with its advisory roster,
+        // implementor/verifier are internal, and every def carries an icon.
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        let sw = svc.get("spec-writer", None).unwrap();
+        assert_eq!(sw["specialist"]["role"], "orchestrator");
+        assert_eq!(
+            sw["specialist"]["teamAgents"],
+            json!(["implementor", "verifier"])
+        );
+        assert_eq!(sw["specialist"]["icon"], "coordinator");
+        for id in ["implementor", "verifier"] {
+            let got = svc.get(id, None).unwrap();
+            assert_eq!(got["specialist"]["role"], "internal", "{id}");
+            assert_eq!(got["specialist"]["icon"], id, "{id}");
+        }
+        for id in LATEST_EMBEDDED_IDS {
+            let got = svc.get(id, None).unwrap();
+            assert!(
+                got["specialist"]["icon"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()),
+                "{id}: carries an icon"
             );
         }
     }

@@ -49,7 +49,7 @@ use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
 use super::git_metadata_watcher::{GitCommonDirWatches, GitMetadataWatcher};
 use super::git_status_refresher::GitStatusRefresher;
-use super::shared_watch::SharedWatchHub;
+use super::shared_watch::{SharedWatchHub, WatchHealth};
 use super::skills_watcher::SkillsWatcher;
 use super::specialists_watcher::SpecialistsWatcher;
 use super::watcher::FileWatcher;
@@ -100,7 +100,21 @@ impl WatcherRegistry {
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
     ) -> Self {
-        Self::start_with_backstop(bus, services, refresher, SETUP_COMPLETION_BACKSTOP).await
+        Self::start_with_health(bus, services, refresher, &WatchHealth::default()).await
+    }
+
+    /// [`Self::start`] that additionally attaches `health` to the shared hub,
+    /// so `system.status` can render live watch coverage
+    /// (intent-hq/intent#3708). The composition root creates the handle before
+    /// this backgrounded start runs; until attachment the handle snapshots
+    /// `None` (rendered as an absent field).
+    pub async fn start_with_health(
+        bus: EventBus,
+        services: Arc<dyn WorkspaceApi>,
+        refresher: Arc<GitStatusRefresher>,
+        health: &WatchHealth,
+    ) -> Self {
+        Self::start_with_backstop(bus, services, refresher, health, SETUP_COMPLETION_BACKSTOP).await
     }
 
     /// [`Self::start`] with an explicit setup-completion backstop, so tests
@@ -109,6 +123,7 @@ impl WatcherRegistry {
         bus: EventBus,
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
+        health: &WatchHealth,
         setup_backstop: Duration,
     ) -> Self {
         // Subscribe BEFORE taking the workspace snapshot: subscription
@@ -132,7 +147,7 @@ impl WatcherRegistry {
             Ok(ws) => ws
                 .into_iter()
                 .filter_map(|ws| {
-                    let root = ws.path.clone().or_else(|| ws.worktree_path.clone())?;
+                    let root = ws.effective_path()?.to_string();
                     let path = PathBuf::from(&root);
                     path.is_dir().then_some((ws.id, path))
                 })
@@ -148,6 +163,11 @@ impl WatcherRegistry {
         // directories the workspace roots live under, not the workspace count
         // times the number of watch roots each one used to register.
         let hub = SharedWatchHub::new();
+        health.attach(&hub);
+        tracing::info!(
+            os_watch_limits = %super::shared_watch::os_watch_limits(),
+            "watcher registry starting"
+        );
         // Shared common-dir watches for linked-worktree workspaces: one watch
         // per repo, fanned out to every worktree workspace (monorepo#1663).
         let git_common = GitCommonDirWatches::new();
@@ -523,16 +543,26 @@ async fn lifecycle_loop(
 
 /// Resolve the on-disk root for a lifecycle event: prefer the self-sufficient
 /// `data.workspace` payload (`workspace:created`, §6.7), fall back to a
-/// `get_workspace` lookup (`workspace:opened` carries only the id). Returns
+/// `get_workspace` lookup (`workspace:opened` carries only the id). Both arms
+/// resolve `path`, else `worktreePath`, else `repositoryPath` — direct
+/// checkouts may persist only `repositoryPath` (monorepo#3778). Returns
 /// `None` when the workspace has no existing directory.
 async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf> {
     let from_payload = ev
         .data
         .get("workspace")
         .and_then(|ws| {
-            ws.get("path")
-                .and_then(|v| v.as_str())
-                .or_else(|| ws.get("worktreePath").and_then(|v| v.as_str()))
+            // Per-step empty-string filtering, matching `effective_path()`:
+            // an empty candidate falls through to the next one rather than
+            // masking it.
+            let candidate = |key: &str| {
+                ws.get(key)
+                    .and_then(|v| v.as_str())
+                    .filter(|p| !p.is_empty())
+            };
+            candidate("path")
+                .or_else(|| candidate("worktreePath"))
+                .or_else(|| candidate("repositoryPath"))
         })
         .map(PathBuf::from);
 
@@ -540,7 +570,7 @@ async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf
         Some(p)
     } else {
         let ws = services.get_workspace(ev.workspace_id.clone()).await.ok()?;
-        ws.path.or(ws.worktree_path).map(PathBuf::from)
+        ws.effective_path().map(PathBuf::from)
     }?;
 
     path.is_dir().then_some(path)
@@ -696,6 +726,55 @@ mod tests {
         ev
     }
 
+    /// Materialize a [`NewEvent`] as a stored [`Event`] so the private
+    /// `resolve_path` helper can be exercised directly.
+    fn stored_event(ev: NewEvent) -> Event {
+        Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ev.workspace_id,
+            timestamp: ev.timestamp,
+            event_type: ev.event_type,
+            actor: ev.actor,
+            session_id: ev.session_id,
+            correlation_id: ev.correlation_id,
+            parent_event_id: ev.parent_event_id,
+            metadata: ev.metadata,
+            data: ev.data,
+        }
+    }
+
+    /// `resolve_path` resolves `repositoryPath` as the final fallback in BOTH
+    /// arms (monorepo#3778): the self-sufficient `data.workspace` payload arm
+    /// and the `get_workspace` lookup arm — direct checkouts may persist only
+    /// `repositoryPath`.
+    #[tokio::test]
+    async fn resolve_path_falls_back_to_repository_path() {
+        let dir = TempDir::new("repo-fallback");
+        let mut ws = chief_workspace();
+        ws.id = WorkspaceId::from("ws-repo-only");
+        ws.title = "ws-repo-only".to_string();
+        ws.repository_path = Some(dir.path.to_string_lossy().into_owned());
+        let api = FakeApi::new(vec![ws.clone()]);
+
+        // Payload arm (`workspace:created` carries the row).
+        let ev = stored_event(lifecycle_event(WORKSPACE_CREATED, &ws, true));
+        assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
+
+        // Lookup arm (`workspace:opened` carries only the id).
+        let ev = stored_event(lifecycle_event(WORKSPACE_OPENED, &ws, false));
+        assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
+
+        // Payload arm with an empty `path`: each candidate is filtered
+        // per-step, so an empty string falls through to `repositoryPath`
+        // instead of resolving the whole chain to `None`. The API is left
+        // empty so the lookup arm cannot compensate — the payload arm alone
+        // must resolve.
+        ws.path = Some(String::new());
+        let api = FakeApi::new(vec![]);
+        let ev = stored_event(lifecycle_event(WORKSPACE_CREATED, &ws, true));
+        assert_eq!(resolve_path(&ev, &api).await, Some(dir.path.clone()));
+    }
+
     async fn bus_and_sub() -> (TempDb, EventBus, super::super::bus::Subscription) {
         let db = TempDb::new();
         let store = Store::open(&db.path).await.expect("open store");
@@ -747,7 +826,14 @@ mod tests {
             api.clone(),
             Arc::new(crate::git_status_cache::GitStatusCache::new()),
         ));
-        WatcherRegistry::start_with_backstop(bus.clone(), api, refresher, backstop).await
+        WatcherRegistry::start_with_backstop(
+            bus.clone(),
+            api,
+            refresher,
+            &WatchHealth::default(),
+            backstop,
+        )
+        .await
     }
 
     /// Wait until `root` is watched-and-established (`want = true`) or absent
@@ -826,6 +912,36 @@ mod tests {
 
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
         assert!(ev.is_some(), "boot-time workspace must emit file events");
+    }
+
+    /// The startup snapshot resolves `repositoryPath` as the final fallback
+    /// (monorepo#3778): a direct-checkout workspace persisting only
+    /// `repositoryPath` that exists at daemon start must be watched, not
+    /// silently skipped on every restart.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn boot_time_repository_only_workspace_is_watched() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let root = TempDir::new("boot-repo");
+        let mut ws = chief_workspace();
+        ws.id = WorkspaceId::from("ws-boot-repo");
+        ws.title = "ws-boot-repo".to_string();
+        ws.repository_path = Some(root.path.to_string_lossy().into_owned());
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
+
+        std::fs::write(root.path.join("hello.txt"), "hi").expect("write file");
+
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
+        assert!(
+            ev.is_some(),
+            "boot-time repository-only workspace must emit file events"
+        );
     }
 
     #[tokio::test]
@@ -1118,8 +1234,9 @@ mod tests {
     /// stream count. Before this change each workspace registered its own file
     /// watcher, `.git` watcher (two roots) and four project-tier skills /
     /// specialists watches — roughly five or six OS streams each, so eight
-    /// workspaces meant ~40+. Now every root under a shared parent joins ONE
-    /// stream, so the count follows the number of distinct parent directories.
+    /// workspaces meant ~40+. Now roots join shared streams (per parent
+    /// directory on macOS, one global group on Linux — see
+    /// `shared_watch::group_key`), so sibling workspaces ride ONE stream.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn many_workspaces_share_a_single_stream_per_parent_directory() {

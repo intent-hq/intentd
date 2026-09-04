@@ -12,6 +12,72 @@ use intent_core::{FileStatus, GitFileStatus, GitStatus, Result};
 
 use crate::map_git_err;
 
+/// Per-response cap on `GitStatus.files` entries served over the wire
+/// (monorepo#3635). A worktree with ~100k untracked files (mid-build
+/// generated trees, nested worktrees) otherwise produces multi-megabyte
+/// `git.status` frames — far past the transport's 1 MiB outbound warn
+/// threshold. 5000 entries keeps the frame well under that bound while
+/// remaining far more than any UI renders.
+pub const MAX_STATUS_FILES: usize = 5000;
+
+/// Project a wire `GitStatus` with `files` capped at [`MAX_STATUS_FILES`]
+/// entries (monorepo#3635), preferring tracked changes (staged / modified /
+/// deleted / renamed…) over untracked entries so real work is never pushed
+/// out of the list by untracked noise. Relative order within each group is
+/// preserved (libgit2's path order). On truncation, `files_truncated` is set
+/// and `total_files` carries the full pre-cap count; an under-cap status is
+/// cloned unchanged, keeping the pre-#3635 wire shape byte-for-byte.
+/// Aggregate flags are untouched — they were computed over the full scan.
+///
+/// Takes the (typically cached) status by reference and clones only the
+/// entries that survive the cap, so a ~100k-entry cached scan costs one
+/// counting pass plus O(cap) clones per read — not a full-list clone that is
+/// immediately discarded (the RPC cost contract's O(rows returned) rule).
+#[must_use]
+pub fn cap_status_files(status: &GitStatus) -> GitStatus {
+    let total = status.files.len();
+    if total <= MAX_STATUS_FILES {
+        return status.clone();
+    }
+    let is_tracked = |f: &&FileStatus| f.status != GitFileStatus::Untracked;
+    let tracked_kept = status
+        .files
+        .iter()
+        .filter(is_tracked)
+        .count()
+        .min(MAX_STATUS_FILES);
+    let mut files = Vec::with_capacity(MAX_STATUS_FILES);
+    files.extend(
+        status
+            .files
+            .iter()
+            .filter(is_tracked)
+            .take(tracked_kept)
+            .cloned(),
+    );
+    files.extend(
+        status
+            .files
+            .iter()
+            .filter(|f| f.status == GitFileStatus::Untracked)
+            .take(MAX_STATUS_FILES - tracked_kept)
+            .cloned(),
+    );
+    GitStatus {
+        branch: status.branch.clone(),
+        ahead: status.ahead,
+        behind: status.behind,
+        diverged: status.diverged,
+        files,
+        has_uncommitted_changes: status.has_uncommitted_changes,
+        has_untracked_files: status.has_untracked_files,
+        files_truncated: true,
+        total_files: Some(total),
+        has_upstream: status.has_upstream,
+        unpushed_count: status.unpushed_count,
+    }
+}
+
 /// The empty status returned for remote workspaces and non-repositories,
 /// matching the TS `getStatus` fallback (`branch:""`, everything zeroed).
 #[must_use]
@@ -24,6 +90,10 @@ pub fn empty_status() -> GitStatus {
         files: Vec::new(),
         has_uncommitted_changes: false,
         has_untracked_files: false,
+        files_truncated: false,
+        total_files: None,
+        has_upstream: false,
+        unpushed_count: None,
     }
 }
 
@@ -36,7 +106,7 @@ pub fn status(worktree_path: &Path) -> Result<GitStatus> {
     let started = Instant::now();
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let branch = current_branch(&repo);
-    let (ahead, behind) = ahead_behind(&repo, &branch);
+    let (ahead, behind, has_upstream) = ahead_behind(&repo, &branch);
     // The canonical definition (per the `GitStatus.diverged` doc): both ahead
     // and behind the upstream.
     let diverged = ahead > 0 && behind > 0;
@@ -61,6 +131,13 @@ pub fn status(worktree_path: &Path) -> Result<GitStatus> {
         files,
         has_uncommitted_changes,
         has_untracked_files,
+        files_truncated: false,
+        total_files: None,
+        has_upstream,
+        // `upstream..HEAD` is exactly the `ahead` count when the upstream
+        // exists; without one there is nothing to count against
+        // (monorepo#4058).
+        unpushed_count: has_upstream.then_some(ahead),
     })
 }
 
@@ -95,13 +172,15 @@ pub fn current_branch_at(worktree_path: &Path) -> Option<String> {
 }
 
 /// Ahead/behind counts vs `origin/<branch>`, defaulting to `(0, 0)` when there
-/// is no upstream (the `git rev-list … || 0\t0` fallback).
-fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64) {
+/// is no upstream (the `git rev-list … || 0\t0` fallback). The third element
+/// reports whether the upstream ref exists (monorepo#4058), so callers can
+/// distinguish "even with upstream" from "no upstream at all" — both `(0, 0)`.
+fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64, bool) {
     if branch.is_empty() {
-        return (0, 0);
+        return (0, 0, false);
     }
     let Some(local) = repo.head().ok().and_then(|h| h.target()) else {
-        return (0, 0);
+        return (0, 0, false);
     };
     let upstream_ref = format!("refs/remotes/origin/{branch}");
     let Some(upstream) = repo
@@ -109,20 +188,27 @@ fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64) {
         .ok()
         .and_then(|r| r.target())
     else {
-        return (0, 0);
+        return (0, 0, false);
     };
     match repo.graph_ahead_behind(local, upstream) {
         Ok((a, b)) => (
             i64::try_from(a).expect("value fits in i64"),
             i64::try_from(b).expect("value fits in i64"),
+            true,
         ),
-        Err(_) => (0, 0),
+        // Deliberate fallback: the upstream ref exists but the walk failed, so
+        // report the pre-existing (0, 0) counts with `has_upstream: true` —
+        // `unpushedCount` then reads `Some(0)`, preserving the documented
+        // `unpushedCount == ahead` invariant over a degraded count.
+        Err(_) => (0, 0, true),
     }
 }
 
 /// Build the file list from `repo.statuses`, replicating the porcelain
 /// `--untracked-files=all` parse (directories skipped; staged+unstaged split).
-fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
+/// Shared with [`crate::local_changes`] so its `uncommittedCount` covers the
+/// exact entry set `git.status.files` reports.
+pub(crate) fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
@@ -332,6 +418,100 @@ mod tests {
         assert!(!st.diverged);
     }
 
+    /// Point `refs/remotes/origin/<branch>` at the current HEAD commit — a
+    /// local stand-in for a pushed branch (no network).
+    fn set_origin_ref(worktree: &std::path::Path, branch: &str) {
+        let repo = git2::Repository::open(worktree).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.reference(&format!("refs/remotes/origin/{branch}"), head, true, "test")
+            .unwrap();
+    }
+
+    /// With an upstream at HEAD the branch is even: `hasUpstream: true` and
+    /// `unpushedCount: 0` (monorepo#4058) — distinguishable from the
+    /// no-upstream case below despite identical ahead/behind.
+    #[test]
+    fn upstream_even_reports_zero_unpushed() {
+        let dir = init_repo("status-upstream-even");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let branch = status(dir.path()).unwrap().branch;
+        set_origin_ref(dir.path(), &branch);
+        let st = status(dir.path()).unwrap();
+        assert!(st.has_upstream);
+        assert_eq!(st.ahead, 0);
+        assert_eq!(st.unpushed_count, Some(0));
+    }
+
+    /// Commits past the upstream surface as both `ahead` and
+    /// `unpushedCount` (the `upstream..HEAD` count).
+    #[test]
+    fn upstream_ahead_reports_unpushed_count() {
+        let dir = init_repo("status-upstream-ahead");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let branch = status(dir.path()).unwrap().branch;
+        set_origin_ref(dir.path(), &branch);
+        commit_file(dir.path(), "b.txt", "y\n");
+        let st = status(dir.path()).unwrap();
+        assert!(st.has_upstream);
+        assert_eq!(st.ahead, 1);
+        assert_eq!(st.unpushed_count, Some(1));
+    }
+
+    /// A never-pushed branch (no `refs/remotes/origin/<branch>`) reports
+    /// `hasUpstream: false` with `unpushedCount` omitted — no longer
+    /// indistinguishable from an even branch (monorepo#4058).
+    #[test]
+    fn missing_upstream_reports_no_upstream() {
+        let dir = init_repo("status-upstream-missing");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let st = status(dir.path()).unwrap();
+        assert!(!st.has_upstream);
+        assert_eq!(st.ahead, 0);
+        assert_eq!(st.unpushed_count, None);
+    }
+
+    /// Detached HEAD: no branch, so no upstream to compare against.
+    #[test]
+    fn detached_head_reports_no_upstream() {
+        let dir = init_repo("status-upstream-detached");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(head).unwrap();
+        let st = status(dir.path()).unwrap();
+        assert!(st.branch.is_empty());
+        assert!(!st.has_upstream);
+        assert_eq!(st.unpushed_count, None);
+    }
+
+    /// Unborn HEAD (fresh `git init`, no commit): the unborn branch name is
+    /// reported but there is no local commit, hence no upstream comparison.
+    #[test]
+    fn unborn_head_reports_no_upstream() {
+        let dir = init_repo("status-upstream-unborn");
+        let st = status(dir.path()).unwrap();
+        assert!(!st.has_upstream);
+        assert_eq!(st.unpushed_count, None);
+    }
+
+    /// Wire additivity (monorepo#4058): `hasUpstream` is a plain
+    /// always-present boolean, while `unpushedCount` is omitted without an
+    /// upstream and present (even at 0) with one.
+    #[test]
+    fn upstream_fields_wire_shape() {
+        let dir = init_repo("status-upstream-wire");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let v = serde_json::to_value(status(dir.path()).unwrap()).unwrap();
+        assert_eq!(v["hasUpstream"], serde_json::json!(false));
+        assert!(v.get("unpushedCount").is_none());
+
+        let branch = v["branch"].as_str().unwrap();
+        set_origin_ref(dir.path(), branch);
+        let v = serde_json::to_value(status(dir.path()).unwrap()).unwrap();
+        assert_eq!(v["hasUpstream"], serde_json::json!(true));
+        assert_eq!(v["unpushedCount"], serde_json::json!(0));
+    }
+
     /// A submodule pin change carries `mode: "160000"` plus the old/new pin
     /// SHAs; regular file entries carry none of the gitlink metadata
     /// (monorepo#1739).
@@ -401,5 +581,121 @@ mod tests {
         assert_eq!(sub.mode.as_deref(), Some("160000"));
         assert_eq!(sub.old_sha.as_deref(), Some(old_sha));
         assert_eq!(sub.new_sha, None, "blob OID must not leak as a pin SHA");
+    }
+
+    fn file(path: &str, status: GitFileStatus, staged: bool) -> FileStatus {
+        FileStatus {
+            path: path.to_string(),
+            status,
+            staged,
+            mode: None,
+            old_sha: None,
+            new_sha: None,
+        }
+    }
+
+    fn status_with_files(files: Vec<FileStatus>) -> GitStatus {
+        GitStatus {
+            files,
+            has_uncommitted_changes: true,
+            has_untracked_files: true,
+            ..empty_status()
+        }
+    }
+
+    /// Under the cap the status passes through untouched: no truncation
+    /// markers, files identical (the pre-#3635 wire shape).
+    #[test]
+    fn cap_leaves_under_cap_status_untouched() {
+        let files: Vec<_> = (0..10)
+            .map(|i| file(&format!("f{i}.txt"), GitFileStatus::Untracked, false))
+            .collect();
+        let capped = cap_status_files(&status_with_files(files.clone()));
+        assert_eq!(capped.files, files);
+        assert!(!capped.files_truncated);
+        assert_eq!(capped.total_files, None);
+    }
+
+    /// An exactly-at-cap list is not truncated (the cap is inclusive).
+    #[test]
+    fn cap_is_inclusive_at_the_boundary() {
+        let files: Vec<_> = (0..MAX_STATUS_FILES)
+            .map(|i| file(&format!("f{i}"), GitFileStatus::Untracked, false))
+            .collect();
+        let capped = cap_status_files(&status_with_files(files));
+        assert_eq!(capped.files.len(), MAX_STATUS_FILES);
+        assert!(!capped.files_truncated);
+        assert_eq!(capped.total_files, None);
+    }
+
+    /// Over the cap, tracked changes are all retained ahead of untracked
+    /// entries, the list is capped, and the truncation markers carry the full
+    /// pre-cap count. Aggregate flags stay as computed over the full scan.
+    #[test]
+    fn cap_prefers_tracked_changes_over_untracked() {
+        let mut files = Vec::new();
+        for i in 0..MAX_STATUS_FILES {
+            files.push(file(
+                &format!("untracked{i}"),
+                GitFileStatus::Untracked,
+                false,
+            ));
+        }
+        // Tracked entries interleaved after the untracked block: they must
+        // survive the cap even though they come last in scan order.
+        files.push(file("staged.txt", GitFileStatus::Modified, true));
+        files.push(file("deleted.txt", GitFileStatus::Deleted, false));
+        let total = files.len();
+
+        let capped = cap_status_files(&status_with_files(files));
+        assert_eq!(capped.files.len(), MAX_STATUS_FILES);
+        assert!(capped.files_truncated);
+        assert_eq!(capped.total_files, Some(total));
+        assert!(capped.has_uncommitted_changes);
+        assert!(capped.has_untracked_files);
+        assert!(capped.files.iter().any(|f| f.path == "staged.txt"));
+        assert!(capped.files.iter().any(|f| f.path == "deleted.txt"));
+        // Tracked entries lead the list; untracked fill the remainder in
+        // their original relative order.
+        assert_eq!(capped.files[0].path, "staged.txt");
+        assert_eq!(capped.files[1].path, "deleted.txt");
+        assert_eq!(capped.files[2].path, "untracked0");
+        let untracked_kept = capped
+            .files
+            .iter()
+            .filter(|f| f.status == GitFileStatus::Untracked)
+            .count();
+        assert_eq!(untracked_kept, MAX_STATUS_FILES - 2);
+    }
+
+    /// A pathological all-tracked overflow still enforces the cap.
+    #[test]
+    fn cap_applies_even_when_tracked_alone_overflows() {
+        let files: Vec<_> = (0..MAX_STATUS_FILES + 7)
+            .map(|i| file(&format!("m{i}"), GitFileStatus::Modified, false))
+            .collect();
+        let capped = cap_status_files(&status_with_files(files));
+        assert_eq!(capped.files.len(), MAX_STATUS_FILES);
+        assert!(capped.files_truncated);
+        assert_eq!(capped.total_files, Some(MAX_STATUS_FILES + 7));
+    }
+
+    /// The truncation markers serialize additively: absent on an untruncated
+    /// status (pre-#3635 shape byte-for-byte), present when truncated.
+    #[test]
+    fn truncation_markers_are_additive_on_the_wire() {
+        let untruncated = serde_json::to_value(status_with_files(vec![])).unwrap();
+        assert!(untruncated.get("filesTruncated").is_none());
+        assert!(untruncated.get("totalFiles").is_none());
+
+        let files: Vec<_> = (0..=MAX_STATUS_FILES)
+            .map(|i| file(&format!("f{i}"), GitFileStatus::Untracked, false))
+            .collect();
+        let truncated = serde_json::to_value(cap_status_files(&status_with_files(files))).unwrap();
+        assert_eq!(truncated["filesTruncated"], serde_json::json!(true));
+        assert_eq!(
+            truncated["totalFiles"],
+            serde_json::json!(MAX_STATUS_FILES + 1)
+        );
     }
 }

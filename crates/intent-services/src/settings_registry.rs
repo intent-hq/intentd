@@ -49,12 +49,14 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "providers.enabled",
     "providers.paths",
     "model.default",
+    "model.defaultProvider",
     "model.providerDefaults",
     "model.defaultReasoningEffort",
     "quickActions.defaultModel",
     "quickActions.typeOverrides",
     "quickActions.providerSettings",
     "specialists.default",
+    "specialists.dir",
     "workspace.branchPrefix",
     "workspace.worktreesLocation",
     "workspace.sshKeyPath",
@@ -83,6 +85,9 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "server.maxOutstandingRpcs",
     "server.wsApi.enabled",
     "server.wsApi.port",
+    "server.tunnel.enabled",
+    "server.tunnel.derpUrl",
+    "server.tunnel.only",
     "server.tls.enabled",
     "server.auth.enabled",
     "sourceControl.activeProvider",
@@ -103,8 +108,11 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "logging.level",
     "agents.maxConcurrent",
     "agents.maxConcurrentAdapters",
+    "agents.maxTopLevelAgents",
     "agents.memoryBudgetMb",
+    "agents.acpNodeMaxOldSpaceMb",
     "agents.idleReapMinutes",
+    "agents.reportToParentDebounceSeconds",
     "agents.flushQueuedMessages",
     "agents.resumeInterruptedOnStart",
     "events.streamRetentionHours",
@@ -121,6 +129,8 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.stateSnapshot",
     "agentFeatures.prMonitor",
     "agentFeatures.taskGraph",
+    "agentFeatures.peerAgents",
+    "agentFeatures.mcpTools",
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",
 ];
@@ -289,9 +299,10 @@ impl SettingsRegistry {
         let text = std::fs::read_to_string(&path).map_err(|e| {
             Error::Internal(format!("could not read config {}: {e}", path.display()))
         })?;
-        let doc: DocumentMut = text.parse().map_err(|e| {
+        let mut doc: DocumentMut = text.parse().map_err(|e| {
             Error::Internal(format!("could not parse config {}: {e}", path.display()))
         })?;
+        sync_normalized_compounds(&mut doc, &file)?;
         let inner = Inner {
             file,
             doc,
@@ -536,9 +547,10 @@ impl SettingsRegistry {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn reload(&self, text: &str) -> Result<SettingsChanged> {
         let file = SettingsFile::parse_str(text)?;
-        let doc: DocumentMut = text
+        let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid config.toml: {e}")))?;
+        sync_normalized_compounds(&mut doc, &file)?;
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         inner.file = file;
         inner.doc = doc;
@@ -686,6 +698,74 @@ fn doc_has_path(doc: &DocumentMut, path: &str) -> bool {
         }
     }
     true
+}
+
+/// String value of a dotted path in the raw document, when present.
+fn doc_str(doc: &DocumentMut, path: &str) -> Option<String> {
+    let mut item = doc.as_item();
+    for seg in path.split('.') {
+        item = item.as_table_like()?.get(seg)?;
+    }
+    item.as_str().map(str::to_string)
+}
+
+/// Sync the raw document with the parse-time legacy-compound normalization
+/// (`SettingsFile` splits a compound `model.default` into the
+/// `(defaultProvider, default)` pair and strips a `model.providerDefaults`
+/// value's own map-key prefix). Without this, the document keeps the
+/// compound while the typed file holds the split values, so
+/// `model.defaultProvider` reports `origin: default` and `settings.reset`
+/// on it no-ops — the inherited provider would reappear on the next load.
+/// Only the IN-MEMORY document is rewritten; the user's file on disk stays
+/// byte-identical until the next daemon-initiated write (which persists the
+/// normalized form as a side effect).
+fn sync_normalized_compounds(doc: &mut DocumentMut, file: &SettingsFile) -> Result<()> {
+    if doc_str(doc, "model.default").is_some_and(|raw| raw.contains(':')) {
+        let default = file
+            .model
+            .default
+            .as_deref()
+            .map_or(Value::Null, |m| Value::String(m.to_string()));
+        doc_set(doc, "model.default", &default)?;
+        let provider = file
+            .model
+            .default_provider
+            .as_deref()
+            .map_or(Value::Null, |p| Value::String(p.to_string()));
+        doc_set(doc, "model.defaultProvider", &provider)?;
+    }
+    for (provider, bare) in &file.model.provider_defaults {
+        let path = format!("model.providerDefaults.{provider}");
+        if doc_str(doc, &path).is_some_and(|raw| raw != *bare) {
+            doc_set(doc, &path, &Value::String(bare.clone()))?;
+        }
+    }
+    // Normalization can also REMOVE an entry (own-prefix with a blank
+    // remainder, e.g. `codex = "codex:"` reads as unset): drop the stale
+    // document key so origin/reset agree with the typed file.
+    let stale: Vec<String> = doc_table_keys(doc, "model.providerDefaults")
+        .into_iter()
+        .filter(|k| !file.model.provider_defaults.contains_key(k))
+        .collect();
+    for key in stale {
+        doc_remove(doc, &format!("model.providerDefaults.{key}"));
+    }
+    Ok(())
+}
+
+/// Keys of a table-like value at a dotted path (empty when absent or not a
+/// table).
+fn doc_table_keys(doc: &DocumentMut, path: &str) -> Vec<String> {
+    let mut item = doc.as_item();
+    for seg in path.split('.') {
+        match item.as_table_like().and_then(|t| t.get(seg)) {
+            Some(next) => item = next,
+            None => return Vec::new(),
+        }
+    }
+    item.as_table_like()
+        .map(|t| t.iter().map(|(k, _)| k.to_string()).collect())
+        .unwrap_or_default()
 }
 
 /// Set a dotted path in the raw document to a JSON value, preserving all
@@ -1002,6 +1082,82 @@ mod tests {
         assert_eq!(reloaded.get("mcp.disabledServers"), Some(json!(["linear"])));
         assert_eq!(reloaded.get("notifications.volume"), Some(json!(0.25)));
         assert_eq!(reloaded.origin("git.autoCommit"), Some(SettingOrigin::File));
+    }
+
+    #[test]
+    fn legacy_compound_model_default_loads_as_the_split_triple() {
+        // A user-authored config predating the bare-id contract carries a
+        // compound `model.default`; the registry surfaces the split triple —
+        // the effective state is identical to the split form and the on-disk
+        // file is untouched.
+        let legacy = "[model]\ndefault = \"codex:gpt-5\"\n";
+        let (_dir, path) = temp_config(Some(legacy));
+        let reg = SettingsRegistry::load(&path).expect("load legacy config");
+        assert_eq!(reg.get("model.default"), Some(json!("gpt-5")));
+        assert_eq!(reg.get("model.defaultProvider"), Some(json!("codex")));
+        // The in-memory document is synced with the split, so both halves
+        // report file origin and reset works on each independently.
+        assert_eq!(reg.origin("model.default"), Some(SettingOrigin::File));
+        assert_eq!(
+            reg.origin("model.defaultProvider"),
+            Some(SettingOrigin::File),
+            "the split-off provider must report file origin, not default"
+        );
+
+        let (_dir2, path2) = temp_config(Some(
+            "[model]\ndefault = \"gpt-5\"\ndefaultProvider = \"codex\"\n",
+        ));
+        let split = SettingsRegistry::load(&path2).expect("load split config");
+        assert_eq!(
+            reg.snapshot().effective,
+            split.snapshot().effective,
+            "legacy and split forms must produce identical effective settings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            legacy,
+            "normalization never rewrites the user's file"
+        );
+
+        // apply() on model.default persists the split-off provider: the
+        // synced document already holds the split form, so rewriting the
+        // default leaves `defaultProvider = "codex"` in the file and a
+        // fresh load agrees with the running daemon — no silent provider
+        // change across a restart.
+        reg.apply(&set("model.default", json!("gpt-6")))
+            .expect("update the default model");
+        assert_eq!(reg.get("model.defaultProvider"), Some(json!("codex")));
+        let reloaded = SettingsRegistry::load(&path).expect("reload after update");
+        assert_eq!(reloaded.get("model.default"), Some(json!("gpt-6")));
+        assert_eq!(
+            reloaded.get("model.defaultProvider"),
+            Some(json!("codex")),
+            "the split-off provider must survive a write to model.default"
+        );
+
+        // settings.reset on the split-off provider durably clears it: the
+        // apply(null) rewrite persists the normalized split form, so the
+        // compound never resurrects the provider on the next load.
+        reg.apply(&set("model.defaultProvider", Value::Null))
+            .expect("reset the split-off provider");
+        assert_eq!(reg.get("model.defaultProvider"), Some(Value::Null));
+        let reloaded = SettingsRegistry::load(&path).expect("reload from disk");
+        assert_eq!(
+            reloaded.get("model.defaultProvider"),
+            Some(Value::Null),
+            "the cleared provider must not reappear on the next load"
+        );
+        assert_eq!(reloaded.get("model.default"), Some(json!("gpt-6")));
+
+        // reload() (live-reload watcher path) normalizes the same way.
+        reg.reload("[model]\ndefault = \"auggie:sonnet4.5\"\n")
+            .expect("reload");
+        assert_eq!(reg.get("model.default"), Some(json!("sonnet4.5")));
+        assert_eq!(reg.get("model.defaultProvider"), Some(json!("auggie")));
+        assert_eq!(
+            reg.origin("model.defaultProvider"),
+            Some(SettingOrigin::File)
+        );
     }
 
     #[test]

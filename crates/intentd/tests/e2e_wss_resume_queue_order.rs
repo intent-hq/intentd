@@ -270,6 +270,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -386,7 +387,7 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
         json!({
             "workspaceId": ws_id,
             "name": "Queue Order Agent",
-            "model": "mock:default"
+            "model": "default", "provider": "mock"
         }),
     )
     .await;

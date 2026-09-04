@@ -11,11 +11,12 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS;
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
     model::{AgentDelegateInput, BatchTaskEntry},
-    AgentCreateExtra, AgentId, AgentWakeOrCreateInput, MessageOrigin, NoteId, WorkspaceApi,
-    WorkspaceId, MAX_DELEGATION_DEPTH,
+    AgentCreateExtra, AgentId, AgentStatus, AgentWakeOrCreateInput, Error, MessageOrigin, NoteId,
+    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 use serde_json::{json, Value};
 
@@ -32,10 +33,14 @@ pub(crate) const PRELUDE: &str = r"
         create: (name, message, opts) =>
             host({ method: 'agent.create', args: { name, message, ...(opts || {}) } }),
         delegate: (opts) => host({ method: 'agent.delegate', args: { ...(opts || {}) } }),
-        send: (agentId, message, priority, messageMetadata) =>
-            host({ method: 'agent.send', args: { agentId, message, priority, messageMetadata } }),
-        sendToTask: (taskNoteId, message, priority, messageMetadata) =>
-            host({ method: 'agent.sendToTask', args: { taskNoteId, message, priority, messageMetadata } }),
+        send: (agentId, message, priority, messageMetadata) => {
+            const opts = priority !== null && typeof priority === 'object' ? priority : { priority };
+            return host({ method: 'agent.send', args: { agentId, message, messageMetadata, ...opts } });
+        },
+        sendToTask: (taskNoteId, message, priority, messageMetadata) => {
+            const opts = priority !== null && typeof priority === 'object' ? priority : { priority };
+            return host({ method: 'agent.sendToTask', args: { taskNoteId, message, messageMetadata, ...opts } });
+        },
         subscribe: (eventTypes, opts) =>
             host({ method: 'agent.subscribe', args: { eventTypes, ...(opts || {}) } }),
         unsubscribe: (subscriptionId) =>
@@ -46,8 +51,12 @@ pub(crate) const PRELUDE: &str = r"
             const args = s === '' ? {} : s.startsWith('agent-') ? { agentId: s } : { subscriptionId: s };
             return host({ method: 'agent.unwatch', args });
         },
-        list: (includeCompleted) =>
-            host({ method: 'agent.list', args: { includeCompleted } }),
+        list: (optsOrIncludeCompleted) => {
+            const o = optsOrIncludeCompleted;
+            const args = o !== null && typeof o === 'object' ? { ...o } : { includeCompleted: o };
+            return host({ method: 'agent.list', args });
+        },
+        listSpecialists: () => host({ method: 'agent.listSpecialists', args: {} }),
         status: (agentId) => host({ method: 'agent.status', args: { agentId } }),
         mergeSandbox: (agentId) => host({ method: 'agent.mergeSandbox', args: { agentId } }),
         getQueue: (agentId) => host({ method: 'agent.getQueue', args: { agentId } }),
@@ -60,6 +69,8 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata, reasoningEffort } }),
         readConversation: (agentId, opts) =>
             host({ method: 'agent.readConversation', args: { agentId, ...(opts || {}) } }),
+        getMessageBlock: (agentId, messageId, blockId) =>
+            host({ method: 'agent.getMessageBlock', args: { agentId, messageId, blockId } }),
         summary: (agentId) => host({ method: 'agent.summary', args: { agentId } }),
         reportToParent: (report) =>
             host({ method: 'agent.reportToParent', args: { report } }),
@@ -67,6 +78,8 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'agent.requestDiscussion', args: { reason } }),
         reportBlocker: (reason) =>
             host({ method: 'agent.reportBlocker', args: { reason } }),
+        retire: (reason) =>
+            host({ method: 'agent.retire', args: { reason } }),
     };
 ";
 
@@ -76,17 +89,31 @@ pub(crate) const PRELUDE: &str = r"
 /// verbatim).
 pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (reason) =>\n            host({ method: 'agent.requestDiscussion', args: { reason } }),\n        reportBlocker: (reason) =>\n            host({ method: 'agent.reportBlocker', args: { reason } }),\n";
 
+/// The `ws.agent.retire` installer lines inside [`PRELUDE`], removed when
+/// `agentFeatures.peerAgents` is off — the default, since the toggle is
+/// opt-in (a unit test guards that this segment still matches the prelude
+/// verbatim).
+pub(crate) const RETIRE_PRELUDE_SEGMENT: &str = "        retire: (reason) =>\n            host({ method: 'agent.retire', args: { reason } }),\n";
+
 /// Feature-aware `ws.agent` prelude: with `agentFeatures.attentionRequests`
-/// off the two attention-request installers are omitted, so agent code
-/// touching them fails with a clear `not a function` `TypeError`. Every other
-/// `ws.agent.*` method (including `reportToParent`) stays un-gated. With the
-/// toggle on — the default — this borrows [`PRELUDE`] byte-identically.
+/// off the two attention-request installers are omitted, and with
+/// `agentFeatures.peerAgents` off (the default — it is the one opt-in
+/// toggle) the `retire` installer is omitted, so agent code touching them
+/// fails with a clear `not a function` `TypeError`. Every other
+/// `ws.agent.*` method (including `reportToParent`) stays un-gated. With
+/// both toggles on this borrows [`PRELUDE`] byte-identically.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str> {
-    if features.attention_requests {
-        Cow::Borrowed(PRELUDE)
-    } else {
-        Cow::Owned(PRELUDE.replacen(ATTENTION_PRELUDE_SEGMENT, "", 1))
+    if features.attention_requests && features.peer_agents {
+        return Cow::Borrowed(PRELUDE);
     }
+    let mut js = PRELUDE.to_string();
+    if !features.attention_requests {
+        js = js.replacen(ATTENTION_PRELUDE_SEGMENT, "", 1);
+    }
+    if !features.peer_agents {
+        js = js.replacen(RETIRE_PRELUDE_SEGMENT, "", 1);
+    }
+    Cow::Owned(js)
 }
 
 pub(crate) async fn dispatch(
@@ -105,7 +132,8 @@ pub(crate) async fn dispatch(
         "unsubscribe" => unsubscribe(api, ws, args).await,
         "watch" => watch(api, ws, caller, args).await,
         "unwatch" => unwatch(api, ws, caller, args).await,
-        "list" => list(api, ws).await,
+        "list" => list(api, ws, args).await,
+        "listSpecialists" => list_specialists(api, ws).await,
         "status" => status(api, ws, args).await,
         "mergeSandbox" => merge_sandbox(api, ws, args).await,
         "getQueue" => get_queue(api, ws, args).await,
@@ -114,10 +142,12 @@ pub(crate) async fn dispatch(
         "snapshot" => snapshot(api, ws, caller).await,
         "wakeOrCreate" => wake_or_create(api, ws, caller, args).await,
         "readConversation" => read_conversation(api, ws, args).await,
+        "getMessageBlock" => get_message_block(api, ws, args).await,
         "summary" => summary(api, ws, args).await,
         "reportToParent" => report_to_parent(api, ws, caller, args).await,
         "requestDiscussion" => request_attention(api, ws, caller, "discussion", args).await,
         "reportBlocker" => request_attention(api, ws, caller, "blocker", args).await,
+        "retire" => retire(api, ws, caller, args).await,
         other => Err(format!("host: unknown method `agent.{other}`")),
     }
 }
@@ -128,6 +158,9 @@ async fn create(
     caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
+    if opt_bool(args, "topLevel").unwrap_or(false) {
+        return create_top_level(api, ws, caller, args).await;
+    }
     let name = req_str(args, "name").map_err(|_| "name is required".to_string())?;
     let initial_message =
         req_str(args, "message").map_err(|_| "message is required".to_string())?;
@@ -183,6 +216,7 @@ async fn create(
     let extra = AgentCreateExtra {
         metadata: Some(Value::Object(metadata)),
         is_background: Some(is_background),
+        provider: opt_str(args, "provider"),
         reasoning_effort: opt_str(args, "reasoningEffort"),
         ..AgentCreateExtra::default()
     };
@@ -278,6 +312,217 @@ async fn create(
     }))
 }
 
+/// Cap on live top-level agents for `ws.agent.create({ topLevel: true })`,
+/// read from `agents.maxTopLevelAgents` (settings) with the compiled default
+/// as the fallback when the settings read fails. `settings.get` normalizes
+/// number settings to the float wire shape (e.g. `20.0`), so the value is
+/// read as `f64` — `as_u64` would return `None` for floats and silently
+/// ignore user overrides.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+async fn max_top_level_agents(api: &Arc<dyn WorkspaceApi>) -> u64 {
+    api.settings_get("agents.maxTopLevelAgents".to_string())
+        .await
+        .ok()
+        .and_then(|v| v.get("value").and_then(Value::as_f64))
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map_or(u64::from(DEFAULT_MAX_TOP_LEVEL_AGENTS), |n| n as u64)
+}
+
+/// Live (non-deleted, non-retired) TOP-LEVEL (depth-0, parentless) agents in
+/// the workspace — the population `agents.maxTopLevelAgents` caps on the
+/// top-level-create path. Depth is read like the `create` depth guard:
+/// session `delegationDepth` metadata, absent reads as 0; parentless is
+/// required so a child row with scrubbed metadata never counts.
+fn count_live_top_level(agents: &[intent_core::AgentLite]) -> u64 {
+    agents
+        .iter()
+        .filter(|a| {
+            a.status != AgentStatus::Deleted
+                && a.retired_at.is_none()
+                && a.parent_agent_id.is_none()
+                && a.metadata.delegation_depth.unwrap_or(0) == 0
+        })
+        .count() as u64
+}
+
+/// The daemon-prepended sponsor preamble on a spawned peer's initial
+/// message: names the sponsor, states the peer's independent co-equal
+/// standing (no reporting obligation — `reportToParent` does not apply),
+/// and points at `ws.agent.list` / `ws.agent.send` for team coordination.
+fn sponsor_preamble(sponsor_id: &AgentId, sponsor_name: Option<&str>) -> String {
+    let sponsor = match sponsor_name {
+        Some(n) => format!("{n} ({})", sponsor_id.as_str()),
+        None => sponsor_id.as_str().to_string(),
+    };
+    format!(
+        "[You were spawned as an independent top-level agent by {sponsor} (your sponsor). \
+         You are a co-equal peer, not a sub-agent: you have no parent and no obligation to \
+         report progress or status to your sponsor — `ws.agent.reportToParent` does not \
+         apply to you. Use `ws.agent.list` to discover the other agents in this workspace \
+         and `ws.agent.send` to reach them.]\n\n"
+    )
+}
+
+/// `ws.agent.create({ topLevel: true })`: create an INDEPENDENT top-level
+/// agent — depth 0, no `parentAgentId`, no `createdByAgentId`, no
+/// auto-subscribe of the caller — with metadata `sponsorAgentId` = caller
+/// and the sponsor preamble prepended to the delivered initial message.
+/// Top-level agents are FOREGROUND by default (`isBackground: false`).
+/// Guarded by the `agents.maxTopLevelAgents` cap on live (non-deleted,
+/// non-retired) top-level agents; the depth guard never applies (the new
+/// agent is depth 0). Feature-gated behind `agentFeatures.peerAgents`
+/// (arg-conditional at the dispatch layer) and restricted to FOREGROUND
+/// TOP-LEVEL callers: sub-agents are denied at the dispatch layer, and
+/// background callers are denied here by reading the caller's persisted
+/// `isBackground` metadata. `taskNoteId` is rejected — task assignment
+/// stays a delegation concept.
+async fn create_top_level(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller = caller.ok_or_else(|| {
+        "create with topLevel: true requires an agent caller identity".to_string()
+    })?;
+    let name = req_str(args, "name").map_err(|_| "name is required".to_string())?;
+    let initial_message =
+        req_str(args, "message").map_err(|_| "message is required".to_string())?;
+    if opt_str(args, "taskNoteId").is_some() {
+        return Err(
+            "topLevel: true cannot be combined with taskNoteId — a top-level agent is \
+             independent; use ws.agent.delegate (or create without topLevel) to assign a task"
+                .to_string(),
+        );
+    }
+    // Foreground-caller rule: only FOREGROUND top-level agents may create
+    // independent top-level peers (parity with proposeSibling). The
+    // sub-agent half of the rule is enforced at the dispatch layer; the
+    // background half reads the caller's persisted `isBackground` metadata
+    // here. FAIL CLOSED: a failed lookup must not skip the check — an
+    // unavailable/deleted caller session cannot bypass the foreground-caller
+    // restriction. The lookup also serves the sponsor name for the preamble
+    // and kickoff attribution.
+    let caller_lite = api
+        .agent_get(caller.clone(), Some(ws.clone()))
+        .await
+        .map_err(|e| {
+            format!(
+                "create with topLevel: true could not verify the caller's session \
+                 (required for the foreground-caller check): {}",
+                map_err(e)
+            )
+        })?;
+    if caller_lite.metadata.is_background {
+        return Err(
+            "create with topLevel: true is only available to foreground top-level agents — \
+             background agents cannot create independent top-level agents; use ws.agent.create \
+             or ws.agent.delegate to start sub-agents instead"
+                .to_string(),
+        );
+    }
+    // Runaway-spawn guard: reject when live top-level agents are already at
+    // the `agents.maxTopLevelAgents` cap. Advisory (check-then-create, no
+    // atomicity) — the cap bounds runaway loops, not a hard invariant.
+    let cap = max_top_level_agents(api).await;
+    let live = count_live_top_level(&api.agent_list(ws.clone()).await.map_err(map_err)?);
+    if live >= cap {
+        return Err(format!(
+            "Cannot create top-level agent: the workspace already has {live} live top-level agents, at the `agents.maxTopLevelAgents` cap ({cap}). Retire or delete an agent, or raise the cap in settings."
+        ));
+    }
+    let sponsor_name = Some(caller_lite.name);
+    // Kickoff = daemon-prepended sponsor preamble, caller message after.
+    // Persisted as `AgentSession.initial_message` (harvested from the
+    // `metadata.initialMessage` create param; served by `agent.getSession`
+    // only — off the AgentLite projection) AND delivered, so the stored
+    // copy matches what the new agent actually received (parity with the
+    // child-create path).
+    let kickoff = format!(
+        "{}{initial_message}",
+        sponsor_preamble(caller, sponsor_name.as_deref())
+    );
+    let is_background = opt_bool(args, "isBackground").unwrap_or(false);
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("initialMessage".to_string(), Value::String(kickoff.clone()));
+    metadata.insert("isBackground".to_string(), Value::Bool(is_background));
+    metadata.insert(
+        "sponsorAgentId".to_string(),
+        Value::String(caller.as_str().to_string()),
+    );
+    if let Some(bp) = opt_str(args, "behaviorPrompt") {
+        metadata.insert("behaviorPrompt".to_string(), Value::String(bp));
+    }
+    let extra = AgentCreateExtra {
+        metadata: Some(Value::Object(metadata)),
+        is_background: Some(is_background),
+        provider: opt_str(args, "provider"),
+        reasoning_effort: opt_str(args, "reasoningEffort"),
+        ..AgentCreateExtra::default()
+    };
+    // `parent_agent_id: None` is the independence seam: the new agent is
+    // created exactly like a user-created top-level agent (depth 0,
+    // parentless), so the depth guard, child-linkage suppressions and
+    // `reportToParent` plumbing never see the sponsor.
+    let created = api
+        .agent_create(
+            ws.clone(),
+            Some(name),
+            opt_str(args, "model"),
+            opt_str(args, "specialist"),
+            None,
+            opt_str(args, "idempotencyKey").or_else(|| Some(uuid::Uuid::new_v4().to_string())),
+            extra,
+        )
+        .await
+        .map_err(map_err)?;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let agent_name = created["agent"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // NO completion watch for the caller — top-level agents are
+    // independent; the sponsor is not auto-woken when the agent finishes
+    // (watch explicitly with `ws.agent.watch` if desired).
+    //
+    // Deliver the kickoff with the same daemon-stamped sender attribution
+    // as other agent sends. Failure is non-fatal (the session exists).
+    let kickoff_metadata = merge_sender_attribution(
+        explicit_metadata(args),
+        Some(caller),
+        sponsor_name.as_deref(),
+    );
+    if let Err(e) = api
+        .agent_send_message(
+            ws.clone(),
+            AgentId::from(agent_id.as_str()),
+            kickoff,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            kickoff_metadata,
+            MessageOrigin::Automatic,
+        )
+        .await
+    {
+        tracing::warn!(agent = %agent_id, error = %e, "agent.create(topLevel): failed to start agent turn");
+    }
+    Ok(json!({
+        "ok": true,
+        "id": agent_id,
+        "agentId": agent_id,
+        "name": agent_name,
+        "sponsorAgentId": caller.as_str(),
+    }))
+}
+
 async fn delegate(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -368,7 +613,14 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// `ws.agent.send`. Guarded by the single-pending-message rule: when the
 /// caller (an agent) already has a pending entry in the target's queue, the
 /// send is refused with an `ok: false` result echoing the target's queue —
-/// see [`pending_send_refusal`].
+/// see [`pending_send_refusal`]. `replacePending: true` (options-object third
+/// argument) turns the refusal into a replace: the new message is sent FIRST
+/// and the pending entry retracted after ([`replace_pending_entry`]), so a
+/// failed send never discards the pending entry — the replace is lossless,
+/// with the replace outcome reported on the result. Success results carry a
+/// top-level `delivery` outcome ([`delivery_outcome`]) so `ok: true` +
+/// silently-queued is unambiguous even to a sender that only glances at
+/// the result.
 async fn send(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -378,8 +630,16 @@ async fn send(
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
+    let replace_pending = opt_bool(args, "replacePending").unwrap_or(false);
+    let mut pending_to_replace: Option<String> = None;
     if let Some(refusal) = pending_send_refusal(api, ws, caller, &agent_id).await {
-        return Ok(refusal);
+        if !replace_pending {
+            return Ok(refusal);
+        }
+        pending_to_replace = refusal
+            .get("pendingMessageId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
     }
     let mut result = api
         .agent_send_message(
@@ -398,6 +658,15 @@ async fn send(
         )
         .await
         .map_err(map_err)?;
+    let mut replace_report: Option<Value> = None;
+    if replace_pending {
+        if let Some(caller) = caller {
+            replace_report = Some(match &pending_to_replace {
+                Some(pid) => replace_pending_entry(api, caller, &agent_id, pid).await,
+                None => json!({ "replaced": false, "replaceOutcome": "none" }),
+            });
+        }
+    }
     if let Some(sub) = watch_sender(api, ws, caller, &agent_id).await {
         result["subscriptionId"] = json!(sub);
         result["message"] = json!(SENDER_WATCH_NOTIFICATION);
@@ -405,6 +674,10 @@ async fn send(
     let mut out = merge_ok(result);
     if let Some(obj) = out.as_object_mut() {
         obj.insert("agentId".to_string(), json!(agent_id_str));
+        if let Some(delivery) = delivery_outcome(obj) {
+            obj.insert("delivery".to_string(), json!(delivery));
+        }
+        merge_replace_report(obj, replace_report);
     }
     Ok(out)
 }
@@ -412,11 +685,20 @@ async fn send(
 /// `ws.agent.sendToTask`. Same single-pending-message guard as [`send`],
 /// applied against the task's assigned agent (resolution failures fall
 /// through so the unguarded call surfaces its existing error/`ok: false`
-/// shapes — e.g. "No agent assigned to task"). The guard's target
-/// resolution (`task.assigned_agents.first()`) deliberately mirrors
+/// shapes — e.g. "No agent assigned to task"), the same send-first
+/// `replacePending` replace path, and the same top-level
+/// `delivery` outcome on success ([`delivery_outcome`] — the op nests its
+/// flags under `result`). The guard's target resolution
+/// (`task.assigned_agents.first()`) deliberately mirrors
 /// `agent_send_to_task_op` in `intent-services` — if the op's resolution
 /// ever changes, this site must change with it or the guard checks the
-/// wrong agent.
+/// wrong agent. The op re-resolves the assignee itself, so the retraction
+/// only runs when the op's resolved `agentId` matches the guard's target;
+/// a mid-call reassignment retracts nothing and reports
+/// `replaceOutcome: "reassigned"`. An agent caller passing
+/// `replacePending: true` always gets a replace report — the fall-through
+/// paths report `replaceOutcome: "none"` rather than silently ignoring the
+/// option.
 async fn send_to_task(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -426,6 +708,9 @@ async fn send_to_task(
     let task_note_id =
         req_str(args, "taskNoteId").map_err(|_| "taskNoteId is required".to_string())?;
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
+    let replace_pending = opt_bool(args, "replacePending").unwrap_or(false);
+    let mut guard_target: Option<AgentId> = None;
+    let mut pending_to_replace: Option<String> = None;
     if caller.is_some() {
         if let Ok(task) = api
             .get_my_task(ws.clone(), NoteId::from_string(&task_note_id))
@@ -433,10 +718,17 @@ async fn send_to_task(
         {
             if let Some(target) = task.assigned_agents.first() {
                 if let Some(mut refusal) = pending_send_refusal(api, ws, caller, target).await {
-                    if let Some(obj) = refusal.as_object_mut() {
-                        obj.insert("taskNoteId".to_string(), json!(task_note_id));
+                    if !replace_pending {
+                        if let Some(obj) = refusal.as_object_mut() {
+                            obj.insert("taskNoteId".to_string(), json!(task_note_id));
+                        }
+                        return Ok(refusal);
                     }
-                    return Ok(refusal);
+                    pending_to_replace = refusal
+                        .get("pendingMessageId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    guard_target = Some(target.clone());
                 }
             }
         }
@@ -455,6 +747,24 @@ async fn send_to_task(
         .get("agentId")
         .and_then(Value::as_str)
         .map(AgentId::from);
+    let mut replace_report: Option<Value> = None;
+    if replace_pending {
+        if let Some(caller_id) = caller {
+            replace_report = Some(match (&pending_to_replace, &guard_target) {
+                (Some(pid), Some(gt)) if target.as_ref() == Some(gt) => {
+                    replace_pending_entry(api, caller_id, gt, pid).await
+                }
+                (Some(_), Some(_)) => {
+                    // The op resolved a different assignee (or none) than the
+                    // guard did — the pending entry sits in the old assignee's
+                    // queue while the new message went elsewhere. Retract
+                    // nothing and say so instead of reporting a false replace.
+                    json!({ "replaced": false, "replaceOutcome": "reassigned" })
+                }
+                _ => json!({ "replaced": false, "replaceOutcome": "none" }),
+            });
+        }
+    }
     if let Some(target) = target {
         if let Some(sub) = watch_sender(api, ws, caller, &target).await {
             result["subscriptionId"] = json!(sub);
@@ -464,6 +774,10 @@ async fn send_to_task(
     let mut out = merge_ok(result);
     if let Some(obj) = out.as_object_mut() {
         obj.insert("taskNoteId".to_string(), json!(task_note_id));
+        if let Some(delivery) = delivery_outcome(obj) {
+            obj.insert("delivery".to_string(), json!(delivery));
+        }
+        merge_replace_report(obj, replace_report);
     }
     Ok(out)
 }
@@ -556,9 +870,222 @@ async fn unwatch(
     Ok(merge_ok(v))
 }
 
-async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
+/// `ws.agent.list` scope filter: `"top-level"` keeps only rows with no
+/// `parentAgentId`, `"subagents"` only rows with one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AgentListScope {
+    TopLevel,
+    Subagents,
+}
+
+/// Parsed `ws.agent.list` options (`{ includeCompleted?, scope?,
+/// parentAgentId? }`; the JS wrapper maps the legacy bare-boolean form to
+/// `{ includeCompleted }`).
+#[derive(Debug)]
+struct AgentListFilter {
+    include_completed: bool,
+    scope: Option<AgentListScope>,
+    parent_agent_id: Option<String>,
+}
+
+/// Like `opt_str`, but rejects a present-but-non-string value instead of
+/// silently ignoring it (a typo'd filter must not widen the result set).
+fn opt_str_strict(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!("{key} must be a string, got: {other}")),
+    }
+}
+
+fn parse_agent_list_filter(args: &Value) -> Result<AgentListFilter, String> {
+    let scope = match opt_str_strict(args, "scope")?.as_deref() {
+        None => None,
+        Some("top-level") => Some(AgentListScope::TopLevel),
+        Some("subagents") => Some(AgentListScope::Subagents),
+        Some(other) => {
+            return Err(format!(
+                "invalid scope \"{other}\": valid values are \"top-level\" (agents with no parent) and \"subagents\" (agents with a parent)"
+            ));
+        }
+    };
+    let parent_agent_id = opt_str_strict(args, "parentAgentId")?;
+    if scope == Some(AgentListScope::TopLevel) && parent_agent_id.is_some() {
+        return Err(
+            "parentAgentId cannot be combined with scope \"top-level\": top-level agents have no parent. Drop one of the two filters (parentAgentId alone already returns only that agent's sub-agents)."
+                .to_string(),
+        );
+    }
+    Ok(AgentListFilter {
+        include_completed: opt_bool(args, "includeCompleted").unwrap_or(false),
+        scope,
+        parent_agent_id,
+    })
+}
+
+impl AgentListFilter {
+    /// Whether a row with this status/parent survives the filter. Terminal
+    /// statuses mirror the `ws.app.agents.list` `includeCompleted` set:
+    /// completed / error / deleted.
+    fn retains(&self, status: AgentStatus, parent_agent_id: Option<&str>) -> bool {
+        let terminal = matches!(
+            status,
+            AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
+        );
+        if terminal && !self.include_completed {
+            return false;
+        }
+        match self.scope {
+            Some(AgentListScope::TopLevel) if parent_agent_id.is_some() => return false,
+            Some(AgentListScope::Subagents) if parent_agent_id.is_none() => return false,
+            _ => {}
+        }
+        match &self.parent_agent_id {
+            Some(p) => parent_agent_id == Some(p.as_str()),
+            None => true,
+        }
+    }
+}
+
+async fn list(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let filter = parse_agent_list_filter(args)?;
+    // Soft retire: `agent_list` excludes retired sessions by default, so the
+    // agent-facing list never shows them (the wire `includeRetired` escape
+    // hatch is FE-only by design).
     let rows = api.agent_list(ws.clone()).await.map_err(map_err)?;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|r| filter.retains(r.status, r.parent_agent_id.as_ref().map(AgentId::as_str)))
+        .collect();
     serde_json::to_value(rows).map_err(|e| e.to_string())
+}
+
+/// `ws.agent.listSpecialists`: the current specialist catalog projected to a
+/// compact dispatch-oriented shape — prompt bodies are deliberately dropped
+/// (the purpose is model/specialist selection, not prompt inspection). The
+/// loader runs at call time with the workspace's path so the project tier
+/// (`.intent/specialists/`) applies. The dispatch variant of the list
+/// resolves the `resolvedProvider`/`resolvedModel` preview per-specialist —
+/// each row against the provider a no-`model` delegate of that specialist
+/// would actually spawn on (its own pin first, else the settings default) —
+/// matching the session-start specialist hints.
+async fn list_specialists(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
+    // Best-effort workspace path: a workspace without a checkout (e.g. chief)
+    // simply gets no project tier.
+    let workspace_path = api
+        .get_workspace(ws.clone())
+        .await
+        .ok()
+        .and_then(|w| w.effective_path().map(String::from));
+    let result = api
+        .specialist_list_dispatch(workspace_path)
+        .await
+        .map_err(map_err)?;
+    let specialists = result
+        .get("specialists")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "specialist.list returned invalid shape".to_string())?;
+    Ok(Value::Array(
+        specialists.iter().map(project_specialist_row).collect(),
+    ))
+}
+
+/// Project one resolved `SpecialistDef` into the compact
+/// `ws.agent.listSpecialists` row: `{ id, name, description, hidden?,
+/// aliases?, defaultModel?, modelOptions }`. `defaultModel` is
+/// `{ provider, model, reasoningEffort? }` with bare `model`, pairing the
+/// loader's `resolvedProvider`/`resolvedModel` preview fields (what a
+/// no-`model` delegate would pin) plus its `resolvedReasoningEffort` (the
+/// effort a no-`reasoningEffort` delegate would apply) when the loader
+/// resolved one; the whole object is omitted when the loader omitted the
+/// pair — resolution yielding the provider CLI default. `modelOptions`
+/// entries keep the loader's normalized triple shape
+/// `{ provider?, model, hint?, reasoningEffort? }` with bare `model`,
+/// dropping an empty `hint`.
+fn project_specialist_row(def: &Value) -> Value {
+    let mut row = serde_json::Map::new();
+    for key in ["id", "name", "description"] {
+        row.insert(
+            key.to_string(),
+            def.get(key)
+                .cloned()
+                .unwrap_or(Value::String(String::new())),
+        );
+    }
+    if def.get("hidden").and_then(Value::as_bool) == Some(true) {
+        row.insert("hidden".to_string(), json!(true));
+    }
+    if let Some(aliases) = def.get("aliases").and_then(Value::as_array) {
+        if !aliases.is_empty() {
+            row.insert("aliases".to_string(), Value::Array(aliases.clone()));
+        }
+    }
+    if let (Some(provider), Some(model)) = (
+        def.get("resolvedProvider").and_then(Value::as_str),
+        def.get("resolvedModel").and_then(Value::as_str),
+    ) {
+        let mut default_model = serde_json::Map::new();
+        default_model.insert("provider".to_string(), json!(provider));
+        default_model.insert("model".to_string(), json!(model));
+        if let Some(effort) = def.get("resolvedReasoningEffort").and_then(Value::as_str) {
+            default_model.insert("reasoningEffort".to_string(), json!(effort));
+        }
+        row.insert("defaultModel".to_string(), Value::Object(default_model));
+    }
+    let options: Vec<Value> = def
+        .get("modelOptions")
+        .and_then(Value::as_array)
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|opt| {
+                    let model = opt.get("model").and_then(Value::as_str)?;
+                    let mut out = serde_json::Map::new();
+                    if let Some(provider) = opt.get("provider").and_then(Value::as_str) {
+                        out.insert("provider".to_string(), json!(provider));
+                    }
+                    out.insert("model".to_string(), json!(model));
+                    if let Some(hint) = opt
+                        .get("hint")
+                        .and_then(Value::as_str)
+                        .filter(|h| !h.is_empty())
+                    {
+                        out.insert("hint".to_string(), json!(hint));
+                    }
+                    if let Some(effort) = opt.get("reasoningEffort").and_then(Value::as_str) {
+                        out.insert("reasoningEffort".to_string(), json!(effort));
+                    }
+                    Some(Value::Object(out))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    row.insert("modelOptions".to_string(), Value::Array(options));
+    Value::Object(row)
+}
+
+/// Soft-retire inertness on the agent-facing read surface: resolve the
+/// target via `agent_get` (workspace-scoped) and reject retired sessions
+/// with a clear "agent is retired" error. Shared by `status` /
+/// `readConversation` / `summary` / `getQueue` — the wire-level reads
+/// (`agent.get`, `agent.getConversation`) deliberately still serve retired
+/// rows so the FE can render the preserved conversation read-only.
+async fn require_active_target(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<intent_core::AgentLite, String> {
+    let agent = api
+        .agent_get(agent_id.clone(), Some(ws.clone()))
+        .await
+        .map_err(map_err)?;
+    if agent.retired_at.is_some() {
+        return Err(format!("agent {} is retired", agent_id.as_str()));
+    }
+    Ok(agent)
 }
 
 /// `ws.agent.status` merges the target's pending queue into the result
@@ -576,10 +1103,7 @@ async fn status(
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
-    let agent = api
-        .agent_get(agent_id.clone(), Some(ws.clone()))
-        .await
-        .map_err(map_err)?;
+    let agent = require_active_target(api, ws, &agent_id).await?;
     let sandboxed = agent.metadata.sandbox_path.is_some();
     let mut out = serde_json::to_value(agent).map_err(|e| e.to_string())?;
     let queue = fetch_presented_queue(api, ws, &agent_id).await?;
@@ -654,6 +1178,7 @@ async fn get_queue(
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
+    let _ = require_active_target(api, ws, &agent_id).await?;
     let queue = fetch_presented_queue(api, ws, &agent_id).await?;
     Ok(json!({
         "ok": true,
@@ -747,7 +1272,7 @@ async fn wake_or_create(
             caller_name = Some(caller_lite.name);
         }
     }
-    // Sender attribution on the delivered context message (monorepo#1015):
+    // Sender attribution on the delivered context message (intent-hq/intent#3721, monorepo#1015):
     // same daemon-stamped attribution semantics as `send`, reusing the
     // depth-guard lookup's name (no second `agent_get` round-trip).
     let message_metadata =
@@ -780,21 +1305,50 @@ async fn read_conversation(
     args: &Value,
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    let _ = require_active_target(api, ws, &agent_id).await?;
     let last_n = args.get("lastN").and_then(Value::as_i64);
     let page_token = opt_str(args, "pageToken");
+    // Slim projection (§5.5): agents get bounded tool/image bodies like every
+    // other consumer since v8.0; full blocks are read on demand via
+    // `agent.getMessageBlock`. The binding always opts into the in-progress
+    // tail (monorepo#3647): a coordinator reading a mid-turn child sees the
+    // in-flight turn's streamed blocks so far as a trailing
+    // `inProgress: true` row instead of a transcript frozen at turn start.
     let v = api
         .agent_get_conversation(
-            AgentId::from(agent_id_str.as_str()),
+            agent_id,
             last_n,
             Some(ws.clone()),
             page_token,
             None,
             None,
-            None,
+            Some(intent_core::ConversationProjection::Slim),
+            true,
         )
         .await
         .map_err(map_err)?;
     Ok(v)
+}
+
+/// `ws.agent.getMessageBlock`: one FULL content block of one persisted
+/// message — the on-demand hydration counterpart of the slim
+/// `readConversation` above. Block ids are the served identity (persisted
+/// assistant ids and the synthetic `{messageId}:{index}` ids both resolve),
+/// and the returned block is the full, unprojected body.
+async fn get_message_block(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    let _ = require_active_target(api, ws, &agent_id).await?;
+    let message_id = req_str(args, "messageId").map_err(|_| "messageId is required".to_string())?;
+    let block_id = req_str(args, "blockId").map_err(|_| "blockId is required".to_string())?;
+    api.agent_get_message_block(agent_id, message_id, block_id, Some(ws.clone()))
+        .await
+        .map_err(map_err)
 }
 
 async fn summary(
@@ -803,7 +1357,9 @@ async fn summary(
     args: &Value,
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
-    api.agent_summary(ws.clone(), AgentId::from(agent_id_str.as_str()))
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    let _ = require_active_target(api, ws, &agent_id).await?;
+    api.agent_summary(ws.clone(), agent_id)
         .await
         .map_err(map_err)
 }
@@ -841,6 +1397,51 @@ async fn request_attention(
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))
+}
+
+/// `ws.agent.retire`: SOFT-retire the CALLER's own agent session (no target
+/// argument; always self-scoped — callers can never retire other agents).
+/// Sets `retiredAt` via the `agent_retire` service op: the session row and
+/// its full conversation survive (still searchable), but the session is
+/// INERT — excluded from default `agent.list` reads, unreachable on the
+/// agent-facing MCP surface, and nothing may start a turn on it — until the
+/// user/FE-initiated `agent.restore` wire method clears the mark. TERMINAL
+/// for the caller: nothing after the call runs. Emits `agent:retired`; the
+/// optional `reason` rides the event payload and the log line — no new
+/// persistence.
+///
+/// FAILS (invalid params, nothing mutated) while any descendant child agent
+/// is still running a turn — the error names the active children; stop or
+/// wait for them first. On success the caller's settled descendants are
+/// cascade-retired with it (each with the full retire cleanup), and
+/// restoring the caller later does NOT restore them.
+async fn retire(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller = caller.ok_or_else(|| "retire requires an agent caller identity".to_string())?;
+    let reason = opt_str(args, "reason");
+    tracing::info!(
+        agent = %caller,
+        workspace = %ws,
+        reason = reason.as_deref().unwrap_or("(none)"),
+        "agent.retire: soft-retiring agent session"
+    );
+    let v = api
+        .agent_retire(caller.clone(), Some(ws.clone()), reason.clone())
+        .await
+        .map_err(map_err)?;
+    let mut out = merge_ok(v);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("agentId".to_string(), json!(caller.as_str()));
+        obj.insert("retired".to_string(), json!(true));
+        if let Some(r) = reason {
+            obj.insert("reason".to_string(), json!(r));
+        }
+    }
+    Ok(out)
 }
 
 /// Build the `{ type: "agent_message", fromAgentId, fromAgentName }`
@@ -972,10 +1573,11 @@ async fn fetch_presented_queue(
 /// when the caller (an agent) already has a pending entry in the target's
 /// queue, refuse the send instead of stacking a second one. Returns
 /// `Some(refusal)` — a **successful** tool result with `ok: false`, the
+/// unmissable `refused: true` discriminator, an `error` naming the rule,
 /// target's presented queue (drain order, [`truncate_entry_content`]'d), the
 /// caller's pending entry id, and the instruction to either keep the existing
-/// entry or remove it and re-send one combined message (which lands at the
-/// end of the queue). Returns `None` when the guard does not apply: no agent
+/// entry or re-send one combined message with `replacePending: true` (which
+/// lands at the end of the queue). Returns `None` when the guard does not apply: no agent
 /// caller identity (user/FE-origin sends are never guarded), the queue could
 /// not be fetched (fall through so the unguarded send surfaces its existing
 /// error shapes — e.g. the monorepo#564 unknown-id `-32602`), or the caller
@@ -999,15 +1601,109 @@ async fn pending_send_refusal(
     let queue: Vec<Value> = queue.into_iter().map(truncate_entry_content).collect();
     Some(json!({
         "ok": false,
+        "refused": true,
         "agentId": target.as_str(),
         "error": format!(
-            "send refused: you already have a pending message (id: {pending_id}) in this agent's queue"
+            "send refused: only one pending message per target is allowed, and you already have a pending message (id: {pending_id}) in this agent's queue"
         ),
         "pendingMessageId": pending_id,
         "queueLength": queue_length,
         "queue": queue,
-        "instruction": "Only one pending message per target is allowed. Either keep your existing entry as-is, or remove it with ws.agent.removeQueuedMessage(agentId, messageId) and re-send ONE message combining everything you want to say. Note: a re-sent message lands at the END of the queue.",
+        "instruction": "Only one pending message per target is allowed. Either keep your existing entry as-is, or re-send ONE message combining everything you want to say with `replacePending: true` in the options-object third argument — it sends the new message and retracts your pending entry in a single call (the entry is only removed after the new message is accepted, so nothing is lost if the send fails; the result reports `replaced`/`replaceOutcome`). Manual removeQueuedMessage + re-send still works but is NOT atomic (the pending entry is gone even if the re-send then fails). Either way the re-sent message lands at the END of the queue.",
     }))
+}
+
+/// Execute the `replacePending` retraction against the pending entry id
+/// captured from a [`pending_send_refusal`] result, returning the
+/// replace-report fragment merged into the send result by
+/// [`merge_replace_report`]. Runs AFTER the new message was sent, so a
+/// failed send never discards the pending entry. Retraction success →
+/// `replaced: true` + `replacedMessageId`; `NotFound` (entry drained /
+/// delivered between the guard check and the removal) → `replaced: false` +
+/// `replaceOutcome: "drained"`; any other removal error (unexpected here —
+/// the refusal already established the caller's ownership) is logged and
+/// reported as `replaceOutcome: "error"` so an infrastructure failure never
+/// masquerades as a drained race. The new message was sent either way, so
+/// the caller never has to re-drive the sequence.
+async fn replace_pending_entry(
+    api: &Arc<dyn WorkspaceApi>,
+    caller: &AgentId,
+    target: &AgentId,
+    pending_id: &str,
+) -> Value {
+    match api
+        .agent_remove_queued_message_owned(target.clone(), pending_id.to_string(), caller.clone())
+        .await
+    {
+        Ok(_) => json!({ "replaced": true, "replacedMessageId": pending_id }),
+        Err(Error::NotFound(_)) => json!({ "replaced": false, "replaceOutcome": "drained" }),
+        Err(e) => {
+            tracing::warn!(target_agent = %target.0, message_id = %pending_id, error = %e, "agent.send: replacePending retraction failed");
+            json!({ "replaced": false, "replaceOutcome": "error" })
+        }
+    }
+}
+
+/// Merge a [`replace_pending_entry`] report (or a fall-through
+/// `replaceOutcome` fragment) into a send result. `replaced: true` carries
+/// `replacedMessageId`; `replaced: false` carries `replaceOutcome`
+/// (`"drained"` — the entry delivered before it could be retracted,
+/// `"none"` — there was nothing to replace, `"reassigned"` — sendToTask
+/// only: the task's assignee changed mid-call so the entry was left in the
+/// old assignee's queue, or `"error"` — the retraction failed for a reason
+/// other than the entry draining).
+fn merge_replace_report(obj: &mut serde_json::Map<String, Value>, report: Option<Value>) {
+    if let Some(Value::Object(report)) = report {
+        for (k, v) in report {
+            obj.insert(k, v);
+        }
+    }
+}
+
+/// Classify a successful send result into the top-level `delivery` outcome:
+/// `"queued"` (parked in the target's queue: target busy / non-interrupt
+/// send — but ALSO the indefinite parks, `quarantined: true` which drains
+/// only after `agent.retry` and `archivedParked: true` which drains only on
+/// unarchive; both carry `queued: true`, and the underlying flag stays in
+/// the result for callers that need the distinction), or `"delivered"`
+/// (driving a turn now). Returns `None` for non-success shapes (e.g.
+/// sendToTask's `ok: false` "No agent assigned to task") — those keep their
+/// existing fields with no `delivery` claim.
+///
+/// A `result` object, when present, takes PRECEDENCE over top-level flags
+/// (not just a fallback): `sendToTask` nests the underlying send flags
+/// under `result`, and plain `send` results never carry a `result` key.
+/// Nested `result.success` is deliberately not re-checked — sound because
+/// `agent_send_to_task_op` only nests success shapes (inner errors
+/// propagate as `Err`, no-assignee returns a `result`-less `ok: false`).
+///
+/// `queued: false` alone is NOT proof a turn is being driven: the
+/// no-`AgentManager` store-only fallback (`agent_send_message_op`) returns
+/// `{ success: true, queued: false, messageId }` after only persisting the
+/// row. Every turn-driving success from `AgentManager` carries a `turnId`,
+/// so `"delivered"` is claimed only on that marker — plus the interrupt
+/// dedup replay (`deduplicated: true`), which delivered nothing NEW on this
+/// call but whose original delivery did run, so "the message reached the
+/// target's turn" still holds. A persist-only success gets no `delivery`
+/// claim rather than a false "delivered".
+fn delivery_outcome(obj: &serde_json::Map<String, Value>) -> Option<&'static str> {
+    let ok = obj.get("ok").and_then(Value::as_bool).unwrap_or(false)
+        || obj.get("success").and_then(Value::as_bool).unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    let flags = match obj.get("result") {
+        Some(Value::Object(inner)) => inner,
+        _ => obj,
+    };
+    let flag = |k: &str| flags.get(k).and_then(Value::as_bool).unwrap_or(false);
+    if flag("queued") {
+        Some("queued")
+    } else if flags.get("turnId").is_some() || flag("deduplicated") {
+        Some("delivered")
+    } else {
+        None
+    }
 }
 
 /// The id of the caller's first pending entry in a presented queue
@@ -1111,6 +1807,82 @@ fn merge_ok(mut v: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_list_filter_omits_terminal_rows_by_default() {
+        let f = parse_agent_list_filter(&json!({})).expect("empty args parse");
+        assert!(f.retains(AgentStatus::Active, None));
+        assert!(f.retains(AgentStatus::RuntimeIdle, Some("agent-p")));
+        for terminal in [
+            AgentStatus::Completed,
+            AgentStatus::Error,
+            AgentStatus::Deleted,
+        ] {
+            assert!(!f.retains(terminal, None), "{terminal:?} must be omitted");
+        }
+        // The legacy boolean form arrives from the JS wrapper as
+        // `{ includeCompleted: true }`.
+        let f = parse_agent_list_filter(&json!({ "includeCompleted": true })).unwrap();
+        for terminal in [
+            AgentStatus::Completed,
+            AgentStatus::Error,
+            AgentStatus::Deleted,
+        ] {
+            assert!(f.retains(terminal, None), "{terminal:?} must be included");
+        }
+    }
+
+    #[test]
+    fn agent_list_filter_scope_splits_on_parent() {
+        let top = parse_agent_list_filter(&json!({ "scope": "top-level" })).unwrap();
+        assert!(top.retains(AgentStatus::Active, None));
+        assert!(!top.retains(AgentStatus::Active, Some("agent-p")));
+
+        let sub = parse_agent_list_filter(&json!({ "scope": "subagents" })).unwrap();
+        assert!(!sub.retains(AgentStatus::Active, None));
+        assert!(sub.retains(AgentStatus::Active, Some("agent-p")));
+    }
+
+    #[test]
+    fn agent_list_filter_parent_agent_id_matches_only_children() {
+        let f = parse_agent_list_filter(&json!({ "parentAgentId": "agent-p" })).unwrap();
+        assert!(f.retains(AgentStatus::Active, Some("agent-p")));
+        assert!(!f.retains(AgentStatus::Active, Some("agent-other")));
+        assert!(!f.retains(AgentStatus::Active, None));
+        // Terminal children stay omitted unless includeCompleted.
+        assert!(!f.retains(AgentStatus::Completed, Some("agent-p")));
+
+        // Redundant-but-consistent combo: subagents + parentAgentId.
+        let f =
+            parse_agent_list_filter(&json!({ "scope": "subagents", "parentAgentId": "agent-p" }))
+                .unwrap();
+        assert!(f.retains(AgentStatus::Active, Some("agent-p")));
+        assert!(!f.retains(AgentStatus::Active, Some("agent-other")));
+    }
+
+    #[test]
+    fn agent_list_filter_rejects_non_string_scope_and_parent() {
+        let err = parse_agent_list_filter(&json!({ "scope": 5 })).unwrap_err();
+        assert!(err.contains("scope must be a string"), "{err}");
+        let err = parse_agent_list_filter(&json!({ "parentAgentId": 5 })).unwrap_err();
+        assert!(err.contains("parentAgentId must be a string"), "{err}");
+        // Explicit null still means "absent", matching the JS wrapper.
+        let f = parse_agent_list_filter(&json!({ "scope": null, "parentAgentId": null })).unwrap();
+        assert!(f.retains(AgentStatus::Active, None));
+    }
+
+    #[test]
+    fn agent_list_filter_rejects_invalid_combos() {
+        let err = parse_agent_list_filter(&json!({ "scope": "bogus" })).unwrap_err();
+        assert!(
+            err.contains("\"top-level\"") && err.contains("\"subagents\""),
+            "error must name the valid values: {err}"
+        );
+        let err =
+            parse_agent_list_filter(&json!({ "scope": "top-level", "parentAgentId": "agent-p" }))
+                .unwrap_err();
+        assert!(err.contains("cannot be combined"), "{err}");
+    }
 
     fn entry(id: &str, extra: &Value) -> Value {
         let mut v = json!({
@@ -1254,5 +2026,264 @@ mod tests {
 
         let short = truncate_entry_content(json!({ "id": "e", "content": "short" }));
         assert_eq!(short["content"], json!("short"));
+    }
+
+    fn outcome(v: &Value) -> Option<&'static str> {
+        delivery_outcome(v.as_object().unwrap())
+    }
+
+    #[test]
+    fn delivery_outcome_classifies_send_shapes() {
+        // Plain `send`: flags top-level (post-merge_ok `ok: true`). A
+        // turn-driving delivery carries `turnId`.
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "success": true, "queued": false, "turnId": "t-1"
+            })),
+            Some("delivered")
+        );
+        assert_eq!(
+            outcome(&json!({ "ok": true, "success": true, "queued": true })),
+            Some("queued")
+        );
+        // Pre-merge `success: true` alone still classifies.
+        assert_eq!(
+            outcome(&json!({ "success": true, "queued": false, "turnId": "t-2" })),
+            Some("delivered")
+        );
+        // The interrupt dedup shape (no turn spawned — the original
+        // delivery already ran) still reads as delivered.
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "success": true, "queued": false, "deduplicated": true
+            })),
+            Some("delivered")
+        );
+    }
+
+    #[test]
+    fn delivery_outcome_reads_nested_send_to_task_result() {
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "agentId": "a-1",
+                "result": { "success": true, "queued": false, "turnId": "t-1" }
+            })),
+            Some("delivered")
+        );
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "agentId": "a-1",
+                "result": { "success": true, "queued": true }
+            })),
+            Some("queued")
+        );
+    }
+
+    #[test]
+    fn delivery_outcome_skips_non_success_shapes() {
+        assert_eq!(
+            outcome(&json!({ "ok": false, "error": "No agent assigned to task" })),
+            None
+        );
+        assert_eq!(outcome(&json!({ "ok": false, "refused": true })), None);
+    }
+
+    /// The store-only fallback's persist-only success (`queued: false`, no
+    /// `turnId`) drives no turn — it must NOT claim `"delivered"`.
+    #[test]
+    fn delivery_outcome_makes_no_claim_for_persist_only_success() {
+        assert_eq!(
+            outcome(&json!({ "ok": true, "success": true, "queued": false, "messageId": "m-1" })),
+            None
+        );
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "agentId": "a-1",
+                "result": { "success": true, "queued": false, "messageId": "m-1" }
+            })),
+            None
+        );
+    }
+
+    mod list_specialists {
+        use super::super::*;
+        use intent_core::{
+            BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+
+        /// `WorkspaceApi` fake: `get_workspace` serves a row with a worktree
+        /// path (so the binding forwards it as the project-tier root) and
+        /// `specialist_list_dispatch` records the received path and returns
+        /// resolved defs in the wire `SpecialistDef` shape — prompt bodies
+        /// included, so the projection's dropping of them is actually
+        /// exercised.
+        struct FakeApi {
+            received_path: std::sync::Mutex<Option<String>>,
+        }
+
+        impl WorkspaceApi for FakeApi {
+            fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+                Box::pin(async move {
+                    Ok(Workspace {
+                        id,
+                        title: "Agent".to_string(),
+                        branch: "main".to_string(),
+                        base_ref: None,
+                        base_commit_sha: None,
+                        status: WorkspaceStatus::Active,
+                        status_message: None,
+                        status_image_asset_id: None,
+                        activity: WorkspaceActivity::Idle,
+                        attention: WorkspaceAttention::None,
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        updated_at: "2026-01-01T00:00:00Z".to_string(),
+                        last_activity: None,
+                        tags: vec![],
+                        path: None,
+                        repository_path: None,
+                        repository_owner: None,
+                        repository_name: None,
+                        worktree_path: Some("/tmp/ws-root".to_string()),
+                        scope: None,
+                        skip_worktree: false,
+                        setup_script: None,
+                        is_remote: false,
+                        default_model: None,
+                        pr_number: None,
+                        pr_url: None,
+                        pr_status: None,
+                        active_pull_request: None,
+                        pull_requests: None,
+                        context_links: None,
+                        execution_environment: None,
+                        archived: false,
+                        archived_at: None,
+                        task_stats: None,
+                        agent_summary: None,
+                        diff_summary: None,
+                        token_usage: None,
+                        cow_supported: None,
+                        display_status: None,
+                        waiting: false,
+                        checkout_mode: None,
+                        disk_usage: None,
+                        pending_delete_at: None,
+                    })
+                })
+            }
+
+            fn specialist_list_dispatch(
+                &self,
+                workspace_path: Option<String>,
+            ) -> BoxFuture<'_, Result<Value>> {
+                *self.received_path.lock().unwrap() = workspace_path;
+                Box::pin(async move {
+                    Ok(json!({
+                        "specialists": [
+                            {
+                                "id": "implementor",
+                                "name": "Implementor",
+                                "description": "Implements tasks",
+                                "prompt": "You are an implementor",
+                                "behaviorPrompt": "You are an implementor",
+                                "source": "bundled",
+                                "isCustomized": false,
+                                "aliases": ["builder"],
+                                "resolvedProvider": "claude",
+                                "resolvedModel": "sonnet-4.5",
+                                "resolvedReasoningEffort": "medium",
+                                "modelOptions": [
+                                    { "provider": "opencode", "model": "kimi-k3", "hint": "cheap" },
+                                    { "model": "opus", "hint": "", "reasoningEffort": "high" }
+                                ]
+                            },
+                            {
+                                "id": "scout",
+                                "name": "Scout",
+                                "description": "Recon",
+                                "prompt": "You scout",
+                                "behaviorPrompt": "You scout",
+                                "source": "bundled",
+                                "isCustomized": false,
+                                "hidden": true
+                            }
+                        ]
+                    }))
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn projects_compact_rows_without_prompt_bodies() {
+            let fake = Arc::new(FakeApi {
+                received_path: std::sync::Mutex::new(None),
+            });
+            let api: Arc<dyn WorkspaceApi> = fake.clone();
+            let ws = WorkspaceId::from_string("ws-1");
+            let out = dispatch(&api, &ws, None, "listSpecialists", &json!({}))
+                .await
+                .unwrap();
+            // The workspace's effective path reached the loader (project tier).
+            assert_eq!(
+                *fake.received_path.lock().unwrap(),
+                Some("/tmp/ws-root".to_string())
+            );
+            let rows = out.as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+
+            let imp = &rows[0];
+            assert_eq!(imp["id"], json!("implementor"));
+            assert_eq!(imp["name"], json!("Implementor"));
+            assert_eq!(imp["description"], json!("Implements tasks"));
+            assert_eq!(
+                imp["defaultModel"],
+                json!({
+                    "provider": "claude",
+                    "model": "sonnet-4.5",
+                    "reasoningEffort": "medium"
+                })
+            );
+            assert_eq!(imp["aliases"], json!(["builder"]));
+            assert_eq!(
+                imp["modelOptions"],
+                json!([
+                    { "provider": "opencode", "model": "kimi-k3", "hint": "cheap" },
+                    { "model": "opus", "reasoningEffort": "high" }
+                ])
+            );
+            // Prompt bodies and loader internals never reach the row.
+            for key in [
+                "prompt",
+                "behaviorPrompt",
+                "source",
+                "isCustomized",
+                "resolvedProvider",
+                "resolvedModel",
+                "resolvedReasoningEffort",
+                "hidden",
+            ] {
+                assert!(imp.get(key).is_none(), "{key} must be omitted");
+            }
+
+            let scout = &rows[1];
+            assert_eq!(scout["hidden"], json!(true));
+            // No resolved preview fields → defaultModel omitted; no
+            // modelOptions → empty array; no aliases → omitted.
+            assert!(scout.get("defaultModel").is_none());
+            assert!(scout.get("aliases").is_none());
+            assert_eq!(scout["modelOptions"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn unknown_method_is_rejected() {
+            let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi {
+                received_path: std::sync::Mutex::new(None),
+            });
+            let ws = WorkspaceId::from_string("ws-1");
+            let err = dispatch(&api, &ws, None, "listSpecialistsX", &json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(err, "host: unknown method `agent.listSpecialistsX`");
+        }
     }
 }

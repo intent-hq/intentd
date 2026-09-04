@@ -172,6 +172,7 @@ fn workspace(id: &WorkspaceId, title: &str) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -231,6 +232,7 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     }
 }
 
@@ -406,7 +408,7 @@ async fn boot() -> Fixture {
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
     let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");

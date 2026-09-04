@@ -48,7 +48,7 @@ use serde_json::Value;
 mod parse;
 mod probe;
 
-pub(crate) use parse::{gguf_bytes_fit_within_ram, is_default_pseudo_row};
+pub(crate) use parse::{gguf_bytes_fit_within_ram, is_auth_required_error, is_default_pseudo_row};
 use probe::{run_acp_probe, AcpProbeCommand, ProbeError};
 
 /// Timeout for the one-shot `opencode models` CLI invocation.
@@ -113,6 +113,7 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
     match provider_id {
         "claude-code" => fetch_claude_code_models().await,
         "codex" => fetch_codex_models().await,
+        "antigravity" => fetch_antigravity_models(None).await,
         "pi" => fetch_pi_models().await,
         "droid" => fetch_droid_models().await,
         "opencode" => fetch_opencode_models().await,
@@ -120,6 +121,85 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
         "unsloth" => fetch_unsloth_models().await,
         other => ProviderModelsFetch::unavailable(other, "no dynamic model source"),
     }
+}
+
+/// Native official ACP discovery. No generic authenticate call, prompt,
+/// global configuration, npm fallback, or automatic browser login.
+pub(crate) async fn fetch_antigravity_models(explicit_path: Option<&str>) -> ProviderModelsFetch {
+    fetch_antigravity_models_at(find_provider_binary(
+        "antigravity",
+        "antigravity-acp",
+        explicit_path,
+    ))
+    .await
+}
+
+/// Probe the executable already resolved for this request's cache identity.
+pub(crate) async fn fetch_antigravity_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    let Some(bin) = binary else {
+        return ProviderModelsFetch::unavailable("antigravity", "antigravity-acp binary not found");
+    };
+    finish(
+        "antigravity",
+        antigravity_probe(bin, false, |value| {
+            parse::parse_acp_models(value, "antigravity")
+        })
+        .await,
+    )
+}
+
+pub(crate) async fn probe_antigravity_auth(bin: PathBuf) -> Option<bool> {
+    // A valid session proves authentication even when its catalog is empty.
+    // Ignore notifications: they cannot prove a successful session/new.
+    antigravity_auth_outcome(
+        antigravity_probe(bin, true, |value| {
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(|_| vec![Value::Bool(true)])
+                .unwrap_or_default()
+        })
+        .await,
+    )
+}
+
+fn antigravity_auth_outcome(outcome: Result<Vec<Value>, ProbeError>) -> Option<bool> {
+    match outcome {
+        Ok(rows) if !rows.is_empty() => Some(true),
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+async fn antigravity_probe<F>(
+    bin: PathBuf,
+    session_only: bool,
+    extract: F,
+) -> Result<Vec<Value>, ProbeError>
+where
+    F: Fn(&Value) -> Vec<Value>,
+{
+    let helper = std::env::current_exe().map_err(|err| ProbeError::Spawn(err.to_string()))?;
+    let profile = crate::antigravity::probe_profile(&helper)
+        .map_err(|err| ProbeError::Spawn(format!("isolated Antigravity configuration: {err}")))?;
+    let mut cmd = AcpProbeCommand::binary(bin, Vec::new())
+        .cwd(profile.path().to_path_buf())
+        .auth_required_marker(crate::antigravity::AUTH_REQUIRED_MARKER);
+    for (key, value) in crate::antigravity::unattended_env(profile.path(), &helper)
+        .map_err(|err| ProbeError::Spawn(err.to_string()))?
+    {
+        cmd = cmd.env(key, value);
+    }
+    let outcome = if session_only {
+        probe::run_acp_session_probe(cmd, extract).await
+    } else {
+        run_acp_probe(cmd, extract).await
+    };
+    drop(profile);
+    outcome
 }
 
 /// claude-code: ACP probe via the pinned npx adapter. Models arrive in the
@@ -377,6 +457,57 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
             Some(false)
         }
         Err(_) => None,
+    }
+}
+
+/// claude-code auth fallback probe (`host.providerAuthStatus`): the same
+/// ACP probe as [`fetch_claude_code_models`], mapped to auth semantics by
+/// [`claude_code_acp_auth_verdict`]. Consulted only when the cheap
+/// `claude auth status` CLI probe is inconclusive; an explicit `loggedIn`
+/// boolean skips this fallback, including a reported logout. The fallback
+/// can only demote to `Some(false)` (explicit auth-required error) or stay
+/// unknown — it can never confirm `Some(true)`, because the adapter serves
+/// its model catalog without credentials (see
+/// [`claude_code_acp_auth_verdict`]). The caller gates on the `claude` CLI
+/// being installed. The probe runs the SAME adapter a session spawn would
+/// (intent-hq/monorepo#4352): `adapter_override` — the validated
+/// `providers.paths["claude-code"]` binary
+/// ([`intent_providers::resolve_npx_only_override`]) — when set, else the
+/// pinned npx adapter ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]),
+/// so the verdict reflects what sessions actually run.
+pub(crate) async fn probe_claude_code_auth(adapter_override: Option<PathBuf>) -> Option<bool> {
+    let cmd = match adapter_override {
+        Some(bin) => AcpProbeCommand::binary(bin, Vec::new()),
+        None => AcpProbeCommand::npx(find_npx()?, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE),
+    };
+    let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "claude-code")).await;
+    claude_code_acp_auth_verdict(outcome)
+}
+
+/// Map a claude-code ACP probe outcome to the auth tri-state (the pure seam
+/// unit tests drive without spawning the adapter). Only the adapter's
+/// explicit auth-required RPC error (`-32000 Authentication required` —
+/// intent-hq/intent#3178) is conclusive, demoting to `Some(false)`.
+/// Everything else — INCLUDING a non-empty model list — stays unknown:
+/// claude-agent-acp serves its model catalog uncredentialed (verified
+/// empirically against v0.66.0 with a scratch HOME — `initialize` and
+/// `session/new` succeed and return the full catalog in config options
+/// while logged out, with `authMethods` empty either way; the auth error
+/// only fires at `session/prompt` time, which a probe cannot afford to
+/// send), so a served catalog proves the adapter spawned, not that the
+/// user is logged in. Unlike pi — whose adapter serves only credentialed
+/// models, so a non-empty list confirms `Some(true)` and an empty list
+/// demotes to `Some(false)` — neither claude-code list shape is
+/// conclusive. On the current pin the demotion arm is expected to be a
+/// no-op signal-wise (the auth error never fires during the probe's
+/// initialize + session/new handshake); it is kept as a hedge for other
+/// adapter versions and credential-failure shapes.
+fn claude_code_acp_auth_verdict(outcome: Result<Vec<Value>, ProbeError>) -> Option<bool> {
+    match outcome {
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            Some(false)
+        }
+        _ => None,
     }
 }
 

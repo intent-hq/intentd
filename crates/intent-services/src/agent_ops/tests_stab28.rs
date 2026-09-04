@@ -22,17 +22,25 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     (tmp, services, ws)
 }
 
-async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
+async fn create_agent(
+    svc: &Services,
+    ws: &WorkspaceId,
+    name: &str,
+    parent: Option<&AgentId>,
+) -> AgentId {
     let created = svc
         .agent_create_op(
             ws.clone(),
             Some(name.to_string()),
-            Some("auggie:sonnet4.5".into()),
+            Some("sonnet4.5".into()),
             None,
-            None,
+            parent.cloned(),
             None,
             false,
-            intent_core::AgentCreateExtra::default(),
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                ..Default::default()
+            },
         )
         .await
         .expect("create");
@@ -45,8 +53,11 @@ async fn parent_rewoken_after_send_to_settled_child() {
     // → parent sends follow-up via agent.send → child settles again → parent MUST
     // be woken again.
     let (_t, svc, ws) = setup().await;
-    let parent = create_agent(&svc, &ws, "Parent").await;
-    let child = create_agent(&svc, &ws, "Child").await;
+    let parent = create_agent(&svc, &ws, "Parent", None).await;
+    // The child carries real parent linkage: the SUB-1 independent-peer
+    // suppression skips the auto-watch for top-level foreground targets, and
+    // this test is about the parent→child re-wake path.
+    let child = create_agent(&svc, &ws, "Child", Some(&parent)).await;
 
     // Initial delegation: register completion watch.
     svc.register_completion_watch(

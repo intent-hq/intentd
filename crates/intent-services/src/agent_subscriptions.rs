@@ -64,13 +64,40 @@ pub(crate) struct CompletionWatch {
     /// still delivers for `agent:failed` / `agent:deleted` (failure after
     /// reporting is a new signal, not a duplicate).
     pub report_delivered: bool,
-    /// Explicit `agent.watch` registration (monorepo#1229): the watcher is
-    /// also woken when the child raises an attention request
-    /// (`agent.reportBlocker` / `agent.requestDiscussion`). Auto-registered
-    /// watches (delegation, SUB-1 sender watches) leave this `false`; the
-    /// child's parent is excluded from the attention fan-out because
-    /// `agent_request_attention_op` already wakes it directly.
+    /// Set by explicit `agent.watch` registration (monorepo#1229);
+    /// auto-registered watches (delegation, SUB-1 sender watches) leave this
+    /// `false`. Since monorepo#3443 the flag no longer gates the attention
+    /// fan-out — `agent_request_attention_op` wakes EVERY active watch when
+    /// the child raises an attention request (`agent.reportBlocker` /
+    /// `agent.requestDiscussion`), excluding only the child's parent, which
+    /// it already wakes directly. The field is kept as the persisted record
+    /// of an explicit registration.
     pub wake_on_attention: bool,
+    /// Ask-only watches wait strictly for terminal completion. Attention
+    /// requests do not consume or wake this watch, and monitoring-idle
+    /// advisories (child idle while only hooks / PR monitors are active) are
+    /// skipped for it too — the parent hears nothing until settlement, even
+    /// if the child parks on a TTL-less PR monitor (intent-hq/intent#4254
+    /// design). It may coexist with an unrelated grouped watch for the same
+    /// parent/child pair. The flag is set only on watches the ask path
+    /// CREATES: `register_completion_watch_strict_durable` reuses an
+    /// existing non-strict ungrouped watch as-is, and any later non-ask
+    /// registration adopting an ask-only watch CLEARS the flag (upgrade to
+    /// a full watch — the explicit watcher expects advisories; see
+    /// `insert_watch_in_memory`). The skip therefore holds exactly while the
+    /// ask registration is the pair's only ungrouped interest.
+    pub completion_only: bool,
+    /// Identity (`completion_report.timestamp`) of the child report whose
+    /// report-time wake was SENT toward this parent (monorepo#4026): stamped
+    /// when the wake is handed off — immediate delivery, queued, or parked
+    /// as a debounce hold. The stamp alone does not prove the parent saw
+    /// it: the terminal completion wake suppresses the `Report:` clause in
+    /// favor of a short already-delivered reference only when this identity
+    /// matches the settling report AND the #1614 retracts removed nothing
+    /// (an undelivered wake is retracted there, failing open to the full
+    /// report). In-memory only (not persisted): after a daemon restart the
+    /// terminal wake fails open to the full report, which is benign.
+    pub delivered_report_ts: Option<String>,
 }
 
 /// Fan-in table for `waitMode: "after_all"` delegation groups. All children a
@@ -217,15 +244,73 @@ impl Services {
         if let Err(e) = self.store.upsert_completion_watch(&persisted).await {
             tracing::warn!("completion_watch upsert failed {id}: {e}");
         }
+        self.delete_watch_row_if_swept(&id).await;
+        Ok(id)
+    }
+
+    /// Ask-only durable registration. A new completion-only watch is persisted
+    /// before it becomes visible to completion delivery, so a concurrent
+    /// delivery cannot delete it before a late upsert resurrects an orphan.
+    /// An existing ungrouped watch already provides an immediate completion
+    /// path and is reused without another durable write.
+    pub(crate) async fn register_completion_watch_strict_durable(
+        &self,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        parent_agent_name: String,
+        child_agent_id: AgentId,
+    ) -> Result<String> {
+        check_watch_scope(parent_workspace_id, child_workspace_id)?;
+        let _registration = self.completion_watch_registration_gate.lock().await;
+        if let Some(existing) = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .find(|watch| {
+                watch.parent_agent_id == parent_agent_id
+                    && watch.child_agent_id == child_agent_id
+                    && watch.group_id.is_none()
+            })
+        {
+            return Ok(existing.id.clone());
+        }
+        let watch = CompletionWatch {
+            id: Uuid::new_v4().to_string(),
+            parent_workspace_id: parent_workspace_id.clone(),
+            child_workspace_id: child_workspace_id.clone(),
+            parent_agent_id,
+            parent_agent_name,
+            child_agent_id,
+            group_id: None,
+            created_at: now_iso(),
+            report_delivered: false,
+            wake_on_attention: false,
+            completion_only: true,
+            delivered_report_ts: None,
+        };
+        let id = watch.id.clone();
+        self.store
+            .upsert_completion_watch(&completion_watch_to_persisted(&watch))
+            .await?;
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .push(watch);
         Ok(id)
     }
 
     /// Explicit `agent.watch` registration (monorepo#1229): an ungrouped
-    /// watch that also wakes on the child's attention requests, with an
-    /// AWAITED persist (the registration is the caller's durable contract).
+    /// watch with an AWAITED persist (the registration is the caller's
+    /// durable contract). Attention wakes reach every active watch
+    /// regardless of the `wake_on_attention` flag (monorepo#3443); the flag
+    /// is kept as the persisted record of an explicit registration.
     /// Adoption strengthens an existing watch for the pair
-    /// (`wake_on_attention` set) — grouped watches keep their group but gain
-    /// the attention flag.
+    /// (`wake_on_attention` set, `completion_only` cleared) — grouped watches
+    /// keep their group but gain the flag.
     pub(crate) async fn register_agent_watch_durable(
         &self,
         parent_workspace_id: &WorkspaceId,
@@ -248,7 +333,37 @@ impl Services {
         if let Err(e) = self.store.upsert_completion_watch(&persisted).await {
             tracing::warn!("completion_watch upsert failed {id}: {e}");
         }
+        self.delete_watch_row_if_swept(&id).await;
         Ok(id)
+    }
+
+    /// Close the write-through registration race (monorepo#4183): the two
+    /// insert-then-upsert variants above make the watch memory-visible
+    /// BEFORE the persisted row lands, so a concurrent parent sweep
+    /// (retire/delete cascade) can remove the in-memory watch and its rows
+    /// between the insert and the upsert — the late upsert then resurrects
+    /// an orphan row that rehydrates on restart. After the upsert commits,
+    /// re-check membership and best-effort delete the row when the watch is
+    /// already gone. (The strict variant persists before memory-visibility
+    /// and does not need this.)
+    async fn delete_watch_row_if_swept(&self, watch_id: &str) {
+        let still_present = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .any(|s| s.id == watch_id);
+        if still_present {
+            return;
+        }
+        tracing::info!(
+            watch = %watch_id,
+            "watch swept during registration upsert; deleting resurrected row"
+        );
+        if let Err(e) = self.store.delete_completion_watch(watch_id).await {
+            tracing::warn!("completion_watch post-sweep delete failed {watch_id}: {e}");
+        }
     }
 
     /// Shared body of the two registration variants: run the scope gate,
@@ -267,6 +382,11 @@ impl Services {
     /// - `wake_on_attention` is strengthen-only: an explicit `agent.watch`
     ///   sets it on the adopted watch; a later auto registration never
     ///   clears it.
+    /// - `completion_only` is cleared: every registration through this path
+    ///   is a full (non-ask) watch, so adopting an ask-only watch upgrades it
+    ///   to hear monitoring-idle advisories (PR #1686 review). The ask path
+    ///   (`register_completion_watch_strict_durable`) never adopts through
+    ///   here, so it cannot re-narrow a full watch.
     #[allow(clippy::too_many_arguments)]
     fn insert_watch_in_memory(
         &self,
@@ -291,6 +411,7 @@ impl Services {
                     existing.group_id = Some(gid);
                 }
                 existing.wake_on_attention = existing.wake_on_attention || wake_on_attention;
+                existing.completion_only = false;
                 // monorepo#2532: adoption expresses fresh interest in the
                 // child's NEXT completion — clear the report-time disarm so
                 // a re-armed watch fires on the next `agent:idle` (mirrors
@@ -323,6 +444,8 @@ impl Services {
                     created_at: now_iso(),
                     report_delivered: false,
                     wake_on_attention,
+                    completion_only: false,
+                    delivered_report_ts: None,
                 };
                 guard.subscriptions.push(watch.clone());
                 watch
@@ -587,9 +710,24 @@ impl Services {
         removed
     }
 
-    /// Mark a watch as having delivered the report wake (report-time wake).
-    /// When marked, `deliver_completion_to_watches` will skip delivery for
-    /// `agent:idle` but still deliver for `agent:failed` / `agent:deleted`.
+    /// Remove a fired watch from memory after its durable retirement
+    /// transaction committed. Unlike [`Services::remove_watch`], this does not
+    /// spawn a second best-effort store delete.
+    pub(crate) fn remove_watch_after_delivery_commit(&self, subscription_id: &str) -> bool {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let before = guard.subscriptions.len();
+        guard
+            .subscriptions
+            .retain(|watch| watch.id != subscription_id);
+        guard.subscriptions.len() != before
+    }
+
+    /// Legacy test helper for waiting-projection compatibility. Production
+    /// progress delivery no longer sets this historical suppression bit.
+    #[cfg(test)]
     pub(crate) fn mark_watch_report_delivered(&self, subscription_id: &str) -> bool {
         let marked = {
             let mut guard = self
@@ -630,6 +768,35 @@ impl Services {
             });
         }
         marked
+    }
+
+    /// Stamp `delivered_report_ts` on every UNGROUPED watch `parent_agent_id`
+    /// holds on `child_agent_id` (monorepo#4026). Called when a
+    /// report-to-parent wake is sent toward the parent — immediate delivery,
+    /// queued, or parked as a debounce hold. The stamp records the report
+    /// identity only; actual delivery is proven at settlement by the #1614
+    /// retract gate (retracts removing nothing = the wake left the queue),
+    /// so a retracted held or still-queued wake never suppresses the
+    /// terminal report. Grouped watches are skipped: `after_all` children
+    /// defer their reports to the aggregate wake, which has no per-child
+    /// duplicate to suppress.
+    pub(crate) fn stamp_watch_delivered_report_ts(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+        report_ts: &str,
+    ) {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        for watch in guard.subscriptions.iter_mut().filter(|w| {
+            w.group_id.is_none()
+                && &w.parent_agent_id == parent_agent_id
+                && &w.child_agent_id == child_agent_id
+        }) {
+            watch.delivered_report_ts = Some(report_ts.to_string());
+        }
     }
 
     /// Remove every watch registered by `parent_agent_id`; returns the count
@@ -700,6 +867,25 @@ impl Services {
         // Write-through persist (best-effort).
         self.persist_delegation_group(&group);
         group_id
+    }
+
+    /// Whether `parent_id` currently has an ENROLLMENT-OPEN (unsealed &&
+    /// undelivered) delegation group — one still accepting children in the
+    /// parent's current delegating turn. Used by the batch-delegate
+    /// zero-started advisory (monorepo#3334) to decide whether to deliver the
+    /// immediate advisory wake. Note this is deliberately NARROWER than
+    /// "a settlement wake is still owed": a sealed-but-undelivered group from
+    /// an earlier turn also owes a wake, but it does not suppress the
+    /// advisory — that errs on the side of an extra (redundant) advisory
+    /// rather than risking a permanent stall if the sealed group's delivery
+    /// never fires. Fail-noisy over fail-silent.
+    pub(crate) fn has_open_delegation_group(&self, parent_id: &AgentId) -> bool {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .delegation_groups
+            .iter()
+            .any(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)
     }
 
     /// Add `child_id` to a group's expected set (idempotent).
@@ -859,65 +1045,58 @@ impl Services {
         }
     }
 
-    /// Claim a group for delivery if sealed, complete, and not yet delivered.
-    /// Flips `delivered` in memory, removes from in-memory table, triggers
-    /// best-effort async DB delete, and returns a clone. Returns `None` otherwise.
-    ///
-    /// DURABLE-BEFORE-OBSERVABLE: delete the delegation-group row from the DB before
-    /// returning it for wake delivery. This ensures crash-safety:
-    ///
-    /// - Crash BEFORE delete commits: row still present → rehydration restores the
-    ///   group and re-delivers the wake (correct: wake was never observable).
-    /// - Crash AFTER delete commits: row absent → rehydration skips it, no re-delivery
-    ///   (correct: wake already delivered, or about to be).
-    ///
-    /// The synchronous delete before publish prevents double-wake.
-    pub(crate) async fn take_group_if_ready(&self, group_id: &str) -> Option<DelegationGroup> {
-        // Inside the lock: check readiness and remove from in-memory table.
-        let group = {
-            let mut guard = self
-                .agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned");
-            let idx = guard
-                .delegation_groups
-                .iter()
-                .position(|g| g.group_id == group_id)?;
-            if !(guard.delegation_groups[idx].sealed
-                && !guard.delegation_groups[idx].delivered
-                && is_group_complete(&guard.delegation_groups[idx]))
-            {
-                return None;
-            }
-            guard.delegation_groups.remove(idx)
-        }; // Drop guard before await
-           // DURABLE-BEFORE-OBSERVABLE: delete the row synchronously before returning.
-           // If the delete FAILS, do NOT deliver the wake — put the group back into the
-           // in-memory table (delivered=false) and return None. The next child-completion
-           // or restart retry will attempt the delete again. This makes delete-commit
-           // strictly precede observability in ALL paths.
-        if let Err(e) = self.store.delete_delegation_group(group_id).await {
-            tracing::warn!(
-                "Failed to delete delegation_group row {} (workspace {}): {}. \
-                 Wake NOT delivered; group restored to memory for retry.",
-                group_id,
-                group.workspace_id.0,
-                e
-            );
-            // Restore the group to the in-memory table for retry
-            self.agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned")
-                .delegation_groups
-                .push(group);
+    /// Claim a complete group for delivery without retiring its durable row.
+    /// The in-memory `delivered` bit serializes live attempts; the persisted
+    /// complete group remains the restart-recovery record until the aggregated
+    /// parent wake is durable and final settlement commits.
+    pub(crate) fn take_group_if_ready(&self, group_id: &str) -> Option<DelegationGroup> {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let group = guard
+            .delegation_groups
+            .iter_mut()
+            .find(|g| g.group_id == group_id)?;
+        if !(group.sealed && !group.delivered && is_group_complete(group)) {
             return None;
         }
-        // Delete committed → safe to deliver the wake
-        Some(group)
+        group.delivered = true;
+        Some(group.clone())
     }
 
-    /// Settle a delivered group's watches in one atomic registry pass: every
-    /// completion watch carrying `group_id` is dropped, EXCEPT that watches on
+    /// Release an in-memory delivery claim after delivery or durable settlement
+    /// fails. The persisted row was never retired, so a later event or restart
+    /// can retry the same complete group.
+    pub(crate) fn release_group_delivery(&self, group_id: &str) {
+        if let Some(group) = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .delegation_groups
+            .iter_mut()
+            .find(|g| g.group_id == group_id)
+        {
+            group.delivered = false;
+        }
+    }
+
+    /// Whether an in-memory delegation group still needs settlement. The
+    /// durable wake retry task stops after delivery or cancellation removes it.
+    pub(crate) fn has_delegation_group(&self, group_id: &str) -> bool {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .delegation_groups
+            .iter()
+            .any(|group| group.group_id == group_id)
+    }
+
+    /// Finalize a group after its aggregated wake and the matching store
+    /// settlement are durable. Every completion watch carrying `group_id` is
+    /// dropped, EXCEPT that watches on children listed in `retain_children`
+    /// are converted in place into ungrouped watches. The group is removed in
+    /// the same registry lock, so live readers never observe half-settlement.
     /// children listed in `retain_children` are converted in place into
     /// ungrouped watches (STAB-129: failed-not-deleted members may still be
     /// working, and their eventual real settlement must keep a wake path to
@@ -926,61 +1105,40 @@ impl Services {
     /// `wakeOrCreate` watch racing settlement) — since either already gives
     /// the parent a wake path, so the late settlement delivers exactly one
     /// wake. Returns the number of watches retained.
-    pub(crate) fn settle_group_watches(
+    pub(crate) fn finalize_group_delivery(
         &self,
         group_id: &str,
         retain_children: &[AgentId],
     ) -> usize {
         let retain_set: std::collections::HashSet<&AgentId> = retain_children.iter().collect();
-        let mut converted_ids: Vec<String> = Vec::new();
-        let mut dropped_ids: Vec<String> = Vec::new();
-        let retained = {
-            let mut guard = self
-                .agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned");
-            let mut kept: std::collections::HashSet<(AgentId, AgentId)> = guard
-                .subscriptions
-                .iter()
-                .filter(|s| s.group_id.is_none())
-                .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
-                .collect();
-            let mut retained = 0;
-            guard.subscriptions.retain_mut(|s| {
-                if s.group_id.as_deref() != Some(group_id) {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        guard
+            .delegation_groups
+            .retain(|group| group.group_id != group_id);
+        let mut kept: std::collections::HashSet<(AgentId, AgentId)> = guard
+            .subscriptions
+            .iter()
+            .filter(|s| s.group_id.is_none())
+            .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
+            .collect();
+        let mut retained = 0;
+        guard.subscriptions.retain_mut(|watch| {
+            if watch.group_id.as_deref() != Some(group_id) {
+                return true;
+            }
+            if retain_set.contains(&watch.child_agent_id) {
+                let pair = (watch.parent_agent_id.clone(), watch.child_agent_id.clone());
+                if kept.insert(pair) {
+                    watch.group_id = None;
+                    retained += 1;
                     return true;
                 }
-                if retain_set.contains(&s.child_agent_id) {
-                    let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
-                    if kept.insert(pair) {
-                        s.group_id = None;
-                        converted_ids.push(s.id.clone());
-                        retained += 1;
-                        return true;
-                    }
-                }
-                dropped_ids.push(s.id.clone());
-                false
-            });
-            retained
-        };
-        // Best-effort DB sync: converted watches become ungrouped rows,
-        // dropped watches lose their rows (restart durability).
-        if !converted_ids.is_empty() || !dropped_ids.is_empty() {
-            let store = self.store.clone();
-            tokio::spawn(async move {
-                for id in converted_ids {
-                    if let Err(e) = store.ungroup_completion_watch(&id).await {
-                        tracing::warn!("completion_watch ungroup failed {id}: {e}");
-                    }
-                }
-                for id in dropped_ids {
-                    if let Err(e) = store.delete_completion_watch(&id).await {
-                        tracing::warn!("completion_watch delete failed {id}: {e}");
-                    }
-                }
-            });
-        }
+            }
+            false
+        });
         retained
     }
 
@@ -1279,12 +1437,22 @@ impl Services {
             // Prune when either endpoint is gone: no wake could fire (child
             // deleted watches are handled by reconciliation below instead,
             // since a deleted child IS a completion signal for the parent).
-            let parent_alive = self.agent_is_live(&p.parent_agent_id).await;
+            // A RETIRED parent is equally gone (monorepo#4183): the
+            // soft-retire inertness gate rejects every wake, so rehydrating
+            // its watch only feeds the delivery-retry loop; `agent.restore`
+            // does not resurrect watches, matching the retire sweep.
+            let parent_alive = self.agent_is_live(&p.parent_agent_id).await
+                && !matches!(
+                    self.store
+                        .get_agent_session_retired_at(&p.parent_agent_id)
+                        .await,
+                    Ok(Some(_))
+                );
             if !parent_alive {
                 tracing::info!(
                     watch = %p.id,
                     parent = %p.parent_agent_id.0,
-                    "pruning persisted completion watch — parent agent gone"
+                    "pruning persisted completion watch — parent agent gone or retired"
                 );
                 let _ = self.store.delete_completion_watch(&p.id).await;
                 continue;
@@ -1319,7 +1487,8 @@ impl Services {
                     LoadOutcome::AlreadyInMemory
                 } else if guard.subscriptions.iter().any(|s| {
                     s.parent_agent_id == p.parent_agent_id && s.child_agent_id == p.child_agent_id
-                }) {
+                }) && !p.completion_only
+                {
                     // Pair uniqueness: a stronger (grouped) watch for the
                     // same (parent, child) already loaded — this row is a
                     // pre-invariant duplicate.
@@ -1386,8 +1555,9 @@ impl Services {
 
     /// Reconcile one watch's child against current agent state (mirrors the
     /// STAB-108 group reconciliation): if the child already completed /
-    /// failed / was deleted, synthesize the matching completion event and
-    /// route it through [`Services::deliver_completion_to_watches`] so the
+    /// failed / was deleted / retired, synthesize the matching completion
+    /// event and route it through
+    /// [`Services::deliver_completion_to_watches`] so the
     /// parent wakes now instead of waiting for an event that already fired.
     /// Used both at startup rehydration (child settled while the daemon was
     /// down) and at `agent.watch` / `app.agents.waitFor` registration time
@@ -1405,12 +1575,24 @@ impl Services {
             match self.store.get_agent_session(child_id).await {
                 Ok(session) => {
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
+                    // A retired session (`retired_at` set) is inert — no
+                    // future completion can fire, so the watch resolves NOW
+                    // with a synthetic `agent:retired` (a child that retired
+                    // while the daemon was down, or a watch racing a
+                    // concurrent retire). Deletion still wins: a deleted row
+                    // stays deleted regardless of the retire mark.
+                    let is_retired = !is_deleted && session.retired_at.is_some();
                     let is_completed = matches!(session.status, AgentStatus::Completed);
                     let is_failed = matches!(session.status, AgentStatus::Error);
                     // RuntimeIdle: genuinely complete only with a completion
                     // report and no interrupted row (same conservative
-                    // predicate as reconcile_group_on_rehydration).
-                    let is_idle_complete = if matches!(session.status, AgentStatus::RuntimeIdle) {
+                    // predicate as reconcile_group_on_rehydration). A retired
+                    // child skips this block entirely — its idle-deferral
+                    // early-returns (agent-waiting / hooks / monitors) must
+                    // not leave a watch armed on an inert session.
+                    let is_idle_complete = if !is_retired
+                        && matches!(session.status, AgentStatus::RuntimeIdle)
+                    {
                         let has_report = session.completion_report.is_some();
                         let settled = match self.store.get_interrupted_agent(child_id).await {
                             Ok(opt) => has_report && opt.is_none(),
@@ -1472,6 +1654,11 @@ impl Services {
                     };
                     let event_type = if is_deleted {
                         intent_core::events::AGENT_DELETED
+                    } else if is_retired {
+                        // Retired outranks failed/completed: whatever the
+                        // status was when the mark landed, the session is
+                        // inert now and "retired" is the accurate settlement.
+                        intent_core::events::AGENT_RETIRED
                     } else if is_failed {
                         intent_core::events::AGENT_FAILED
                     } else if is_completed || is_idle_complete {
@@ -1566,7 +1753,11 @@ impl Services {
             metadata: None,
             data,
         };
-        self.deliver_completion_to_watches(child_id, &event).await;
+        // No-advisory variant: registration-time / boot reconciliation must
+        // never fire the monitoring-idle advisory — a deferred idle here
+        // leaves the watch armed, exactly as before the advisory existed.
+        self.deliver_completion_to_watches_no_advisory(child_id, &event)
+            .await;
     }
 
     /// Rehydrate undelivered delegation groups on resume (AS-2 rehydration).
@@ -1583,6 +1774,36 @@ impl Services {
         workspace_id: &WorkspaceId,
     ) -> Result<usize> {
         let persisted = self.store.list_undelivered_groups(workspace_id).await?;
+        // Prune groups whose parent is permanently gone (deleted/missing or
+        // retired) BEFORE loading them (monorepo#4183): an aggregated wake
+        // toward such a parent can never be delivered, so rehydrating the
+        // group only feeds the delivery-retry loop from persisted state
+        // after every restart. Delete the row so it stays pruned. The
+        // liveness probe fails open — a transient store error keeps the
+        // group (the delivery-path backstop catches it later).
+        let mut survivors = Vec::with_capacity(persisted.len());
+        for p in persisted {
+            let parent_gone = !self.agent_is_live(&p.parent_agent_id).await
+                || matches!(
+                    self.store
+                        .get_agent_session_retired_at(&p.parent_agent_id)
+                        .await,
+                    Ok(Some(_)) | Err(intent_store::Error::NotFound(_))
+                );
+            if parent_gone {
+                tracing::info!(
+                    group = %p.group_id,
+                    parent = %p.parent_agent_id.0,
+                    "pruning persisted delegation group — parent agent gone or retired"
+                );
+                if let Err(e) = self.store.delete_delegation_group(&p.group_id).await {
+                    tracing::warn!("delegation_group delete failed {}: {e}", p.group_id);
+                }
+                continue;
+            }
+            survivors.push(p);
+        }
+        let persisted = survivors;
         let (loaded, groups_to_reconcile) = {
             let mut guard = self
                 .agent_subscriptions
@@ -1671,13 +1892,17 @@ impl Services {
                     // - Otherwise, skip (child may be interrupted/healing)
 
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
+                    // A retired child (`retired_at` set) settles like a
+                    // deleted one: the session is inert, no future completion
+                    // can fire, so the group must not hang on it. Deletion
+                    // still wins for the event kind.
+                    let is_retired = !is_deleted && session.retired_at.is_some();
                     let is_explicitly_completed = matches!(session.status, AgentStatus::Completed);
                     let is_failed = matches!(session.status, AgentStatus::Error);
 
-                    let is_idle_and_genuinely_complete = if matches!(
-                        session.status,
-                        AgentStatus::RuntimeIdle
-                    ) {
+                    let is_idle_and_genuinely_complete = if !is_retired
+                        && matches!(session.status, AgentStatus::RuntimeIdle)
+                    {
                         // Check if there's a completion report and no interrupted row
                         let has_completion_report = session.completion_report.is_some();
                         let interrupted_check = self.store.get_interrupted_agent(&child_id).await;
@@ -1698,15 +1923,19 @@ impl Services {
                     };
 
                     let should_record = is_deleted
+                        || is_retired
                         || is_explicitly_completed
                         || is_failed
                         || is_idle_and_genuinely_complete;
 
                     if should_record {
-                        // Build a synthetic agent:idle, agent:failed, or agent:deleted event
+                        // Build a synthetic agent:idle, agent:failed,
+                        // agent:deleted, or agent:retired event.
                         // Prefer the child's persisted completion_report when present
                         let event_type = if is_deleted {
                             intent_core::events::AGENT_DELETED
+                        } else if is_retired {
+                            intent_core::events::AGENT_RETIRED
                         } else if is_failed {
                             intent_core::events::AGENT_FAILED
                         } else {
@@ -1862,9 +2091,15 @@ impl Services {
                             stall.as_ref(),
                         );
 
-                        // Record the completion
+                        // Record the completion. Retired records in the
+                        // deleted bucket (terminal, non-completing — same as
+                        // the live delivery path).
                         self.record_group_child_completion(
-                            group_id, &child_id, is_deleted, summary, event,
+                            group_id,
+                            &child_id,
+                            is_deleted || is_retired,
+                            summary,
+                            event,
                         )
                         .await;
                     }
@@ -2109,6 +2344,7 @@ fn completion_watch_to_persisted(watch: &CompletionWatch) -> PersistedCompletion
         group_id: watch.group_id.clone(),
         report_delivered: watch.report_delivered,
         wake_on_attention: watch.wake_on_attention,
+        completion_only: watch.completion_only,
         created_at: watch.created_at.clone(),
     }
 }
@@ -2124,8 +2360,16 @@ fn persisted_to_completion_watch(p: &PersistedCompletionWatch) -> CompletionWatc
         child_agent_id: p.child_agent_id.clone(),
         group_id: p.group_id.clone(),
         created_at: p.created_at.clone(),
-        report_delivered: p.report_delivered,
+        // Compatibility: older daemons persisted this bit after a progress
+        // report and then suppressed the terminal idle wake. Progress no longer
+        // consumes completion interest, so rehydration deliberately re-arms
+        // those legacy rows.
+        report_delivered: false,
         wake_on_attention: p.wake_on_attention,
+        completion_only: p.completion_only,
+        // In-memory only: after a restart the terminal wake falls back to
+        // rendering the full report (fail-open, monorepo#4026).
+        delivered_report_ts: None,
     }
 }
 
@@ -2251,6 +2495,7 @@ mod tests {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -2311,6 +2556,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 

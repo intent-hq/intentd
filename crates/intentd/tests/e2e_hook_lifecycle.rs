@@ -11,7 +11,9 @@
 //!     `agent.getQueue` (`messageMetadata.type == "hook_wake"`), with
 //!     `hook:run-completed` + `hook:dispatched` on the wire.
 //!  2. Agent turn 2 schedules a watcher hook that reads a seeded note —
-//!     `hook:scheduled` observed; `hook.list` reports both hooks;
+//!     `hook:scheduled` observed; `hook.list` reports both hooks; a follow-up
+//!     agent turn recovers the RETIRED dispatcher's row via `ws.hook.get`
+//!     (MCP-only) and proves it still carries the original `code`;
 //!     `hook.runNow` drives `hook:run-started` + `hook:run-completed`.
 //!  3. The test plants an EVICT marker in the note over the wire and calls
 //!     `hook.runNow` again — the run throws, `hook:evicted` carries
@@ -44,6 +46,15 @@
 //!     says the hook remains active (`hookStillActive: true` in its
 //!     metadata), and the TTL finally expires the hook with a notice
 //!     reporting runs AND dispatches.
+//!  9. Schedule kinds: agent turn 7 schedules a recurring `cron` hook and a
+//!     one-shot `runAt` timer (~5s out) through the MCP route, and probes the
+//!     validation arms (two kinds at once, past `runAt` — both rejected with
+//!     the documented messages). `hook.list` surfaces `cron`/`runAt` on the
+//!     wire with the kind-specific TTLs (7-day cron cap, fire + 1h grace); a
+//!     `hook.runNow` on the cron hook reschedules from the expression; the
+//!     timer fires without dispatching, retires as `expired` (`runNow` →
+//!     -32602), and the owner is woken with the "fired and is now retired"
+//!     notice.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -392,6 +403,7 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -472,9 +484,23 @@ async fn hook_lifecycle_over_wss() {
 
     // Agent-JS payloads, one per prompt marker. The inner hook scripts are
     // JSON-escaped into the outer `ws.hook.schedule` calls.
+    let dispatcher_code = "return { dispatch: true, message: 'CI is red' };";
     let schedule_dispatch_js = format!(
         "return await ws.hook.schedule({{ name: 'dispatcher', code: {}, delayMs: 60000 }});",
-        json!("return { dispatch: true, message: 'CI is red' };")
+        json!(dispatcher_code)
+    );
+    // Retired-hook recovery: `ws.hook.get` on the dispatcher AFTER it retired
+    // must return the full row — original `code` included — through the real
+    // prelude → ACP callback → service → store route.
+    let get_retired_js = format!(
+        "const hooks = await ws.hook.list(); \
+         const retired = hooks.find(h => h.name === 'dispatcher'); \
+         const row = await ws.hook.get(retired.hookId); \
+         const out = ['getState=' + row.state]; \
+         out.push('codeMatch=' + (row.code === {code})); \
+         out.push('idMatch=' + (row.hookId === retired.hookId)); \
+         return out.join(' ');",
+        code = json!(dispatcher_code)
     );
     let watcher_inner = format!(
         "console.log('watcher checked the note'); \
@@ -540,6 +566,30 @@ async fn hook_lifecycle_over_wss() {
          ttlMs: 20000, perpetual: true }});",
         json!(perpetual_inner)
     );
+    // Schedule-kinds section: one turn drives `cron` and `runAt` through the
+    // production MCP `ws.hook.schedule` route (a recurring every-minute cron
+    // hook and a one-shot timer ~5s out), plus the validation arms — two
+    // kinds at once and a past `runAt` are rejected with the documented
+    // messages, surfaced through the MCP error path.
+    let schedule_kinds_js = format!(
+        "const out = []; \
+         const cron = await ws.hook.schedule({{ name: 'croner', code: {code}, \
+         cron: '* * * * *' }}); \
+         out.push('cronState=' + cron.hook.state); \
+         const timer = await ws.hook.schedule({{ name: 'timer', code: {code}, \
+         runAt: new Date(Date.now() + 5000).toISOString() }}); \
+         out.push('timerState=' + timer.hook.state); \
+         try {{ await ws.hook.schedule({{ name: 'both', code: {code}, \
+         delayMs: 60000, cron: '* * * * *' }}); out.push('both=allowed'); }} \
+         catch (e) {{ out.push('both=rejected'); \
+                     out.push('bothMsg=' + e.message.includes('mutually exclusive')); }} \
+         try {{ await ws.hook.schedule({{ name: 'past', code: {code}, \
+         runAt: '2020-01-01T00:00:00Z' }}); out.push('past=allowed'); }} \
+         catch (e) {{ out.push('past=rejected'); \
+                     out.push('pastMsg=' + e.message.includes('must be in the future')); }} \
+         return out.join(' ');",
+        code = json!("return { dispatch: false };")
+    );
     // `firstTurnDelayMs` holds turn 1 open after the schedule tool call so the
     // dispatch wake stays QUEUED behind the in-flight turn long enough for the
     // `agent.getQueue` assertion; queue-drain turns (the wake text matches no
@@ -563,6 +613,15 @@ async fn hook_lifecycle_over_wss() {
                     "arguments": { "code": schedule_watch_js, "summary": "schedule watcher" },
                 },
                 "response": "scheduled watcher",
+            },
+            {
+                "ifPromptContains": "GET_RETIRED",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": get_retired_js, "summary": "recover retired hook code" },
+                },
+                "emitToolBlocks": true,
+                "response": "recovered retired hook",
             },
             {
                 "ifPromptContains": "SCHEDULE_CANCELME",
@@ -604,6 +663,15 @@ async fn hook_lifecycle_over_wss() {
                     "arguments": { "code": schedule_perpetual_js, "summary": "schedule forever" },
                 },
                 "response": "scheduled forever",
+            },
+            {
+                "ifPromptContains": "SCHEDULE_KINDS",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": schedule_kinds_js, "summary": "schedule cron + runAt" },
+                },
+                "emitToolBlocks": true,
+                "response": "scheduled cron and runAt",
             },
         ],
     })
@@ -654,7 +722,7 @@ async fn hook_lifecycle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "HookOwner", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "HookOwner", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -822,6 +890,32 @@ async fn hook_lifecycle_over_wss() {
     // "fires so far" for every hook, not just perpetual ones.
     assert_eq!(dispatcher["dispatchCount"], 1, "{dispatcher}");
 
+    // Retired-hook recovery over the production MCP route: the agent calls
+    // `ws.hook.get` on the RETIRED dispatcher and gets the full row back —
+    // terminal state, matching id, and the original `code` verbatim — so a
+    // retired hook's script can be recovered to re-arm it.
+    let sent = wss_rpc(
+        &mut rpc,
+        210,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "GET_RETIRED" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    for (i, needle) in ["getState=dispatched", "codeMatch=true", "idMatch=true"]
+        .into_iter()
+        .enumerate()
+    {
+        await_conversation_contains(
+            &mut rpc,
+            211 + i64::try_from(i).expect("fits in i64") * 20,
+            &ws_id,
+            &agent_id,
+            needle,
+        )
+        .await;
+    }
+
     // FE trigger: hook.runNow drives run-started + run-completed (still
     // scheduled — the note has no EVICT marker yet).
     let ran = wss_rpc(
@@ -929,7 +1023,7 @@ async fn hook_lifecycle_over_wss() {
         &mut rpc,
         420,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Intruder", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Intruder", "model": "default", "provider": "mock" }),
     )
     .await;
     let intruder_id = intruder["agent"]["id"]
@@ -1365,4 +1459,128 @@ async fn hook_lifecycle_over_wss() {
         "expired after reaching its TTL (2 runs, 2 dispatches)",
     )
     .await;
+
+    // ── 9. Schedule kinds: cron + runAt through the MCP route ────────────
+    let sent = wss_rpc(
+        &mut rpc,
+        900,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SCHEDULE_KINDS" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Both persisting schedules land (validation runs continue), and the
+    // rejection arms surface the documented messages through the MCP error
+    // path — asserted from the emitted tool blocks in the transcript.
+    let cron_scheduled = next_hook_event(&mut sub, "hook:scheduled", Some("croner")).await;
+    let cron_id = cron_scheduled["data"]["hookId"]
+        .as_str()
+        .expect("croner hookId")
+        .to_string();
+    let timer_scheduled = next_hook_event(&mut sub, "hook:scheduled", Some("timer")).await;
+    let timer_id = timer_scheduled["data"]["hookId"]
+        .as_str()
+        .expect("timer hookId")
+        .to_string();
+    for (i, needle) in [
+        "cronState=scheduled",
+        "timerState=scheduled",
+        "both=rejected",
+        "bothMsg=true",
+        "past=rejected",
+        "pastMsg=true",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        await_conversation_contains(
+            &mut rpc,
+            910 + i64::try_from(i).unwrap(),
+            &ws_id,
+            &agent_id,
+            needle,
+        )
+        .await;
+    }
+
+    // hook.list carries the schedule-kind fields on the wire, with the
+    // kind-specific TTLs: cron defaults to the 7-day cap; runAt's expiry is
+    // its fire time (~5s out) + the 1h grace window, so the createdAt→
+    // expiresAt delta lands just above 1h and nowhere near the 24h default.
+    let listed = wss_rpc(&mut rpc, 920, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let find = |listed: &Value, id: &str| -> Value {
+        listed["hooks"]
+            .as_array()
+            .expect("hooks array")
+            .iter()
+            .find(|h| h["hookId"] == json!(id))
+            .unwrap_or_else(|| panic!("{id} in hook.list: {listed}"))
+            .clone()
+    };
+    let cron_hook = find(&listed, &cron_id);
+    assert_eq!(cron_hook["cron"], "* * * * *", "{cron_hook}");
+    assert_eq!(cron_hook.get("runAt"), None, "{cron_hook}");
+    assert!(cron_hook["nextRunAt"].is_string(), "{cron_hook}");
+    assert_eq!(ttl_of(&listed, "croner"), 7 * 86_400_000, "{listed}");
+    let timer_hook = find(&listed, &timer_id);
+    assert!(timer_hook["runAt"].is_string(), "{timer_hook}");
+    assert_eq!(timer_hook.get("cron"), None, "{timer_hook}");
+    assert_eq!(
+        timer_hook["nextRunAt"], timer_hook["runAt"],
+        "one-shot nextRunAt is the fire time: {timer_hook}"
+    );
+    let timer_ttl = ttl_of(&listed, "timer");
+    assert!(
+        (3_600_000..3_700_000).contains(&timer_ttl),
+        "runAt expiry = fire (~5s) + 1h grace: {timer_ttl}"
+    );
+
+    // A manual fire on the cron hook reschedules from the EXPRESSION: the
+    // hook stays active with a strictly-future nextRunAt (cron rows persist
+    // delayMs = 0, so a fixed-cadence reschedule would re-fire immediately).
+    let ran = wss_rpc(
+        &mut rpc,
+        921,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": cron_id }),
+    )
+    .await;
+    assert_eq!(ran["ok"], true, "runNow ok: {ran}");
+    let completed = next_hook_event(&mut sub, "hook:run-completed", Some("croner")).await;
+    assert_eq!(completed["data"]["state"], "scheduled", "{completed}");
+    let next = completed["data"]["nextRunAt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("recomputed nextRunAt: {completed}"));
+    let next = chrono::DateTime::parse_from_rfc3339(next).expect("nextRunAt parses");
+    assert!(next > chrono::Utc::now(), "strictly future: {next}");
+
+    // The timer fires (~5s after schedule) without dispatching: the one-shot
+    // retires as `expired` (terminal on the wire: runNow → -32602) and the
+    // owner is woken with the "fired" notice, not the TTL-expiry wording.
+    let expired = next_hook_event(&mut sub, "hook:expired", Some("timer")).await;
+    assert_eq!(expired["data"]["hookId"], json!(timer_id));
+    assert_eq!(expired["data"]["state"], "expired", "{expired}");
+    let timer_row = find(
+        &wss_rpc(&mut rpc, 930, "hook.list", json!({ "workspaceId": ws_id })).await,
+        &timer_id,
+    );
+    assert_eq!(timer_row["state"], "expired", "{timer_row}");
+    assert_eq!(
+        timer_row.get("nextRunAt"),
+        None,
+        "no re-arm after the fire: {timer_row}"
+    );
+    let err = wss_rpc_raw(
+        &mut rpc,
+        931,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": timer_id }),
+    )
+    .await;
+    assert_eq!(
+        err["error"]["code"], -32602,
+        "retired timer ⇒ -32602: {err}"
+    );
+    await_conversation_contains(&mut rpc, 940, &ws_id, &agent_id, "fired and is now retired").await;
 }

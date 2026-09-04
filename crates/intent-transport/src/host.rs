@@ -17,7 +17,9 @@ use intent_services::EventBus;
 use serde_json::{json, Map, Value};
 
 use crate::events::{error_frame, success_frame};
-use crate::host_env::{detect_display_server, detect_has_display, local_hostname};
+use crate::host_env::{
+    detect_display_server, detect_has_display, local_hostname, pretty_hostname, HostEnvironment,
+};
 use crate::host_ops;
 use crate::reverse::{ReverseChannel, DEFAULT_REVERSE_TIMEOUT};
 
@@ -55,9 +57,17 @@ pub(crate) enum HostMethod {
     ListInstalledEditors,
     ProviderDiscovery,
     /// Daemon-owned provider auth probes (`host.providerAuthStatus`, §5.14):
-    /// `{ providerId?, force? }` → `{ providers: [{ id, authenticated }] }`
-    /// with `authenticated: true | false | null`.
+    /// `{ providerId?, force? }` → `{ providers: [{ id, authenticated,
+    /// identity? }] }` with `authenticated: true | false | null` and the
+    /// additive optional `identity` object `{ email?, orgName?,
+    /// subscriptionType? }` (v9.4) present only when the provider's probe
+    /// captured identity metadata (today: claude-code's logged-in JSON).
     ProviderAuthStatus,
+    /// Live end-to-end provider test prompt (`host.providerTestPrompt`,
+    /// §5.14): `{ providerId, model? }` → `{ ok: true }` or `{ ok: false,
+    /// reason, message }` — one ephemeral ACP prompt proving the provider
+    /// actually answers, coupled to the auth-verdict cache.
+    ProviderTestPrompt,
     /// Client-callable editor-open trigger (`host.openInEditor`, §5.14):
     /// dispatched to [`open_in_editor`], which short-circuits locally on a
     /// local connection and re-dispatches to the connected FE as the
@@ -118,6 +128,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
         "host.providerDiscovery" => HostMethod::ProviderDiscovery,
         "host.providerAuthStatus" => HostMethod::ProviderAuthStatus,
+        "host.providerTestPrompt" => HostMethod::ProviderTestPrompt,
         "host.openInEditor" => HostMethod::OpenInEditor,
         "host.exec" => HostMethod::Exec,
         "host.execStream" => HostMethod::ExecStream,
@@ -142,25 +153,37 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
 }
 
 /// Build the `host.status` result JSON (§5.14): `{ os, arch, hostname,
-/// hasDisplay, locality, displayServer? }`. `displayServer` is omitted when no
-/// display server is detected. Pure (inputs injected) so it is unit-testable.
+/// prettyHostname, hasDisplay, locality, displayServer? }`. `displayServer` is
+/// omitted when no display server is detected. Pure (inputs injected) so it is
+/// unit-testable.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn host_status_json(
     os: &str,
     arch: &str,
     hostname: &str,
+    pretty_hostname: &str,
     has_display: bool,
     display_server: Option<&str>,
+    device_kind: Option<&str>,
+    hardware_model: Option<&str>,
     is_local: bool,
 ) -> Value {
     let mut result = json!({
         "os": os,
         "arch": arch,
         "hostname": hostname,
+        "prettyHostname": pretty_hostname,
         "hasDisplay": has_display,
         "locality": if is_local { "local" } else { "remote" },
     });
     if let Some(ds) = display_server {
         result["displayServer"] = json!(ds);
+    }
+    if let Some(kind) = device_kind {
+        result["deviceKind"] = json!(kind);
+    }
+    if let Some(model) = hardware_model {
+        result["hardwareModel"] = json!(model);
     }
     result
 }
@@ -181,10 +204,22 @@ pub(crate) fn host_status_json(
 /// values); `findApp` / `listInstalledEditors` return only app names + paths.
 /// `reverse` is the connection's reverse-RPC channel, consumed by the
 /// client-called `openInEditor` trigger on a remote connection.
+#[cfg(test)]
 pub(crate) async fn handle(
     req: HostRequest,
     api: &dyn WorkspaceApi,
     bus: Option<&EventBus>,
+    is_local: bool,
+    reverse: &ReverseChannel,
+) -> Option<String> {
+    handle_with_host_environment(req, api, bus, None, is_local, reverse).await
+}
+
+pub(crate) async fn handle_with_host_environment(
+    req: HostRequest,
+    api: &dyn WorkspaceApi,
+    bus: Option<&EventBus>,
+    host_environment: Option<HostEnvironment>,
     is_local: bool,
     reverse: &ReverseChannel,
 ) -> Option<String> {
@@ -196,12 +231,25 @@ pub(crate) async fn handle(
     } = req;
     let frame = match method {
         HostMethod::Status => {
+            let hostname = host_environment
+                .as_ref()
+                .map_or_else(local_hostname, |host| host.hostname.clone());
+            let pretty_hostname = host_environment
+                .as_ref()
+                .map_or_else(pretty_hostname, |host| host.pretty_hostname.clone());
             let result = host_status_json(
                 std::env::consts::OS,
                 std::env::consts::ARCH,
-                &local_hostname(),
+                &hostname,
+                &pretty_hostname,
                 detect_has_display(),
                 detect_display_server().as_deref(),
+                host_environment
+                    .as_ref()
+                    .and_then(|host| host.device_kind.as_deref()),
+                host_environment
+                    .as_ref()
+                    .and_then(|host| host.hardware_model.as_deref()),
                 is_local,
             );
             success_frame(&id_echo, &result)
@@ -413,6 +461,56 @@ pub(crate) async fn handle(
                 provider_id.as_deref(),
                 force,
                 &provider_paths,
+            )
+            .await
+            {
+                Ok(result) => success_frame(&id_echo, &result),
+                Err(msg) => error_frame(&id_echo, -32602, &msg),
+            }
+        }
+        HostMethod::ProviderTestPrompt => {
+            let provider_id = match params.get("providerId").and_then(Value::as_str) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        &id_echo,
+                        -32602,
+                        "Missing required parameter: providerId",
+                    ));
+                }
+            };
+            let model = match params.get("model") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                Some(_) => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        &id_echo,
+                        -32602,
+                        "Invalid parameter: model must be a non-empty string",
+                    ));
+                }
+            };
+            // Same settings seam as `ProviderAuthStatus` / `ProviderDiscovery`
+            // (monorepo#1065): binary resolution must honor `providers.paths`
+            // overrides, with `context.auggiePath` winning for auggie.
+            let mut provider_paths = read_provider_paths(api).await;
+            if let Some(p) = read_setting_string(api, "context.auggiePath").await {
+                provider_paths.insert("auggie".to_string(), p);
+            }
+            // Live `agents.acpNodeMaxOldSpaceMb` so the probe child carries the
+            // same V8 heap cap a real ACP spawn gets (intent-hq/intent#4330).
+            let node_max_old_space_mb = read_setting_u32(api, "agents.acpNodeMaxOldSpaceMb").await;
+            match intent_services::provider_test_prompt::provider_test_prompt(
+                &provider_id,
+                model.as_deref(),
+                &provider_paths,
+                node_max_old_space_mb,
             )
             .await
             {
@@ -666,6 +764,25 @@ async fn read_setting_string(api: &dyn WorkspaceApi, path: &str) -> Option<Strin
         None
     } else {
         Some(s.to_string())
+    }
+}
+
+/// Read a single `u32`-valued setting; returns `None` for missing / null /
+/// non-whole / out-of-`u32`-range values, or when the lookup itself fails.
+/// `settings.get` reports `Number` settings as floats (`8192.0`), so the value
+/// is read via `as_f64` — `as_u64` would always be `None` on the wire shape.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
+async fn read_setting_u32(api: &dyn WorkspaceApi, path: &str) -> Option<u32> {
+    let payload = api.settings_get(path.to_string()).await.ok()?;
+    let n = payload.get("value")?.as_f64()?;
+    if n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= f64::from(u32::MAX) {
+        Some(n as u32)
+    } else {
+        None
     }
 }
 

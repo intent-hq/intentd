@@ -60,7 +60,9 @@ pub use session::{MappedToolCall, MappedUpdate};
 pub use spawn::{spawn_provider, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};
 pub use tool_restrictions::{
-    get_tool_denylist_for_agent_type, get_tools_to_remove, SUBAGENT_TOOLS,
+    get_native_tools_to_remove, get_tool_denylist_for_agent_type, get_tools_to_remove,
+    CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS, DROID_ORCHESTRATOR_DISALLOWED_TOOLS,
+    EXECUTION_TOOLS, FILE_WRITE_TOOLS, SUBAGENT_TOOLS,
 };
 pub use transport::{Connection, ConnectionHooks, IncomingNotification, IncomingRequest};
 

@@ -46,6 +46,9 @@ pub(crate) struct CowProvisionTimings {
     pub strip_registrations: Duration,
     /// Duration of branch creation + checkout + hard reset in the clone.
     pub checkout: Duration,
+    /// The hard reset used the stat-trusting fast path ([`fast_hard_reset`])
+    /// rather than the full-rehash libgit2 fallback.
+    pub reset_fast_path: bool,
     /// Duration of the post-reset submodule work: force-update, orphaned
     /// work-tree cleanup, and closing URL sync (zero when neither the
     /// source tip nor the checked-out ref involves submodules).
@@ -133,6 +136,7 @@ pub fn provision_cow_checkout(
         skipped_excluded = timings.skipped_excluded,
         strip_registrations_ms = u64::try_from(timings.strip_registrations.as_millis()).unwrap_or(u64::MAX),
         checkout_ms = u64::try_from(timings.checkout.as_millis()).unwrap_or(u64::MAX),
+        reset_fast_path = timings.reset_fast_path,
         submodule_update_ms = u64::try_from(timings.submodule_update.as_millis()).unwrap_or(u64::MAX),
         "provision_cow_checkout: provisioning phase timings"
     );
@@ -213,8 +217,10 @@ pub(crate) fn provision_cow_checkout_timed(
             std::collections::BTreeSet::default()
         };
         let checkout_started = Instant::now();
-        let sha = checkout_in_clone(checkout_path, branch, base_ref, remote)?;
+        let (sha, reset_fast_path) =
+            checkout_in_clone_impl(checkout_path, branch, base_ref, remote, ResetMode::FastStat)?;
         timings.checkout = checkout_started.elapsed();
+        timings.reset_fast_path = reset_fast_path;
         // The hard reset above moved the superproject only; force-sync the
         // byte-copied submodule work trees to the gitlinks the base commit
         // records (local: the clone carries the source's `.git/modules`).
@@ -447,16 +453,46 @@ fn resolve_inherited_origin(source_repo: &Path, checkout_path: &Path) -> Result<
     Ok(())
 }
 
+/// How [`checkout_in_clone_impl`] hard-resets tracked files to the base
+/// commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResetMode {
+    /// libgit2 hard reset. Fresh `git clone` checkouts (the plain-clone
+    /// provisioners) have a stat-valid index, so this is already O(diff)
+    /// for them.
+    Full,
+    /// `CoW`-clone fast path: trust the byte-copied index's mtime+size stat
+    /// data ([`fast_hard_reset`]) instead of re-hashing the whole working
+    /// tree; falls back to [`ResetMode::Full`] on any failure.
+    FastStat,
+}
+
 /// Branch + checkout + hard reset inside the freshly cloned repository.
 /// Shared with [`crate::repo_cache::provision_direct_checkout`], which needs
 /// the identical base-ref resolution + branch-reuse semantics in a plain
-/// local clone.
+/// local clone (with the full libgit2 reset — its fresh-clone index is
+/// already stat-valid).
 pub(crate) fn checkout_in_clone(
     checkout_path: &Path,
     branch: &str,
     base_ref: Option<&str>,
     remote: &str,
 ) -> Result<String> {
+    checkout_in_clone_impl(checkout_path, branch, base_ref, remote, ResetMode::Full)
+        .map(|(sha, _)| sha)
+}
+
+/// [`checkout_in_clone`] with the reset strategy explicit; the `CoW`
+/// provisioning path opts into [`ResetMode::FastStat`]. Also returns whether
+/// the hard reset used the stat-trusting fast path (always `false` for
+/// [`ResetMode::Full`]), so provisioning timings can report it.
+fn checkout_in_clone_impl(
+    checkout_path: &Path,
+    branch: &str,
+    base_ref: Option<&str>,
+    remote: &str,
+    reset_mode: ResetMode,
+) -> Result<(String, bool)> {
     let repo = Repository::open(checkout_path).map_err(map_git_err)?;
 
     // Resolve the base commit in the clone (a full copy of the source repo's
@@ -481,13 +517,26 @@ pub(crate) fn checkout_in_clone(
     };
 
     // Create the branch at the base commit, or reuse an existing branch of
-    // the same name (provision_worktree parity).
-    let branch_ref = match repo.find_branch(branch, BranchType::Local) {
-        Ok(b) => b.into_reference(),
-        Err(_) => repo
-            .branch(branch, &base_commit, false)
-            .map_err(map_git_err)?
-            .into_reference(),
+    // the same name (provision_worktree parity). A branch that exists only
+    // as a remote-tracking ref (e.g. a PR head branch never checked out
+    // locally) materializes as a local branch at the remote tip — with
+    // upstream tracking — instead of a fresh branch at the base commit, so
+    // the checkout carries the branch's existing commits.
+    let branch_ref = if let Ok(b) = repo.find_branch(branch, BranchType::Local) {
+        b.into_reference()
+    } else {
+        let remote_tip = repo
+            .find_reference(&format!("refs/remotes/{remote}/{branch}"))
+            .ok()
+            .and_then(|r| r.peel_to_commit().ok());
+        let target = remote_tip.as_ref().unwrap_or(&base_commit);
+        let mut b = repo.branch(branch, target, false).map_err(map_git_err)?;
+        if remote_tip.is_some() {
+            // Best-effort: a failure to record tracking never fails
+            // provisioning.
+            let _ = b.set_upstream(Some(&format!("{remote}/{branch}")));
+        }
+        b.into_reference()
     };
     let target = branch_ref.peel_to_commit().map_err(map_git_err)?;
     let checked_out_sha = target.id().to_string();
@@ -497,9 +546,112 @@ pub(crate) fn checkout_in_clone(
     // source working tree but leaves untracked files in place.
     let refname = format!("refs/heads/{branch}");
     repo.set_head(&refname).map_err(map_git_err)?;
-    repo.reset(target.as_object(), git2::ResetType::Hard, None)
-        .map_err(map_git_err)?;
-    Ok(checked_out_sha)
+    let reset_fast_path = match reset_mode {
+        ResetMode::Full => {
+            repo.reset(target.as_object(), git2::ResetType::Hard, None)
+                .map_err(map_git_err)?;
+            false
+        }
+        ResetMode::FastStat => fast_hard_reset(checkout_path, &repo, &target)?,
+    };
+    Ok((checked_out_sha, reset_fast_path))
+}
+
+/// Hard-reset the `CoW` clone to `target` in O(diff), trusting the
+/// byte-copied index's mtime+size stat data.
+///
+/// The byte copy gives every file a new inode/ctime while preserving mtime
+/// and size, so git's default stat check (`core.checkstat=default`, which
+/// compares inode/ctime too) sees every index entry as stat-dirty and
+/// re-hashes — and rewrites — the entire working tree on reset. libgit2
+/// hard-codes that inode/uid/gid comparison (it has no `core.checkstat`
+/// support at all), so the fast path shells out to `git reset --hard` with
+/// `core.checkstat=minimal` + `core.trustctime=false` scoped to the one
+/// invocation via `-c` (the clone's own config stays untouched): entries
+/// whose mtime+size still match the index are trusted, and only real
+/// differences — files dirty in the source working tree, or paths differing
+/// between the source tip and the base ref — are checked out. One residual
+/// case survives this stat trust where the full libgit2 re-hash would not:
+/// a tracked file dirty in the source with an unchanged size and an mtime
+/// not newer than the index's recorded mtime (e.g. backdated by a tool that
+/// restores mtimes) is trusted as clean and left stale in the clone. This is
+/// exactly the trust plain `git status`/`git reset` places in its own stat
+/// cache on the source repo, so the clone is no less trustworthy than normal
+/// git operation there, and the gap is accepted. Any failure (no `git`
+/// binary, nonzero exit) degrades to the full libgit2 hard reset with a
+/// warning naming the error.
+/// Returns whether the fast path engaged (`false` means the fallback ran).
+fn fast_hard_reset(
+    checkout_path: &Path,
+    repo: &Repository,
+    target: &git2::Commit<'_>,
+) -> Result<bool> {
+    fast_hard_reset_with(checkout_path, repo, target, cli_stat_trusting_reset)
+}
+
+/// [`fast_hard_reset`] with the CLI reset injectable, so tests can force
+/// the libgit2 fallback deterministically.
+fn fast_hard_reset_with(
+    checkout_path: &Path,
+    repo: &Repository,
+    target: &git2::Commit<'_>,
+    cli_reset: impl FnOnce(&Path, &str) -> Result<()>,
+) -> Result<bool> {
+    match cli_reset(checkout_path, &target.id().to_string()) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            tracing::warn!(
+                checkout = %checkout_path.display(),
+                error = %e,
+                "provision_cow_checkout: fast-path stat-trusting reset failed; falling back to full hard reset"
+            );
+            repo.reset(target.as_object(), git2::ResetType::Hard, None)
+                .map_err(map_git_err)?;
+            Ok(false)
+        }
+    }
+}
+
+/// `git reset --hard <sha>` with the stat-trusting config applied via `-c`
+/// for this one invocation. Local-only (no network, no prompt); `sha` is a
+/// hex object id from libgit2, never user input. Hermetic against inherited
+/// context: `submodule.recurse=false` pins the reset to the superproject
+/// even if host config sets `submodule.recurse=true` (libgit2's reset never
+/// recursed), and `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` are stripped —
+/// they would override `-C`-based repo discovery, aiming a destructive
+/// command that exits 0 at the wrong repository, bypassing the fallback.
+fn cli_stat_trusting_reset(checkout_path: &Path, sha: &str) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout_path)
+        .args([
+            "-c",
+            "core.checkstat=minimal",
+            "-c",
+            "core.trustctime=false",
+            "-c",
+            "submodule.recurse=false",
+            "reset",
+            "--hard",
+            "--quiet",
+            sha,
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(Error::Internal(format!(
+        "git reset --hard failed ({}): {}",
+        output.status,
+        stderr.trim()
+    )))
 }
 
 /// Provision a **standalone** plain-clone checkout from an arbitrary local
@@ -740,6 +892,81 @@ mod tests {
         );
     }
 
+    /// The fast-path reset ([`fast_hard_reset`], `git reset --hard`
+    /// trusting mtime+size) produces the same end state as the full libgit2
+    /// reset: a tracked modification is discarded, an untracked file is
+    /// preserved, and a target differing from the current tip lands on the
+    /// target's tree. Exercised directly on a plain repository (no `CoW`
+    /// clone needed) so it runs on non-CoW CI filesystems too.
+    #[test]
+    fn fast_hard_reset_matches_full_reset_semantics() {
+        let dir = init_repo("cowchk-fastreset");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let base_oid = repo.head().unwrap().target().unwrap();
+        // Advance HEAD past the target, dirty the tracked file, and add an
+        // untracked artifact.
+        commit_file(dir.path(), "b.txt", "y\n");
+        write_file(dir.path(), "a.txt", "dirty\n");
+        write_file(dir.path(), "target/build.log", "artifact\n");
+
+        let target = repo.find_commit(base_oid).unwrap();
+        let fast = fast_hard_reset(dir.path(), &repo, &target).unwrap();
+
+        assert!(fast, "the stat-trusting CLI fast path engaged");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "x\n",
+            "dirty tracked file is reset to the target"
+        );
+        assert!(
+            !dir.path().join("b.txt").exists(),
+            "paths past the target are removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target/build.log")).unwrap(),
+            "artifact\n",
+            "untracked file is preserved"
+        );
+        let head = Repository::open(dir.path()).unwrap();
+        assert_eq!(head.head().unwrap().target().unwrap(), base_oid);
+    }
+
+    /// A failing CLI fast-path reset falls back to the full libgit2 hard
+    /// reset and still produces the identical end state — provisioning
+    /// never fails because of the optimization.
+    #[test]
+    fn fast_hard_reset_falls_back_to_libgit2_on_cli_failure() {
+        let dir = init_repo("cowchk-fastfallback");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let base_oid = repo.head().unwrap().target().unwrap();
+        commit_file(dir.path(), "b.txt", "y\n");
+        write_file(dir.path(), "a.txt", "dirty\n");
+        write_file(dir.path(), "target/build.log", "artifact\n");
+
+        let target = repo.find_commit(base_oid).unwrap();
+        let fast = fast_hard_reset_with(dir.path(), &repo, &target, |_, _| {
+            Err(Error::Internal("forced CLI failure".to_string()))
+        })
+        .unwrap();
+
+        assert!(!fast, "the fallback reports the fast path did not engage");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "x\n",
+            "fallback reset still discards the dirty tracked file"
+        );
+        assert!(!dir.path().join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target/build.log")).unwrap(),
+            "artifact\n",
+            "fallback reset still preserves the untracked file"
+        );
+        let head = Repository::open(dir.path()).unwrap();
+        assert_eq!(head.head().unwrap().target().unwrap(), base_oid);
+    }
+
     #[test]
     fn reuses_existing_branch_of_same_name() {
         let dir = init_repo("cowchk-reuse");
@@ -759,6 +986,53 @@ mod tests {
             provision_cow_checkout(dir.path(), &checkout, "cow-ws", Some(&base), "origin", &[])
                 .unwrap();
         assert_eq!(sha, pinned_sha, "existing branch is reused, not recreated");
+    }
+
+    /// A branch that exists ONLY as a remote-tracking ref (e.g. a PR head
+    /// branch never checked out locally) checks out at the remote tip — not
+    /// as a fresh branch at the base commit — and records upstream tracking.
+    #[test]
+    fn checkout_in_clone_materializes_remote_only_branch_at_remote_tip() {
+        let dir = init_repo("cowchk-remote-only");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let base_sha = head_sha(&dir);
+        let base = head_branch(&dir);
+        // A remote-tracking ref one commit AHEAD of the base branch, with no
+        // local branch of that name.
+        commit_file(dir.path(), "b.txt", "y\n");
+        let tip_sha = head_sha(&dir);
+        {
+            let repo = Repository::open(dir.path()).unwrap();
+            repo.remote("origin", &dir.path().display().to_string())
+                .unwrap();
+            let tip = git2::Oid::from_str(&tip_sha).unwrap();
+            repo.reference("refs/remotes/origin/pr-head", tip, false, "test")
+                .unwrap();
+            let base_oid = git2::Oid::from_str(&base_sha).unwrap();
+            repo.reference(&format!("refs/heads/{base}"), base_oid, true, "test")
+                .unwrap();
+            let base_obj = repo.find_object(base_oid, None).unwrap();
+            repo.reset(&base_obj, git2::ResetType::Hard, None).unwrap();
+        }
+
+        let sha = checkout_in_clone(dir.path(), "pr-head", Some(&base), "origin").unwrap();
+        assert_eq!(sha, tip_sha, "checkout lands on the remote tip");
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand().unwrap(), "pr-head");
+        let local = repo.find_branch("pr-head", BranchType::Local).unwrap();
+        assert_eq!(
+            local
+                .upstream()
+                .ok()
+                .and_then(|u| u.name().ok().flatten().map(str::to_string))
+                .as_deref(),
+            Some("origin/pr-head"),
+            "upstream tracking recorded"
+        );
+        assert!(
+            repo.find_reference("refs/heads/pr-head").is_ok(),
+            "local branch materialized"
+        );
     }
 
     #[test]
@@ -967,6 +1241,10 @@ mod tests {
             timings.submodule_update,
             Duration::ZERO,
             "a repo without submodules skips the submodule phase entirely"
+        );
+        assert!(
+            timings.reset_fast_path,
+            "the CoW provisioning reset used the stat-trusting fast path"
         );
         // The display helper renders one entry per recorded subtree.
         assert_eq!(
@@ -1733,6 +2011,146 @@ mod tests {
         assert_eq!(
             configured_url, gitmodules_url,
             "configured URL is re-pointed at the .gitmodules value"
+        );
+    }
+
+    /// Manual benchmark for the reset fast path (intent-hq/monorepo#3346):
+    /// times the checkout/hard-reset phase of `CoW` provisioning on a real
+    /// large repository, before (full libgit2 reset) vs after (stat-trusting
+    /// fast path), interleaved to level filesystem-cache effects. The "after"
+    /// runs go through [`provision_cow_checkout_timed`] so the reported
+    /// number is the production `checkout_ms`; the "before" runs replicate
+    /// the identical pre-steps and time [`checkout_in_clone_impl`] with
+    /// [`ResetMode::Full`] (the exact span `checkout_ms` covered before the
+    /// fast path). Both runs assert the tracked end state is clean.
+    ///
+    /// Ignored by default; requires a repository on a `CoW`-capable volume:
+    ///
+    /// ```sh
+    /// INTENT_GIT_BENCH_REPO=/path/to/large/repo \
+    /// INTENT_GIT_BENCH_DEST=/same/volume/scratch \
+    ///   cargo test -p intent-git --release bench_reset_fast_path -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual benchmark; set INTENT_GIT_BENCH_REPO (see doc comment)"]
+    fn bench_reset_fast_path_on_large_repo() {
+        let Ok(repo) = std::env::var("INTENT_GIT_BENCH_REPO") else {
+            eprintln!("INTENT_GIT_BENCH_REPO not set; skipping benchmark");
+            return;
+        };
+        let repo_path = PathBuf::from(&repo).canonicalize().unwrap();
+        let dest_parent = std::env::var("INTENT_GIT_BENCH_DEST")
+            .map_or_else(|_| repo_path.parent().unwrap().to_path_buf(), PathBuf::from);
+        std::fs::create_dir_all(&dest_parent).unwrap();
+        assert!(
+            matches!(
+                cow_probe(&repo_path, &dest_parent),
+                Ok(CowSupport::Supported)
+            ),
+            "benchmark needs CoW support between repo and dest"
+        );
+        let branch = {
+            let src = Repository::open(&repo_path).unwrap();
+            let name = src.head().unwrap().shorthand().unwrap().to_string();
+            name
+        };
+
+        let assert_tracked_clean = |checkout: &Path, tag: &str| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(checkout)
+                .args(["status", "--porcelain", "-uno", "--ignore-submodules=all"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git status failed after {tag}");
+            assert!(
+                out.stdout.is_empty(),
+                "tracked files dirty after {tag}:\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        };
+        let tracked_files = |checkout: &Path| -> usize {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(checkout)
+                .args(["ls-files"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().count()
+        };
+
+        let bench_checkout = |tag: &str| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            dest_parent.join(format!("cow-bench-{tag}-{nanos}"))
+        };
+        // Before: identical pre-steps to provisioning, then the full libgit2
+        // reset (what checkout_ms covered before the fast path landed).
+        let run_before = |tag: &str| -> Duration {
+            let checkout = bench_checkout(tag);
+            let _cleanup = Cleanup(checkout.clone());
+            cow_clone_with_excludes(&repo_path, &checkout, &[]).unwrap();
+            strip_worktree_registrations(&checkout).unwrap();
+            let started = Instant::now();
+            let (_, fast) = checkout_in_clone_impl(
+                &checkout,
+                "cow-bench",
+                Some(&branch),
+                "origin",
+                ResetMode::Full,
+            )
+            .unwrap();
+            let elapsed = started.elapsed();
+            assert!(!fast, "ResetMode::Full never uses the fast path");
+            assert_tracked_clean(&checkout, tag);
+            eprintln!(
+                "bench {tag} (before, full libgit2 reset): checkout_ms={} tracked_files={}",
+                elapsed.as_millis(),
+                tracked_files(&checkout)
+            );
+            elapsed
+        };
+        // After: the production path end to end, reading its own checkout_ms.
+        let run_after = |tag: &str| -> Duration {
+            let checkout = bench_checkout(tag);
+            let _cleanup = Cleanup(checkout.clone());
+            let (_, timings) = provision_cow_checkout_timed(
+                &repo_path,
+                &checkout,
+                "cow-bench",
+                Some(&branch),
+                "origin",
+                &[],
+            )
+            .unwrap();
+            assert!(
+                timings.reset_fast_path,
+                "fast path must engage on the benchmark repo"
+            );
+            assert_tracked_clean(&checkout, tag);
+            eprintln!(
+                "bench {tag} (after, fast path): checkout_ms={} total_ms={} cow_clone_ms={} submodule_update_ms={} tracked_files={}",
+                timings.checkout.as_millis(),
+                timings.total.as_millis(),
+                timings.cow_clone.as_millis(),
+                timings.submodule_update.as_millis(),
+                tracked_files(&checkout)
+            );
+            timings.checkout
+        };
+
+        let before_1 = run_before("full-1");
+        let after_1 = run_after("fast-1");
+        let before_2 = run_before("full-2");
+        let after_2 = run_after("fast-2");
+        eprintln!(
+            "bench summary: before(full)={}ms/{}ms after(fast)={}ms/{}ms",
+            before_1.as_millis(),
+            before_2.as_millis(),
+            after_1.as_millis(),
+            after_2.as_millis()
         );
     }
 }

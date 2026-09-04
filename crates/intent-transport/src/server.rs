@@ -1,7 +1,8 @@
 //! Server pairing fast-path: `server.pairingInfo` + `server.rotateToken`
 //! (docs/protocol/05-method-catalog.md §5 fast-path catalog).
 //!
-//! These two methods expose pairing credentials (token + fingerprint + port + local IPs + hostname)
+//! These two methods expose pairing credentials (token + fingerprint + port + local IPs + available
+//! bind-candidate IPs + hostname + pretty hostname)
 //! and rotate the bearer token. They are LOCAL-ONLY: gated on the real connection origin (UDS vs TCP)
 //! via the task-local context set by the transport layer. WSS connections are ALWAYS remote (TCP),
 //! regardless of the `--mode local` locality flag. UDS connections are ALWAYS local. Remote callers
@@ -22,6 +23,8 @@ use intent_core::{Error, Result};
 pub trait ServerPairingInfo: Send + Sync {
     /// Get the current bound WSS port, or `None` if the listener is stopped.
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>>;
+    /// Cached host identity, refreshed by the composition root off the RPC path.
+    fn host_environment(&self) -> crate::host_env::HostEnvironment;
     /// Data directory for TLS cert access.
     fn data_dir(&self) -> &std::path::Path;
     /// Token store for get/generate operations.
@@ -33,10 +36,14 @@ pub trait ServerPairingInfo: Send + Sync {
 pub struct PairingSnapshot {
     /// The bound WSS port, when the TCP listener is running.
     pub port: Option<u16>,
-    /// The address the running listener is bound to (`server.bindAddress`),
-    /// when known — drives which hosts the pairing payload advertises
-    /// (`pairing_hosts`).
-    pub bind_address: Option<std::net::IpAddr>,
+    /// The address set the running listener is bound to
+    /// (`server.bindAddress`; one listener per address), when known — drives
+    /// which hosts the pairing payload advertises (`pairing_hosts`).
+    pub bind_addresses: Option<Vec<std::net::IpAddr>>,
+    /// The tailcat tunnel's stable `tc...` address (`server.tunnel.*`), when
+    /// the sidecar is running. Rides `server.pairingInfo` / `pairing.getInfo`
+    /// as the additive `tcAddress` field (omitted when `None`).
+    pub tc_address: Option<String>,
 }
 
 /// The two server methods, once classified.
@@ -121,17 +128,40 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let snapshot = provider.pairing_snapshot().await;
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
-    let local_ips = pairing_hosts(&snapshot);
-    let hostname = crate::host_env::local_hostname();
+    // Enumerate once: the v4 list is both the unspecified-bind fallback for
+    // `localIps` and, verbatim, the `availableIps` bind-candidate set — every
+    // non-loopback IPv4 the machine could listen on, deliberately NOT
+    // narrowed by the current bind set, so a loopback locked-in daemon still
+    // reports what a client could switch the bind to.
+    let available_ips = collect_local_ips();
+    let local_ips = pairing_hosts_from(&snapshot, &available_ips, &collect_local_ipv6s());
+    let host = provider.host_environment();
 
-    Ok(json!({
+    let mut result = json!({
         "token": token,
         "certFingerprint": cert.fingerprint256,
         "port": snapshot.port,
         "path": "/ws",
         "localIps": local_ips,
-        "hostname": hostname,
-    }))
+        "availableIps": available_ips,
+        "hostname": host.hostname,
+        "prettyHostname": host.pretty_hostname,
+    });
+    let obj = result
+        .as_object_mut()
+        .expect("pairing_info_json literal is an object");
+    if let Some(device_kind) = host.device_kind {
+        obj.insert("deviceKind".into(), device_kind.into());
+    }
+    if let Some(hardware_model) = host.hardware_model {
+        obj.insert("hardwareModel".into(), hardware_model.into());
+    }
+    // Additive tunnel route (presence-detected): omitted when the tunnel is
+    // disabled or down, so older clients are unaffected.
+    if let Some(tc) = &snapshot.tc_address {
+        obj.insert("tcAddress".into(), tc.clone().into());
+    }
+    Ok(result)
 }
 
 /// Build the `server.rotateToken` result JSON. Returns an error when `INTENTD_AUTH_TOKEN` is set.
@@ -148,21 +178,70 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 }
 
 /// Hosts the pairing payload should advertise for `snapshot`: a listener
-/// bound to a specific address (loopback included) is reachable only there,
-/// so advertise exactly that address; an unspecified bind (`0.0.0.0` / `::`)
-/// or an unknown one falls back to enumerating the machine's local IPs.
+/// bound to specific addresses is reachable only there, so advertise exactly
+/// those addresses; an unspecified bind (`0.0.0.0` / `::` — always the sole
+/// entry per the settings validation) or an unknown set falls back to
+/// enumerating the machine's local IPs.
+/// Loopback (`127.0.0.1` / `::1`) is NEVER advertised here, even when bound:
+/// pairing hosts feed remote clients (QR payload, keychain sync), and
+/// loopback is not dialable from another device — with the loopback lock-in
+/// posture it is routinely in `server.bindAddress`. The diagnostic
+/// `system.status` localIps surface keeps loopback by calling
+/// [`advertised_hosts`] directly.
 /// An IPv6-unspecified bind (`::`) also accepts native IPv6 connections
-/// (v4-mapped sockets cover the IPv4 side), so its enumeration additionally
-/// carries the machine's global IPv6 addresses.
+/// (the listener is bound explicitly dual-stack — `IPV6_V6ONLY = false` in
+/// `lifecycle::bind_listener` — so v4-mapped sockets cover the IPv4 side on
+/// every OS), and its enumeration additionally carries the machine's global
+/// IPv6 addresses.
 pub(crate) fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
-    match snapshot.bind_address {
-        Some(addr) if !addr.is_unspecified() => vec![addr.to_string()],
-        Some(std::net::IpAddr::V6(_)) => {
-            let mut hosts = collect_local_ips();
-            hosts.extend(collect_local_ipv6s());
+    pairing_hosts_from(snapshot, &collect_local_ips(), &collect_local_ipv6s())
+}
+
+/// [`pairing_hosts`] over pre-enumerated local address lists, for callers
+/// that already hold them (`server.pairingInfo` reuses `local_v4` as its
+/// `availableIps`).
+fn pairing_hosts_from(
+    snapshot: &PairingSnapshot,
+    local_v4: &[String],
+    local_v6: &[String],
+) -> Vec<String> {
+    let mut hosts = advertised_hosts(snapshot.bind_addresses.as_deref(), local_v4, local_v6);
+    hosts.retain(|h| {
+        !h.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    });
+    hosts
+}
+
+/// Pure core of [`pairing_hosts`]: pick the advertised host set for a bind
+/// set from pre-enumerated local address lists (`local_v4` from
+/// [`collect_local_ips`], `local_v6` from [`collect_local_ipv6s`]). Shared
+/// with the `system.status` route snapshot (composition root), which passes
+/// its background-sampled enumerations so the status read path never touches
+/// `getifaddrs(3)` — a listener bound to specific addresses (loopback
+/// included) advertises exactly those, an unspecified bind falls back to the
+/// enumerated lists (v4 only for `0.0.0.0`, v4 + v6 for `::`), and an
+/// unknown set (`None`) keeps the historical full enumeration.
+#[must_use]
+pub fn advertised_hosts(
+    bind_addresses: Option<&[std::net::IpAddr]>,
+    local_v4: &[String],
+    local_v6: &[String],
+) -> Vec<String> {
+    match bind_addresses {
+        Some(addrs) if !addrs.is_empty() && !addrs.iter().any(std::net::IpAddr::is_unspecified) => {
+            addrs.iter().map(std::string::ToString::to_string).collect()
+        }
+        Some(addrs)
+            if addrs
+                .iter()
+                .any(|a| a.is_unspecified() && matches!(a, std::net::IpAddr::V6(_))) =>
+        {
+            let mut hosts = local_v4.to_vec();
+            hosts.extend_from_slice(local_v6);
             hosts
         }
-        _ => collect_local_ips(),
+        _ => local_v4.to_vec(),
     }
 }
 
@@ -170,7 +249,8 @@ pub(crate) fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
 /// [`collect_local_ips`] for advertising hosts of an IPv6-unspecified (`::`)
 /// bind; link-local (`fe80::/10`) addresses are skipped because they are not
 /// usable without a zone index.
-fn collect_local_ipv6s() -> Vec<String> {
+#[must_use]
+pub fn collect_local_ipv6s() -> Vec<String> {
     let mut ips = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for iface in ifaces {

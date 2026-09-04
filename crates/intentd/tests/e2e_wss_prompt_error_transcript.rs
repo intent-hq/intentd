@@ -297,6 +297,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -392,7 +393,7 @@ async fn transient_prompt_fetch_failure_retries_in_place_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-3007-RETRY", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-3007-RETRY", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -543,7 +544,7 @@ async fn failed_prompt_turn_preserves_partial_transcript_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-PROMPTERR", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-PROMPTERR", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -821,7 +822,7 @@ async fn poisoned_session_quarantines_send_message_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-POISON", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-POISON", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

@@ -2,11 +2,12 @@
 //!
 //! Spawns `command` with `args` on the daemon host (no shell interpolation —
 //! `argv` only), captures stdout/stderr/exit code, and enforces a
-//! workspace-containment guard on `cwd` in the same spirit as `file_ops`
-//! (lexical resolve against the workspace root). The guard here uses the
-//! component-aware `Path::starts_with` instead of a raw-string prefix so
-//! sibling paths like `/tmp/ws2` cannot escape a `/tmp/ws` root; `file_ops`
-//! is not (yet) bit-for-bit identical.
+//! workspace-containment guard on `cwd` in the same spirit as `file_ops`:
+//! a lexical resolve against the workspace root (component-aware
+//! `Path::starts_with`, so sibling paths like `/tmp/ws2` cannot escape a
+//! `/tmp/ws` root) followed by a symlink-aware canonicalize re-check
+//! ([`enforce_cwd_symlink_containment`], intent-hq/intent#3847) so a symlink
+//! inside the root cannot point the spawn outside it.
 //! Reuses the process-group leader + `kill_on_drop` discipline (`mcp_servers` /
 //! `intent-acp::spawn`) so a `timeoutMs` reaps the whole tree (no orphaned
 //! grandchildren). The child env is assembled with a strict precedence:
@@ -293,7 +294,36 @@ pub(crate) async fn resolve_cwd_within_workspace(
             "Access denied: cwd outside workspace",
         ));
     }
+    enforce_cwd_symlink_containment(&root, &full)?;
     Ok(full)
+}
+
+/// Symlink-aware second gate on the exec `cwd` (intent-hq/intent#3847),
+/// applied AFTER the lexical [`cwd_within_root`] check passes: the lexical
+/// guard cannot see a symlink inside the root pointing outside it — the
+/// spawned child would chdir through it and run outside the workspace. The
+/// cwd must exist for the spawn to succeed anyway, so canonicalize it
+/// directly (no deepest-ancestor handling needed, unlike the `file.*` write
+/// path) and re-check against the canonicalized root with the same
+/// component-aware boundary; any canonicalize failure (missing cwd, broken
+/// symlink) fails closed with the existing containment message.
+///
+/// Residual TOCTOU window (accepted, NOT a guarantee): between this check
+/// and `Command::spawn`, a concurrently running local process could swap the
+/// verified cwd for an out-of-root symlink and the child would chdir through
+/// it. Winning that race requires already having concurrent code execution
+/// on the daemon host, which is outside this guard's threat model
+/// (intent-hq/intent#3847 covers planted static symlinks, which this gate
+/// fully closes); see `file_ops::enforce_symlink_containment` for the same
+/// accepted residual on the `file.*` path.
+fn enforce_cwd_symlink_containment(root: &str, full: &Path) -> Result<(), HostExecError> {
+    let denied = || HostExecError::internal("Access denied: cwd outside workspace");
+    let canon_root = std::fs::canonicalize(root).map_err(|_| denied())?;
+    let canon_full = std::fs::canonicalize(full).map_err(|_| denied())?;
+    if !cwd_within_root(&canon_root, &canon_full) {
+        return Err(denied());
+    }
+    Ok(())
 }
 
 /// Component-aware containment check for the `cwd` guard: a raw-string
@@ -382,6 +412,13 @@ fn build_command_with_captured(
     }
     // Enrich PATH so a user-supplied `env["PATH"]` still wins if provided.
     cmd.env("PATH", enhanced_path(None));
+    // Commit-identity `GIT_*` vars resolved from the exec's cwd repository
+    // (intent-hq/intent#4142) — same config chain `git.commit` uses; nothing
+    // is set when no identity resolves, a var already in the daemon's own env
+    // is inherited untouched, and the caller's `env` (below) wins.
+    for (k, v) in intent_git::identity::commit_identity_env(cwd_resolved) {
+        cmd.env(k, v);
+    }
     for (k, v) in &args.env {
         cmd.env(k, v);
     }
@@ -757,6 +794,64 @@ mod tests {
         );
     }
 
+    /// intent-hq/intent#4142: an exec resolved into a repository cwd carries
+    /// the commit-identity `GIT_*` vars; a caller-set key still wins, and no
+    /// cwd means no identity vars. The four vars are unset for the test's
+    /// lifetime: the harness itself may inherit them (agent-spawned shells
+    /// do, post-#4142), and `commit_identity_env` correctly gap-fills nothing
+    /// then (intent-hq/monorepo#4191).
+    #[test]
+    fn build_command_injects_commit_identity_caller_wins() {
+        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+            ("GIT_AUTHOR_NAME", None),
+            ("GIT_AUTHOR_EMAIL", None),
+            ("GIT_COMMITTER_NAME", None),
+            ("GIT_COMMITTER_EMAIL", None),
+        ]);
+        let dir = std::env::temp_dir().join(format!(
+            "intentd-hostexec-identity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Exec Test").unwrap();
+        cfg.set_str("user.email", "exec@example.com").unwrap();
+        drop(cfg);
+
+        let args = HostExecArgs {
+            command: "echo".to_string(),
+            args: vec![],
+            cwd: None,
+            env: btree(&[("GIT_AUTHOR_NAME", "caller-wins")]),
+            timeout_ms: None,
+            workspace_id: None,
+            caller_agent_id: None,
+        };
+        let cmd = build_command_with_captured(&args, Some(&dir), &BTreeMap::new());
+        let envs = cmd_envs(&cmd);
+        assert_eq!(
+            envs.get("GIT_AUTHOR_EMAIL").map(String::as_str),
+            Some("exec@example.com")
+        );
+        assert_eq!(
+            envs.get("GIT_COMMITTER_NAME").map(String::as_str),
+            Some("Exec Test")
+        );
+        assert_eq!(
+            envs.get("GIT_AUTHOR_NAME").map(String::as_str),
+            Some("caller-wins"),
+            "caller env wins over injected identity"
+        );
+
+        let no_cwd = build_command_with_captured(&args, None, &BTreeMap::new());
+        assert!(
+            !cmd_envs(&no_cwd).contains_key("GIT_AUTHOR_EMAIL"),
+            "no cwd must inject no identity vars"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn build_command_captured_path_never_clobbers_enhanced_path() {
         // PATH is always present in the daemon's process env (and cargo
@@ -780,5 +875,55 @@ mod tests {
             Some("/captured/only"),
             "captured PATH must not clobber the enhanced PATH"
         );
+    }
+
+    /// Canonicalized tempdir root for the symlink-gate tests (the OS temp
+    /// dir may itself be a symlink, e.g. macOS `/var` → `/private/var`).
+    #[cfg(unix)]
+    fn canon_tempdir(prefix: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::canonicalize(&path).unwrap()
+    }
+
+    /// HIGH-severity regression (intent-hq/intent#3847, Finding 3): a symlink
+    /// inside the workspace pointing outside it passes the lexical
+    /// `cwd_within_root` guard, but the spawned child chdir's through it and
+    /// runs OUTSIDE the root — the symlink-aware gate must reject it with the
+    /// existing containment message. In-root symlinks and plain subdirs keep
+    /// resolving, and a missing cwd fails closed.
+    #[cfg(unix)]
+    #[test]
+    fn cwd_symlink_escape_rejected_in_root_links_allowed() {
+        use std::os::unix::fs::symlink;
+        let outside = canon_tempdir("intentd-hostexec-outside-");
+        let root_path = canon_tempdir("intentd-hostexec-root-");
+        let root = root_path.to_string_lossy().into_owned();
+
+        symlink(&outside, root_path.join("escape")).unwrap();
+        std::fs::create_dir_all(root_path.join("sub")).unwrap();
+        symlink(root_path.join("sub"), root_path.join("alias")).unwrap();
+
+        // Lexical guard passes for the escaping link…
+        let full = node_resolve(&root, "escape").unwrap();
+        assert!(cwd_within_root(Path::new(&root), &full));
+        // …but the symlink-aware gate rejects it.
+        let err = enforce_cwd_symlink_containment(&root, &full).unwrap_err();
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(err.message.contains("cwd outside workspace"), "{err:?}");
+
+        // In-root symlink and plain subdir still pass.
+        let alias = node_resolve(&root, "alias").unwrap();
+        assert!(enforce_cwd_symlink_containment(&root, &alias).is_ok());
+        let sub = node_resolve(&root, "sub").unwrap();
+        assert!(enforce_cwd_symlink_containment(&root, &sub).is_ok());
+
+        // Non-existent cwd fails closed (canonicalize error path).
+        let missing = node_resolve(&root, "missing").unwrap();
+        let err = enforce_cwd_symlink_containment(&root, &missing).unwrap_err();
+        assert!(err.message.contains("cwd outside workspace"), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&root_path);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

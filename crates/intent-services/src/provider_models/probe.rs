@@ -87,6 +87,29 @@ pub(super) async fn run_acp_probe<F>(
 where
     F: Fn(&Value) -> Vec<Value>,
 {
+    run_probe(cmd, extract, true).await
+}
+
+/// Authentication requires a successful session/new response, not a model
+/// notification (which can carry sessionId before setup has completed).
+pub(super) async fn run_acp_session_probe<F>(
+    cmd: AcpProbeCommand,
+    extract: F,
+) -> Result<Vec<Value>, ProbeError>
+where
+    F: Fn(&Value) -> Vec<Value>,
+{
+    run_probe(cmd, extract, false).await
+}
+
+async fn run_probe<F>(
+    cmd: AcpProbeCommand,
+    extract: F,
+    accept_notifications: bool,
+) -> Result<Vec<Value>, ProbeError>
+where
+    F: Fn(&Value) -> Vec<Value>,
+{
     let mut adapter = spawn_adapter(&cmd, cmd.setup_timeout())
         .await
         .map_err(|e| match e {
@@ -105,6 +128,8 @@ where
             extract,
             cmd.initialize_timeout(),
             cmd.session_new_timeout(),
+            &cmd.working_dir(),
+            accept_notifications,
         ),
     )
     .await
@@ -165,6 +190,8 @@ async fn drive_probe<F>(
     extract: F,
     initialize_timeout: Duration,
     session_new_timeout: Duration,
+    cwd: &std::path::Path,
+    accept_notifications: bool,
 ) -> Result<Vec<Value>, ProbeError>
 where
     F: Fn(&Value) -> Vec<Value>,
@@ -173,7 +200,6 @@ where
         .await
         .map_err(map_acp_error)?;
 
-    let cwd = std::env::temp_dir();
     let session_params = json!({
         "cwd": cwd.to_string_lossy(),
         "mcpServers": [],
@@ -191,7 +217,7 @@ where
             note = notifications.recv(), if notifications_open => {
                 match note {
                     Some(note) => {
-                        if is_model_update_method(&note.method) {
+                        if accept_notifications && is_model_update_method(&note.method) {
                             let models = extract(&note.params);
                             if !models.is_empty() {
                                 return Ok(models);
@@ -211,6 +237,10 @@ where
     let models = extract(&result);
     if !models.is_empty() {
         return Ok(models);
+    }
+
+    if !accept_notifications {
+        return Err(ProbeError::Empty);
     }
 
     // Empty session/new result: give a late notification a short grace window.

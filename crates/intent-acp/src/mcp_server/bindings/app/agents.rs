@@ -1,7 +1,8 @@
 //! `ws.app.agents.*` bindings (chief-gated).
 //!
-//! Exposes cross-workspace agent audit methods (`list`, `readConversation`)
-//! and the completion-watch registration method (`waitFor`) exclusively to
+//! Exposes cross-workspace agent audit methods (`list`, `readConversation`),
+//! messaging (`send` / completion-bound `ask`) and completion watches
+//! (`waitFor`) exclusively to
 //! Chief-of-Staff workspace agents. Non-chief agents receive a clear gating
 //! error. Shape parity with the TS reference
 //! `packages/cloudlands-fe/src/features/mcp/main/mcp/ws-app-agents-api.ts`.
@@ -20,6 +21,12 @@ pub(crate) const PRELUDE: &str = r"
         list: (options) => host({ method: 'app.agents.list', args: options || {} }),
         readConversation: (workspaceId, agentId, opts) =>
             host({ method: 'app.agents.readConversation', args: { workspaceId, agentId, ...(opts || {}) } }),
+        getMessageBlock: (workspaceId, agentId, messageId, blockId) =>
+            host({ method: 'app.agents.getMessageBlock', args: { workspaceId, agentId, messageId, blockId } }),
+        send: (agentId, message, priority) =>
+            host({ method: 'app.agents.send', args: { agentId, message, priority } }),
+        ask: (agentId, message, priority) =>
+            host({ method: 'app.agents.ask', args: { agentId, message, priority } }),
         waitFor: (options) => host({ method: 'app.agents.waitFor', args: options || {} }),
     };
 ";
@@ -28,6 +35,10 @@ const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 200;
 const DEFAULT_READ_LIMIT: i64 = 20;
 const MAX_READ_LIMIT: i64 = 100;
+/// Hard cap on `nextToken` continuations a single `readConversation` call
+/// follows when the slim page byte budget (§5.5) trims pages below their
+/// message limit. 100 messages at worst-case one message per 512 KiB page.
+const READ_PAGE_WALK_CAP: usize = 100;
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -45,9 +56,74 @@ pub(crate) async fn dispatch(
     match method {
         "list" => list(api, args).await,
         "readConversation" => read_conversation(api, args).await,
+        "getMessageBlock" => get_message_block(api, args).await,
+        "send" => send(api, workspace_id, caller, args).await,
+        "ask" => ask(api, workspace_id, caller, args).await,
         "waitFor" => wait_for(api, workspace_id, caller, args).await,
         other => Err(format!("host: unknown method `app.agents.{other}`")),
     }
+}
+
+async fn send(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller_agent_id = caller.cloned().ok_or_else(|| {
+        "No agent context available. This tool must be called by an agent.".to_string()
+    })?;
+    let agent_id = opt_str(args, "agentId").ok_or_else(|| "agentId is required".to_string())?;
+    let message = opt_str(args, "message").ok_or_else(|| "message is required".to_string())?;
+    if message.trim().is_empty() {
+        return Err("message must not be empty".to_string());
+    }
+    let priority = match args.get("priority") {
+        None | Some(Value::Null) => Some("interrupt".to_string()),
+        Some(Value::String(value)) if value == "interrupt" => Some(value.clone()),
+        Some(Value::String(value)) if value == "queue" => Some("normal".to_string()),
+        Some(_) => return Err("priority must be \"interrupt\" or \"queue\"".to_string()),
+    };
+    api.app_agents_send(
+        workspace_id.clone(),
+        caller_agent_id,
+        AgentId::from(agent_id.as_str()),
+        message,
+        priority,
+    )
+    .await
+    .map_err(map_err)
+}
+
+async fn ask(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller_agent_id = caller.cloned().ok_or_else(|| {
+        "No agent context available. This tool must be called by an agent.".to_string()
+    })?;
+    let agent_id = opt_str(args, "agentId").ok_or_else(|| "agentId is required".to_string())?;
+    let message = opt_str(args, "message").ok_or_else(|| "message is required".to_string())?;
+    if message.trim().is_empty() {
+        return Err("message must not be empty".to_string());
+    }
+    let priority = match args.get("priority") {
+        None | Some(Value::Null) => Some("interrupt".to_string()),
+        Some(Value::String(value)) if value == "interrupt" => Some(value.clone()),
+        Some(Value::String(value)) if value == "queue" => Some("normal".to_string()),
+        Some(_) => return Err("priority must be \"interrupt\" or \"queue\"".to_string()),
+    };
+    api.app_agents_ask(
+        workspace_id.clone(),
+        caller_agent_id,
+        AgentId::from(agent_id.as_str()),
+        message,
+        priority,
+    )
+    .await
+    .map_err(map_err)
 }
 
 async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
@@ -169,30 +245,58 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
         .await
         .map_err(map_err)?;
 
-    // Fetch full conversation (use agent.getConversation which returns { messages, ... })
-    let conversation_result = api
+    // The conversation is read under the slim projection (§5.5): bounded
+    // tool/image block bodies, like every other consumer since v8.0. The
+    // slim service read is also BYTE-BUDGETED — one page can carry fewer
+    // messages than its `limit` (512 KiB page budget) — and its
+    // `totalMessages` is transcript-wide, not page-length. So: take the
+    // total from the service, resolve the requested window against it
+    // (turn indices are transcript positions), and follow the re-minted
+    // `nextToken` continuations until the window is covered — never slice
+    // a single page in memory, which under-reports totals and silently
+    // drops requested older turns.
+    let first_limit = if start_turn.is_some() || end_turn.is_some() {
+        // Turn-range mode: the window may sit far older than the newest
+        // page; the first read only resolves `totalMessages`.
+        1
+    } else {
+        normalize_limit(last_n, DEFAULT_READ_LIMIT, MAX_READ_LIMIT)?
+    };
+    // No in-progress tail here (monorepo#3647): this reader window-slices by
+    // transcript position against `totalMessages`, and a serve-time synthetic
+    // row would skew that arithmetic.
+    let first_page = api
         .agent_get_conversation(
             agent_id.clone(),
-            None,
+            Some(first_limit),
             Some(workspace_id.clone()),
             None,
             None,
             None,
-            None,
+            Some(intent_core::ConversationProjection::Slim),
+            false,
         )
         .await
         .map_err(map_err)?;
-    let all_messages = conversation_result
+    let mut rows: Vec<Value> = first_page
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let total_messages = all_messages.len();
+    let total_messages = first_page
+        .get("totalMessages")
+        .and_then(Value::as_u64)
+        .map_or(rows.len(), |t| {
+            usize::try_from(t).expect("value fits in usize")
+        });
+    let mut next_token = first_page
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
-    // Apply bounds: either turn-range or lastN
-    let (selected_messages, selected_start_turn, selected_end_turn) = if start_turn.is_some()
-        || end_turn.is_some()
-    {
+    // Resolve the requested global window [win_start, win_end) — 0-based
+    // transcript positions counted from the oldest message.
+    let (win_start, win_end) = if start_turn.is_some() || end_turn.is_some() {
         // Turn-based slicing (1-based, inclusive)
         let start =
             usize::try_from(start_turn.unwrap_or(1).max(1)).expect("value fits in usize") - 1; // convert to 0-based
@@ -204,16 +308,78 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
         if end < start + 1 {
             return Err("endTurn must be greater than or equal to startTurn".to_string());
         }
-        let slice = all_messages[start..end].to_vec();
-        (slice, start + 1, end) // return 1-based
+        (start, end)
     } else {
         // lastN slicing (default 20, max 100)
         let limit = usize::try_from(normalize_limit(last_n, DEFAULT_READ_LIMIT, MAX_READ_LIMIT)?)
             .expect("value fits in usize");
-        let start = total_messages.saturating_sub(limit);
-        let slice = all_messages[start..].to_vec();
-        (slice, start + 1, total_messages)
+        (total_messages.saturating_sub(limit), total_messages)
     };
+
+    // Walk `nextToken` pages older until the collected suffix reaches
+    // `win_start`. `rows` is always a contiguous run ending at
+    // `min(win_end, total)` (rows newer than the window are dropped as we
+    // go, bounding memory to window + one page); `covered` counts the full
+    // suffix walked so far, so `total - covered` is the oldest index held.
+    let mut covered = rows.len();
+    let keep = win_end
+        .saturating_sub(total_messages.saturating_sub(covered))
+        .min(rows.len());
+    rows.truncate(keep);
+    let mut walk_guard = 0usize;
+    while total_messages.saturating_sub(covered) > win_start {
+        let Some(token) = next_token.take() else {
+            break;
+        };
+        walk_guard += 1;
+        if walk_guard > READ_PAGE_WALK_CAP {
+            break;
+        }
+        let missing = total_messages.saturating_sub(covered) - win_start;
+        let page = api
+            .agent_get_conversation(
+                agent_id.clone(),
+                Some(i64::try_from(missing.min(200)).expect("value fits in i64")),
+                Some(workspace_id.clone()),
+                Some(token),
+                None,
+                None,
+                Some(intent_core::ConversationProjection::Slim),
+                false,
+            )
+            .await
+            .map_err(map_err)?;
+        let older = page
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if older.is_empty() {
+            break; // defensive: no forward progress
+        }
+        covered += older.len();
+        let mut merged = older;
+        merged.extend(rows);
+        rows = merged;
+        let keep = win_end
+            .saturating_sub(total_messages.saturating_sub(covered))
+            .min(rows.len());
+        rows.truncate(keep);
+        next_token = page
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+
+    // Slice the window out of the collected run. `rows` covers
+    // [total - covered, min(win_end, total)); the window's local offset is
+    // its distance from the run's oldest held row.
+    let suffix_start = total_messages.saturating_sub(covered);
+    let local_start = win_start.saturating_sub(suffix_start).min(rows.len());
+    let selected_messages: Vec<Value> = rows.split_off(local_start);
+    // Report the range actually served: if the page walk stopped early
+    // (token exhausted or walk cap), the oldest held row bounds the start.
+    let (selected_start_turn, selected_end_turn) = (win_start.max(suffix_start) + 1, win_end);
 
     // Filter tool-call blocks if requested
     let filtered_messages: Vec<Value> = selected_messages
@@ -249,6 +415,35 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
         "lastActivity": agent.last_activity,
         "messages": filtered_messages,
     }))
+}
+
+/// `ws.app.agents.getMessageBlock`: one FULL content block of one persisted
+/// message in the target workspace — the on-demand hydration counterpart of
+/// the slim `readConversation` above (§5.5). Block ids are the served
+/// identity (persisted assistant ids and synthetic `{messageId}:{index}` ids
+/// both resolve); the returned block is the full, unprojected body.
+async fn get_message_block(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    let workspace_id_str =
+        opt_str(args, "workspaceId").ok_or_else(|| "workspaceId is required".to_string())?;
+    let agent_id_str = opt_str(args, "agentId").ok_or_else(|| "agentId is required".to_string())?;
+    let workspace_id = WorkspaceId::from(workspace_id_str.as_str());
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    if workspace_id.is_chief() {
+        return Err(format!("Workspace not found: {workspace_id_str}"));
+    }
+    let message_id =
+        opt_str(args, "messageId").ok_or_else(|| "messageId is required".to_string())?;
+    let block_id = opt_str(args, "blockId").ok_or_else(|| "blockId is required".to_string())?;
+    // Validate workspace + agent exist for consistent chief-surface errors.
+    api.get_workspace(workspace_id.clone())
+        .await
+        .map_err(map_err)?;
+    api.agent_get(agent_id.clone(), Some(workspace_id.clone()))
+        .await
+        .map_err(map_err)?;
+    api.agent_get_message_block(agent_id, message_id, block_id, Some(workspace_id))
+        .await
+        .map_err(map_err)
 }
 
 /// `ws.app.agents.waitFor({ agentIds, waitMode? })`: register completion
@@ -361,12 +556,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     type WaitCall = (WorkspaceId, AgentId, Vec<String>, Option<String>);
+    type SendCall = (WorkspaceId, AgentId, AgentId, String, Option<String>);
 
     #[derive(Default)]
     struct FakeApi {
         workspaces: Mutex<Vec<Workspace>>,
         agents: Mutex<Vec<AgentLite>>,
         conversation_messages: Mutex<Vec<Value>>,
+        send_calls: Mutex<Vec<SendCall>>,
+        ask_calls: Mutex<Vec<SendCall>>,
+        send_error: Mutex<Option<String>>,
         wait_calls: Mutex<Vec<WaitCall>>,
         wait_error: Mutex<Option<String>>,
     }
@@ -420,6 +619,7 @@ mod tests {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             let messages = self.conversation_messages.lock().unwrap().clone();
             Box::pin(async move { Ok(json!({ "messages": messages })) })
@@ -459,6 +659,76 @@ mod tests {
                 Ok(json!({ "ok": true, "waitMode": mode, "results": results }))
             })
         }
+
+        fn app_agents_send(
+            &self,
+            workspace_id: WorkspaceId,
+            caller_agent_id: AgentId,
+            target_agent_id: AgentId,
+            message: String,
+            priority: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let error = self.send_error.lock().unwrap().clone();
+            self.send_calls.lock().unwrap().push((
+                workspace_id,
+                caller_agent_id,
+                target_agent_id.clone(),
+                message,
+                priority,
+            ));
+            Box::pin(async move {
+                if let Some(msg) = error {
+                    return Err(Error::InvalidParams(msg));
+                }
+                Ok(json!({
+                    "ok": true,
+                    "agentId": target_agent_id.0,
+                    "workspaceId": "ws-target",
+                    "sourceUrl": "intent://local/__chief__/agent/agent-caller/message/msg-source",
+                    "success": true,
+                    "queued": false,
+                }))
+            })
+        }
+
+        fn app_agents_ask(
+            &self,
+            workspace_id: WorkspaceId,
+            caller_agent_id: AgentId,
+            target_agent_id: AgentId,
+            message: String,
+            priority: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let error = self.send_error.lock().unwrap().clone();
+            self.ask_calls.lock().unwrap().push((
+                workspace_id,
+                caller_agent_id,
+                target_agent_id.clone(),
+                message,
+                priority,
+            ));
+            Box::pin(async move {
+                if let Some(msg) = error {
+                    return Err(Error::InvalidParams(msg));
+                }
+                Ok(json!({
+                    "ok": true,
+                    "send": {
+                        "ok": true,
+                        "agentId": target_agent_id.0,
+                        "workspaceId": "ws-target",
+                        "sourceUrl": "intent://local/__chief__/agent/agent-caller/message/msg-source",
+                        "success": true,
+                        "queued": false,
+                    },
+                    "watch": {
+                        "ok": true,
+                        "waitMode": "immediate",
+                        "results": [{ "subscriptionId": "watch-1" }],
+                    },
+                }))
+            })
+        }
     }
 
     fn make_workspace(id: &str, title: &str) -> Workspace {
@@ -492,6 +762,7 @@ mod tests {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -535,6 +806,7 @@ mod tests {
             waiting_on_pr_monitors: vec![],
             turn_in_flight: false,
             last_stream_activity_at: None,
+            context_usage: None,
             stats: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -552,6 +824,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,
@@ -563,14 +836,16 @@ mod tests {
                 attention_request_reason: None,
                 attention_request_timestamp: None,
                 delegation_depth: None,
-                initial_message: None,
                 sandbox_id: None,
                 sandbox_branch: None,
                 sandbox_path: None,
                 dismissed_questions_message_id: None,
                 pending_questions_message_id: None,
+                pending_proposals: Vec::new(),
+                proposal_resolutions: serde_json::Map::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
+                sponsor_agent_id: None,
             },
         }
     }
@@ -1229,6 +1504,158 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("unknown agent id: agent-ghost"));
+    }
+
+    #[tokio::test]
+    async fn test_send_requires_agent_context_and_valid_args() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        let no_caller = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "send",
+            &json!({ "agentId": "agent-target", "message": "hello" }),
+        )
+        .await;
+        assert_eq!(
+            no_caller.unwrap_err(),
+            "No agent context available. This tool must be called by an agent."
+        );
+
+        for (args, expected) in [
+            (json!({ "message": "hello" }), "agentId is required"),
+            (json!({ "agentId": "agent-target" }), "message is required"),
+            (
+                json!({ "agentId": "agent-target", "message": "  " }),
+                "message must not be empty",
+            ),
+            (
+                json!({ "agentId": "agent-target", "message": "hello", "priority": "later" }),
+                "priority must be \"interrupt\" or \"queue\"",
+            ),
+        ] {
+            let result = dispatch(&api, &chief_id, Some(&caller), "send", &args).await;
+            assert_eq!(result.unwrap_err(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_maps_priority_and_forwards_to_service() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        for (args, expected_priority) in [
+            (
+                json!({ "agentId": "agent-target", "message": "urgent" }),
+                "interrupt",
+            ),
+            (
+                json!({ "agentId": "agent-target", "message": "later", "priority": "queue" }),
+                "normal",
+            ),
+        ] {
+            let result = dispatch(&api, &chief_id, Some(&caller), "send", &args)
+                .await
+                .unwrap();
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["agentId"], "agent-target");
+            assert!(result["sourceUrl"]
+                .as_str()
+                .unwrap()
+                .starts_with("intent://"));
+            assert_eq!(
+                fake.send_calls.lock().unwrap().last().unwrap().4.as_deref(),
+                Some(expected_priority)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ask_maps_priority_and_returns_completion_subscription() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        let result = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "ask",
+            &json!({
+                "agentId": "agent-target",
+                "message": "finish this",
+                "priority": "queue",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["send"]["agentId"], "agent-target");
+        assert_eq!(result["watch"]["results"][0]["subscriptionId"], "watch-1");
+        assert!(fake.send_calls.lock().unwrap().is_empty());
+        let calls = fake.ask_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, chief_id);
+        assert_eq!(calls[0].1, caller);
+        assert_eq!(calls[0].2, AgentId::from_string("agent-target"));
+        assert_eq!(calls[0].3, "finish this");
+        assert_eq!(calls[0].4.as_deref(), Some("normal"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_requires_agent_context_and_valid_args() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+        let no_caller = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "ask",
+            &json!({ "agentId": "agent-target", "message": "hello" }),
+        )
+        .await;
+        assert_eq!(
+            no_caller.unwrap_err(),
+            "No agent context available. This tool must be called by an agent."
+        );
+        let invalid = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "ask",
+            &json!({ "agentId": "agent-target", "message": "hello", "priority": "later" }),
+        )
+        .await;
+        assert_eq!(
+            invalid.unwrap_err(),
+            "priority must be \"interrupt\" or \"queue\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_surfaces_service_errors() {
+        let fake = Arc::new(FakeApi::default());
+        *fake.send_error.lock().unwrap() = Some("unknown agent id: agent-ghost".to_string());
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let result = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            Some(&AgentId::from_string("agent-caller")),
+            "send",
+            &json!({ "agentId": "agent-ghost", "message": "hello" }),
+        )
+        .await;
         assert!(result
             .unwrap_err()
             .contains("unknown agent id: agent-ghost"));

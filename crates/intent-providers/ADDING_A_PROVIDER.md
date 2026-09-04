@@ -31,14 +31,20 @@ Add an entry to `ACP_PROVIDERS` in `crates/intent-providers/src/config.rs`, star
 needs. Fields that matter most:
 
 - **`id`** — stable identifier (`auggie`, `opencode`, …). Keys everything: settings
-  (`providers.paths`), compound model ids, per-provider match arms.
+  (`providers.paths`), session `provider` fields, per-provider match arms.
 - **`command` / `base_args`** — the CLI and its ACP-mode args (e.g. opencode: `["acp"]`,
   droid: `["exec", "--output-format", "acp"]`, grok: `["agent", "stdio"]`).
 - **`runtime`** (`ProviderRuntime`) — `Node`, `Electron`, or `Native`. Anything V8-backed
   (`Node`/`Electron`) gets `NODE_OPTIONS=--max-old-space-size=<MB>` injected by
   `build_provider_env` (`crates/intent-providers/src/args.rs`) to raise the ~1.7 GB V8
-  default old-space cap that OOM-killed long coordinator sessions (STAB-50). Default is
-  8192 MB (`DEFAULT_MAX_OLD_SPACE_MB`), overridable via `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB`.
+  default old-space cap that OOM-killed long coordinator sessions (STAB-50). The cap
+  resolves as an inherited `NODE_OPTIONS` that already contains `--max-old-space-size`
+  (left untouched — the daemon never clobbers a parent cap) >
+  `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var (only when it parses as a `u32`; a
+  malformed value is WARN-logged and skipped) > `agents.acpNodeMaxOldSpaceMb`
+  daemon setting (1024–65536, threaded in via `SpawnOptions::node_max_old_space_mb`) >
+  8192 MB default (`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB` in intent-core); it is read live
+  per spawn, so a settings change applies to the next spawned provider process.
   `Native` (Rust/Go binaries: codex, droid, grok) opts out. Getting this wrong is silent —
   a `Native` mislabel on a Node provider reintroduces mid-turn SIGABRT crashes.
 - **`injection_mechanism`** (`InjectionMechanism`) — how the assembled system prompt
@@ -64,8 +70,16 @@ needs. Fields that matter most:
   `parse_grok_models_command_output` in `crates/intent-providers/src/models.rs`),
   `auth_error_patterns` (stderr matching), `login_command_hint`, `login_docs_url`.
 - **npx fields** — `fallback_npx_package` (spawn `npx -y <pkg>` only when no local binary
-  resolves; codex) vs `npx_only_package` (ALWAYS spawn via npx with a version we pin,
-  skipping local discovery entirely; claude-code). Resolution:
+  resolves; codex) vs `npx_only_package` (spawn via npx with a version we pin, skipping
+  auto-discovery entirely; claude-code, pi). The one npx-only exception, for providers
+  that opt in via `npx_only_honors_path_override` (claude-code), is a valid
+  `providers.paths[id]` override (absolute + executable): it is exec'd directly in place
+  of the pinned npx spawn (`resolve_npx_only_override`, intent-hq/monorepo#4352) and the
+  same override drives discovery's `installed`, the one-shot / test-prompt launches, and
+  the claude-code ACP auth fallback probe, so every launch surface runs the same adapter
+  (the model-catalog fetch stays on the pinned package). pi does not opt in: its adapter
+  also depends on the version-gated real `pi` CLI, so it keeps pinned-npx-only
+  semantics. Resolution:
   `resolve_npx_only` in `crates/intent-services/src/agent_manager.rs` and the
   `npx_fallback_*` fields on `SpawnOptions` (`crates/intent-acp/src/spawn.rs`).
 
@@ -101,7 +115,7 @@ intentd assembles one effective system prompt per agent (`assemble_system_prompt
 | `RulesFileFlag` | auggie (`--rules`), droid (`--append-system-prompt-file`) | `create_agent` writes a temp rules file; `build_provider_args` (`crates/intent-providers/src/args.rs`) appends `rules_flag` + path, gated on `supports_rules_file`. |
 | `SessionMeta` | claude-code (system prompt), codex (session title only) | `build_session_meta` (`crates/intent-services/src/agent_session.rs`) builds a provider-shaped `_meta`: claude-code `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": "<prompt>" }` (a string `systemPrompt` fully replaces the claude_code preset prompt — at adapter 0.66.0 the string is passed to the SDK as-is and treated as a custom prompt, so the model sees only our assembled instructions), sent on `session/new` **and** `session/load` (and the recreate path); codex `{ "sessionTitle": "<agent name>" }`, sent on `session/new` only (create + recreate; never on `session/load` — monorepo#3151), while its system prompt still travels via `FirstTurnPrepend` below. Carried by `session::new_session` / `load_session` (`crates/intent-acp/src/session.rs`). |
 | `EnvConfig` | opencode | `build_provider_env` (`crates/intent-providers/src/args.rs`) emits `OPENCODE_CONFIG_CONTENT` with an `instructions: [<rules file path>]` key (plus `model`, `permission`, `mcp` — see §3b and §6). |
-| `FirstTurnPrepend` | codex (the pinned codex-acp adapter ignores `_meta.developerInstructions`, #479), cortex, pi, grok (fallback), plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
+| `FirstTurnPrepend` | codex (the pinned codex-acp adapter ignores `_meta.developerInstructions`, #479), cortex, pi, grok (fallback), antigravity, plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
 | `None` | — | Provider gets no system prompt. Avoid if at all possible. |
 
 Add a new mechanism only if the provider genuinely supports none of these; prefer reusing
@@ -127,7 +141,7 @@ per provider — pick exactly one delivery path:
   `opencode_env_mcp_config` → `to_opencode_mcp_config` serializes the set as the
   OpenCode `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` by `build_provider_env`
   (`SpawnOptions.env_mcp_config`, `crates/intent-acp/src/spawn.rs`).
-- **(c) ACP session field** (claude-code, codex, droid, grok):
+- **(c) ACP session field** (claude-code, codex, droid, grok, antigravity):
   `supports_session_mcp_servers: true`. `create_agent` stashes
   `to_acp_session_mcp_servers(...)` on the agent handle; `start_session`
   (`crates/intent-services/src/agent_manager.rs`) passes it into every session-open
@@ -205,15 +219,15 @@ certainly needs new normalization arms:
   `get_tool_denylist_for_agent_type`) filters workspace tools by agent type; it covers
   MCP tools only, never provider-native ones.
 - **V8 heap cap** — set `runtime` correctly (§1); this *is* the policy knob.
-- **Model ids** — models are stored as compound `provider:model` ids
-  (`parse_compound_model_id` / `create_compound_model_id`,
-  `crates/intent-providers/src/models.rs`); the bare part feeds `model_flag` /
-  `session/set_model`, and the prefix feeds provider resolution (`resolve_provider_id`,
-  `crates/intent-services/src/agent_session.rs`: compound prefix → session `provider`
-  field → settings-derived default → first registered provider). Model discovery is
-  fully dynamic (`models.list` sources, `crates/intent-services/src/model_catalog.rs`);
-  there is no static tier catalog. Fuzzy model matching against a dynamic pool goes
-  through `resolve_preferred_model`. codex additionally splits reasoning effort from
+- **Model ids** — models are stored as BARE ids; the provider is a separate field
+  everywhere (compound `provider:model` ids are rejected at the wire). The model id
+  feeds `model_flag` / `session/set_model`, and provider resolution
+  (`resolve_provider_id`, `crates/intent-services/src/agent_session.rs`) is
+  session `provider` field → settings-derived default (`model.defaultProvider`).
+  Model discovery is fully dynamic (`models.list` sources,
+  `crates/intent-services/src/model_catalog.rs`); there is no static tier catalog.
+  Fuzzy model matching against a dynamic pool goes through
+  `resolve_preferred_model`. codex additionally splits reasoning effort from
   the model id (`parse_codex_reasoning_effort`).
 
 ## 7. Tests and gates
@@ -281,3 +295,47 @@ semantics). Today that is **Grok Build** only (`/bin/bash -lc '…'` in
 `command`). intentd then spawns the packed line exactly as Node `shell: true`
 would — `/bin/sh -c` on POSIX, the native shell (PowerShell `-Command` /
 `cmd /c`) on Windows — instead of exec'ing the packed string as argv[0].
+
+## Antigravity setup and compatibility boundary
+
+Antigravity uses the official native ACP server, not `agy` and not an npm adapter.
+The initial verified target is macOS Apple Silicon with personal Google OAuth.
+The tested upstream build is `agy_acp_server_20260818_01_RC01`.
+
+1. Get the archive from the [official ACP registry](https://github.com/agentclientprotocol/registry/blob/a3d294f480dee2e506a1c51f802455d4d49783a2/antigravity-acp/agent.json).
+   Keep `agy_acp_server.par` and `localharness_external` together.
+2. Set `providers.paths.antigravity` to the server executable, or provide an
+   `antigravity-acp` launcher that starts it. Intent does not install or update this archive.
+3. On the daemon host, run `intentd provider login antigravity`.
+   Use `--path /absolute/path/to/agy_acp_server.par` for an explicit login-path override.
+   Follow the official Google authorization URL printed in that terminal.
+   The command verifies a fresh guarded session after authentication.
+4. Refresh provider status and enable Antigravity explicitly in Settings.
+   Refresh the model list before selecting a model.
+
+The [official setup guide](https://antigravity.google/docs/ide/extensions/zed)
+describes the upstream authentication choices. Intent currently uses only personal OAuth.
+Credentials stay in the official macOS Keychain entry. Intent never copies tokens into profiles.
+Normal sessions and discovery probes cannot open a browser. Unknown authentication stays unknown.
+
+`intent-services/src/antigravity.rs` owns profile isolation and the native tool guard.
+Profiles use private permissions and persist under `<data-dir>/antigravity/` by workspace and agent identity.
+They contain conversation state, not token copies. They survive daemon restarts and are not temporary configuration files.
+Global Gemini MCP settings and hooks are excluded, without changing those global files.
+
+The guard permits only known native tools and the caller-filtered workspace tool set.
+Native subagent aliases are always denied. Permission mode stays `default`. Unrestricted Intent permissions do not select `yolo`.
+User MCP tools require an exact schema under the permitted server in the current private conversation:
+`antigravity-acp/brain/<conversationId>/mcp/<server>/<tool>.json`.
+This is an observed upstream layout, not a public contract. A missing or changed schema denies the tool.
+Recheck this behavior before certifying another server build. These hooks are provider policy controls, not an OS sandbox.
+
+Cold load can reset the upstream model. Intent reapplies the exact saved ID and requires confirmation before sending a prompt.
+Model rejection is an actionable setup error, never silent fallback.
+This ACP build does not emit usage events. Do not infer usage from stderr or display missing accounting as measured zero.
+One-shot quick actions and the generic onboarding test prompt are not enabled for this provider.
+
+To roll back, disable Antigravity and select another provider. Do not delete global credentials or configuration.
+Private conversation profiles remain under the daemon data directory. If their history is no longer needed, remove the profiles.
+Backend protocol support must land before frontend support. Do not create a manual submodule-pin bump.
+After authorized merges, monitor the carrying cloudlands-fe alpha release before calling the work shipped.

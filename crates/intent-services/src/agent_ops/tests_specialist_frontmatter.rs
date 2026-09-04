@@ -50,7 +50,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
     // binary on the test host.
     registry
         .apply(&[
-            ("providers.active".into(), serde_json::json!("auggie")),
+            ("model.defaultProvider".into(), serde_json::json!("auggie")),
             (
                 "providers.paths".into(),
                 serde_json::json!({ "auggie": "/bin/sh" }),
@@ -151,14 +151,14 @@ async fn specialist_frontmatter_model_used_for_delegated_agent() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist with a frontmatter model
-    create_user_specialist(specialists_dir.path(), "test-specialist", "auggie:opus");
+    create_user_specialist(specialists_dir.path(), "test-specialist", "opus");
 
     // Create agent with specialist but no explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("test-specialist".into())).await;
 
     // Verify the specialist frontmatter model was used
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:opus"));
+    assert_eq!(got.model.as_deref(), Some("opus"));
 }
 
 /// Explicit model param beats specialist frontmatter model.
@@ -167,21 +167,21 @@ async fn explicit_model_beats_specialist_frontmatter() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist with a frontmatter model
-    create_user_specialist(specialists_dir.path(), "test-specialist", "auggie:opus");
+    create_user_specialist(specialists_dir.path(), "test-specialist", "opus");
 
     // Create agent with both explicit model and specialist
     let id = create_agent(
         &svc,
         &ws,
         "TestAgent",
-        Some("auggie:haiku".into()),
+        Some("haiku".into()),
         Some("test-specialist".into()),
     )
     .await;
 
     // Verify the explicit model won
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+    assert_eq!(got.model.as_deref(), Some("haiku"));
 }
 
 /// Missing/empty specialist frontmatter model falls through to settings chain.
@@ -195,7 +195,7 @@ async fn missing_frontmatter_falls_through_to_settings() {
     // Set a global default in settings (via the wired registry)
     svc.settings_registry()
         .expect("registry wired")
-        .apply(&[("model.default".to_string(), json!("auggie:haiku"))])
+        .apply(&[("model.default".to_string(), json!("haiku"))])
         .expect("set default model");
 
     // Create agent with specialist but no explicit model
@@ -203,7 +203,7 @@ async fn missing_frontmatter_falls_through_to_settings() {
 
     // Verify the settings chain default was used
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+    assert_eq!(got.model.as_deref(), Some("haiku"));
 }
 
 /// Retirement regression (PROTOCOL §5.11): a lingering frontmatter
@@ -231,12 +231,12 @@ async fn retired_model_tier_falls_through_to_settings() {
 
     svc.settings_registry()
         .expect("registry wired")
-        .apply(&[("model.default".to_string(), json!("auggie:haiku"))])
+        .apply(&[("model.default".to_string(), json!("haiku"))])
         .expect("set default model");
 
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("tiered".into())).await;
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+    assert_eq!(got.model.as_deref(), Some("haiku"));
 }
 
 /// The delegate path ignores the retired `modelTier` identically to direct
@@ -263,6 +263,62 @@ async fn retired_model_tier_ignored_on_delegate_path() {
     assert_eq!(got.model, None, "retired modelTier must not pin a model");
 }
 
+/// An unknown specialist id rejects `agent.delegate` with `-32602` naming
+/// the id, BEFORE provider/effort resolution — not a confusing downstream
+/// provider-resolution failure — and no child agent is created
+/// (monorepo#3497). An alias still delegates fine.
+#[tokio::test]
+async fn unknown_specialist_rejects_delegate() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            intent_core::AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("no-such-specialist".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("unknown specialist must reject the delegate");
+    assert!(matches!(err, intent_core::Error::InvalidParams(_)));
+    assert!(
+        err.to_string()
+            .contains("unknown specialist: no-such-specialist"),
+        "error names the id: {err}"
+    );
+    let agents = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list sessions");
+    assert!(agents.is_empty(), "no child persisted on rejection");
+
+    // An alias (bundled `spec-writer` claims `coordinator`) still delegates
+    // and persists the canonical id.
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            intent_core::AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("coordinator".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("alias delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
+}
+
 /// monorepo#1729 (issue repro): a delegated specialist with no frontmatter
 /// model resolves `model.providerDefaults`, NOT the quick-action default —
 /// the quick-action model settings never apply to a delegated session.
@@ -280,7 +336,7 @@ async fn delegate_ignores_quick_action_default_model() {
             ),
             (
                 "quickActions.defaultModel".to_string(),
-                json!("auggie:sonnet5-high"),
+                json!("sonnet5-high"),
             ),
         ])
         .expect("set provider default + quick-action default");
@@ -328,7 +384,7 @@ async fn delegate_ignores_quick_action_type_override() {
             ),
             (
                 "quickActions.typeOverrides".to_string(),
-                json!({ "implementor-test": "auggie:sonnet5-high" }),
+                json!({ "implementor-test": "sonnet5-high" }),
             ),
         ])
         .expect("set provider default + quick-action type override");
@@ -354,16 +410,26 @@ async fn delegate_ignores_quick_action_type_override() {
     );
 }
 
-/// A specialist frontmatter model owned by another provider is ignored
-/// (provider guard) — resolution falls through to the settings chain; a
-/// lingering `modelTier` no longer bridges the gap.
+/// A specialist frontmatter model provably owned by another provider (cached
+/// catalog evidence) is ignored (provider guard) — resolution falls through
+/// to the settings chain; a lingering `modelTier` no longer bridges the gap.
 #[tokio::test]
 async fn frontmatter_model_of_other_provider_falls_through_to_settings() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
-    let content = "---\nname: \"Mixed\"\ndescription: \"d\"\nmodel: \"auggie:opus\"\nmodelTier: \"smart\"\n---\n\nTest prompt";
+    let content = "---\nname: \"Mixed\"\ndescription: \"d\"\nmodel: \"opus\"\nmodelTier: \"smart\"\n---\n\nTest prompt";
     std::fs::write(specialists_dir.path().join("mixed.md"), content).expect("write specialist");
+    // Cached evidence: auggie owns "opus", grok provably does not (grok's
+    // catalog version key is stable/empty, so the seeded entry always
+    // matches the current registry key).
+    svc.models_catalog.store_for_test(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        vec![json!({ "id": "opus" })],
+    );
+    svc.models_catalog
+        .store_for_test("grok", "", vec![json!({ "id": "grok-4" })]);
 
-    let id = create_agent_with_provider(&svc, &ws, "mixed", "codex").await;
+    let id = create_agent_with_provider(&svc, &ws, "mixed", "grok").await;
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(
         got.model, None,
@@ -396,18 +462,31 @@ async fn bundled_specialist_inherits_model_default() {
 /// Malicious specialist id with path traversal is rejected.
 /// SECURITY: `validate_id` is called inside `SpecialistsService::resolve()` (which
 /// `resolve_model` uses), blocking all frontmatter lookups from path traversal.
+/// Since monorepo#3497 the create itself rejects the unresolvable id with
+/// `-32602` — strictly stronger than the former lenient fall-through.
 #[tokio::test]
 async fn malicious_specialist_id_rejected() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
 
     // Attempt to create agent with path-traversal specialist id
-    let id = create_agent(&svc, &ws, "TestAgent", None, Some("../evil".into())).await;
-
-    // The agent should be created but resolve_model should have returned None
-    // (because validate_id fails inside resolve()), falling through to settings chain default
-    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    // With no settings configured, model should be None
-    assert_eq!(got.model, None);
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some("../evil".to_string()),
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                is_background: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("path-traversal specialist id must reject the create");
+    assert!(matches!(err, intent_core::Error::InvalidParams(_)));
+    assert!(err.to_string().contains("unknown specialist: ../evil"));
 }
 
 /// SECURITY: `workspace_path` is derived from workspace record, not client params
@@ -504,20 +583,27 @@ async fn malicious_specialist_id_rejected_in_agent_type_resolution() {
     );
 
     // Now attempt to create agent with path-traversal specialist id.
-    // resolve_agent_type (via derive_agent_type) should call validate_id inside resolve()
-    // and return None, so the agent should be created but with default agent_type.
-    // If path traversal was allowed, it might read a file outside the specialists dir
-    // or crash; the fact that it succeeds with no panic proves the guard works.
-    let malicious_id =
-        create_agent(&svc, &ws, "MaliciousAgent", None, Some("../evil".into())).await;
-    let malicious_agent = svc
-        .agent_get_op(malicious_id.clone(), None)
+    // `validate_id` inside `resolve()` makes the id unresolvable, and since
+    // monorepo#3497 an unresolvable id rejects the create with `-32602` —
+    // the traversal never reaches any frontmatter lookup.
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("MaliciousAgent".to_string()),
+            None,
+            Some("../evil".to_string()),
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                is_background: Some(true),
+                ..Default::default()
+            },
+        )
         .await
-        .expect("get");
-    assert!(
-        malicious_agent.id.0.starts_with("agent-"),
-        "malicious agent created with default type"
-    );
+        .expect_err("path-traversal specialist id must reject the create");
+    assert!(matches!(err, intent_core::Error::InvalidParams(_)));
+    assert!(err.to_string().contains("unknown specialist: ../evil"));
 }
 
 /// Create an agent with an optional name, returning the created `agent` value.
@@ -620,22 +706,41 @@ async fn no_specialist_falls_back_to_generic_name() {
     assert_eq!(agent["nameExplicitlySet"], false);
 }
 
-/// An unknown specialist id never fails the create — it falls back to the
-/// generic `Agent {6-hex}` label (renameable, not explicitly set).
+/// An unknown specialist id fails the create with `-32602` naming the id and
+/// the known catalog ids (monorepo#3497) — no session row is persisted.
 #[tokio::test]
-async fn unknown_specialist_falls_back_to_generic_name() {
+async fn unknown_specialist_rejects_create() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
-    let agent = create_agent_with_optional_name(
-        &svc,
-        &ws,
-        None,
-        Some("no-such-specialist".into()),
-        intent_core::AgentCreateExtra::default(),
-    )
-    .await;
-    let name = agent["name"].as_str().expect("name");
-    assert!(name.starts_with("Agent "), "generic fallback: {name}");
-    assert_eq!(agent["nameExplicitlySet"], false);
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            None,
+            None,
+            Some("no-such-specialist".to_string()),
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect_err("unknown specialist must reject the create");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown specialist: no-such-specialist"),
+        "error names the id: {msg}"
+    );
+    assert!(
+        msg.contains("known specialists:") && msg.contains("spec-writer"),
+        "error lists the known ids: {msg}"
+    );
+    assert!(matches!(err, intent_core::Error::InvalidParams(_)));
+    // No side effect: no session row was persisted.
+    let agents = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list sessions");
+    assert!(agents.is_empty(), "no session persisted on rejection");
 }
 
 /// Delegate flows that pass `name_explicitly_set: Some(false)` keep their
@@ -806,23 +911,30 @@ async fn caller_reminder_removed_when_resolution_has_none() {
     assert!(svc.agent_role_reminder(&id).await.is_none());
 }
 
-/// An unknown specialist writes no snapshot and never fails the create
-/// (existing leniency), leaving caller metadata absent.
+/// An unknown specialist is rejected with `-32602` even when an explicit
+/// name is supplied (monorepo#3497) — the name derivation never runs.
 #[tokio::test]
-async fn unknown_specialist_creates_without_snapshot() {
+async fn unknown_specialist_rejects_create_with_explicit_name() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
 
-    let id = create_agent(
-        &svc,
-        &ws,
-        "TestAgent",
-        None,
-        Some("no-such-specialist".into()),
-    )
-    .await;
-
-    let session = svc.store().get_agent_session(&id).await.expect("session");
-    assert!(session.metadata.is_none(), "no snapshot for unknown id");
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some("no-such-specialist".to_string()),
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                is_background: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("unknown specialist must reject the create");
+    assert!(matches!(err, intent_core::Error::InvalidParams(_)));
+    assert!(err.to_string().contains("no-such-specialist"));
 }
 
 // ---- Regression: prompt frozen across specialist file edits (end-to-end) ----
@@ -878,6 +990,144 @@ async fn injection_frozen_after_specialist_file_edit() {
     assert_eq!(inj.role_reminder.as_deref(), Some("Stay frozen"));
 }
 
+/// Specialist alias canonicalization (PROTOCOL §5.11): creating an agent
+/// with an alias persists the CANONICAL specialist id, and the specialist's
+/// resolution (display name, prompt snapshot) applies as if the canonical id
+/// had been passed. The bundled `spec-writer` carries `aliases:
+/// ["coordinator"]`, so this exercises the embedded floor end to end.
+#[tokio::test]
+async fn alias_create_persists_canonical_specialist_id() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+
+    let extra = intent_core::AgentCreateExtra {
+        is_background: Some(true),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            None, // no name: derive from the specialist display name
+            None,
+            Some("coordinator".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    // The canonical id is persisted and surfaced, never the alias.
+    assert_eq!(
+        created["agent"]["metadata"]["specialist"].as_str(),
+        Some("spec-writer")
+    );
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
+    // Downstream resolution ran against the canonical specialist: the
+    // derived display name and frozen prompt snapshot are spec-writer's.
+    assert_eq!(session.name, "Coordinator");
+    let meta = session.metadata.expect("metadata");
+    assert_eq!(meta["specialistName"].as_str(), Some("Coordinator"));
+
+    // A directly-known canonical id is untouched.
+    let extra = intent_core::AgentCreateExtra {
+        is_background: Some(true),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Direct".to_string()),
+            None,
+            Some("spec-writer".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    assert_eq!(
+        created["agent"]["metadata"]["specialist"].as_str(),
+        Some("spec-writer")
+    );
+
+    // An unknown specialist id is rejected with `-32602` (monorepo#3497).
+    let extra = intent_core::AgentCreateExtra {
+        is_background: Some(true),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Unknown".to_string()),
+            None,
+            Some("no-such-specialist".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("unknown specialist must reject the create");
+    assert!(matches!(err, intent_core::Error::InvalidParams(_)));
+    assert!(err.to_string().contains("no-such-specialist"));
+}
+
+/// `agent.update` honors the same canonical-id invariant as create
+/// (PROTOCOL §5.11): setting `specialist` to an alias via the update seam
+/// persists the canonical id — a wire client cannot store an alias into
+/// `metadata.specialist` through `agent.update`. Canonical ids pass through
+/// unchanged, an unknown id is rejected (monorepo#3497), and null clears.
+#[tokio::test]
+async fn alias_update_persists_canonical_specialist_id() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let id = create_agent(&svc, &ws, "TestAgent", None, None).await;
+
+    // Alias → canonical id.
+    svc.agent_update_op(
+        id.clone(),
+        serde_json::json!({ "specialist": "coordinator" }),
+    )
+    .await
+    .expect("update with alias");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
+
+    // A directly-known canonical id is untouched.
+    svc.agent_update_op(
+        id.clone(),
+        serde_json::json!({ "specialist": "implementor" }),
+    )
+    .await
+    .expect("update with canonical id");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+
+    // An unknown id is rejected with `-32602` and the session is untouched
+    // (monorepo#3497).
+    let err = svc
+        .agent_update_op(id.clone(), serde_json::json!({ "specialist": "no-such" }))
+        .await
+        .expect_err("unknown specialist must reject the update");
+    assert!(matches!(err, intent_core::Error::InvalidParams(_)));
+    assert!(err.to_string().contains("unknown specialist: no-such"));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.specialist.as_deref(),
+        Some("implementor"),
+        "rejected update leaves the previous value intact"
+    );
+
+    // Null clears the field.
+    svc.agent_update_op(id.clone(), serde_json::json!({ "specialist": null }))
+        .await
+        .expect("update with null");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist, None);
+}
+
 /// Companion pin: a pre-change-style session (no frozen snapshot keys in its
 /// metadata) resolves live and DOES pick up the file edit — legacy behavior
 /// unchanged.
@@ -915,4 +1165,172 @@ async fn legacy_session_without_snapshot_picks_up_file_edit() {
     assert_eq!(inj.behavior_prompt.as_deref(), Some("Edited body."));
     assert_eq!(inj.specialist_name.as_deref(), Some("Edited Name"));
     assert_eq!(inj.role_reminder.as_deref(), Some("Edited reminder"));
+}
+
+/// Legacy live resolution (no frozen snapshot) must resolve the workspace
+/// path for the project tier via the `repositoryPath` fallback
+/// (monorepo#3778): a direct-checkout workspace persisting only
+/// `repositoryPath` picks up its project-tier reminder instead of silently
+/// falling back to the user tier.
+#[tokio::test]
+async fn legacy_role_reminder_resolves_project_tier_via_repository_path() {
+    let (_t, svc, _ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "tiered",
+        "User Name",
+        "User reminder",
+        "User body.",
+    );
+
+    // Project tier lives under `<repositoryPath>/.intent/specialists/`.
+    let repo = TempDir::new().expect("repo dir");
+    let project_dir = repo.path().join(".intent").join("specialists");
+    std::fs::create_dir_all(&project_dir).expect("project specialists dir");
+    create_specialist_with_body(
+        &project_dir,
+        "tiered",
+        "Project Name",
+        "Project reminder",
+        "Project body.",
+    );
+
+    // A direct-checkout workspace: only `repositoryPath` is persisted.
+    let ws2 = WorkspaceId::new();
+    let mut row = workspace(&ws2);
+    row.repository_path = Some(repo.path().to_string_lossy().into_owned());
+    svc.store().insert_workspace(&row).await.expect("ws2");
+
+    let id = create_agent(&svc, &ws2, "TestAgent", None, Some("tiered".into())).await;
+    // Strip the frozen creation-time snapshot to force legacy live resolution.
+    svc.store()
+        .update_agent_session_metadata(&ws2, &id, None, &intent_core::now_iso())
+        .await
+        .expect("strip snapshot");
+
+    let reminder = svc.agent_role_reminder(&id).await.expect("reminder");
+    assert!(
+        reminder.contains("Project Name") && reminder.contains("Project reminder"),
+        "expected project-tier reminder via repositoryPath fallback, got: {reminder}"
+    );
+}
+
+/// Create a specialist file with an explicit `role` frontmatter value.
+fn create_specialist_with_role(dir: &Path, id: &str, role: &str) {
+    let content = format!(
+        "---\nname: \"{id}\"\ndescription: \"Test specialist\"\nrole: \"{role}\"\n---\n\nTest prompt"
+    );
+    std::fs::write(dir.join(format!("{id}.md")), content).expect("write specialist");
+}
+
+/// The creation-time orchestrator-role decision is snapshotted into
+/// `metadata.specialistIsOrchestrator`, and the frozen value keeps gating
+/// `session_specialist_is_orchestrator` after the specialist file is edited
+/// to drop the role or deleted outright — later file changes never hand an
+/// orchestrator its file-editing tools back.
+#[tokio::test]
+async fn orchestrator_snapshot_persisted_and_frozen_across_file_changes() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_role(specialists_dir.path(), "conductor", "orchestrator");
+    create_specialist_without_model(specialists_dir.path(), "plain");
+
+    let orch = create_agent(&svc, &ws, "Orch", None, Some("conductor".into())).await;
+    let plain = create_agent(&svc, &ws, "Plain", None, Some("plain".into())).await;
+
+    let orch_session = svc.store().get_agent_session(&orch).await.expect("session");
+    assert_eq!(
+        orch_session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(true)
+    );
+    let plain_session = svc
+        .store()
+        .get_agent_session(&plain)
+        .await
+        .expect("session");
+    assert_eq!(
+        plain_session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(false)
+    );
+
+    // Edit the file to drop the role, then delete it entirely: the frozen
+    // snapshot keeps the decision stable either way.
+    create_specialist_without_model(specialists_dir.path(), "conductor");
+    assert!(svc.session_specialist_is_orchestrator(&orch_session, None));
+    std::fs::remove_file(specialists_dir.path().join("conductor.md")).expect("delete");
+    assert!(svc.session_specialist_is_orchestrator(&orch_session, None));
+    // And a false snapshot stays false even if the file later gains the role.
+    create_specialist_with_role(specialists_dir.path(), "plain", "orchestrator");
+    assert!(!svc.session_specialist_is_orchestrator(&plain_session, None));
+}
+
+/// A caller-supplied `metadata.specialistIsOrchestrator` never survives the
+/// create: the snapshot write always overwrites it with the daemon-resolved
+/// decision, so the frozen readers never consume caller input as a trusted
+/// role.
+#[tokio::test]
+async fn caller_orchestrator_key_overwritten_at_create() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_without_model(specialists_dir.path(), "plain");
+
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "specialistIsOrchestrator": true })),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some("plain".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(false)
+    );
+}
+
+/// `agent.update` with a `specialist` change refreshes the frozen
+/// orchestrator snapshot for the NEW specialist, and clearing the specialist
+/// retires the key.
+#[tokio::test]
+async fn update_specialist_refreshes_orchestrator_snapshot() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_role(specialists_dir.path(), "conductor", "orchestrator");
+    create_specialist_without_model(specialists_dir.path(), "plain");
+
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("plain".into())).await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(false)
+    );
+
+    svc.agent_update_op(id.clone(), json!({ "specialist": "conductor" }))
+        .await
+        .expect("update to orchestrator");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("conductor"));
+    assert_eq!(
+        session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+        json!(true)
+    );
+
+    svc.agent_update_op(id.clone(), json!({ "specialist": null }))
+        .await
+        .expect("clear specialist");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist, None);
+    assert!(session
+        .metadata
+        .as_ref()
+        .is_none_or(|m| m.get("specialistIsOrchestrator").is_none()));
 }

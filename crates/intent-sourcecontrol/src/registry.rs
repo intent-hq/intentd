@@ -87,12 +87,17 @@ async fn resolve_github_token(github: &GithubSettings) -> Result<String> {
             return Ok(token.trim().to_string());
         }
     }
-    token::resolve(&github.token_source).await.ok_or_else(|| {
-        Error::NotConfigured(
+    let resolution = token::resolve_detailed(&github.token_source).await;
+    resolution.token.ok_or_else(|| {
+        let mut msg = String::from(
             "github: no token found (set sourceControl.github.token, GITHUB_TOKEN/GH_TOKEN, \
-             or authenticate with `gh auth token`)"
-                .to_string(),
-        )
+             or authenticate with `gh auth login`)",
+        );
+        if !resolution.skipped.is_empty() {
+            msg.push_str("; sources tried: ");
+            msg.push_str(&resolution.skipped.join("; "));
+        }
+        Error::NotConfigured(msg)
     })
 }
 
@@ -137,6 +142,19 @@ mod tests {
             api_base_url: None,
         })
         .await;
-        assert!(matches!(token, Err(Error::NotConfigured(_))));
+        // The error names the sources tried and why each yielded nothing
+        // (monorepo#3321). GITHUB_TOKEN/GH_TOKEN may legitimately be set in
+        // dev/CI shells, in which case resolution succeeds instead.
+        match token {
+            Err(Error::NotConfigured(msg)) => {
+                assert!(msg.contains("sources tried"), "{msg}");
+                assert!(msg.contains("GITHUB_TOKEN/GH_TOKEN"), "{msg}");
+            }
+            Ok(_) => assert!(
+                std::env::var("GITHUB_TOKEN").is_ok() || std::env::var("GH_TOKEN").is_ok(),
+                "resolution succeeded without an env token"
+            ),
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
     }
 }

@@ -354,11 +354,11 @@ fn gate(test: &str) -> Option<String> {
 const MARKER: &str = "MCP_TOOL_MARKER_wss_e2e";
 
 /// Full agent lifecycle over WSS (steps 1–9 of the task note): events.subscribe
-/// + client.hello → agent.create → agent.sendMessage → assert ≥1 chunk + one
-/// terminal stream:end + ≥1 note:updated → note.get sees the MCP-mutated body →
-/// agent.list reports an assistant message persisted.
+/// + client.hello → agent.create → agent.sendMessage → the mock agent calls
+/// `ws.note.saveAsset` and `ws.note.add` through MCP → note.readAsset proves the
+/// returned URL is readable → agent.list reports an assistant message persisted.
 #[tokio::test]
-async fn mock_agent_full_turn_over_wss() {
+async fn mock_agent_full_turn_saves_readable_asset_over_wss() {
     let Some(script) = gate("WSS full-turn E2E") else {
         return;
     };
@@ -368,10 +368,12 @@ async fn mock_agent_full_turn_over_wss() {
     // process starts so it gets a clean handle. Mirrors the UDS analogue.
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
-    // Post-WSAPI-8: agent-supplied JS via `workspace_api` replaces the
-    // discrete `add_to_note` tool.
+    // The agent saves generated media, then embeds the returned URL in a note.
+    // Both calls run through the production workspace_api MCP bridge.
     let js = format!(
-        "return await ws.note.add({}, {{ content: {} }});",
+        "const asset = await ws.note.saveAsset({{ data: 'AAAA', mimeType: 'video/webm', originalName: 'clip.webm' }}); \
+         await ws.note.add({}, {{ content: {} + '\\n![clip](' + asset.url + ')' }}); \
+         return asset;",
         json!(note_id),
         json!(MARKER),
     );
@@ -381,7 +383,7 @@ async fn mock_agent_full_turn_over_wss() {
     let behavior = json!({
         "toolCall": {
             "name": "workspace_api",
-            "arguments": { "code": js, "summary": "WSS E2E ws.note.add" },
+            "arguments": { "code": js, "summary": "WSS E2E ws.note.saveAsset" },
         },
         "response": "first line done\nadded via mcp over wss",
     })
@@ -440,7 +442,7 @@ async fn mock_agent_full_turn_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -604,9 +606,28 @@ async fn mock_agent_full_turn_over_wss() {
                 .contains(MARKER),
         "note mutated by the daemon-spawned MCP tool call over WSS: {note}"
     );
+    let content = note["note"]["content"]
+        .as_str()
+        .or_else(|| note["content"].as_str())
+        .expect("note content");
+    let asset_url = content
+        .split_once("![clip](")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(url, _)| url)
+        .expect("agent embedded the returned asset URL");
+    let asset = wss_rpc(
+        &mut rpc,
+        14,
+        "note.readAsset",
+        json!({ "workspaceId": ws_id, "asset": asset_url }),
+    )
+    .await;
+    assert_eq!(asset["assetId"].as_str(), asset_url.rsplit('/').next());
+    assert_eq!(asset["mimeType"], "video/webm");
+    assert_eq!(asset["data"], "AAAA");
 
     // Assistant message persisted (AgentLite messageCount ≥ 1).
-    let list = wss_rpc(&mut rpc, 14, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let list = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": ws_id })).await;
     let agents = list["agents"].as_array().expect("agents array");
     let listed = agents
         .iter()
@@ -675,7 +696,7 @@ async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-FINISH", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-FINISH", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -827,7 +848,7 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Stalled", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Stalled", "model": "default", "provider": "mock" }),
     )
     .await;
     let stalled_id = stalled["agent"]["id"]
@@ -838,7 +859,7 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Quick", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Quick", "model": "default", "provider": "mock" }),
     )
     .await;
     let quick_id = quick["agent"]["id"].as_str().expect("quick id").to_string();
@@ -965,6 +986,358 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
     }
 }
 
+/// intent-hq/monorepo#3402 over the real WSS wire: a mid-turn stream silence
+/// past the (lowered) stall threshold delivers the advisory
+/// `agent:stream:status` `phase: "stalled"` frame — `level: "warn"` plus the
+/// additive `silentMs` — to an `events.subscribe` subscriber, and the stream
+/// coming back delivers the paired `phase: "resumed"` (`level: "info"`, no
+/// `silentMs`) BEFORE the turn's first `agent:stream:activity`; the turn then
+/// ends normally with one terminal `agent:stream:end`. The mock parks
+/// `firstTurnDelayMs` of silence after `session/prompt` before streaming its
+/// response, so the stall window is deterministic. Margins: the stall fires
+/// ~1s into a 3s park (checker cadence ~166ms at the 1s threshold), leaving
+/// ~2s of slack each way for saturated CI runners.
+#[tokio::test]
+async fn mid_turn_stall_and_resume_status_over_wss() {
+    let Some(script) = gate("WSS mid-turn stall status E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "response": "back after the stall",
+        "firstTurnDelayMs": 3000,
+    })
+    .to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_STREAM_STALL_MS", "1000"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — events.subscribe BEFORE the turn so we miss nothing.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Staller", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "go stall mid-turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect frames until the terminal stream:end, recording every status
+    // frame's arrival ordinal so stalled/resumed can be ordered against the
+    // first activity.
+    let mut status_frames: Vec<(usize, Value)> = Vec::new();
+    let mut first_activity_at: Option<usize> = None;
+    let mut ends = 0u32;
+    for i in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:stream:status") => status_frames.push((i, event.clone())),
+            Some("agent:stream:activity") => {
+                if first_activity_at.is_none() {
+                    first_activity_at = Some(i);
+                }
+            }
+            Some("agent:stream:end") => {
+                ends += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        ends, 1,
+        "stalls never fail the turn — one terminal stream:end"
+    );
+
+    // Exactly one stalled and one resumed rode the wire, in that order.
+    let stalled: Vec<&(usize, Value)> = status_frames
+        .iter()
+        .filter(|(_, e)| e["data"]["phase"] == json!("stalled"))
+        .collect();
+    let resumed: Vec<&(usize, Value)> = status_frames
+        .iter()
+        .filter(|(_, e)| e["data"]["phase"] == json!("resumed"))
+        .collect();
+    assert_eq!(stalled.len(), 1, "one stalled frame: {status_frames:?}");
+    assert_eq!(resumed.len(), 1, "one resumed frame: {status_frames:?}");
+    let (stalled_at, stalled_ev) = stalled[0];
+    let (resumed_at, resumed_ev) = resumed[0];
+    assert!(stalled_at < resumed_at, "stalled precedes resumed");
+    let first_activity_at = first_activity_at.expect("stream activity observed");
+    assert!(
+        *resumed_at < first_activity_at,
+        "resumed lands before the first activity frame that cleared it"
+    );
+
+    // Payload contract (§6.5 self-sufficient status shape + #3402 additions).
+    let data = &stalled_ev["data"];
+    assert_eq!(data["agentId"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(data["workspaceId"].as_str(), Some(ws_id.as_str()));
+    assert_eq!(data["level"], json!("warn"), "stalled is warn: {data}");
+    let silent_ms = data["silentMs"].as_u64().expect("stalled carries silentMs");
+    assert!(
+        silent_ms >= 1000,
+        "silence past the lowered threshold: {silent_ms}"
+    );
+    assert_eq!(
+        data["message"],
+        json!(format!("No model activity for {}s", silent_ms / 1000)),
+        "stalled message derives from silentMs: {data}"
+    );
+    assert!(data["timestamp"].as_u64().is_some(), "epoch-ms timestamp");
+
+    let data = &resumed_ev["data"];
+    assert_eq!(data["agentId"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(data["workspaceId"].as_str(), Some(ws_id.as_str()));
+    assert_eq!(data["level"], json!("info"), "resumed is info: {data}");
+    assert_eq!(data["message"], json!("Stream activity resumed"));
+    assert!(
+        data.get("silentMs").is_none(),
+        "resumed carries no silentMs: {data}"
+    );
+    assert!(data["timestamp"].as_u64().is_some(), "epoch-ms timestamp");
+}
+
+/// Tool-call-aware stall suppression over the real WSS wire
+/// (intent-hq/monorepo#3466): silence past the (lowered) stall threshold
+/// while a tool call is IN FLIGHT emits NO advisory `agent:stream:status`
+/// `phase: "stalled"` frame — a long tool run is expected silence, not a
+/// stall — and the turn still ends with one normal terminal
+/// `agent:stream:end`.
+///
+/// Two agents against one daemon prove the suppression is attributable to
+/// the open tool call rather than a broken harness: the TOOL agent's mock
+/// echoes a `tool_call` update (open, `in_progress`, never closed within
+/// the turn) before parking 3s of silence, while the CONTROL agent parks
+/// the identical 3s silence with no tool call open. Same 1s threshold, same
+/// tail: the control turn MUST put a `stalled` frame on the wire, the tool
+/// turn MUST NOT. Margins match [`mid_turn_stall_and_resume_status_over_wss`]:
+/// the checker fires ~1s into a 3s park (~166ms cadence at the 1s
+/// threshold), leaving ~2s of slack for saturated CI runners.
+#[tokio::test]
+async fn open_tool_call_suppresses_stall_status_over_wss() {
+    let Some(script) = gate("WSS tool-aware stall suppression E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // `silentTailBeforeResultMs` parks AFTER the last session/update and
+    // before the prompt resolves, so for the tool rule the silence spans a
+    // window where the `tool_call` echoed via `rawUpdates` is still open.
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "TOOL_SILENCE",
+                "rawUpdates": [
+                    { "sessionUpdate": "tool_call", "toolCallId": "tc_stall_e2e",
+                      "title": "bash: cargo test --workspace", "kind": "execute",
+                      "status": "in_progress" }
+                ],
+                "response": "tool still running",
+                "silentTailBeforeResultMs": 3000,
+            },
+            {
+                "ifPromptContains": "BARE_SILENCE",
+                "response": "about to go silent",
+                "silentTailBeforeResultMs": 3000,
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_STREAM_STALL_MS", "1000"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — events.subscribe BEFORE either turn so we miss nothing.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Tooler", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let tool_id = created["agent"]["id"]
+        .as_str()
+        .expect("tool agent id")
+        .to_string();
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Control", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let control_id = created["agent"]["id"]
+        .as_str()
+        .expect("control agent id")
+        .to_string();
+
+    // Drive the TOOL turn: an open tool call spans the whole silent tail, so
+    // no stalled frame may ride the wire before its terminal stream:end.
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": tool_id, "content": "TOOL_SILENCE" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let tool_statuses = timeout(Duration::from_secs(30), async {
+        let mut frames: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["data"]["agentId"].as_str() != Some(tool_id.as_str()) {
+                continue;
+            }
+            match ev["type"].as_str() {
+                Some("agent:stream:status") => frames.push(ev["data"].clone()),
+                Some("agent:stream:end") => return frames,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("tool turn reached its terminal stream:end in time");
+    let stalled: Vec<&Value> = tool_statuses
+        .iter()
+        .filter(|d| d["phase"] == json!("stalled"))
+        .collect();
+    assert!(
+        stalled.is_empty(),
+        "no stalled advisory while a tool call is in flight: {tool_statuses:?}"
+    );
+
+    // Drive the CONTROL turn: the identical silent tail with NO open tool
+    // call MUST stall — proving the harness detects stalls and the tool
+    // turn's absence above is the suppression, not a broken setup.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": control_id, "content": "BARE_SILENCE" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let control_statuses = timeout(Duration::from_secs(30), async {
+        let mut frames: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["data"]["agentId"].as_str() != Some(control_id.as_str()) {
+                continue;
+            }
+            match ev["type"].as_str() {
+                Some("agent:stream:status") => frames.push(ev["data"].clone()),
+                Some("agent:stream:end") => return frames,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("control turn reached its terminal stream:end in time");
+    let stalled: Vec<&Value> = control_statuses
+        .iter()
+        .filter(|d| d["phase"] == json!("stalled"))
+        .collect();
+    assert_eq!(
+        stalled.len(),
+        1,
+        "the tool-free control turn stalls on the same silence: {control_statuses:?}"
+    );
+    let data = stalled[0];
+    assert_eq!(data["agentId"].as_str(), Some(control_id.as_str()));
+    assert_eq!(data["level"], json!("warn"), "stalled is warn: {data}");
+    assert!(
+        data["silentMs"].as_u64().expect("silentMs") >= 1000,
+        "control silence past the lowered threshold: {data}"
+    );
+}
+
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
 /// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
 /// turn as
@@ -1037,7 +1410,7 @@ async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-SessionMCP", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-SessionMCP", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1158,7 +1531,7 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-Status", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-Status", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1289,7 +1662,7 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "WSS-Status-BG",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
             "isBackground": true,
         }),
     )
@@ -1383,7 +1756,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1450,6 +1823,58 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     assert!(
         conv["lastStreamActivityAt"].is_string(),
         "mid-turn getConversation carries lastStreamActivityAt: {conv}"
+    );
+    // Opted out, the parked turn's streamed content is absent from the page
+    // (nothing persisted yet) — the pre-`includeInProgress` shape.
+    let opted_out_len = conv["messages"].as_array().expect("messages array").len();
+    assert!(
+        conv["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .all(|m| m.get("inProgress").is_none()),
+        "opted-out page carries no in-progress row: {conv}"
+    );
+
+    // In-progress tail over the wire (monorepo#3647): opting in appends the
+    // parked turn's REAL streamed blocks as a trailing `inProgress: true`
+    // row — same page otherwise, excluded from `totalMessages`.
+    let conv_live = wss_rpc(
+        &mut rpc,
+        23,
+        "agent.getConversation",
+        json!({ "agentId": agent_id, "includeInProgress": true }),
+    )
+    .await;
+    let live_msgs = conv_live["messages"].as_array().expect("messages array");
+    assert_eq!(
+        live_msgs.len(),
+        opted_out_len + 1,
+        "opted-in page appends exactly the in-progress row: {conv_live}"
+    );
+    let live_row = live_msgs.last().expect("in-progress row");
+    assert_eq!(
+        live_row["inProgress"], true,
+        "trailing row flagged inProgress: {live_row}"
+    );
+    assert_eq!(
+        live_row["role"], "assistant",
+        "in-progress row is assistant: {live_row}"
+    );
+    assert!(
+        live_row["contentBlocks"]
+            .as_array()
+            .expect("content blocks")
+            .iter()
+            .any(|b| b["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")),
+        "in-progress row carries the actually-streamed chunk: {live_row}"
+    );
+    assert_eq!(
+        conv_live["totalMessages"], conv["totalMessages"],
+        "synthetic row not counted in totalMessages: {conv_live}"
     );
 
     // Stop the agent mid-turn — interrupt (not kill); terminal stream:end fires
@@ -1641,7 +2066,7 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-Overlay", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-Overlay", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1870,7 +2295,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -2105,7 +2530,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -2273,7 +2698,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -2501,7 +2926,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Idle", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Idle", "model": "default", "provider": "mock" }),
     )
     .await;
     let idle_id = idle["agent"]["id"].as_str().expect("idle id").to_string();
@@ -2511,7 +2936,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Busy", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Busy", "model": "default", "provider": "mock" }),
     )
     .await;
     let busy_id = busy["agent"]["id"].as_str().expect("busy id").to_string();
@@ -2701,7 +3126,7 @@ async fn agent_diagnostics_reports_subtree_memory_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Unspawned", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Unspawned", "model": "default", "provider": "mock" }),
     )
     .await;
     let idle_id = idle["agent"]["id"].as_str().expect("idle id").to_string();
@@ -2711,7 +3136,7 @@ async fn agent_diagnostics_reports_subtree_memory_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Spawned", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Spawned", "model": "default", "provider": "mock" }),
     )
     .await;
     let busy_id = busy["agent"]["id"].as_str().expect("busy id").to_string();
@@ -2825,7 +3250,7 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
     // Post-WSAPI-8: replace discrete `delegate_task` with the unified
     // `workspace_api` tool routing through `ws.agent.delegate`.
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_MARK),
     );
     let behavior = json!({
@@ -2881,7 +3306,7 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -3033,7 +3458,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
             "workspaceId": ws_id,
             "agentInstructions": "do the delegated work",
             "taskText": task_text,
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -3152,11 +3577,11 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
     let report_a_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_A));
     let report_b_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_B));
     let delegate_a_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'default', provider: 'mock' }});",
         json!(CHILD_A),
     );
     let delegate_b_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'default', provider: 'mock' }});",
         json!(CHILD_B),
     );
     // One behavior, prompt-matched rules: children (matched by their delegated
@@ -3245,7 +3670,7 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -3465,12 +3890,18 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     };
 
     let data_dir = temp_data_dir();
-    let ws_id = seed_workspace_only(&data_dir).await;
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     // The child reports via the unified `workspace_api` tool + `ws.*` binding
-    // (post-WSAPI-8: discrete `report_to_parent` MCP tool is gone).
-    let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    // after an ordinary linked task-note append, reproducing monorepo#3577.
+    let report_js = format!(
+        "await ws.note.add({}, {{ content: {} }}); return await ws.agent.reportToParent({});",
+        json!(note_id),
+        json!("\n## Verification\nWSS incident regression covered."),
+        json!(REPORT),
+    );
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'default', provider: 'mock' }});",
+        json!(note_id),
         json!(CHILD_TAG),
     );
     // One behavior, prompt-matched rules:
@@ -3540,11 +3971,19 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     );
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    let parent = wss_rpc(
+    let marked = wss_rpc(
         &mut rpc,
         10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+    let parent = wss_rpc(
+        &mut rpc,
+        11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SUB2 Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "SUB2 Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -3553,7 +3992,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         .to_string();
     let sent = wss_rpc(
         &mut rpc,
-        11,
+        12,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
     )
@@ -3646,7 +4085,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     // `Report:` branch — the `Summary:` fallback MUST NOT appear.
     let conv = wss_rpc(
         &mut rpc,
-        12,
+        13,
         "agent.getConversation",
         json!({ "agentId": parent_id }),
     )
@@ -3684,7 +4123,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     let cid = child_id.expect("child id captured");
     let child_got = wss_rpc(
         &mut rpc,
-        13,
+        14,
         "agent.get",
         json!({ "workspaceId": ws_id, "agentId": cid }),
     )
@@ -3693,6 +4132,31 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         child_got["agent"]["metadata"]["completionReport"].as_str(),
         Some(REPORT),
         "child's persisted completionReport matches: {child_got}"
+    );
+    let task = wss_rpc(
+        &mut rpc,
+        15,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        task["task"]["status"], "review_required",
+        "report persists after the note edit and transitions the task: {task}"
+    );
+    let note = wss_rpc(
+        &mut rpc,
+        16,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert!(
+        note["note"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("WSS incident regression covered"),
+        "ordinary task-note append persisted before reportToParent: {note}"
     );
 }
 
@@ -3732,8 +4196,11 @@ async fn attention_request_discussion_over_wss() {
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let request_js = format!(
-        "return await ws.agent.requestDiscussion({});",
-        json!(REASON)
+        "await ws.note.add({}, {{ content: {} }}); await ws.task.updateNoteStatus({}, 'waiting'); return await ws.agent.requestDiscussion({});",
+        json!(note_id),
+        json!("\n## Notes\nNeed a coordinator decision."),
+        json!(note_id),
+        json!(REASON),
     );
     let behavior = json!({
         "rules": [{
@@ -3803,7 +4270,7 @@ async fn attention_request_discussion_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": note_id,
             "agentInstructions": format!("{CHILD_MARKER} raise a discussion request"),
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -3816,21 +4283,24 @@ async fn attention_request_discussion_over_wss() {
     let mut attention: Option<Value> = None;
     let mut raise_updated = false;
     let mut system_message = false;
-    let mut task_changed: Option<Value> = None;
+    let mut direct_task_changed = false;
+    let mut attention_task_changed: Option<Value> = None;
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(attention.is_some()
         && raise_updated
         && system_message
-        && task_changed.is_some()
+        && direct_task_changed
+        && attention_task_changed.is_some()
         && idle)
     {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!(
                 "timed out: attention={a} raise_updated={raise_updated} \
-                 system_message={system_message} task_changed={t} idle={idle}",
+                 system_message={system_message} direct_task_changed={direct_task_changed} \
+                 attention_task_changed={t} idle={idle}",
                 a = attention.is_some(),
-                t = task_changed.is_some(),
+                t = attention_task_changed.is_some(),
             )
         };
         let ev = &frame["params"]["event"];
@@ -3861,7 +4331,17 @@ async fn attention_request_discussion_over_wss() {
                 system_message = true;
             }
             "task:status-changed" if data["noteId"] == json!(note_id) => {
-                task_changed = Some(data.clone());
+                match data["newStatus"].as_str() {
+                    Some("waiting") => {
+                        assert_eq!(
+                            data["previousStatus"], "in_progress",
+                            "direct task update: {data}"
+                        );
+                        direct_task_changed = true;
+                    }
+                    Some("discussion_needed") => attention_task_changed = Some(data.clone()),
+                    _ => {}
+                }
             }
             "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
             _ => {}
@@ -3892,9 +4372,9 @@ async fn attention_request_discussion_over_wss() {
         attention["reason"], REASON,
         "attention event reason: {attention}"
     );
-    let task_changed = task_changed.expect("task:status-changed captured");
+    let task_changed = attention_task_changed.expect("attention task:status-changed captured");
     assert_eq!(
-        task_changed["previousStatus"], "in_progress",
+        task_changed["previousStatus"], "waiting",
         "task transition source: {task_changed}"
     );
     assert_eq!(
@@ -4183,7 +4663,7 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "FG-Attn", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "FG-Attn", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -4331,8 +4811,10 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let blocker_js = format!(
-        "return await ws.agent.reportBlocker({});",
-        json!(BLOCK_REASON)
+        "await ws.note.add({}, {{ content: {} }}); return await ws.agent.reportBlocker({});",
+        json!(note_id),
+        json!("\n## Notes\nBlocked after reproducing the incident."),
+        json!(BLOCK_REASON),
     );
     let taskless_js = format!(
         "return await ws.agent.requestDiscussion({});",
@@ -4412,7 +4894,7 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": note_id,
             "agentInstructions": format!("{BLOCKER_MARKER} report an environment blocker"),
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -4507,7 +4989,7 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
         &mut rpc,
         20,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Taskless", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Taskless", "model": "default", "provider": "mock" }),
     )
     .await;
     let taskless_id = created["agent"]["id"]
@@ -4612,11 +5094,11 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
         json!(REASON)
     );
     let delegate_attn_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(format!("{CHILD_ATTN} raise a discussion request")),
     );
     let delegate_die_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(format!("{CHILD_DIE} this child dies mid-prompt")),
     );
     let behavior = json!({
@@ -4695,7 +5177,7 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "ParentId-Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "ParentId-Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -4847,6 +5329,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -5658,6 +6141,82 @@ async fn event_query_event_type_glob_over_wss() {
     );
 }
 
+/// Regression (monorepo#3347): a busy workspace's `event.query` response no
+/// longer serializes past the transport's 1 MiB large-frame advisory over the
+/// real WSS wire. Seeds 50 `note:created` events with ~30 KiB caller-supplied
+/// titles (~1.5 MiB of raw event data), then asserts the queried row set is
+/// bounded with additive `truncated` / `originalBytes` markers, row identity
+/// preserved, and no rows dropped.
+#[tokio::test]
+async fn event_query_response_bounded_over_wss() {
+    const ONE_MIB: usize = 1024 * 1024;
+    const SEEDED: usize = 50;
+    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // Seed notes whose ~30 KiB titles land verbatim in the `note:created`
+    // event payload — ~1.5 MiB of event data total.
+    let big_title = "t".repeat(30 * 1024);
+    for i in 0..SEEDED {
+        let created = wss_rpc(
+            &mut rpc,
+            i64::try_from(i).expect("value fits in i64") + 1,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": big_title, "content": format!("n{i}") }),
+        )
+        .await;
+        assert!(created["note"]["id"].as_str().is_some(), "note {i} created");
+    }
+
+    // Event writes commit asynchronously relative to the RPC responses; poll
+    // until all seeded `note:created` events are visible.
+    let mut id = i64::try_from(SEEDED).expect("value fits in i64") + 1;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let rows = loop {
+        let rows = wss_rpc(
+            &mut rpc,
+            id,
+            "event.query",
+            json!({ "workspaceId": ws_id, "eventType": "note:created", "limit": 100 }),
+        )
+        .await;
+        id += 1;
+        if rows.as_array().expect("rows array").len() >= SEEDED {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "seeded note:created events never all appeared: {} rows",
+            rows.as_array().expect("rows array").len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let arr = rows.as_array().expect("rows array");
+    assert_eq!(arr.len(), SEEDED, "no rows may be dropped");
+    let size = serde_json::to_string(&rows).expect("serialize").len();
+    assert!(
+        size < ONE_MIB,
+        "event.query response must stay under the 1 MiB frame advisory: {size}"
+    );
+    assert!(
+        arr.iter().any(|r| r["truncated"] == json!(true)),
+        "trimming must be observable via row markers: {size} bytes"
+    );
+    for row in arr {
+        assert!(row["id"].as_str().is_some(), "row identity survives: {row}");
+        assert_eq!(row["type"], json!("note:created"));
+        assert!(row["timestamp"].as_str().is_some());
+        if row["truncated"] == json!(true) {
+            assert!(
+                row["originalBytes"].as_u64().is_some(),
+                "trimmed rows carry originalBytes: {row}"
+            );
+        }
+    }
+}
+
 /// WSS-2 (subscriptions): narrow `eventTypes` filters route only matching
 /// events to a subscriber. Two pinned WSS subscribers — one scoped to
 /// `["note:*"]`, one to `["agent:*"]` — observe a single mock agent turn and
@@ -5742,7 +6301,7 @@ async fn subscription_filter_branches_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-Filter", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-Filter", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -5861,7 +6420,7 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-Disc", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-Disc", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -6029,7 +6588,7 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QDrain", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QDrain", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -6164,7 +6723,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "StabFour", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "StabFour", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -6346,7 +6905,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QMeta", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QMeta", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -6466,7 +7025,25 @@ async fn queued_message_metadata_survives_drain_over_wss() {
 // the dequeue-wait [SYSTEM NOTE] and WITHOUT the queueInfo metadata stamp —
 // the sub-threshold hop reads exactly like an immediate delivery (PROTOCOL
 // §5.5), while caller-supplied messageMetadata still persists verbatim.
+//
+// Load-tolerant by measurement (monorepo#3409): under parallel suite load,
+// scheduling delay can legitimately push the real queue wait past the 5s
+// threshold, so the test measures an upper bound on the wait client-side and
+// asserts conditionally — the strong no-annotation assertions when the run
+// provably stayed sub-threshold (the norm), internal-consistency assertions
+// on the annotation otherwise. The exact threshold gate itself is covered
+// deterministically by `agent_manager::tests::dequeue_wait_tests`.
 // ---------------------------------------------------------------------------
+
+/// Production default of `DEQUEUE_WAIT_ANNOTATION_MIN_MS`
+/// (`intent-services/src/agent_manager.rs`, monorepo#2353) — this test runs
+/// without the `INTENTD_DEQUEUE_WAIT_MIN_MS` override.
+const PROD_DEQUEUE_WAIT_MIN_MS: u128 = 5_000;
+
+/// Slack for comparing the daemon's wall-clock `waitedMs` against the test's
+/// monotonic upper bound (covers wall-clock adjustments between the daemon's
+/// `queuedAt` mint and its dequeue reading).
+const WALL_CLOCK_SLACK_MS: u128 = 1_000;
 
 #[tokio::test]
 async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
@@ -6505,7 +7082,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:stream:end"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:queue:processing", "agent:stream:end"], "workspaceId": ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -6515,7 +7092,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SubThresh", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "SubThresh", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -6533,7 +7110,11 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
     sleep(Duration::from_millis(200)).await;
 
     // Second send while busy — queues, waits ~2s, drains sub-threshold.
+    // The stopwatch starts BEFORE the queuing send is issued, so it strictly
+    // precedes the daemon minting `queuedAt` — any elapsed reading is a safe
+    // upper bound on the daemon-measured dequeue wait.
     let metadata = json!({ "type": "event_notification" });
+    let queue_wait_clock = std::time::Instant::now();
     let send2 = wss_rpc(
         &mut rpc,
         12,
@@ -6548,19 +7129,42 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
     .await;
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second send should queue: {send2}");
+    let queued_id = send2["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued entry id")
+        .to_string();
 
-    // Wait for both turns to finish (first send + drained queued send).
+    // Wait for both turns to finish (first send + drained queued send). The
+    // drain-start signal `agent:queue:processing` (monorepo#1022) is emitted
+    // immediately AFTER `annotate_dequeue_wait` stamps the entry, so the
+    // elapsed reading at that frame (matched to the queued entry's id)
+    // strictly upper-bounds the daemon-measured wait.
     let mut stream_end_count = 0;
-    for _ in 0..120 {
+    let mut wait_upper_bound: Option<Duration> = None;
+    for _ in 0..240 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:end" {
-            stream_end_count += 1;
-            if stream_end_count >= 2 {
-                break;
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:queue:processing")
+                if evt["data"]["messageId"].as_str() == Some(&queued_id) =>
+            {
+                wait_upper_bound = Some(queue_wait_clock.elapsed());
             }
+            Some("agent:stream:end") => {
+                stream_end_count += 1;
+                if stream_end_count >= 2 {
+                    break;
+                }
+            }
+            _ => {}
         }
     }
     assert_eq!(stream_end_count, 2, "both turns must complete");
+    // The subscription predates the queuing send and events are delivered in
+    // order, so the drain-start frame must have been observed — no loose
+    // fallback that could misclassify an incorrectly annotated run.
+    let wait_upper_bound =
+        wait_upper_bound.expect("agent:queue:processing frame for the queued entry");
 
     let convo = wss_rpc(
         &mut rpc,
@@ -6580,21 +7184,63 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
                     .is_some_and(|t| t.contains("sub-threshold queued message"))
         })
         .expect("drained user message row present");
-    // No dequeue-wait system note on the persisted content.
     let text = drained["contentBlocks"][0]["text"].as_str().unwrap();
-    assert!(
-        !text.contains("This message was queued at"),
-        "sub-threshold drain must not carry the dequeue-wait note: {drained}"
-    );
-    // No queueInfo stamp — neither on the row metadata nor the in-block fold.
-    assert!(
-        drained["metadata"]["queueInfo"].is_null(),
-        "sub-threshold drain must not stamp queueInfo on row metadata: {drained}"
-    );
-    assert!(
-        drained["contentBlocks"][0]["messageMetadata"]["queueInfo"].is_null(),
-        "sub-threshold drain must not fold queueInfo into the block: {drained}"
-    );
+    let annotated = text.contains("This message was queued at");
+    if annotated {
+        // Loaded run (monorepo#3409): the annotation is only legitimate when
+        // the wait genuinely reached the threshold — hold the daemon to
+        // internal consistency: the queueInfo stamp must carry the entry's
+        // queuedAt and a waitedMs at/above the threshold and within the
+        // observed upper bound (small slack for wall-clock adjustments
+        // between the daemon's `queuedAt` mint and the dequeue reading).
+        eprintln!(
+            "sub-threshold window overrun under load (upper bound \
+             {wait_upper_bound:?}); asserting over-threshold consistency"
+        );
+        // Symmetric wall-clock slack: the daemon gates the annotation on a
+        // wall-clock reading (`now_utc() - queuedAt`), so a forward clock
+        // step can legitimately annotate while the monotonic bound sits just
+        // under the threshold.
+        assert!(
+            wait_upper_bound.as_millis() + WALL_CLOCK_SLACK_MS >= PROD_DEQUEUE_WAIT_MIN_MS,
+            "dequeue-wait note appeared although the observed wait upper \
+             bound {wait_upper_bound:?} is sub-threshold: {drained}"
+        );
+        let queue_info = &drained["metadata"]["queueInfo"];
+        assert_eq!(
+            queue_info["queuedAt"], send2["queuedMessage"]["queuedAt"],
+            "annotated drain must stamp the entry's queuedAt: {drained}"
+        );
+        let waited_ms = queue_info["waitedMs"]
+            .as_u64()
+            .expect("annotated drain stamps integer waitedMs");
+        assert!(
+            u128::from(waited_ms) >= PROD_DEQUEUE_WAIT_MIN_MS,
+            "annotation implies an over-threshold daemon-measured wait, got \
+             waitedMs={waited_ms}: {drained}"
+        );
+        assert!(
+            u128::from(waited_ms) <= wait_upper_bound.as_millis() + WALL_CLOCK_SLACK_MS,
+            "daemon-measured wait ({waited_ms}ms) exceeds the observed upper \
+             bound {wait_upper_bound:?}: {drained}"
+        );
+        assert_eq!(
+            drained["contentBlocks"][0]["messageMetadata"], drained["metadata"],
+            "annotated drain must fold the same messageMetadata: {drained}"
+        );
+    } else {
+        // The norm — the drain reads exactly like an immediate delivery: no
+        // dequeue-wait system note (checked above) and no queueInfo stamp,
+        // neither on the row metadata nor the in-block fold.
+        assert!(
+            drained["metadata"]["queueInfo"].is_null(),
+            "sub-threshold drain must not stamp queueInfo on row metadata: {drained}"
+        );
+        assert!(
+            drained["contentBlocks"][0]["messageMetadata"]["queueInfo"].is_null(),
+            "sub-threshold drain must not fold queueInfo into the block: {drained}"
+        );
+    }
     // Caller-supplied messageMetadata still persists verbatim.
     assert_eq!(
         drained["metadata"]["type"], "event_notification",
@@ -6660,7 +7306,7 @@ async fn user_app_message_id_round_trips_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "AppIds", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "AppIds", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -6779,7 +7425,7 @@ async fn remove_queued_message_is_idempotent_over_wss() {
         &mut rpc,
         1,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QIdempotent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QIdempotent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -6863,7 +7509,7 @@ async fn send_queued_message_now_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QSendNow", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QSendNow", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -7084,7 +7730,7 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QMixed", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QMixed", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -7336,7 +7982,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
             "initialAgent": {
                 "prompt": "build the initial feature",
                 "name": "Initial agent",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
                 "specialist": "implementor",
             },
         }),
@@ -7464,7 +8110,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
         &mut rpc,
         16,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Sibling", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Sibling", "model": "default", "provider": "mock" }),
     )
     .await;
     let sibling_id = sibling["agent"]["id"]
@@ -7507,7 +8153,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
             "idempotencyKey": "wss-create-idem-1",
             "initialAgent": {
                 "prompt": "some other prompt",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
@@ -7842,7 +8488,7 @@ async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": note_id,
             "contextMessage": "kickoff",
-            "create": { "model": "mock:default" },
+            "create": { "model": "default", "provider": "mock" },
         }),
     )
     .await;
@@ -8009,7 +8655,7 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Coordinator", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Coordinator", "model": "default", "provider": "mock" }),
     )
     .await;
     let coordinator_id = coordinator["agent"]["id"]
@@ -8020,7 +8666,7 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Target", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Target", "model": "default", "provider": "mock" }),
     )
     .await;
     let target_id = target["agent"]["id"]
@@ -8113,7 +8759,9 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
         )
         .await;
         let text = serde_json::to_string(&conv["messages"]).unwrap_or_default();
-        if text.contains("[WORKSPACE EVENTS] Child agent") && text.contains(&target_id) {
+        // The target is not the coordinator's delegation child, so the SUB-1
+        // sender wake renders "Watched agent" (monorepo#3906).
+        if text.contains("[WORKSPACE EVENTS] Watched agent") && text.contains(&target_id) {
             delivered = true;
             break;
         }
@@ -8158,8 +8806,8 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
 
     // The parent delegates two after_all children, sends follow-ups to each.
     let delegate_js = format!(
-        "const a = await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default', waitMode: 'after_all' }}); \
-         const b = await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default', waitMode: 'after_all' }}); \
+        "const a = await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock', waitMode: 'after_all' }}); \
+         const b = await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock', waitMode: 'after_all' }}); \
          return {{ a, b }};",
         json!(CHILD_A_TAG),
         json!(CHILD_B_TAG),
@@ -8231,7 +8879,7 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SUB1 Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "SUB1 Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -8466,7 +9114,7 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "SP-1 WSS", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "SP-1 WSS", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -8609,7 +9257,7 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
             "branch": "feat/initial-agent-no-prompt-e2e",
             "initialAgent": {
                 "name": "Coordinator",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
                 "specialist": "implementor",
             },
         }),
@@ -8712,7 +9360,7 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
             "title": "Specialist-name WS",
             "branch": "feat/initial-agent-specialist-name-e2e",
             "initialAgent": {
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
                 "specialist": "spec-writer",
             },
         }),
@@ -8759,7 +9407,7 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     // Child behavior: first turn reports back, second turn acknowledges.
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_TAG),
     );
     let behavior = json!({
@@ -8829,7 +9477,7 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Clear Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Clear Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -8982,7 +9630,7 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     let ws_id = seed_workspace_only(&data_dir).await;
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_TAG),
     );
     // Prompt-matched rules; the STALE_MSG rule comes FIRST so the redriven
@@ -9060,7 +9708,7 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Stale Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Stale Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -9325,7 +9973,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "QueueTest", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "QueueTest", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -9472,7 +10120,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
             "workspaceId": &ws_id,
             "taskNoteId": &note_id,
             "contextMessage": "wake test",
-            "create": { "model": "mock:default" },
+            "create": { "model": "default", "provider": "mock" },
         }),
     )
     .await;
@@ -9608,7 +10256,7 @@ async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -9815,7 +10463,7 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -9929,7 +10577,7 @@ async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss()
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "PreToken", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "PreToken", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -10085,7 +10733,7 @@ async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_w
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "StopRedeliver", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "StopRedeliver", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -10240,6 +10888,169 @@ async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_w
     );
 }
 
+/// monorepo#3338: an image block carrying an attachment-registry
+/// `attachmentId` reference (no inline base64) is resolved daemon-side at
+/// prompt assembly — the ACP receives an `image` content block exactly as if
+/// the bytes had been sent inline, while the persisted transcript row keeps
+/// only the reference. Asserted via the fixture's `MOCK_AGENT_PROMPT_LOG`
+/// seam (`blockTypes`).
+#[tokio::test]
+async fn image_reference_block_resolves_to_acp_image_over_wss() {
+    use base64::Engine as _;
+
+    let Some(script) = gate("image-reference block resolution E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    // The workspace needs a real filesystem root: `file.placeAttachment`
+    // lands bytes under `.intent/attachments/` and the reference resolution
+    // reads them back from the same root.
+    let ws_id = {
+        use intent_store::Store;
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open store");
+        let ws = intent_core::WorkspaceId::new();
+        let root = data_dir.join("ws-root");
+        std::fs::create_dir_all(&root).expect("mkdir ws root");
+        let mut seed = workspace_seed(&ws);
+        seed.worktree_path = Some(root.to_string_lossy().into_owned());
+        store.insert_workspace(&seed).await.expect("insert ws");
+        ws.0
+    };
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "seen" }).to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    // Register the attachment (1x1 transparent PNG).
+    let png_b64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let placed = wss_rpc(
+        &mut rpc,
+        10,
+        "file.placeAttachment",
+        json!({
+            "workspaceId": &ws_id,
+            "fileName": "pixel.png",
+            "data": png_b64,
+            "mimeType": "image/png",
+        }),
+    )
+    .await;
+    let attachment_id = placed["attachmentId"]
+        .as_str()
+        .expect("attachmentId")
+        .to_string();
+
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "ImgRef", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "describe the referenced image",
+            "imageBlocks": [
+                { "type": "image", "attachmentId": &attachment_id }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Outbound-prompt contract: the turn's prompt reaches the mock carrying
+    // an `image` content block — the daemon resolved the reference to bytes.
+    let mut prompt = None;
+    for _ in 0..50 {
+        if let Ok(log) = std::fs::read_to_string(&prompt_log) {
+            if let Some(p) = log
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .find(|p| {
+                    p["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("describe the referenced image")
+                })
+            {
+                prompt = Some(p);
+                break;
+            }
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    let prompt = prompt.expect("turn's prompt reached the mock");
+    let block_types: Vec<&str> = prompt["blockTypes"]
+        .as_array()
+        .expect("prompt log carries blockTypes")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        block_types.contains(&"image"),
+        "reference resolved to an ACP image block: {block_types:?}"
+    );
+
+    // Persisted transcript: the user row keeps the REFERENCE (no bytes).
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let image = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .flat_map(|m| m["contentBlocks"].as_array().cloned().unwrap_or_default())
+        .find(|b| b["type"] == "image")
+        .expect("image block on the user row");
+    assert_eq!(image["attachmentId"], json!(attachment_id), "{image}");
+    assert!(
+        image.get("data").is_none(),
+        "no bytes on the transcript row: {image}"
+    );
+    // Sanity: the placed bytes decode (the mock does not echo block payloads,
+    // so byte-equality is covered by the services-layer resolution unit test).
+    base64::engine::general_purpose::STANDARD
+        .decode(png_b64)
+        .expect("valid fixture png");
+}
+
 /// STAB-124 regression: an interrupt landing mid-tool-call must NOT persist an
 /// anonymous `tool_use` block (`name: ""`). The mock parks after emitting a
 /// `tool_call` (`in_progress`); on `session/cancel` it echoes a title-less
@@ -10295,7 +11106,7 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "STAB124", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "STAB124", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -10448,7 +11259,7 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "STAB133", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "STAB133", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -10528,8 +11339,10 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
 /// messages agent B through the `ws.agent.send` host binding, the delivered
 /// user row on B's transcript must carry
 /// `metadata == { type: "agent_message", fromAgentId, fromAgentName }` so
-/// clients can render who sent it. A human `agent.sendMessage` (FE/RPC front
-/// door, no caller agent) must stay untagged.
+/// clients can render who sent it, and its content must start with the
+/// daemon-prepended A2A sender header (monorepo#3721). A human
+/// `agent.sendMessage` (FE/RPC front door, no caller agent) must stay
+/// untagged AND header-free (byte-identical content).
 #[tokio::test]
 async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
     let Some(script) = gate("WSS agent-to-agent sender metadata E2E") else {
@@ -10596,7 +11409,7 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "TargetB", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "TargetB", "model": "default", "provider": "mock" }),
     )
     .await;
     let target_id = target["agent"]["id"].as_str().unwrap().to_string();
@@ -10604,7 +11417,7 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "default", "provider": "mock" }),
     )
     .await;
     let sender_id = sender["agent"]["id"].as_str().unwrap().to_string();
@@ -10659,9 +11472,17 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
             m["role"] == "user"
                 && m["contentBlocks"][0]["text"]
                     .as_str()
-                    .is_some_and(|t| t.starts_with("cross-agent hello"))
+                    .is_some_and(|t| t.contains("cross-agent hello"))
         })
         .expect("cross-agent user row present");
+    // The delivered content carries the A2A sender header (monorepo#1015)
+    // prepended at the send front door, above the caller's text.
+    let text = tagged["contentBlocks"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        text,
+        format!("[MESSAGE FROM AGENT SenderA ({sender_id})]\n\ncross-agent hello"),
+        "agent-origin content carries the sender header"
+    );
     assert_eq!(
         tagged["metadata"],
         json!({
@@ -10715,6 +11536,14 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         })
         .expect("human user row present")
         .clone();
+    // FE-origin content is byte-identical to what the user sent — the A2A
+    // sender header (monorepo#3721) is gated on the daemon-stamped
+    // `fromAgentId` attribution, which human front-door sends never carry.
+    assert_eq!(
+        human_row["contentBlocks"][0]["text"],
+        json!("human follow-up"),
+        "FE-origin content must carry NO sender header: {human_row}"
+    );
     assert_ne!(
         human_row["metadata"]["type"],
         json!("agent_message"),
@@ -10744,9 +11573,9 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     // create kickoff, and a create kickoff with explicit messageMetadata.
     let ops_code = format!(
         "const st = await ws.agent.sendToTask({note}, 'task hello'); \
-         const auto = await ws.agent.create('ChildAuto', 'kickoff hello', {{ model: 'mock:default' }}); \
+         const auto = await ws.agent.create('ChildAuto', 'kickoff hello', {{ model: 'default', provider: 'mock' }}); \
          const explicit = await ws.agent.create('ChildExplicit', 'kickoff explicit', \
-             {{ model: 'mock:default', messageMetadata: {{ type: 'custom_tag', note: 'explicit wins' }} }}); \
+             {{ model: 'default', provider: 'mock', messageMetadata: {{ type: 'custom_tag', note: 'explicit wins' }} }}); \
          return {{ st, auto, explicit }};",
         note = json!(note_id),
     );
@@ -10801,7 +11630,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "TaskTarget", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "TaskTarget", "model": "default", "provider": "mock" }),
     )
     .await;
     let target_id = target["agent"]["id"].as_str().unwrap().to_string();
@@ -10809,7 +11638,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "default", "provider": "mock" }),
     )
     .await;
     let sender_id = sender["agent"]["id"].as_str().unwrap().to_string();
@@ -10922,6 +11751,8 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         "fromAgentId": sender_id,
         "fromAgentName": "SenderA",
     });
+    // Agent-origin rows carry the A2A sender header (monorepo#1015) above
+    // the caller's text, so match on `contains` rather than `starts_with`.
     let user_row = |conv: &Value, text: &str| -> Value {
         conv["messages"]
             .as_array()
@@ -10931,7 +11762,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
                 m["role"] == "user"
                     && m["contentBlocks"][0]["text"]
                         .as_str()
-                        .is_some_and(|t| t.starts_with(text))
+                        .is_some_and(|t| t.contains(text))
             })
             .unwrap_or_else(|| panic!("user row `{text}` present: {conv}"))
             .clone()
@@ -10995,9 +11826,11 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
 /// `parent_agent_id` linkage), the child sends a coordination message back to
 /// its parent through `ws.agent.send`, and:
 /// - the child's persisted send tool result carries NO `subscriptionId` (the
-///   SUB-1 sender auto-watch is suppressed for child→parent sends), while a
-///   parentless bystander's identical send DOES get one — and only the
-///   bystander is later woken by the parent's completion;
+///   SUB-1 sender auto-watch is suppressed for child→parent sends — and the
+///   parent is also an independent top-level FOREGROUND target, which the
+///   target-side suppression skips), while a parentless bystander sending to
+///   the CHILD (a created worker target) DOES get one — and only the
+///   bystander is later woken by the child's completion;
 /// - the parent's `chat.subscribe` delta for the delivered row lifts the
 ///   persisted `agent_message` sender-attribution `metadata` onto the wire
 ///   entity (§7.1), while a human `agent.sendMessage` row carries no
@@ -11013,15 +11846,20 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     let ws_id = seed_workspace_only(&data_dir).await;
     // Rule 1 (parent kickoff): spawn the child through the real MCP
     // `workspace_api` binding so the session persists `parent_agent_id`.
-    // Rule 2 (child kickoff + bystander kickoff): find the parent by name and
-    // send to it — same code path for both callers; only the caller's parent
-    // linkage differs. `emitToolBlocks` persists the tool results so the
-    // suppression (no `subscriptionId`) is asserted from the transcript.
+    // Rule 2 (child kickoff): find the parent by name and send to it — the
+    // caller's parent linkage AND the target's top-level shape both suppress
+    // the watch. Rule 3 (bystander kickoff): send to the CHILD — a created
+    // worker target, so the sender watch IS armed. `emitToolBlocks` persists
+    // the tool results so the suppression (no `subscriptionId`) is asserted
+    // from the transcript.
     let spawn_code = "return await ws.agent.create('ChildC', 'please MESSAGE_PARENT now', \
-                      { model: 'mock:default' });";
+                      { model: 'default', provider: 'mock' });";
     let send_code = "const agents = await ws.agent.list(true); \
                      const target = agents.find(a => a.name === 'Coordinator'); \
                      return await ws.agent.send(target.id, 'child says hi');";
+    let bystander_code = "const agents = await ws.agent.list(true); \
+                          const target = agents.find(a => a.name === 'ChildC'); \
+                          return await ws.agent.send(target.id, 'bystander says hi');";
     let behavior = json!({
         "rules": [
             {
@@ -11040,6 +11878,15 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
                     "arguments": { "code": send_code, "summary": "send to parent e2e" }
                 },
                 "response": "sent upward",
+                "emitToolBlocks": true
+            },
+            {
+                "ifPromptContains": "MESSAGE_CHILD",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": bystander_code, "summary": "send to child e2e" }
+                },
+                "response": "sent sideways",
                 "emitToolBlocks": true
             }
         ],
@@ -11097,7 +11944,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "Coordinator", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "Coordinator", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"].as_str().unwrap().to_string();
@@ -11343,13 +12190,15 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         }
     }
 
-    // Contrast: a parentless BYSTANDER running the identical send DOES get
-    // the SUB-1 sender watch — and is later woken by the parent's completion.
+    // Contrast: a parentless BYSTANDER sending to the CHILD — a created
+    // worker target (parent linkage), not an independent top-level peer —
+    // DOES get the SUB-1 sender watch, and is later woken by the child's
+    // completion.
     let bystander = wss_rpc(
         &mut rpc,
         15,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "Bystander", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "Bystander", "model": "default", "provider": "mock" }),
     )
     .await;
     let bystander_id = bystander["agent"]["id"].as_str().unwrap().to_string();
@@ -11357,7 +12206,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         &mut rpc,
         16,
         "agent.sendMessage",
-        json!({ "workspaceId": &ws_id, "agentId": &bystander_id, "content": "please MESSAGE_PARENT now" }),
+        json!({ "workspaceId": &ws_id, "agentId": &bystander_id, "content": "please MESSAGE_CHILD now" }),
     )
     .await;
     assert_eq!(sent["success"], true, "bystander kickoff ok: {sent}");
@@ -11390,16 +12239,16 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         json!({ "workspaceId": &ws_id, "agentId": &bystander_id }),
     )
     .await;
-    let result = send_tool_result(&conv, &parent_id);
+    let result = send_tool_result(&conv, &child_id);
     assert!(
         result["subscriptionId"].is_string(),
-        "a non-child sender still gets the SUB-1 watch: {result}"
+        "a non-child sender to a worker target still gets the SUB-1 watch: {result}"
     );
 
-    // The parent's post-send idle fires the bystander's watch — the
-    // wake lands in the bystander transcript. The CHILD, whose watch was
-    // suppressed, has no wake despite the parent idling multiple times since
-    // its earlier send.
+    // The child's post-send idle fires the bystander's watch — the
+    // wake lands in the bystander transcript. The CHILD, whose own watch on
+    // the parent was suppressed, has no wake despite the parent idling
+    // multiple times since its earlier send.
     let mut woken = false;
     for attempt in 0..120i64 {
         let conv = wss_rpc(
@@ -11493,7 +12342,7 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Edit", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Edit", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -11697,7 +12546,7 @@ async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Busy", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Busy", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -11871,7 +12720,7 @@ async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Guard", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Guard", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -12030,7 +12879,7 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Interruptee", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Interruptee", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -12238,7 +13087,7 @@ async fn proposal_resource_standalone_block_over_chat_subscribe() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Proposer", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Proposer", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -12437,7 +13286,7 @@ async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Collapser", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Collapser", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -12654,7 +13503,7 @@ async fn token_usage_captured_at_turn_end_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Usage", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Usage", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -12804,7 +13653,7 @@ async fn usage_update_cost_captured_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Cost", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Cost", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -12825,7 +13674,7 @@ async fn usage_update_cost_captured_over_wss() {
     assert_eq!(usage1["totals"]["cost"]["amount"], 0.5, "event: {ev1}");
     assert_eq!(usage1["totals"]["cost"]["currency"], "USD");
     assert_eq!(usage1["byAgentId"][&agent_id]["cost"]["amount"], 0.5);
-    assert_eq!(usage1["byModel"]["mock:default"]["cost"]["amount"], 0.5);
+    assert_eq!(usage1["byModel"]["default"]["cost"]["amount"], 0.5);
 
     // Turn 2 — cumulative per ACP session, so 1.25 REPLACES 0.5 (not 1.75).
     let sent2 = wss_rpc(
@@ -12853,6 +13702,221 @@ async fn usage_update_cost_captured_over_wss() {
     assert_eq!(usage["totals"]["cost"]["amount"], 1.25, "read: {read}");
     assert_eq!(usage["totals"]["cost"]["currency"], "USD");
     assert_eq!(usage["totals"]["inputTokens"], 100);
+
+    // The same usage_update's required used/size fields surface as the
+    // additive AgentLite.contextUsage occupancy overlay (§5.5,
+    // intent-hq/intent#3797): latest-wins — turn two's 61_000 replaced turn
+    // one's 53_000 — and never fed into the token tallies asserted above.
+    let got = wss_rpc(&mut rpc, 14, "agent.get", json!({ "agentId": agent_id })).await;
+    let ctx = &got["agent"]["contextUsage"];
+    assert_eq!(ctx["used"], 61_000, "agent.get contextUsage: {got}");
+    assert_eq!(ctx["size"], 200_000);
+    assert!(ctx["updatedAt"].is_string(), "RFC-3339 timestamp: {got}");
+    let listed = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let row = listed["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == agent_id.as_str())
+        .expect("created agent listed");
+    assert_eq!(
+        row["contextUsage"]["used"], 61_000,
+        "agent.list carries the same overlay: {listed}"
+    );
+}
+
+/// Pin the `grok` provider binary to a wrapper around the mock ACP fixture
+/// via the highest-precedence `providers.paths` config tier, so the test is
+/// hermetic even when a real grok install exists. Mirrors the cross-provider
+/// history e2e's setup.
+fn seed_grok_path_override(data_dir: &Path, script: &str) {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
+    let wrapper = data_dir.join("fake-grok");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nexec \"{}\" \"{script}\"\n", node.display()),
+    )
+    .expect("write wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod wrapper");
+    let path = data_dir.join("config.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let _ = writeln!(
+        text,
+        "\n[providers.paths]\ngrok = \"{}\"",
+        wrapper.display()
+    );
+    std::fs::write(&path, text).expect("write config.toml");
+}
+
+/// grok's `_meta.usage` whole-prompt bill over the real WSS transport
+/// (intent-hq/intent#3803): the provider never sends the standard
+/// `PromptResponse.usage` field — its bill rides `_meta.usage` (inputTokens
+/// INCLUDING cache reads, costUsdTicks at 1e10/$). The daemon must
+/// synthesize the per-turn report at the turn-end seam, normalize to the
+/// disjoint buckets, and emit `workspace:tokenUsage-changed` with tokens AND
+/// cost; a second turn's bill SUMS (tokens and cost) — never REPLACEs — and
+/// `workspace.getTokenUsage` returns the same tally over the wire.
+#[tokio::test]
+async fn grok_meta_usage_bill_captured_over_wss() {
+    let Some(script) = gate("WSS grok _meta.usage E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    seed_grok_path_override(&data_dir, &script);
+    // No standard `usage` field on either turn — only the `_meta` bill, in
+    // grok's captured shape (sibling last-call fields + context-occupancy
+    // totalTokens that must NOT be read). Turn 1: 5000 input incl. 3000
+    // cache reads, $0.025. Turn 2 (rule): a SMALLER bill, $0.005.
+    let behavior = json!({
+        "response": "grok turn one",
+        "promptMeta": {
+            "sessionId": "sess-1",
+            "totalTokens": 999_999,
+            "modelId": "grok-code-1",
+            "inputTokens": 11,
+            "outputTokens": 7,
+            "usage": {
+                "inputTokens": 5000,
+                "outputTokens": 1200,
+                "totalTokens": 6200,
+                "cachedReadTokens": 3000,
+                "reasoningTokens": 0,
+                "costUsdTicks": 250_000_000i64,
+                "numTurns": 1,
+            },
+        },
+        "rules": [{
+            "ifPromptContains": "SECOND_TURN",
+            "response": "grok turn two",
+            "promptMeta": {
+                "usage": {
+                    "inputTokens": 1000,
+                    "outputTokens": 300,
+                    "totalTokens": 1300,
+                    "costUsdTicks": 50_000_000i64,
+                },
+            },
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so no event is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:tokenUsage-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "GrokBill", "model": "grok-code-1", "provider": "grok" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Turn 1 — tokens synthesized from the _meta bill land on the event,
+    // normalized to disjoint buckets (input MINUS cache reads), with the
+    // ticks converted to USD.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage 1 ok: {sent}");
+    let ev1 = wss_event(&mut sub, 30).await;
+    let ev1 = &ev1["params"]["event"];
+    assert_eq!(ev1["type"], "workspace:tokenUsage-changed");
+    let totals1 = &ev1["data"]["tokenUsage"]["totals"];
+    assert_eq!(
+        totals1["inputTokens"], 2000,
+        "5000 minus 3000 cache reads (disjoint buckets): {ev1}"
+    );
+    assert_eq!(totals1["outputTokens"], 1200);
+    assert_eq!(totals1["cacheReadTokens"], 3000);
+    assert_eq!(totals1["cost"]["amount"], 0.025, "ticks / 1e10: {ev1}");
+    assert_eq!(totals1["cost"]["currency"], "USD");
+
+    // Turn 2 — the smaller whole-prompt bill SUMS on top: tokens AND cost.
+    let sent2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SECOND_TURN please" }),
+    )
+    .await;
+    assert_eq!(sent2["success"], true, "sendMessage 2 ok: {sent2}");
+    let ev2 = wss_event(&mut sub, 30).await;
+    let totals2 = &ev2["params"]["event"]["data"]["tokenUsage"]["totals"];
+    assert_eq!(
+        totals2["inputTokens"], 3000,
+        "whole-prompt bills SUM (2000 + 1000), never REPLACE: {ev2}"
+    );
+    assert_eq!(totals2["outputTokens"], 1500);
+    let cost2 = totals2["cost"]["amount"].as_f64().expect("cost amount");
+    assert!(
+        (cost2 - 0.03).abs() < 1e-12,
+        "per-prompt costs SUM ($0.025 + $0.005), got {cost2}: {ev2}"
+    );
+
+    // workspace.getTokenUsage over WSS returns the same durable tally (§5.23).
+    let read = wss_rpc(
+        &mut rpc,
+        13,
+        "workspace.getTokenUsage",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let usage = &read["tokenUsage"];
+    assert_eq!(usage["totals"]["inputTokens"], 3000, "read: {read}");
+    let read_cost = usage["totals"]["cost"]["amount"]
+        .as_f64()
+        .expect("cost amount");
+    assert!((read_cost - 0.03).abs() < 1e-12, "read cost: {read}");
+    assert_eq!(usage["byAgentId"][&agent_id]["inputTokens"], 3000);
 }
 
 /// Title-preserving tool updates (the claude-code "Run" collapse): ACP
@@ -12940,7 +14004,7 @@ async fn status_only_tool_update_preserves_richer_title_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Titler", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Titler", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13192,7 +14256,7 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QueueDrainDelta", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QueueDrainDelta", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13369,7 +14433,7 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "DirectSendDelta", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "DirectSendDelta", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13587,7 +14651,7 @@ async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Tooler", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Tooler", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13708,7 +14772,7 @@ async fn thinking_blocks_stream_and_persist_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Thinker", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Thinker", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -13917,7 +14981,7 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Reap", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Reap", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -14091,7 +15155,7 @@ async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Wedged", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Wedged", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -14199,4 +15263,263 @@ async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(settled, "agent session settled to idle; last: {last}");
+}
+
+/// `kills_child_on_interrupt` quirk fence over the real WSS wire
+/// (intent-hq/monorepo#2763): a provider whose cancellation is unreliable
+/// keeps streaming `session/update` chunks long after `session/cancel` —
+/// those zombie chunks must NOT leak into the next turn's transcript. The
+/// mock parks the first turn (`parkIfPromptEndsWith`), and on cancel resolves
+/// it as `cancelled` but keeps emitting marker chunks every 100ms for 3s
+/// (`zombieAfterCancel`) — far past the daemon's bounded 500ms post-interrupt
+/// drain cap. `MOCK_AGENT_KILLS_ON_INTERRUPT=1` grants the mock the quirk, so
+/// the interrupt tears the child down and the stragglers die with the
+/// process. Without the quirk (env seam off) the kept-alive child's zombies
+/// outlive the drain window, buffer in the shared notifications channel, and
+/// bleed into the follow-up turn's assistant message — the pre-fix failure.
+/// Asserts:
+/// - the interrupt lands normally (stream:end `stopReason: "interrupted"`);
+/// - the daemon log carries the quirk-teardown INFO line (the quirk arm ran,
+///   not a coincidental clean cancel);
+/// - the follow-up turn completes normally on a RESPAWNED child (prompt log:
+///   its `session/prompt` is that process's turn 1) — teardown kept the agent
+///   resumable;
+/// - no post-interrupt `chat:stream:delta` and no persisted assistant message
+///   carries the zombie marker.
+#[tokio::test]
+async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
+    const ZOMBIE_MARKER: &str = "ZOMBIE-CHUNK-2763";
+    const PARK_MARKER: &str = "PARK-FIRST-TURN-2763";
+    let Some(script) = gate("WSS kill-on-interrupt zombie-fence E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let prompt_log = data_dir.join("prompt-log.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().to_string();
+    // 30 chunks × 100ms = 3s of stragglers — comfortably past the 500ms
+    // post-interrupt drain cap, so a kept-alive child provably leaks them
+    // into the follow-up turn (the pre-fix failure this test regresses).
+    let behavior = json!({
+        "parkIfPromptEndsWith": PARK_MARKER,
+        "zombieAfterCancel": { "marker": ZOMBIE_MARKER, "count": 30, "intervalMs": 100 },
+        "response": "resumed after respawn",
+    })
+    .to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+        ("MOCK_AGENT_KILLS_ON_INTERRUPT", "1"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("port fits u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE any turn so no delta is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "ZombieFence", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": format!("do the parked work {PARK_MARKER}") }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The parked turn streams nothing; poll turn-liveness until the prompt is
+    // provably in flight before interrupting it.
+    let mut in_flight = false;
+    for i in 0..100 {
+        let got = wss_rpc(
+            &mut rpc,
+            100 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["turnInFlight"] == true {
+            in_flight = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(in_flight, "first turn is in flight before the stop");
+
+    // Interrupt mid-turn. The mock resolves the cancel politely, then keeps
+    // streaming zombie chunks; the quirk tears the child down underneath them.
+    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("terminal stream:end reached the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("stop must not fail the agent: {ev}"),
+            Some("agent:stream:end") => {
+                assert_eq!(
+                    ev["data"]["stopReason"], "interrupted",
+                    "interrupt stream:end carries stopReason: {ev}"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // The quirk-teardown INFO line proves the quirk arm produced the kill —
+    // not a coincidental clean settle.
+    let log_path = data_dir.join("daemon.log");
+    let mut quirk_ran = false;
+    for _ in 0..200 {
+        if tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default()
+            .contains("kills_child_on_interrupt quirk")
+        {
+            quirk_ran = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(quirk_ran, "daemon log carries the quirk-teardown line");
+
+    // Let the zombie stream run well past the 500ms drain cap before the
+    // follow-up: a kept-alive child would still be emitting stragglers into
+    // its buffered channel right now.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Follow-up turn: completes normally on a respawned child, with ZERO
+    // zombie-marker deltas.
+    let resumed = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "follow up after the interrupt" }),
+    )
+    .await;
+    assert_eq!(resumed["success"], true, "resume sendMessage ok: {resumed}");
+
+    let mut saw_resume_end = false;
+    let mut tainted_deltas: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !saw_resume_end {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("follow-up turn reached stream:end on the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("follow-up must not fail: {ev}"),
+            Some("chat:stream:delta") => {
+                let data = serde_json::to_string(&ev["data"]).unwrap_or_default();
+                if data.contains(ZOMBIE_MARKER) {
+                    tainted_deltas.push(data);
+                }
+            }
+            Some("agent:stream:end") => saw_resume_end = true,
+            _ => {}
+        }
+    }
+    assert!(
+        tainted_deltas.is_empty(),
+        "the cancelled turn's zombie chunks streamed into the follow-up (monorepo#2763): {tainted_deltas:?}"
+    );
+
+    // Transcript: the follow-up response landed and NO assistant message
+    // carries the zombie marker.
+    let conv = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let assistant_texts: Vec<String> = messages
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    assert!(
+        assistant_texts
+            .iter()
+            .any(|t| t.contains("resumed after respawn")),
+        "follow-up turn completed after the teardown: {conv}"
+    );
+    let tainted: Vec<&String> = assistant_texts
+        .iter()
+        .filter(|t| t.contains(ZOMBIE_MARKER))
+        .collect();
+    assert!(
+        tainted.is_empty(),
+        "zombie chunks leaked into a persisted assistant message (monorepo#2763): {tainted:?}"
+    );
+
+    // Prompt log: the follow-up prompt is the receiving PROCESS's turn 1 — the
+    // daemon spawned a FRESH child (the kept-alive old child would have
+    // received it as its turn 2), proving teardown + respawn-resume.
+    let log = std::fs::read_to_string(&prompt_log).expect("prompt log");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("prompt log line"))
+        .collect();
+    assert_eq!(entries.len(), 2, "two prompts total: {entries:?}");
+    assert!(
+        entries[0]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains(PARK_MARKER)),
+        "first prompt is the parked turn: {entries:?}"
+    );
+    assert_eq!(
+        entries[1]["turn"], 1,
+        "follow-up prompt is the FRESH child's turn 1 (teardown happened): {entries:?}"
+    );
 }

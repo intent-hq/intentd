@@ -6,10 +6,13 @@
 //! already covers the resolution order at the service-layer seam; this file
 //! locks the same behavior through the router + a real WSS connection:
 //! - no explicit `model`, no specialist → the configured default
-//!   (`providers.active`) is resolved onto the created session, never left
+//!   (`model.defaultProvider`) is resolved onto the created session, never left
 //!   to fall through to the hardcoded default provider (Auggie).
 //! - an unavailable configured default fails the RPC with a clear error
 //!   naming the configured provider, never silently substituting Auggie.
+//! - a hard-false cached auth verdict (seeded through a real
+//!   `host.providerAuthStatus` probe) fails both `agent.delegate` and
+//!   `agent.create` with the actionable `-32602` login remedy.
 
 #![cfg(unix)]
 
@@ -231,7 +234,7 @@ fn gate() -> Option<String> {
 }
 
 /// D2 step 2: no explicit `model`, no specialist — `agent.delegate` resolves
-/// the configured default (`providers.active`) onto the created session,
+/// the configured default (`model.defaultProvider`) onto the created session,
 /// instead of leaving `provider` unset and falling through to the spawn
 /// path's hardcoded default (Auggie).
 #[tokio::test]
@@ -279,7 +282,7 @@ async fn delegate_resolves_configured_default_provider_over_wss() {
         &mut ws,
         20,
         "settings.update",
-        json!({ "changes": [{ "path": "providers.active", "value": "mock" }] }),
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "mock" }] }),
     )
     .await;
 
@@ -314,7 +317,7 @@ async fn delegate_resolves_configured_default_provider_over_wss() {
     );
 }
 
-/// D2 step 3 (error path): the configured default (`providers.active`) is
+/// D2 step 3 (error path): the configured default (`model.defaultProvider`) is
 /// unavailable — `agent.delegate` fails the RPC with a clear error naming the
 /// configured provider, never silently substituting/spawning the hardcoded
 /// default provider (Auggie).
@@ -354,7 +357,7 @@ async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss
         &mut ws,
         20,
         "settings.update",
-        json!({ "changes": [{ "path": "providers.active", "value": "mock" }] }),
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "mock" }] }),
     )
     .await;
 
@@ -384,7 +387,7 @@ async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss
     );
 }
 
-/// monorepo#3044: nothing configured at all (`providers.active` unset, no
+/// monorepo#3044: nothing configured at all (`model.defaultProvider` unset, no
 /// compound `model.default`) — `agent.delegate` without an explicit
 /// provider/model fails the RPC with `-32602` and a clear "no default
 /// provider/model is configured" message, never silently spawning the former
@@ -502,7 +505,7 @@ async fn delegate_explicit_provider_param_over_wss() {
         &mut ws,
         20,
         "settings.update",
-        json!({ "changes": [{ "path": "providers.active", "value": "codex" }] }),
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "codex" }] }),
     )
     .await;
 
@@ -537,8 +540,9 @@ async fn delegate_explicit_provider_param_over_wss() {
         "explicit provider param persisted on the delegated session: {get_result}"
     );
 
-    // Contradiction: compound model naming a different provider than the
-    // param rejects with -32602 naming both sides, before any side effect.
+    // Compound model id → the wire-boundary -32602 (PROTOCOL §5.5): compound
+    // `provider:model` ids reject before any side effect, regardless of the
+    // provider param.
     let contradiction = wss_rpc_raw(
         &mut ws,
         50,
@@ -553,16 +557,16 @@ async fn delegate_explicit_provider_param_over_wss() {
     .await;
     let error = contradiction
         .get("error")
-        .unwrap_or_else(|| panic!("contradicting provider/model must fail: {contradiction}"));
+        .unwrap_or_else(|| panic!("compound model must fail: {contradiction}"));
     assert_eq!(
         error["code"].as_i64(),
         Some(-32602),
-        "contradiction rejects with InvalidParams: {error}"
+        "compound model rejects with InvalidParams: {error}"
     );
     let message = error["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("codex") && message.contains("mock"),
-        "error names both the model's provider and the param: {message}"
+        message.contains("model must be a bare model id"),
+        "error tells the caller to pass a bare model id: {message}"
     );
 
     // Unknown provider id rejects with -32602 naming the known providers.
@@ -589,5 +593,165 @@ async fn delegate_explicit_provider_param_over_wss() {
     assert!(
         message.contains("unknown provider: typo-provider"),
         "error names the bad id: {message}"
+    );
+}
+
+/// Executable stub standing in for a provider CLI whose auth check reports
+/// "not logged in": exit 2 lands on the probe's not-authenticated arm
+/// (non-zero, and not the loader's 127 could-not-run code).
+fn write_failing_auth_probe(data_dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = data_dir.join("fake-opencode");
+    std::fs::write(&script, "#!/bin/sh\nexit 2\n").expect("write probe stub");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod probe stub");
+    script
+}
+
+/// Seed `config.toml` with a `providers.paths` override pinning `opencode` to
+/// the stub — the highest-precedence tier of provider binary resolution, read
+/// by both the auth probe and the install gate, so a real opencode install
+/// can never be picked up.
+fn seed_opencode_path_override(data_dir: &Path, stub: &Path) {
+    use std::fmt::Write as _;
+    let path = data_dir.join("config.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let _ = write!(
+        text,
+        "\n[providers.paths]\nopencode = \"{}\"\n",
+        stub.display()
+    );
+    std::fs::write(&path, text).expect("write config.toml");
+}
+
+/// Hard-false auth-verdict gate over the real WSS wire: a genuine
+/// `host.providerAuthStatus` probe (against a stub CLI that reports "not
+/// logged in") plants the hard-false verdict in the daemon's cache, and both
+/// `agent.delegate` and `agent.create` then reject with the actionable
+/// `-32602` login remedy (PROTOCOL §9) before any session row is persisted.
+/// opencode is the probe target because its auth probe honors the
+/// `providers.paths` override (its probe CLI is its catalog `command`),
+/// keeping the test hermetic.
+#[tokio::test]
+async fn create_and_delegate_reject_hard_false_auth_verdict_over_wss() {
+    let data_dir = temp_data_dir();
+    let stub = write_failing_auth_probe(&data_dir);
+    seed_opencode_path_override(&data_dir, &stub);
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    let ws_result = wss_rpc(
+        &mut ws,
+        10,
+        "workspace.create",
+        json!({ "title": "auth gate WSS E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"].as_str().expect("workspace id");
+
+    // A real probe of the stub plants the hard-false verdict in the daemon's
+    // auth cache — the exact producer (`host.providerAuthStatus`) the gate
+    // reads in production, not a test seam.
+    let probed = wss_rpc(
+        &mut ws,
+        20,
+        "host.providerAuthStatus",
+        json!({ "providerId": "opencode" }),
+    )
+    .await;
+    assert_eq!(
+        probed["providers"][0]["authenticated"],
+        json!(false),
+        "stub probe yields a hard-false verdict: {probed}"
+    );
+
+    wss_rpc(
+        &mut ws,
+        30,
+        "settings.update",
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "opencode" }] }),
+    )
+    .await;
+
+    // agent.delegate resolves the configured default onto the gate.
+    let delegate_resp = wss_rpc_raw(
+        &mut ws,
+        40,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do the thing",
+        }),
+    )
+    .await;
+    let error = delegate_resp
+        .get("error")
+        .unwrap_or_else(|| panic!("hard-false verdict must fail the delegate: {delegate_resp}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "not-authenticated rejection maps to invalid params (§9): {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not authenticated") && message.contains("OpenCode"),
+        "error names the provider and the auth failure: {message}"
+    );
+    assert!(
+        message.contains("opencode login"),
+        "error names the CLI login remedy: {message}"
+    );
+
+    // agent.create rides the same gate via its explicit provider param.
+    let create_resp = wss_rpc_raw(
+        &mut ws,
+        50,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "Blocked",
+            "provider": "opencode",
+        }),
+    )
+    .await;
+    let error = create_resp
+        .get("error")
+        .unwrap_or_else(|| panic!("hard-false verdict must fail the create: {create_resp}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "create rejection maps to invalid params (§9): {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not authenticated") && message.contains("opencode login"),
+        "create error carries the same actionable remedy: {message}"
+    );
+
+    // Fail-fast means fail-clean: no session row was persisted by either call.
+    let list = wss_rpc(&mut ws, 60, "agent.list", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(
+        list["agents"].as_array().map(Vec::len),
+        Some(0),
+        "no session row persisted by the rejected calls: {list}"
     );
 }

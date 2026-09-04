@@ -25,10 +25,10 @@ pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
-    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
-    NewPullRequest, Page, PageParams, PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, Repo,
-    RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
-    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
+    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment, ReviewDecision,
+    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
 pub use token::TokenSource;

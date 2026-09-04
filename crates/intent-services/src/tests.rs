@@ -102,7 +102,7 @@ impl Drop for TempDb {
 }
 
 /// A settings registry (backed by a config file next to the temp db, removed
-/// by [`TempDb`]'s drop) seeding `providers.active = "auggie"`: since
+/// by [`TempDb`]'s drop) seeding `model.defaultProvider = "auggie"`: since
 /// monorepo#3044 there is no positional provider fallback, so tests that
 /// create/delegate agents without an explicit provider or model need a
 /// configured default to resolve to. The `providers.paths` override points
@@ -116,7 +116,10 @@ pub(crate) fn test_registry_with_default_provider(
     let registry = std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
     registry
         .apply(&[
-            ("providers.active".to_string(), serde_json::json!("auggie")),
+            (
+                "model.defaultProvider".to_string(),
+                serde_json::json!("auggie"),
+            ),
             (
                 "providers.paths".to_string(),
                 serde_json::json!({ "auggie": "/bin/sh" }),
@@ -183,6 +186,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -232,6 +236,45 @@ async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
         .expect("note");
     let services = Services::new(store);
     (tmp, services, ws, id)
+}
+
+#[tokio::test]
+async fn settings_revision_gate_orders_mutation_before_snapshot() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store);
+    let gate = services.settings_revision_gate();
+    let held = gate.write().await;
+
+    let update_services = services.clone();
+    let update = tokio::spawn(async move {
+        update_services
+            .settings_update(serde_json::json!([
+                { "path": "git.autoCommit", "value": false }
+            ]))
+            .await
+            .expect("settings.update")
+    });
+    tokio::task::yield_now().await;
+
+    let list_services = services.clone();
+    let list =
+        tokio::spawn(async move { list_services.settings_list().await.expect("settings.list") });
+    assert!(!update.is_finished());
+    assert!(!list.is_finished());
+
+    drop(held);
+    let updated = update.await.expect("update task");
+    let snapshot = list.await.expect("list task");
+    assert_eq!(updated["revision"], serde_json::json!(1));
+    assert_eq!(snapshot["revision"], updated["revision"]);
+    let auto_commit = snapshot["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|entry| entry["path"] == "git.autoCommit")
+        .expect("git.autoCommit");
+    assert_eq!(auto_commit["value"], serde_json::json!(false));
 }
 
 /// `workspace.list` / `workspace.get` populate the iOS card aggregates
@@ -335,6 +378,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
     store
         .insert_agent_session(&mk_agent(
@@ -501,6 +545,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     store
         .insert_agent_session(&mk_session("agent-1", &ws_active))
@@ -632,6 +677,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
 
     for i in 0..WORKSPACES {
@@ -1074,6 +1120,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -1368,6 +1415,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -2017,6 +2065,7 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .expect("session");
@@ -2396,6 +2445,7 @@ async fn task_update_atomic_and_conflict() {
             None,
             Some("done".into()),
             Some("do the thing".into()),
+            None,
         )
         .await
         .expect("update");
@@ -2414,6 +2464,7 @@ async fn task_update_atomic_and_conflict() {
             None,
             Some("todo".into()),
             Some("stale text".into()),
+            None,
         )
         .await
         .unwrap_err();
@@ -2424,7 +2475,13 @@ async fn task_update_atomic_and_conflict() {
 async fn task_update_status_and_not_found() {
     let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
     let r = svc
-        .task_update_status(ws.clone(), id.clone(), "beta".into(), "in-progress".into())
+        .task_update_status(
+            ws.clone(),
+            id.clone(),
+            "beta".into(),
+            "in-progress".into(),
+            None,
+        )
         .await
         .expect("updateStatus");
     assert_eq!(r.status, "in-progress");
@@ -2433,7 +2490,7 @@ async fn task_update_status_and_not_found() {
         "- [ ] alpha\n- [/] beta"
     );
     assert!(svc
-        .task_update_status(ws, id, "ghost".into(), "done".into())
+        .task_update_status(ws, id, "ghost".into(), "done".into(), None)
         .await
         .is_err());
 }
@@ -3891,6 +3948,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     svc.store
         .insert_agent_session(&session)
@@ -4139,6 +4197,258 @@ async fn set_note_content_with_task_block_auto_converts() {
     // The conversion performs a second store write; the response must carry
     // the refetched note's timestamp, not the pre-conversion write time.
     assert_eq!(r.updated_at, persisted.updated_at);
+}
+
+/// The Markdown a spec typically carries: headings, a blank line, a task
+/// checkbox with an `intent://` link, and inline code (monorepo#4208).
+const SPEC_MARKDOWN: &str =
+    "# Spec\n\n## Goal\n\n- [ ] [Do it](intent://local/task/abc-123)\n- [x] use `ws.note.add`";
+
+/// Render `content` the way the agent-facing `note.read` binding does
+/// (`{:>4} | {line}` per line, blank lines included).
+fn numbered_read_presentation(content: &str) -> String {
+    content
+        .split('\n')
+        .enumerate()
+        .map(|(idx, line)| format!("{:>4} | {line}", idx + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn set_note_content_rejects_numbered_read_presentation() {
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let numbered = numbered_read_presentation(SPEC_MARKDOWN);
+    let err = svc
+        .set_note_content(ws.clone(), id.clone(), numbered, true, None, None)
+        .await
+        .expect_err("numbered read presentation must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rawContent"),
+        "remediation must name rawContent: {msg}"
+    );
+    assert!(
+        msg.contains("note.read"),
+        "remediation must name note.read: {msg}"
+    );
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, SPEC_MARKDOWN, "spec must be preserved");
+}
+
+#[tokio::test]
+async fn set_note_content_rejects_numbered_task_note_read_presentation() {
+    // A task note's `note.read` content carries a metadata trailer after the
+    // numbered body; writing that shape back must be rejected too.
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let numbered = format!(
+        "{}\n\n--- Task Metadata ---\nStatus: in_progress\nEstimated Effort: 45m",
+        numbered_read_presentation(SPEC_MARKDOWN)
+    );
+    svc.set_note_content(ws.clone(), id.clone(), numbered, true, None, None)
+        .await
+        .expect_err("numbered task-note read presentation must be rejected");
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, SPEC_MARKDOWN);
+}
+
+#[tokio::test]
+async fn set_note_content_raw_round_trip_preserves_markdown() {
+    // The documented remediation — writing `rawContent` back — must remain a
+    // no-op round trip, and legitimate numbered text inside a fence must pass.
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            SPEC_MARKDOWN.into(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("raw round trip");
+    assert_eq!(r.new_content, SPEC_MARKDOWN);
+
+    let fenced = format!("{SPEC_MARKDOWN}\n\n```text\n   1 | listing\n   2 | example\n```");
+    let r = svc
+        .set_note_content(ws.clone(), id.clone(), fenced.clone(), true, None, None)
+        .await
+        .expect("fenced numbered listing is legitimate content");
+    assert_eq!(r.new_content, fenced);
+
+    // An indented (4-space) code block is one column wider than the read's
+    // `{:>4}` field and must not trip the guard.
+    let indented = "    1 | listing\n    2 | example";
+    let r = svc
+        .set_note_content(ws, id, indented.into(), true, None, None)
+        .await
+        .expect("indented code block is legitimate content");
+    assert_eq!(r.new_content, indented);
+}
+
+#[tokio::test]
+async fn content_edit_ops_reject_numbered_read_presentation() {
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let numbered = numbered_read_presentation(SPEC_MARKDOWN);
+
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: numbered.clone(),
+            heading: None,
+            position: None,
+        },
+        None,
+    )
+    .await
+    .expect_err("note.add must reject the numbered read presentation");
+
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "## Goal".into(),
+            new: "   3 | ## Goal\n   4 | ".into(),
+        },
+        None,
+    )
+    .await
+    .expect_err("note.edit must reject a numbered `new`");
+
+    svc.edit_note_lines(
+        ws.clone(),
+        id.clone(),
+        NoteEditLinesInput {
+            start: 3,
+            end: 4,
+            content: "   3 | ## Goal\n   4 | ".into(),
+        },
+        None,
+    )
+    .await
+    .expect_err("note.editLines must reject numbered `content`");
+
+    svc.update_note(
+        ws.clone(),
+        id.clone(),
+        NoteUpdateInput {
+            content: Some(numbered.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("note.update must reject numbered `content`");
+
+    svc.create_note(
+        ws.clone(),
+        NoteCreate {
+            title: "Copy".into(),
+            content: Some(numbered),
+            tags: None,
+            parent_id: None,
+        },
+        None,
+        None,
+    )
+    .await
+    .expect_err("note.create must reject numbered `content`");
+
+    let persisted = svc.get_note(ws.clone(), id).await.expect("get");
+    assert_eq!(persisted.content, SPEC_MARKDOWN, "spec must be preserved");
+    let notes = svc.list_notes(&ws).await.expect("list");
+    assert!(
+        notes.iter().all(|n| n.title != "Copy"),
+        "rejected create must not persist a note"
+    );
+}
+
+#[tokio::test]
+async fn set_note_content_rejects_numbered_read_presentation_with_appended_lines() {
+    // The reported incident shape: an agent appends raw Markdown to the
+    // numbered `content` of a read and writes the whole thing back. The
+    // unnumbered tail must not launder the numbered body.
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let appended = format!(
+        "{}\n- [ ] new item\n\n## Notes\nprose",
+        numbered_read_presentation(SPEC_MARKDOWN)
+    );
+    svc.set_note_content(ws.clone(), id.clone(), appended, true, None, None)
+        .await
+        .expect_err("numbered body with appended raw lines must be rejected");
+
+    // An empty task note's read is only the metadata trailer; writing it
+    // back would persist the trailer as Markdown.
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "\n\n--- Task Metadata ---\nStatus: not_started".into(),
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect_err("trailer-only task read must be rejected");
+
+    let persisted = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(persisted.content, SPEC_MARKDOWN, "spec must be preserved");
+}
+
+#[tokio::test]
+async fn create_prerequisite_rejects_numbered_read_presentation() {
+    // `task.createPrerequisite` materializes note content outside the
+    // `note.*` surface; its `content` must hit the same guard and a rejected
+    // call must create no child note (monorepo#4299).
+    let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
+    let numbered = numbered_read_presentation(SPEC_MARKDOWN);
+    let before = svc.list_notes(&ws).await.expect("list").len();
+
+    let err = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Copied Step".into(),
+            Some(numbered),
+            None,
+            None,
+        )
+        .await
+        .expect_err("numbered read presentation must be rejected");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "guard surfaces as InvalidParams (-32602): {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("note.read") && msg.contains("rawContent"),
+        "remediation must name note.read and rawContent: {msg}"
+    );
+
+    let notes = svc.list_notes(&ws).await.expect("list");
+    assert_eq!(notes.len(), before, "rejected create must persist nothing");
+    assert!(notes.iter().all(|n| n.title != "Copied Step"));
+
+    // Raw Markdown (and an absent `content`) still create the child.
+    let r = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Raw Step".into(),
+            Some(SPEC_MARKDOWN.into()),
+            None,
+            None,
+        )
+        .await
+        .expect("raw Markdown content is accepted");
+    let child = svc
+        .get_note(ws.clone(), r.prerequisite_note_id)
+        .await
+        .expect("child");
+    assert_eq!(child.content, SPEC_MARKDOWN);
+    svc.create_prerequisite(ws, id, "Bare Step".into(), None, None, None)
+        .await
+        .expect("absent content is accepted");
 }
 
 #[tokio::test]
@@ -5976,6 +6286,156 @@ async fn query_opt_in_pagination_envelope_and_token() {
     assert!(clamped["nextToken"].is_null());
 }
 
+/// Insert an event whose `data` payload is roughly `data_bytes` bytes.
+async fn insert_big_event(svc: &Services, ws: &WorkspaceId, i: usize, data_bytes: usize) {
+    svc.store()
+        .insert_event(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: format!("2026-01-01T00:{:02}:{:02}Z", i / 60, i % 60),
+            event_type: "note:updated".to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some("a1".to_string()),
+                name: Some("name-a1".to_string()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({ "blob": "x".repeat(data_bytes) }),
+        })
+        .await
+        .expect("insert event");
+}
+
+/// Regression (monorepo#3347): a busy workspace's `event.query` no longer
+/// serializes past the transport's 1 MiB large-frame advisory. Both response
+/// shapes (legacy bare array and paginated envelope) are bounded by
+/// per-row payload trimming with observable `truncated` / `originalBytes`
+/// markers, row count is preserved, and the caller-supplied legacy `limit`
+/// is clamped (a negative value previously meant "no limit" in SQL).
+#[tokio::test]
+async fn query_response_size_is_bounded_below_frame_advisory() {
+    const ONE_MIB: usize = 1024 * 1024;
+    let (_tmp, svc, ws) = event_setup().await;
+    // 60 rows × ~30 KiB ≈ 1.8 MiB serialized — past the advisory before the fix.
+    for i in 0..60 {
+        insert_big_event(&svc, &ws, i, 30 * 1024).await;
+    }
+
+    // Legacy bare array: all 60 rows survive, total stays under 1 MiB, and
+    // trimmed rows carry the additive markers.
+    let rows = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("legacy query");
+    let arr = rows.as_array().expect("bare array (non-paginated)");
+    assert_eq!(arr.len(), 60, "no rows may be dropped");
+    let size = serde_json::to_string(&rows).expect("serialize").len();
+    assert!(
+        size < ONE_MIB,
+        "legacy response must stay under 1 MiB: {size}"
+    );
+    assert!(
+        arr.iter()
+            .any(|r| r["truncated"] == serde_json::json!(true)),
+        "trimming must be observable via row markers"
+    );
+    for row in arr {
+        assert!(row["id"].as_str().is_some(), "identity survives: {row}");
+        assert_eq!(row["type"], serde_json::json!("note:updated"));
+        assert_eq!(row["actor"]["type"], serde_json::json!("agent"));
+        if row["truncated"] == serde_json::json!(true) {
+            assert!(row["originalBytes"].as_u64().is_some(), "marker: {row}");
+        }
+    }
+
+    // Paginated envelope: same bound on a full page.
+    let page = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(200),
+                paginate: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("paginated query");
+    assert_eq!(page["items"].as_array().expect("items").len(), 60);
+    let size = serde_json::to_string(&page).expect("serialize").len();
+    assert!(
+        size < ONE_MIB,
+        "paginated response must stay under 1 MiB: {size}"
+    );
+
+    // Legacy limit clamp: a negative limit no longer means "no limit" — it
+    // clamps to 1 row instead of returning the whole table.
+    let neg = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(-1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("negative-limit query");
+    assert_eq!(neg.as_array().expect("bare array").len(), 1);
+
+    // A small query on the same store is returned untouched: no markers.
+    // (The clamp's UPPER bound is pinned by query_legacy_limit_upper_clamp.)
+    let small = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("small query");
+    let small_arr = small.as_array().expect("bare array");
+    assert_eq!(small_arr.len(), 3);
+    assert!(
+        small_arr.iter().all(|r| r.get("truncated").is_none()),
+        "under-budget responses stay byte-identical: {small}"
+    );
+}
+
+/// The legacy `event.query` limit's UPPER bound (monorepo#3347): a limit past
+/// 500 is clamped to exactly 500 rows — the second half of the [1, 500]
+/// contract (the lower bound is covered by the regression test above).
+#[tokio::test]
+async fn query_legacy_limit_upper_clamp() {
+    let (_tmp, svc, ws) = event_setup().await;
+    for i in 0..510 {
+        insert_big_event(&svc, &ws, i, 16).await;
+    }
+    let rows = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(1000),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("over-limit query");
+    assert_eq!(
+        rows.as_array().expect("bare array").len(),
+        500,
+        "limit > 500 clamps to EVENT_QUERY_MAX_LEGACY_LIMIT rows"
+    );
+}
+
 #[tokio::test]
 async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
     let (_tmp, svc, ws) = event_setup().await;
@@ -6074,6 +6534,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .expect("insert agent session");
@@ -6427,6 +6888,7 @@ mod change_event_parity {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -6662,6 +7124,7 @@ mod change_event_parity {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -6815,6 +7278,7 @@ mod change_event_parity {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -7797,6 +8261,7 @@ mod change_event_parity {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -7821,9 +8286,11 @@ mod change_event_parity {
             .await
             .expect("insert session");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
+        assert!(flipped, "a persisted flip reports true");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
@@ -7861,9 +8328,11 @@ mod change_event_parity {
         let agent_id = AgentId::from("agent-noop");
         let before = h.store.get_workspace(&h.ws).await.expect("row");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
+        assert!(!flipped, "no flip on an active workspace");
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
@@ -7884,13 +8353,75 @@ mod change_event_parity {
         let agent_id = AgentId::from("agent-fail");
         let missing = WorkspaceId::from("ws-does-not-exist");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&missing, &agent_id)
             .await;
+        assert!(!flipped, "a failed read reports no flip");
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "failed read must emit nothing, got: {quiet:?}"
+        );
+    }
+
+    /// The losing racer on the auto path: when the conditional store flip
+    /// declines (the row is already Active — another turn start or a manual
+    /// unarchive won the race between this caller's `archived: true` read
+    /// and its write), the call reports `flipped = false` and emits NOTHING
+    /// — the winner's stamped delta already announced the flip, and the
+    /// loser must not persist a notice for a flip it did not perform.
+    /// Exercised via `unarchive_workspace_inner` directly: the in-race
+    /// interleaving (read archived → lose the write) is not otherwise
+    /// reachable deterministically.
+    #[tokio::test]
+    async fn auto_unarchive_losing_racer_reports_no_flip_and_emits_nothing() {
+        let h = harness().await;
+        // The row is Active — the state the losing racer's conditional
+        // write observes after the winner's flip.
+        let mut sub = subscribe(&h);
+        let stamp = json!({
+            "reason": "agent_activity",
+            "agentId": "agent-loser",
+            "agentName": "Builder",
+        });
+        let (ws, flipped) = h
+            .services
+            .unarchive_workspace_inner(h.ws.clone(), Some(stamp))
+            .await
+            .expect("losing racer still succeeds");
+        assert!(!flipped, "the losing racer must not claim the flip");
+        assert!(!ws.archived, "the returned row reflects the Active state");
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "the losing racer must emit nothing, got: {quiet:?}"
+        );
+    }
+
+    /// The manual RPC stays idempotent: `unarchive_workspace` on an
+    /// already-Active workspace still succeeds and still emits the delta
+    /// (no stamp) — the flipped-only short-circuit is auto-path-only.
+    #[tokio::test]
+    async fn manual_unarchive_on_active_workspace_stays_idempotent() {
+        use intent_core::WorkspaceApi;
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let ws = h
+            .services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("idempotent unarchive");
+        assert!(!ws.archived);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"]["changes"],
+            json!({
+                "archived": false,
+                "status": "Active",
+                "archivedAt": null,
+            })
         );
     }
 
@@ -7908,9 +8439,11 @@ mod change_event_parity {
         h.store.update_workspace(&ws).await.expect("archive row");
         let agent_id = AgentId::from("agent-no-row");
         let mut sub = subscribe(&h);
-        h.services
+        let flipped = h
+            .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
+        assert!(flipped, "the flip persists despite the missing session row");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
@@ -8606,6 +9139,118 @@ mod change_event_parity {
         );
     }
 
+    /// `workspace.create` persists a valid `contextLinks` param (§5.1): the
+    /// returned workspace carries it, the row round-trips it through the
+    /// store, and its JSON wire shape matches the documented camelCase +
+    /// lowercase-kind contract.
+    #[tokio::test]
+    async fn workspace_create_persists_context_links() {
+        use intent_core::{ContextLink, ContextLinkKind, WorkspaceCreate};
+        let h = harness().await;
+        let links = vec![ContextLink {
+            kind: ContextLinkKind::Issue,
+            url: "https://github.com/intent-hq/intent/issues/42".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intent".to_string(),
+            number: 42,
+        }];
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Ctx links".to_string()),
+                    context_links: Some(links.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(created.context_links.as_deref(), Some(&links[..]));
+        let row = h.store.get_workspace(&created.id).await.expect("get row");
+        assert_eq!(row.context_links.as_deref(), Some(&links[..]));
+        let v = serde_json::to_value(&row).expect("workspace json");
+        assert_eq!(
+            v["contextLinks"],
+            json!([{
+                "kind": "issue",
+                "url": "https://github.com/intent-hq/intent/issues/42",
+                "owner": "intent-hq",
+                "repo": "intent",
+                "number": 42,
+            }])
+        );
+    }
+
+    /// `workspace.create` `contextLinks` validation (§5.1): empty string
+    /// fields, a zero `number`, or an over-bound list reject `-32602` before
+    /// any state change; an empty list persists as absent (wire omits it).
+    #[tokio::test]
+    async fn workspace_create_context_links_validation() {
+        use intent_core::{ContextLink, ContextLinkKind, WorkspaceCreate};
+        let h = harness().await;
+        let valid = ContextLink {
+            kind: ContextLinkKind::Pr,
+            url: "https://github.com/intent-hq/intentd/pull/7".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intentd".to_string(),
+            number: 7,
+        };
+        let create = |links: Vec<ContextLink>| WorkspaceCreate {
+            title: Some("Ctx invalid".to_string()),
+            context_links: Some(links),
+            ..Default::default()
+        };
+        let cases: Vec<(Vec<ContextLink>, &str)> = vec![
+            (
+                vec![ContextLink {
+                    url: "  ".to_string(),
+                    ..valid.clone()
+                }],
+                "contextLinks[0].url",
+            ),
+            (
+                vec![ContextLink {
+                    owner: String::new(),
+                    ..valid.clone()
+                }],
+                "contextLinks[0].owner",
+            ),
+            (
+                vec![ContextLink {
+                    number: 0,
+                    ..valid.clone()
+                }],
+                "contextLinks[0].number",
+            ),
+            (vec![valid.clone(); 21], "at most 20 entries"),
+        ];
+        for (links, needle) in cases {
+            let err = h
+                .services
+                .create_workspace(create(links), None)
+                .await
+                .expect_err("invalid contextLinks must reject");
+            match err {
+                intent_core::Error::InvalidParams(msg) => {
+                    assert!(msg.contains(needle), "expected `{needle}` in `{msg}`");
+                }
+                other => panic!("expected InvalidParams, got {other:?}"),
+            }
+        }
+        // Empty list: accepted, persisted as absent, omitted from the wire.
+        let created = h
+            .services
+            .create_workspace(create(vec![]), None)
+            .await
+            .expect("empty list accepted")
+            .workspace;
+        assert!(created.context_links.is_none());
+        let v = serde_json::to_value(&created).expect("workspace json");
+        assert!(v.get("contextLinks").is_none(), "wire omits empty list");
+    }
+
     /// Mirror-at-creation (spec Diagnosis §3b): `workspace.create` seeds the
     /// per-workspace auto-commit override from the global `git.autoCommit` in
     /// force at create time, so `workspace.getAutoCommit` reports
@@ -9109,24 +9754,91 @@ mod change_event_parity {
         assert_eq!(ev["data"]["noteId"], "spec");
     }
 
-    /// A `note.list` for a workspace id that has no matching workspace row
-    /// must not regress from `Ok([])` to `Err`: the reseed attempt trips the
-    /// `note.workspace_id → workspace.id` FK, but the failure is swallowed
-    /// (best-effort self-heal) and the empty listing is returned unchanged.
-    /// No `note:created` fires.
+    /// Regression guard for monorepo#3404: a `note.list` for a workspace id
+    /// that has no matching workspace row returns `NotFound("workspace …")` —
+    /// the spec reseed verifies the workspace exists before any INSERT, so no
+    /// raw `note.workspace_id → workspace.id` FK violation occurs and no
+    /// `note:created` fires.
     #[tokio::test]
-    async fn note_list_tolerates_reseed_failure_for_unknown_workspace() {
+    async fn note_list_returns_workspace_not_found_for_unknown_workspace() {
         let h = harness().await;
         let mut sub = h.bus.subscribe(SubscriptionFilter::default());
         let unknown = intent_core::WorkspaceId::new();
 
-        let notes = h.services.list_notes(&unknown).await.expect("list");
-        assert!(notes.is_empty());
+        let err = h
+            .services
+            .list_notes(&unknown)
+            .await
+            .expect_err("unknown workspace must error");
+        match err {
+            intent_core::Error::NotFound(msg) => {
+                assert!(
+                    msg.contains("workspace"),
+                    "not-found must name the workspace, got: {msg}"
+                );
+            }
+            other => panic!("expected NotFound, got: {other:?}"),
+        }
 
         let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(
             none.is_err(),
             "unknown-workspace list must not publish a reseed event"
+        );
+    }
+
+    /// Regression guard for monorepo#3404 (deletion shape): after a workspace
+    /// row is deleted, `note.list` with the stale id returns
+    /// `NotFound("workspace …")` instead of attempting the spec reseed INSERT
+    /// against the gone FK target. No `note:created` fires.
+    #[tokio::test]
+    async fn note_list_returns_workspace_not_found_after_workspace_deletion() {
+        use intent_core::{NoteId, WorkspaceCreate};
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Doomed".to_string()),
+                    branch: Some("feat/doomed-list".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let _ = recv_one(&mut sub).await; // workspace:created
+        let _ = recv_one(&mut sub).await; // note:created (initial seed)
+        let _ = recv_one(&mut sub).await; // workspace:setup:completed (no worktree)
+
+        // Drop the spec first so the reseed path (not the spec-exists fast
+        // path) is what the stale list exercises, then delete the workspace
+        // row itself. Store-level deletes publish nothing.
+        h.store
+            .delete_note(&created.id, &NoteId::from("spec"))
+            .await
+            .expect("delete spec");
+        h.store
+            .delete_workspace(&created.id)
+            .await
+            .expect("delete workspace");
+
+        let err = h
+            .services
+            .list_notes(&created.id)
+            .await
+            .expect_err("deleted workspace must error");
+        assert!(
+            matches!(&err, intent_core::Error::NotFound(msg) if msg.contains("workspace")),
+            "expected workspace NotFound, got: {err:?}"
+        );
+
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(
+            none.is_err(),
+            "deleted-workspace list must not publish a reseed event"
         );
     }
 
@@ -9550,6 +10262,1086 @@ mod change_event_parity {
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(quiet.is_err(), "healthy workspace must not fire adoption");
     }
+
+    // -----------------------------------------------------------------------
+    // Linked-checkbox materialization (intent-hq/intent#4255): a checkbox that
+    // links a task note is a projection of that note's status, so every
+    // daemon-side status write rewrites the linked lines' markers.
+    // -----------------------------------------------------------------------
+
+    /// Insert a task note directly (no event) with the given status.
+    async fn insert_task_note(h: &Harness, id: &str, status: TaskStatus) {
+        let mut tn = note(&h.ws, id, "body");
+        tn.metadata.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        h.store.insert_note(&tn).await.expect("insert task note");
+    }
+
+    /// Flip a task note's status in the store only (no events, no
+    /// materialization) — stages "the task write already landed" for tests
+    /// that drive the materializer by hand.
+    async fn set_task_status_direct(h: &Harness, id: &str, status: TaskStatus) {
+        let mut tn = h
+            .store
+            .get_note(&h.ws, &intent_core::NoteId::from(id))
+            .await
+            .expect("get task note");
+        tn.metadata.task.as_mut().expect("task metadata").status = status;
+        h.store.update_note(&tn).await.expect("update task note");
+    }
+
+    async fn note_content(h: &Harness, id: &str) -> (String, i64) {
+        let n = h
+            .store
+            .get_note(&h.ws, &intent_core::NoteId::from(id))
+            .await
+            .expect("get note");
+        (n.content, n.rev)
+    }
+
+    async fn set_status(h: &Harness, id: &str, status: &str) {
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from(id),
+                status.to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("updateNoteStatus");
+    }
+
+    const T1: &str = "a1a1";
+    const T2: &str = "b2b2";
+    const FRESH: &str = "c3c3";
+
+    fn linked(marker: &str, label: &str, id: &str) -> String {
+        format!("- {marker} [{label}](intent://local/task/{id})")
+    }
+
+    #[tokio::test]
+    async fn update_note_status_materializes_linked_checkbox() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = format!("# Spec\n{}\n- [ ] plain", linked("[ ]", "T", T1));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        set_status(&h, T1, "complete").await;
+        let events = drain_events(&mut sub).await;
+
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(
+            content,
+            format!("# Spec\n{}\n- [ ] plain", linked("[x]", "T", T1))
+        );
+        assert_eq!(rev, rev_before + 1, "parent write bumps rev");
+        let updated = of_type(&events, "note:updated");
+        assert!(
+            updated.iter().any(|e| e["data"]["noteId"] == "spec"),
+            "note:updated for the spec expected, got {events:?}"
+        );
+        let rows = h
+            .services
+            .list_note_tasks(h.ws.clone(), intent_core::NoteId::from("spec"))
+            .await
+            .expect("listTasks");
+        let row = rows
+            .iter()
+            .find(|r| r.task_note_id.as_deref() == Some(T1))
+            .expect("linked row");
+        assert_eq!(row.status, "done");
+        assert_eq!(rows[1].status, "todo");
+    }
+
+    #[tokio::test]
+    async fn update_note_status_reverse_transitions_and_cancelled() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::Complete).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[x]", "T", T1)))
+            .await
+            .expect("insert spec");
+
+        set_status(&h, T1, "in_progress").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        set_status(&h, T1, "not_started").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+        set_status(&h, T1, "complete").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        set_status(&h, T1, "cancelled").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+    }
+
+    #[tokio::test]
+    async fn materialization_covers_every_linked_line_and_skips_unlinked_notes() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let spec_body = |m: &str| {
+            format!(
+                "{}\n  - [ ] nested plain\n{}\n{}",
+                linked(m, "T", T1),
+                linked("[ ]", "Other", T2),
+                linked(m, "T again", T1)
+            )
+        };
+        h.store
+            .insert_note(&note(&h.ws, "spec", &spec_body("[ ]")))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&note(&h.ws, "plan", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert plan");
+        let other_body = format!("{}\n- [ ] free", linked("[ ]", "O", T2));
+        h.store
+            .insert_note(&note(&h.ws, "other", &other_body))
+            .await
+            .expect("insert other");
+        let (_, other_rev) = note_content(&h, "other").await;
+
+        let mut sub = subscribe(&h);
+        set_status(&h, T1, "complete").await;
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(note_content(&h, "spec").await.0, spec_body("[x]"));
+        assert_eq!(note_content(&h, "plan").await.0, linked("[x]", "T", T1));
+        let (other_content, other_rev_after) = note_content(&h, "other").await;
+        assert_eq!(other_content, other_body);
+        assert_eq!(other_rev_after, other_rev, "unlinked note keeps its rev");
+        let updated: Vec<&Value> = of_type(&events, "note:updated");
+        assert!(updated.iter().any(|e| e["data"]["noteId"] == "spec"));
+        assert!(updated.iter().any(|e| e["data"]["noteId"] == "plan"));
+        assert!(
+            !updated.iter().any(|e| e["data"]["noteId"] == "other"),
+            "no note:updated for an unlinked note, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_char_status_write_does_not_rewrite_parent() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        // not_started → blocked keeps `[ ]`: no parent write, no event.
+        set_status(&h, T1, "blocked").await;
+        let events = drain_events(&mut sub).await;
+
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, linked("[ ]", "T", T1));
+        assert_eq!(rev, rev_before);
+        assert!(!of_type(&events, "note:updated")
+            .iter()
+            .any(|e| e["data"]["noteId"] == "spec"));
+    }
+
+    /// The workspace list a status write hands to materialization only selects
+    /// candidate parents; each parent is rewritten from a fresh, versioned
+    /// read. A snapshot that predates another task's materialized `[x]` and an
+    /// editor save must not revert either (lost-update race from the #1696
+    /// review).
+    #[tokio::test]
+    async fn materialization_writes_from_a_fresh_read_not_the_stale_snapshot() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let body = |a: &str, b: &str| format!("{}\n{}", linked(a, "A", T1), linked(b, "B", T2));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]", "[ ]")))
+            .await
+            .expect("insert spec");
+
+        // B's status write lists the workspace before A's parent write lands.
+        let stale = h.store.list_notes(&h.ws).await.expect("list");
+        set_status(&h, T1, "complete").await;
+        // An editor save lands in the same window.
+        let mut edited = h.store.get_note(&h.ws, &spec_id()).await.expect("get spec");
+        edited.content = format!("{}\n- [ ] added by editor", body("[x]", "[ ]"));
+        h.store.update_note(&edited).await.expect("editor save");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        set_task_status_direct(&h, T2, TaskStatus::Complete).await;
+        h.services
+            .materialize_linked_checkboxes_in(&h.ws, &intent_core::NoteId::from(T2), stale)
+            .await;
+        let events = drain_events(&mut sub).await;
+
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(
+            content,
+            format!("{}\n- [ ] added by editor", body("[x]", "[x]")),
+            "A's marker and the editor's line survive B's materialization"
+        );
+        assert_eq!(rev, rev_before + 1, "exactly one versioned parent write");
+        assert!(of_type(&events, "note:updated")
+            .iter()
+            .any(|e| e["data"]["noteId"] == "spec"));
+    }
+
+    /// Two linked tasks in one parent completing concurrently (the
+    /// `after_all` delegation-group case) both end up materialized.
+    #[tokio::test]
+    async fn concurrent_status_writes_in_one_parent_both_materialize() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let body = |a: &str, b: &str| format!("{}\n{}", linked(a, "A", T1), linked(b, "B", T2));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]", "[ ]")))
+            .await
+            .expect("insert spec");
+
+        tokio::join!(
+            set_status(&h, T1, "complete"),
+            set_status(&h, T2, "complete")
+        );
+
+        assert_eq!(note_content(&h, "spec").await.0, body("[x]", "[x]"));
+        let rows = h
+            .services
+            .list_note_tasks(h.ws.clone(), spec_id())
+            .await
+            .expect("listTasks");
+        assert!(rows.iter().all(|r| r.status == "done"), "{rows:?}");
+    }
+
+    /// Two transitions of the same task racing (`complete`, then
+    /// `in_progress`): a delayed materialization for the earlier write must
+    /// not stamp its stale `[x]` over the `[/]` the later one already
+    /// projected — the marker is derived from the task's status at write
+    /// time, not from the status the caller captured (#1696 review).
+    #[tokio::test]
+    async fn delayed_materialization_projects_the_current_task_status_not_the_stale_one() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+
+        // The first write lists the workspace, then stalls before its parent
+        // write while a second transition lands and materializes.
+        let stale = h.store.list_notes(&h.ws).await.expect("list");
+        set_status(&h, T1, "complete").await;
+        set_status(&h, T1, "in_progress").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .materialize_linked_checkboxes_in(&h.ws, &intent_core::NoteId::from(T1), stale)
+            .await;
+        let events = drain_events(&mut sub).await;
+
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(
+            content,
+            linked("[/]", "T", T1),
+            "the delayed write projects the task's current status"
+        );
+        assert_eq!(rev, rev_before, "marker already current: no parent write");
+        assert_eq!(spec_updates(&events), 0, "{events:?}");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_materializes_linked_checkbox() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = format!("{}\n- [ ] plain", linked("[ ]", "T", T1));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from(T1),
+                "complete".to_string(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            format!("{}\n- [ ] plain", linked("[x]", "T", T1))
+        );
+        assert!(of_type(&events, "note:updated")
+            .iter()
+            .any(|e| e["data"]["noteId"] == "spec"));
+
+        // A fresh markAsTask (note was not a task yet) materializes too.
+        h.store
+            .insert_note(&note(&h.ws, FRESH, "body"))
+            .await
+            .expect("insert fresh");
+        h.store
+            .insert_note(&note(&h.ws, "spec2", &linked("[ ]", "F", FRESH)))
+            .await
+            .expect("insert spec2");
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from(FRESH),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask fresh");
+        assert_eq!(note_content(&h, "spec2").await.0, linked("[/]", "F", FRESH));
+    }
+
+    #[tokio::test]
+    async fn assign_agent_materializes_linked_checkbox() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = format!("{}\n- [ ] plain", linked("[ ]", "T", T1));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .assign_agent(
+                h.ws.clone(),
+                intent_core::NoteId::from(T1),
+                "agent-b0a8044a-5eac-4b52-8456-15d3b784decb".to_string(),
+                None,
+            )
+            .await
+            .expect("assignAgent");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            format!("{}\n- [ ] plain", linked("[/]", "T", T1))
+        );
+        assert!(of_type(&events, "note:updated")
+            .iter()
+            .any(|e| e["data"]["noteId"] == "spec"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkbox-level writes on linked lines redirect to the task note
+    // (intent-hq/intent#4255): `task.updateStatus` / `task.update` write the
+    // task's metadata status, the char follows via materialization.
+    // -----------------------------------------------------------------------
+
+    async fn task_status(h: &Harness, id: &str) -> TaskStatus {
+        h.store
+            .get_note(&h.ws, &intent_core::NoteId::from(id))
+            .await
+            .expect("get task note")
+            .metadata
+            .task
+            .expect("task metadata")
+            .status
+    }
+
+    fn spec_updates(events: &[Value]) -> usize {
+        of_type(events, "note:updated")
+            .iter()
+            .filter(|e| e["data"]["noteId"] == "spec")
+            .count()
+    }
+
+    fn spec_id() -> intent_core::NoteId {
+        intent_core::NoteId::from("spec")
+    }
+
+    #[tokio::test]
+    async fn update_status_on_linked_line_redirects_to_task_note() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = |m: &str| format!("# Spec\n{}\n- [ ] plain", linked(m, "T", T1));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]")))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(r.task_text, "T");
+        assert_eq!(r.note_id, spec_id());
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, body("[x]"));
+        assert_eq!(rev, rev_before + 1, "exactly one parent write");
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T1);
+        assert_eq!(changed[0]["data"]["previousStatus"], "not_started");
+        assert_eq!(changed[0]["data"]["newStatus"], "complete");
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+
+        // The unlinked line on the same note keeps the raw path: no task write.
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(
+                h.ws.clone(),
+                spec_id(),
+                "plain".into(),
+                "in-progress".into(),
+                None,
+            )
+            .await
+            .expect("updateStatus plain");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(r.status, "in-progress");
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            format!("# Spec\n{}\n- [/] plain", linked("[x]", "T", T1))
+        );
+        assert!(of_type(&events, "task:status-changed").is_empty());
+        assert_eq!(spec_updates(&events), 1);
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+    }
+
+    /// `NoteId` is an arbitrary string. A linked row whose id is not a
+    /// hex/dash shape (`task-a`) passes the materialization prefilter
+    /// (`extract_spec_task_ids`) and must be rewritten and redirected like
+    /// a UUID-shaped one — not left with a stale marker / raw fallback.
+    #[tokio::test]
+    async fn non_hex_linked_task_ids_materialize_and_redirect() {
+        const ID: &str = "task-a";
+        let h = harness().await;
+        insert_task_note(&h, ID, TaskStatus::NotStarted).await;
+        let body = |m: &str| format!("# Spec\n{}\n- [ ] plain", linked(m, "T", ID));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]")))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        // Task-side status write → the parent's marker follows.
+        set_status(&h, ID, "in_progress").await;
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, body("[/]"));
+        assert_eq!(rev, rev_before + 1, "materialization writes the parent");
+
+        // Parent-side checkbox write on the linked line → redirected to the
+        // task, no raw checkbox write.
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(r.status, "done");
+        assert_eq!(task_status(&h, ID).await, TaskStatus::Complete);
+        assert_eq!(note_content(&h, "spec").await.0, body("[x]"));
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], ID);
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+
+        // listTasks projects the link too.
+        let rows = h
+            .services
+            .list_note_tasks(h.ws.clone(), spec_id())
+            .await
+            .expect("listTasks");
+        let row = rows.iter().find(|r| r.text == "T").expect("linked row");
+        assert_eq!(row.linked_task_note_id.as_deref(), Some(ID));
+    }
+
+    #[tokio::test]
+    async fn task_update_on_linked_line_redirects_status_to_task_note() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+        let link = format!("[T](intent://local/task/{T1})");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("in-progress".into()),
+                Some(link.clone()),
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "in-progress");
+        assert_eq!(r.line_number, 1);
+        assert_eq!(r.previous_text, link);
+        assert_eq!(r.new_text, link);
+        assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T1);
+        assert_eq!(changed[0]["data"]["newStatus"], "in_progress");
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+
+        // `expected` mismatch still conflicts before anything is written.
+        let err = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("done".into()),
+                Some("stale".into()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, intent_core::Error::Internal(ref m) if m.contains("Conflict detected"))
+        );
+        assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+    }
+
+    #[tokio::test]
+    async fn task_update_text_and_status_on_linked_line_writes_parent_once() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(
+                &h.ws,
+                "spec",
+                &format!("{}\n- [ ] plain", linked("[ ]", "T", T1)),
+            ))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+        let new_text = format!("[Renamed](intent://local/task/{T1}) more");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                Some(new_text.clone()),
+                Some("done".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(r.previous_text, format!("[T](intent://local/task/{T1})"));
+        assert_eq!(r.new_text, new_text);
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, format!("- [x] {new_text}\n- [ ] plain"));
+        assert_eq!(
+            rev,
+            rev_before + 1,
+            "text edit and materialized char land in one parent write"
+        );
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+        assert_eq!(of_type(&events, "task:status-changed").len(), 1);
+    }
+
+    /// `text` that retargets the line's link from task A to task B: the
+    /// redirect resolves against the post-edit line, so the status write
+    /// lands on B, the line carries B's marker, and A is untouched (#1696
+    /// review).
+    #[tokio::test]
+    async fn task_update_retargeting_the_link_redirects_status_to_the_new_task() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "A", T1)))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+        let new_text = format!("[B](intent://local/task/{T2})");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                Some(new_text.clone()),
+                Some("done".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(r.previous_text, format!("[A](intent://local/task/{T1})"));
+        assert_eq!(r.new_text, new_text);
+        assert_eq!(task_status(&h, T2).await, TaskStatus::Complete);
+        assert_eq!(
+            task_status(&h, T1).await,
+            TaskStatus::NotStarted,
+            "the former target is no longer linked here"
+        );
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, linked("[x]", "B", T2));
+        assert_eq!(rev, rev_before + 1, "one parent write");
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T2);
+        assert_eq!(changed[0]["data"]["newStatus"], "complete");
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+    }
+
+    /// A text-only retarget to a task in a different status renders that
+    /// task's marker: the char is a projection of the (new) linked task.
+    #[tokio::test]
+    async fn task_update_text_only_retarget_renders_the_new_tasks_marker() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::InProgress).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "A", T1)))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+        let new_text = format!("[B](intent://local/task/{T2})");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                Some(new_text.clone()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "in-progress");
+        assert_eq!(r.new_text, new_text);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, linked("[/]", "B", T2));
+        assert_eq!(rev, rev_before + 1, "one parent write");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::NotStarted);
+        assert_eq!(task_status(&h, T2).await, TaskStatus::InProgress);
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn todo_on_linked_line_preserves_detailed_task_status() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::Blocked).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+        let (_, rev_before) = note_content(&h, "spec").await;
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into(), None)
+            .await
+            .expect("updateStatus todo");
+        let r2 = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("todo".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update todo");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "todo");
+        assert_eq!(r2.status, "todo");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Blocked);
+        let (content, rev) = note_content(&h, "spec").await;
+        assert_eq!(content, linked("[ ]", "T", T1));
+        assert_eq!(
+            rev, rev_before,
+            "no parent write when the char already projects the status"
+        );
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 0, "{events:?}");
+
+        // From a status projecting a different char, `todo` reopens to not_started.
+        set_status(&h, T1, "complete").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "todo".into(), None)
+            .await
+            .expect("updateStatus reopen");
+        assert_eq!(r.status, "todo");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::NotStarted);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+
+        set_status(&h, T1, "in_progress").await;
+        assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
+        let r = h
+            .services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("todo".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update reopen");
+        assert_eq!(r.status, "todo");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::NotStarted);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
+    }
+
+    #[tokio::test]
+    async fn linked_line_write_heals_a_diverged_char() {
+        // The task is already complete but the line still reads `[ ]`: `done`
+        // is a no-op on the task and rewrites the char via materialization.
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::Complete).await;
+        h.store
+            .insert_note(&note(&h.ws, "spec", &linked("[ ]", "T", T1)))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(r.status, "done");
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 1, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn dangling_task_link_keeps_the_raw_checkbox_write() {
+        let h = harness().await;
+        // FRESH exists but is not a task; `d4d4` does not exist at all.
+        h.store
+            .insert_note(&note(&h.ws, FRESH, "body"))
+            .await
+            .expect("insert fresh");
+        let body =
+            |a: &str, b: &str| format!("{}\n{}", linked(a, "F", FRESH), linked(b, "G", "d4d4"));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body("[ ]", "[ ]")))
+            .await
+            .expect("insert spec");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_status(h.ws.clone(), spec_id(), "F".into(), "done".into(), None)
+            .await
+            .expect("updateStatus");
+        h.services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                2,
+                None,
+                Some("in-progress".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+
+        assert_eq!(note_content(&h, "spec").await.0, body("[x]", "[/]"));
+        assert!(
+            of_type(&events, "task:status-changed").is_empty(),
+            "{events:?}"
+        );
+        assert_eq!(spec_updates(&events), 2, "{events:?}");
+        let fresh = h
+            .store
+            .get_note(&h.ws, &intent_core::NoteId::from(FRESH))
+            .await
+            .expect("get fresh");
+        assert!(fresh.metadata.task.is_none());
+    }
+
+    fn attribution_recompute_scheduled(h: &Harness, id: &str) -> bool {
+        h.services
+            .line_attribution_debouncers
+            .lock()
+            .expect("debouncer lock")
+            .contains_key(&(h.ws.clone(), intent_core::NoteId::from(id)))
+    }
+
+    fn seed_crdt_session(h: &Harness, id: &str, content: &str) {
+        let nid = intent_core::NoteId::from(id);
+        h.services
+            .crdt_notes
+            .apply_full_content(&h.ws, &nid, content, content);
+        assert!(h.services.crdt_notes.has_session(&h.ws, &nid));
+    }
+
+    /// A materialized parent write is a surgical content mutation like
+    /// `note.edit`: it drops the parent's cached CRDT session (so the next
+    /// `note.setContent` reseeds from the persisted marker) and schedules its
+    /// line-attribution recompute. Parents left untouched — and the task note
+    /// itself — keep their sessions and schedule nothing.
+    #[tokio::test]
+    async fn materialization_invalidates_parent_crdt_and_schedules_attribution_recompute() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        insert_task_note(&h, T2, TaskStatus::NotStarted).await;
+        let body = linked("[ ]", "T", T1);
+        let other = linked("[ ]", "Other", T2);
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&note(&h.ws, FRESH, &other))
+            .await
+            .expect("insert other");
+        seed_crdt_session(&h, "spec", &body);
+        seed_crdt_session(&h, FRESH, &other);
+
+        set_status(&h, T1, "complete").await;
+
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        assert!(
+            !h.services.crdt_notes.has_session(&h.ws, &spec_id()),
+            "rewritten parent drops its CRDT session"
+        );
+        assert!(
+            attribution_recompute_scheduled(&h, "spec"),
+            "rewritten parent schedules a line-attribution recompute"
+        );
+        assert!(h
+            .services
+            .crdt_notes
+            .has_session(&h.ws, &intent_core::NoteId::from(FRESH)));
+        assert!(!attribution_recompute_scheduled(&h, FRESH));
+        assert!(!attribution_recompute_scheduled(&h, T1));
+
+        // The marker already matches: no rewrite, so no invalidation either.
+        seed_crdt_session(&h, "spec", &linked("[x]", "T", T1));
+        set_status(&h, T1, "complete").await;
+        assert!(h.services.crdt_notes.has_session(&h.ws, &spec_id()));
+    }
+
+    /// Redirected writes through `task.updateStatus` / `task.update` behave as
+    /// on every other materializing path: the redirect target's parents are
+    /// invalidated too (here the parent is the note the call addressed).
+    #[tokio::test]
+    async fn redirected_write_invalidates_parent_crdt() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::NotStarted).await;
+        let body = linked("[ ]", "T", T1);
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        seed_crdt_session(&h, "spec", &body);
+
+        h.services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                1,
+                None,
+                Some("done".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("task.update");
+
+        assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
+        assert!(!h.services.crdt_notes.has_session(&h.ws, &spec_id()));
+        assert!(attribution_recompute_scheduled(&h, "spec"));
+    }
+
+    /// A redirected checkbox write from an agent caller carries the same
+    /// provenance as `task.updateNoteStatus`: `task:status-changed` names the
+    /// agent (payload `agentId` + agent actor) and a complete-boundary crossing
+    /// records / removes the agent's flipped-completion pair. A caller-less
+    /// write (FE/RPC front door) carries neither.
+    #[tokio::test]
+    async fn redirected_writes_carry_agent_provenance_and_flipped_completion() {
+        let h = harness().await;
+        insert_task_note(&h, T1, TaskStatus::InProgress).await;
+        insert_task_note(&h, T2, TaskStatus::InProgress).await;
+        let body = format!("{}\n{}", linked("[/]", "T", T1), linked("[/]", "U", T2));
+        h.store
+            .insert_note(&note(&h.ws, "spec", &body))
+            .await
+            .expect("insert spec");
+        let agent = AgentId::from("agent-redirect");
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent, &h.ws, "Redirector"))
+            .await
+            .expect("session");
+        let flipped = || async {
+            h.store
+                .list_agent_flipped_completions(&agent)
+                .await
+                .expect("list flipped")
+        };
+        let t1 = intent_core::NoteId::from(T1);
+        let t2 = intent_core::NoteId::from(T2);
+
+        // task.updateStatus → complete: provenance + recorded pair.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_status(
+                h.ws.clone(),
+                spec_id(),
+                "T".into(),
+                "done".into(),
+                Some(agent.clone()),
+            )
+            .await
+            .expect("updateStatus");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T1);
+        assert_eq!(changed[0]["data"]["newStatus"], "complete");
+        assert_eq!(changed[0]["data"]["agentId"], "agent-redirect");
+        assert_eq!(
+            changed[0]["actor"],
+            json!({ "type": "agent", "id": "agent-redirect", "name": "Redirector" })
+        );
+        assert_eq!(flipped().await, vec![(h.ws.clone(), t1.clone())]);
+
+        // task.update → complete on the second line: same provenance.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update(
+                h.ws.clone(),
+                spec_id(),
+                2,
+                None,
+                Some("done".into()),
+                None,
+                Some(agent.clone()),
+            )
+            .await
+            .expect("task.update");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert_eq!(changed[0]["data"]["noteId"], T2);
+        assert_eq!(changed[0]["data"]["agentId"], "agent-redirect");
+        assert_eq!(
+            changed[0]["actor"],
+            json!({ "type": "agent", "id": "agent-redirect", "name": "Redirector" })
+        );
+        let mut pairs = flipped().await;
+        pairs.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
+        assert_eq!(
+            pairs,
+            vec![(h.ws.clone(), t1.clone()), (h.ws.clone(), t2.clone())]
+        );
+
+        // Reopening through a redirected write removes the pair.
+        h.services
+            .task_update_status(
+                h.ws.clone(),
+                spec_id(),
+                "T".into(),
+                "todo".into(),
+                Some(agent.clone()),
+            )
+            .await
+            .expect("updateStatus todo");
+        assert_eq!(flipped().await, vec![(h.ws.clone(), t2.clone())]);
+
+        // No caller: system-attributed event, nothing recorded.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_status(h.ws.clone(), spec_id(), "T".into(), "done".into(), None)
+            .await
+            .expect("updateStatus no caller");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "{events:?}");
+        assert!(changed[0]["data"].get("agentId").is_none());
+        assert_eq!(changed[0]["actor"]["type"], "system");
+        assert_eq!(flipped().await, vec![(h.ws.clone(), t2)]);
+    }
 }
 
 /// End-to-end §6.8 "one impl, two front doors": an agent (via the in-process MCP
@@ -9682,6 +11474,7 @@ mod mcp_callback {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -10833,20 +12626,30 @@ mod pr {
         async fn create_issue(&self, _: &RepoRef, _: &str, _: Option<&str>) -> ScResult<Issue> {
             unimplemented!()
         }
-        async fn get_issue(&self, _: &RepoRef, _: u64) -> ScResult<Issue> {
-            unimplemented!()
+        async fn get_issue(&self, _: &RepoRef, number: u64) -> ScResult<Issue> {
+            Ok(Issue {
+                number,
+                ..stub_issue()
+            })
         }
         async fn list_issues(&self, _: &RepoRef, _: IssueQuery) -> ScResult<Page<Issue>> {
             Ok(Page {
-                items: vec![Issue {
-                    number: 11,
-                    title: "Bug report".into(),
-                    body: Some("something broke".into()),
-                    state: "open".into(),
-                    url: "https://github.com/o/r/issues/11".into(),
-                }],
+                items: vec![stub_issue()],
                 next_cursor: None,
             })
+        }
+    }
+
+    fn stub_issue() -> Issue {
+        Issue {
+            number: 11,
+            title: "Bug report".into(),
+            body: Some("something broke".into()),
+            state: "open".into(),
+            url: "https://github.com/o/r/issues/11".into(),
+            author: "reporter".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-02T00:00:00Z".into(),
         }
     }
 
@@ -10922,6 +12725,8 @@ mod pr {
                     required_conversation_resolution: Some(true),
                     required_status_checks: vec!["build".into(), "test".into()],
                 }),
+                is_in_merge_queue: None,
+                merge_queue_removal: None,
             }),
             ..Default::default()
         })
@@ -12520,6 +14325,27 @@ mod pr {
     }
 
     #[tokio::test]
+    async fn github_issues_get_shape() {
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let g = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        let issue = &g["issue"];
+        assert_eq!(issue["number"], 7);
+        assert_eq!(issue["title"], "Bug report");
+        assert_eq!(issue["state"], "open");
+        assert_eq!(issue["htmlUrl"], "https://github.com/o/r/issues/11");
+        assert_eq!(issue["user"]["login"], "reporter");
+        assert_eq!(issue["createdAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(issue["updatedAt"], "2026-01-02T00:00:00Z");
+        assert_eq!(issue["owner"], "o");
+        assert_eq!(issue["repo"], "r");
+        assert_eq!(issue["labels"], json!([]));
+        assert_eq!(issue["comments"], 0);
+    }
+
+    #[tokio::test]
     async fn github_issues_list_and_search_shapes() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
         let l = svc
@@ -12536,6 +14362,10 @@ mod pr {
         assert_eq!(l["issues"][0]["number"], 11);
         assert_eq!(l["issues"][0]["owner"], "o");
         assert_eq!(l["issues"][0]["repo"], "r");
+        // The list DTO carries the real author/timestamps, not placeholders.
+        assert_eq!(l["issues"][0]["user"]["login"], "reporter");
+        assert_eq!(l["issues"][0]["createdAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(l["issues"][0]["updatedAt"], "2026-01-02T00:00:00Z");
         assert!(l["nextToken"].is_null());
 
         let s = svc
@@ -13657,6 +15487,236 @@ mod pr {
             .find(|r| r.pr_status == Some(intent_core::PullRequestStatus::Merged));
         assert!(merged.is_some(), "merged status delta persists");
     }
+
+    // ---- PR-aware workspace.create (pr-kind contextLink) ------------------
+
+    fn pr_context_link() -> intent_core::ContextLink {
+        intent_core::ContextLink {
+            kind: intent_core::ContextLinkKind::Pr,
+            url: "https://github.com/o/r/pull/42".to_string(),
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 42,
+        }
+    }
+
+    async fn create_services(forge: StubForge) -> (TempDb, super::WorkspacesRoot, Services) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = super::WorkspacesRoot::new();
+        let services = Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_source_control(Arc::new(forge));
+        (tmp, ws_root, services)
+    }
+
+    /// A pr-kind contextLink on `workspace.create` links the workspace from
+    /// birth: branch defaults to the PR head branch, `baseRef` to the PR base
+    /// branch, and `pr_number`/`pr_url`/status/snapshot are seeded.
+    #[tokio::test]
+    async fn create_with_pr_context_link_derives_branch_and_base_ref() {
+        let (_t, _r, svc) = create_services(StubForge::default()).await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(created.branch, "feature", "PR head branch checked out");
+        assert_eq!(created.base_ref.as_deref(), Some("main"), "PR base branch");
+        assert_eq!(created.pr_number, Some(42));
+        assert_eq!(
+            created.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+        assert_eq!(
+            created.pr_status,
+            Some(intent_core::PullRequestStatus::Open)
+        );
+        let info = created.active_pull_request.expect("pr snapshot");
+        assert_eq!(info.number, 42);
+        assert_eq!(created.pull_requests.map(|v| v.len()), Some(1));
+    }
+
+    /// Explicit `branch`/`baseRef` params win over PR-derived values; the PR
+    /// linkage (number/url) still seeds from the link.
+    #[tokio::test]
+    async fn create_with_pr_context_link_explicit_params_win() {
+        let (_t, _r, svc) = create_services(StubForge::default()).await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws explicit".to_string()),
+                    branch: Some("my-branch".to_string()),
+                    base_ref: Some("develop".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(created.branch, "my-branch", "explicit branch wins");
+        assert_eq!(
+            created.base_ref.as_deref(),
+            Some("develop"),
+            "explicit baseRef wins"
+        );
+        assert_eq!(created.pr_number, Some(42));
+    }
+
+    /// A failed forge lookup is non-fatal: the create succeeds without the
+    /// PR-derived git setup, keeping the number/url linkage from the link.
+    #[tokio::test]
+    async fn create_with_pr_context_link_forge_failure_is_non_fatal() {
+        let (_t, _r, svc) = create_services(StubForge {
+            missing_pr: Some(42),
+            ..Default::default()
+        })
+        .await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws degraded".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create succeeds despite forge failure")
+            .workspace;
+        assert_ne!(created.branch, "feature", "no PR-derived branch");
+        assert!(created.base_ref.is_none(), "no PR-derived baseRef");
+        assert_eq!(created.pr_number, Some(42), "linkage from the link itself");
+        assert_eq!(
+            created.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+        assert!(created.pr_status.is_none(), "no snapshot without a lookup");
+        assert!(created.active_pull_request.is_none());
+    }
+
+    /// An issue-kind contextLink (no pr-kind entry) leaves the create
+    /// unchanged: no forge lookup, no PR linkage.
+    #[tokio::test]
+    async fn create_with_issue_context_link_stays_unlinked() {
+        let (_t, _r, svc) = create_services(StubForge::default()).await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("Issue ws".to_string()),
+                    context_links: Some(vec![intent_core::ContextLink {
+                        kind: intent_core::ContextLinkKind::Issue,
+                        url: "https://github.com/o/r/issues/7".to_string(),
+                        owner: "o".to_string(),
+                        repo: "r".to_string(),
+                        number: 7,
+                    }]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(created.pr_number.is_none());
+        assert!(created.pr_url.is_none());
+        assert!(created.base_ref.is_none());
+    }
+
+    /// A hung forge connection degrades like a lookup error instead of
+    /// stalling the interactive create: the bounded `get_pr` times out, the
+    /// create succeeds, and the linkage from the link itself survives.
+    #[tokio::test]
+    async fn create_with_pr_context_link_hung_forge_times_out() {
+        let (_t, _r, svc) = create_services(StubForge {
+            hang_get_pr: Some(42),
+            ..Default::default()
+        })
+        .await;
+        let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(200));
+        let created = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            svc.create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws hung forge".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("create does not stall on a hung forge")
+        .expect("create succeeds despite the timeout")
+        .workspace;
+        assert_ne!(created.branch, "feature", "no PR-derived branch");
+        assert!(created.base_ref.is_none(), "no PR-derived baseRef");
+        assert_eq!(created.pr_number, Some(42), "linkage from the link itself");
+        assert!(created.pr_status.is_none(), "no snapshot without a lookup");
+    }
+
+    /// A pr-kind link whose owner/repo mismatch the workspace's known
+    /// repository identity is ignored entirely: no forge lookup, no PR
+    /// linkage, no derived branches.
+    #[tokio::test]
+    async fn create_with_cross_repo_pr_context_link_is_ignored() {
+        let (_t, _r, svc) = create_services(StubForge::default()).await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws cross-repo".to_string()),
+                    repository_owner: Some("other".to_string()),
+                    repository_name: Some("elsewhere".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(created.pr_number.is_none(), "cross-repo link is ignored");
+        assert!(created.pr_url.is_none());
+        assert_ne!(created.branch, "feature", "no PR-derived branch");
+        assert!(created.base_ref.is_none(), "no PR-derived baseRef");
+    }
+
+    /// A context-link-only create seeds `repository_owner`/`repository_name`
+    /// from the link so the persisted PR linkage stays functional (the §7.6
+    /// background refresh keys the forge repo off the row's owner/name) —
+    /// including on the degraded forge-failure path.
+    #[tokio::test]
+    async fn create_with_pr_context_link_seeds_repository_identity() {
+        let (_t, _r, svc) = create_services(StubForge {
+            missing_pr: Some(42),
+            ..Default::default()
+        })
+        .await;
+        let created = svc
+            .create_workspace(
+                intent_core::WorkspaceCreate {
+                    title: Some("PR ws repo identity".to_string()),
+                    context_links: Some(vec![pr_context_link()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(created.repository_owner.as_deref(), Some("o"));
+        assert_eq!(created.repository_name.as_deref(), Some("r"));
+        assert_eq!(created.pr_number, Some(42));
+    }
 }
 
 /// `file-tracking.*` reads + stage/unstage over the M4.7 `tracked_changes` table
@@ -13664,6 +15724,7 @@ mod pr {
 mod file_tracking {
     use super::*;
     use git2::{Repository, Signature};
+    use intent_core::WorkspaceGitRootId;
     use intent_store::NewTrackedChange;
 
     /// A self-cleaning git repository seeded with one commit.
@@ -14201,6 +16262,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14253,6 +16315,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14300,6 +16363,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -14320,7 +16384,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("dirty.txt"), "dirty\n").unwrap();
 
         let err = svc
-            .git_agent_commit(ws, "msg".to_string(), None, None, None, false)
+            .git_agent_commit(ws, "msg".to_string(), None, None, None, false, None)
             .await
             .unwrap_err();
         assert!(
@@ -14347,6 +16411,7 @@ mod file_tracking {
                 None,
                 Some(vec!["dirty.txt".to_string()]),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14384,6 +16449,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -14425,6 +16491,7 @@ mod file_tracking {
                 None,
                 Some(vec!["sub/inner.txt".to_string()]),
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -14454,7 +16521,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("unstaged.txt"), "unstaged\n").unwrap();
 
         let r = svc
-            .git_agent_commit(ws, "checkpoint".to_string(), None, None, None, true)
+            .git_agent_commit(ws, "checkpoint".to_string(), None, None, None, true, None)
             .await
             .unwrap();
         assert_eq!(r.files, vec!["staged.txt".to_string()]);
@@ -14503,6 +16570,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14609,6 +16677,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14714,6 +16783,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14754,6 +16824,7 @@ mod file_tracking {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -14767,6 +16838,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -14790,6 +16862,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14841,6 +16914,7 @@ mod file_tracking {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14861,6 +16935,394 @@ mod file_tracking {
             st.files.is_empty(),
             "worktree clean after the move commit: {st:?}"
         );
+    }
+
+    /// Build a bus-wired service on `repo` plus a second repo registered as a
+    /// secondary git root, returning the registered root's id and path.
+    async fn svc_with_registered_root(
+        repo: &GitRepo,
+    ) -> (TempDb, Services, WorkspaceId, GitRepo, WorkspaceGitRootId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let svc = Services::new(store).with_event_bus(bus);
+        let secondary = init_git_repo();
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().to_string(),
+                AgentId::from("agent-reg"),
+            )
+            .await
+            .unwrap();
+        let root_id = WorkspaceGitRootId(row["id"].as_str().unwrap().to_string());
+        (tmp, svc, ws_id, secondary, root_id)
+    }
+
+    /// `git.agentCommit` with a `gitRootId` and explicit `files` commits in
+    /// the registered secondary root (pathspec-limited, with attribution
+    /// trailers), leaves the primary worktree untouched, and the emitted
+    /// `git:commit` / `changes:git-status` events carry the additive
+    /// `gitRootId` (with status read from the target root).
+    #[tokio::test]
+    async fn agent_commit_targets_registered_root_with_explicit_files() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("root.txt"), "in root\n").unwrap();
+        std::fs::write(repo.dir.join("primary.txt"), "in primary\n").unwrap();
+
+        let r = svc
+            .git_agent_commit(
+                ws.clone(),
+                "root work".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["root.txt".to_string()]),
+                false,
+                Some(root_id.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["root.txt".to_string()]);
+        assert_eq!(r.file_count, 1);
+
+        // The commit landed in the secondary root, not the primary worktree,
+        // and carries the attribution trailer.
+        let history = intent_git::history::history(&secondary.dir, 5).unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert!(history[0].message.contains("root work"));
+        assert_eq!(history[0].agent_id.as_deref(), Some("agent-a"));
+        assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 1);
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        let dirty: Vec<&str> = st.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(dirty.contains(&"primary.txt"), "{dirty:?}");
+
+        // Both events carry the additive `gitRootId`, and the status payload
+        // reflects the (now-clean) target root.
+        let commits = svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].data["gitRootId"], root_id.as_str());
+        let statuses = svc
+            .store()
+            .events_by_type(&ws, "changes:git-status", 10)
+            .await
+            .unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].data["gitRootId"], root_id.as_str());
+        assert_eq!(statuses[0].data["status"]["files"], serde_json::json!([]));
+    }
+
+    /// A `userRequested` `git.agentCommit` with a `gitRootId` and no `files`
+    /// commits the target root's staged index as-is (plain `git commit`
+    /// semantics against the secondary root).
+    #[tokio::test]
+    async fn agent_commit_root_user_requested_commits_staged_index() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("staged.txt"), "staged\n").unwrap();
+        std::fs::write(secondary.dir.join("unstaged.txt"), "unstaged\n").unwrap();
+        let git = git2::Repository::open(&secondary.dir).unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(std::path::Path::new("staged.txt")).unwrap();
+        index.write().unwrap();
+
+        let r = svc
+            .git_agent_commit(
+                ws,
+                "checkpoint".to_string(),
+                None,
+                None,
+                None,
+                true,
+                Some(root_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["staged.txt".to_string()]);
+        let st = intent_git::status::status(&secondary.dir).unwrap();
+        let dirty: Vec<&str> = st.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(dirty.contains(&"unstaged.txt"), "{dirty:?}");
+        assert!(!dirty.contains(&"staged.txt"), "{dirty:?}");
+    }
+
+    /// An agent-initiated (non-`userRequested`) `git.agentCommit` with a
+    /// `gitRootId` but no explicit `files` is refused: the attribution
+    /// pipeline only observes the primary worktree, so a secondary-root
+    /// commit set cannot be attribution-filtered.
+    #[tokio::test]
+    async fn agent_commit_root_without_files_is_rejected() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("root.txt"), "in root\n").unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "sweep attempt".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+                Some(root_id),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("requires an explicit `files` list"),
+            "got: {err}"
+        );
+        assert_eq!(
+            intent_git::history::history(&secondary.dir, 5)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// An unknown `gitRootId` — or one registered to a different workspace —
+    /// fails with the identical `Unknown git root: {id}` `InvalidParams`
+    /// (`resolve_git_read_root` parity; a foreign root is indistinguishable
+    /// from a nonexistent one).
+    #[tokio::test]
+    async fn agent_commit_rejects_unknown_and_foreign_root_ids() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, _secondary, _root_id) = svc_with_registered_root(&repo).await;
+
+        let unknown = WorkspaceGitRootId::new();
+        let err = svc
+            .git_agent_commit(
+                ws.clone(),
+                "msg".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["a.txt".to_string()]),
+                false,
+                Some(unknown.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "expected -32602, got: {err}"
+        );
+        assert!(
+            format!("{err}").ends_with(&format!("Unknown git root: {unknown}")),
+            "got: {err}"
+        );
+
+        // A root registered to ANOTHER workspace fails with the same message.
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        let foreign_repo = init_git_repo();
+        let ts = now_iso();
+        let foreign = intent_core::WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: other_ws,
+            path: foreign_repo.dir.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        svc.store()
+            .upsert_workspace_git_root(&foreign)
+            .await
+            .unwrap();
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "msg".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["a.txt".to_string()]),
+                false,
+                Some(foreign.id.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "expected -32602, got: {err}"
+        );
+        assert!(
+            format!("{err}").ends_with(&format!("Unknown git root: {}", foreign.id)),
+            "got: {err}"
+        );
+    }
+
+    /// Param validation precedes the auto-commit gate: with auto-commit
+    /// disabled and `userRequested: false`, an unknown `gitRootId` still
+    /// fails with the documented `Unknown git root: {id}` `InvalidParams`
+    /// (`-32602`) rather than the auto-commit `-32603` rejection.
+    #[tokio::test]
+    async fn agent_commit_unknown_root_precedes_auto_commit_gate() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, _secondary, _root_id) = svc_with_registered_root(&repo).await;
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+
+        let unknown = WorkspaceGitRootId::new();
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "msg".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["a.txt".to_string()]),
+                false,
+                Some(unknown.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "expected -32602, got: {err}"
+        );
+        assert!(
+            format!("{err}").ends_with(&format!("Unknown git root: {unknown}")),
+            "got: {err}"
+        );
+    }
+
+    /// Remediation hint (monorepo#2053): a primary-target commit whose
+    /// explicit `files` match nothing, where the paths exist under a
+    /// registered secondary root, errors with the root's path/id and suggests
+    /// passing `gitRootId`.
+    #[tokio::test]
+    async fn agent_commit_primary_miss_hints_at_registered_root() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("root-only.txt"), "in root\n").unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "misdirected".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["root-only.txt".to_string()]),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("did not match any files"), "got: {msg}");
+        assert!(
+            msg.contains(
+                &secondary
+                    .dir
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            ),
+            "hint names the root path, got: {msg}"
+        );
+        assert!(msg.contains(root_id.as_str()), "hint names the id: {msg}");
+        assert!(msg.contains("gitRootId"), "hint suggests gitRootId: {msg}");
+    }
+
+    /// Hint absolute-path guard: `Path::join` with an absolute argument
+    /// discards the base, so an absolute path existing anywhere used to
+    /// "match" every registered root. An absolute path OUTSIDE the root must
+    /// suppress the hint; one INSIDE the root still triggers it.
+    #[tokio::test]
+    async fn agent_commit_primary_miss_hint_handles_absolute_paths() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
+        std::fs::write(secondary.dir.join("root-only.txt"), "in root\n").unwrap();
+
+        // Mixed set: a relative file that exists in the root plus an absolute
+        // path that exists but is outside it — no hint (the old join-based
+        // check matched the absolute path against any root).
+        let outside = repo.dir.canonicalize().unwrap().join("README.md");
+        std::fs::write(&outside, "outside the root\n").unwrap();
+        let err = svc
+            .git_agent_commit(
+                ws.clone(),
+                "misdirected".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec![
+                    "root-only.txt".to_string(),
+                    outside.to_string_lossy().to_string(),
+                ]),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("did not match any files"), "got: {msg}");
+        assert!(!msg.contains("gitRootId"), "no hint expected: {msg}");
+
+        // An absolute path inside the root counts via containment, so the
+        // hint still fires for a mixed relative + in-root-absolute set.
+        let inside = secondary.dir.canonicalize().unwrap().join("root-only.txt");
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "misdirected".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec![
+                    "root-only.txt".to_string(),
+                    inside.to_string_lossy().to_string(),
+                ]),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("did not match any files"), "got: {msg}");
+        assert!(msg.contains(root_id.as_str()), "hint names the id: {msg}");
+        assert!(msg.contains("gitRootId"), "hint suggests gitRootId: {msg}");
+    }
+
+    /// Primary-path regression: with `git_root_id: None` an explicit-files
+    /// miss that matches NO registered root keeps the bare pathspec error —
+    /// no hint is appended.
+    #[tokio::test]
+    async fn agent_commit_primary_miss_without_matching_root_keeps_bare_error() {
+        let repo = init_git_repo();
+        let (_t, svc, ws, _secondary, _root_id) = svc_with_registered_root(&repo).await;
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "misdirected".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["nowhere.txt".to_string()]),
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("did not match any files"), "got: {msg}");
+        assert!(!msg.contains("gitRootId"), "no hint expected: {msg}");
     }
 
     /// `git.commits` returns the §5.5 `{ items, nextToken }` envelope of
@@ -17570,7 +20032,9 @@ mod usage_stats_recording {
         }
     }
 
-    /// Create an agent session via the real `agent.create` path and return its id.
+    /// Create an agent session via the real `agent.create` path (pinned to
+    /// the auggie provider — this harness wires no settings registry, so
+    /// there is no derivable default) and return its id.
     async fn create_agent(svc: &Services, ws: &WorkspaceId, model: Option<&str>) -> String {
         let created = svc
             .agent_create_op(
@@ -17581,7 +20045,10 @@ mod usage_stats_recording {
                 None,
                 None,
                 false,
-                intent_core::AgentCreateExtra::default(),
+                intent_core::AgentCreateExtra {
+                    provider: Some("auggie".into()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("create agent");
@@ -17772,7 +20239,7 @@ mod usage_stats_recording {
     async fn lines_changed_accrue_by_model_and_survive_metrics_clear() {
         let (_t, svc, ws) = setup().await;
         let store = svc.store();
-        let agent = create_agent(&svc, &ws, Some("auggie:claude-opus-4-8")).await;
+        let agent = create_agent(&svc, &ws, Some("claude-opus-4-8")).await;
 
         let delta =
             crate::file_tracking::track_change(store, change(&ws, "a.ts", Some(&agent), 10, 2))
@@ -17991,6 +20458,7 @@ mod search_adapters {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -19578,9 +22046,9 @@ mod rules {
     /// SP-1: top-level (non-sub-agent) interactive agents get the
     /// `## Suggested Next Steps` directive at the very end of the assembled
     /// prompt so the model reliably emits a `<!-- suggested-prompts ... -->`
-    /// block. The default (`auto_commit_enabled = false`) variant uses the
-    /// "Review changes before committing." example line and appends no
-    /// auto-commit clause.
+    /// block. The default (`auto_commit_enabled = false`) variant carries the
+    /// lever examples and appends no auto-commit clause (v2.3 wording; the
+    /// v1 bytes stay pinned in `v1_goldens`).
     #[tokio::test]
     async fn assembly_appends_suggested_prompts_for_top_level_agent() {
         let tree = worktree();
@@ -19605,8 +22073,12 @@ mod rules {
             "SP-1 directive present for non-sub-agent"
         );
         assert!(
-            prompt.contains("Review changes before committing."),
-            "auto-commit-off example line"
+            prompt.contains("Hold off on opening the PR until I have reviewed the diff."),
+            "lever example line"
+        );
+        assert!(
+            prompt.contains("Never suggest a step you already said you will take"),
+            "no-duplication rule present"
         );
         assert!(
             !prompt.contains("Auto-commit is enabled;"),
@@ -19623,7 +22095,7 @@ mod rules {
         assert!(
             prompt
                 .trim_end()
-                .ends_with("something the user might say next."),
+                .ends_with("or a decision only they can make."),
             "suggested-prompts block is the tail of the assembled prompt: {:?}",
             &prompt[tail_start..]
         );
@@ -19662,10 +22134,10 @@ mod rules {
         );
     }
 
-    /// SP-1: when auto-commit is enabled the directive swaps the example
-    /// second-line (`Check the changes in the diff view.`) and appends the
-    /// auto-commit clause that tells the model not to propose commit-review
-    /// prompts, matching the reference `autoCommitEnabled` branch.
+    /// SP-1: when auto-commit is enabled the directive keeps the same lever
+    /// examples (v2.3 no longer varies them by auto-commit state) and appends
+    /// the auto-commit clause that tells the model not to propose
+    /// commit-review prompts, matching the reference `autoCommitEnabled` branch.
     #[tokio::test]
     async fn assembly_suggested_prompts_toggles_auto_commit_clause() {
         let tree = worktree();
@@ -19687,12 +22159,12 @@ mod rules {
         .expect("assembled prompt");
         assert!(prompt.contains("## Suggested Next Steps"));
         assert!(
-            prompt.contains("Check the changes in the diff view."),
-            "auto-commit-on example line"
+            prompt.contains("Skip the verifier pass and open the PR now."),
+            "lever example line"
         );
         assert!(
             !prompt.contains("Review changes before committing."),
-            "auto-commit-off example line must not appear when auto-commit is on"
+            "v1 auto-commit-off example line must not appear"
         );
         assert!(
             prompt.contains(
@@ -19811,6 +22283,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -19866,6 +22339,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -19956,6 +22430,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20011,6 +22486,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20092,6 +22568,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20146,6 +22623,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20223,6 +22701,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20277,6 +22756,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20353,6 +22833,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20408,6 +22889,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20488,6 +22970,7 @@ mod rules {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -20543,6 +23026,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20597,6 +23081,7 @@ mod rules {
 
         let workspace = intent_core::Workspace {
             pending_delete_at: None,
+            context_links: None,
             waiting: false,
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
@@ -20666,6 +23151,7 @@ mod rules {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            retired_at: None,
             attention_request_kind: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
@@ -20755,6 +23241,7 @@ mod rules {
         // though delegates ARE sandboxed (agent_ops is_standalone_checkout).
         let workspace = intent_core::Workspace {
             pending_delete_at: None,
+            context_links: None,
             waiting: false,
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
@@ -20824,6 +23311,7 @@ mod rules {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            retired_at: None,
             attention_request_kind: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
@@ -21018,6 +23506,7 @@ mod rules {
         // microVM workspace
         let workspace = intent_core::Workspace {
             pending_delete_at: None,
+            context_links: None,
             waiting: false,
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
@@ -21089,6 +23578,7 @@ mod rules {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            retired_at: None,
             attention_request_kind: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
@@ -21947,6 +24437,7 @@ mod known_repo {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             token_usage: None,
@@ -22707,6 +25198,7 @@ mod worktree_provisioning {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            retired_at: None,
             attention_request_kind: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
@@ -24277,7 +26769,10 @@ mod worktree_provisioning {
                     "workspace.branchPrefix".to_string(),
                     serde_json::json!("aw/"),
                 ),
-                ("providers.active".to_string(), serde_json::json!("auggie")),
+                (
+                    "model.defaultProvider".to_string(),
+                    serde_json::json!("auggie"),
+                ),
             ])
             .expect("set prefix");
         let (repo_dir, _, head_branch) = seed_repo("intentd-wtslug-repo");
@@ -25833,6 +28328,7 @@ mod file_ops_service {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store
             .insert_agent_session(&agent)
@@ -26865,6 +29361,7 @@ mod heal_stale_agent_sessions {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -28705,18 +31202,32 @@ mod line_attribution_hooks {
     #[tokio::test]
     async fn task_update_status_schedules_recompute() {
         let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
-        svc.task_update_status(ws.clone(), id.clone(), "beta".into(), "in-progress".into())
-            .await
-            .expect("updateStatus");
+        svc.task_update_status(
+            ws.clone(),
+            id.clone(),
+            "beta".into(),
+            "in-progress".into(),
+            None,
+        )
+        .await
+        .expect("updateStatus");
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
 
     #[tokio::test]
     async fn task_update_schedules_recompute() {
         let (_tmp, svc, ws, id) = setup("- [ ] alpha").await;
-        svc.task_update(ws.clone(), id.clone(), 1, None, Some("done".into()), None)
-            .await
-            .expect("task.update");
+        svc.task_update(
+            ws.clone(),
+            id.clone(),
+            1,
+            None,
+            Some("done".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("task.update");
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
 
@@ -29095,6 +31606,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
         is_background: false,
         metadata: None,
     };
@@ -29140,6 +31652,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
         is_background: false,
         metadata: None,
     };
@@ -29264,6 +31777,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
         is_background: false,
         metadata: None,
     };
@@ -29509,6 +32023,251 @@ mod last_activity_events {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Regression (monorepo#3623): `workspace.delete` cancels the pending
+    /// debounced lastActivity derivation. Without the cancel the timer
+    /// outlives the workspace, fires against the deleted row, and logs a
+    /// spurious `get_workspace failed ... not found` WARN.
+    #[tokio::test]
+    async fn delete_workspace_cancels_pending_last_activity_schedule() {
+        use intent_core::WorkspaceApi;
+        // Debounce window far longer than the test: the delete must land
+        // while the schedule is still pending.
+        let _guard = DebounceEnvGuard::new("30000");
+        let h = harness().await;
+
+        h.services.schedule_last_activity_event(h.ws.clone());
+        assert!(
+            h.services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "schedule must be pending before the delete"
+        );
+
+        h.services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("delete workspace");
+
+        assert!(
+            !h.services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "workspace.delete must cancel the pending last-activity schedule"
+        );
+    }
+
+    /// Regression (monorepo#3623, review): a timer that fires against an
+    /// already-deleted workspace — the shape a bump racing the delete takes
+    /// when it re-arms a schedule after `workspace.delete`'s cancel — must
+    /// still remove its own `(gen, AbortHandle)` entry from the debouncers
+    /// map. Without the shared tail cleanup the early `NotFound` return would
+    /// strand the entry for the daemon's lifetime (ids are never recycled).
+    #[tokio::test]
+    async fn stray_timer_on_deleted_workspace_cleans_up_map_entry() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+
+        // Delete the row directly in the store, bypassing the services-layer
+        // cancel — then schedule, simulating a schedule re-armed after the
+        // delete's cancel already ran.
+        h.store.delete_workspace(&h.ws).await.expect("row delete");
+        h.services.schedule_last_activity_event(h.ws.clone());
+        assert!(
+            h.services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "schedule must be pending before the timer fires"
+        );
+
+        // Bounded poll: the timer fires after the debounce window, takes the
+        // NotFound arm, and must still sweep its map entry on the way out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = h
+                .services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stray timer must remove its own debouncers entry after firing \
+                 against a deleted workspace"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Regression (monorepo#3632): `workspace.delete` sweeps the pending
+    /// idle debouncer. Without the sweep the timer outlives the workspace,
+    /// emits a spurious `workspace:activity-changed { idle }` ~3s after
+    /// deletion, and its `(gen, AbortHandle)` map entry lingers.
+    #[tokio::test]
+    async fn delete_workspace_cancels_pending_idle_debounce() {
+        use intent_core::WorkspaceApi;
+        // Debounce window far longer than the test: the delete must land
+        // while the idle flip is still pending.
+        let _guard = DebounceEnvGuard::new("30000");
+        let h = harness().await;
+
+        // Last in-flight session ends → idle flip scheduled.
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
+        assert!(
+            h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "idle flip must be pending before the delete"
+        );
+
+        h.services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("delete workspace");
+
+        assert!(
+            !h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "workspace.delete must sweep the pending idle debouncer"
+        );
+    }
+
+    /// Regression (monorepo#3632): an idle timer whose fire is suppressed —
+    /// agents back in flight when the guard runs — must still remove its own
+    /// `(gen, AbortHandle)` entry from the debouncers map. Without the
+    /// every-exit-path removal the entry would linger until the next
+    /// `agent_activity_begin`/`schedule_idle_debounce` for the workspace —
+    /// for a deleted id, the daemon's lifetime (ids are never recycled).
+    #[tokio::test]
+    async fn suppressed_idle_timer_cleans_up_map_entry() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Last in-flight session ends → idle flip scheduled.
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
+        assert!(
+            h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "idle flip must be pending before the timer fires"
+        );
+
+        // Force the suppressed-fire path deterministically: make the
+        // in-flight count non-zero WITHOUT going through
+        // `agent_activity_begin` (which would cancel the entry itself) —
+        // the shape of a begin racing the timer's fire-time guard.
+        h.services
+            .agent_activity
+            .lock()
+            .expect("activity lock")
+            .insert(h.ws.clone(), 1);
+
+        // Bounded poll: the timer fires after the debounce window, takes the
+        // suppressed path, and must still sweep its map entry on the way out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = h
+                .services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "suppressed idle timer must remove its own debouncers entry"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The suppression itself still holds: no idle event was emitted
+        // (the only event is the begin's agent_running flip).
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(ev["data"]["activity"], "agent_running");
+        assert!(
+            timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .is_err(),
+            "no idle event on the suppressed-fire path"
+        );
+    }
+
+    /// Regression (monorepo#3632, review): an idle timer that fires against
+    /// an already-deleted workspace — the shape of a fire racing
+    /// `workspace.delete` (the timer passes its gen/count guards and removes
+    /// its own entry before the delete's sweep runs, so the sweep finds no
+    /// handle to abort) — must not emit the spurious `{ idle }` event, and
+    /// must still remove its own map entry.
+    #[tokio::test]
+    async fn idle_timer_firing_against_deleted_workspace_skips_emit() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Last in-flight session ends → idle flip scheduled.
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
+
+        // Delete the row directly in the store, bypassing the services-layer
+        // sweep — the interleaving where the timer fires while the delete is
+        // mid-flight (entry still present, gen/count guards pass, row gone).
+        h.store.delete_workspace(&h.ws).await.expect("row delete");
+
+        // Bounded poll: the timer fires, hits the emit-time existence guard,
+        // and must still sweep its map entry on the way out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = h
+                .services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "idle timer must remove its own debouncers entry after firing \
+                 against a deleted workspace"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // No idle event for the deleted id: the only event is the begin's
+        // agent_running flip.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(ev["data"]["activity"], "agent_running");
+        assert!(
+            timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .is_err(),
+            "no idle event for a deleted workspace"
+        );
     }
 
     /// After `raise_attention` (which bumps `workspace.updated_at`), a
@@ -29955,8 +32714,10 @@ mod last_activity_events {
         );
     }
 
-    /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
-    /// when the token tallies actually changed (idempotent re-scan is silent).
+    /// `scan_workspace_token_usage` emits `workspace:tokenUsage-changed` only
+    /// when the token tallies actually changed (idempotent re-scan is silent)
+    /// and — since a token recompute is not a turn boundary — never schedules
+    /// a `workspace:updated { lastActivity }`.
     #[tokio::test]
     async fn token_usage_scan_only_on_change() {
         let _guard = DebounceEnvGuard::new("100");
@@ -29971,17 +32732,18 @@ mod last_activity_events {
             .expect("scan 1");
         assert!(changed1, "first scan changed (none -> zero)");
 
-        // Consume the first scan's events deterministically instead of a
-        // sleep-based drain: under coverage CI the debounced lastActivity
-        // task can fire late and leak into the no-emit assertion below
-        // (monorepo#934). The immediate tokenUsage-changed lands first, then
-        // the debounced workspace:updated { lastActivity } (guaranteed to
-        // emit: the seeded workspace has no stored lastActivity).
+        // The immediate tokenUsage-changed lands; no debounced
+        // workspace:updated { lastActivity } follows (turn-boundary-only
+        // scheduling — a token recompute is mid-turn bookkeeping).
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:tokenUsage-changed");
-        let ev = recv_one(&mut sub).await;
-        assert_envelope(&ev, &h.ws.0, "workspace:updated");
-        assert!(ev["data"]["changes"]["lastActivity"].is_string());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "token recompute must not emit a lastActivity workspace:updated"
+        );
 
         // Second scan (tallies unchanged, no emit).
         let changed2 = h
@@ -29991,8 +32753,8 @@ mod last_activity_events {
             .expect("scan 2");
         assert!(!changed2, "second scan unchanged");
 
-        // Nothing is pending from the first scan anymore, so any event in
-        // this window would be a real over-emit from the idempotent re-scan.
+        // Any event in this window would be a real over-emit from the
+        // idempotent re-scan.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             timeout(Duration::from_millis(50), sub.recv())
@@ -30152,6 +32914,105 @@ mod last_activity_events {
         assert!(usage.last_scan_at.is_some(), "scan timestamp set");
     }
 
+    /// Whether a debounced `lastActivity` derivation is pending for the
+    /// harness workspace (the schedule inserts into the debouncers map
+    /// synchronously; the default 3s window keeps the entry observable).
+    fn last_activity_pending(h: &Harness) -> bool {
+        h.services
+            .last_activity_debouncers
+            .lock()
+            .expect("debouncers lock")
+            .contains_key(&h.ws)
+    }
+
+    /// Message-append role gating (§10.1): `agent.appendMessage` schedules
+    /// the debounced `lastActivity` only for `role: "user"` appends —
+    /// assistant/system/tool transcript writes are mid-turn noise for the
+    /// workspace ordering.
+    #[tokio::test]
+    async fn append_message_op_schedules_last_activity_only_for_user_role() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        h.services
+            .agent_append_message_op(
+                agent_id.clone(),
+                "assistant".into(),
+                serde_json::json!("mid-turn note"),
+                None,
+            )
+            .await
+            .expect("assistant append");
+        assert!(
+            !last_activity_pending(&h),
+            "assistant-role append must not schedule lastActivity"
+        );
+
+        h.services
+            .agent_append_message_op(agent_id, "user".into(), serde_json::json!("hi"), None)
+            .await
+            .expect("user append");
+        assert!(
+            last_activity_pending(&h),
+            "user-role append must schedule lastActivity"
+        );
+    }
+
+    /// Store-only force-send gating (§10.1): `agent.sendQueuedMessageNow` on
+    /// the no-manager path schedules the debounced `lastActivity` only for
+    /// user-origin entries — parity with the queue-drain `persist_user` gate.
+    #[tokio::test]
+    async fn send_queued_message_now_op_schedules_last_activity_only_for_user_origin() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        let (auto_entry, _) = h.services.enqueue_message_with_origin(
+            &agent_id,
+            "wake".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        h.services
+            .agent_send_queued_message_now_op(agent_id.clone(), auto_entry.id)
+            .await
+            .expect("force-send automatic entry");
+        assert!(
+            !last_activity_pending(&h),
+            "automatic-origin force-send must not schedule lastActivity"
+        );
+
+        let (user_entry, _) = h.services.enqueue_message_with_origin(
+            &agent_id,
+            "human".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        h.services
+            .agent_send_queued_message_now_op(agent_id, user_entry.id)
+            .await
+            .expect("force-send user entry");
+        assert!(
+            last_activity_pending(&h),
+            "user-origin force-send must schedule lastActivity"
+        );
+    }
+
     fn agent_session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         AgentSession {
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -30196,6 +33057,7 @@ mod last_activity_events {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -30456,6 +33318,7 @@ mod turn_end_unread_gate {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -30709,6 +33572,10 @@ mod idle_workspace_archived_stamp {
     #[tokio::test]
     async fn harness_wake_idle_carries_stamp() {
         let h = harness().await;
+        let lifecycle = crate::agent_session::HarnessWakeLifecycle {
+            correlation_id: "harness-wake-idle-stamp-test".to_string(),
+            block_count: 1,
+        };
 
         let archived_ws = seed_workspace(&h, true).await;
         let archived_agent = AgentId::new();
@@ -30718,7 +33585,7 @@ mod idle_workspace_archived_stamp {
             .expect("insert archived-ws session");
         let mut sub = subscribe_idle(&h, &archived_ws);
         h.services
-            .publish_harness_wake_idle(&archived_agent, &archived_ws, false)
+            .publish_harness_wake_idle(&archived_agent, &archived_ws, &lifecycle, false)
             .await;
         let ev = recv_idle(&mut sub).await;
         assert_eq!(ev["type"], AGENT_IDLE);
@@ -30736,7 +33603,7 @@ mod idle_workspace_archived_stamp {
             .expect("insert active-ws session");
         let mut sub = subscribe_idle(&h, &active_ws);
         h.services
-            .publish_harness_wake_idle(&active_agent, &active_ws, false)
+            .publish_harness_wake_idle(&active_agent, &active_ws, &lifecycle, false)
             .await;
         let ev = recv_idle(&mut sub).await;
         assert!(
@@ -30862,6 +33729,7 @@ mod turn_token_usage {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -31649,6 +34517,572 @@ mod turn_token_usage {
         }
         assert!(seen >= 1, "at least one tokenUsage-changed event fired");
     }
+
+    /// Provider-keyed accumulation (intent-hq/intent#3794): a per-turn
+    /// provider's session (bare model id; the provider is its own field).
+    fn per_turn_session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+        let mut session = agent_session(agent_id, ws, "sonnet");
+        session.provider = Some("claude-code".into());
+        session
+    }
+
+    /// #3794: claude-agent-acp reports PER-TURN counters, so each report
+    /// SUMS into the stored snapshot — persisted totals equal the sum of
+    /// all turns, never just the last report (the old REPLACE undercount).
+    #[tokio::test]
+    async fn per_turn_provider_sums_reports_into_snapshot() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&per_turn_session(&agent, &h.ws))
+            .await
+            .expect("insert session");
+
+        // Turn 1 reports 70/50 (+30 cached read, +4 cached write).
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 30, 4)), None)
+            .await;
+        // Turn 2 reports 30/20 (+10, +2) — a SMALLER report than turn 1's,
+        // which REPLACE would have dropped turn 1 for.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(30, 20, 10, 2)), None)
+            .await;
+
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 100, "sum of turns, not latest");
+        assert_eq!(usage.totals.output_tokens, 70);
+        assert_eq!(usage.totals.cache_read_tokens, 40);
+        assert_eq!(usage.totals.cache_creation_tokens, 6);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
+    }
+
+    /// #3795: codex-acp (and opencode/unsloth) report LAST-REQUEST counters
+    /// — also summed, so totals accumulate monotonically per turn instead
+    /// of bouncing to whatever the final request happened to cost.
+    #[tokio::test]
+    async fn last_request_provider_accumulates_monotonically() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "gpt-5.3-codex");
+        session.provider = Some("codex".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        let mut expected_input = 0;
+        for report in [(40, 10), (25, 5), (60, 15)] {
+            h.services
+                .persist_turn_token_usage(
+                    &agent,
+                    &h.ws,
+                    Some(&acp_usage(report.0, report.1, 0, 0)),
+                    None,
+                )
+                .await;
+            expected_input += report.0;
+            let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+            let usage = ws.token_usage.expect("usage persisted");
+            assert_eq!(
+                usage.totals.input_tokens, expected_input,
+                "totals accumulate monotonically"
+            );
+        }
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(ws.token_usage.unwrap().totals.output_tokens, 30);
+    }
+
+    /// #3795: a codex totals-only report (`totalTokens > 0`, every breakdown
+    /// zero — the `fill_to_context_window()` synthesized shape) is NOT
+    /// silently zero: the total lands as degraded input-attributed usage in
+    /// both the session tally and the hourly stats delta.
+    #[tokio::test]
+    async fn totals_only_report_preserved_in_tally_and_stats() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "gpt-5.3-codex");
+        session.provider = Some("codex".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        // `Usage` is #[non_exhaustive]; construct via its camelCase wire form.
+        let totals_only: Usage = serde_json::from_value(serde_json::json!({
+            "totalTokens": 258_000,
+            "inputTokens": 0,
+            "outputTokens": 0,
+        }))
+        .expect("totals-only usage deserializes");
+
+        // Turn 1: a normal last-request report of 40/10.
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(40, 10, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(40, 10, 0, 0)), None)
+            .await;
+        // Turn 2: the totals-only report — dropping totalTokens would make
+        // this turn read as all-zero / "no report".
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&totals_only),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&totals_only), None)
+            .await;
+
+        // Session tally: 40 + 258_000 input-attributed, not 40.
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 258_040, "total preserved");
+        assert_eq!(usage.totals.output_tokens, 10);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 258_040);
+
+        // Hourly delta: turn 2's report records in full, not as zero.
+        let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+        let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+        assert_eq!(input, 258_040, "hourly delta reflects the total");
+    }
+
+    /// #3796: codex reports `thoughtTokens` as a SUBSET of `outputTokens`;
+    /// both accounting seams carve it out so the STORED buckets are disjoint
+    /// (matching grok's `_meta.usage` normalization) and the five-counter
+    /// total is correct.
+    #[tokio::test]
+    async fn codex_thought_subset_carved_out_at_both_seams() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "gpt-5.3-codex");
+        session.provider = Some("codex".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        // 100 input, 50 output of which 20 are reasoning (codex subset shape).
+        let with_thought: Usage = serde_json::from_value(serde_json::json!({
+            "totalTokens": 150,
+            "inputTokens": 100,
+            "outputTokens": 50,
+            "thoughtTokens": 20,
+        }))
+        .expect("usage deserializes");
+
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&with_thought),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&with_thought), None)
+            .await;
+
+        // Session snapshot: output carved to 30, thought disjoint at 20.
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let totals = ws.token_usage.expect("usage persisted").totals;
+        assert_eq!(totals.input_tokens, 100);
+        assert_eq!(totals.output_tokens, 30, "thought carved out of output");
+        assert_eq!(totals.thought_tokens, 20);
+
+        // Hourly stats: the same disjoint carve lands in the delta.
+        let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+        let output: u64 = rows.iter().map(|r| r.output_tokens).sum();
+        let thought: u64 = rows.iter().map(|r| r.thought_tokens).sum();
+        assert_eq!(output, 30, "stats delta carved identically");
+        assert_eq!(thought, 20);
+    }
+
+    /// SUM providers still get REPLACE cost semantics: ACP `usage_update`
+    /// cost is cumulative per session regardless of counter semantics, so
+    /// the latest cost wins and a token-only turn keeps it.
+    #[tokio::test]
+    async fn per_turn_provider_cost_still_replaces() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&per_turn_session(&agent, &h.ws))
+            .await
+            .expect("insert session");
+        let cost = |amount: f64| {
+            Some(intent_core::UsageCost {
+                amount,
+                currency: "USD".to_string(),
+            })
+        };
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), cost(0.5))
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(30, 20, 0, 0)), cost(1.25))
+            .await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 100, "counters summed");
+        assert_eq!(usage.totals.cost, cost(1.25), "cost replaced, not summed");
+
+        // Token-only turn: the summed counters grow, the cost is kept.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 5, 0, 0)), None)
+            .await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 110);
+        assert_eq!(usage.totals.cost, cost(1.25), "cost not dropped");
+    }
+
+    /// The recreate-baseline fold (monorepo#737) keeps working for SUM
+    /// providers: the stored snapshot is cumulative in every mode, so the
+    /// CAS swap banks it into the baseline and post-recreate reports keep
+    /// summing on top — the tally never regresses.
+    #[tokio::test]
+    async fn per_turn_provider_recreate_fold_keeps_totals() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&per_turn_session(&agent, &h.ws))
+            .await
+            .expect("insert session");
+        h.store
+            .set_acp_session_id(&h.ws, &agent, "acp-1")
+            .await
+            .expect("set acp id");
+
+        // Two per-turn reports sum to a 100/80 snapshot.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(30, 30, 0, 0)), None)
+            .await;
+
+        // Recreate: the swap folds the 100/80 snapshot into the baseline.
+        h.store
+            .replace_acp_session_id(&h.ws, &agent, "acp-1", "acp-2")
+            .await
+            .expect("CAS swap");
+
+        // First post-recreate turn reports 5/3: baseline 100/80 + fresh
+        // summed snapshot 5/3 = 105/83, never just 5/3.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(5, 3, 0, 0)), None)
+            .await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 105);
+        assert_eq!(usage.totals.output_tokens, 83);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 105);
+    }
+
+    /// Hourly stats (#3794): for a per-turn provider the report itself IS
+    /// the delta — no snapshot subtraction, so a report smaller than the
+    /// stored snapshot records in full instead of clamping to zero.
+    #[tokio::test]
+    async fn per_turn_provider_stats_delta_is_the_report() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&per_turn_session(&agent, &h.ws))
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        // Turn 1 reports 70/50; bookkeeping order: stats first, then persist.
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(70, 50, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
+            .await;
+        // Turn 2 reports 30/20 — smaller than the stored 70/50 snapshot;
+        // cumulative subtraction would clamp this turn to 0.
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(30, 20, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(30, 20, 0, 0)), None)
+            .await;
+
+        let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+        let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+        let output: u64 = rows.iter().map(|r| r.output_tokens).sum();
+        assert_eq!(input, 100, "each report recorded in full");
+        assert_eq!(output, 70);
+    }
+
+    /// Cumulative providers (the default, e.g. mock or an unknown future
+    /// adapter) keep the pre-quirk behavior byte-identical: snapshots
+    /// REPLACE and the hourly delta is the saturating subtraction.
+    #[tokio::test]
+    async fn cumulative_provider_behavior_unchanged() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "opus-4.8");
+        session.provider = Some("mock".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(70, 50, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
+            .await;
+        h.services
+            .record_turn_usage_stats(
+                &agent,
+                &h.ws,
+                Some(&acp_usage(100, 80, 0, 0)),
+                Duration::from_secs(1),
+                now,
+                true,
+            )
+            .await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), None)
+            .await;
+
+        // Snapshot replaced: the tally equals the latest cumulative report.
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 100, "latest snapshot, not sum");
+        assert_eq!(usage.totals.output_tokens, 80);
+
+        // Hourly delta: 70 (first report) + 30 (100 - 70), never 170.
+        let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+        let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+        assert_eq!(input, 100, "saturating-sub delta unchanged");
+    }
+
+    /// A session row with `provider = NULL` actually runs on the configured
+    /// default (`model.defaultProvider`), so the accounting seam must
+    /// resolve through the settings-derived default — mirroring the spawn
+    /// precedence — instead of falling to the Cumulative REPLACE default and
+    /// reintroducing the undercount for a SUM default provider
+    /// (#3794/#3795).
+    #[tokio::test]
+    async fn bare_model_null_provider_resolves_via_configured_default() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("seed workspace");
+        let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+        let registry =
+            std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+        registry
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("claude-code"),
+            )])
+            .expect("seed default provider");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &ws, "sonnet");
+        session.provider = None;
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let now = time::OffsetDateTime::now_utc();
+
+        // Two per-turn reports: with the default resolved to claude-code the
+        // snapshot SUMS (100/70); the Cumulative misclassification would have
+        // REPLACED down to 30/20.
+        for report in [(70u64, 50u64), (30, 20)] {
+            services
+                .record_turn_usage_stats(
+                    &agent,
+                    &ws,
+                    Some(&acp_usage(report.0, report.1, 0, 0)),
+                    Duration::from_secs(1),
+                    now,
+                    true,
+                )
+                .await;
+            services
+                .persist_turn_token_usage(
+                    &agent,
+                    &ws,
+                    Some(&acp_usage(report.0, report.1, 0, 0)),
+                    None,
+                )
+                .await;
+        }
+
+        let ws_row = store.get_workspace(&ws).await.expect("reload");
+        let usage = ws_row.token_usage.expect("usage persisted");
+        assert_eq!(
+            usage.totals.input_tokens, 100,
+            "summed via default provider"
+        );
+        assert_eq!(usage.totals.output_tokens, 70);
+
+        // Hourly stats: each report is the delta (70 + 30), not clamped-to-0
+        // saturating subtraction for the second, smaller report.
+        let rows = store.list_usage_stats_hourly().await.expect("stats rows");
+        let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+        assert_eq!(input, 100, "each report recorded in full");
+    }
+
+    /// A `PromptResponse._meta` in the shape grok serializes (#3803, audit
+    /// §8.2): the whole-prompt `usage` bill plus the sibling last-call token
+    /// fields and context-occupancy `totalTokens` that must NOT be read.
+    fn grok_meta(input: u64, output: u64, cached: u64, ticks: i64) -> intent_acp::session::Meta {
+        serde_json::json!({
+            "sessionId": "sess-1",
+            "promptId": "req-1",
+            "totalTokens": 999_999,
+            "modelId": "grok-code-1",
+            "inputTokens": 11,
+            "outputTokens": 7,
+            "usage": {
+                "inputTokens": input,
+                "outputTokens": output,
+                "totalTokens": input + output,
+                "cachedReadTokens": cached,
+                "reasoningTokens": 0,
+                "costUsdTicks": ticks,
+                "numTurns": 1
+            }
+        })
+        .as_object()
+        .expect("object")
+        .clone()
+    }
+
+    /// grok's `_meta.usage` bill (#3803): synthesized into a standard
+    /// per-turn report at the seam and SUMMED across turns — tokens AND
+    /// cost, since the bill covers one prompt.
+    #[tokio::test]
+    async fn grok_meta_bill_ingested_and_sums_across_turns() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "grok-code-1");
+        session.provider = Some("grok".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        // Turn 1: 5000 input incl. 3000 cache reads, $0.025.
+        let meta = grok_meta(5000, 1200, 3000, 250_000_000);
+        let (usage, cost) = h
+            .services
+            .prompt_meta_turn_usage(&agent, &h.ws, Some(&meta))
+            .await
+            .expect("grok bill synthesized");
+        assert_eq!(usage.input_tokens, 2000, "cache reads subtracted");
+        assert_eq!(usage.cached_read_tokens, Some(3000));
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&usage), cost)
+            .await;
+        // Turn 2: a smaller bill — REPLACE would drop turn 1.
+        let meta = grok_meta(1000, 300, 0, 50_000_000);
+        let (usage, cost) = h
+            .services
+            .prompt_meta_turn_usage(&agent, &h.ws, Some(&meta))
+            .await
+            .expect("grok bill synthesized");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&usage), cost)
+            .await;
+
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 3000, "2000 + 1000 summed");
+        assert_eq!(usage.totals.output_tokens, 1500);
+        assert_eq!(usage.totals.cache_read_tokens, 3000);
+        let cost = usage.totals.cost.expect("cost persisted");
+        assert!(
+            (cost.amount - 0.03).abs() < 1e-12,
+            "$0.025 + $0.005 summed, got {}",
+            cost.amount
+        );
+        assert_eq!(cost.currency, "USD");
+    }
+
+    /// The `_meta` synthesis is gated on the provider: an identical payload
+    /// from a non-grok session is never misread as a usage report.
+    #[tokio::test]
+    async fn meta_bill_ignored_for_non_grok_providers() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let mut session = agent_session(&agent, &h.ws, "opus-4.8");
+        session.provider = Some("mock".into());
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        let meta = grok_meta(5000, 1200, 3000, 250_000_000);
+        assert!(
+            h.services
+                .prompt_meta_turn_usage(&agent, &h.ws, Some(&meta))
+                .await
+                .is_none(),
+            "non-grok provider skips the _meta bill"
+        );
+        assert!(
+            h.services
+                .prompt_meta_turn_usage(&agent, &h.ws, None)
+                .await
+                .is_none(),
+            "no _meta at all"
+        );
+    }
 }
 
 /// Wire-payload tests for `discover_providers_with_npx` (host.providerDiscovery):
@@ -31928,8 +35362,8 @@ mod provider_discovery_payload {
 /// Default-provider settings self-heal (monorepo#3044,
 /// `Services::heal_default_provider_settings`): with no derivable default and
 /// an installed registered provider, the first installed provider is
-/// persisted as `providers.active` plus its cached catalog default (or first)
-/// model as a compound `model.default`; existing values are never
+/// persisted as `model.defaultProvider` plus its cached catalog default (or
+/// first) model as a bare `model.default`; existing values are never
 /// overwritten, and with nothing installed nothing is written.
 mod default_provider_self_heal {
     use super::*;
@@ -31973,14 +35407,14 @@ mod default_provider_self_heal {
             .expect("heal");
         assert_eq!(result["healed"], true, "{result}");
         assert_eq!(result["provider"], "auggie", "{result}");
-        assert_eq!(result["model"], "auggie:sonnet5", "{result}");
+        assert_eq!(result["model"], "sonnet5", "{result}");
         assert_eq!(
-            setting(&svc, "providers.active"),
+            setting(&svc, "model.defaultProvider"),
             Some(serde_json::json!("auggie"))
         );
         assert_eq!(
             setting(&svc, "model.default"),
-            Some(serde_json::json!("auggie:sonnet5"))
+            Some(serde_json::json!("sonnet5"))
         );
 
         // Idempotent: the healed values now derive a default, so a repeat
@@ -32011,13 +35445,13 @@ mod default_provider_self_heal {
             .await
             .expect("heal");
         assert_eq!(result["healed"], true, "{result}");
-        assert_eq!(result["model"], "auggie:fable-5", "{result}");
+        assert_eq!(result["model"], "fable-5", "{result}");
     }
 
-    /// A cached row id with a FOREIGN compound prefix (`grok:foo` in the
-    /// auggie catalog) is not an ownership claim (monorepo#607) — persisting
-    /// it would let the prefix override the healed `providers.active`. The
-    /// provider is healed alone; a self-prefixed row is kept as-is.
+    /// A legacy cached row id with a FOREIGN compound prefix (`grok:foo` in
+    /// the auggie catalog) is not an ownership claim (monorepo#607) — the
+    /// provider is healed alone; a self-prefixed row is stripped to its bare
+    /// model half (persisted values are always bare ids).
     #[tokio::test]
     async fn foreign_prefixed_catalog_row_heals_provider_only() {
         let (_tmp, svc) = setup().await;
@@ -32035,12 +35469,12 @@ mod default_provider_self_heal {
         assert_eq!(result["provider"], "auggie", "{result}");
         assert!(result["model"].is_null(), "{result}");
         assert_eq!(
-            setting(&svc, "providers.active"),
+            setting(&svc, "model.defaultProvider"),
             Some(serde_json::json!("auggie"))
         );
         assert_eq!(setting(&svc, "model.default"), None);
 
-        // A self-prefixed row id IS trusted and kept verbatim.
+        // A self-prefixed row id IS trusted — persisted as the bare id.
         let (_tmp2, svc2) = setup().await;
         svc2.models_catalog.store_for_test(
             "auggie",
@@ -32051,7 +35485,7 @@ mod default_provider_self_heal {
             .heal_default_provider_settings(&["auggie".into()])
             .await
             .expect("heal");
-        assert_eq!(result["model"], "auggie:sonnet5", "{result}");
+        assert_eq!(result["model"], "sonnet5", "{result}");
     }
 
     /// Cold catalog cache (no models known) ⇒ the provider is persisted
@@ -32068,21 +35502,21 @@ mod default_provider_self_heal {
         assert_eq!(result["provider"], "auggie", "{result}");
         assert!(result["model"].is_null(), "{result}");
         assert_eq!(
-            setting(&svc, "providers.active"),
+            setting(&svc, "model.defaultProvider"),
             Some(serde_json::json!("auggie"))
         );
         assert_eq!(setting(&svc, "model.default"), None);
     }
 
-    /// A configured `providers.active` is never overwritten — the heal is a
-    /// no-op even when discovery reports a different installed provider.
+    /// A configured `model.defaultProvider` is never overwritten — the heal
+    /// is a no-op even when discovery reports a different installed provider.
     #[tokio::test]
-    async fn configured_active_provider_is_never_overwritten() {
+    async fn configured_default_provider_is_never_overwritten() {
         let (_tmp, svc) = setup().await;
         svc.settings_registry()
             .expect("registry wired")
-            .apply(&[("providers.active".into(), serde_json::json!("codex"))])
-            .expect("seed active provider");
+            .apply(&[("model.defaultProvider".into(), serde_json::json!("codex"))])
+            .expect("seed default provider");
 
         let result = svc
             .heal_default_provider_settings(&["auggie".into()])
@@ -32091,32 +35525,37 @@ mod default_provider_self_heal {
         assert_eq!(result["healed"], false, "{result}");
         assert_eq!(result["reason"], "already-configured", "{result}");
         assert_eq!(
-            setting(&svc, "providers.active"),
+            setting(&svc, "model.defaultProvider"),
             Some(serde_json::json!("codex"))
         );
         assert_eq!(setting(&svc, "model.default"), None);
     }
 
-    /// A compound `model.default` alone already derives a default provider —
-    /// the heal never touches either key.
+    /// A `model.default` alone no longer derives a default provider (the
+    /// provider is its own key): the heal writes `model.defaultProvider` and
+    /// leaves the configured model untouched (per-key no-overwrite).
     #[tokio::test]
-    async fn compound_default_model_alone_blocks_heal() {
+    async fn default_model_alone_no_longer_blocks_heal() {
         let (_tmp, svc) = setup().await;
         svc.settings_registry()
             .expect("registry wired")
-            .apply(&[("model.default".into(), serde_json::json!("codex:gpt-5"))])
+            .apply(&[("model.default".into(), serde_json::json!("gpt-5"))])
             .expect("seed default model");
 
         let result = svc
             .heal_default_provider_settings(&["auggie".into()])
             .await
             .expect("heal");
-        assert_eq!(result["healed"], false, "{result}");
-        assert_eq!(result["reason"], "already-configured", "{result}");
-        assert_eq!(setting(&svc, "providers.active"), None);
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert!(result["model"].is_null(), "{result}");
+        assert_eq!(
+            setting(&svc, "model.defaultProvider"),
+            Some(serde_json::json!("auggie"))
+        );
         assert_eq!(
             setting(&svc, "model.default"),
-            Some(serde_json::json!("codex:gpt-5"))
+            Some(serde_json::json!("gpt-5"))
         );
     }
 
@@ -32134,21 +35573,21 @@ mod default_provider_self_heal {
             assert_eq!(result["healed"], false, "{result}");
             assert_eq!(result["reason"], "no-installed-provider", "{result}");
         }
-        assert_eq!(setting(&svc, "providers.active"), None);
+        assert_eq!(setting(&svc, "model.defaultProvider"), None);
         assert_eq!(setting(&svc, "model.default"), None);
     }
 
-    /// Both keys hold raw values that don't resolve to a registered provider
-    /// (e.g. ids from a foreign build): no derivable default, but the
-    /// no-overwrite rule still wins — nothing is rewritten.
+    /// Both keys hold raw values, the provider one unresolvable (e.g. an id
+    /// from a foreign build): no derivable default, but the no-overwrite
+    /// rule still wins — nothing is rewritten.
     #[tokio::test]
     async fn unresolvable_existing_values_are_not_overwritten() {
         let (_tmp, svc) = setup().await;
         svc.settings_registry()
             .expect("registry wired")
             .apply(&[
-                ("providers.active".into(), serde_json::json!("mystery")),
-                ("model.default".into(), serde_json::json!("mystery:m1")),
+                ("model.defaultProvider".into(), serde_json::json!("mystery")),
+                ("model.default".into(), serde_json::json!("m1")),
             ])
             .expect("seed unresolvable values");
 
@@ -32159,27 +35598,27 @@ mod default_provider_self_heal {
         assert_eq!(result["healed"], false, "{result}");
         assert_eq!(result["reason"], "values-already-set", "{result}");
         assert_eq!(
-            setting(&svc, "providers.active"),
+            setting(&svc, "model.defaultProvider"),
             Some(serde_json::json!("mystery"))
         );
         assert_eq!(
             setting(&svc, "model.default"),
-            Some(serde_json::json!("mystery:m1"))
+            Some(serde_json::json!("m1"))
         );
     }
 
-    /// Heal writing only `providers.active` (model key holds an unresolvable
-    /// raw value) must NOT trip the provider-switch side effect riding the
-    /// same `settings_update` path: with no derivable provider beforehand
-    /// this is first-time setup, not a switch, so `model.default` keeps its
-    /// raw value per heal's per-key no-overwrite guard.
+    /// Heal writing only `model.defaultProvider` (model key holds a raw
+    /// legacy value) must NOT trip the provider-switch side effect riding
+    /// the same `settings_update` path: with no derivable provider
+    /// beforehand this is first-time setup, not a switch, so `model.default`
+    /// keeps its raw value per heal's per-key no-overwrite guard.
     #[tokio::test]
-    async fn single_key_heal_does_not_rewrite_unresolvable_model() {
+    async fn single_key_heal_does_not_rewrite_legacy_model() {
         let (_tmp, svc) = setup().await;
         svc.settings_registry()
             .expect("registry wired")
             .apply(&[("model.default".into(), serde_json::json!("mystery:m1"))])
-            .expect("seed unresolvable model");
+            .expect("seed legacy model");
 
         let result = svc
             .heal_default_provider_settings(&["auggie".into()])
@@ -32189,12 +35628,49 @@ mod default_provider_self_heal {
         assert_eq!(result["provider"], "auggie", "{result}");
         assert!(result["model"].is_null(), "{result}");
         assert_eq!(
-            setting(&svc, "providers.active"),
+            setting(&svc, "model.defaultProvider"),
             Some(serde_json::json!("auggie"))
         );
         assert_eq!(
             setting(&svc, "model.default"),
             Some(serde_json::json!("mystery:m1"))
+        );
+    }
+
+    /// PR #1648 review: a nonblank-but-unregistered `model.defaultProvider`
+    /// (e.g. a typo) with `model.default` unset must not have the heal
+    /// persist the DISCOVERED provider's catalog model — that provider is
+    /// not going to be the effective one, and the stale model would survive
+    /// the user's eventual correction. The model rung runs only when the
+    /// provider key is healed in the same sweep.
+    #[tokio::test]
+    async fn typo_provider_with_unset_model_heals_nothing() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("model.defaultProvider".into(), serde_json::json!("typo"))])
+            .expect("seed typo provider");
+        svc.models_catalog.store_for_test(
+            "auggie",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
+            vec![serde_json::json!({ "id": "sonnet5", "isDefault": true })],
+        );
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], false, "{result}");
+        assert_eq!(result["reason"], "values-already-set", "{result}");
+        assert_eq!(
+            setting(&svc, "model.defaultProvider"),
+            Some(serde_json::json!("typo")),
+            "no-overwrite rule keeps the raw provider value"
+        );
+        assert_eq!(
+            setting(&svc, "model.default"),
+            None,
+            "the discovered provider's model must not be persisted"
         );
     }
 
@@ -32215,7 +35691,7 @@ mod default_provider_self_heal {
         assert_eq!(result["healed"], true, "{result}");
         assert_eq!(result["provider"], "codex", "{result}");
         assert_eq!(
-            setting(&svc, "providers.active"),
+            setting(&svc, "model.defaultProvider"),
             Some(serde_json::json!("codex"))
         );
     }
@@ -32223,17 +35699,18 @@ mod default_provider_self_heal {
 
 /// Default-model re-resolution on a default-provider switch (monorepo#3177,
 /// `Services::reresolve_default_model_on_provider_switch`): a
-/// `settings.update` batch that switches `providers.active` to a different
-/// registered provider gets a re-resolved `model.default` appended — the new
-/// provider's cached catalog default-or-first model, else (model currently
-/// set, no catalog) a blank clearing value. An explicit `model.default` in
-/// the batch wins, and a same-provider rewrite changes nothing.
+/// `settings.update` batch that switches `model.defaultProvider` to a
+/// different registered provider gets a re-resolved `model.default` appended
+/// — the new provider's cached catalog default-or-first model, else (model
+/// currently set, no catalog) a blank clearing value. An explicit
+/// `model.default` in the batch wins, and a same-provider rewrite changes
+/// nothing.
 mod provider_switch_reresolves_default_model {
     use super::*;
 
-    /// Services with a settings registry wired, seeded with `providers.active`
-    /// = auggie and `model.default` = auggie:fable-5 (the stale-shadow setup
-    /// from monorepo#3177).
+    /// Services with a settings registry wired, seeded with
+    /// `model.defaultProvider` = auggie and `model.default` = fable-5 (the
+    /// stale-shadow setup from monorepo#3177).
     async fn setup() -> (TempDb, Services) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -32245,8 +35722,8 @@ mod provider_switch_reresolves_default_model {
             .settings_registry()
             .expect("registry wired")
             .apply(&[
-                ("providers.active".into(), serde_json::json!("auggie")),
-                ("model.default".into(), serde_json::json!("auggie:fable-5")),
+                ("model.defaultProvider".into(), serde_json::json!("auggie")),
+                ("model.default".into(), serde_json::json!("fable-5")),
             ])
             .expect("seed settings");
         (tmp, services)
@@ -32261,7 +35738,7 @@ mod provider_switch_reresolves_default_model {
 
     async fn switch_to(svc: &Services, provider: &str) -> serde_json::Value {
         svc.settings_update(serde_json::json!([
-            { "path": "providers.active", "value": provider }
+            { "path": "model.defaultProvider", "value": provider }
         ]))
         .await
         .expect("settings.update")
@@ -32286,12 +35763,12 @@ mod provider_switch_reresolves_default_model {
         let applied = result["applied"].as_array().expect("applied array");
         assert_eq!(applied.len(), 2, "{result}");
         assert_eq!(
-            setting(&svc, "providers.active"),
+            setting(&svc, "model.defaultProvider"),
             Some(serde_json::json!("grok"))
         );
         assert_eq!(
             setting(&svc, "model.default"),
-            Some(serde_json::json!("grok:grok-code-fast"))
+            Some(serde_json::json!("grok-code-fast"))
         );
     }
 
@@ -32312,7 +35789,7 @@ mod provider_switch_reresolves_default_model {
         switch_to(&svc, "grok").await;
         assert_eq!(
             setting(&svc, "model.default"),
-            Some(serde_json::json!("grok:grok-4"))
+            Some(serde_json::json!("grok-4"))
         );
     }
 
@@ -32325,15 +35802,16 @@ mod provider_switch_reresolves_default_model {
 
         switch_to(&svc, "grok").await;
         assert_eq!(
-            setting(&svc, "providers.active"),
+            setting(&svc, "model.defaultProvider"),
             Some(serde_json::json!("grok"))
         );
         assert_eq!(setting(&svc, "model.default"), Some(serde_json::json!("")));
     }
 
-    /// A foreign-prefixed catalog row (`codex:foo` in the grok catalog) is
-    /// not an ownership claim (monorepo#607) — it is not persisted; with a
-    /// model currently stored the stale value is cleared instead.
+    /// A legacy foreign-prefixed catalog row (`codex:foo` in the grok
+    /// catalog) is not an ownership claim (monorepo#607) — it is not
+    /// persisted; with a model currently stored the stale value is cleared
+    /// instead.
     #[tokio::test]
     async fn foreign_prefixed_catalog_row_clears_instead() {
         let (_tmp, svc) = setup().await;
@@ -32346,7 +35824,8 @@ mod provider_switch_reresolves_default_model {
         switch_to(&svc, "grok").await;
         assert_eq!(setting(&svc, "model.default"), Some(serde_json::json!("")));
 
-        // A self-prefixed row id IS trusted and kept verbatim.
+        // A self-prefixed legacy row id IS trusted — persisted as the bare
+        // id.
         let (_tmp2, svc2) = setup().await;
         svc2.models_catalog.store_for_test(
             "grok",
@@ -32356,7 +35835,7 @@ mod provider_switch_reresolves_default_model {
         switch_to(&svc2, "grok").await;
         assert_eq!(
             setting(&svc2, "model.default"),
-            Some(serde_json::json!("grok:grok-4"))
+            Some(serde_json::json!("grok-4"))
         );
     }
 
@@ -32372,20 +35851,20 @@ mod provider_switch_reresolves_default_model {
         );
 
         svc.settings_update(serde_json::json!([
-            { "path": "providers.active", "value": "grok" },
-            { "path": "model.default", "value": "grok:grok-4" }
+            { "path": "model.defaultProvider", "value": "grok" },
+            { "path": "model.default", "value": "grok-4" }
         ]))
         .await
         .expect("settings.update");
         assert_eq!(
             setting(&svc, "model.default"),
-            Some(serde_json::json!("grok:grok-4"))
+            Some(serde_json::json!("grok-4"))
         );
     }
 
-    /// A same-provider rewrite of `providers.active` is NOT a switch — the
-    /// configured model is left alone (also the loop guard: replaying the
-    /// applied batch appends nothing).
+    /// A same-provider rewrite of `model.defaultProvider` is NOT a switch —
+    /// the configured model is left alone and the no-op neither reports an
+    /// applied change nor advances the settings revision.
     #[tokio::test]
     async fn same_provider_rewrite_is_a_noop() {
         let (_tmp, svc) = setup().await;
@@ -32397,36 +35876,11 @@ mod provider_switch_reresolves_default_model {
 
         let result = switch_to(&svc, "auggie").await;
         let applied = result["applied"].as_array().expect("applied array");
-        assert_eq!(applied.len(), 1, "{result}");
+        assert!(applied.is_empty(), "{result}");
+        assert_eq!(result["revision"], serde_json::json!(0), "{result}");
         assert_eq!(
             setting(&svc, "model.default"),
-            Some(serde_json::json!("auggie:fable-5"))
-        );
-    }
-
-    /// The compound `model.default` prefix outranks `providers.active` in
-    /// derivation, so even after a prior (pre-fix) switch left a stale
-    /// foreign model behind, re-selecting the same target provider is still
-    /// detected as a switch and re-resolves the model.
-    #[tokio::test]
-    async fn stale_compound_prefix_still_detected_as_switch() {
-        let (_tmp, svc) = setup().await;
-        // Simulate the pre-fix corrupted state: provider already switched,
-        // model still the old provider's.
-        svc.settings_registry()
-            .expect("registry wired")
-            .apply(&[("providers.active".into(), serde_json::json!("grok"))])
-            .expect("seed switched provider");
-        svc.models_catalog.store_for_test(
-            "grok",
-            "",
-            vec![serde_json::json!({ "id": "grok-code-fast", "isDefault": true })],
-        );
-
-        switch_to(&svc, "grok").await;
-        assert_eq!(
-            setting(&svc, "model.default"),
-            Some(serde_json::json!("grok:grok-code-fast"))
+            Some(serde_json::json!("fable-5"))
         );
     }
 
@@ -32440,7 +35894,7 @@ mod provider_switch_reresolves_default_model {
         switch_to(&svc, "mystery").await;
         assert_eq!(
             setting(&svc, "model.default"),
-            Some(serde_json::json!("auggie:fable-5"))
+            Some(serde_json::json!("fable-5"))
         );
     }
 
@@ -32461,11 +35915,11 @@ mod provider_switch_reresolves_default_model {
         assert_eq!(setting(&svc, "model.default"), None);
     }
 
-    /// First-time setup is NOT a switch: with no derivable provider (only an
-    /// unresolvable raw `model.default` stored), setting `providers.active`
-    /// appends nothing even on a warm cache — the raw model value is
-    /// preserved (heal's no-overwrite guard relies on this, since heal
-    /// persists through the same `settings_update` path).
+    /// First-time setup is NOT a switch: with no derivable provider (only a
+    /// raw `model.default` stored), setting `model.defaultProvider` appends
+    /// nothing even on a warm cache — the raw model value is preserved
+    /// (heal's no-overwrite guard relies on this, since heal persists
+    /// through the same `settings_update` path).
     #[tokio::test]
     async fn first_time_setup_is_not_a_switch() {
         let tmp = TempDb::new();
@@ -33225,6 +36679,7 @@ mod agent_delete_grace_window {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: ts.clone(),
             updated_at: ts,
         }
@@ -33855,6 +37310,98 @@ mod harness_versioning {
     }
 }
 
+/// Context-window occupancy (intent-hq/intent#3797): the latest ACP
+/// `usage_update` `used`/`size` is recorded latest-wins in the in-memory
+/// registry and overlaid on the `AgentLite` projection as `contextUsage` —
+/// never persisted, never folded into token tallies.
+mod context_usage_projection {
+    use super::*;
+
+    async fn setup() -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let registry = test_registry_with_default_provider(&tmp);
+        let services = Services::new(store).with_settings_registry(registry);
+        (tmp, services, ws)
+    }
+
+    async fn create_agent(svc: &Services, ws: &WorkspaceId) -> AgentId {
+        let created = svc
+            .agent_create_op(
+                ws.clone(),
+                Some("Occupancy".into()),
+                None,
+                None,
+                None,
+                None,
+                false,
+                intent_core::AgentCreateExtra::default(),
+            )
+            .await
+            .expect("create agent");
+        AgentId::from(created["agent"]["id"].as_str().unwrap())
+    }
+
+    /// A recorded report surfaces on the projection (`used`/`size` +
+    /// `updatedAt` stamp), a second report replaces it wholesale
+    /// (latest-wins), and the serialized wire form carries camelCase
+    /// `contextUsage`.
+    #[tokio::test]
+    async fn latest_report_overlays_projection() {
+        let (_tmp, svc, ws) = setup().await;
+        let id = create_agent(&svc, &ws).await;
+
+        // No report yet: field absent (fresh session / post-restart shape).
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let lite = svc.project_lite_with_flags(session);
+        assert_eq!(lite.context_usage, None, "no report → omitted");
+
+        svc.record_context_usage(&id, 53_000, 200_000);
+        svc.record_context_usage(&id, 61_500, 200_000);
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let lite = svc.project_lite_with_flags(session);
+        let usage = lite.context_usage.as_ref().expect("latest report overlaid");
+        assert_eq!((usage.used, usage.size), (61_500, 200_000), "latest wins");
+        assert!(!usage.updated_at.is_empty(), "report carries a timestamp");
+
+        let wire = serde_json::to_value(&lite).expect("serialize");
+        assert_eq!(wire["contextUsage"]["used"], 61_500);
+        assert_eq!(wire["contextUsage"]["size"], 200_000);
+        assert!(
+            wire["contextUsage"]["updatedAt"].is_string(),
+            "camelCase wire field"
+        );
+    }
+
+    /// The registry is in-memory only and keyed by agent: deleting the
+    /// session drops its entry (no leak, and a projection built for a
+    /// same-id row would start clean), and other agents are unaffected.
+    #[tokio::test]
+    async fn delete_drops_registry_entry() {
+        let (_tmp, svc, ws) = setup().await;
+        let id = create_agent(&svc, &ws).await;
+        let other = create_agent(&svc, &ws).await;
+        svc.record_context_usage(&id, 10_000, 200_000);
+        svc.record_context_usage(&other, 20_000, 200_000);
+
+        svc.agent_delete_op(id.clone(), None).await.expect("delete");
+        assert_eq!(
+            svc.context_usage_for(&id),
+            None,
+            "deleted agent's entry dropped"
+        );
+        let session = svc.store().get_agent_session(&other).await.expect("get");
+        let lite = svc.project_lite_with_flags(session);
+        assert_eq!(
+            lite.context_usage.map(|u| u.used),
+            Some(20_000),
+            "other agent's entry survives"
+        );
+    }
+}
+
 /// Regression tests for the `agentSummary` soft-delete filter: sessions with
 /// `AgentStatus::Deleted` must be excluded from the card aggregate's
 /// `count`/`agents`/`agentIds` (all three consistent, §5.1) so clients never
@@ -33916,5 +37463,898 @@ mod agent_summary_excludes_deleted {
             vec![active_id],
             "agentIds stays consistent with agents"
         );
+    }
+}
+
+/// Daemon-side derived workspace `unread` (§5.1): unread = any top-level
+/// (non-background, non-deleted) session whose newest user/assistant message
+/// is an assistant message the per-agent seen marker (`agent.markSeen`,
+/// §5.5) has not caught up with. Read paths serve the derivation (stored
+/// `review_required` still wins), `agent.markSeen` settles the workspace
+/// flag when the last unread session is read, and `workspace.markSeen`
+/// advances every top-level marker.
+mod derived_workspace_unread {
+    use std::time::Duration;
+
+    use intent_core::{
+        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    };
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    struct Harness {
+        _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        harness_with_park(None).await
+    }
+
+    /// Harness variant with the monorepo#1481 attention-write park seam
+    /// armed, so settle-race tests can hold the settlement immediately
+    /// before its atomic clear (the probe→write gap).
+    async fn harness_with_park(
+        park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+    ) -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let ws_root = WorkspacesRoot::new();
+        let mut services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+        if let Some(park) = park {
+            services = services.with_attention_write_park(park);
+        }
+        Harness {
+            _tmp: tmp,
+            _ws_root: ws_root,
+            store,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    fn mk_session(ws: &WorkspaceId, id: &str) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            retired_at: None,
+        }
+    }
+
+    /// Insert a top-level session and append `roles` in order, returning the
+    /// LAST appended message id.
+    async fn seed_session(h: &Harness, id: &str, roles: &[&str]) -> String {
+        seed_session_with(h, mk_session(&h.ws, id), roles).await
+    }
+
+    async fn seed_session_with(h: &Harness, session: AgentSession, roles: &[&str]) -> String {
+        let agent_id = session.id.clone();
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let mut last = String::new();
+        for role in roles {
+            let msg = h
+                .store
+                .append_agent_message(
+                    &agent_id,
+                    role,
+                    &json!([{ "type": "text", "text": "m" }]),
+                    &now_iso(),
+                )
+                .await
+                .expect("append message");
+            last = msg.id;
+        }
+        last
+    }
+
+    fn subscribe_attention(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:attention-changed".to_string()],
+            ..Default::default()
+        })
+    }
+
+    async fn recv_one(sub: &mut Subscription) -> Value {
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        assert_eq!(batch.len(), 1, "expected exactly one event");
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    async fn assert_silent(sub: &mut Subscription) {
+        let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(res.is_err(), "expected no attention event: {res:?}");
+    }
+
+    /// Served attention over `workspace.get` (the enrichment path).
+    async fn served_attention(h: &Harness) -> WorkspaceAttention {
+        h.services
+            .get_workspace(h.ws.clone())
+            .await
+            .expect("get workspace")
+            .attention
+    }
+
+    /// Store-level derivation truth table: no agents / unseen-assistant /
+    /// seen / user-last / background / child / deleted sessions.
+    #[tokio::test]
+    async fn derivation_truth_table() {
+        let h = harness().await;
+        let probe = || h.store.workspace_has_unread_top_level_session(&h.ws);
+
+        // No agents: not unread.
+        assert!(!probe().await.expect("probe"));
+
+        // Top-level session with no messages: not unread.
+        h.store
+            .insert_agent_session(&mk_session(&h.ws, "agent-empty"))
+            .await
+            .expect("insert");
+        assert!(!probe().await.expect("probe"));
+
+        // User-last session: not unread.
+        seed_session(&h, "agent-user-last", &["assistant", "user"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Background session with an unseen assistant last: never unread.
+        let mut background = mk_session(&h.ws, "agent-background");
+        background.is_background = true;
+        seed_session_with(&h, background, &["user", "assistant"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Child session with an unseen assistant last: never unread.
+        let mut child = mk_session(&h.ws, "agent-child");
+        child.parent_agent_id = Some(AgentId::from("agent-empty"));
+        seed_session_with(&h, child, &["user", "assistant"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Deleted session with an unseen assistant last: never unread.
+        let mut deleted = mk_session(&h.ws, "agent-deleted");
+        deleted.status = AgentStatus::Deleted;
+        seed_session_with(&h, deleted, &["user", "assistant"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Top-level unseen assistant last: unread.
+        let last = seed_session(&h, "agent-unread", &["user", "assistant"]).await;
+        assert!(probe().await.expect("probe"));
+
+        // Marker caught up: not unread again.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-unread"), last)
+            .await
+            .expect("mark seen");
+        assert!(!probe().await.expect("probe"));
+    }
+
+    /// Read paths serve the derivation: an unseen assistant last message
+    /// reads `unread` even when the stored flag is `none`, and a stale
+    /// stored `unread` reads `none` once every marker is caught up.
+    #[tokio::test]
+    async fn reads_serve_derived_attention_over_stored_flag() {
+        let h = harness().await;
+        // Derived unread, stored none.
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        // Stale stored unread + marker caught up: derived none wins.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::Unread;
+        h.store.update_workspace(&ws).await.expect("seed stale");
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // list_workspaces serves the same derivation.
+        let listed = h
+            .services
+            .list_workspaces(false)
+            .await
+            .expect("list workspaces");
+        let row = listed.iter().find(|w| w.id == h.ws).expect("row");
+        assert_eq!(row.attention, WorkspaceAttention::None);
+    }
+
+    /// Stored `review_required` always wins over the derivation — in both
+    /// directions (derived unread and derived none).
+    #[tokio::test]
+    async fn review_required_wins_over_derivation() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::ReviewRequired;
+        h.store.update_workspace(&ws).await.expect("seed review");
+        assert_eq!(
+            served_attention(&h).await,
+            WorkspaceAttention::ReviewRequired
+        );
+
+        // markSeen advances the marker but leaves review_required in place
+        // (and never emits attention-changed { none } while it holds).
+        let mut sub = subscribe_attention(&h);
+        h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        assert_silent(&mut sub).await;
+        assert_eq!(
+            served_attention(&h).await,
+            WorkspaceAttention::ReviewRequired
+        );
+    }
+
+    /// `agent.markSeen` partial vs final clear: reading one of two unread
+    /// agents stays silent; reading the last one clears the stored flag and
+    /// emits exactly one `workspace:attention-changed { none }`.
+    #[tokio::test]
+    async fn agent_mark_seen_partial_then_final_clear() {
+        let h = harness().await;
+        let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let last_b = seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        // Stored flag raised as the turn-end gate would have left it.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        let mut sub = subscribe_attention(&h);
+        // Partial: agent-b still unread — no workspace-level emission.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last_a)
+            .await
+            .expect("mark a seen");
+        assert_silent(&mut sub).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        // Final: last unread agent read — stored flag cleared + one emit.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-b"), last_b)
+            .await
+            .expect("mark b seen");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // Idempotent re-mark: no duplicate emission.
+        h.services
+            .agent_mark_seen_op(
+                h.ws.clone(),
+                AgentId::from("agent-b"),
+                h.store
+                    .get_agent_session_summary(&AgentId::from("agent-b"))
+                    .await
+                    .expect("summary")
+                    .last_seen_message_id()
+                    .expect("marker")
+                    .to_string(),
+            )
+            .await
+            .expect("re-mark");
+        assert_silent(&mut sub).await;
+    }
+
+    /// The final `agent.markSeen` clears the derived state even when the
+    /// stored flag was never raised (e.g. the turn-end raise was skipped):
+    /// clients tracking the derived value still get the clear.
+    #[tokio::test]
+    async fn agent_mark_seen_emits_clear_without_stored_flag() {
+        let h = harness().await;
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        let mut sub = subscribe_attention(&h);
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+    }
+
+    /// `workspace.markSeen` advances every top-level session's marker to its
+    /// `last_message_id` (background/child sessions untouched), clears the
+    /// derived + stored unread, and emits exactly one attention-changed.
+    #[tokio::test]
+    async fn workspace_mark_seen_marks_all_top_level_sessions() {
+        let h = harness().await;
+        let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let last_b = seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        let mut background = mk_session(&h.ws, "agent-background");
+        background.is_background = true;
+        seed_session_with(&h, background, &["user", "assistant"]).await;
+        let mut child = mk_session(&h.ws, "agent-child");
+        child.parent_agent_id = Some(AgentId::from("agent-a"));
+        seed_session_with(&h, child, &["user", "assistant"]).await;
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        let mut sub = subscribe_attention(&h);
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+
+        // Exactly one workspace-level clear.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_silent(&mut sub).await;
+
+        // Top-level markers advanced to each session's last message.
+        for (id, last) in [("agent-a", &last_a), ("agent-b", &last_b)] {
+            let s = h
+                .store
+                .get_agent_session_summary(&AgentId::from(id))
+                .await
+                .expect("summary");
+            assert_eq!(s.last_seen_message_id(), Some(last.as_str()));
+        }
+        // Child/background markers untouched.
+        for id in ["agent-background", "agent-child"] {
+            let s = h
+                .store
+                .get_agent_session_summary(&AgentId::from(id))
+                .await
+                .expect("summary");
+            assert_eq!(s.last_seen_message_id(), None, "{id} marker untouched");
+        }
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // Idempotent: a second markSeen is silent.
+        h.services.mark_seen(h.ws.clone()).await.expect("again");
+        assert_silent(&mut sub).await;
+    }
+
+    /// The turn-end raise still only emits on the none→unread transition
+    /// (guarded write), and the derivation agrees with the raise.
+    #[tokio::test]
+    async fn turn_end_raise_transition_only() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let mut sub = subscribe_attention(&h);
+
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "unread" })
+        );
+
+        // Re-raise while already unread: guarded no-op, no spam.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("re-raise");
+        assert_silent(&mut sub).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+    }
+
+    /// Settle race: an assistant message landing in the gap between the
+    /// settle's unread probe and its attention write must NOT be retired.
+    /// Parks the settlement immediately before the write, seeds a fresh
+    /// unread session while parked, and asserts the atomic clear declines —
+    /// stored flag still `unread`, no `{ none }` emit — so subscribers never
+    /// believe the workspace is caught up while the derivation reads unread.
+    #[tokio::test]
+    async fn settle_race_new_message_in_gap_never_clears() {
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_park(Some(park.clone())).await;
+        let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        // Stored flag raised as the turn-end gate would have left it (seeded
+        // via the store — the armed park would hold the service-path raise).
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::Unread;
+        h.store.update_workspace(&ws).await.expect("seed flag");
+
+        let mut sub = subscribe_attention(&h);
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let task = tokio::spawn(async move {
+            services
+                .agent_mark_seen_op(ws_id, AgentId::from("agent-a"), last_a)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("settle reaches the attention write window");
+
+        // New unread session lands while the settle sits parked between its
+        // probe (which saw "all seen") and its write.
+        seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        park.release.notify_one();
+
+        task.await.expect("join").expect("mark seen");
+        // The atomic clear re-checked the derivation inside the write and
+        // declined; the fallback emit re-probed and stayed silent too.
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.attention,
+            WorkspaceAttention::Unread,
+            "stored unread must survive a message landing in the settle gap"
+        );
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+    }
+
+    /// `workspace.markSeen` propagates marker-advance failures instead of
+    /// swallowing them: a failed per-session advance (here: the message
+    /// table dropped out from under the monotonicity gate) surfaces as the
+    /// call's error, the stored `unread` flag survives, and no `{ none }`
+    /// event is emitted — the caller never sees "seen" while a session
+    /// stays unread.
+    #[tokio::test]
+    async fn workspace_mark_seen_propagates_marker_failures() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        // Persist a dangling current marker so the monotonicity gate must
+        // resolve transcript positions (and hit the induced store failure).
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), "stale".into())
+            .await
+            .expect("seed marker");
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        // Force the per-session advance to fail hard (not NotFound).
+        sqlx::query("DROP TABLE agent_message")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop agent_message");
+
+        let mut sub = subscribe_attention(&h);
+        let err = h.services.mark_seen(h.ws.clone()).await;
+        assert!(err.is_err(), "marker failure must propagate: {err:?}");
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.attention,
+            WorkspaceAttention::Unread,
+            "stored unread must survive a failed mark-all"
+        );
+    }
+
+    /// Batch list-path derivation (`workspaces_with_unread_top_level_sessions`)
+    /// agrees with the per-workspace EXISTS probe: only workspaces with an
+    /// unread top-level session appear in the set, and a marker catch-up
+    /// removes them.
+    #[tokio::test]
+    async fn batch_unread_set_matches_single_probe() {
+        let h = harness().await;
+        // Second workspace, fully seen.
+        let ws_seen = WorkspaceId::new();
+        h.store
+            .insert_workspace(&workspace(&ws_seen))
+            .await
+            .expect("ws2");
+        let seen_session = mk_session(&ws_seen, "agent-seen");
+        let last_seen = seed_session_with(&h, seen_session, &["user", "assistant"]).await;
+        h.services
+            .agent_mark_seen_op(ws_seen.clone(), AgentId::from("agent-seen"), last_seen)
+            .await
+            .expect("catch up ws2");
+        // Primary workspace unread.
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+
+        let set = h
+            .store
+            .workspaces_with_unread_top_level_sessions()
+            .await
+            .expect("batch probe");
+        assert!(set.contains(h.ws.as_str()), "unread workspace in the set");
+        assert!(
+            !set.contains(ws_seen.as_str()),
+            "caught-up workspace absent"
+        );
+
+        // Marker catch-up drains the set.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        let set = h
+            .store
+            .workspaces_with_unread_top_level_sessions()
+            .await
+            .expect("batch probe");
+        assert!(!set.contains(h.ws.as_str()), "seen workspace drained");
+    }
+}
+
+/// `workspace.localChanges` (§5.1): per-root aggregation over the primary
+/// worktree and every registered secondary git root. The per-repository
+/// signal math is covered in `intent_git::local_changes`; these assert row
+/// composition, ordering, remote-workspace skipping, and fail-soft rows.
+mod local_changes {
+    use std::path::{Path, PathBuf};
+
+    use intent_core::{now_iso, Error, WorkspaceId};
+    use intent_store::Store;
+
+    use super::{workspace, TempDb};
+    use crate::Services;
+
+    /// Self-cleaning temp directory.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("intentd-lc-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Init a repo at `dir` with one commit (no remotes → the commit is
+    /// unpushed) and one untracked file (→ one uncommitted path).
+    fn dirty_repo(dir: &Path) {
+        let repo = git2::Repository::init(dir).unwrap();
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+        std::fs::write(dir.join("untracked.txt"), "hi\n").unwrap();
+    }
+
+    /// Init an empty repo at `dir` (unborn HEAD, clean worktree → 0/0).
+    fn empty_repo(dir: &Path) {
+        git2::Repository::init(dir).unwrap();
+    }
+
+    fn git_root(ws_id: &WorkspaceId, path: &Path) -> intent_core::WorkspaceGitRoot {
+        let ts = now_iso();
+        intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws_id.clone(),
+            path: path.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    /// Store + service + a seeded workspace whose worktree is `worktree`
+    /// (when given) and whose `is_remote` flag is `remote`.
+    async fn setup(
+        worktree: Option<&Path>,
+        remote: bool,
+    ) -> (TempDb, Services, intent_core::Workspace) {
+        setup_with(worktree, |ws| ws.is_remote = remote).await
+    }
+
+    /// [`setup`] with an arbitrary tweak applied to the workspace before it
+    /// is inserted.
+    async fn setup_with(
+        worktree: Option<&Path>,
+        tweak: impl FnOnce(&mut intent_core::Workspace),
+    ) -> (TempDb, Services, intent_core::Workspace) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = worktree.map(|p| p.to_string_lossy().into_owned());
+        tweak(&mut ws);
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+        (tmp, svc, ws)
+    }
+
+    #[tokio::test]
+    async fn primary_only_workspace_reports_one_primary_row() {
+        let wt = TempDir::new();
+        dirty_repo(&wt.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "{v}");
+        assert_eq!(roots[0]["kind"], "primary");
+        assert!(roots[0].get("gitRootId").is_none(), "{v}");
+        assert_eq!(roots[0]["path"], wt.0.to_string_lossy().as_ref());
+        assert_eq!(roots[0]["hasRemoteRefs"], false);
+        assert_eq!(roots[0]["unpushedCount"], 1);
+        assert_eq!(roots[0]["uncommittedCount"], 1);
+        assert!(roots[0].get("error").is_none(), "{v}");
+        assert_eq!(v["hasUnpushedCommits"], true);
+        assert_eq!(v["hasUncommittedChanges"], true);
+    }
+
+    #[tokio::test]
+    async fn secondary_root_row_follows_primary() {
+        let wt = TempDir::new();
+        empty_repo(&wt.0);
+        let sub = TempDir::new();
+        dirty_repo(&sub.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+        let root = git_root(&ws.id, &sub.0);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 2, "{v}");
+        assert_eq!(roots[0]["kind"], "primary");
+        assert_eq!(roots[0]["path"], wt.0.to_string_lossy().as_ref());
+        assert_eq!(roots[0]["unpushedCount"], 0);
+        assert_eq!(roots[0]["uncommittedCount"], 0);
+        assert_eq!(roots[1]["kind"], "secondary");
+        assert_eq!(roots[1]["gitRootId"], root.id.as_str());
+        assert_eq!(roots[1]["path"], root.path);
+        assert_eq!(roots[1]["unpushedCount"], 1);
+        assert_eq!(roots[1]["uncommittedCount"], 1);
+        // The aggregate flags OR over rows: only the secondary root is dirty.
+        assert_eq!(v["hasUnpushedCommits"], true);
+        assert_eq!(v["hasUncommittedChanges"], true);
+    }
+
+    #[tokio::test]
+    async fn deleted_root_path_yields_error_row_without_failing() {
+        let wt = TempDir::new();
+        empty_repo(&wt.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+        let gone = std::env::temp_dir().join(format!("intentd-lc-gone-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&gone).unwrap();
+        let root = git_root(&ws.id, &gone);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 2, "{v}");
+        assert_eq!(roots[1]["kind"], "secondary");
+        assert_eq!(roots[1]["gitRootId"], root.id.as_str());
+        assert_eq!(roots[1]["path"], root.path);
+        assert!(
+            roots[1]["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{v}"
+        );
+        assert_eq!(roots[1]["hasRemoteRefs"], false);
+        assert_eq!(roots[1]["unpushedCount"], 0);
+        assert_eq!(roots[1]["uncommittedCount"], 0);
+        assert!(roots[1].get("branch").is_none(), "{v}");
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+    }
+
+    /// Rows come back in `gitRoot.list` order even though the roots are
+    /// scanned concurrently.
+    #[tokio::test]
+    async fn secondary_rows_preserve_git_root_list_order() {
+        let wt = TempDir::new();
+        empty_repo(&wt.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+        let subs: Vec<TempDir> = (0..4).map(|_| TempDir::new()).collect();
+        for sub in &subs {
+            dirty_repo(&sub.0);
+            let root = git_root(&ws.id, &sub.0);
+            svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        }
+        let listed: Vec<String> = svc
+            .store()
+            .list_workspace_git_roots(&ws.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id.as_str().to_string())
+            .collect();
+        assert_eq!(listed.len(), 4);
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 5, "{v}");
+        assert_eq!(roots[0]["kind"], "primary");
+        let got: Vec<&str> = roots[1..]
+            .iter()
+            .map(|r| r["gitRootId"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, listed);
+        assert!(roots[1..].iter().all(|r| r["unpushedCount"] == 1), "{v}");
+    }
+
+    /// No `.git` entry at all: the workspace has no checkout to lose, so
+    /// there is no primary row (same gate as `git.status`).
+    #[tokio::test]
+    async fn non_git_primary_worktree_is_skipped() {
+        let wt = TempDir::new();
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        assert_eq!(v["roots"], serde_json::json!([]));
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+    }
+
+    /// A `.git` entry that exists but cannot be opened (a gitfile pointing
+    /// at a missing gitdir) is a primary row carrying `error`, not a silent
+    /// omission — the same fail-soft shape a secondary root gets.
+    #[tokio::test]
+    async fn unopenable_primary_worktree_yields_error_row() {
+        let wt = TempDir::new();
+        std::fs::write(
+            wt.0.join(".git"),
+            "gitdir: /nonexistent/intentd-lc-gitdir\n",
+        )
+        .unwrap();
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "{v}");
+        assert_eq!(roots[0]["kind"], "primary");
+        assert_eq!(roots[0]["path"], wt.0.to_string_lossy().as_ref());
+        assert!(
+            roots[0]["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{v}"
+        );
+        assert_eq!(roots[0]["unpushedCount"], 0);
+        assert_eq!(roots[0]["uncommittedCount"], 0);
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+    }
+
+    /// `skipWorktree`: `worktree_path` falls back to the user's own
+    /// `repository_path`, which archive/delete never removes, so the primary
+    /// row is skipped exactly like a remote workspace's.
+    #[tokio::test]
+    async fn skip_worktree_workspace_skips_primary_row() {
+        let repo = TempDir::new();
+        dirty_repo(&repo.0);
+        let sub = TempDir::new();
+        dirty_repo(&sub.0);
+        let (_t, svc, ws) = setup_with(None, |ws| {
+            ws.repository_path = Some(repo.0.to_string_lossy().into_owned());
+            ws.skip_worktree = true;
+        })
+        .await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        assert_eq!(v["roots"], serde_json::json!([]), "{v}");
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+
+        let root = git_root(&ws.id, &sub.0);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "{v}");
+        assert_eq!(roots[0]["kind"], "secondary");
+        assert_eq!(roots[0]["gitRootId"], root.id.as_str());
+        assert_eq!(v["hasUnpushedCommits"], true);
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_without_roots_is_empty() {
+        let wt = TempDir::new();
+        dirty_repo(&wt.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), true).await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        assert_eq!(v["roots"], serde_json::json!([]));
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_still_evaluates_secondary_roots() {
+        let wt = TempDir::new();
+        dirty_repo(&wt.0);
+        let sub = TempDir::new();
+        dirty_repo(&sub.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), true).await;
+        let root = git_root(&ws.id, &sub.0);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "{v}");
+        assert_eq!(roots[0]["kind"], "secondary");
+        assert_eq!(roots[0]["gitRootId"], root.id.as_str());
+        assert_eq!(roots[0]["path"], root.path);
+        assert_eq!(roots[0]["unpushedCount"], 1);
+        assert_eq!(v["hasUnpushedCommits"], true);
+        assert_eq!(v["hasUncommittedChanges"], true);
+    }
+
+    #[tokio::test]
+    async fn unknown_workspace_is_not_found() {
+        let (_t, svc, _ws) = setup(None, false).await;
+        let err = svc
+            .workspace_local_changes_op(WorkspaceId::from("missing"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
     }
 }

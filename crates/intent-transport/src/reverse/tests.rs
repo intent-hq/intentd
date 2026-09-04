@@ -7,6 +7,47 @@ use tokio::sync::mpsc;
 
 use super::*;
 
+#[test]
+fn screenshot_requests_use_a_shorter_inner_deadline() {
+    let timeout = request_timeout(
+        "browser.exec",
+        &json!({ "actions": [{ "action": "screenshot" }] }),
+    );
+    assert_eq!(timeout, SCREENSHOT_REVERSE_TIMEOUT);
+    assert!(timeout < DEFAULT_REVERSE_TIMEOUT);
+
+    assert_eq!(
+        request_timeout(
+            "browser.exec",
+            &json!({
+                "actions": [
+                    { "action": "listTabs" },
+                    { "action": "screenshot" }
+                ]
+            }),
+        ),
+        SCREENSHOT_REVERSE_TIMEOUT,
+    );
+}
+
+#[test]
+fn unrelated_reverse_requests_keep_the_default_deadline() {
+    assert_eq!(
+        request_timeout(
+            "browser.exec",
+            &json!({ "actions": [{ "action": "listTabs" }] }),
+        ),
+        DEFAULT_REVERSE_TIMEOUT,
+    );
+    assert_eq!(
+        request_timeout(
+            "host.openExternal",
+            &json!({ "actions": [{ "action": "screenshot" }] }),
+        ),
+        DEFAULT_REVERSE_TIMEOUT,
+    );
+}
+
 #[tokio::test]
 async fn request_round_trips_through_a_mock_client() {
     let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
@@ -97,6 +138,39 @@ async fn request_times_out_without_a_reply() {
         .await
         .expect_err("must time out");
     assert!(err.message.contains("timed out"));
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
+    assert!(
+        !reverse.route_response(&json!({
+            "jsonrpc": "2.0", "id": "rev-1", "result": { "late": true }
+        })),
+        "a late response cannot match a timed-out request"
+    );
+}
+
+#[tokio::test]
+async fn request_timeout_includes_outbound_queue_wait() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let reverse = ReverseChannel::new(out_tx);
+    reverse
+        .out_tx
+        .send("occupied".to_string())
+        .await
+        .expect("fill outbound queue");
+
+    let started = tokio::time::Instant::now();
+    let err = reverse
+        .request(
+            "browser.exec",
+            json!({ "actions": [{ "action": "screenshot" }] }),
+            Duration::from_millis(30),
+        )
+        .await
+        .expect_err("queue wait must time out");
+    assert!(err.message.contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
+    assert_eq!(out_rx.recv().await.as_deref(), Some("occupied"));
+    assert!(out_rx.try_recv().is_err(), "timed-out frame was cancelled");
 }
 
 #[tokio::test]
@@ -113,4 +187,83 @@ async fn request_fails_when_connection_closed() {
         .await
         .expect_err("closed connection fails");
     assert!(err.message.contains("closed"));
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
+}
+
+#[tokio::test]
+async fn blocked_request_fails_when_connection_closes() {
+    let (out_tx, out_rx) = mpsc::channel::<String>(1);
+    let reverse = ReverseChannel::new(out_tx);
+    reverse
+        .out_tx
+        .send("occupied".to_string())
+        .await
+        .expect("fill outbound queue");
+
+    let caller = reverse.clone();
+    let request = tokio::spawn(async move {
+        caller
+            .request(
+                "browser.exec",
+                json!({ "actions": [{ "action": "screenshot" }] }),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+    while reverse.pending.lock().unwrap().requests.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    drop(out_rx);
+
+    let err = request
+        .await
+        .expect("join")
+        .expect_err("closed connection wakes blocked sender");
+    assert!(err.message.contains("closed"));
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
+}
+
+#[tokio::test]
+async fn accepted_request_fails_when_connection_closes() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let reverse = ReverseChannel::new(out_tx);
+    let caller = reverse.clone();
+    let request = tokio::spawn(async move {
+        caller
+            .request(
+                "browser.exec",
+                json!({ "actions": [{ "action": "screenshot" }] }),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+    let frame = out_rx.recv().await.expect("accepted reverse frame");
+    assert!(frame.contains("screenshot"));
+
+    reverse.close();
+    let err = request
+        .await
+        .expect("join")
+        .expect_err("connection close wakes response waiter");
+    assert!(err.message.contains("closed"));
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
+}
+
+#[tokio::test]
+async fn request_after_close_fails_without_enqueuing() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let reverse = ReverseChannel::new(out_tx);
+    reverse.close();
+
+    let err = reverse
+        .request(
+            "browser.exec",
+            json!({ "actions": [{ "action": "screenshot" }] }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("closed state is permanent");
+    assert!(err.message.contains("closed"));
+    assert!(out_rx.try_recv().is_err());
+    assert!(reverse.pending.lock().unwrap().requests.is_empty());
 }

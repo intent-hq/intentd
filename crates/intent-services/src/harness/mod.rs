@@ -3,14 +3,24 @@
 //! prompt or per-turn prompt envelope.
 //!
 //! One trait, one module per version. [`Harness`] exposes a method per text
-//! surface; each version implements it ([`v1`] = today's post-#2457 set,
+//! surface; each version implements it ([`v1`] = the post-#2457 set,
 //! byte-pinned by `crate::v1_goldens` and
-//! `agent_manager::v1_turn_envelope_goldens`). Call sites carry typed data
+//! `agent_manager::v1_turn_envelope_goldens`; [`v1_1`] reuses v1's text
+//! surfaces and swaps in its own doctrine, byte-pinned by
+//! `crate::v1_1_goldens`; [`v2`] builds on v1.1 doctrine with scoped sibling
+//! workspace handoffs; [`v2_1`] adds the Vulnerability Scanner specialist;
+//! [`v2_2`] rewrites the workspace status-message guidance to one short
+//! plain sentence; [`v2_3`] rewords the `## Suggested Next Steps` prompt
+//! hint so suggestions are levers on the plan, not a restatement of it,
+//! byte-pinned by `crate::v2_3_goldens`). Call sites carry typed data
 //! into the harness and never format doctrine/envelope text themselves, so a
 //! future version can reword or reorder surfaces without touching managers.
-//! A new version starts as `pub use` re-exports of the prior version's
-//! surface functions and overrides only what changed — the v(N)→v(N+1) diff
-//! is exactly the changed surfaces.
+//! A new version that changes no text surface reuses the prior version's
+//! harness singleton and swaps only its doctrine (as [`v1_1`]–[`v2_2`] do);
+//! one that rewords a surface adds a unit struct whose [`Harness`] impl
+//! forwards every method to the prior implementation and overrides only
+//! what changed (as [`v2_3`] does) — the v(N)→v(N+1) diff is exactly the
+//! changed surfaces, and the compiler enforces the forwarding set.
 //!
 //! Wake/queue system messages (hook/PR-monitor/watch wakes, dequeue notes,
 //! delegation preamble, notices — H6) live behind the same trait: the
@@ -21,11 +31,17 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (intent-core's `"1.0"` form) to the pair, so a
-//! session keeps assembling the exact doctrine it was created with even after
-//! the binary ships a newer set. All past versions stay bundled.
+//! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, `"2.2"`,
+//! or `"2.3"`) to the pair, so a session keeps assembling the exact doctrine
+//! it was created with even after the binary ships a newer set. All past
+//! versions stay bundled.
 
 pub(crate) mod v1;
+pub(crate) mod v1_1;
+pub(crate) mod v2;
+pub(crate) mod v2_1;
+pub(crate) mod v2_2;
+pub(crate) mod v2_3;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -65,6 +81,13 @@ pub(crate) struct TurnEnvelopeParams<'a> {
 pub(crate) struct ChildSettlementParams<'a> {
     /// The child's agent id (`agent-…`), always present.
     pub child_id: &'a str,
+    /// Whether the settling agent is a genuine child of the wake's recipient
+    /// (its session's `parentAgentId` == the watcher). `true` renders the
+    /// "Child agent" label; `false` — an explicit `agent.watch` on a peer,
+    /// or a SUB-1 sender watch on a non-child — renders "Watched agent"
+    /// (intent-hq/monorepo#3906). Group child lines never render the
+    /// relationship label, so the field is inert there.
+    pub child_of_recipient: bool,
     /// Resolved display name (event `agentName`, falling back to the event
     /// actor); `None` renders the bare id.
     pub agent_name: Option<&'a str>,
@@ -82,6 +105,13 @@ pub(crate) struct ChildSettlementParams<'a> {
     pub attention: Option<(&'a str, &'a str)>,
     /// Suspected stall (monorepo#1016): `(task_title, task_status)`.
     pub stall: Option<(&'a str, &'a str)>,
+    /// intent-hq/monorepo#4026: the settling report was already delivered to
+    /// this recipient by a report-time wake (same report identity, wake left
+    /// the queue). The terminal completion wake then renders a short
+    /// already-delivered reference instead of repeating the full `Report:`
+    /// clause. Callers that cannot prove prior delivery pass `false`
+    /// (fail-open to the full report); group child lines ignore the field.
+    pub report_already_delivered: bool,
 }
 
 /// One method per system-generated text surface. Implementations own 100% of
@@ -136,8 +166,17 @@ pub(crate) trait Harness: Send + Sync {
     /// Provider-correct spelling of the workspace-MCP rename tool for the
     /// naming nudge.
     fn naming_tool_reference(&self, provider_id: &str) -> &'static str;
-    /// Fire-once `<system>` workspace-naming instruction.
-    fn naming_nudge(&self, tool_reference: &str) -> String;
+    /// Provider-correct spelling of the workspace API MCP tool used for agent
+    /// self-naming.
+    fn agent_naming_tool_reference(&self, provider_id: &str) -> &'static str;
+    /// Fire-once `<system>` agent/workspace naming instruction. The caller
+    /// independently gates each instruction; each tool reference is present
+    /// only when its corresponding name still needs attention.
+    fn naming_nudge(
+        &self,
+        agent_tool_reference: Option<&str>,
+        workspace_tool_reference: Option<&str>,
+    ) -> String;
     /// Per-turn `[Role Reminder: You are a {name}. {reminder}]` prefix.
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String;
     /// Compose the full outbound turn prompt: the layering order
@@ -151,6 +190,10 @@ pub(crate) trait Harness: Send + Sync {
     fn stale_redrive_note(&self, report_timestamp: &str) -> String;
     /// `[SYSTEM NOTE]` appended to a drained queue entry (monorepo#2353).
     fn dequeue_wait_note(&self, queued_at: &str, waited: &str) -> String;
+    /// `[MESSAGE FROM AGENT {name} ({agent_id})]` sender-attribution header
+    /// prepended to agent-origin (A2A) sends; an absent `name` renders
+    /// `[MESSAGE FROM AGENT ({agent_id})]`.
+    fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String;
     /// Human-readable wait for [`Harness::dequeue_wait_note`]: `Ns` under a
     /// minute, then `Nm Ss`, then `Nh Mm`; negative waits clamp to `0s`.
     fn wait_duration(&self, secs: i64) -> String;
@@ -186,8 +229,10 @@ pub(crate) trait Harness: Send + Sync {
 
     // --- Completion / group / watch wakes (`lib.rs`, `agent_ops.rs`) ---
 
-    /// `[WORKSPACE EVENTS] Child agent {label} {kind}.` completion wake with
-    /// report/summary/error tail and the #2051 watch-retired notes.
+    /// `[WORKSPACE EVENTS] {Child|Watched} agent {label} {kind}.` completion
+    /// wake with report/summary/error tail and the #2051 watch-retired notes;
+    /// the relationship label follows `params.child_of_recipient`
+    /// (intent-hq/monorepo#3906).
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String;
     /// One `- {label} {kind}.…` per-child line of an `after_all` group wake,
     /// including the attention fold.
@@ -214,8 +259,10 @@ pub(crate) trait Harness: Send + Sync {
         kind: &str,
         reason: &str,
     ) -> String;
-    /// Attention-request fan-out wake to an explicit watcher (monorepo#1229);
-    /// `grouped_watch` flips the completion promise to group settlement.
+    /// Attention-request fan-out wake to a watcher (monorepo#1229; since
+    /// monorepo#3443 every active watch, not just explicit `agent.watch`
+    /// registrations); `grouped_watch` flips the completion promise to group
+    /// settlement.
     fn attention_watcher_wake(
         &self,
         agent_name: &str,
@@ -249,22 +296,33 @@ pub(crate) trait Harness: Send + Sync {
     /// State note on a re-armed perpetual dispatch: the hook remains active
     /// until `expires_at` (`None` renders the TTL-elapses fallback).
     fn hook_dispatch_active_note(&self, expires_at: Option<&str>) -> String;
-    /// State note on a one-shot dispatch: the hook is retired.
-    fn hook_dispatch_retired_note(&self) -> String;
-    /// State note on an eviction wake: the hook will not run again.
-    fn hook_evicted_state_note(&self) -> String;
+    /// State note on a one-shot dispatch: the hook is retired, with a
+    /// `ws.hook.get("<hookId>")` pointer for recovering the script. MUST
+    /// stay a single line starting `[This hook` and ending `]` — the FE
+    /// strips it with a single-line regex (`hook-wake-attribution.ts`).
+    fn hook_dispatch_retired_note(&self, hook_id: &str) -> String;
+    /// State note on an eviction wake: the hook will not run again, with a
+    /// `ws.hook.get("<hookId>")` pointer for recovering the script. Same
+    /// single-line `[This hook …]` constraint as the retired note.
+    fn hook_evicted_state_note(&self, hook_id: &str) -> String;
     /// Eviction notice body after a failed run.
     fn hook_evicted_failed_run_notice(&self, hook_name: &str, error: &str) -> String;
     /// Eviction notice body after an internal (store) error.
     fn hook_evicted_internal_error_notice(&self, hook_name: &str, error: &str) -> String;
-    /// TTL-expiry notice body, with the perpetual runs+dispatches tally.
+    /// TTL-expiry notice body, with the perpetual runs+dispatches tally and
+    /// a `ws.hook.get("<hookId>")` pointer for recovering the script.
     fn hook_expired_notice(
         &self,
         hook_name: &str,
+        hook_id: &str,
         perpetual: bool,
         run_count: i64,
         dispatch_count: i64,
     ) -> String;
+    /// One-shot `runAt` fire notice body (the timer fired and continued —
+    /// the hook is retired), with a `ws.hook.get("<hookId>")` pointer for
+    /// recovering the script.
+    fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String;
     /// FE-cancel notice body (`hook.cancel` with no agent caller).
     fn hook_cancelled_from_app_notice(&self) -> String;
     /// Archive-sweep cancel notice body.
@@ -307,6 +365,13 @@ pub(crate) trait Harness: Send + Sync {
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String;
     /// System notice after the user dismissed pending structured questions.
     fn questions_dismissed_notice(&self, count: usize) -> String;
+    /// System notice after the user applied a pending proposal
+    /// (`agent.resolveProposal`, outcome `applied`); `detail` is the
+    /// caller-supplied context (e.g. the created workspace id).
+    fn proposal_applied_notice(&self, title: &str, detail: Option<&str>) -> String;
+    /// System notice after the user dismissed a pending proposal without
+    /// applying it (`agent.resolveProposal`, outcome `dismissed`).
+    fn proposal_dismissed_notice(&self, title: &str) -> String;
 }
 
 /// One registry row: a stamped `harnessVersion` and everything that version
@@ -359,7 +424,14 @@ pub(crate) const LATEST_VERSION: &str = intent_core::CURRENT_HARNESS_VERSION;
 /// bundled so an old session keeps resolving the doctrine it was created
 /// with. Adding a version = a `resources/**/<ver>/` directory + a module +
 /// one row here.
-static REGISTRY: &[&HarnessEntry] = &[&v1::ENTRY];
+static REGISTRY: &[&HarnessEntry] = &[
+    &v1::ENTRY,
+    &v1_1::ENTRY,
+    &v2::ENTRY,
+    &v2_1::ENTRY,
+    &v2_2::ENTRY,
+    &v2_3::ENTRY,
+];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
 /// exists; the tail fallback is unreachable and only avoids a panic path.
@@ -401,17 +473,77 @@ mod tests {
         std::ptr::from_ref::<dyn Harness>(h).cast::<()>()
     }
 
+    /// The harness types are unit structs, so pointer identity between two
+    /// of them is vacuous (zero-sized statics may share an address). Tell
+    /// versions apart by the one surface that differs between them.
+    fn next_steps(h: &dyn Harness) -> String {
+        h.suggested_next_steps_block(false)
+    }
+
     /// The registry keys on the exact version string sessions are stamped
-    /// with (intent-core's `CURRENT_HARNESS_VERSION`, "1.0"): the stamp and
+    /// with (intent-core's `CURRENT_HARNESS_VERSION`): the stamp and
     /// the resolved harness can never drift.
     #[test]
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
+        assert_eq!(entry.version, "2.3");
+        assert_eq!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
+        assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));
+    }
+
+    /// A "1.0"-stamped session keeps resolving the v1 row (its original
+    /// doctrine), and the v1↔v1.1 rows share text surfaces but differ in
+    /// doctrine exactly where the rewrites landed.
+    #[test]
+    fn registry_pins_v1_sessions_to_v1_doctrine() {
+        let v1_entry = resolve_entry("1.0");
+        assert_eq!(v1_entry.version, "1.0");
         assert!(std::ptr::eq(
-            data_ptr(resolve_entry(intent_core::CURRENT_HARNESS_VERSION).harness),
-            data_ptr(&v1::V1)
+            v1_entry.doctrine.instructions,
+            std::ptr::addr_of!(crate::instructions::V1)
         ));
+        let v1_1_entry = resolve_entry("1.1");
+        assert_eq!(v1_1_entry.version, "1.1");
+        assert!(std::ptr::eq(
+            v1_1_entry.doctrine.instructions,
+            std::ptr::addr_of!(crate::instructions::V1_1)
+        ));
+        // Same Harness singleton (text surfaces unchanged) …
+        assert!(std::ptr::eq(
+            data_ptr(v1_entry.harness),
+            data_ptr(v1_1_entry.harness)
+        ));
+        // … different common.md (the rewrites), identical specialist prompt
+        // bodies and frontmatter modulo the picker-metadata keys the v1.1
+        // copies additionally carry (role/teamAgents/icon).
+        assert_ne!(
+            v1_entry.doctrine.instructions.common,
+            v1_1_entry.doctrine.instructions.common
+        );
+        assert_eq!(
+            v1_entry.doctrine.specialists.len(),
+            v1_1_entry.doctrine.specialists.len()
+        );
+        for ((id_a, content_a), (id_b, content_b)) in v1_entry
+            .doctrine
+            .specialists
+            .iter()
+            .zip(v1_1_entry.doctrine.specialists.iter())
+        {
+            assert_eq!(id_a, id_b);
+            let (mut fm_a, body_a) = crate::specialists::parse_frontmatter(content_a);
+            let (mut fm_b, body_b) = crate::specialists::parse_frontmatter(content_b);
+            assert_eq!(body_a, body_b, "specialist {id_a} body diverged");
+            for key in crate::specialists::PICKER_METADATA_KEYS {
+                fm_a.remove(*key);
+                fm_b.remove(*key);
+            }
+            assert_eq!(
+                fm_a, fm_b,
+                "specialist {id_a} frontmatter diverged beyond the picker-metadata keys"
+            );
+        }
     }
 
     #[test]
@@ -430,7 +562,8 @@ mod tests {
     fn latest_is_current_harness_version() {
         assert_eq!(LATEST_VERSION, intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(latest_entry().version, LATEST_VERSION);
-        assert!(std::ptr::eq(data_ptr(latest()), data_ptr(&v1::V1)));
+        assert_eq!(next_steps(latest()), next_steps(&v2_3::V2_3));
+        assert_ne!(next_steps(latest()), next_steps(&v1::V1));
     }
 
     /// Every registry row is coherent: unique version keys, a doctrine whose
@@ -448,64 +581,98 @@ mod tests {
         }
     }
 
-    /// Adding a hypothetical v2 is a directory + registry entry: a fixture
-    /// registry with a second row resolves each version to its own doctrine
-    /// and still falls back to its latest for unknown stamps.
+    /// The v2 registry row selects new doctrine while v1 and v1.1 remain available.
     #[test]
-    fn hypothetical_v2_is_a_directory_plus_registry_entry() {
-        // A future set would `include_str!` from
-        // `resources/agent-instructions/v2/`; the fixture only needs
-        // distinct bytes.
-        static V2_INSTRUCTIONS: crate::instructions::InstructionSet =
-            crate::instructions::InstructionSet {
-                chat: "v2",
-                common: "v2 common",
-                debug: "v2",
-                workspace: "v2",
-                setup_script_generator: "v2",
-                task_breakdown: "v2",
-                task_debug: "v2",
-                task_focused: "v2",
-                task_loop: "v2",
-                ralph_loop: "v2",
-                workspace_agent: "v2",
-                notes_system_guide: "v2",
-                code_review: "v2",
-                code_walkthrough: "v2",
-                commit_message: "v2",
-                pr_description: "v2",
-            };
-        static V2_DOCTRINE: Doctrine = Doctrine {
-            instructions: &V2_INSTRUCTIONS,
-            specialists: &[("implementor", "v2 implementor body")],
-        };
-        static V2_ENTRY: HarnessEntry = HarnessEntry {
-            version: "2.0",
-            harness: &v1::V1,
-            doctrine: &V2_DOCTRINE,
-            default_features: intent_core::settings_file::AgentFeaturesSettings::default,
-            feature_labels: &[("taskGraph", "Task-graph workflow teaching")],
-        };
-        let fixture: &[&HarnessEntry] = &[&v1::ENTRY, &V2_ENTRY];
-        let find = |v: &str| {
-            fixture
-                .iter()
-                .find(|e| e.version == v)
-                .copied()
-                .unwrap_or(fixture[fixture.len() - 1])
-        };
+    fn v2_selects_new_doctrine_without_changing_v1() {
         assert_eq!(
-            find("1.0").doctrine.instructions.common,
+            resolve_entry("1.0").doctrine.instructions.common,
             v1::ENTRY.doctrine.instructions.common
         );
-        assert_eq!(find("2.0").doctrine.instructions.common, "v2 common");
-        // Unknown stamps fall back to the fixture's latest row.
-        assert_eq!(find("9.9").version, "2.0");
-        // An old session pinned to 1.0 keeps its original doctrine even
-        // though 2.0 exists.
+        assert_eq!(
+            resolve_entry("2.0").doctrine.instructions.common,
+            crate::instructions::V2.common
+        );
+        assert_eq!(
+            resolve_entry("1.1").doctrine.instructions.common,
+            crate::instructions::V1_1.common
+        );
         assert_ne!(
-            find("1.0").doctrine.instructions.common,
-            find("2.0").doctrine.instructions.common
+            resolve_entry("1.1").doctrine.instructions.common,
+            resolve_entry("2.0").doctrine.instructions.common
+        );
+    }
+
+    #[test]
+    fn v2_1_adds_specialist_without_changing_v2_doctrine() {
+        let v2 = resolve_entry("2.0");
+        let v2_1 = resolve_entry("2.1");
+        assert!(std::ptr::eq(
+            v2.doctrine.instructions,
+            v2_1.doctrine.instructions
+        ));
+        assert_eq!(
+            v2.doctrine.specialists,
+            crate::specialists::EMBEDDED_BUNDLED_V1_1
+        );
+        assert_eq!(
+            v2_1.doctrine.specialists,
+            crate::specialists::EMBEDDED_BUNDLED_V2_1
+        );
+    }
+
+    /// v2.2 swaps only the two workspace instruction bodies; the specialist
+    /// bundle, text surfaces, and every other instruction body are v2.1's.
+    #[test]
+    fn v2_2_rewrites_only_workspace_status_guidance() {
+        let v2_1 = resolve_entry("2.1");
+        let v2_2 = resolve_entry("2.2");
+        assert_eq!(v2_1.doctrine.specialists, v2_2.doctrine.specialists);
+        let (a, b) = (v2_1.doctrine.instructions, v2_2.doctrine.instructions);
+        assert_ne!(a.workspace, b.workspace);
+        assert_ne!(a.workspace_agent, b.workspace_agent);
+        assert_eq!(a.chat, b.chat);
+        assert_eq!(a.common, b.common);
+        assert_eq!(a.debug, b.debug);
+        assert_eq!(a.setup_script_generator, b.setup_script_generator);
+        assert_eq!(a.task_breakdown, b.task_breakdown);
+        assert_eq!(a.task_debug, b.task_debug);
+        assert_eq!(a.task_focused, b.task_focused);
+        assert_eq!(a.task_loop, b.task_loop);
+        assert_eq!(a.ralph_loop, b.ralph_loop);
+        assert_eq!(a.notes_system_guide, b.notes_system_guide);
+        assert_eq!(a.code_review, b.code_review);
+        assert_eq!(a.code_walkthrough, b.code_walkthrough);
+        assert_eq!(a.commit_message, b.commit_message);
+        assert_eq!(a.pr_description, b.pr_description);
+    }
+
+    /// v2.3 keeps v2.2's doctrine (instructions + specialists) byte-for-byte
+    /// and swaps only the text-surface implementation, so the diff is exactly
+    /// the reworded suggested-next-steps block.
+    #[test]
+    fn v2_3_rewords_only_suggested_next_steps() {
+        let v2_2 = resolve_entry("2.2");
+        let v2_3 = resolve_entry("2.3");
+        assert_eq!(v2_2.doctrine.specialists, v2_3.doctrine.specialists);
+        assert!(std::ptr::eq(
+            v2_2.doctrine.instructions,
+            v2_3.doctrine.instructions
+        ));
+        assert_eq!(next_steps(v2_2.harness), next_steps(&v1::V1));
+        assert_eq!(next_steps(v2_3.harness), next_steps(&v2_3::V2_3));
+        for auto_commit in [false, true] {
+            assert_ne!(
+                v2_2.harness.suggested_next_steps_block(auto_commit),
+                v2_3.harness.suggested_next_steps_block(auto_commit)
+            );
+        }
+        assert_eq!(
+            v2_2.harness.ask_questions_block(),
+            v2_3.harness.ask_questions_block()
+        );
+        assert_eq!(
+            v2_2.harness.commit_policy_clause(),
+            v2_3.harness.commit_policy_clause()
         );
     }
 }

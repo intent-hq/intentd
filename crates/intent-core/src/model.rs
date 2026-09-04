@@ -84,6 +84,35 @@ pub struct PullRequestInfo {
     pub is_draft: Option<bool>,
 }
 
+/// Kind of a workspace context link (§5.1). Wire values are lowercase
+/// (`"issue"` / `"pr"`); the set is deliberately extensible for future
+/// link kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextLinkKind {
+    Issue,
+    Pr,
+}
+
+/// A GitHub issue/PR context link persisted on a [`Workspace`] as
+/// `contextLinks` (§5.1). Supplied by clients on `workspace.create` from the
+/// initializer's issue/PR context mentions and returned on the `Workspace`
+/// wire shape so any client opening the workspace can seed its layout from
+/// the linked pages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextLink {
+    pub kind: ContextLinkKind,
+    pub url: String,
+    pub owner: String,
+    pub repo: String,
+    /// Issue/PR number. `u64` on purpose: a negative or fractional wire value
+    /// rejects `-32602` at deserialization time (like an unknown `kind`),
+    /// before the service validation that names `contextLinks[i].number` —
+    /// only a zero gets the entry-named error.
+    pub number: u64,
+}
+
 /// Note body content type (§9.1). `PlainText` serializes as `plain_text` to
 /// match the TS `ContentType` enum (`src/shared/types.ts`); the others are their
 /// lowercase names.
@@ -117,12 +146,14 @@ pub enum NoteVisibility {
 /// in `error`) > `Blocked` (a top-level pending `blocker` attention
 /// request) > `NeedsAttention` (discussion requests, pending structured
 /// questions, or the `review_required` attention flag) > `InProgress`
-/// (running agent) > the PR/task rollup. The dismissible `unread` attention
-/// flag (`Workspace.attention`, §9.9) never feeds the derivation — unread
-/// is the flag's own contract, not a display status. Without a running
-/// agent, a task-stage rollup (`InProgress`/`NotStarted`) demotes to `Idle`
-/// — so `NotStarted` and the task-derived `InProgress` never reach the wire
-/// on their own.
+/// (running agent) > the PR/task rollup. Within the open-PR rung,
+/// `PrQueued` (the PR sits in the forge's merge queue) outranks `PrReady`
+/// (mergeable, action needed), which outranks `PrOpen`. The dismissible
+/// `unread` attention flag (`Workspace.attention`, §9.9) never feeds the
+/// derivation — unread is the flag's own contract, not a display status.
+/// Without a running agent, a task-stage rollup (`InProgress`/`NotStarted`)
+/// demotes to `Idle` — so `NotStarted` and the task-derived `InProgress`
+/// never reach the wire on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDisplayStatus {
@@ -133,6 +164,7 @@ pub enum WorkspaceDisplayStatus {
     Blocked,
     Idle,
     Complete,
+    PrQueued,
     PrReady,
     PrOpen,
     PrMerged,
@@ -206,6 +238,11 @@ pub struct Workspace {
     /// FE reconciles stale PR links against this collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_requests: Option<Vec<PullRequestInfo>>,
+    /// Issue/PR context links supplied at `workspace.create` (§5.1), persisted
+    /// on the row and returned on every `Workspace` payload. Omitted (not
+    /// `null`) when the workspace was created without links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_links: Option<Vec<ContextLink>>,
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
@@ -287,6 +324,24 @@ pub struct Workspace {
     /// when no deletion is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+}
+
+impl Workspace {
+    /// The workspace's on-disk root: `path`, else `worktreePath`, else
+    /// `repositoryPath` — direct-checkout workspaces (`skipIsolation`) may
+    /// persist only `repositoryPath` (monorepo#3778). Empty strings are
+    /// filtered at every step; `None` when no non-empty candidate exists.
+    #[must_use]
+    pub fn effective_path(&self) -> Option<&str> {
+        [
+            self.path.as_deref(),
+            self.worktree_path.as_deref(),
+            self.repository_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|p| !p.is_empty())
+    }
 }
 
 /// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
@@ -376,6 +431,7 @@ pub fn chief_workspace() -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -448,16 +504,38 @@ pub struct TokenUsageTotals {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
-    /// Cumulative reasoning ("thought") tokens, reported by providers that
-    /// break them out of `outputTokens` via ACP `usage_update.thoughtTokens`.
-    /// Omitted (not `0`) when nothing reported any, so clients that predate
-    /// the field see the previous shape byte-for-byte.
+    /// Cumulative reasoning ("thought") tokens, sourced from the end-of-turn
+    /// ACP `PromptResponse.usage.thoughtTokens` field (not the `usage_update`
+    /// notification, which carries only `used`/`size`/`cost`). DISJOINT from
+    /// `outputTokens`: providers whose wire report is a subset (codex, grok)
+    /// have it carved out of `outputTokens` at ingestion, so summing all five
+    /// counters yields the correct total (intent-hq/intent#3796). Omitted
+    /// (not `0`) when nothing reported any, so clients that predate the field
+    /// see the previous shape byte-for-byte.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub thought_tokens: u64,
     /// Cumulative cost, present only when at least one contributing session
     /// reported one via ACP `usage_update`. Omitted (not `null`) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<UsageCost>,
+}
+
+/// Context-window occupancy of a live ACP session (PROTOCOL §5.5), from the
+/// latest `usage_update` notification's required `used`/`size` fields
+/// (intent-hq/intent#3797). Point-in-time occupancy (input + cache tokens vs.
+/// the model's context window) — a UI signal, never a token-tally input.
+/// Latest-wins per live session, held in-memory only: a daemon restart or an
+/// ACP session recreate drops it and the field disappears until the next
+/// report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    /// Tokens currently in the session's context window.
+    pub used: u64,
+    /// Total context window size in tokens.
+    pub size: u64,
+    /// RFC-3339 timestamp of the report this snapshot came from.
+    pub updated_at: String,
 }
 
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
@@ -882,6 +960,10 @@ pub struct WorkspaceCreate {
     /// today (worktree / `CoW` / direct) emit milestone frames. Absent keeps
     /// the legacy event behavior exactly. Never persisted.
     pub progress_id: Option<String>,
+    /// Issue/PR context links from the initializer's context mentions (§5.1).
+    /// Validated and bounded by the service; persisted on the workspace row
+    /// and returned as `Workspace.contextLinks`.
+    pub context_links: Option<Vec<ContextLink>>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
 }
@@ -897,6 +979,8 @@ pub struct WorkspaceCreate {
 pub struct WorkspaceCreateInitialAgent {
     pub prompt: Option<String>,
     pub name: Option<String>,
+    /// Bare model id (no `provider:` prefix — compound ids are rejected
+    /// `-32602` at the wire boundary, PROTOCOL §5.5); pair with `provider`.
     pub model: Option<String>,
     pub specialist: Option<String>,
     pub provider: Option<String>,
@@ -1531,6 +1615,30 @@ pub struct ReadAssetResult {
     pub mime_type: String,
     pub data: String,
     pub size_kb: i64,
+}
+
+/// MIME types accepted by `note.saveAsset`, paired with their persisted file
+/// extensions. Callers must reject values absent from this table so a later
+/// `note.readAsset` call can recover the correct MIME type from the asset ID.
+pub const SUPPORTED_ASSET_MIME_TYPES: &[(&str, &str)] = &[
+    ("image/png", ".png"),
+    ("image/jpeg", ".jpg"),
+    ("image/jpg", ".jpg"),
+    ("image/gif", ".gif"),
+    ("image/webp", ".webp"),
+    ("image/svg+xml", ".svg"),
+    ("image/bmp", ".bmp"),
+    ("image/tiff", ".tiff"),
+    ("video/mp4", ".mp4"),
+    ("video/webm", ".webm"),
+];
+
+/// Return the persisted extension for a supported asset MIME type.
+#[must_use]
+pub fn asset_extension_from_mime(mime_type: &str) -> Option<&'static str> {
+    SUPPORTED_ASSET_MIME_TYPES
+        .iter()
+        .find_map(|(supported, extension)| (*supported == mime_type).then_some(*extension))
 }
 
 /// Result of `note.saveAsset` (PROTOCOL §5.2 — additive asset write). `path`
@@ -2281,17 +2389,19 @@ pub struct AgentMessage {
     pub created_at: String,
 }
 
-/// The additive `projection` param on conversation reads (PROTOCOL §5.5):
-/// `agent.getConversation` and `chat.subscribe` accept `projection: "slim"`,
-/// which serves bounded `tool_use`/`tool_result`/`image` blocks so large
-/// transcripts never produce multi-MB RPC frames. Oversized `tool_use.input`
+/// The `projection` param on conversation reads (PROTOCOL §5.5):
+/// `agent.getConversation` and `chat.subscribe` serve bounded
+/// `tool_use`/`tool_result`/`image` blocks so large transcripts never
+/// produce multi-MB RPC frames. Slim is the wire default since v8.0 — an
+/// absent / `null` `projection` selects it, `"slim"` is an explicit no-op —
+/// so `None` survives only as an internal plumbing value meaning "no
+/// transform" (test seams and non-wire callers). Oversized `tool_use.input`
 /// / `tool_result.output` bodies are replaced by a
 /// [`SLIM_PROJECTION_BUDGET_BYTES`] preview with additive
 /// `*Truncated`/`*Bytes` flags; oversized `image.data` is replaced by the
 /// thumbnail persisted at message-write time (`dataIsThumbnail: true`), or
-/// omitted for pre-thumbnail rows. Absent param (`None` at every plumbing
-/// layer) keeps responses byte-identical to before — old clients are
-/// unaffected. Serve-time only; stored rows are untouched.
+/// omitted for pre-thumbnail rows. Full block bodies are read on demand via
+/// `agent.getMessageBlock`. Serve-time only; stored rows are untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationProjection {
     /// Bounded tool/image block bodies (previews + additive flags).
@@ -2426,14 +2536,58 @@ pub fn cap_json_value(value: &serde_json::Value, budget: &mut usize) -> serde_js
     }
 }
 
+/// Bound one `tool_use.input` / `tool_result.output` body in place — THE
+/// slim-preview transform (PROTOCOL §5.5), shared by the serve-time slim
+/// projection (intent-services `tool_block`, `threshold` =
+/// [`SLIM_PROJECTION_BUDGET_BYTES`]) and the write-time heavy-payload
+/// extraction (intent-store `message_payload`, `threshold` = its inline
+/// ceiling), so a persisted preview is byte-identical to what serving the
+/// full body slim would have produced. A body over `threshold` is replaced
+/// by [`cap_json_value`]'s bounded preview (budget always
+/// [`SLIM_PROJECTION_BUDGET_BYTES`]) plus additive `truncated_flag: true` /
+/// `bytes_flag: <original size>` and the ORIGINAL body is returned (the
+/// extraction side persists it; the serve side drops it). At-or-under
+/// threshold bodies — and blocks already carrying `truncated_flag` (a
+/// persisted write-time preview; re-capping would corrupt `bytes_flag` and
+/// shrink the preview) — pass through untouched as `None`.
+pub fn slim_heavy_body(
+    block: &mut serde_json::Value,
+    field: &str,
+    truncated_flag: &str,
+    bytes_flag: &str,
+    threshold: usize,
+) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    if block.get(truncated_flag).and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let body = block.get(field)?;
+    let size = slim_body_size(body);
+    if size <= threshold {
+        return None;
+    }
+    let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+    let capped = cap_json_value(body, &mut budget);
+    let obj = block.as_object_mut()?;
+    let original = obj.insert(field.to_string(), capped)?;
+    obj.insert(truncated_flag.to_string(), Value::Bool(true));
+    obj.insert(bytes_flag.to_string(), serde_json::json!(size));
+    Some(original)
+}
+
 /// The `lastToolUse` preview of one message's content blocks (PROTOCOL §5.5 /
 /// §6.5): the LAST `tool_use` block's `name` plus its `input` bounded by
 /// [`SLIM_PROJECTION_BUDGET_BYTES`] — an over-budget input is replaced by
 /// [`cap_json_value`]'s structure-preserving preview with additive
 /// `inputTruncated` / `inputBytes` flags (the same treatment as the slim
-/// conversation projection), an absent input is omitted. `None` when the
-/// content is not a block array or carries no `tool_use` block. Shared by
-/// the write-time `agent_session.last_tool_use_preview` column maintenance
+/// conversation projection), an absent input is omitted. A block already
+/// carrying `inputTruncated: true` (a write-time extraction placeholder —
+/// 0108/0109 — whose `input` is the persisted bounded preview) serves that
+/// preview as-is WITH its flags propagated: the capped input fits the budget
+/// here, so recomputing would silently drop the truncation signal even
+/// though the transcript hydrates the full body. `None` when the content is
+/// not a block array or carries no `tool_use` block. Shared by the
+/// write-time `agent_session.last_tool_use_preview` column maintenance
 /// (intent-store, 0098) and the `agent:last-message` event payload
 /// (intent-services), so the persisted column and the event always agree.
 pub fn last_tool_use_preview(content: &serde_json::Value) -> Option<serde_json::Value> {
@@ -2447,17 +2601,81 @@ pub fn last_tool_use_preview(content: &serde_json::Value) -> Option<serde_json::
     let mut preview = serde_json::Map::new();
     preview.insert("name".to_string(), Value::String(name.to_string()));
     if let Some(input) = block.get("input") {
-        let size = slim_body_size(input);
-        if size <= SLIM_PROJECTION_BUDGET_BYTES {
+        if block.get("inputTruncated").and_then(Value::as_bool) == Some(true) {
             preview.insert("input".to_string(), input.clone());
-        } else {
-            let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
-            preview.insert("input".to_string(), cap_json_value(input, &mut budget));
             preview.insert("inputTruncated".to_string(), Value::Bool(true));
-            preview.insert("inputBytes".to_string(), serde_json::json!(size));
+            if let Some(bytes) = block.get("inputBytes") {
+                preview.insert("inputBytes".to_string(), bytes.clone());
+            }
+        } else {
+            let size = slim_body_size(input);
+            if size <= SLIM_PROJECTION_BUDGET_BYTES {
+                preview.insert("input".to_string(), input.clone());
+            } else {
+                let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+                preview.insert("input".to_string(), cap_json_value(input, &mut budget));
+                preview.insert("inputTruncated".to_string(), Value::Bool(true));
+                preview.insert("inputBytes".to_string(), serde_json::json!(size));
+            }
         }
     }
     Some(Value::Object(preview))
+}
+
+/// The additive `projection` param on `note.list` (PROTOCOL §5.2): full note
+/// rows scale the response with total workspace note content, tripping the
+/// 1 MiB outbound frame warn on note-heavy workspaces (monorepo#3573 — the
+/// oversized-list-response family). `projection: "slim"` serves rows with
+/// `content` omitted, replaced by a bounded `contentPreview` (first
+/// [`NOTE_LIST_PREVIEW_CHARS`] chars) plus `contentLength` (total chars,
+/// matching the `note.listVersions` `contentLength` unit); every other Note
+/// field is unchanged. Absent / `null` / `"full"` keep responses
+/// byte-identical to before — existing clients are unaffected. Serve-time
+/// only; stored rows are untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteListProjection {
+    /// Bounded rows: `content` → `contentPreview` + `contentLength`.
+    Slim,
+}
+
+/// Character budget for the slim `note.list` `contentPreview`: enough for a
+/// list-context summary (first heading + opening lines) while keeping a
+/// slim row's serialized size bounded regardless of note length.
+pub const NOTE_LIST_PREVIEW_CHARS: usize = 500;
+
+/// One slim `note.list` row ([`NoteListProjection::Slim`]): the note's full
+/// wire object with `content` removed and replaced by `contentPreview`
+/// (first [`NOTE_LIST_PREVIEW_CHARS`] chars, char-boundary safe by
+/// construction) and `contentLength` (total chars — Unicode scalar values,
+/// the same unit as the `note.listVersions` summaries' SQL `LENGTH(content)`
+/// for the NUL-free content the daemon writes; on content containing U+0000
+/// this counts every scalar while the SQL `LENGTH` stops at the NUL). All
+/// other fields serialize exactly as the full row does.
+///
+/// Consumes the note and takes `content` out BEFORE serializing, so the
+/// full body is never copied into the JSON value — the transform allocates
+/// only the bounded preview, keeping the hot `note.list` path free of
+/// content-sized work beyond the row fetch itself.
+#[must_use]
+pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
+    let content = std::mem::take(&mut note.content);
+    let mut value = serde_json::to_value(&note).unwrap_or_else(|e| {
+        tracing::warn!(note_id = %note.id.0, error = %e, "note_list_slim_row: serializing note failed; serving null row");
+        serde_json::Value::Null
+    });
+    if let serde_json::Value::Object(map) = &mut value {
+        map.remove("content");
+        let preview: String = content.chars().take(NOTE_LIST_PREVIEW_CHARS).collect();
+        map.insert(
+            "contentPreview".to_string(),
+            serde_json::Value::String(preview),
+        );
+        map.insert(
+            "contentLength".to_string(),
+            serde_json::json!(content.chars().count()),
+        );
+    }
+    value
 }
 
 /// Per-field byte budget for `agent.list` row previews (list-payload cost
@@ -2506,17 +2724,19 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "1.0";
+pub const CURRENT_HARNESS_VERSION: &str = "2.3";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
-/// the migration-0096 backfill.
+/// the migration-0096 backfill. Deliberately the literal "1.0", NOT
+/// [`CURRENT_HARNESS_VERSION`]: a version bump must never relabel pre-feature
+/// payloads to a doctrine they were not created under.
 fn default_harness_version() -> String {
-    CURRENT_HARNESS_VERSION.to_string()
+    "1.0".to_string()
 }
 
 /// Metadata key under which the question-dismissal marker is persisted on the
-/// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, pending questions): the id of the
 /// assistant message whose trailing question resource blocks the user
 /// dismissed via `agent.dismissQuestions`. No schema migration — the marker
 /// rides the existing free-form `metadata` column and survives daemon
@@ -2524,19 +2744,56 @@ fn default_harness_version() -> String {
 pub const DISMISSED_QUESTIONS_MESSAGE_ID_KEY: &str = "dismissedQuestionsMessageId";
 
 /// Metadata key under which the pending-questions marker is persisted on the
-/// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, pending questions): the id of the
 /// assistant message whose trailing question resource blocks are still
 /// awaiting an answer. Written at turn end when the persisted assistant tail
 /// bears question blocks (a newer question-bearing turn overwrites it —
 /// single-slot), and cleared (written as the empty string, which reads back as
 /// absent) when the answer for that exact message id persists or the
 /// transcript is truncated by `agent.editAndRegenerate`. Stored-on-write so
-/// the hold derivation stays a bounded metadata read and pendingness survives
-/// later user messages, agent turns, and daemon restarts. No schema migration
-/// — the marker rides the existing free-form `metadata` column. Read back by
+/// the pending-questions derivation stays a bounded metadata read and
+/// pendingness survives later user messages, agent turns, and daemon
+/// restarts. No schema migration — the marker rides the existing free-form
+/// `metadata` column. Read back by
 /// [`AgentSession::pending_questions_message_id`] /
 /// [`AgentSession::pending_questions_marker_written`].
 pub const PENDING_QUESTIONS_MESSAGE_ID_KEY: &str = "pendingQuestionsMessageId";
+
+/// Metadata key under which the pending-proposals list is persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5): an ordered array of
+/// `{ proposalId, messageId }` entries, one per proposal resource block whose
+/// carrying assistant message persisted and whose proposal is still awaiting
+/// an Apply/Dismiss resolution. Unlike the single-slot question marker this
+/// is a SET — multiple proposals across turns stay pending together; a
+/// re-proposed id replaces its older entry (newest wins, appended last). No
+/// schema migration — the list rides the existing free-form `metadata`
+/// column and survives daemon restarts. Read back by
+/// [`AgentSession::pending_proposals`].
+pub const PENDING_PROPOSALS_KEY: &str = "pendingProposals";
+
+/// Metadata key under which resolved-proposal outcomes are persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, `agent.resolveProposal`): a
+/// `proposalId -> "applied" | "dismissed"` map recording how each formerly
+/// pending proposal was resolved. Doubles as the durable idempotency marker
+/// for `agent.resolveProposal`: re-resolving an id that is no longer pending
+/// succeeds without a duplicate notice, across daemon restarts. A
+/// re-proposed id re-enters the pending list; its re-resolution overwrites
+/// the earlier outcome (latest wins). Bounded: the resolver evicts the
+/// oldest entries past its retention cap, so the map (and the `AgentLite`
+/// projection lifting it into hot `agent.list` / `agent.get` payloads) never
+/// grows without bound. No schema migration — the map rides the existing
+/// free-form `metadata` column. Read back by
+/// [`AgentSession::proposal_resolutions`].
+pub const PROPOSAL_RESOLUTIONS_KEY: &str = "proposalResolutions";
+
+/// The only two `outcome` values `agent.resolveProposal` accepts and the
+/// [`PROPOSAL_RESOLUTIONS_KEY`] map may carry. The reader
+/// ([`AgentSession::proposal_resolutions`]) filters entries against this set
+/// so caller-seeded session metadata cannot smuggle an unknown outcome into
+/// the projection or the RPC's idempotent echo.
+pub const PROPOSAL_OUTCOME_APPLIED: &str = "applied";
+/// See [`PROPOSAL_OUTCOME_APPLIED`].
+pub const PROPOSAL_OUTCOME_DISMISSED: &str = "dismissed";
 
 /// Metadata key under which the per-conversation seen marker is persisted on
 /// the `agent_session.metadata` JSON (PROTOCOL §5.5): the id of the newest
@@ -2554,23 +2811,31 @@ pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 /// Read back by [`AgentSession::is_initial_agent`].
 pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 
-/// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
-/// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
-/// user-originated entry point — which always delivers immediately; it
-/// bypasses the hold but does NOT release it (only an answer-tagged row or
-/// `agent.dismissQuestions` does). Everything else (MCP front-door sends,
-/// reportToParent / completion-watch / event-subscription wakes,
-/// `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations) is
-/// `Automatic` and is held in the queue while the target agent's question
-/// hold is active. `Automatic` is the `Default` so unmarked internal paths
-/// fail closed (held) rather than burying a pending Q&A.
+/// Sponsor attribution key in `agent_session.metadata` JSON: stamped by
+/// `ws.agent.create({ topLevel: true })` with the creating agent's id so
+/// `agent.list` / `agent.get` can serve `metadata.sponsorAgentId` on
+/// sponsored top-level rows. Rides the existing free-form `metadata` column
+/// (no schema migration), like [`IS_INITIAL_AGENT_KEY`]. Read back by
+/// [`AgentSession::sponsor_agent_id`].
+pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
+
+/// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5).
+/// `User` marks the FE `agent.sendMessage` RPC — the ONLY user-originated
+/// entry point — which is an explicit user action: it revives an archived
+/// workspace and retires a pending attention request. Everything else (MCP
+/// front-door sends, reportToParent / completion-watch / event-subscription
+/// wakes, `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations)
+/// is `Automatic`: parked in the queue while the target's workspace is
+/// archived (intent-hq/monorepo#2732) and never treated as user attention.
+/// Pending questions gate NEITHER origin — a pending Q&A is resolved only by
+/// an answer-tagged row, `agent.dismissQuestions`, or a newer question turn,
+/// never by delivery order. `Automatic` is the `Default` so unmarked internal
+/// paths fail closed (never mistaken for a user action).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageOrigin {
-    /// FE-originated `agent.sendMessage` (typed message or wizard answers):
-    /// never held by the question hold.
+    /// FE-originated `agent.sendMessage` (typed message or wizard answers).
     User,
-    /// System/agent-originated delivery: held while the question hold is
-    /// active.
+    /// System/agent-originated delivery.
     #[default]
     Automatic,
 }
@@ -2689,8 +2954,10 @@ pub struct AgentSession {
     /// runaway delegation loops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
-    /// The first message a delegated agent was started with (FE
-    /// `metadata.initialMessage`), persisted so a wake-up can resume.
+    /// The first message a delegated agent was started with (harvested from
+    /// the `metadata.initialMessage` create param), persisted so a wake-up can
+    /// resume. Served by `agent.getSession` only — deliberately absent from
+    /// the `AgentLite` projection (see `AgentMetadata`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_message: Option<String>,
     /// Session-level context references captured at spawn (FE top-level
@@ -2767,6 +3034,14 @@ pub struct AgentSession {
     /// pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+    /// ISO timestamp the session was soft-retired at (`ws.agent.retire`),
+    /// or `None` for active sessions. A retired session keeps its full
+    /// conversation (still searchable) but is INERT: excluded from default
+    /// `agent.list` reads, unreachable on the agent-facing MCP surface, and
+    /// nothing may start a turn on it. Cleared by the user/FE-initiated
+    /// `agent.restore` wire method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     /// Harness version this session was stamped with at creation
     /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
     /// upgrade never changes it, and there is no upgrade/migration/pinning
@@ -2793,9 +3068,9 @@ impl AgentSession {
     /// The question-dismissal marker persisted under
     /// [`DISMISSED_QUESTIONS_MESSAGE_ID_KEY`] in the session's free-form
     /// `metadata`: `Some` only when the metadata is an object carrying a
-    /// non-empty string under that key. The question-hold derivation compares
-    /// this against the last assistant message id — a match means the user
-    /// dismissed that message's questions and automatic deliveries resume.
+    /// non-empty string under that key. The pending-questions derivation
+    /// compares this against the pending marker — a match means the user
+    /// dismissed that message's questions and nothing is pending.
     pub fn dismissed_questions_message_id(&self) -> Option<&str> {
         self.metadata
             .as_ref()
@@ -2807,8 +3082,8 @@ impl AgentSession {
     /// The pending-questions marker persisted under
     /// [`PENDING_QUESTIONS_MESSAGE_ID_KEY`] in the session's free-form
     /// `metadata`: `Some` only when the metadata is an object carrying a
-    /// non-empty string under that key. The question-hold derivation reads it
-    /// directly (no transcript walk) — a set marker that differs from
+    /// non-empty string under that key. The pending-questions derivation reads
+    /// it directly (no transcript walk) — a set marker that differs from
     /// [`AgentSession::dismissed_questions_message_id`] means questions are
     /// still pending. Cleared markers are written as the empty string, which
     /// reads back as `None` here while
@@ -2825,14 +3100,66 @@ impl AgentSession {
     /// session's metadata at all (set or cleared-to-empty). Distinguishes a
     /// session the marker-based derivation has already written (an empty
     /// marker authoritatively means "nothing pending") from a pre-upgrade
-    /// session that never saw a marker write, where the hold derivation must
-    /// fall back to the transcript tail walk so a live hold is not lost
+    /// session that never saw a marker write, where the derivation must fall
+    /// back to the transcript tail walk so a live pending set is not lost
     /// across the upgrade.
     pub fn pending_questions_marker_written(&self) -> bool {
         self.metadata
             .as_ref()
             .and_then(|m| m.get(PENDING_QUESTIONS_MESSAGE_ID_KEY))
             .is_some_and(serde_json::Value::is_string)
+    }
+
+    /// The pending-proposals list persisted under [`PENDING_PROPOSALS_KEY`]
+    /// in the session's free-form `metadata`: the ordered
+    /// `{ proposalId, messageId }` entries still awaiting resolution. Order
+    /// is preserved; malformed entries (non-object, missing/empty ids) are
+    /// skipped defensively. Absent key, non-array value, or an empty array
+    /// all read as an empty list.
+    pub fn pending_proposals(&self) -> Vec<PendingProposal> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PENDING_PROPOSALS_KEY))
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| {
+                        serde_json::from_value::<PendingProposal>(e.clone())
+                            .ok()
+                            .filter(|p| !p.proposal_id.is_empty() && !p.message_id.is_empty())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The resolved-proposal outcomes persisted under
+    /// [`PROPOSAL_RESOLUTIONS_KEY`] in the session's free-form `metadata`:
+    /// a `proposalId -> "applied" | "dismissed"` map. Malformed entries are
+    /// skipped defensively — empty ids, and any outcome outside the
+    /// [`PROPOSAL_OUTCOME_APPLIED`] / [`PROPOSAL_OUTCOME_DISMISSED`] set
+    /// (session creation persists caller metadata unchanged, so a seeded
+    /// entry with an arbitrary outcome must not read as authoritative).
+    /// Absent key or a non-object value reads as an empty map.
+    pub fn proposal_resolutions(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PROPOSAL_RESOLUTIONS_KEY))
+            .and_then(serde_json::Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(id, outcome)| {
+                        !id.is_empty()
+                            && outcome.as_str().is_some_and(|o| {
+                                o == PROPOSAL_OUTCOME_APPLIED || o == PROPOSAL_OUTCOME_DISMISSED
+                            })
+                    })
+                    .map(|(id, outcome)| (id.clone(), outcome.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The per-conversation seen marker persisted under
@@ -2860,6 +3187,31 @@ impl AgentSession {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
     }
+
+    /// The sponsor attribution persisted under [`SPONSOR_AGENT_ID_KEY`] in
+    /// the session's free-form `metadata`: the agent that created this
+    /// independent top-level agent via `ws.agent.create({ topLevel: true })`.
+    /// `None` for non-sponsored sessions (absent, empty, or non-string
+    /// values all read as `None`).
+    pub fn sponsor_agent_id(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(SPONSOR_AGENT_ID_KEY))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// One pending-proposal entry in the [`PENDING_PROPOSALS_KEY`] list
+/// (PROTOCOL §5.5): the proposal's identity (`applyToolCallId ??
+/// preview.title`, the same identity `proposal_resource_uri` encodes) plus
+/// the id of the assistant message carrying the proposal resource block, so
+/// clients can recover the full proposal from the transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingProposal {
+    pub proposal_id: String,
+    pub message_id: String,
 }
 
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
@@ -2867,9 +3219,15 @@ impl AgentSession {
 /// `isBackground`, `specialist`, `createdByAgentId` (the parent/spawning agent),
 /// and `taskNoteId` — plus the persistence-gap fields the FE writer stored
 /// under `metadata` (`completionReport`, `completionReportTimestamp`,
-/// `delegationDepth`, `initialMessage`; P3-1.2b). `isBackground` is always
+/// `delegationDepth`; P3-1.2b). `isBackground` is always
 /// emitted (iOS reads it with a `false` default) and carries the persisted
 /// session value (G-A1/P3-1.2c); the rest are omitted when absent.
+///
+/// The persisted spawn-time `initialMessage` is deliberately ABSENT from this
+/// projection (extending the monorepo#2932 list carve-out to `agent.get`):
+/// it is the last unbounded `AgentLite` field, no client reads it off agent
+/// rows (the FE is write-only at creation; iOS never references it), and the
+/// detail read `agent.getSession` still serves the full persisted value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMetadata {
@@ -2894,8 +3252,6 @@ pub struct AgentMetadata {
     pub attention_request_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_message: Option<String>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<String>,
@@ -2905,7 +3261,7 @@ pub struct AgentMetadata {
     /// Sandbox branch name when this agent runs in a sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_branch: Option<String>,
-    /// Question-dismissal marker (PROTOCOL §5.5, question hold): the id of the
+    /// Question-dismissal marker (PROTOCOL §5.5, pending questions): the id of the
     /// assistant message whose trailing question resource blocks the user
     /// dismissed via `agent.dismissQuestions`. Clients gate the Q&A wizard on
     /// it so a dismissed question set never re-surfaces (including after
@@ -2918,6 +3274,20 @@ pub struct AgentMetadata {
     /// raw metadata never carried the marker key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_questions_message_id: Option<String>,
+    /// Pending-proposals list (PROTOCOL §5.5): the ordered
+    /// `{ proposalId, messageId }` entries still awaiting an Apply/Dismiss
+    /// resolution, mirroring [`AgentSession::pending_proposals`]. Unlike the
+    /// single-slot question marker this is a set — multiple proposals across
+    /// turns stay pending together. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_proposals: Vec<PendingProposal>,
+    /// Resolved-proposal outcomes (PROTOCOL §5.5, `agent.resolveProposal`):
+    /// a `proposalId -> "applied" | "dismissed"` map recording how each
+    /// formerly pending proposal was resolved, mirroring
+    /// [`AgentSession::proposal_resolutions`]. Clients render resolved
+    /// transcript proposal cards from it. Omitted when empty.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub proposal_resolutions: serde_json::Map<String, serde_json::Value>,
     /// Per-conversation seen marker (PROTOCOL §5.5): the id of the newest
     /// transcript message the user has seen, advanced monotonically by
     /// `agent.markSeen`. Clients position the "New messages" divider right
@@ -2930,6 +3300,15 @@ pub struct AgentMetadata {
     /// initial-agent orchestration). Omitted otherwise — never `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_initial_agent: Option<bool>,
+    /// Sponsor attribution for `ws.agent.create({ topLevel: true })`-created
+    /// agents: the agent that created this INDEPENDENT top-level agent.
+    /// Attribution only —
+    /// unlike `createdByAgentId` it implies no parent linkage, no reporting
+    /// obligation, and no delegation depth. Rides the free-form session
+    /// `metadata` under [`SPONSOR_AGENT_ID_KEY`] (like
+    /// [`IS_INITIAL_AGENT_KEY`]); omitted for non-peer agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sponsor_agent_id: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -3036,12 +3415,22 @@ pub struct AgentLite {
     pub turn_in_flight: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_stream_activity_at: Option<String>,
+    /// Context-window occupancy from the latest ACP `usage_update`
+    /// (intent-hq/intent#3797, additive): `{ used, size, updatedAt }` —
+    /// latest-wins per live session, in-memory only (a daemon restart drops
+    /// it). Omitted when no live report exists. Stays `None` in
+    /// [`AgentLite::from_session`] (no runtime context) and is overlaid by
+    /// the service projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<SessionStats>,
     pub created_at: String,
     pub updated_at: String,
     /// Most-recent activity timestamp; derived from `updated_at` (iOS falls back
-    /// to this after `updatedAt`).
+    /// to this after `updatedAt`). Mid-turn the service projection overlays the
+    /// live-turn stream stamp when newer (monorepo#3647), so it advances on
+    /// tool-call/stream activity while nothing has persisted yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
     pub message_count: u64,
@@ -3108,6 +3497,13 @@ pub struct AgentLite {
     /// (not `null`) when no deletion is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+    /// ISO timestamp the session was soft-retired at; mirrors
+    /// [`AgentSession::retired_at`]. Omitted for active sessions. Rows
+    /// carrying it appear in `agent.list` only with `includeRetired: true`
+    /// (and always in `agent.get`, so clients can render the preserved
+    /// conversation read-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     /// Harness version the session was stamped with at creation; mirrors
     /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
     #[serde(default = "default_harness_version")]
@@ -3141,8 +3537,11 @@ impl AgentLite {
                 .unwrap_or_default()
                 .to_string()
         });
+        let pending_proposals = session.pending_proposals();
+        let proposal_resolutions = session.proposal_resolutions();
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
+        let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -3154,14 +3553,16 @@ impl AgentLite {
             attention_request_reason: session.attention_request_reason,
             attention_request_timestamp: session.attention_request_timestamp,
             delegation_depth: session.delegation_depth,
-            initial_message: session.initial_message,
             sandbox_id: session.sandbox_id.clone(),
             sandbox_path: session.sandbox_path.clone(),
             sandbox_branch: session.sandbox_branch.clone(),
             dismissed_questions_message_id,
             pending_questions_message_id,
+            pending_proposals,
+            proposal_resolutions,
             last_seen_message_id,
             is_initial_agent,
+            sponsor_agent_id,
         };
         Self {
             id: session.id,
@@ -3187,6 +3588,7 @@ impl AgentLite {
             waiting_on_pr_monitors: Vec::new(),
             turn_in_flight: false,
             last_stream_activity_at: None,
+            context_usage: None,
             stats: session.stats,
             last_activity: Some(session.updated_at.clone()),
             created_at: session.created_at,
@@ -3206,6 +3608,7 @@ impl AgentLite {
             stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
             pending_delete_at: session.pending_delete_at,
+            retired_at: session.retired_at,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             metadata,
@@ -3356,13 +3759,14 @@ pub struct AgentDelegateInput {
     pub task_text: Option<String>,
     pub agent_instructions: Option<String>,
     pub specialist: Option<String>,
+    /// Bare model id for the delegated child (PROTOCOL §5.5). Compound
+    /// `provider:model` ids are rejected on the wire with `-32602` before
+    /// any side effect — pass [`Self::provider`] alongside the bare id.
     pub model: Option<String>,
     /// Explicit ACP provider for the delegated child (PROTOCOL §5.5).
     /// Disambiguates models that exist under multiple providers. Wins over
-    /// every derived resolution rung (compound-`model` prefix, specialist
-    /// frontmatter, settings default); must name a known, available
-    /// provider, and a compound `model` naming a DIFFERENT provider is a
-    /// contradiction — both reject with `-32602` before any side effect.
+    /// every derived resolution rung (specialist frontmatter, settings
+    /// default); must name a known, available provider.
     pub provider: Option<String>,
     /// Reasoning-effort level for the delegated child (PROTOCOL §5.5/§5.11).
     /// Wins over the chosen model option's `reasoningEffort` and the
@@ -3451,6 +3855,8 @@ pub struct BatchTaskOptions {
     pub task_note_id: NoteId,
     #[serde(default)]
     pub specialist: Option<String>,
+    /// Bare model id — compound `provider:model` ids reject with `-32602`
+    /// on the wire (PROTOCOL §5.5); pass `provider` alongside the bare id.
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -3520,6 +3926,8 @@ pub struct AgentWakeCreateOptions {
     pub specialist: Option<String>,
     pub provider: Option<String>,
     pub agent_type: Option<String>,
+    /// Bare model id — compound `provider:model` ids reject with `-32602`
+    /// on the wire (PROTOCOL §5.5); pass `provider` alongside the bare id.
     pub model: Option<String>,
     /// Reasoning-effort level for the created child (PROTOCOL §5.5/§5.11),
     /// used only on the create branch. Overridden by the wake-level
@@ -3541,6 +3949,8 @@ pub struct AgentWakeCreateOptions {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentWakeOrCreateInput {
+    /// Wake-branch model override: a bare model id — compound
+    /// `provider:model` ids reject with `-32602` on the wire (PROTOCOL §5.5).
     pub model: Option<String>,
     /// Reasoning-effort override for the create branch (PROTOCOL §5.5/§5.11);
     /// wins over `create.reasoningEffort` and the specialist frontmatter.
@@ -3599,6 +4009,27 @@ pub struct FileStatus {
 
 /// `git.status` result (`GitStatus` in `src/shared/types.ts`). `diverged` is true
 /// only when the branch is both ahead and behind its upstream.
+///
+/// `files` served over the wire is capped (monorepo#3635): when the working
+/// tree carries more entries than the per-response cap, the list is truncated
+/// (tracked changes preferred over untracked) and the additive truncation
+/// markers are set — `filesTruncated: true` plus `totalFiles` carrying the
+/// full pre-cap count. Both are omitted from the wire on an untruncated
+/// result, so the pre-#3635 shape is preserved byte-for-byte. Aggregate flags
+/// (`hasUncommittedChanges`, `hasUntrackedFiles`) always reflect the full
+/// scan, never the truncated list.
+///
+/// Upstream tracking (monorepo#4058): `hasUpstream` says whether
+/// `refs/remotes/origin/<branch>` exists, so clients can distinguish an
+/// even-with-upstream branch from a never-pushed one (both report
+/// `ahead: 0`); `unpushedCount` is the `upstream..HEAD` commit count
+/// (exactly `ahead` when the upstream exists), omitted from the wire when
+/// there is no upstream to count against.
+///
+/// The bools mirror the wire contract 1:1 (each an independent flag on the
+/// `git.status` result), so folding them into enums would diverge the model
+/// from the protocol shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatus {
@@ -3609,6 +4040,24 @@ pub struct GitStatus {
     pub files: Vec<FileStatus>,
     pub has_uncommitted_changes: bool,
     pub has_untracked_files: bool,
+    /// `true` when `files` was truncated to the per-response cap
+    /// (monorepo#3635). Omitted from the wire when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub files_truncated: bool,
+    /// Full working-tree entry count before the cap was applied. Present only
+    /// alongside `filesTruncated: true`; omitted on an untruncated result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_files: Option<usize>,
+    /// Whether the branch's upstream ref (`refs/remotes/origin/<branch>`)
+    /// exists (monorepo#4058). `false` on detached/unborn HEAD and for the
+    /// empty non-repo fallback.
+    #[serde(default)]
+    pub has_upstream: bool,
+    /// Commits ahead of the upstream (`upstream..HEAD`; equals `ahead`).
+    /// Present only alongside `hasUpstream: true`; omitted when there is no
+    /// upstream to count against (monorepo#4058).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpushed_count: Option<i64>,
 }
 
 /// `git.getBranches` result (`{ branches, remoteBranches, currentBranch,
@@ -3818,11 +4267,12 @@ pub enum HookState {
     Expired,
 }
 
-/// A background hook: a small agent-owned script the daemon runs periodically
-/// (fixed `delayMs` between runs) until it signals a dispatch, fails, is
-/// cancelled, or its TTL expires. Persisted to the `hook` table so schedules
-/// survive a daemon restart; the name length cap (≤50 chars) is enforced at
-/// the service layer.
+/// A background hook: a small agent-owned script the daemon runs on one of
+/// three schedule kinds — a fixed `delayMs` cadence, a recurring `cron`
+/// expression, or a one-shot `runAt` timestamp — until it signals a
+/// dispatch, fails, is cancelled, or its TTL expires. Persisted to the
+/// `hook` table so schedules survive a daemon restart; the name length cap
+/// (≤50 chars) is enforced at the service layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hook {
@@ -3831,7 +4281,16 @@ pub struct Hook {
     pub agent_id: AgentId,
     pub name: String,
     pub code: String,
+    /// Inter-run delay for the fixed-cadence kind; 0 for cron/runAt hooks.
     pub delay_ms: i64,
+    /// Cron expression (standard 5-field, evaluated in UTC) for the
+    /// recurring kind; `None` for delayMs/runAt hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// Exact one-shot fire time (RFC3339) for the runAt kind; `None` for
+    /// delayMs/cron hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<String>,
     pub state: HookState,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4046,6 +4505,82 @@ mod tests {
 
     use serde_json::json;
 
+    /// [`Workspace::effective_path`] precedence (monorepo#3778): `path`, else
+    /// `worktreePath`, else `repositoryPath`; empty strings are skipped at
+    /// every step and `None` is returned only when no non-empty candidate
+    /// remains — direct-checkout workspaces persisting only `repositoryPath`
+    /// must still resolve.
+    #[test]
+    fn workspace_effective_path_precedence_and_empty_filtering() {
+        let mut ws = chief_workspace();
+        assert_eq!(ws.effective_path(), None);
+
+        // repositoryPath alone resolves (the monorepo#3778 case).
+        ws.repository_path = Some("/repo".to_string());
+        assert_eq!(ws.effective_path(), Some("/repo"));
+
+        // worktreePath beats repositoryPath; path beats both.
+        ws.worktree_path = Some("/worktree".to_string());
+        assert_eq!(ws.effective_path(), Some("/worktree"));
+        ws.path = Some("/path".to_string());
+        assert_eq!(ws.effective_path(), Some("/path"));
+
+        // Empty strings never win — each step falls through.
+        ws.path = Some(String::new());
+        assert_eq!(ws.effective_path(), Some("/worktree"));
+        ws.worktree_path = Some(String::new());
+        assert_eq!(ws.effective_path(), Some("/repo"));
+        ws.repository_path = Some(String::new());
+        assert_eq!(ws.effective_path(), None);
+    }
+
+    /// [`note_list_slim_row`] projection (§5.2, monorepo#3573): `content` is
+    /// removed and replaced by `contentPreview` (first
+    /// [`NOTE_LIST_PREVIEW_CHARS`] chars — char-counted, so multibyte
+    /// content never splits) + `contentLength` (total chars); short content
+    /// previews whole; every other field serializes as the full row does.
+    #[test]
+    fn note_list_slim_row_shapes() {
+        let mut note = Note {
+            id: NoteId::from("n1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            title: "Spec".to_string(),
+            content: "# Hi".to_string(),
+            content_type: ContentType::Markdown,
+            tags: vec!["a".to_string()],
+            is_pinned: false,
+            is_archived: false,
+            is_default: true,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: "t0".to_string(),
+            rev: 3,
+            updated_at: "t1".to_string(),
+        };
+
+        // Short content: whole preview, exact char count.
+        let full = serde_json::to_value(&note).unwrap();
+        let row = note_list_slim_row(note.clone());
+        assert!(row.get("content").is_none());
+        assert_eq!(row["contentPreview"], "# Hi");
+        assert_eq!(row["contentLength"], 4);
+        for (k, v) in full.as_object().unwrap() {
+            if k != "content" {
+                assert_eq!(&row[k], v, "field {k} unchanged");
+            }
+        }
+
+        // Long multibyte content: truncated at the char budget, never a
+        // byte split; contentLength counts chars, not bytes.
+        note.content = "é".repeat(NOTE_LIST_PREVIEW_CHARS * 3);
+        let row = note_list_slim_row(note);
+        let preview = row["contentPreview"].as_str().unwrap();
+        assert_eq!(preview.chars().count(), NOTE_LIST_PREVIEW_CHARS);
+        assert_eq!(preview, "é".repeat(NOTE_LIST_PREVIEW_CHARS));
+        assert_eq!(row["contentLength"], NOTE_LIST_PREVIEW_CHARS * 3);
+    }
+
     /// [`last_tool_use_preview`] derivation: the LAST `tool_use` block wins,
     /// an under-budget input passes through whole (no flags), an over-budget
     /// input is capped with the additive `inputTruncated`/`inputBytes`
@@ -4087,6 +4622,26 @@ mod tests {
             served.len() <= SLIM_PROJECTION_BUDGET_BYTES * 2,
             "capped input stays near the budget, got {} bytes",
             served.len()
+        );
+
+        // A write-time extraction placeholder (0108/0109): the block's
+        // `input` is already the capped preview and fits the budget here —
+        // the flags must propagate rather than be recomputed away, so the
+        // session preview keeps saying the input is truncated.
+        let placeholder = json!([{
+            "type": "tool_use", "id": "m:0", "name": "write_file",
+            "input": {"path": "/tmp/a.txt"},
+            "inputTruncated": true, "inputBytes": 99_999,
+            "toolCallId": "tp",
+        }]);
+        assert_eq!(
+            last_tool_use_preview(&placeholder),
+            Some(json!({
+                "name": "write_file",
+                "input": {"path": "/tmp/a.txt"},
+                "inputTruncated": true,
+                "inputBytes": 99_999,
+            }))
         );
 
         // Missing input omits the field; missing name degrades to "".
@@ -4329,6 +4884,54 @@ mod tests {
         let snake: WorkspaceCreate =
             serde_json::from_value(json!({ "is_new_repo": true })).unwrap();
         assert_eq!(snake.is_new_repo, None);
+    }
+
+    /// `contextLinks` (§5.1) parses from its camelCase wire name with
+    /// lowercase `kind` values; absent keeps `None`, and an unknown `kind`
+    /// rejects at deserialization time.
+    #[test]
+    fn workspace_create_parses_context_links() {
+        let parsed: WorkspaceCreate = serde_json::from_value(json!({
+            "contextLinks": [
+                {
+                    "kind": "issue",
+                    "url": "https://github.com/intent-hq/intent/issues/42",
+                    "owner": "intent-hq",
+                    "repo": "intent",
+                    "number": 42,
+                },
+                {
+                    "kind": "pr",
+                    "url": "https://github.com/intent-hq/intentd/pull/7",
+                    "owner": "intent-hq",
+                    "repo": "intentd",
+                    "number": 7,
+                },
+            ]
+        }))
+        .unwrap();
+        let links = parsed.context_links.expect("parsed links");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].kind, ContextLinkKind::Issue);
+        assert_eq!(links[0].owner, "intent-hq");
+        assert_eq!(links[0].number, 42);
+        assert_eq!(links[1].kind, ContextLinkKind::Pr);
+        assert_eq!(links[1].repo, "intentd");
+
+        let absent: WorkspaceCreate = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.context_links.is_none());
+
+        // Unknown `kind` is a deserialization error, not a silent skip.
+        let bad = serde_json::from_value::<WorkspaceCreate>(json!({
+            "contextLinks": [{
+                "kind": "discussion",
+                "url": "https://example.com",
+                "owner": "o",
+                "repo": "r",
+                "number": 1,
+            }]
+        }));
+        assert!(bad.is_err(), "unknown kind must reject");
     }
 
     #[test]
@@ -4597,6 +5200,7 @@ mod tests {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -4621,6 +5225,7 @@ mod tests {
             "prStatus",
             "activePullRequest",
             "pullRequests",
+            "contextLinks",
             "repositoryOwner",
             "lastActivity",
             "archivedAt",
@@ -5179,6 +5784,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -5271,6 +5877,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -5379,6 +5986,7 @@ mod tests {
                 stop_reason_timestamp: None,
                 session_corrupted: false,
                 pending_delete_at: None,
+                retired_at: None,
                 created_at: "t0".to_string(),
                 updated_at: "t1".to_string(),
                 sandbox_id: None,
@@ -5467,6 +6075,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -5546,6 +6155,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -5638,6 +6248,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,

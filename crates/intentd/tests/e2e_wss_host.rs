@@ -208,6 +208,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
+                    assert_eq!(v["jsonrpc"], "2.0", "JSON-RPC response envelope: {v}");
                     assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
                     return v["result"].clone();
                 }
@@ -252,6 +253,29 @@ async fn host_detection_services_over_wss() {
     // §5.14 sanity: WSS connections report remote locality.
     let status = wss_rpc(&mut ws, 1, "host.status", json!({})).await;
     assert_eq!(status["locality"], "remote", "WSS ⇒ remote (§5.14)");
+    if std::env::consts::OS == "linux" {
+        assert!(
+            status["deviceKind"].is_string(),
+            "Linux always has a device fallback: {status}"
+        );
+    }
+    if let Some(kind) = status.get("deviceKind").and_then(Value::as_str) {
+        assert!(
+            [
+                "macMini",
+                "macStudio",
+                "laptop",
+                "desktop",
+                "server",
+                "cloudVm"
+            ]
+            .contains(&kind),
+            "known deviceKind: {status}"
+        );
+    }
+    if let Some(model) = status.get("hardwareModel") {
+        assert!(model.is_string(), "hardwareModel is a string: {status}");
+    }
 
     // host.findBinary requires a `name` — missing ⇒ -32602 (PROTOCOL §9).
     {
@@ -456,6 +480,7 @@ async fn host_provider_auth_status_over_wss() {
         "droid",
         "grok",
         "pi",
+        "antigravity",
     ];
     assert_eq!(
         providers.len(),
@@ -510,6 +535,123 @@ async fn host_provider_auth_status_over_wss() {
         err["error"]["code"], -32602,
         "unknown providerId ⇒ -32602: {err}"
     );
+}
+
+/// A Claude Desktop sign-in cannot override the CLI's explicit logout.
+/// Override the daemon child's PATH, not providers.paths.claude-code (which
+/// names the adapter), and use only isolated fixtures. Forced checks must
+/// observe login/logout while ordinary reads retain the cached verdict, and
+/// a logged-in report's identity metadata (email / orgName /
+/// subscriptionType) rides the response — including cache-served reads —
+/// while logged-out entries carry no identity object.
+#[tokio::test]
+async fn host_claude_auth_status_honors_cli_json_and_force_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let data_dir = temp_data_dir();
+    let bin_dir = data_dir.join("bin");
+    let home_dir = data_dir.join("home");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let cli = bin_dir.join("claude");
+    std::fs::write(
+        &cli,
+        r#"#!/bin/sh
+[ "$*" = 'auth status' ] || exit 127
+printf 'probe\n' >> "$CLAUDE_AUTH_FIXTURE_DIR/probes"
+IFS= read -r payload < "$CLAUDE_AUTH_FIXTURE_DIR/status.json"
+IFS= read -r code < "$CLAUDE_AUTH_FIXTURE_DIR/exit-code"
+printf '%s\n' "$payload"
+exit "$code"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let npx = bin_dir.join("npx");
+    std::fs::write(
+        &npx,
+        "#!/bin/sh\nprintf 'unexpected adapter spawn\\n' >> \"$CLAUDE_AUTH_FIXTURE_DIR/adapter-spawns\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("PATH", path.as_str()),
+        ("HOME", home_dir.to_str().unwrap()),
+        ("SHELL", "/bin/sh"),
+        ("CLAUDE_AUTH_FIXTURE_DIR", data_dir.to_str().unwrap()),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut ws = connect_ws(port, cfg).await;
+
+    // The initial false/exit-0 pair catches the old exit-code false positive;
+    // true/exit-1 proves the payload wins in the opposite direction as well.
+    for (id, logged_in, exit, force, expected, probe_count) in [
+        (1, false, 0, true, false, 1),
+        (2, true, 1, false, false, 1),
+        (3, true, 1, true, true, 2),
+        (4, false, 1, false, true, 2),
+        (5, false, 1, true, false, 3),
+        (6, false, 0, true, false, 4),
+    ] {
+        let mut status = json!({
+            "loggedIn": logged_in,
+            "authMethod": if logged_in { "oauth" } else { "none" },
+            "apiProvider": "firstParty"
+        });
+        if logged_in {
+            status["email"] = json!("dev@example.com");
+            status["orgName"] = json!("Example Org");
+            status["subscriptionType"] = json!("max");
+        }
+        std::fs::write(data_dir.join("status.json"), format!("{status}\n")).unwrap();
+        std::fs::write(data_dir.join("exit-code"), format!("{exit}\n")).unwrap();
+        let result = wss_rpc(
+            &mut ws,
+            id,
+            "host.providerAuthStatus",
+            json!({ "providerId": "claude-code", "force": force }),
+        )
+        .await;
+        let mut expected_entry = json!({ "id": "claude-code", "authenticated": expected });
+        if expected {
+            // Identity rides every authenticated read — the probe-backed one
+            // AND the cache-served one — and never a logged-out entry.
+            expected_entry["identity"] = json!({
+                "email": "dev@example.com",
+                "orgName": "Example Org",
+                "subscriptionType": "max"
+            });
+        }
+        assert_eq!(
+            result,
+            json!({ "providers": [expected_entry] }),
+            "step {id}: explicit CLI status and cache refresh"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("probes"))
+                .unwrap()
+                .lines()
+                .count(),
+            probe_count,
+            "step {id}: only forced refreshes spawn another CLI"
+        );
+        assert!(
+            !data_dir.join("adapter-spawns").exists(),
+            "step {id}: explicit login/logout must not spawn the adapter"
+        );
+    }
 }
 
 /// host.checkAuggie over the real WSS wire: resolution-only `{ available,
@@ -591,6 +733,7 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -767,6 +910,65 @@ async fn host_exec_over_wss() {
         err["error"]["code"], -32602,
         "missing command ⇒ -32602: {err}"
     );
+
+    // 6) Symlink-aware cwd containment (intent-hq/intent#3847): a symlink
+    // INSIDE the workspace pointing OUTSIDE it passes the lexical guard, but
+    // the child would chdir through it — the canonicalize gate must reject
+    // it with the same -32603 containment error, while an in-workspace
+    // symlink cwd keeps working.
+    #[cfg(unix)]
+    {
+        let outside =
+            std::env::temp_dir().join(format!("itd-wss-exec-outside-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&outside).expect("mkdir outside dir");
+        std::os::unix::fs::symlink(&outside, root.join("escape")).expect("plant escape symlink");
+        let frame = json!({
+            "jsonrpc": "2.0", "id": 206, "method": "host.exec",
+            "params": {
+                "command": "pwd",
+                "cwd": "escape",
+                "workspaceId": ws_id,
+                "timeoutMs": 5000,
+            }
+        });
+        ws.send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+        let err = wss_expect_error(&mut ws, 206).await;
+        assert_eq!(
+            err["error"]["code"], -32603,
+            "symlinked cwd escape ⇒ -32603: {err}"
+        );
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("cwd outside workspace"),
+            "containment message on symlink escape: {err}"
+        );
+
+        // Control: an in-workspace symlink cwd still resolves and runs.
+        std::fs::create_dir_all(root.join("sub")).expect("mkdir sub");
+        std::os::unix::fs::symlink(root.join("sub"), root.join("alias")).expect("in-ws symlink");
+        let inside_link = wss_rpc(
+            &mut ws,
+            207,
+            "host.exec",
+            json!({
+                "command": "pwd",
+                "cwd": "alias",
+                "workspaceId": ws_id,
+                "timeoutMs": 5000,
+            }),
+        )
+        .await;
+        assert_eq!(
+            inside_link["exitCode"], 0,
+            "in-workspace symlink cwd ⇒ ok: {inside_link}"
+        );
+
+        let _ = std::fs::remove_dir_all(&outside);
+    }
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1508,34 +1710,28 @@ async fn host_provider_discovery_over_wss() {
             "only the pi row carries CLI verdict fields: {p}"
         );
     }
-    // cortex is un-gated (monorepo#1902): its row must carry no gatedOff.
-    // The env-var gate mechanism stays wire-covered by mock (the daemon env
-    // above sets no MOCK_AGENT_SCRIPT_PATH), which reports gatedOff and skips
-    // binary probing entirely (installed: false, no resolvedPath).
-    let cortex = providers
-        .iter()
-        .find(|p| p["id"] == "cortex")
-        .expect("cortex must be in the discovery payload");
-    assert!(
-        cortex.get("gatedOff").is_none(),
-        "cortex is un-gated and must omit gatedOff: {cortex}"
-    );
-    let mock = providers
-        .iter()
-        .find(|p| p["id"] == "mock")
-        .expect("mock must be in the discovery payload");
-    assert!(
-        mock["gatedOff"].is_string(),
-        "mock without MOCK_AGENT_SCRIPT_PATH must report gatedOff: {mock}"
-    );
-    assert_eq!(
-        mock["installed"], false,
-        "gated rows are never probed: {mock}"
-    );
-    assert!(
-        mock.get("resolvedPath").is_none(),
-        "gated rows carry no resolvedPath: {mock}"
-    );
+    // Env-var gated rows (the daemon env above sets none of the enable
+    // vars): mock (MOCK_AGENT_SCRIPT_PATH), cortex (INTENTD_ENABLE_CORTEX),
+    // and droid (INTENTD_ENABLE_DROID) report gatedOff and skip binary
+    // probing entirely (installed: false, no resolvedPath).
+    for id in ["mock", "cortex", "droid"] {
+        let row = providers
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("{id} must be in the discovery payload"));
+        assert!(
+            row["gatedOff"].is_string(),
+            "{id} without its enable env var must report gatedOff: {row}"
+        );
+        assert_eq!(
+            row["installed"], false,
+            "gated rows are never probed: {row}"
+        );
+        assert!(
+            row.get("resolvedPath").is_none(),
+            "gated rows carry no resolvedPath: {row}"
+        );
+    }
 
     drop(daemon);
 }
@@ -1706,7 +1902,7 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
 /// WSS e2e for the default-provider self-heal (monorepo#3044): calling
 /// `host.providerDiscovery` on a daemon with UNSET default settings and a
 /// provider forced installed (via a `providers.paths` override, as in the
-/// override test above) must persist `providers.active` through the
+/// override test above) must persist `model.defaultProvider` through the
 /// transport → `WorkspaceApi::settings_heal_default_provider` seam — the
 /// only production trigger — observable via `settings.get` on the same
 /// connection. `model.default` stays unset (cold catalog cache), and a
@@ -1762,12 +1958,12 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
         &mut ws,
         1,
         "settings.get",
-        json!({ "path": "providers.active" }),
+        json!({ "path": "model.defaultProvider" }),
     )
     .await;
     assert!(
         before["value"].is_null(),
-        "providers.active must start unset: {before}"
+        "model.defaultProvider must start unset: {before}"
     );
 
     // Discovery reports installed providers → the daemon self-heals.
@@ -1788,15 +1984,15 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
         &mut ws,
         3,
         "settings.get",
-        json!({ "path": "providers.active" }),
+        json!({ "path": "model.defaultProvider" }),
     )
     .await;
     let active = healed["value"]
         .as_str()
-        .unwrap_or_else(|| panic!("providers.active must be healed to a string: {healed}"));
+        .unwrap_or_else(|| panic!("model.defaultProvider must be healed to a string: {healed}"));
     assert!(
         installed.contains(&active),
-        "healed providers.active ({active}) must be one of the installed providers: {healed}"
+        "healed model.defaultProvider ({active}) must be one of the installed providers: {healed}"
     );
     assert_eq!(healed["origin"], json!("file"), "{healed}");
 
@@ -1806,7 +2002,7 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
         &mut ws,
         5,
         "settings.get",
-        json!({ "path": "providers.active" }),
+        json!({ "path": "model.defaultProvider" }),
     )
     .await;
     assert_eq!(

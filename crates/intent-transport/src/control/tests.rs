@@ -14,6 +14,8 @@ struct FakeControl {
     import_force: std::sync::Mutex<Option<bool>>,
     credential: Option<(String, String)>,
     credential_pid: std::sync::Mutex<Option<Option<u64>>>,
+    update_error: Option<String>,
+    update_called: AtomicBool,
 }
 
 impl FakeControl {
@@ -32,9 +34,14 @@ impl FakeControl {
                 has_display: true,
                 max_agents: 20,
                 version: "0.1.0".to_string(),
+                build_commit: Some("0123456789abcdef".to_string()),
                 uptime_seconds: 123,
                 local_ips: vec!["192.168.1.10".to_string(), "10.0.0.5".to_string()],
+                tc_address: Some("tc7f2a91.tailcat.net".to_string()),
                 hostname: "studio.local".to_string(),
+                pretty_hostname: "Clement's Mac Studio".to_string(),
+                device_kind: Some("macStudio".to_string()),
+                hardware_model: Some("Mac Studio".to_string()),
                 cpu_percent: 12.5,
                 memory_bytes: 104_857_600,
                 child_processes: Some(4),
@@ -45,11 +52,19 @@ impl FakeControl {
                 queued_spawns: Some(1),
                 workspaces_disk_available_bytes: Some(250_000_000_000),
                 workspaces_disk_total_bytes: Some(1_000_000_000_000),
+                file_watch: Some(FileWatchStatus {
+                    active_streams: 2,
+                    total_roots: 5,
+                    failed_roots: 0,
+                }),
+                update_supported: true,
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
             credential: None,
             credential_pid: std::sync::Mutex::new(None),
+            update_error: None,
+            update_called: AtomicBool::new(false),
         }
     }
 
@@ -59,14 +74,36 @@ impl FakeControl {
             ..Self::new()
         }
     }
+
+    fn with_update_error(message: &str) -> Self {
+        Self {
+            update_error: Some(message.to_string()),
+            ..Self::new()
+        }
+    }
 }
 
 impl SystemControl for FakeControl {
     fn status(&self) -> SystemStatus {
         self.status.clone()
     }
+    fn host_environment(&self) -> crate::host_env::HostEnvironment {
+        crate::host_env::HostEnvironment {
+            hostname: self.status.hostname.clone(),
+            pretty_hostname: self.status.pretty_hostname.clone(),
+            device_kind: self.status.device_kind.clone(),
+            hardware_model: self.status.hardware_model.clone(),
+        }
+    }
     fn request_shutdown(&self) {
         self.shutdown_called.store(true, Ordering::SeqCst);
+    }
+    fn request_update(&self) -> Result<(), String> {
+        self.update_called.store(true, Ordering::SeqCst);
+        match &self.update_error {
+            Some(message) => Err(message.clone()),
+            None => Ok(()),
+        }
     }
     fn import_legacy(
         &self,
@@ -103,6 +140,9 @@ fn classify_only_matches_system_methods() {
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.gitCredential" })).is_some()
     );
+    assert!(
+        classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.requestUpdate" })).is_some()
+    );
     // Non-system methods fall through.
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "workspace.list" })).is_none());
     // Wrong jsonrpc version falls through.
@@ -124,16 +164,25 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["agents"], 1);
     assert_eq!(local["maxAgents"], 20);
     assert_eq!(local["version"], "0.1.0");
+    assert_eq!(local["buildCommit"], "0123456789abcdef");
     assert_eq!(local["uptimeSeconds"], 123);
     assert_eq!(local["cpuPercent"], 12.5);
     assert_eq!(local["memoryBytes"], 104_857_600u64);
     assert_eq!(local["fingerprint"], "AB:CD");
     assert_eq!(local["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
+    assert_eq!(local["tcAddress"], "tc7f2a91.tailcat.net");
     assert_eq!(local["hostname"], "studio.local");
+    assert_eq!(local["prettyHostname"], "Clement's Mac Studio");
     assert_eq!(local["protocolVersion"], crate::protocol::PROTOCOL_VERSION);
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
     assert_eq!(local["host"]["hasDisplay"], true);
+    assert_eq!(local["host"]["deviceKind"], "macStudio");
+    assert_eq!(local["host"]["hardwareModel"], "Mac Studio");
+    // Supervision probe (intent-hq/intent#3875): a plain boolean, always
+    // present, so a client can gate its update affordance without probing
+    // system.requestUpdate.
+    assert_eq!(local["updateSupported"], true);
 
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
@@ -141,7 +190,9 @@ fn status_json_local_vs_remote_locality() {
     // The routing fields are served to remote callers too — that is the point:
     // an authenticated WSS client refreshes its host list from system.status.
     assert_eq!(remote["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
+    assert_eq!(remote["tcAddress"], "tc7f2a91.tailcat.net");
     assert_eq!(remote["hostname"], "studio.local");
+    assert_eq!(remote["prettyHostname"], "Clement's Mac Studio");
 }
 
 #[test]
@@ -159,9 +210,14 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         has_display: false,
         max_agents: 8,
         version: "0.1.0".to_string(),
+        build_commit: None,
         uptime_seconds: 456,
         local_ips: Vec::new(),
+        tc_address: None,
         hostname: "intent".to_string(),
+        pretty_hostname: "intent".to_string(),
+        device_kind: None,
+        hardware_model: None,
         cpu_percent: 0.0,
         memory_bytes: 0,
         child_processes: None,
@@ -172,6 +228,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         queued_spawns: None,
         workspaces_disk_available_bytes: None,
         workspaces_disk_total_bytes: None,
+        file_watch: None,
+        update_supported: false,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -180,6 +238,10 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     // No routable interfaces still yields an (empty) array, never null.
     assert_eq!(v["localIps"], json!([]));
     assert_eq!(v["hostname"], "intent");
+    assert_eq!(
+        v["prettyHostname"], "intent",
+        "falls back to hostname when no pretty name exists"
+    );
     // An unsampled child tree is explicitly null — never a misleading 0, which
     // a bundle would read as "the daemon has no child processes".
     assert_eq!(v["childProcesses"], Value::Null);
@@ -187,12 +249,23 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert_eq!(v["childMemoryPeakBytes"], Value::Null);
     // Budget off ⇒ the budget fields are ABSENT (presence-detected), not null.
     let obj = v.as_object().unwrap();
+    // Builds without source metadata omit the additive identity field.
+    assert!(!obj.contains_key("buildCommit"));
     assert!(!obj.contains_key("agentMemoryBudgetBytes"));
     assert!(!obj.contains_key("agentMemoryChargedBytes"));
     assert!(!obj.contains_key("queuedSpawns"));
     // No disk sample ⇒ the disk fields are ABSENT (presence-detected), not null.
     assert!(!obj.contains_key("workspacesDiskAvailableBytes"));
     assert!(!obj.contains_key("workspacesDiskTotalBytes"));
+    // Watcher registry not started yet ⇒ fileWatch is ABSENT, not null.
+    assert!(!obj.contains_key("fileWatch"));
+    // Tunnel disabled/down ⇒ tcAddress is ABSENT (presence-detected), not null.
+    assert!(!obj.contains_key("tcAddress"));
+    // Unsupervised daemon ⇒ updateSupported is PRESENT and false — a plain
+    // boolean, never absent or null.
+    assert_eq!(v["updateSupported"], false);
+    assert!(v["host"].get("deviceKind").is_none());
+    assert!(v["host"].get("hardwareModel").is_none());
 }
 
 /// The descendant-tree fields ride `system.status` so a debug
@@ -244,6 +317,29 @@ fn status_json_carries_the_workspaces_disk_fields_when_sampled() {
     let v = status_json(&FakeControl::new().status, true);
     assert_eq!(v["workspacesDiskAvailableBytes"], 250_000_000_000u64);
     assert_eq!(v["workspacesDiskTotalBytes"], 1_000_000_000_000u64);
+}
+
+/// The fileWatch object rides `system.status` once the watcher registry is
+/// live (intent-hq/intent#3708), so a client — and a debug bundle — can see
+/// whether the daemon's watch coverage is degraded (`failedRoots > 0` means
+/// file events under those roots are silently missed) rather than digging
+/// WARN lines out of the daemon log.
+#[test]
+fn status_json_carries_the_file_watch_coverage_when_available() {
+    let v = status_json(&FakeControl::new().status, true);
+    assert_eq!(v["fileWatch"]["activeStreams"], 2);
+    assert_eq!(v["fileWatch"]["totalRoots"], 5);
+    assert_eq!(v["fileWatch"]["failedRoots"], 0);
+
+    // Degraded coverage renders the failed count verbatim.
+    let mut status = FakeControl::new().status;
+    status.file_watch = Some(FileWatchStatus {
+        active_streams: 1,
+        total_roots: 5,
+        failed_roots: 3,
+    });
+    let v = status_json(&status, true);
+    assert_eq!(v["fileWatch"]["failedRoots"], 3);
 }
 
 #[tokio::test]
@@ -306,6 +402,56 @@ async fn handle_shutdown_remote_notification_is_ignored() {
     let req = classify(&json!({ "jsonrpc": "2.0", "method": "system.shutdown" })).unwrap();
     assert!(handle(req, &control, false, false).await.is_none());
     assert!(!control.shutdown_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn request_update_supervised_returns_ok() {
+    let control = FakeControl::new();
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 31, "method": "system.requestUpdate" })).unwrap();
+    let frame = handle(req, &control, true, true)
+        .await
+        .expect("requestUpdate has a response");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 31);
+    assert_eq!(parsed["result"], json!({ "ok": true }));
+    assert!(control.update_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn request_update_unsupervised_maps_to_internal_error() {
+    let control = FakeControl::with_update_error("daemon is not supervised by intentd-sitter");
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 32, "method": "system.requestUpdate" })).unwrap();
+    let parsed: Value =
+        serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+    assert_eq!(parsed["id"], 32);
+    assert_eq!(parsed["error"]["code"], -32603);
+    assert_eq!(
+        parsed["error"]["message"],
+        "daemon is not supervised by intentd-sitter"
+    );
+}
+
+#[tokio::test]
+async fn request_update_is_served_to_remote_callers() {
+    // Unlike system.shutdown, remote (TCP/WSS) callers may trigger an update
+    // check — that is the point of the method (a remote FE's update button).
+    let control = FakeControl::new();
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 33, "method": "system.requestUpdate" })).unwrap();
+    let parsed: Value =
+        serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+    assert_eq!(parsed["result"], json!({ "ok": true }));
+    assert!(control.update_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn request_update_notification_fires_without_response() {
+    let control = FakeControl::new();
+    let req = classify(&json!({ "jsonrpc": "2.0", "method": "system.requestUpdate" })).unwrap();
+    assert!(handle(req, &control, true, true).await.is_none());
+    assert!(control.update_called.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

@@ -59,6 +59,10 @@ pub(crate) fn recording_local_offset() -> Option<UtcOffset> {
 /// per counter. The clamp absorbs snapshot regressions — e.g. the first
 /// report of a recreated ACP session restarting from zero — at the cost of
 /// under-counting that one turn, which is preferable to a huge bogus delta.
+/// Applies to CUMULATIVE-reporting providers only: for per-turn /
+/// last-request providers the report itself is the delta and callers bypass
+/// this subtraction entirely (see [`crate::usage_semantics`],
+/// intent-hq/intent#3794/#3795).
 pub(crate) fn turn_token_delta(
     prev: Option<&TokenUsageTotals>,
     next: &TokenUsageTotals,
@@ -274,10 +278,9 @@ pub(crate) fn stats_provider_key(provider_id: Option<&str>) -> String {
 /// [`stats_model_key`] (normalized model, falling back to the resolved
 /// provider id when no model is resolved at creation time — D13). `provider`
 /// is the session's raw `provider` field; the resolved id follows the spawn
-/// precedence (compound model prefix → provider field → `configured_default`,
-/// the settings-derived default the create seam passes through). An
-/// unresolvable provider falls to the `"unknown"` stats tail (monorepo#3044:
-/// no positional last resort).
+/// precedence (provider field → `configured_default`, the settings-derived
+/// default the create seam passes through). An unresolvable provider falls
+/// to the `"unknown"` stats tail (monorepo#3044: no positional last resort).
 /// Best-effort: errors are logged, never propagated — stats bookkeeping must
 /// not fail `agent.create`.
 pub(crate) async fn record_session_started(
@@ -289,8 +292,7 @@ pub(crate) async fn record_session_started(
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
     let local = recording_local_offset().map(|o| local_stamp(now, o));
-    let provider_id =
-        crate::agent_session::resolve_provider_id(raw_model, provider, configured_default);
+    let provider_id = crate::agent_session::resolve_provider_id(provider, configured_default);
     // No resolved display model exists at creation time — the configOptions
     // resolution (D13/D14) only happens at session open.
     let model = stats_model_key(raw_model, None, provider_id.as_deref());
@@ -336,11 +338,7 @@ pub(crate) async fn record_lines_changed(
         .await
     {
         Ok((model, resolved, provider, _)) => {
-            let provider_id = crate::agent_session::resolve_provider_id(
-                model.as_deref(),
-                provider.as_deref(),
-                None,
-            );
+            let provider_id = crate::agent_session::resolve_provider_id(provider.as_deref(), None);
             (model, resolved, provider_id)
         }
         Err(e) => {

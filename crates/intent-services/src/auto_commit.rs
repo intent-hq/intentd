@@ -6,7 +6,8 @@
 //!
 //! Skips silently (debug-level log) when the workspace has `git.autoCommit`
 //! off (`assert_agent_commit_allowed` rejection), the worktree has no uncommitted
-//! changes, the session opted out via `skip_auto_commit`, or the
+//! changes, a merge is pending (scoped commits are refused mid-merge,
+//! monorepo#4223), the session opted out via `skip_auto_commit`, or the
 //! `agent:idle` finish reason is non-normal (`error`/`cancelled`/
 //! `provider_stopped`/`refusal`).
 
@@ -14,7 +15,7 @@ use std::path::PathBuf;
 
 use intent_core::events::AGENT_IDLE;
 use intent_core::{AgentId, AgentSession, Error, Event, NoteId, WorkspaceApi};
-use intent_git::commit::CLEAN_TREE_ERROR;
+use intent_git::commit::{CLEAN_TREE_ERROR, PARTIAL_MERGE_COMMIT_ERROR};
 
 use crate::events::SubscriptionFilter;
 use crate::instructions::get_instruction_with_common_for;
@@ -40,6 +41,13 @@ const AGENTS_MD_CAP_BYTES: usize = 8 * 1024;
 const RECENT_COMMITS_LIMIT: usize = 10;
 /// Generation timeout (~30 s) — acceptable latency on idle before falling
 /// back. Tests compress it via [`crate::Services::with_auto_commit_timeout_ms`].
+///
+/// This is auto-commit's OWN budget, passed as `agent.completeOnce`'s
+/// `timeoutMs` (§5.32) — generation never runs through the interactive
+/// prompt-enhancement RPC or its budget, and a timeout here degrades to the
+/// deterministic [`Services::build_auto_commit_subject`] fallback rather than
+/// failing the commit (monorepo#4032). Must stay within §5.32's 120 s
+/// `timeoutMs` cap, which the op silently applies.
 const GENERATION_TIMEOUT_MS: u64 = 30_000;
 
 /// Cap on the raw LLM output logged (at debug level) when parsing fails.
@@ -213,16 +221,20 @@ impl Services {
             return;
         }
 
-        // Resolve worktree path for generation + fallback.
+        // Resolve the checkout path for generation + fallback. Direct
+        // checkouts may persist only `repositoryPath` (monorepo#3778), and
+        // `git_agent_commit` itself resolves via `git_ops::worktree_path`
+        // (worktreePath → repositoryPath), so skipping here would be the
+        // only thing blocking auto-commit for them.
         let worktree_path = match self.store().get_workspace(&session.workspace_id).await {
             Ok(ws) => {
-                if let Some(p) = ws.worktree_path.map(PathBuf::from) {
+                if let Some(p) = ws.effective_path().map(PathBuf::from) {
                     p
                 } else {
                     tracing::debug!(
                         agent = %agent_id.0,
                         workspace = %session.workspace_id.0,
-                        "auto-commit skipped: no worktree path"
+                        "auto-commit skipped: no on-disk checkout path"
                     );
                     return;
                 }
@@ -263,6 +275,7 @@ impl Services {
                 linked_note_id.clone(),
                 None,
                 false,
+                None,
             )
             .await
         {
@@ -278,7 +291,8 @@ impl Services {
             Err(Error::Internal(msg))
                 if msg.contains(AUTO_COMMIT_DISABLED_MARK)
                     || msg.contains(NO_CHANGES_MARK)
-                    || msg.contains(CLEAN_TREE_ERROR) =>
+                    || msg.contains(CLEAN_TREE_ERROR)
+                    || msg.contains(PARTIAL_MERGE_COMMIT_ERROR) =>
             {
                 tracing::debug!(
                     agent = %agent_id.0,

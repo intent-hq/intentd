@@ -219,7 +219,7 @@ async fn boot_with_engine(
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
     let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
@@ -283,6 +283,7 @@ async fn seed_vocab_workspace(fx: &Fixture, readme: &str) -> WorkspaceId {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -386,6 +387,48 @@ async fn transcribe_round_trips_over_wss() {
     assert!(
         prompt.ends_with("Release planning."),
         "request prompt appended: {prompt}"
+    );
+}
+
+/// `context.keyterms` carrying ElevenLabs-rejected characters reach the
+/// engine sanitized on the `keyterms` field only — the composed `OpenAI`
+/// `prompt` keeps the unsanitized spellings (PROTOCOL §5.41).
+#[tokio::test]
+async fn keyterms_sanitized_for_elevenlabs_prompt_keeps_unsanitized_spellings() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let resp = wss_rpc_raw(
+        &mut ws,
+        1,
+        "voice.transcribe",
+        json!({
+            "audio": b64(b"opus-bytes"),
+            "context": { "keyterms": ["[fix] task", "C:\\src", "Endara"] },
+        }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+
+    let calls = fx.engine.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let req = &calls[0];
+    for sanitized in ["fix task", "C:src", "Endara"] {
+        assert!(
+            req.keyterms.contains(&sanitized.to_string()),
+            "keyterms carry the ElevenLabs-sanitized spellings: {:?}",
+            req.keyterms
+        );
+    }
+    assert!(
+        !req.keyterms.iter().any(|t| t.contains(['[', ']', '\\'])),
+        "no rejected characters reach the keyterms field: {:?}",
+        req.keyterms
+    );
+    let prompt = req.prompt.as_deref().unwrap();
+    assert!(
+        prompt.contains("[fix] task") && prompt.contains("C:\\src"),
+        "OpenAI prompt keeps the unsanitized spellings: {prompt}"
     );
 }
 

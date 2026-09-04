@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 /// Build the full `providers.catalog` result: `{ providers: [...] }`. No
 /// provider carries a default designation — clients derive an effective
-/// default from settings (`model.default` prefix, else `providers.active`).
+/// default from settings (`model.defaultProvider`).
 /// Gating is evaluated against the daemon's process environment (see
 /// [`provider_visible`]).
 pub(crate) fn build_providers_catalog() -> Value {
@@ -33,7 +33,7 @@ fn build_providers_catalog_with_env(env_has: &dyn Fn(&str) -> bool) -> Value {
 /// Whether a provider passes the daemon-side visibility gate. Derived from
 /// [`intent_providers::gated_reason_with_env`] — the single env-var/
 /// feature-code gate shared with discovery's `gatedOff` and the
-/// `models.list` cortex source — so the surfaces can never drift.
+/// `models.list` cortex/droid sources — so the surfaces can never drift.
 fn provider_visible(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> bool) -> bool {
     intent_providers::gated_reason_with_env(p, env_has).is_none()
 }
@@ -48,6 +48,7 @@ fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> 
     row.insert("shortName".into(), json!(p.short_name));
     row.insert("command".into(), json!(p.command));
     row.insert("canBeDisabled".into(), json!(p.can_be_disabled));
+    row.insert("supportsTestPrompt".into(), json!(p.supports_test_prompt));
     if let Some(hint) = p.login_command_hint {
         row.insert("loginCommandHint".into(), json!(hint));
     }
@@ -102,6 +103,7 @@ mod tests {
         assert_eq!(auggie["shortName"], "Auggie");
         assert_eq!(auggie["command"], "auggie");
         assert_eq!(auggie["canBeDisabled"], true);
+        assert_eq!(auggie["supportsTestPrompt"], true);
         assert_eq!(auggie["loginCommandHint"], "auggie login");
         // The generic provider row's login CTA reads `loginDocsUrl`.
         assert!(auggie["loginDocsUrl"].is_string());
@@ -153,6 +155,19 @@ mod tests {
     }
 
     #[test]
+    fn supports_test_prompt_present_on_every_row_and_respects_opt_outs() {
+        let v = catalog(&|_| false);
+        for p in v["providers"].as_array().unwrap() {
+            let expected = p["id"] != "unsloth" && p["id"] != "antigravity";
+            assert_eq!(
+                p["supportsTestPrompt"], expected,
+                "supportsTestPrompt mismatch for {}",
+                p["id"]
+            );
+        }
+    }
+
+    #[test]
     fn env_var_gate_evaluates_visible_and_passes_raw_field_through() {
         // mock requires MOCK_AGENT_SCRIPT_PATH: hidden when unset…
         let v = catalog(&|_| false);
@@ -183,15 +198,26 @@ mod tests {
         assert_eq!(r["requiresFeatureCode"], "test-code");
     }
 
-    /// Regression (monorepo#1902): cortex is un-gated — served visible with
-    /// no gating fields.
+    /// cortex and droid are hidden by default: `visible: false` with the
+    /// raw `requiresEnvVar` passed through when the enable vars are unset,
+    /// and visible again when each var is present.
     #[test]
-    fn cortex_is_ungated_and_visible() {
+    fn cortex_and_droid_are_gated_by_default_and_visible_when_enabled() {
         let v = catalog(&|_| false);
-        let cortex = row(&v, "cortex");
-        assert_eq!(cortex["visible"], true);
-        assert!(cortex.get("requiresFeatureCode").is_none());
-        assert!(cortex.get("requiresEnvVar").is_none());
+        for (id, var) in [
+            ("cortex", "INTENTD_ENABLE_CORTEX"),
+            ("droid", "INTENTD_ENABLE_DROID"),
+        ] {
+            let p = row(&v, id);
+            assert_eq!(p["visible"], false, "{id} hidden by default");
+            assert_eq!(p["requiresEnvVar"], var);
+            assert!(p.get("requiresFeatureCode").is_none());
+
+            let enabled = catalog(&|v| v == var);
+            let p = row(&enabled, id);
+            assert_eq!(p["visible"], true, "{id} visible when {var} is set");
+            assert_eq!(p["requiresEnvVar"], var, "raw field still passed through");
+        }
     }
 
     #[test]
@@ -201,11 +227,9 @@ mod tests {
             "auggie",
             "claude-code",
             "codex",
-            "cortex",
             "opencode",
             "unsloth",
             "pi",
-            "droid",
             "grok",
         ] {
             assert_eq!(row(&v, id)["visible"], true, "{id} should be visible");

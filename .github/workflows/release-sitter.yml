@@ -43,7 +43,7 @@ on:
 
 jobs:
   plan:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: gh-linux-16x
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -94,8 +94,10 @@ jobs:
           # macOS targets build on GitHub-hosted Apple Silicon runners (the
           # self-hosted m1mac went offline and releases queued forever
           # behind it); the x86_64 target is a cross build, smoke-tested
-          # under Rosetta 2. Linux musl targets stay on the self-hosted
-          # tinybox runner (cross-built with cargo-zigbuild as before).
+          # under Rosetta 2. Linux musl targets build on the org-hosted
+          # gh-linux-16x runner (cross-built with cargo-zigbuild as before)
+          # so the release path never queues behind — or deadlocks on — the
+          # self-hosted tinybox fleet.
           # Windows uses the org-hosted gh-windows-16x runner (16-core/64GB,
           # Windows Server 2022 image) for faster release builds
           # (intent-hq/monorepo#1803).
@@ -104,10 +106,10 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-14
           - target: x86_64-unknown-linux-musl
-            os: [self-hosted, Linux, X64]
+            os: gh-linux-16x
             zigbuild: true
           - target: aarch64-unknown-linux-musl
-            os: [self-hosted, Linux, X64]
+            os: gh-linux-16x
             zigbuild: true
           - target: x86_64-pc-windows-msvc
             os: gh-windows-16x
@@ -119,24 +121,36 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Resolve pinned Rust channel
-        id: toolchain
+      # Provision the toolchain with bare rustup instead of a toolchain
+      # action, mirroring v-release.yml's "Provision Rust toolchain and
+      # matrix targets" step (green on the same runner pool). On the
+      # GitHub-hosted gh-linux-16x images the preinstalled Rust collides
+      # with the channel sync that rust-toolchain.toml triggers to add its
+      # declared rustfmt/clippy components ("failed to install component:
+      # 'rustfmt-preview-...', detected conflict: 'bin/cargo-fmt'" —
+      # sitter-v0.1.8 run 33700707269, x86_64-musl leg; same mechanism as
+      # v0.2.16 Release run 30706345522). --profile minimal skips the
+      # components and the RUSTUP_TOOLCHAIN pin keeps later cargo
+      # invocations from re-entering the toml sync; the components aren't
+      # needed for release builds.
+      - name: Provision Rust toolchain and target
         shell: bash
         run: |
           channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-          targets: ${{ matrix.target }}
-      - uses: swatinem/rust-cache@v2
-        with:
-          shared-key: build-${{ matrix.target }}
-          save-if: false
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          rustup target add --toolchain "$channel" "$TARGET"
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      # No rust-cache step: nothing saves under a key this tag-push-only
+      # workflow could restore (ci.yml's build job uses gh-build-<target>),
+      # so a restore-only cache here was dead weight — and enabling saves
+      # would pressure the repo's 10 GiB Actions cache budget (now
+      # load-bearing for ci.yml's burst caches and release-plz's sccache
+      # dir) for a blob likely LRU-evicted between infrequent sitter
+      # releases anyway. Release builds are accepted as cold.
       # Mirror the dist pipeline's musl approach: cross-compile with
-      # cargo-zigbuild (the PyPI package bundles the zig toolchain). On the
-      # self-hosted runner the user-site install lands in ~/.local/bin, which
-      # is not on the runner service's PATH.
+      # cargo-zigbuild (the PyPI package bundles the zig toolchain). The
+      # user-site install can land in ~/.local/bin, which is not guaranteed
+      # to be on PATH, so add it explicitly.
       - name: Install cargo-zigbuild
         if: ${{ matrix.zigbuild }}
         shell: bash
@@ -224,7 +238,7 @@ jobs:
     needs:
       - plan
       - build
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: gh-linux-16x
     timeout-minutes: 10
     # Serialize sitter-latest updates so two tags pushed close together cannot
     # interleave and leave the fixed release with mixed assets.
@@ -310,7 +324,7 @@ jobs:
       - plan
       - publish
       - deb
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: gh-linux-16x
     timeout-minutes: 10
     outputs:
       enabled: ${{ steps.mirror.outputs.enabled }}
@@ -393,7 +407,7 @@ jobs:
       - publish
       - mirror
     if: ${{ needs.plan.outputs.prerelease == 'false' && needs.mirror.outputs.enabled == 'true' }}
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: gh-linux-16x
     timeout-minutes: 10
     # Serialize tap pushes so two tags pushed close together cannot race the
     # non-fast-forward push.
@@ -417,7 +431,7 @@ jobs:
       - name: Style-check rendered formula (advisory)
         run: |
           export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
-          # Linuxbrew is not installed on the self-hosted Linux runner; this
+          # Recent GitHub-hosted Ubuntu images may not ship Linuxbrew; this
           # check is advisory, so skip rather than fail when brew is absent.
           if ! command -v brew >/dev/null 2>&1; then
             echo "::warning::brew not installed on this runner; skipping advisory formula style check"
@@ -458,7 +472,7 @@ jobs:
     needs:
       - plan
       - publish
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: gh-linux-16x
     timeout-minutes: 10
     # Own group (not the publish one): asset names are disjoint from the
     # archives, so deb refreshes only need to serialize against themselves.

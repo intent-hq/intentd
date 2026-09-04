@@ -21,6 +21,7 @@ fn registry_first_provider_and_lookups() {
             "pi",
             "droid",
             "grok",
+            "antigravity",
             "mock"
         ]
     );
@@ -85,20 +86,42 @@ fn registry_field_parity() {
     assert_eq!(cc.command, "claude-agent-acp");
     assert_eq!(cc.base_args, &[] as &[&str]);
     assert_eq!(cc.auth_check_args, Some(&["auth", "status"][..]));
+    // The hint must name the real `claude` CLI — the `{command} login`
+    // fallback would print the non-runnable "claude-agent-acp login"
+    // (intent-hq/intent#3941).
+    assert_eq!(cc.login_command_hint, Some("claude auth login"));
     assert!(cc.model_flag.is_none() && cc.can_be_disabled);
     assert_eq!(cc.npx_only_package, Some(CLAUDE_AGENT_ACP_NPX_PACKAGE));
     assert_eq!(cc.fallback_npx_package, None);
-    // Claude Code truncates MCP tool descriptions at ~2k chars
-    // (anthropics/claude-code#53933): it gets the compact `workspace_api`
-    // description + system-prompt API reference. Every other provider keeps
-    // the full tool description byte-identical to before.
-    assert!(cc.truncates_tool_descriptions);
-    for p in ACP_PROVIDERS.iter().filter(|p| p.id != "claude-code") {
-        assert!(
-            !p.truncates_tool_descriptions,
-            "{} must keep the full workspace_api tool description",
+    // Providers whose client truncates, defers, or hides long MCP tool
+    // descriptions get the compact `workspace_api` description +
+    // system-prompt API reference: claude-code cuts at ~2k chars
+    // (anthropics/claude-code#53933), grok's `search_tool` truncates at
+    // 2,048 chars (MCP tools never appear in the tool list), and droid's
+    // remote Statsig `mcp_tool_search` flag gates 200-char deferred summaries
+    // (defensive). Cortex also defers ALL MCP tools to a names-only reminder,
+    // but it has no MCP delivery channel yet, so flagging it is deferred to
+    // intent-hq/monorepo#3303. Evidence per entry lives in config.rs. Every
+    // other provider keeps the full tool description byte-identical to before.
+    let flagged = ["claude-code", "droid", "grok"];
+    for p in ACP_PROVIDERS {
+        assert_eq!(
+            p.truncates_tool_descriptions,
+            flagged.contains(&p.id),
+            "{} truncates_tool_descriptions out of sync with the audited set",
             p.id
         );
+        // The full ws.* reference rides the assembled system prompt, so a
+        // flagged provider must have a prompt-delivery channel.
+        if p.truncates_tool_descriptions {
+            assert_ne!(
+                p.injection_mechanism,
+                InjectionMechanism::None,
+                "{} is flagged but has no system-prompt injection channel \
+                 to carry the full workspace_api reference",
+                p.id
+            );
+        }
     }
 
     let codex = find_provider("codex").unwrap();
@@ -107,7 +130,9 @@ fn registry_field_parity() {
 
     let cortex = find_provider("cortex").unwrap();
     assert_eq!(cortex.command, "cortex-acp");
-    // Un-gated (monorepo#1902): cortex carries no feature code.
+    // Hidden by default: cortex gates on INTENTD_ENABLE_CORTEX (env-var
+    // escape hatch — a feature code would be unconditionally gated).
+    assert_eq!(cortex.requires_env_var, Some("INTENTD_ENABLE_CORTEX"));
     assert_eq!(cortex.requires_feature_code, None);
 
     let oc = find_provider("opencode").unwrap();
@@ -143,6 +168,9 @@ fn registry_field_parity() {
     assert_eq!(droid.model_flag, Some("--model"));
     assert!(droid.supports_rules_file);
     assert_eq!(droid.rules_flag, Some("--append-system-prompt-file"));
+    // Hidden by default: droid gates on INTENTD_ENABLE_DROID.
+    assert_eq!(droid.requires_env_var, Some("INTENTD_ENABLE_DROID"));
+    assert_eq!(droid.requires_feature_code, None);
 
     let grok = find_provider("grok").unwrap();
     assert_eq!(grok.display_name, "Grok Build");
@@ -188,6 +216,29 @@ fn registry_field_parity() {
     assert_eq!(unsloth.fallback_npx_package, None);
 }
 
+/// cortex and droid are hidden by default: gated off when their enable env
+/// vars are absent, un-gated when set. Both sides exercised via the
+/// injectable env probe — never by mutating the process environment.
+#[test]
+fn cortex_and_droid_gate_on_enable_env_vars() {
+    for (id, var) in [
+        ("cortex", "INTENTD_ENABLE_CORTEX"),
+        ("droid", "INTENTD_ENABLE_DROID"),
+    ] {
+        let cfg = find_provider(id).unwrap();
+        let reason = gated_reason_with_env(cfg, &|_| false).expect("gated when env var unset");
+        assert!(
+            reason.contains(var),
+            "{id} gate names its env var: {reason}"
+        );
+        assert_eq!(
+            gated_reason_with_env(cfg, &|v| v == var),
+            None,
+            "{id} is un-gated when {var} is set"
+        );
+    }
+}
+
 /// Exactly claude-code, codex, droid, and grok consume MCP servers from the
 /// ACP `session/new` / `session/load` `mcpServers` field; every other
 /// provider receives MCP config out-of-band (auggie `--mcp-config`, opencode
@@ -195,7 +246,7 @@ fn registry_field_parity() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid", "grok"];
+    let opted_in = ["claude-code", "codex", "droid", "grok", "antigravity"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -206,7 +257,7 @@ fn session_mcp_servers_partition() {
     }
 }
 
-/// Exactly claude-code, pi, and codex apply the stored model post-session via
+/// These providers apply the stored model post-session via
 /// `session/set_config_option { configId: "model" }` (their pinned adapters
 /// expose the model as a `configOptions[id="model"]` select; claude-code and
 /// pi have no CLI model flag, and codex's npx-fallback adapter ignores the
@@ -214,7 +265,7 @@ fn session_mcp_servers_partition() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn config_option_model_partition() {
-    let opted_in = ["claude-code", "codex", "pi"];
+    let opted_in = ["claude-code", "codex", "pi", "antigravity"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -399,21 +450,75 @@ fn arg_assembly_dedupes_remove_tool_names() {
 }
 
 #[test]
+fn arg_assembly_emits_comma_joined_denylist_for_droid() {
+    let droid = find_provider("droid").unwrap();
+    assert_eq!(droid.remove_tool_flag, Some("--disabled-tools"));
+    assert_eq!(droid.remove_tool_style, ToolRemovalStyle::CommaJoined);
+    let args = build_provider_args(
+        droid,
+        &ArgInputs {
+            tools_to_remove: &["Edit", "Create", "ApplyPatch", "Task"],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        args,
+        vec![
+            "exec",
+            "--output-format",
+            "acp",
+            "--disabled-tools",
+            "Edit,Create,ApplyPatch,Task",
+        ]
+    );
+}
+
+#[test]
+fn arg_assembly_comma_joined_dedupes_and_skips_empty() {
+    let droid = find_provider("droid").unwrap();
+    // All-empty/duplicate input collapses; an empty result emits no flag.
+    let args = build_provider_args(
+        droid,
+        &ArgInputs {
+            tools_to_remove: &["Edit", "Edit", ""],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        args,
+        vec!["exec", "--output-format", "acp", "--disabled-tools", "Edit"]
+    );
+
+    let args = build_provider_args(
+        droid,
+        &ArgInputs {
+            tools_to_remove: &["", ""],
+            ..Default::default()
+        },
+    );
+    assert_eq!(args, vec!["exec", "--output-format", "acp"]);
+}
+
+#[test]
 fn arg_assembly_skips_remove_tool_for_providers_without_support() {
     // Providers with `remove_tool_flag = None` silently drop the input — we
-    // never pass an unknown flag to claude/codex/cortex/opencode/droid/grok.
+    // never pass an unknown flag to claude/codex/cortex/grok/opencode/pi/mock.
+    // grok is deliberately unset: its `--disallowed-tools` flag is
+    // headless-mode only and clap-rejected on `agent stdio` (see the grok
+    // registry entry).
     for id in [
         "claude-code",
         "codex",
         "cortex",
-        "opencode",
-        "droid",
         "grok",
+        "opencode",
+        "pi",
+        "mock",
     ] {
         let provider = find_provider(id).unwrap();
         assert!(
             provider.remove_tool_flag.is_none(),
-            "{id} unexpectedly opted into --remove-tool"
+            "{id} unexpectedly opted into a tool-removal flag"
         );
         let args = build_provider_args(
             provider,
@@ -423,8 +528,10 @@ fn arg_assembly_skips_remove_tool_for_providers_without_support() {
             },
         );
         assert!(
-            !args.iter().any(|a| a == "--remove-tool"),
-            "{id} unexpectedly received a --remove-tool flag: {args:?}"
+            !args.iter().any(|a| a == "--remove-tool"
+                || a == "--disallowed-tools"
+                || a == "--disabled-tools"),
+            "{id} unexpectedly received a tool-removal flag: {args:?}"
         );
     }
 }
@@ -645,7 +752,7 @@ fn v8_runtime_node_options_heap_cap() {
     std::env::remove_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB");
 
     // Default cap is 8192 for every Node/Electron provider.
-    assert_eq!(args::max_old_space_mb(), 8192);
+    assert_eq!(args::max_old_space_mb(None), 8192);
     for id in [
         "auggie",
         "claude-code",
@@ -673,21 +780,77 @@ fn v8_runtime_node_options_heap_cap() {
     // same provider without the signal (resolved native binary) stays
     // untouched (intent-hq/monorepo#1661).
     let codex = find_provider("codex").unwrap();
-    let codex_via_npx = args::build_provider_env_for_spawn(codex, None, None, None, None, true);
+    let codex_via_npx =
+        args::build_provider_env_for_spawn(codex, None, None, None, None, true, None);
     assert_eq!(
         codex_via_npx.get("NODE_OPTIONS").map(String::as_str),
         Some("--max-old-space-size=8192"),
         "codex npx-fallback spawn must get the heap cap"
     );
-    let codex_native = args::build_provider_env_for_spawn(codex, None, None, None, None, false);
+    let codex_native =
+        args::build_provider_env_for_spawn(codex, None, None, None, None, false, None);
     assert!(
         !codex_native.contains_key("NODE_OPTIONS"),
         "codex resolved-binary spawn must not get NODE_OPTIONS"
     );
 
-    // Override seam produces the requested cap for all V8 providers.
+    // `agents.acpNodeMaxOldSpaceMb` setting (no env override): the supplied
+    // cap replaces the default for V8 providers and npx spawns alike, while
+    // native runtimes still get nothing (intent-hq/intent#4330).
+    assert_eq!(args::max_old_space_mb(Some(4096)), 4096);
+    let env_for_spawn = |id: &str, via_npx: bool, cap: Option<u32>| {
+        args::build_provider_env_for_spawn(
+            find_provider(id).unwrap(),
+            None,
+            None,
+            None,
+            None,
+            via_npx,
+            cap,
+        )
+    };
+    for id in [
+        "auggie",
+        "claude-code",
+        "opencode",
+        "unsloth",
+        "cortex",
+        "mock",
+    ] {
+        assert_eq!(
+            env_for_spawn(id, false, Some(4096))
+                .get("NODE_OPTIONS")
+                .map(String::as_str),
+            Some("--max-old-space-size=4096"),
+            "provider {id} should honor the configured setting"
+        );
+    }
+    assert_eq!(
+        env_for_spawn("codex", true, Some(4096))
+            .get("NODE_OPTIONS")
+            .map(String::as_str),
+        Some("--max-old-space-size=4096"),
+        "codex npx-fallback spawn should honor the configured setting"
+    );
+    for id in ["codex", "droid", "grok"] {
+        assert!(
+            !env_for_spawn(id, false, Some(4096)).contains_key("NODE_OPTIONS"),
+            "native provider {id} must not get NODE_OPTIONS even with a setting"
+        );
+    }
+
+    // Override seam produces the requested cap for all V8 providers, and
+    // wins over the setting.
     std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "4096");
-    assert_eq!(args::max_old_space_mb(), 4096);
+    assert_eq!(args::max_old_space_mb(None), 4096);
+    assert_eq!(args::max_old_space_mb(Some(2048)), 4096);
+    assert_eq!(
+        env_for_spawn("mock", false, Some(2048))
+            .get("NODE_OPTIONS")
+            .map(String::as_str),
+        Some("--max-old-space-size=4096"),
+        "env override must win over the configured setting"
+    );
     for id in [
         "auggie",
         "claude-code",
@@ -703,9 +866,11 @@ fn v8_runtime_node_options_heap_cap() {
         );
     }
 
-    // Unparseable override falls back to the default (WARN logged).
+    // Unparseable override falls back to the setting when supplied, else the
+    // default (WARN logged either way).
     std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "not-a-number");
-    assert_eq!(args::max_old_space_mb(), 8192);
+    assert_eq!(args::max_old_space_mb(None), 8192);
+    assert_eq!(args::max_old_space_mb(Some(2048)), 2048);
     std::env::remove_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB");
 
     // Parent NODE_OPTIONS is appended to, not clobbered.
@@ -783,41 +948,6 @@ fn enhanced_path_dirs_mirror_the_joined_spawn_path() {
     // Spawn precedence: npx parent dir first, so a `pi` co-located with npx
     // shadows one later on the inherited PATH — for probe and child alike.
     assert_eq!(dirs[0], std::path::PathBuf::from("/opt/node"));
-}
-
-#[test]
-fn compound_model_id_round_trip() {
-    assert_eq!(
-        parse_compound_model_id("opencode:claude-sonnet-4"),
-        ("opencode".to_string(), "claude-sonnet-4".to_string())
-    );
-    // Only the first ':' splits; the model may itself contain ':'.
-    assert_eq!(
-        parse_compound_model_id("codex:gpt-5.3-codex/high"),
-        ("codex".to_string(), "gpt-5.3-codex/high".to_string())
-    );
-    // Bare id belongs to the default provider.
-    assert_eq!(
-        parse_compound_model_id("opus4.7"),
-        ("auggie".to_string(), "opus4.7".to_string())
-    );
-    assert_eq!(
-        create_compound_model_id("codex", "gpt-5.3-codex/high"),
-        "codex:gpt-5.3-codex/high"
-    );
-}
-
-#[test]
-fn model_validity_follows_compound_prefix() {
-    assert!(is_model_valid_for_provider(
-        "codex:gpt-5.3-codex/high",
-        "codex"
-    ));
-    assert!(is_model_valid_for_provider("opus4.7", "auggie"));
-    assert!(!is_model_valid_for_provider(
-        "codex:gpt-5.3-codex/high",
-        "auggie"
-    ));
 }
 
 #[test]
@@ -933,9 +1063,15 @@ fn auth_error_message_uses_login_hint() {
     assert!(remote.contains("on the remote server"));
     assert!(remote.contains("auggie login"));
 
-    // Providers without a hint fall back to `{command} login`.
+    // codex's hint names the real `codex` CLI, never the `codex-acp`
+    // adapter command the `{command} login` fallback would produce.
     let codex = auth_error_message("codex", false);
-    assert!(codex.contains("codex-acp login"));
+    assert!(codex.contains("codex login"));
+    assert!(!codex.contains("codex-acp login"));
+
+    // Providers without a hint fall back to `{command} login`.
+    let droid = auth_error_message("droid", false);
+    assert!(droid.contains("droid login"));
 }
 
 #[test]
@@ -953,6 +1089,7 @@ fn disableable_and_always_enabled_partition_registry() {
             "pi",
             "droid",
             "grok",
+            "antigravity",
             "mock"
         ]
     );
@@ -999,12 +1136,26 @@ fn auth_error_pattern_matching_is_case_insensitive_across_patterns() {
 
 #[test]
 fn auth_error_message_remote_falls_back_to_command_login() {
-    // claude-code has no login_command_hint → falls back to `{command} login`,
+    // droid has no login_command_hint → falls back to `{command} login`,
     // and the remote variant includes the remote-server phrasing.
-    let msg = auth_error_message("claude-code", true);
-    assert!(msg.contains("Anthropic Claude Code"));
-    assert!(msg.contains("claude-agent-acp login"));
+    let msg = auth_error_message("droid", true);
+    assert!(msg.contains("droid login"));
     assert!(msg.contains("on the remote server"));
+
+    // codex carries an explicit hint: the fallback would print the
+    // non-runnable adapter command "codex-acp login".
+    let codex = auth_error_message("codex", true);
+    assert!(codex.contains("codex login"));
+    assert!(!codex.contains("codex-acp login"));
+
+    // claude-code carries an explicit hint (intent-hq/intent#3941): the
+    // `{command} login` fallback would print the non-runnable
+    // "claude-agent-acp login".
+    let cc = auth_error_message("claude-code", true);
+    assert!(cc.contains("Anthropic Claude Code"));
+    assert!(cc.contains("claude auth login"));
+    assert!(!cc.contains("claude-agent-acp login"));
+    assert!(cc.contains("on the remote server"));
 
     // Unknown provider ids resolve to the first registered provider's message.
     let unknown = auth_error_message("not-a-real-provider", false);

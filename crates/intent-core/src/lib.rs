@@ -53,6 +53,7 @@ pub use ids::{
     AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
     CHIEF_WORKSPACE_ID,
 };
+pub use model::asset_extension_from_mime;
 pub use model::extract_spec_task_ids;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
@@ -60,11 +61,16 @@ pub use model::CURRENT_HARNESS_VERSION;
 pub use model::DISMISSED_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::LAST_SEEN_MESSAGE_ID_KEY;
 pub use model::MAX_DELEGATION_DEPTH;
+pub use model::PENDING_PROPOSALS_KEY;
 pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
+pub use model::PROPOSAL_OUTCOME_APPLIED;
+pub use model::PROPOSAL_OUTCOME_DISMISSED;
+pub use model::PROPOSAL_RESOLUTIONS_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
-    cap_json_value, last_tool_use_preview, slim_body_size, ConversationProjection,
-    AGENT_LIST_PREVIEW_BUDGET_BYTES, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
+    cap_json_value, last_tool_use_preview, note_list_slim_row, slim_body_size, slim_heavy_body,
+    ConversationProjection, NoteListProjection, AGENT_LIST_PREVIEW_BUDGET_BYTES,
+    NOTE_LIST_PREVIEW_CHARS, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
@@ -75,32 +81,33 @@ pub use model::{
     CommentAnchor, CommentAnchorType, CommentDeleteResult, CommentGetThreadResult,
     CommentListResult, CommentLocation, CommentResolveThreadResult, CommentRespondResult,
     CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary, CommentType,
-    CommentWire, ContentType, ContextItem, CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event,
-    EventActor, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
-    ExecutionEnvironmentRepoConfig, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
-    GitStatus, GuestImageRef, Hook, HookState, KnownRepo, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
+    CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
+    CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, ExecutionEnvironmentRepoConfig, FileActivity,
+    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
+    GitMergeConflicts, GitPullResult, GitStatus, GuestImageRef, Hook, HookState, KnownRepo,
+    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult,
-    RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode, SaveAssetResult, Script,
-    ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript,
-    SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    TokenUsageTotals, TopChangedFile, UsageCost, VmResources, Workspace, WorkspaceActivity,
-    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus,
-    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus,
+    ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode, SaveAssetResult,
+    Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats,
+    SetupScript, SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, VmResources, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage,
+    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use path_utils::prewarm_login_shell_path;
-pub use secrets::FileSecretStore;
+pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
 pub use server_control::ServerControl;
 pub use settings_file::{
     FlushQueuedMessagesMode, LegacySettings, SandboxType, SettingsFile, DEFAULT_CONFIG_TEMPLATE,

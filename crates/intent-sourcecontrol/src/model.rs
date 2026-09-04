@@ -338,6 +338,9 @@ pub struct Issue {
     pub body: Option<String>,
     pub state: String,
     pub url: String,
+    pub author: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Filter for listing issues.
@@ -430,6 +433,20 @@ pub struct BranchRules {
     pub required_status_checks: Vec<String>,
 }
 
+/// The PR's latest merge-queue removal event (GitHub GraphQL
+/// `RemovedFromMergeQueueEvent` timeline item): when the queue ejected the PR
+/// and why. Monotonic — a new ejection produces a new event with a later
+/// `at`; the host never retracts one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeQueueRemoval {
+    /// When the removal happened (`createdAt`, RFC 3339).
+    pub at: String,
+    /// The host's removal reason (e.g. `failed_checks`); `None` when the
+    /// host does not report one.
+    pub reason: Option<String>,
+}
+
 /// Per-PR merge-requirement signals a host can report beyond the plain
 /// [`PullRequest`] snapshot. Hosts without the signals return
 /// [`crate::Error::Unsupported`]; individual fields degrade to `None`/empty
@@ -452,4 +469,12 @@ pub struct MergeRequirementSignals {
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
     /// unsupported endpoint) — a degraded but non-fatal probe.
     pub branch_rules: Option<BranchRules>,
+    /// Whether the PR is currently queued in the host's merge queue (GitHub
+    /// GraphQL `isInMergeQueue`). `None` when the host does not report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_in_merge_queue: Option<bool>,
+    /// The PR's latest merge-queue removal event. `None` when the host does
+    /// not report it (no merge-queue support) or the PR was never ejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_removal: Option<MergeQueueRemoval>,
 }

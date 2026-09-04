@@ -59,79 +59,112 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
 /// opaque per-provider snapshot cache (restored into the two keys above on a
 /// provider switch), not an additional precedence tier.
 ///
-/// The result is provider-guarded and returned BARE — the settings value is
-/// user-authored and easily outlives a provider switch, so the CLI must never
-/// be fed a foreign model id. A compound `{provider}:{model}` id is dropped
-/// with a warn log unless its prefix names the effective provider, and the
-/// prefix is stripped from an owned one because the one-shot launch takes a
-/// raw model id. A value whose prefix is not a registered provider id
-/// (including a malformed `:model`) counts as foreign and is dropped too —
-/// `derived_default_provider`'s `contains(':')` convention already reserves the
-/// colon for compound ids. A bare id reuses `agent.create`'s asymmetric
-/// cached-catalog evidence rule ([`ensure_bare_model_matches_provider`]): it is
-/// dropped only when the effective provider's own cached catalog affirmatively
-/// disproves ownership, so a cold start still passes it through.
+/// The result is a `(provider, bare model)` pair — quick-action settings
+/// resolve the same way as the default-model triple. A bare value pairs with
+/// the effective provider; a legacy compound `{provider}:{model}` value
+/// (pre-wire-rejection, user-authored TOML is never rejected) splits on read:
+/// the prefix names the provider to run on when it is registered AND can
+/// serve one-shots (auggie or [`ACP_ONE_SHOT_PROVIDERS`]) — a registered but
+/// one-shot-incapable prefix (e.g. `grok:m`) drops the rung so stale
+/// settings degrade gracefully to the next rung instead of routing to a
+/// hard `{ available: false }` — the remainder is the bare model. Either
+/// shape is provider-guarded — the CLI must never be fed a foreign model id
+/// — via `agent.create`'s asymmetric cached-catalog evidence rule
+/// ([`ensure_bare_model_matches_provider`]): the model is dropped only when
+/// the paired provider's own cached catalog affirmatively disproves
+/// ownership, so a cold start still passes it through. An unregistered
+/// compound prefix, a blank half, or a remainder that still carries a `:`
+/// (never a bare id) drops the rung with a warn log.
 ///
-/// Every drop falls to the next rung rather than erroring: a `-32602` here
-/// would reject a model the caller never sent.
+/// `effective_provider` is `None` when the settings resolve no default
+/// provider. A compound rung names its own provider and still resolves; a
+/// bare rung has no provider to pair with and drops. `None` is returned only
+/// when the chain produces no pair AND there is no effective provider to
+/// fall back to — the caller's closed gate.
+///
+/// Every drop is PER RUNG and falls to the next one rather than erroring or
+/// skipping the chain: a dropped type override still tries
+/// `quickActions.defaultModel`, and only when every rung drops does the
+/// effective provider's CLI default apply — a `-32602` here would reject a
+/// model the caller never sent.
 ///
 /// This chain is scoped to one-shot quick actions only — agent sessions,
 /// delegated ones included, keep the background-agnostic creation-time chain
 /// (monorepo#1729).
 fn resolve_quick_action_model(
     settings: &intent_core::settings_file::SettingsFile,
-    catalog: &crate::model_catalog::ModelCatalogCache,
+    catalog: &crate::model_catalog::ModelCatalogReader<'_>,
     quick_action_type: Option<&str>,
-    effective_provider: &str,
-) -> Option<String> {
+    effective_provider: Option<&str>,
+) -> Option<(String, Option<String>)> {
     let quick = &settings.quick_actions;
-    let configured = quick_action_type
+    let vet = |configured: &str| -> Option<(String, String)> {
+        // Split a legacy compound value into its (provider, model) pair; a
+        // bare value pairs with the effective provider (when there is one).
+        let pair = match configured.split_once(':') {
+            Some((prefix, bare)) => {
+                let bare = bare.trim();
+                intent_providers::find_provider(prefix.trim())
+                    .map(|p| p.id.to_string())
+                    // A remainder still carrying `:` is not a bare id; the
+                    // rung drops rather than feeding a compound to the CLI.
+                    .filter(|_| !bare.is_empty() && !bare.contains(':'))
+                    // A routed provider that cannot serve one-shots drops
+                    // the rung (falls through) rather than routing to a
+                    // hard `{ available: false }` — stale settings keep
+                    // degrading gracefully, as pre-split colon rungs did.
+                    .filter(|p| p == "auggie" || ACP_ONE_SHOT_PROVIDERS.contains(&p.as_str()))
+                    .map(|p| (p, bare.to_string()))
+            }
+            None => effective_provider.map(|p| (p.to_string(), configured.to_string())),
+        };
+        let owned = pair.filter(|(provider, bare)| {
+            crate::agent_ops::ensure_bare_model_matches_provider(
+                "agent.completeOnce",
+                catalog,
+                provider,
+                bare,
+            )
+            .is_ok()
+        });
+        if owned.is_none() {
+            tracing::warn!(
+                model = configured,
+                provider = effective_provider,
+                "configured quick-action model does not resolve to a (provider, \
+                 model) pair; falling back to the next rung"
+            );
+        }
+        owned
+    };
+    quick_action_type
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .and_then(|t| quick.type_overrides.get(t))
         .map(String::as_str)
         .map(str::trim)
         .filter(|m| !m.is_empty())
+        .and_then(vet)
         .or_else(|| {
             quick
                 .default_model
                 .as_deref()
                 .map(str::trim)
                 .filter(|m| !m.is_empty())
-        })?;
-
-    let owned_bare = if configured.contains(':') {
-        let (prefix, bare) = intent_providers::parse_compound_model_id(configured);
-        (intent_providers::find_provider(&prefix).map(|p| p.id) == Some(effective_provider)
-            && !bare.is_empty())
-        .then_some(bare)
-    } else {
-        crate::agent_ops::ensure_bare_model_matches_provider(
-            "agent.completeOnce",
-            catalog,
-            effective_provider,
-            configured,
-        )
-        .ok()
-        .map(|()| configured.to_string())
-    };
-
-    if owned_bare.is_none() {
-        tracing::warn!(
-            model = configured,
-            provider = effective_provider,
-            "configured quick-action model does not belong to the effective \
-             provider; falling back to the CLI default"
-        );
-    }
-    owned_bare
+                .and_then(vet)
+        })
+        .map(|(provider, model)| (provider, Some(model)))
+        .or_else(|| effective_provider.map(|p| (p.to_string(), None)))
 }
 
-/// Pick the one-shot launch for `provider`, mirroring the model probe's
-/// precedent (`provider_models`): an `npx_only_package` provider always runs
-/// the pinned package via `npx -y`, otherwise the `resolved_bin` wins with the
-/// pinned `fallback_npx_package` as the fallback. `None` when nothing resolves
-/// — the caller turns that into `{ available: false, reason }`.
+/// Pick the one-shot launch for `provider`, mirroring `resolve_spawn`: a
+/// `resolved_bin` wins — for an `npx_only_package` provider that is ONLY the
+/// validated `providers.paths` adapter override
+/// ([`intent_providers::resolve_npx_only_override`], monorepo#4352), with the
+/// pinned package via `npx -y` otherwise; for other providers it is the
+/// discovered binary, with the pinned `fallback_npx_package` as the fallback.
+/// `None` when nothing resolves — the caller turns that into
+/// `{ available: false, reason }`.
 ///
 /// `resolved_bin` / `npx` are the caller's discovery results (parameterized so
 /// the precedence is unit-testable without an install). The provider's own
@@ -140,7 +173,7 @@ fn resolve_quick_action_model(
 /// gates the flag itself — for providers with no CLI model flag the caller
 /// applies `model` best-effort after `session/new` instead (see
 /// [`config_option_model`]).
-fn one_shot_launch(
+pub(crate) fn one_shot_launch(
     provider: &intent_providers::ProviderConfig,
     resolved_bin: Option<PathBuf>,
     npx: Option<PathBuf>,
@@ -151,11 +184,11 @@ fn one_shot_launch(
         ..Default::default()
     };
     let args = intent_providers::build_provider_args(provider, &inputs);
-    if let Some(pkg) = provider.npx_only_package {
-        return npx.map(|npx| OneShotCommand::npx(npx, pkg).args(args));
-    }
     if let Some(bin) = resolved_bin {
         return Some(OneShotCommand::binary(bin, args));
+    }
+    if let Some(pkg) = provider.npx_only_package {
+        return npx.map(|npx| OneShotCommand::npx(npx, pkg).args(args));
     }
     let pkg = provider.fallback_npx_package?;
     // The daemon-managed npx fallback: keep a stray env override from
@@ -166,6 +199,28 @@ fn one_shot_launch(
             .env_remove("CODEX_PATH")
             .env_remove("CODEX_CONFIG")
     })
+}
+
+/// Resolve the adapter binary a one-shot launch (`agent.completeOnce`, the
+/// live test prompt) runs for `provider`, matching `resolve_spawn`'s
+/// precedence: an npx-only provider honors ONLY a valid `providers.paths`
+/// adapter override, and only when it opts in (never auto-discovery —
+/// monorepo#4352; pi resolves nothing), any other provider walks
+/// `find_provider_binary`'s tiers. `explicit_path` is the raw
+/// `providers.paths[primary_binary_provider_id]` value (blank = unset).
+pub(crate) fn resolve_one_shot_binary(
+    provider: &intent_providers::ProviderConfig,
+    explicit_path: Option<&str>,
+) -> Option<PathBuf> {
+    if provider.npx_only_package.is_some() {
+        intent_providers::resolve_npx_only_override(provider, explicit_path)
+    } else {
+        intent_providers::find_provider_binary(
+            provider.primary_binary_provider_id(),
+            provider.command,
+            explicit_path,
+        )
+    }
 }
 
 /// The model to apply post-`session/new` via `session/set_config_option`:
@@ -180,7 +235,7 @@ fn one_shot_launch(
 /// `AgentManager::config_option_model_target`: the adapter's
 /// `configOptions[id="model"]` select values are bare base ids, so a
 /// suffixed value would never match.
-fn config_option_model<'m>(
+pub(crate) fn config_option_model<'m>(
     provider: &intent_providers::ProviderConfig,
     model: Option<&'m str>,
 ) -> Option<&'m str> {
@@ -202,8 +257,8 @@ impl Services {
     /// under `text`. The router pre-validates `prompt` is non-empty and
     /// `timeout_ms` is positive.
     ///
-    /// Routed on the settings-derived effective provider (provider of
-    /// `model.default`, else `providers.active`): auggie keeps the existing
+    /// Routed on the settings-derived effective provider
+    /// (`model.defaultProvider`): auggie keeps the existing
     /// CLI path, claude-code / codex / pi run an ephemeral ACP session, and
     /// anything else returns `{ available: false, reason }`. Unset/undecidable
     /// settings resolve the gate CLOSED: falling through to the first
@@ -215,7 +270,9 @@ impl Services {
     /// settings itself ([`resolve_quick_action_model`], monorepo#1734) so any
     /// client — not just the FE — gets `quickActions.typeOverrides[type]` /
     /// `quickActions.defaultModel` for free; `quick_action_type` is the
-    /// caller's optional `type` hint keying the override map.
+    /// caller's optional `type` hint keying the override map. The chain
+    /// resolves to a `(provider, model)` pair, so a legacy compound value
+    /// naming another registered provider routes the one-shot there.
     pub(crate) async fn agent_complete_once_op(
         &self,
         prompt: String,
@@ -227,25 +284,35 @@ impl Services {
     ) -> Result<Value> {
         let settings = self.effective_settings();
         let effective_provider = crate::agent_session::derived_default_provider(&settings);
-        let effective_provider = match effective_provider.as_deref() {
-            Some(p) => p.to_string(),
-            None => {
-                return Ok(unavailable(
-                    "completeOnce requires a decidable effective default provider",
-                ))
-            }
-        };
 
-        // An explicit client model always wins; only a caller that sent none
-        // falls through to the quick-action settings chain.
-        let model = match model.filter(|m| !m.trim().is_empty()) {
-            Some(m) => Some(m),
-            None => resolve_quick_action_model(
+        // An explicit client model always wins, but it is bare and so needs
+        // the effective provider to run on. A caller that sent none falls
+        // through to the quick-action settings chain, whose result is a
+        // (provider, model) pair — a compound rung names its own provider, so
+        // the chain can still resolve when the default provider is unset;
+        // the gate closes only when neither yields a provider.
+        let (run_provider, model) = match model.filter(|m| !m.trim().is_empty()) {
+            Some(m) => match effective_provider {
+                Some(p) => (p, Some(m)),
+                None => {
+                    return Ok(unavailable(
+                        "completeOnce requires a decidable effective default provider",
+                    ))
+                }
+            },
+            None => match resolve_quick_action_model(
                 &settings,
-                &self.models_catalog,
+                &self.cached_models(),
                 quick_action_type.as_deref(),
-                &effective_provider,
-            ),
+                effective_provider.as_deref(),
+            ) {
+                Some(pair) => pair,
+                None => {
+                    return Ok(unavailable(
+                        "completeOnce requires a decidable effective default provider",
+                    ))
+                }
+            },
         };
 
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
@@ -268,15 +335,9 @@ impl Services {
         };
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
-        if effective_provider != "auggie" {
+        if run_provider != "auggie" {
             return self
-                .complete_once_via_acp(
-                    &effective_provider,
-                    &full_prompt,
-                    model.as_deref(),
-                    cwd,
-                    timeout,
-                )
+                .complete_once_via_acp(&run_provider, &full_prompt, model.as_deref(), cwd, timeout)
                 .await;
         }
 
@@ -318,6 +379,7 @@ impl Services {
             cwd.as_deref(),
             &full_prompt,
             timeout,
+            "One-shot completion",
         )
         .await?;
         let text = clean_agent_message(&stdout);
@@ -340,7 +402,7 @@ impl Services {
     ) -> Result<Value> {
         if !ACP_ONE_SHOT_PROVIDERS.contains(&provider_id) {
             return Ok(unavailable(format!(
-                "completeOnce is not supported for the effective default provider: {provider_id}"
+                "completeOnce is not supported for the resolved provider: {provider_id}"
             )));
         }
         let Some(provider) = intent_providers::find_provider(provider_id) else {
@@ -356,15 +418,7 @@ impl Services {
             .get(provider.primary_binary_provider_id())
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty());
-        let resolved_bin = (provider.npx_only_package.is_none())
-            .then(|| {
-                intent_providers::find_provider_binary(
-                    provider.primary_binary_provider_id(),
-                    provider.command,
-                    explicit_path.as_deref(),
-                )
-            })
-            .flatten();
+        let resolved_bin = resolve_one_shot_binary(provider, explicit_path.as_deref());
         // npx discovery honors the test seam (`one_shot_npx`): `Some(inner)`
         // pins the result so the unresolvable branch below is reachable
         // hermetically on hosts where npx is installed.
@@ -442,7 +496,7 @@ mod tests {
         }
     }
 
-    /// Services with a fake CLI and `providers.active = "auggie"` so the
+    /// Services with a fake CLI and `model.defaultProvider = "auggie"` so the
     /// provider gate is open: unset settings resolve the gate CLOSED
     /// (see `complete_once_unavailable_when_settings_unset`), so op-level
     /// tests must opt in to an auggie-active registry to reach the CLI.
@@ -454,8 +508,11 @@ mod tests {
                 .expect("load registry"),
         );
         registry
-            .apply(&[("providers.active".to_string(), serde_json::json!("auggie"))])
-            .expect("set providers.active");
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("auggie"),
+            )])
+            .expect("set model.defaultProvider");
         let services = Services::new(store)
             .with_auggie_bin(bin)
             .with_settings_registry(registry);
@@ -492,7 +549,7 @@ mod tests {
         // functionally reinstate the removed hardcoded default (coordinator
         // ruling; matches FE #759 where unset resolves disabled). No registry
         // wired → schema defaults → both `model.default` and
-        // `providers.active` unset.
+        // `model.defaultProvider` unset.
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let services =
@@ -584,7 +641,7 @@ rl.on('line', (line) => {{
         // against the mock adapter with no provider install.
         let (_dir, bin) = fake_acp_adapter("ok", "🤖\nslug-from-acp");
         let (_tmp, services) = services_with_settings(&[
-            ("providers.active", serde_json::json!("codex")),
+            ("model.defaultProvider", serde_json::json!("codex")),
             (
                 "providers.paths",
                 serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -606,7 +663,8 @@ rl.on('line', (line) => {{
         // opencode has no one-shot route: a typed unavailable result, never an
         // internal error.
         let (_tmp, services) =
-            services_with_settings(&[("providers.active", serde_json::json!("opencode"))]).await;
+            services_with_settings(&[("model.defaultProvider", serde_json::json!("opencode"))])
+                .await;
         let v = services
             .agent_complete_once_op("hi".into(), None, None, None, None, None)
             .await
@@ -615,7 +673,7 @@ rl.on('line', (line) => {{
             v,
             serde_json::json!({
                 "available": false,
-                "reason": "completeOnce is not supported for the effective default provider: opencode"
+                "reason": "completeOnce is not supported for the resolved provider: opencode"
             })
         );
     }
@@ -630,7 +688,8 @@ rl.on('line', (line) => {{
         // `wss_agent_complete_once_unavailable_when_adapter_unresolvable`
         // e2e, which self-skips wherever npx is installed.
         let (_tmp, services) =
-            services_with_settings(&[("providers.active", serde_json::json!("claude-code"))]).await;
+            services_with_settings(&[("model.defaultProvider", serde_json::json!("claude-code"))])
+                .await;
         let services = services.with_one_shot_npx(None);
         let v = services
             .agent_complete_once_op("hi".into(), None, None, None, None, None)
@@ -690,7 +749,7 @@ rl.on('line', (line) => {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let (_tmp, services) = services_with_settings(&[
-            ("providers.active", serde_json::json!("codex")),
+            ("model.defaultProvider", serde_json::json!("codex")),
             (
                 "providers.paths",
                 serde_json::json!({ "codex": bin.to_string_lossy() }),
@@ -749,11 +808,18 @@ rl.on('line', (line) => {
         let npx = PathBuf::from("/usr/bin/npx");
         let bin = PathBuf::from("/opt/bin/codex-acp");
 
-        // npx-only (claude-code, pi): the pinned package always wins, and no
-        // npx means no launch at all.
+        // npx-only (claude-code, pi): a resolved binary (the validated
+        // adapter override — monorepo#4352) wins even without npx; otherwise
+        // the pinned package runs via npx, and no npx means no launch at all.
         let claude = intent_providers::find_provider("claude-code").unwrap();
-        assert!(one_shot_launch(claude, Some(bin.clone()), Some(npx.clone()), None).is_some());
-        assert!(one_shot_launch(claude, Some(bin.clone()), None, None).is_none());
+        let adapter = PathBuf::from("/opt/lib/claude-agent-acp/dist/index.js");
+        let launch = one_shot_launch(claude, Some(adapter.clone()), Some(npx.clone()), None)
+            .expect("override launches");
+        assert_eq!(launch.program(), adapter.as_path());
+        assert!(one_shot_launch(claude, Some(adapter), None, None).is_some());
+        let launch = one_shot_launch(claude, None, Some(npx.clone()), None).expect("npx launches");
+        assert_eq!(launch.program(), npx.as_path());
+        assert!(one_shot_launch(claude, None, None, None).is_none());
 
         // codex: resolved binary first, pinned npx fallback second, nothing
         // when neither resolves (the `{ available: false }` path).
@@ -761,6 +827,36 @@ rl.on('line', (line) => {
         assert!(one_shot_launch(codex, Some(bin), None, None).is_some());
         assert!(one_shot_launch(codex, None, Some(npx), None).is_some());
         assert!(one_shot_launch(codex, None, None, None).is_none());
+    }
+
+    /// monorepo#4352: an npx-only provider resolves ONLY a valid adapter
+    /// override — never a PATH/managed-bin hit — so one-shots and the live
+    /// test prompt run the same adapter `resolve_spawn` would.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_one_shot_binary_npx_only_honors_only_valid_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = dir.path().join("claude-agent-acp");
+        std::fs::write(&adapter, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_one_shot_binary(claude, Some(adapter.to_str().unwrap())),
+            Some(adapter.clone())
+        );
+        assert_eq!(resolve_one_shot_binary(claude, None), None);
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            resolve_one_shot_binary(claude, Some(missing.to_str().unwrap())),
+            None
+        );
+        let pi = intent_providers::find_provider("pi").unwrap();
+        assert_eq!(
+            resolve_one_shot_binary(pi, Some(adapter.to_str().unwrap())),
+            None,
+            "pi does not opt in: a valid override still resolves nothing"
+        );
     }
 
     #[cfg(unix)]
@@ -785,7 +881,14 @@ rl.on('line', (line) => {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("timed out after 200ms"),
+            err.to_string()
+                .contains("One-shot completion timed out after 200ms"),
+            "got {err:?}"
+        );
+        // monorepo#4032: completeOnce timeouts (auto-commit generation rides
+        // this op) must not masquerade as prompt-enhancement failures.
+        assert!(
+            !err.to_string().contains("Prompt enhancement"),
             "got {err:?}"
         );
     }
@@ -821,8 +924,8 @@ rl.on('line', (line) => {
         );
         // Keep the provider gate open (unset settings resolve it closed).
         registry
-            .apply(&[("providers.active".to_string(), json!("auggie"))])
-            .expect("set providers.active");
+            .apply(&[("model.defaultProvider".to_string(), json!("auggie"))])
+            .expect("set model.defaultProvider");
 
         // Case 1: context.auggiePath set and valid → use it exclusively
         registry
@@ -923,73 +1026,213 @@ rl.on('line', (line) => {
         crate::model_catalog::ModelCatalogCache::new(None)
     }
 
+    /// The expected pair for a rung that resolved on the effective provider.
+    /// (Wrapped in `Some` to mirror the resolver's return type — `None` is
+    /// the closed gate.)
+    #[allow(clippy::unnecessary_wraps)]
+    fn on(provider: &str, model: &str) -> Option<(String, Option<String>)> {
+        Some((provider.to_string(), Some(model.to_string())))
+    }
+
+    /// The expected pair for a chain that fell through entirely: the
+    /// effective provider with its CLI default.
+    #[allow(clippy::unnecessary_wraps)]
+    fn cli_default(provider: &str) -> Option<(String, Option<String>)> {
+        Some((provider.to_string(), None))
+    }
+
     #[test]
     fn quick_action_model_precedence() {
         // typeOverrides[type] outranks defaultModel; an absent/blank override
         // (and an unknown type key) falls through to the default; nothing
-        // configured resolves to the CLI default.
+        // configured resolves to the CLI default. Bare values pair with the
+        // effective provider.
         let catalog = empty_catalog();
         let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "haiku4.5")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
-            Some("haiku4.5".to_string())
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("commit"),
+                Some("auggie")
+            ),
+            on("auggie", "haiku4.5")
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("pr"), "auggie"),
-            Some("sonnet4.5".to_string())
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("pr"),
+                Some("auggie")
+            ),
+            on("auggie", "sonnet4.5")
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, Some("not-a-type"), "auggie"),
-            Some("sonnet4.5".to_string())
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("not-a-type"),
+                Some("auggie")
+            ),
+            on("auggie", "sonnet4.5")
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
-            Some("sonnet4.5".to_string())
+            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+            on("auggie", "sonnet4.5")
         );
 
         let blank = quick_action_settings(Some("  "), &[("commit", "")]);
         assert_eq!(
-            resolve_quick_action_model(&blank, &catalog, Some("commit"), "auggie"),
-            None,
+            resolve_quick_action_model(
+                &blank,
+                &catalog.reader(None),
+                Some("commit"),
+                Some("auggie")
+            ),
+            cli_default("auggie"),
             "blank values read as unset, not as an empty model id"
         );
         assert_eq!(
             resolve_quick_action_model(
                 &intent_core::settings_file::SettingsFile::default(),
-                &catalog,
+                &catalog.reader(None),
                 Some("commit"),
-                "auggie"
+                Some("auggie")
             ),
-            None
+            cli_default("auggie")
         );
     }
 
     #[test]
-    fn quick_action_model_is_provider_guarded_and_returned_bare() {
-        // An owned compound id loses its `{provider}:` prefix — the one-shot
-        // launch takes a raw model id — and one owned by another provider is
-        // dropped rather than fed to the resolved provider's CLI. A prefix
-        // that is not a registered provider id (including a malformed
-        // `:model`) counts as foreign: the colon is reserved for compound ids.
+    fn quick_action_compound_value_resolves_to_its_own_pair() {
+        // A legacy compound value splits on read into a (provider, model)
+        // pair: a registered prefix routes the one-shot to that provider —
+        // even a foreign one — instead of being dropped.
         let catalog = empty_catalog();
-        let owned = quick_action_settings(Some("auggie:sonnet4.5"), &[]);
+        let settings = quick_action_settings(Some("auggie:sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&owned, &catalog, None, "auggie"),
-            Some("sonnet4.5".to_string())
+            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+            on("auggie", "sonnet4.5")
         );
-        let foreign = quick_action_settings(Some("codex:gpt-5"), &[]);
+        let settings = quick_action_settings(Some("codex:gpt-5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&foreign, &catalog, None, "auggie"),
-            None
+            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+            on("codex", "gpt-5"),
+            "a foreign registered prefix routes the one-shot to that provider"
         );
-        for malformed in [":sonnet4.5", "not-a-provider:sonnet4.5", "auggie:"] {
-            let settings = quick_action_settings(Some(malformed), &[]);
-            assert_eq!(
-                resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+    }
+
+    #[test]
+    fn quick_action_compound_rung_resolves_without_an_effective_provider() {
+        // A compound rung names its own provider, so the chain still yields a
+        // pair when the default provider is undecidable; a bare rung has
+        // nothing to pair with and the chain resolves to None (closed gate).
+        let catalog = empty_catalog();
+        let compound = quick_action_settings(Some("codex:gpt-5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&compound, &catalog.reader(None), None, None),
+            on("codex", "gpt-5"),
+            "a decidable compound rung must open the gate on its own"
+        );
+        let bare = quick_action_settings(Some("sonnet4.5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&bare, &catalog.reader(None), None, None),
+            None,
+            "a bare rung with no effective provider must close the gate"
+        );
+        assert_eq!(
+            resolve_quick_action_model(
+                &intent_core::settings_file::SettingsFile::default(),
+                &catalog.reader(None),
                 None,
-                "{malformed} must fall through to the CLI default"
+                None
+            ),
+            None,
+            "nothing configured and no effective provider must close the gate"
+        );
+    }
+
+    #[test]
+    fn quick_action_malformed_compound_values_drop_the_rung() {
+        // An unregistered prefix, a blank half, or a remainder still carrying
+        // a colon cannot form a (provider, bare model) pair; the rung drops
+        // with a warn log and the chain falls through.
+        let catalog = empty_catalog();
+        for legacy in [
+            ":sonnet4.5",
+            "not-a-provider:sonnet4.5",
+            "auggie:",
+            "codex:org:model",
+        ] {
+            let settings = quick_action_settings(Some(legacy), &[]);
+            assert_eq!(
+                resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+                cli_default("auggie"),
+                "{legacy} must fall through to the CLI default"
             );
         }
+    }
+
+    #[test]
+    fn quick_action_compound_rung_with_non_one_shot_provider_drops() {
+        // A registered prefix whose provider cannot serve one-shots (not
+        // auggie / ACP_ONE_SHOT_PROVIDERS) drops the rung and falls through
+        // — the pre-split behavior for colon rungs — instead of routing to a
+        // hard `{ available: false }`.
+        let catalog = empty_catalog();
+        for legacy in ["grok:m", "droid:m", "opencode:m"] {
+            let settings = quick_action_settings(Some(legacy), &[]);
+            assert_eq!(
+                resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+                cli_default("auggie"),
+                "{legacy} must fall through to the CLI default"
+            );
+            assert_eq!(
+                resolve_quick_action_model(&settings, &catalog.reader(None), None, None),
+                None,
+                "{legacy} with no effective provider must close the gate"
+            );
+        }
+        // The dropped override still falls to a capable default rung.
+        let settings = quick_action_settings(Some("codex:gpt-5"), &[("commit", "grok:m")]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog.reader(None), Some("commit"), None),
+            on("codex", "gpt-5"),
+            "a dropped non-one-shot override must fall to the default-model rung"
+        );
+    }
+
+    #[test]
+    fn quick_action_dropped_override_falls_to_default_model() {
+        // A drop is per rung: a malformed type override still falls through
+        // to a valid quickActions.defaultModel — the documented override →
+        // default → CLI-default chain — rather than skipping straight to the
+        // CLI default.
+        let catalog = empty_catalog();
+        let settings =
+            quick_action_settings(Some("sonnet4.5"), &[("commit", "not-a-provider:haiku")]);
+        assert_eq!(
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("commit"),
+                Some("auggie")
+            ),
+            on("auggie", "sonnet4.5"),
+            "a dropped override must fall to the default-model rung"
+        );
+        // Both rungs malformed ⇒ CLI default.
+        let settings =
+            quick_action_settings(Some("bogus:gpt-5"), &[("commit", "not-a-provider:haiku")]);
+        assert_eq!(
+            resolve_quick_action_model(
+                &settings,
+                &catalog.reader(None),
+                Some("commit"),
+                Some("auggie")
+            ),
+            cli_default("auggie")
+        );
     }
 
     #[test]
@@ -1000,8 +1243,13 @@ rl.on('line', (line) => {
         // while another provider claims it.
         let settings = quick_action_settings(Some("grok-4"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&settings, &empty_catalog(), None, "auggie"),
-            Some("grok-4".to_string()),
+            resolve_quick_action_model(
+                &settings,
+                &empty_catalog().reader(None),
+                None,
+                Some("auggie")
+            ),
+            on("auggie", "grok-4"),
             "no cached evidence must not drop a bare id"
         );
 
@@ -1018,14 +1266,33 @@ rl.on('line', (line) => {
             vec![serde_json::json!({ "id": "grok-4", "provider": "grok" })],
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
-            None,
+            resolve_quick_action_model(&settings, &catalog.reader(None), None, Some("auggie")),
+            cli_default("auggie"),
             "a bare id the effective provider's catalog disproves is dropped"
         );
         let owned = quick_action_settings(Some("sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&owned, &catalog, None, "auggie"),
-            Some("sonnet4.5".to_string())
+            resolve_quick_action_model(&owned, &catalog.reader(None), None, Some("auggie")),
+            on("auggie", "sonnet4.5")
+        );
+        // The ownership guard applies to a compound rung's own pair too: a
+        // split pair whose provider's catalog disproves the model drops.
+        // (codex is one-shot capable, so the rung reaches the guard; the
+        // entry is stored under codex's CURRENT version key so it counts as
+        // live evidence on any host.)
+        let codex_version = (crate::model_catalog::source_for("codex")
+            .expect("codex source")
+            .version_key)();
+        catalog.store_for_test(
+            "codex",
+            &codex_version,
+            vec![serde_json::json!({ "id": "gpt-5", "provider": "codex" })],
+        );
+        let foreign = quick_action_settings(Some("codex:sonnet4.5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&foreign, &catalog.reader(None), None, Some("auggie")),
+            cli_default("auggie"),
+            "a split pair failing its own provider's ownership guard drops"
         );
     }
 
@@ -1048,7 +1315,10 @@ rl.on('line', (line) => {
             .expect("load registry");
         registry
             .apply(&[
-                ("providers.active".to_string(), serde_json::json!("auggie")),
+                (
+                    "model.defaultProvider".to_string(),
+                    serde_json::json!("auggie"),
+                ),
                 (
                     "quickActions.defaultModel".to_string(),
                     serde_json::json!("sonnet4.5"),
@@ -1109,7 +1379,10 @@ rl.on('line', (line) => {
             .expect("load registry");
         registry
             .apply(&[
-                ("providers.active".to_string(), serde_json::json!("auggie")),
+                (
+                    "model.defaultProvider".to_string(),
+                    serde_json::json!("auggie"),
+                ),
                 (
                     "quickActions.providerSettings".to_string(),
                     serde_json::json!({ "auggie": { "defaultModel": "from-provider-settings" } }),

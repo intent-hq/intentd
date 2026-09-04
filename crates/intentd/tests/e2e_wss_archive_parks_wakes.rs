@@ -307,6 +307,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -332,7 +333,7 @@ async fn create_agent(rpc: &mut TlsWs, budget: Budget, id: i64, ws_id: &str, nam
         budget,
         id,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": name, "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock" }),
     )
     .await;
     created["agent"]["id"]

@@ -1,6 +1,6 @@
 [package]
 name = "intent-core"
-version = "0.7.46"
+version = "0.9.19"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -19,6 +19,16 @@ toml.workspace = true
 tracing.workspace = true
 serde_path_to_error = "0.1.20"
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 ctor = "1.0.10"

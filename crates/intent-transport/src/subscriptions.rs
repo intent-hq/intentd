@@ -12,18 +12,22 @@
 
 use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
-    AGENT_RENAMED, AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, AGENT_STREAM_END,
-    AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
-    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
-    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
+    AGENT_RENAMED, AGENT_RESTORED, AGENT_RETIRED, AGENT_STARTED, AGENT_STATUS_CHANGED,
+    AGENT_STREAM_END, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED,
+    NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
+    TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
+    WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
-    extract_spec_task_ids, now_iso, AgentId, ConversationProjection, Event, Note, NoteId,
-    WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
+    extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, ConversationProjection, Event,
+    Note, NoteId, NoteListProjection, WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::events::IdInfo;
 
@@ -60,10 +64,15 @@ pub(crate) enum SubFastPath {
 /// Parsed params for a workspace-scoped collection channel (`note`/`task`/
 /// `agent`, §6.1). `workspaceId` is required; `replaceGroup` is optional;
 /// `sinceSeq` is reserved for post-v1.0 replay (§6.4) and ignored here.
+/// `projection` is a note-channel-only param ([`parse_note_subscribe_params`],
+/// v8.2 — mirroring `note.list`'s, monorepo#3586): the shared
+/// [`parse_subscribe_params`] leaves it `None`, so the `task`/`agent`
+/// channels keep ignoring the key like any other unknown param.
 #[derive(Debug)]
 pub(crate) struct NoteSubscribeParams {
     pub workspace_id: String,
     pub replace_group: Option<String>,
+    pub projection: Option<NoteListProjection>,
 }
 
 /// Parsed `workspace.subscribe` params (§6.1). The workspace channel is global
@@ -194,8 +203,9 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
     }
 }
 
-/// Validate `note.subscribe` params. A missing/empty `workspaceId` is a
-/// `-32602` error (the note channel is workspace-scoped, §6.2).
+/// Validate the shared workspace-scoped collection-channel params
+/// (`task`/`agent`, and the base of `note`). A missing/empty `workspaceId`
+/// is a `-32602` error (these channels are workspace-scoped, §6.2).
 pub(crate) fn parse_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<NoteSubscribeParams, String> {
@@ -206,7 +216,27 @@ pub(crate) fn parse_subscribe_params(
     Ok(NoteSubscribeParams {
         workspace_id,
         replace_group: replace_group(params),
+        projection: None,
     })
+}
+
+/// Validate `note.subscribe` params: the shared collection-channel params
+/// plus the optional `projection` (v8.2, monorepo#3586), mirroring
+/// `note.list`'s semantics (§5.2): absent / `null` / `"full"` keep the full
+/// rows (`None` — byte-identical to before, so existing clients are
+/// unaffected), `"slim"` serves the bounded listing rows on the seq-0
+/// snapshot and every `added`/`updated` delta, anything else is `-32602`.
+pub(crate) fn parse_note_subscribe_params(
+    params: &Map<String, Value>,
+) -> Result<NoteSubscribeParams, String> {
+    let mut parsed = parse_subscribe_params(params)?;
+    parsed.projection = match params.get("projection") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "full" => None,
+        Some(Value::String(s)) if s == "slim" => Some(NoteListProjection::Slim),
+        Some(_) => return Err("projection must be \"slim\" or \"full\"".to_string()),
+    };
+    Ok(parsed)
 }
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
@@ -267,12 +297,13 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(Value::String(s)) if s == "incremental" => DeltaEncoding::Incremental,
         Some(_) => return Err("deltaEncoding must be \"full\" or \"incremental\"".to_string()),
     };
-    // `projection` is optional: absent / `null` serve full fidelity, `"slim"`
-    // bounds tool/image block bodies (§5.5); any other value is `-32602` (a
-    // silently ignored typo would hand the client the full-size frames it
-    // opted out of).
+    // `projection` is optional: absent / `null` and the explicit `"slim"`
+    // all select the slim projection — slim is the wire default since v8.0,
+    // so no subscription class can receive unbudgeted tool/image bodies
+    // (§5.5); any other value is `-32602` (a silently ignored typo could
+    // otherwise select a projection the client did not intend).
     let projection = match params.get("projection") {
-        None | Some(Value::Null) => None,
+        None | Some(Value::Null) => Some(ConversationProjection::Slim),
         Some(Value::String(s)) if s == "slim" => Some(ConversationProjection::Slim),
         Some(_) => return Err("projection must be \"slim\"".to_string()),
     };
@@ -341,11 +372,15 @@ pub(crate) fn build_delta_push(subscription_id: &str, seq: u64, delta: &Value) -
 /// Map one `note:*` bus change event to a note-channel delta by re-reading the
 /// latest entity (TB-0 §2.2 option B). `note:created` → `added`, `note:updated`
 /// → `updated`, `note:deleted` → `removedIds`. Returns `None` for events that do
-/// not translate (no `noteId`, unrelated type, or a re-read miss).
+/// not translate (no `noteId`, unrelated type, or a re-read miss). The
+/// subscription's `projection` (v8.2, monorepo#3586) shapes the re-read rows:
+/// slim serves the same bounded [`note_list_slim_row`] as the seq-0 snapshot,
+/// so no note-channel frame class escapes the bound.
 pub(crate) async fn note_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
     event: &Event,
+    projection: Option<NoteListProjection>,
 ) -> Option<Value> {
     let note_id = event.data.get("noteId").and_then(Value::as_str)?;
     match event.event_type.as_str() {
@@ -354,17 +389,28 @@ pub(crate) async fn note_delta(
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "added": [serde_json::to_value(note).ok()?] }))
+            Some(json!({ "added": [note_row(note, projection)?] }))
         }
         NOTE_UPDATED => {
             let note = api
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "updated": [serde_json::to_value(note).ok()?] }))
+            Some(json!({ "updated": [note_row(note, projection)?] }))
         }
         NOTE_DELETED => Some(json!({ "removedIds": [note_id] })),
         _ => None,
+    }
+}
+
+/// Serialize one note-channel row under the subscription's projection: full
+/// (`None`) keeps the complete wire `Note` byte-identical to before;
+/// [`NoteListProjection::Slim`] serves the bounded `note.list` slim row
+/// (`content` → `contentPreview` + `contentLength`, §5.2).
+fn note_row(note: Note, projection: Option<NoteListProjection>) -> Option<Value> {
+    match projection {
+        Some(NoteListProjection::Slim) => Some(note_list_slim_row(note)),
+        None => serde_json::to_value(note).ok(),
     }
 }
 
@@ -372,6 +418,141 @@ pub(crate) async fn note_delta(
 /// `workspace` is per-user/global; every other v1.0 channel is workspace-scoped.
 pub(crate) fn channel_is_global(channel: Channel) -> bool {
     matches!(channel, Channel::Workspace)
+}
+
+/// The wire name of a channel, for log fields.
+pub(crate) fn channel_name(channel: Channel) -> &'static str {
+    match channel {
+        Channel::Note => "note",
+        Channel::Task => "task",
+        Channel::Agent => "agent",
+        Channel::Workspace => "workspace",
+        Channel::Comment => "comment",
+        Channel::Chat => "chat",
+    }
+}
+
+/// Default duration threshold in milliseconds for a subscribe fast-path
+/// snapshot: a subscription whose seq-0 snapshot takes longer than this from
+/// request receipt to being queued on the outbound lane draws a WARN.
+///
+/// The fast-path is intercepted in [`crate::conn::process_frame`] BEFORE the
+/// JSON-RPC dispatcher, so it never enters the `rpc_dispatch` span the
+/// `RpcProfileLayer` duration guardrail watches — this threshold is its
+/// equivalent for snapshot emission (intent-hq/intent#3707).
+pub const DEFAULT_SNAPSHOT_DURATION_WARN_MS: u64 = 200;
+/// Env override for the subscribe fast-path snapshot duration threshold in
+/// milliseconds (u64). Read once on first use; unparseable values fall back
+/// to [`DEFAULT_SNAPSHOT_DURATION_WARN_MS`] (same convention as the
+/// `rpc_profile` thresholds).
+pub const SNAPSHOT_DURATION_WARN_ENV: &str = "INTENTD_SUBSCRIBE_SNAPSHOT_WARN_MS";
+
+/// Target the snapshot-timing WARN events are emitted under.
+const SNAPSHOT_WARN_TARGET: &str = "intent_transport::subscribe_profile";
+
+/// Parse an override value into the snapshot duration threshold, falling back
+/// to the default when absent or unparseable.
+fn snapshot_warn_threshold_from(raw: Option<String>) -> Duration {
+    Duration::from_millis(
+        raw.and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_SNAPSHOT_DURATION_WARN_MS),
+    )
+}
+
+/// The process-wide snapshot duration threshold, honoring the
+/// [`SNAPSHOT_DURATION_WARN_ENV`] override (read once).
+fn snapshot_warn_threshold() -> Duration {
+    static THRESHOLD: OnceLock<Duration> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        snapshot_warn_threshold_from(std::env::var(SNAPSHOT_DURATION_WARN_ENV).ok())
+    })
+}
+
+/// Process-wide count of subscribe fast-path snapshots currently in flight
+/// (request received, seq-0 snapshot not yet queued). Lets a slow-snapshot
+/// WARN distinguish concurrent-load slowness from a request that is slow in
+/// isolation.
+static SNAPSHOT_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Emit the slow-snapshot WARN when `elapsed` exceeds `threshold`. Returns
+/// whether the WARN fired (unit-testable without a subscriber).
+fn maybe_warn_slow_snapshot(
+    channel: &'static str,
+    scope: &str,
+    elapsed: Duration,
+    threshold: Duration,
+    in_flight: u64,
+) -> bool {
+    if elapsed <= threshold {
+        return false;
+    }
+    // `elapsed_ms` is fractional: `as_millis()` truncation would render a
+    // marginal breach (e.g. 200.5ms over a 200ms budget) as equal to the
+    // threshold, hiding it from threshold-based log queries.
+    tracing::warn!(
+        target: SNAPSHOT_WARN_TARGET,
+        channel,
+        scope,
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        threshold_ms =
+            u64::try_from(threshold.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
+        in_flight,
+        "subscribe fast-path snapshot exceeded duration budget"
+    );
+    true
+}
+
+/// Times one subscribe fast-path request from receipt to its seq-0 snapshot
+/// frame being queued on the outbound lane, warning above the threshold
+/// (intent-hq/intent#3707). Started by the connection task when the request
+/// is handled and carried into the spawned forwarder, so the measured
+/// interval covers bus wiring, response enqueue, task spawn scheduling, AND
+/// snapshot materialization. `scope` is the workspace id (or the agent id
+/// for the chat channel; `"global"` for the global workspace channel).
+///
+/// Hot-path cost is one `Instant::now()` plus two relaxed atomic ops on the
+/// process-wide in-flight counter; dropping without [`Self::snapshot_emitted`]
+/// (send failure / connection gone) just releases the counter.
+pub(crate) struct SnapshotTimer {
+    channel: &'static str,
+    scope: String,
+    started: Instant,
+    finished: bool,
+}
+
+impl SnapshotTimer {
+    pub(crate) fn start(channel: Channel, scope: &str) -> Self {
+        SNAPSHOT_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            channel: channel_name(channel),
+            scope: scope.to_string(),
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    /// Record that the seq-0 snapshot frame was queued for this subscription,
+    /// warning when the interval since [`Self::start`] exceeded the
+    /// threshold. `in_flight` in the log includes this request itself.
+    pub(crate) fn snapshot_emitted(mut self) {
+        self.finished = true;
+        let in_flight = SNAPSHOT_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        maybe_warn_slow_snapshot(
+            self.channel,
+            &self.scope,
+            self.started.elapsed(),
+            snapshot_warn_threshold(),
+            in_flight,
+        );
+    }
+}
+
+impl Drop for SnapshotTimer {
+    fn drop(&mut self) {
+        if !self.finished {
+            SNAPSHOT_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The bus event types a channel tails for deltas (TB-0 §3). The `agent:stream:*`
@@ -394,6 +575,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_STATUS_CHANGED,
             AGENT_RENAMED,
             AGENT_UPDATED,
+            AGENT_RETIRED,
             AGENT_RESTORED,
             AGENT_DELETED,
         ],
@@ -526,7 +708,16 @@ pub(crate) async fn chat_snapshot(
     projection: Option<ConversationProjection>,
 ) -> Value {
     let mut snapshot = match api
-        .agent_get_conversation(agent_id.clone(), None, None, None, None, None, projection)
+        .agent_get_conversation(
+            agent_id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            projection,
+            false,
+        )
         .await
     {
         Ok(v) => v,
@@ -560,8 +751,18 @@ pub(crate) async fn chat_recovery_snapshot(
     agent_id: &AgentId,
     projection: Option<ConversationProjection>,
 ) -> Option<Value> {
-    let read =
-        || api.agent_get_conversation(agent_id.clone(), None, None, None, None, None, projection);
+    let read = || {
+        api.agent_get_conversation(
+            agent_id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            projection,
+            false,
+        )
+    };
     let mut snapshot = match read().await {
         Ok(v) => v,
         Err(_) => read().await.ok()?,
@@ -945,6 +1146,7 @@ impl ChatDeltaState {
                 None,
                 None,
                 self.projection,
+                false,
             )
             .await
             .ok()?;
@@ -1258,6 +1460,7 @@ impl ChatDeltaState {
                 None,
                 None,
                 self.projection,
+                false,
             )
         };
         let conv = match read().await {
@@ -1477,7 +1680,10 @@ pub(crate) async fn channel_delta(
     event: &Event,
 ) -> Option<Value> {
     match channel {
-        Channel::Note => note_delta(api, workspace_id, event).await,
+        // The note channel uses the dedicated `forward_note_subscription`
+        // path (which threads the subscription's v8.2 projection), so this
+        // generic arm is unreachable for `Note`; full rows keep it faithful.
+        Channel::Note => note_delta(api, workspace_id, event, None).await,
         Channel::Agent => agent_delta(api, event).await,
         Channel::Workspace => workspace_delta(api, event).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
@@ -1662,9 +1868,13 @@ pub(crate) async fn task_delta(
 }
 
 /// Map an `agent` channel lifecycle event by re-reading the [`AgentLite`].
-/// `agent:created` → `added`, `agent:deleted` → `removedIds`, every other
-/// lifecycle/status event → `updated`. The agent id is read from `data.agentId`
-/// (falling back to the agent-scoped `sessionId`).
+/// `agent:created` / `agent:restored` → `added`, `agent:deleted` /
+/// `agent:retired` → `removedIds`, every other lifecycle/status event →
+/// `updated`. Retirement maps to removal (and restore to re-add) because the
+/// channel's seq-0 snapshot is the default `agent.list`, which excludes
+/// retired rows — deltas must converge on the same state a fresh snapshot
+/// would serve. The agent id is read from `data.agentId` (falling back to
+/// the agent-scoped `sessionId`).
 pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
     let agent_id = event
         .data
@@ -1672,13 +1882,13 @@ pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option
         .and_then(Value::as_str)
         .or(event.session_id.as_deref())?;
     match event.event_type.as_str() {
-        AGENT_DELETED => Some(json!({ "removedIds": [agent_id] })),
-        AGENT_CREATED => {
+        AGENT_DELETED | AGENT_RETIRED => Some(json!({ "removedIds": [agent_id] })),
+        AGENT_CREATED | AGENT_RESTORED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
             Some(json!({ "added": [serde_json::to_value(agent).ok()?] }))
         }
         AGENT_STARTED | AGENT_COMPLETED | AGENT_FAILED | AGENT_IDLE | AGENT_STATUS_CHANGED
-        | AGENT_RENAMED | AGENT_UPDATED | AGENT_RESTORED => {
+        | AGENT_RENAMED | AGENT_UPDATED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
             Some(json!({ "updated": [serde_json::to_value(agent).ok()?] }))
         }

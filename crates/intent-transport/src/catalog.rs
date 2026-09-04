@@ -50,7 +50,9 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveInterrupted",
+    "agent.resolveProposal",
     "agent.respondPermission",
+    "agent.restore",
     "agent.retry",
     "agent.sendMessage",
     "agent.sendQueuedMessageNow",
@@ -127,6 +129,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.issues.get",
     "github.issues.list",
     "github.issues.search",
     "github.listReviewComments",
@@ -309,6 +312,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.import.commit",
     "workspace.initializeRepository",
     "workspace.list",
+    "workspace.localChanges",
     "workspace.markSeen",
     "workspace.restore",
     "workspace.saveSetupScript",
@@ -331,7 +335,7 @@ pub(crate) const METHOD_ALIASES: &[(&str, &str)] =
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 37 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 39 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`, `server.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
@@ -367,6 +371,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "host.openInEditor",
     "host.providerAuthStatus",
     "host.providerDiscovery",
+    "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
     "pairing.getInfo",
@@ -374,6 +379,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "server.rotateToken",
     "system.gitCredential",
     "system.importLegacy",
+    "system.requestUpdate",
     "system.shutdown",
     "system.status",
 ];

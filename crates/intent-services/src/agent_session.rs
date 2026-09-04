@@ -9,7 +9,7 @@
 //! `agent:stream:end` is emitted per turn — `complete` and `error` both map to it
 //! (PROTOCOL §7).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,8 +25,8 @@ use intent_core::events::{
     AGENT_STREAM_STATUS, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA,
 };
 use intent_core::{
-    now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, UsageCost, WorkspaceId,
-    WorkspaceStatus,
+    now_epoch_ms, now_iso, ActorType, AgentId, AgentSession, ContextUsage, Error, EventActor,
+    Result, UsageCost, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -37,6 +37,75 @@ use crate::agent_ops::{
     last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
 };
 use crate::{token_usage, usage_stats, Services};
+
+/// Derive the cross-layer, content-free stream correlation value used only in
+/// diagnostics. The input is an existing wire `turnId` (or the assistant
+/// `messageId` on interruption paths that have no turn id); the raw id is never
+/// logged. FNV-1a is fixed here so non-Rust clients can derive the same 16-hex
+/// value without a dependency or protocol field.
+pub(crate) fn opaque_stream_ref(id: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Emit one bounded, content-free lifecycle diagnostic. Callers pass only a
+/// fixed stage/outcome vocabulary and counts; no transcript, identifiers,
+/// provider payloads, request ids, or errors enter this record. At most one
+/// record is emitted for each stage a turn reaches.
+pub(crate) fn trace_stream_lifecycle(
+    correlation_id: Option<&str>,
+    correlation_basis: &'static str,
+    stage: &'static str,
+    elapsed: Option<Duration>,
+    block_count: usize,
+    outcome: &'static str,
+) {
+    let Some(correlation_id) = correlation_id else {
+        return;
+    };
+    let elapsed_ms = elapsed.map_or(0, |value| {
+        u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+    });
+    tracing::info!(
+        target: "intent_services::stream_lifecycle",
+        turnCorrelation = %opaque_stream_ref(correlation_id),
+        correlationBasis = correlation_basis,
+        stage,
+        elapsed_ms,
+        elapsed_known = elapsed.is_some(),
+        block_count,
+        outcome,
+        "stream lifecycle"
+    );
+}
+
+/// Content-free correlation carried from a completed harness-wake turn to its
+/// separately published idle stage.
+pub(crate) struct HarnessWakeLifecycle {
+    pub(crate) correlation_id: String,
+    pub(crate) block_count: usize,
+}
+
+/// Join the assistant-message correlation used by content stages to the
+/// turn-only correlation available to worker fallback paths. Both values are
+/// fixed-size opaque hashes; neither raw id enters the diagnostic bundle.
+pub(crate) fn trace_stream_correlation_mapping(message_id: &str, turn_id: Option<&str>) {
+    let Some(turn_id) = turn_id else {
+        return;
+    };
+    tracing::info!(
+        target: "intent_services::stream_lifecycle",
+        turnCorrelation = %opaque_stream_ref(message_id),
+        turnOnlyCorrelation = %opaque_stream_ref(turn_id),
+        correlationBasis = "mapping",
+        stage = "correlation_mapping",
+        "stream lifecycle correlation mapping"
+    );
+}
 
 #[cfg(test)]
 mod tests;
@@ -77,6 +146,41 @@ pub(crate) const PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX: &str = "[turn streamed out
 /// resume it.
 pub(crate) const PROMPT_SUSPEND_INTERRUPT_PREFIX: &str =
     "session/prompt interrupted by system suspend:";
+
+/// Prefix of the auth-required `session/prompt` failure mapping
+/// (intent-hq/intent#3941): [`Services::run_prompt_turn`] surfaces such a
+/// failure as `Error::InvalidParams("session/prompt: provider \"…\" … is not
+/// authenticated …")` and has ALREADY emitted the terminal `agent:failed` +
+/// `agent:stream:end` pair (and persisted + stashed the Error status), so the
+/// turn worker's terminal-failure path must not re-emit the pair
+/// ([`prompt_auth_required_turn_error`]). The mapped message is composed as
+/// `session/prompt: ` + [`crate::provider_auth::not_authenticated_message`]
+/// (which starts with `provider "…"`); a unit test pins that composition
+/// against this prefix so the contract cannot drift.
+pub(crate) const PROMPT_AUTH_REQUIRED_PREFIX: &str = "session/prompt: provider \"";
+
+/// Whether a turn error is the auth-required `session/prompt` mapping from
+/// [`Services::run_prompt_turn`] (see [`PROMPT_AUTH_REQUIRED_PREFIX`]).
+/// Prefix-anchored on the `InvalidParams` payload — mid-string mentions and
+/// other `InvalidParams` shapes never classify.
+pub(crate) fn prompt_auth_required_turn_error(err: &Error) -> bool {
+    matches!(err, Error::InvalidParams(msg) if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX))
+}
+
+/// Prefix of the auth-required `session/load` mapping
+/// ([`map_acp_session_error`] with context `session/load`); same composition
+/// contract as [`PROMPT_AUTH_REQUIRED_PREFIX`].
+pub(crate) const LOAD_AUTH_REQUIRED_PREFIX: &str = "session/load: provider \"";
+
+/// Whether a resume failure is the auth-required `session/load` mapping.
+/// `AgentManager::start_session` propagates such a failure instead of
+/// falling through to recreate (PR #1650 review): the provider just said it
+/// is not logged in, and for claude-code the recreate's `session/new` can
+/// succeed while logged out — deferring the actionable login error to a
+/// later opaque prompt failure.
+pub(crate) fn load_auth_required_error(err: &Error) -> bool {
+    matches!(err, Error::InvalidParams(msg) if msg.starts_with(LOAD_AUTH_REQUIRED_PREFIX))
+}
 
 /// Debounce before the self-healing resume that [`enroll_suspend_interrupted_turn`]
 /// fires directly (independent of the host-wake broadcast). It must outlast the
@@ -143,6 +247,12 @@ fn transient_prompt_retry_base_ms() -> u64 {
         }
     }
     1000
+}
+
+/// A candidate session that has not changed the canonical stored ACP identity.
+pub(crate) struct PreparedAcpSession {
+    pub response: session::NewSessionResponse,
+    stored: AgentSession,
 }
 
 /// Result of opening or resuming an ACP session: the canonical `acpSessionId`
@@ -237,6 +347,13 @@ struct Transcript {
     /// this turn (§5.23). Cumulative per ACP session, so the last one wins;
     /// `None` when the provider reported no cost.
     usage_cost: Option<UsageCost>,
+    /// `toolCallId`s recorded by [`record_tool`](Self::record_tool) whose
+    /// latest status is non-terminal (neither `completed` nor `error`).
+    /// Drives tool-call-aware stall suppression (intent-hq/monorepo#3466):
+    /// while non-empty, the mid-turn `stalled` advisory is suppressed —
+    /// long tool runs are legitimately silent. Anonymous updates dropped by
+    /// `record_tool` (STAB-124) never enter this set.
+    open_tool_calls: HashSet<String>,
 }
 
 /// The block indices one [`Transcript::record_tool`] call materialized. The
@@ -266,7 +383,14 @@ impl Transcript {
             tool_result_index: HashMap::new(),
             proposal_index: HashMap::new(),
             usage_cost: None,
+            open_tool_calls: HashSet::new(),
         }
+    }
+
+    /// Number of recorded tool calls still awaiting a terminal
+    /// `tool_call_update` (see [`open_tool_calls`](Self::open_tool_calls)).
+    fn open_tool_call_count(&self) -> usize {
+        self.open_tool_calls.len()
     }
 
     /// The stable block id for a 0-based block index (`{messageId}:{index}`).
@@ -384,10 +508,29 @@ impl Transcript {
                             "input".to_string(),
                             crate::tool_block::attach_acp_title(tc.input.clone(), &title),
                         );
+                        // 0109 (intent-hq/intent#3884 part 2): a replaced
+                        // input invalidates any mid-turn prestage placeholder
+                        // — strip the slim flags so the block re-extracts on
+                        // its next terminal update (or the final append), and
+                        // the prestaged append's reconcile drops the stale
+                        // staged row if the new body stays inline.
+                        obj.remove("inputTruncated");
+                        obj.remove("inputBytes");
                     }
                 } else if !tc.title.is_empty() {
-                    if let Some(obj) = block.get_mut("input").and_then(Value::as_object_mut) {
-                        obj.insert("_acpTitle".to_string(), Value::String(tc.title.clone()));
+                    // 0109: skip the title-only patch when the block carries a
+                    // prestage placeholder (`inputTruncated`) — the full input
+                    // lives ONLY in the staged row (old title), so patching the
+                    // preview would make it disagree with what hydration
+                    // splices back. Keeping the preview untouched keeps slim
+                    // and hydrated reads consistent; the rare post-terminal
+                    // title-only update is carried by the live event, and any
+                    // later input replace above re-attaches the fresh title
+                    // and re-stages.
+                    if block.get("inputTruncated").and_then(Value::as_bool) != Some(true) {
+                        if let Some(obj) = block.get_mut("input").and_then(Value::as_object_mut) {
+                            obj.insert("_acpTitle".to_string(), Value::String(tc.title.clone()));
+                        }
                     }
                 }
                 if let Some(meta) = block.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -418,6 +561,17 @@ impl Transcript {
         let mut result_index = None;
         let mut proposal_indices = Vec::new();
         let completed = tc.status == "completed" || tc.status == "error";
+        // Stall suppression bookkeeping (intent-hq/monorepo#3466): every
+        // recorded (non-dropped) update flips the id's membership on its
+        // latest status — open on a non-terminal status, closed on a
+        // terminal one. Reaching here means the update was NOT dropped
+        // (anonymous first sights returned above), so STAB-124 stale ids
+        // can never leak into the set.
+        if completed {
+            self.open_tool_calls.remove(&tc.tool_call_id);
+        } else {
+            self.open_tool_calls.insert(tc.tool_call_id.clone());
+        }
         if completed {
             if let Some(output) = &tc.output {
                 let is_error = tc.status == "error";
@@ -426,6 +580,11 @@ impl Transcript {
                     if let Some(obj) = self.blocks[ri].as_object_mut() {
                         obj.insert("output".to_string(), output.clone());
                         obj.insert("is_error".to_string(), Value::Bool(is_error));
+                        // 0109: same placeholder invalidation as the input
+                        // replace above — a re-patched output supersedes any
+                        // prestage placeholder for this block.
+                        obj.remove("outputTruncated");
+                        obj.remove("outputBytes");
                     }
                 } else {
                     self.flush_text();
@@ -613,16 +772,59 @@ pub(crate) struct LiveTurn {
 /// interrupt path's downstream decisions agree with the durable row instead of
 /// with a pre-abort clone.
 pub(crate) struct FlushedTurn {
-    /// Id of the interrupted assistant row this flush appended — `None` when
-    /// nothing was appended (the worker's own full row won the `agent_message.id`
-    /// UNIQUE collision, or the store errored).
-    pub(crate) message_id: Option<String>,
+    /// What became of the slot's content — see [`InterruptFlushOutcome`].
+    pub(crate) outcome: InterruptFlushOutcome,
     /// Whether the flushed slot carried any blocks — the zero-output test the
     /// stop-redelivery arm (intent-hq/monorepo#1757) keys off.
     pub(crate) had_output: bool,
+    /// Total persisted block count, including tool/thought/resource blocks.
+    pub(crate) block_count: usize,
     /// The flushed content's `type: "text"` block strings, for the terminal
     /// `agent:stream:end` live-preview fields.
     pub(crate) text_blocks: Vec<String>,
+}
+
+/// Outcome of one
+/// [`flush_partial_turn_on_interruption`](Services::flush_partial_turn_on_interruption)
+/// attempt. The arms are deliberately kept apart: only `Appended` is an
+/// interruption THIS flush recorded; the two `Already*` arms are the
+/// `agent_message.id` UNIQUE collision, split by what the durable row says
+/// (`AlreadyPersisted` — the worker's full row won, the turn was NOT
+/// interrupted at all; `AlreadyInterrupted` — another interrupt flush's row
+/// won); and `Failed` leaves the slot as the only copy of the content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InterruptFlushOutcome {
+    /// This flush appended the interrupted assistant row under the turn's
+    /// minted id (carried here).
+    Appended(String),
+    /// The append hit the `agent_message.id` UNIQUE collision and the durable
+    /// row is NOT tagged `metadata.interrupted`: the worker had already
+    /// persisted the turn's FULL row under this id — the interrupt landed in
+    /// the persist→worker-exit gap of a turn that completed normally. Carries
+    /// that completed row's id so the interrupt path can close the stream as
+    /// the completion it really was, rather than stamp
+    /// `stopReason: "interrupted"` on a turn that was never cut short.
+    AlreadyPersisted(String),
+    /// The append hit the `agent_message.id` UNIQUE collision and the durable
+    /// row IS an interrupted row — a concurrent interrupt flush (the suspend
+    /// enrollment, `owns_slot: false`) persisted it first. Carries that row's
+    /// id and its metadata (`Null` when the row could not be re-read) so the
+    /// interrupt path's terminal emit mirrors the row's `interruptReason` /
+    /// `interruptedBy` rather than misreporting the turn as completed.
+    AlreadyInterrupted { message_id: String, metadata: Value },
+    /// A genuine store error: nothing was persisted; the slot is kept.
+    Failed,
+}
+
+impl InterruptFlushOutcome {
+    /// Id of the interrupted row this flush appended — `None` for the
+    /// collision and error arms.
+    pub(crate) fn appended_message_id(&self) -> Option<&str> {
+        match self {
+            Self::Appended(id) => Some(id.as_str()),
+            Self::AlreadyPersisted(_) | Self::AlreadyInterrupted { .. } | Self::Failed => None,
+        }
+    }
 }
 
 /// Machine-readable cause of a turn interruption, stamped as
@@ -708,6 +910,14 @@ pub(crate) const ACTIVITY_THROTTLE: std::time::Duration = std::time::Duration::f
 /// writer observe the same state.
 pub(crate) type LiveTurns = Arc<Mutex<HashMap<AgentId, LiveTurn>>>;
 
+/// Per-agent latest context-window occupancy from ACP `usage_update`
+/// (intent-hq/intent#3797): latest-wins per live session, in-memory only —
+/// never a token-tally input, dropped with the session on delete and on
+/// daemon restart. Shared across [`Services`] clones so the notification
+/// writer and the `agent.get`/`agent.list` projection overlay observe the
+/// same state.
+pub(crate) type ContextUsages = Arc<Mutex<HashMap<AgentId, ContextUsage>>>;
+
 /// Per-agent silent tail (ms of `session/update` silence before the prompt
 /// resolved) of the most recently ended turn (intent-hq/monorepo#2669):
 /// recorded at turn end by [`run_prompt_turn`](Services::run_prompt_turn) and
@@ -719,13 +929,38 @@ pub(crate) type LastTurnSilentTails = Arc<Mutex<HashMap<AgentId, u64>>>;
 /// Silent-tail threshold past which a bare `end_turn` is suspected to be a
 /// silently-truncated turn (intent-hq/monorepo#2669): in that incident,
 /// bloated sessions resolved `session/prompt` with a clean `end_turn` after
-/// 11–13 minutes of total silence. 5 minutes sits comfortably past normal
-/// tool-free inference tails while catching the incident signature well
+/// 11–13 minutes of total silence. 8 minutes sits comfortably past normal
+/// tool-free inference tails (and above the 5-minute [`stream_stall_ms`]
+/// advisory, preserving the stall < silent-tail-suspect < 30-minute prompt
+/// idle timeout ordering) while catching the incident signature well
 /// before the 30-minute prompt idle timeout. Advisory only — the annotation
 /// never interrupts or fails the turn, because healthy long silent tails
 /// exist. Overridable via `INTENTD_SILENT_TAIL_SUSPECT_MS` (test seam).
 pub(crate) fn silent_tail_suspect_ms() -> u64 {
     if let Ok(val) = std::env::var("INTENTD_SILENT_TAIL_SUSPECT_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    8 * 60 * 1000
+}
+
+/// Mid-turn stream-stall threshold (intent-hq/monorepo#3402): after this many
+/// ms of zero `session/update` traffic while `session/prompt` is still in
+/// flight, [`run_prompt_turn`](Services::run_prompt_turn) emits ONE advisory
+/// `agent:stream:status` with `phase: "stalled"` so subscribers can surface
+/// the silence live instead of an indefinite spinner. 5 minutes clears the
+/// silent thinking phases some models run well past 90s while staying below
+/// the 8-minute #2669 silent-tail suspicion window
+/// ([`silent_tail_suspect_ms`]) and far below the 30-minute prompt idle
+/// timeout, which remains the only terminal mechanism — the stall event never
+/// cancels or fails the turn. Tool-call-aware (intent-hq/monorepo#3466):
+/// while ≥1 recorded tool call is still open the stalled advisory is fully
+/// suppressed regardless of silence duration — long tool runs are expected
+/// silence — with the 30-minute prompt idle timeout as the backstop for hung
+/// tools. Overridable via `INTENTD_STREAM_STALL_MS` (test seam).
+pub(crate) fn stream_stall_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_STREAM_STALL_MS") {
         if let Ok(ms) = val.parse::<u64>() {
             return ms;
         }
@@ -860,6 +1095,8 @@ pub(crate) struct HarnessWakeOutcome {
     /// signature of a failed post-interrupt recovery wake (a single bare
     /// newline accepted as `harness_wake_complete`).
     pub empty_response: bool,
+    /// Content-free correlation for the separately published idle stage.
+    pub lifecycle: HarnessWakeLifecycle,
 }
 
 /// Extract the `type: "text"` block strings from content blocks — the input
@@ -937,42 +1174,33 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 }
 
 /// Derive the user-configured default provider from the effective settings:
-/// the provider prefix of the configured default model (`model.default`
-/// compound prefix), else `providers.active`. Each candidate is validated
-/// against the provider registry ([`intent_providers::find_provider`]) so a
-/// stale, mistyped, or foreign-build id falls through to the next precedence
-/// step instead of being trusted (an unknown `model.default` prefix must not
-/// shadow a perfectly valid `providers.active`). `None` when neither yields
-/// a registered provider — no provider carries a hardcoded default
+/// `model.defaultProvider`, validated against the provider registry
+/// ([`intent_providers::find_provider`]) so a stale, mistyped, or
+/// foreign-build id reads as unset instead of being trusted. `None` when it
+/// is unset or fails validation — no provider carries a hardcoded default
 /// designation, and there is no positional last resort (monorepo#3044):
 /// resolution that falls through entirely fails loudly at the caller.
+/// The deprecated `providers.active` is deliberately NOT consulted — the
+/// boot migration ([`crate::settings::migrate_active_provider_setting`])
+/// carries a legacy value into `model.defaultProvider` once at startup.
 pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
-    /// Accept a candidate id only when it names a registered provider
-    /// (whitespace-trimmed, so padded settings values still resolve).
-    fn registered(id: &str) -> Option<String> {
-        let id = id.trim();
-        intent_providers::find_provider(id).map(|p| p.id.to_string())
-    }
-    settings
-        .model
-        .default
-        .as_deref()
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .and_then(|id| registered(&id))
-        .or_else(|| settings.providers.active.as_deref().and_then(registered))
+    settings.model.default_provider.as_deref().and_then(|id| {
+        // Accept the candidate only when it names a registered provider
+        // (whitespace-trimmed, so padded settings values still resolve).
+        intent_providers::find_provider(id.trim()).map(|p| p.id.to_string())
+    })
 }
 
-/// Resolve the effective provider id for an agent session using the same precedence
-/// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
-/// yields a non-empty provider) → `provider` field → `configured_default` (the
-/// settings-derived default — see [`derived_default_provider`] — when the
-/// caller has one to offer). Malformed compound ids like `:sonnet` yield an
-/// empty prefix and fall through to the provider field / configured default.
-/// This ensures `_meta` injection, spawn args, and all provider-keyed logic
-/// use a consistent provider id.
+/// Resolve the effective provider id for an agent session using the same
+/// precedence as the spawn path (§6.9): explicit `provider` field →
+/// `configured_default` (the settings-derived default — see
+/// [`derived_default_provider`] — when the caller has one to offer). Session
+/// `model` is always a bare id and never participates in provider resolution
+/// (compound `provider:model` ids are rejected at the wire). This ensures
+/// `_meta` injection, spawn args, and all provider-keyed logic use a
+/// consistent provider id.
 ///
 /// `None` when nothing resolves (monorepo#3044): the former positional last
 /// resort (the first registered provider, auggie) silently spawned a binary
@@ -980,19 +1208,12 @@ pub(crate) fn derived_default_provider(
 /// [`no_default_provider_error`] instead; stats-attribution callers (which
 /// pass `configured_default: None`) fall to their existing `"unknown"` tail.
 pub(crate) fn resolve_provider_id(
-    model: Option<&str>,
     provider: Option<&str>,
     configured_default: Option<&str>,
 ) -> Option<String> {
-    model
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
-        .or_else(|| {
-            provider
-                .filter(|p| !p.is_empty())
-                .map(std::string::ToString::to_string)
-        })
+    provider
+        .filter(|p| !p.is_empty())
+        .map(std::string::ToString::to_string)
         .or_else(|| {
             configured_default
                 .filter(|p| !p.is_empty())
@@ -1008,10 +1229,59 @@ pub(crate) fn resolve_provider_id(
 pub(crate) fn no_default_provider_error(context: &str) -> Error {
     Error::InvalidParams(format!(
         "{context}: no default provider/model is configured — no explicit \
-         provider or model was given and neither providers.active nor a \
-         compound model.default is set. Choose a provider in Settings > \
-         Agents, or pass an explicit provider/model."
+         provider or model was given and model.defaultProvider is not set. \
+         Choose a provider in Settings > Agents, or pass an explicit \
+         provider/model."
     ))
+}
+
+/// Whether an ACP failure from the adapter signals "authentication required"
+/// for the provider (intent-hq/intent#3941). [`AcpError::Auth`] is the
+/// structural signal (`session/new` answered with an auth-required error and
+/// no usable auth method); adapters that reject later calls surface it as a
+/// JSON-RPC error instead, classified by the same code/message heuristic as
+/// the model-list auth probe ([`crate::provider_models::is_auth_required_error`]).
+///
+/// Deliberately classifies on `rpc.message` ONLY — not the rendered error
+/// with its bounded `data` like the transient classifiers
+/// (`is_transient_upstream_disconnect` / `is_transient_provider_fetch_failure`).
+/// `data` carries arbitrary provider JSON that can mention "unauthorized" /
+/// "401" in unrelated contexts (tool output, upstream body echoes), and a
+/// false positive here is expensive: it demotes the cached auth verdict and
+/// blocks create/delegate spawns for the cache TTL. A false negative (auth
+/// text riding only in `data`, e.g. the monorepo#3007 bridge shape) degrades
+/// gracefully to today's opaque `Internal` error — the transient classifiers
+/// keep their broader match because their retry/fail-fast outcome is cheap
+/// to get wrong in comparison.
+fn is_acp_auth_required(e: &AcpError) -> bool {
+    match e {
+        AcpError::Auth(_) => true,
+        AcpError::Rpc(rpc) => {
+            crate::provider_models::is_auth_required_error(rpc.code, &rpc.message)
+        }
+        _ => false,
+    }
+}
+
+/// Map an ACP session-setup/prompt failure to the surfaced [`Error`]. An
+/// auth-required failure becomes the same actionable
+/// [`Error::InvalidParams`] login message as the create/delegate gate
+/// ([`crate::provider_auth::not_authenticated_message`]) — non-retryable at
+/// spawn, with the catalog login command and the claude-code desktop-app
+/// caveat — and demotes the provider's cached auth verdict to a hard `false`
+/// so follow-up spawns fail fast at the gate instead of dying on their first
+/// turn. Everything else keeps the existing opaque
+/// `Error::Internal("{context} failed: {e}")` shape (`context` is the ACP
+/// method name, e.g. `session/new`).
+fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
+    if is_acp_auth_required(e) {
+        crate::provider_auth::demote_auth_verdict(provider_id);
+        return Error::InvalidParams(format!(
+            "{context}: {}",
+            crate::provider_auth::not_authenticated_message(provider_id)
+        ));
+    }
+    Error::Internal(format!("{context} failed: {e}"))
 }
 
 /// Resolve the effective model a provider is actually running from the
@@ -1042,7 +1312,7 @@ fn resolve_effective_model(config_options: Option<&[SessionConfigOption]>) -> Op
 
 /// Resolve the display identity of an EXPLICITLY selected model id against
 /// the same `configOptions[id="model"]` option list the default path uses
-/// (D14): match the stored bare id (compound prefix stripped) against an
+/// (D14): match the stored bare id against an
 /// option's `value` and derive a version-bearing family display from that
 /// entry's name/description (e.g. `claude-fable-5[1m]` → name "Fable" is
 /// version-less, description "Fable 5 with 1M context · …" → `"Fable 5"`).
@@ -1137,14 +1407,25 @@ fn select_entry<'a>(
 }
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
-/// assembled system prompt (§18.1) and the agent's name (task-derived for
-/// delegated agents; may be user-assigned or renamed). Returns
+/// assembled system prompt (§18.1), the agent's name (task-derived for
+/// delegated agents; may be user-assigned or renamed), and the session
+/// specialist's resolved orchestrator role (§18.4). Returns
 /// `None` for providers that do not use `_meta` injection (auggie, droid,
 /// opencode, cortex, pi, grok, mock use other mechanisms).
 /// Provider-specific shapes:
-/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": "<prompt>"? }`
+/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": [...] } }, "systemPrompt": "<prompt>"? }`
 ///   (disallowedTools always present; systemPrompt present only when non-blank
-///   prompt). A string `systemPrompt` fully REPLACES the `claude_code` preset
+///   prompt). `disallowedTools` carries `Task` for every agent (native-subagent
+///   denial) plus, for orchestrator-role agents, the SDK's built-in file-write
+///   tools ([`intent_acp::CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS`]) — bare
+///   names remove the tool from the model's context entirely. Merge behavior
+///   verified against the pinned adapter 0.66.0: `createSession` (shared by
+///   `session/new` and `session/load`) spread-merges user-provided entries with
+///   its own additions — `[...(userProvidedOptions?.disallowedTools || []),
+///   ...internal]` — rather than overwriting them (the drop-user-entries
+///   regression tracked upstream in claude-agent-acp #294/#334 is fixed there);
+///   re-verify on adapter bumps.
+///   A string `systemPrompt` fully REPLACES the `claude_code` preset
 ///   prompt (verified against adapter 0.66.0: a string `_meta.systemPrompt` is
 ///   passed to the SDK as-is, and SDK 0.3.220 treats a string as a custom
 ///   prompt) — the model sees only our assembled prompt, with none of the
@@ -1159,19 +1440,26 @@ fn build_session_meta(
     provider_id: &str,
     system_prompt: Option<&str>,
     session_title: Option<&str>,
+    is_orchestrator: bool,
 ) -> Option<Meta> {
     match provider_id {
         "claude-code" => {
             let mut meta = Meta::new();
 
-            // Always add disallowedTools to prevent provider-native Task tool
-            // (verified against @agentclientprotocol/claude-agent-acp 0.59.0;
-            // disallowedTools are merged with ACP's internal deny rules).
+            // Native tool denylist: `Task` always (agents must delegate via
+            // the workspace `ws.agent.*` surface, not provider-native
+            // subagents); orchestrators additionally lose the SDK's built-in
+            // file-write tools — the same resolved role decision that gates
+            // the spawn-time CLI-side denylist (`get_tools_to_remove`, §18.4).
+            let mut disallowed = vec!["Task"];
+            if is_orchestrator {
+                disallowed.extend_from_slice(intent_acp::CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS);
+            }
             meta.insert(
                 "claudeCode".to_string(),
                 serde_json::json!({
                     "options": {
-                        "disallowedTools": ["Task"]
+                        "disallowedTools": disallowed
                     }
                 }),
             );
@@ -1286,6 +1574,44 @@ impl Services {
     pub fn clear_live_turn(&self, agent_id: &AgentId) {
         if let Ok(mut slots) = self.live_turns.lock() {
             slots.remove(agent_id);
+        }
+    }
+
+    /// Record the latest context-window occupancy reported by an ACP
+    /// `usage_update` for `agent_id` (intent-hq/intent#3797): latest-wins,
+    /// in-memory only — never folded into token tallies. `pub(crate)` so
+    /// in-crate tests can seed the registry without driving a stream.
+    pub(crate) fn record_context_usage(&self, agent_id: &AgentId, used: u64, size: u64) {
+        if let Ok(mut usages) = self.context_usages.lock() {
+            usages.insert(
+                agent_id.clone(),
+                ContextUsage {
+                    used,
+                    size,
+                    updated_at: now_iso(),
+                },
+            );
+        }
+    }
+
+    /// The latest recorded context-window occupancy for `agent_id`, or `None`
+    /// when no live `usage_update` has reported one (fresh session, daemon
+    /// restart). Read by the `AgentLite` service projection overlay.
+    pub(crate) fn context_usage_for(&self, agent_id: &AgentId) -> Option<ContextUsage> {
+        self.context_usages
+            .lock()
+            .ok()
+            .and_then(|usages| usages.get(agent_id).cloned())
+    }
+
+    /// Drop an agent's recorded context occupancy (registry hygiene, mirrors
+    /// the other per-agent in-memory maps): called on agent delete, session
+    /// recreate (CAS winner only — the old session's report is stale), and
+    /// the vanished-session cleanup sweep, so the map never leaks entries or
+    /// serves a snapshot for a session that no longer exists.
+    pub(crate) fn clear_context_usage(&self, agent_id: &AgentId) {
+        if let Ok(mut usages) = self.context_usages.lock() {
+            usages.remove(agent_id);
         }
     }
 
@@ -1607,13 +1933,15 @@ impl Services {
         // Derived before the flush consumes the blocks; `text_block_strings`
         // copies only the text, leaving mid-turn tool payloads uncloned.
         let had_output = !live.blocks.is_empty();
+        let block_count = live.blocks.len();
         let text_blocks = text_block_strings(&live.blocks);
-        let message_id = self
+        let outcome = self
             .flush_partial_turn_on_interruption(agent_id, live, reason, interrupted_by, true)
             .await;
         Some(FlushedTurn {
-            message_id,
+            outcome,
             had_output,
+            block_count,
             text_blocks,
         })
     }
@@ -1653,9 +1981,13 @@ impl Services {
     /// combined-delivery re-queue check in `preempt_busy_turn` excludes the
     /// row this flush appends.)
     ///
-    /// Returns the persisted interrupted row's message id (`Some` only when
-    /// this flush appended the row), so the interrupt path can carry
-    /// `messageId` on the terminal `agent:stream:end`.
+    /// Returns an [`InterruptFlushOutcome`]: `Appended` (this flush persisted
+    /// the interrupted row) so the interrupt path can carry `messageId` on the
+    /// terminal `agent:stream:end`; on the UNIQUE collision either
+    /// `AlreadyPersisted` (the worker's full row won, so the turn actually
+    /// completed — that path closes the stream as a normal completion) or
+    /// `AlreadyInterrupted` (a concurrent interrupt flush's row won — that
+    /// path mirrors the row's interrupted metadata); or `Failed`.
     /// `owns_slot` says whose slot this flush may release: the teardown flush
     /// owns the pin it is flushing and clears unconditionally; the suspend
     /// enrollment flushes caller-held content and must NOT release a pin a
@@ -1669,7 +2001,14 @@ impl Services {
         reason: InterruptReason,
         interrupted_by: Option<&InterruptedBy>,
         owns_slot: bool,
-    ) -> Option<String> {
+    ) -> InterruptFlushOutcome {
+        let block_count = live.blocks.len();
+        // A partial tail can already carry proposal blocks (the interrupt
+        // landed after the propose tool call): capture their ids BEFORE the
+        // blocks move into the persisted row, so the flushed row feeds the
+        // same stored-on-write pending-proposals recording as a normal turn
+        // end (PROTOCOL §5.5).
+        let proposal_ids = crate::tool_block::proposal_ids_in(&live.blocks);
         let mut metadata = json!({
             "interrupted": true,
             "stopReason": "interrupted",
@@ -1684,9 +2023,14 @@ impl Services {
                 metadata["interruptedBy"] = by.to_json();
             }
         }
+        // Prestaged variant (0109, intent-hq/intent#3884 part 2): a flushed
+        // partial turn can already carry mid-turn placeholder blocks whose
+        // heavy bodies sit staged in `agent_message_payload` under this
+        // message id — adopt those rows (and reconcile stale ones) instead of
+        // treating the placeholders as the full content.
         match self
             .store
-            .append_agent_message_with_id(
+            .append_agent_message_prestaged(
                 agent_id,
                 &live.message_id,
                 "assistant",
@@ -1697,6 +2041,14 @@ impl Services {
             .await
         {
             Ok(message) => {
+                trace_stream_lifecycle(
+                    Some(live.message_id.as_str()),
+                    "message",
+                    "assistant_persisted",
+                    None,
+                    block_count,
+                    "interrupted",
+                );
                 // Best-effort: resolve workspace from the session so the
                 // projection cache drops without requiring the caller to pass
                 // workspace_id on this interrupt flush path. The same lookup
@@ -1712,13 +2064,26 @@ impl Services {
                         None,
                     )
                     .await;
+                    // The flushed partial row is this turn's durable
+                    // assistant message: record any proposal blocks it
+                    // carries exactly as the normal turn-end persist would,
+                    // so an interrupted turn's proposals stay discoverable.
+                    if !proposal_ids.is_empty() {
+                        self.record_pending_proposals(
+                            &session.workspace_id,
+                            agent_id,
+                            &live.message_id,
+                            &proposal_ids,
+                        )
+                        .await;
+                    }
                 }
                 if owns_slot {
                     self.clear_live_turn(agent_id);
                 } else {
                     self.clear_unpinned_live_turn(agent_id);
                 }
-                Some(live.message_id)
+                InterruptFlushOutcome::Appended(live.message_id)
             }
             // Only the `agent_message.id` violation means "the worker already
             // persisted the full turn under this minted id" — a `(agent_id,
@@ -1735,12 +2100,52 @@ impl Services {
                 } else {
                     self.clear_unpinned_live_turn(agent_id);
                 }
-                tracing::debug!(
-                    agent = %agent_id,
-                    error = %e,
-                    "partial flush skipped: worker already persisted the full turn under this id"
-                );
-                None
+                // The collision alone does not say WHO won: the worker's
+                // normal turn-end append (a completed turn) or another
+                // interrupt flush racing this one (the suspend enrollment
+                // flushing caller-held content while a teardown holds the
+                // pin). Only the durable row's own metadata tells them apart,
+                // and the terminal emit must not call an interrupted row a
+                // completion — re-read it. An unreadable row is reported as
+                // interrupted (metadata `Null`): the conservative shape, and
+                // the one this path always emitted before the split.
+                let durable_metadata = match self
+                    .store
+                    .get_agent_message_by_id(agent_id, &live.message_id)
+                    .await
+                {
+                    Ok(Some(row)) => Some(row.metadata.unwrap_or(Value::Null)),
+                    Ok(None) => None,
+                    Err(read_err) => {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            error = %read_err,
+                            "interrupt flush collided with a durable row that could not be re-read"
+                        );
+                        None
+                    }
+                };
+                let row_interrupted = durable_metadata
+                    .as_ref()
+                    .is_none_or(|m| m.get("interrupted").and_then(Value::as_bool) == Some(true));
+                if row_interrupted {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        error = %e,
+                        "partial flush skipped: a concurrent interrupt flush already persisted this turn's row"
+                    );
+                    InterruptFlushOutcome::AlreadyInterrupted {
+                        message_id: live.message_id,
+                        metadata: durable_metadata.unwrap_or(Value::Null),
+                    }
+                } else {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        error = %e,
+                        "partial flush skipped: worker already persisted the full turn under this id"
+                    );
+                    InterruptFlushOutcome::AlreadyPersisted(live.message_id)
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -1763,7 +2168,7 @@ impl Services {
                 if owns_slot {
                     self.mark_live_turn_flush_failed(agent_id);
                 }
-                None
+                InterruptFlushOutcome::Failed
             }
         }
     }
@@ -1783,13 +2188,6 @@ impl Services {
     /// value (`None` matches NULL), so it loses benignly to a concurrent
     /// `agent.setModel`.
     ///
-    /// Dropped guarantee (intentional): the old rewrite persisted the
-    /// compound `{provider_id}:{effective}`, which as a side effect pinned
-    /// the provider for legacy rows with a NULL `model` AND an empty
-    /// `provider`. Such rows now fall through to the configured default /
-    /// first-registered provider on every resolution — a reversion to
-    /// pre-D13 behavior; current creation paths pin `model` at creation, so
-    /// no new rows enter that population.
     ///
     /// A NON-placeholder (explicitly selected) model takes the D14 branch
     /// instead: its display identity is resolved against the same option
@@ -1846,9 +2244,8 @@ impl Services {
     /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
     /// resolve an EXPLICITLY selected model id's display identity against the
     /// session-open `configOptions` and persist it to `resolved_model`. The
-    /// bare id (compound `{provider}:` prefix stripped — stored explicit
-    /// picks are compound, option values are bare) is matched against the
-    /// model select's option values. The outcome is persisted EITHER way — a
+    /// stored bare id is matched against the model select's option values.
+    /// The outcome is persisted EITHER way — a
     /// `None` resolution overwrites (clears) any previously persisted
     /// display name, so a resolution from an older option list can never go
     /// stale and mis-attribute stats after the provider's catalog changes.
@@ -1864,8 +2261,7 @@ impl Services {
         config_options: Option<&[SessionConfigOption]>,
     ) {
         let Some(stored) = stored_model else { return };
-        let (_, bare_id) = intent_providers::parse_compound_model_id(stored);
-        let resolved = resolve_explicit_display_model(&bare_id, config_options);
+        let resolved = resolve_explicit_display_model(stored, config_options);
         match self
             .store
             .set_agent_session_resolved_model(
@@ -1891,38 +2287,86 @@ impl Services {
         }
     }
 
-    /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
-    /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
-    /// modes the provider advertised in `session/new` (used by the caller to
-    /// pick a permissive `session/set_mode` target from `availableModes`).
-    pub(crate) async fn open_acp_session(
+    /// Resolve whether the stored session's specialist carries the
+    /// `orchestrator` role — the SAME decision that gates the spawn-time
+    /// CLI-side denylist (`derive_is_orchestrator` in `agent_manager`, §18.4),
+    /// re-resolved here for the session-open paths because they run after
+    /// spawn with only the stored session at hand. Only the claude-code
+    /// `_meta` branch of [`build_session_meta`] consumes the decision — the
+    /// other providers apply their denylists at spawn time — so any other
+    /// `provider_id` short-circuits to `false` without touching the store.
+    /// The frozen creation-time snapshot
+    /// (`metadata.specialistIsOrchestrator`) also skips the workspace read
+    /// (the path only feeds the legacy live-resolution project tier). The
+    /// workspace read is best-effort: a failure resolves embedded/user-tier
+    /// specialists only (never fails the session open). Plain agents (no
+    /// specialist) skip the read entirely.
+    async fn resolve_session_is_orchestrator(
+        &self,
+        provider_id: &str,
+        stored: &AgentSession,
+    ) -> bool {
+        if provider_id != "claude-code" {
+            return false;
+        }
+        if stored.specialist.as_deref().is_none_or(str::is_empty) {
+            return false;
+        }
+        let has_snapshot = stored
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("specialistIsOrchestrator"))
+            .and_then(serde_json::Value::as_bool)
+            .is_some();
+        let workspace_path = if has_snapshot {
+            None
+        } else {
+            match self.store.get_workspace(&stored.workspace_id).await {
+                Ok(ws) => ws.effective_path().map(PathBuf::from),
+                Err(e) => {
+                    tracing::debug!(
+                        workspace = %stored.workspace_id,
+                        error = %e,
+                        "orchestrator role resolution: workspace read failed; resolving without project tier"
+                    );
+                    None
+                }
+            }
+        };
+        self.session_specialist_is_orchestrator(stored, workspace_path.as_deref())
+    }
+
+    pub(crate) async fn prepare_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
-    ) -> Result<AcpSessionOpened> {
+    ) -> Result<PreparedAcpSession> {
         // Load the session up front so the store write is scoped to the owning
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
         // resolved this agent id inside a workspace-scoped path.
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
-        // Resolve provider using the same precedence as spawn path (compound model
-        // prefix → provider field → configured default), then build
-        // provider-specific _meta. Reached only after a successful spawn (which
-        // resolved the same inputs), so a fall-through here is a settings race —
-        // fail loudly rather than fabricating a positional default (monorepo#3044).
+        // Resolve provider using the same precedence as spawn path (provider
+        // field → configured default), then build provider-specific _meta.
+        // Reached only after a successful spawn (which resolved the same
+        // inputs), so a fall-through here is a settings race — fail loudly
+        // rather than fabricating a positional default (monorepo#3044).
         let provider_id = resolve_provider_id(
-            stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
+        let is_orchestrator = self
+            .resolve_session_is_orchestrator(&provider_id, &stored)
+            .await;
         let meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             Some(&stored.name),
+            is_orchestrator,
         );
         self.publish_status_event(
             &workspace_id,
@@ -1934,7 +2378,87 @@ impl Services {
         .await;
         let resp = session::new_session(conn, cwd, mcp_servers, meta)
             .await
-            .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
+            .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        Ok(PreparedAcpSession {
+            response: resp,
+            stored,
+        })
+    }
+
+    /// Commit only a confirmed Antigravity candidate. A concurrent winner is
+    /// never used with this candidate's configuration or first-turn context.
+    pub(crate) async fn commit_antigravity_acp_session(
+        &self,
+        prepared: PreparedAcpSession,
+        expected_old: Option<&str>,
+    ) -> Result<AcpSessionOpened> {
+        let PreparedAcpSession {
+            response: resp,
+            stored,
+        } = prepared;
+        let candidate = resp.session_id.0.to_string();
+        if candidate.is_empty() {
+            return Err(Error::InvalidParams(
+                "Antigravity returned an empty session ID".into(),
+            ));
+        }
+        let workspace_id = &stored.workspace_id;
+        let agent_id = &stored.id;
+        // Use the existing transactional CAS even for first-set: an empty
+        // expected id cannot match a valid established session, while the
+        // store's None branch atomically initializes an unclaimed session.
+        let canonical = self
+            .store
+            .replace_acp_session_id(
+                workspace_id,
+                agent_id,
+                expected_old.unwrap_or(""),
+                &candidate,
+            )
+            .await?;
+        if canonical != candidate {
+            return Err(Error::Conflict {
+                current: json!({"acpSessionId": canonical}),
+            });
+        }
+        if expected_old.is_some() {
+            self.clear_context_usage(agent_id);
+        }
+        self.persist_effective_model(
+            workspace_id,
+            agent_id,
+            stored.model.as_deref(),
+            resp.config_options.as_deref(),
+        )
+        .await;
+        let thought_level = discover_thought_level(resp.config_options.as_deref());
+        self.persist_session_effort_levels(workspace_id, agent_id, thought_level.as_ref())
+            .await;
+        Ok(AcpSessionOpened {
+            session_id: candidate,
+            modes: resp.modes,
+            thought_level,
+        })
+    }
+
+    /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
+    /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
+    /// modes the provider advertised in `session/new` (used by the caller to
+    /// pick a permissive `session/set_mode` target from `availableModes`).
+    pub(crate) async fn open_acp_session(
+        &self,
+        conn: &Connection,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<AcpSessionOpened> {
+        let PreparedAcpSession {
+            response: resp,
+            stored,
+        } = self
+            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
+            .await?;
+        let workspace_id = stored.workspace_id.clone();
         let acp_session_id = resp.session_id.0.to_string();
         self.store
             .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
@@ -1974,36 +2498,13 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<AcpSessionOpened> {
-        // Load the session up front so the CAS replace is scoped to the owning
-        // workspace (see [`open_acp_session`]).
-        let stored = self.store.get_agent_session(agent_id).await?;
+        let PreparedAcpSession {
+            response: resp,
+            stored,
+        } = self
+            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
+            .await?;
         let workspace_id = stored.workspace_id.clone();
-        // Resolve provider using the same precedence as spawn path, then build
-        // provider-specific _meta for system-prompt injection (recreate path sends
-        // the same prompt as new/load). Same loud fall-through as
-        // [`open_acp_session`] (monorepo#3044).
-        let provider_id = resolve_provider_id(
-            stored.model.as_deref(),
-            stored.provider.as_deref(),
-            derived_default_provider(&self.effective_settings()).as_deref(),
-        )
-        .ok_or_else(|| no_default_provider_error("session/new"))?;
-        let meta = build_session_meta(
-            &provider_id,
-            stored.system_prompt.as_deref(),
-            Some(&stored.name),
-        );
-        self.publish_status_event(
-            &workspace_id,
-            agent_id,
-            "session-create",
-            "Creating session\u{2026}",
-            "info",
-        )
-        .await;
-        let resp = session::new_session(conn, cwd, mcp_servers, meta)
-            .await
-            .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let new_acp_session_id = resp.session_id.0.to_string();
         let canonical = self
             .store
@@ -2017,6 +2518,12 @@ impl Services {
         // unknown", not "the provider advertised no selector", and writing it
         // would clobber what the winner just persisted.
         let (modes, thought_level) = if canonical == new_acp_session_id {
+            // The old ACP session is gone: its last context-occupancy report
+            // no longer describes anything live, so drop it rather than serve
+            // a stale snapshot until the new session's first `usage_update`
+            // (intent-hq/intent#3797). Skipped on CAS loss — the winner owns
+            // the canonical session and this cleanup with it.
+            self.clear_context_usage(agent_id);
             self.persist_effective_model(
                 &workspace_id,
                 agent_id,
@@ -2062,7 +2569,6 @@ impl Services {
         // provider-specific _meta for system-prompt injection. Same loud
         // fall-through as [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
-            stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
@@ -2108,7 +2614,15 @@ impl Services {
         }
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
-        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref(), None);
+        let is_orchestrator = self
+            .resolve_session_is_orchestrator(&provider_id, &stored)
+            .await;
+        let meta = build_session_meta(
+            &provider_id,
+            stored.system_prompt.as_deref(),
+            None,
+            is_orchestrator,
+        );
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -2119,7 +2633,7 @@ impl Services {
         .await;
         let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
             .await
-            .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
+            .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
         self.persist_effective_model(
             &workspace_id,
             agent_id,
@@ -2197,6 +2711,7 @@ impl Services {
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
+        trace_stream_correlation_mapping(&message_id, turn_id);
         let mut transcript = Transcript::new(message_id.clone());
         // Turn wall-clock start, for the global usage-stats longest-run MAX.
         let turn_started = std::time::Instant::now();
@@ -2265,6 +2780,28 @@ impl Services {
         // client-served handler may have side-effected on behalf of this
         // turn, so the attempt is no longer provably idempotent.
         let client_request_watermark = conn.client_request_seq();
+        // Mid-turn stall detection (intent-hq/monorepo#3402): a timer arm in
+        // the select loop below samples `activity.idle_ms()` on a fraction of
+        // the stall threshold (clamped to 15s at the 5-minute default) and
+        // emits ONE advisory `stalled` status event once the silence crosses
+        // [`stream_stall_ms`].
+        // The next received `session/update` emits `resumed` and re-arms the
+        // detector, so a later second stall in the same turn reports again.
+        // Advisory only: turn resolution is untouched (the 30-minute prompt
+        // idle timeout stays the terminal backstop).
+        //
+        // Tool-call-aware (intent-hq/monorepo#3466): while ≥1 recorded tool
+        // call is still open (`transcript.open_tool_call_count() > 0`), the
+        // arm emits nothing regardless of silence duration — long tool runs
+        // (builds, test suites) are legitimately silent between `tool_call`
+        // and the terminal `tool_call_update`. Once the last open call
+        // resolves, the standard threshold applies to subsequent silence
+        // (`activity` was touched by the resolving update, so the window
+        // restarts from that point). Hung tools stay covered by the
+        // 30-minute prompt idle timeout.
+        let stall_threshold_ms = stream_stall_ms();
+        let stall_check = Duration::from_millis((stall_threshold_ms / 6).clamp(10, 15_000));
+        let mut stall_emitted = false;
         let result = loop {
             let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
             tokio::pin!(prompt_fut);
@@ -2274,6 +2811,8 @@ impl Services {
                     maybe = notifications.recv(), if !closed => match maybe {
                         Some(note) => {
                             activity.touch();
+                            self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
+                                .await;
                             any_update_received = true;
                             updates_applied |= self
                                 .route_notification(&note, agent_id, workspace_id, &mut transcript)
@@ -2281,6 +2820,19 @@ impl Services {
                         }
                         None => closed = true,
                     },
+                    () = tokio::time::sleep(stall_check), if !stall_emitted => {
+                        let silent_ms = activity.idle_ms();
+                        if silent_ms >= stall_threshold_ms && transcript.open_tool_call_count() == 0 {
+                            stall_emitted = true;
+                            tracing::warn!(
+                                agent = %agent_id,
+                                silent_ms,
+                                "mid-turn stream stall — no session/update past threshold (monorepo#3402)"
+                            );
+                            self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
+                                .await;
+                        }
+                    }
                 }
             };
             // Drain updates buffered before this attempt settled BEFORE the
@@ -2293,6 +2845,8 @@ impl Services {
             if attempt_result.is_err() {
                 while let Ok(note) = notifications.try_recv() {
                     activity.touch();
+                    self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
+                        .await;
                     any_update_received = true;
                     updates_applied |= self
                         .route_notification(&note, agent_id, workspace_id, &mut transcript)
@@ -2327,6 +2881,8 @@ impl Services {
                     // this attempt's error instead of retrying.
                     while let Ok(note) = notifications.try_recv() {
                         activity.touch();
+                        self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
+                            .await;
                         any_update_received = true;
                         updates_applied |= self
                             .route_notification(&note, agent_id, workspace_id, &mut transcript)
@@ -2354,6 +2910,8 @@ impl Services {
         // carrying a long tail it never had.
         while let Ok(note) = notifications.try_recv() {
             activity.touch();
+            self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
+                .await;
             any_update_received = true;
             updates_applied |= self
                 .route_notification(&note, agent_id, workspace_id, &mut transcript)
@@ -2380,12 +2938,16 @@ impl Services {
         for attachment in drained_attachments {
             transcript.push_block(attachment.resource_item());
         }
-        // Split the PromptOutcome into its stop reason and the optional
+        // Split the PromptOutcome into its stop reason, the optional
         // end-of-turn usage snapshot (persisted below once the turn's message
-        // is durable).
+        // is durable), and the raw `_meta` payload — the fallback usage
+        // source for providers that bill only there (grok's `_meta.usage`
+        // whole-prompt bill, intent-hq/intent#3803).
         let mut turn_usage = None;
+        let mut turn_meta = None;
         let result = result.map(|outcome| {
             turn_usage = outcome.usage;
+            turn_meta = outcome.meta;
             outcome.stop_reason
         });
         // Latest ACP `usage_update` cost of the turn (§5.23), accumulated by
@@ -2393,6 +2955,7 @@ impl Services {
         let turn_cost = transcript.usage_cost.clone();
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
+        let block_count = blocks.len();
         let last_response_summary = last_response_summary(&blocks);
         // Final-value preview for the terminal `agent:stream:end` below: the
         // last throttled `agent:stream:activity` may have missed the response
@@ -2438,6 +3001,12 @@ impl Services {
         // blocks (`ws.app.question.ask`) — computed BEFORE the append consumes
         // `blocks`, used for the pending-questions marker write below.
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        // Proposal ids carried by this turn's lifted proposal-resource blocks
+        // (both the registry/array path and the wrapped-echo path in
+        // `record_tool` land as persisted blocks) — computed BEFORE the
+        // append consumes `blocks`, used for the pending-proposals recording
+        // below (PROTOCOL §5.5).
+        let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
         // Sleep-induced turn failure (Task C): the turn died with a transient
         // upstream disconnect AND a detected host suspend overlapped its active
         // window `[turn_started, now]`. Enroll it as interrupted (so the wake
@@ -2528,10 +3097,11 @@ impl Services {
         // left to today's behavior: root/user-facing agents and taskless
         // agents (WARN + advisory only, per the issue's guard scope),
         // question-bearing turns (the redrive would bury the pending Q&A
-        // behind the question hold's back), and turns with a ready-to-send
+        // the user has not yet answered), and turns with a ready-to-send
         // queue entry (the imminent drain is itself the nudge). The counter
         // clears on any clean (non-truncated) completion — the stall
         // episode is over.
+        let mut truncation_terminal_outcome = "suspected_truncated_ineligible";
         let truncation_redrive = if suspected_truncated
             && !questions_persisted
             && !self.has_ready_to_send(agent_id)
@@ -2551,6 +3121,7 @@ impl Services {
                 self.arm_truncation_redrive(agent_id);
                 true
             } else {
+                truncation_terminal_outcome = "truncation_cap_exhausted";
                 tracing::warn!(
                     agent = %agent_id,
                     streak,
@@ -2582,9 +3153,14 @@ impl Services {
             let row_metadata = abnormal_finish_reason
                 .as_ref()
                 .map(|reason| json!({ "finishReason": reason }));
-            let message = self
+            // Prestaged variant (0109, intent-hq/intent#3884 part 2): heavy
+            // tool bodies were staged mid-turn as their calls completed and
+            // sit in the transcript as placeholders — the append adopts those
+            // rows (reconciling any stale ones) so the turn-end write carries
+            // only the delta, not the heavy bytes again.
+            let append = self
                 .store
-                .append_agent_message_with_id(
+                .append_agent_message_prestaged(
                     agent_id,
                     &message_id,
                     "assistant",
@@ -2592,7 +3168,39 @@ impl Services {
                     row_metadata.as_ref(),
                     &now_iso(),
                 )
-                .await?;
+                .await;
+            let message = match append {
+                Ok(message) => message,
+                Err(e) => {
+                    // The envelope will never be appended (the live guard
+                    // clears the slot on this exit): reap the turn's staged
+                    // rows now instead of leaving orphans until the next
+                    // `Store::open` sweep. Guarded server-side — a no-op when
+                    // a racing teardown flush already persisted the envelope
+                    // under this id (its append adopted the rows).
+                    if let Err(del) = self
+                        .store
+                        .delete_prestaged_agent_message_payloads(&message_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            message_id = %message_id,
+                            error = %del,
+                            "failed to reap prestaged payloads after append failure (#3884)"
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+            trace_stream_lifecycle(
+                Some(message_id.as_str()),
+                "message",
+                "assistant_persisted",
+                Some(turn_started.elapsed()),
+                block_count,
+                if result.is_ok() { "complete" } else { "failed" },
+            );
             self.invalidate_agent_list_cache(workspace_id);
             // Persisted-row event pair (PROTOCOL §6.5): the assistant turn
             // flush emits `agent:message` + `agent:last-message` like every
@@ -2603,8 +3211,8 @@ impl Services {
                 .await;
             message_persisted = true;
         }
-        // Stored-on-write pending-questions marker (PROTOCOL §5.5, question
-        // hold): a question-bearing assistant tail arms the hold under this
+        // Stored-on-write pending-questions marker (PROTOCOL §5.5): a
+        // question-bearing assistant tail arms the marker under this
         // turn's message id (a newer question set overwrites an older marker
         // — single-slot). A question-FREE turn end deliberately does NOT
         // clear the marker: pendingness survives the agent's later turns
@@ -2623,6 +3231,15 @@ impl Services {
         // instead of relying on the dedup cache to stay silent.
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
+        }
+        // Stored-on-write pending-proposals recording (PROTOCOL §5.5): a
+        // proposal-bearing tail merges its `{ proposalId, messageId }`
+        // entries into the session's ordered pending set (dedupe by id,
+        // newest wins). A proposal-FREE turn leaves the list untouched —
+        // pendingness survives later turns until resolution.
+        if message_persisted && !proposal_ids.is_empty() {
+            self.record_pending_proposals(workspace_id, agent_id, &message_id, &proposal_ids)
+                .await;
         }
         // The turn's message is now durable: clear the live-turn slot so the next
         // `chat.subscribe` snapshot reflects the persisted message (not a stale
@@ -2664,6 +3281,7 @@ impl Services {
             // real turn end.
             let turn_end = time::OffsetDateTime::now_utc();
             let turn_usage = turn_usage.take();
+            let turn_meta = turn_meta.take();
             let prev = self
                 .turn_bookkeeping
                 .lock()
@@ -2673,6 +3291,28 @@ impl Services {
                 if let Some(prev) = prev {
                     let _ = prev.await;
                 }
+                // grok fallback (intent-hq/intent#3803): no standard report,
+                // but the turn's `_meta` may carry the whole-prompt bill —
+                // synthesize the standard per-turn report from it so the
+                // ordinary seam below ingests it (SUM, grok is PerTurn). A
+                // present standard report always wins; runs after the
+                // predecessor await so its provider read cannot race turn
+                // N-1's bookkeeping.
+                let (turn_usage, turn_cost) = if turn_usage.is_none() {
+                    match services
+                        .prompt_meta_turn_usage(
+                            &agent_id_task,
+                            &workspace_id_task,
+                            turn_meta.as_ref(),
+                        )
+                        .await
+                    {
+                        Some((usage, cost)) => (Some(usage), turn_cost.or(cost)),
+                        None => (turn_usage, turn_cost),
+                    }
+                } else {
+                    (turn_usage, turn_cost)
+                };
                 services
                     .record_turn_usage_stats(
                         &agent_id_task,
@@ -2718,9 +3358,50 @@ impl Services {
         // wrapped text matches the ordinary error the final `map_err` returns
         // below, so the persisted `stop_reason` is byte-identical to what the
         // worker would have written.
+        //
+        // Auth-required prompt failure (intent-hq/intent#3941): resolved BEFORE
+        // the persist seam so the persisted `stop_reason` and the returned
+        // error carry the identical actionable message. The provider's cached
+        // auth verdict is demoted to a hard `false` so follow-up spawns fail
+        // fast at the create/delegate gate instead of dying on their first
+        // turn. Falls back to the opaque wrapper when the agent's provider
+        // cannot be resolved from the session row.
+        let prompt_auth_message = match &result {
+            Err(e)
+                if !pre_output_transport_failure
+                    && !prompt_idle_timeout
+                    && is_acp_auth_required(e) =>
+            {
+                match self
+                    .store
+                    .get_agent_session_token_usage(workspace_id, agent_id)
+                    .await
+                {
+                    Ok((_, _, provider, _)) => resolve_provider_id(
+                        provider.as_deref(),
+                        derived_default_provider(&self.effective_settings()).as_deref(),
+                    )
+                    .map(|provider_id| {
+                        crate::provider_auth::demote_auth_verdict(&provider_id);
+                        format!(
+                            "session/prompt: {}",
+                            crate::provider_auth::not_authenticated_message(&provider_id)
+                        )
+                    }),
+                    Err(e) => {
+                        tracing::warn!(agent = %agent_id, error = %e, "read provider for auth-failure mapping failed");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout {
-                let wrapped = Error::Internal(format!("session/prompt failed: {e}"));
+                let wrapped = match prompt_auth_message.as_deref() {
+                    Some(msg) => Error::InvalidParams(msg.to_string()),
+                    None => Error::Internal(format!("session/prompt failed: {e}")),
+                };
                 if !crate::agent_manager::prompt_cancellation_error(&wrapped) {
                     let persist = crate::agent_manager::persist_terminal_error_status_via_services(
                         self,
@@ -2730,6 +3411,14 @@ impl Services {
                     )
                     .await;
                     self.stash_pending_terminal_error(agent_id, persist);
+                    trace_stream_lifecycle(
+                        Some(message_id.as_str()),
+                        "message",
+                        "terminal_failure",
+                        Some(turn_started.elapsed()),
+                        block_count,
+                        "failed",
+                    );
                 }
             }
         }
@@ -2745,6 +3434,23 @@ impl Services {
         // registration order) when any were drained — omitted otherwise
         // (monorepo#732 fix wave: live delivery of turn-end attachments).
         if !pre_output_transport_failure {
+            let outcome = if result.is_err() {
+                "failed"
+            } else if suspected_truncated && truncation_redrive {
+                "suspected_truncated_redrive"
+            } else if suspected_truncated {
+                truncation_terminal_outcome
+            } else {
+                "complete"
+            };
+            trace_stream_lifecycle(
+                Some(message_id.as_str()),
+                "message",
+                "agent_stream_end",
+                Some(turn_started.elapsed()),
+                block_count,
+                outcome,
+            );
             let mut end_data = json!({ "agentId": agent_id.0 });
             if message_persisted {
                 end_data["messageId"] = json!(message_id);
@@ -2798,6 +3504,23 @@ impl Services {
                 );
             }
             Ok(stop_reason) if !self.has_ready_to_send(agent_id) => {
+                trace_stream_lifecycle(
+                    Some(message_id.as_str()),
+                    "message",
+                    "agent_idle",
+                    Some(turn_started.elapsed()),
+                    block_count,
+                    if suspected_truncated {
+                        truncation_terminal_outcome
+                    } else {
+                        "complete"
+                    },
+                );
+                // Surface an attention request the turn raised mid-flight
+                // BEFORE the idle emit, so subscribers see the notice/toast
+                // and then the idle — never a "quiet idle" that later grows
+                // an attention card.
+                self.flush_deferred_attention(agent_id, workspace_id).await;
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "stream_complete",
@@ -2899,7 +3622,22 @@ impl Services {
                 );
             }
             Err(e) => {
-                let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
+                trace_stream_lifecycle(
+                    Some(message_id.as_str()),
+                    "message",
+                    "agent_failed",
+                    Some(turn_started.elapsed()),
+                    block_count,
+                    "failed",
+                );
+                // A turn error also ends the turn — surface a mid-turn raise
+                // now (same ordering rationale as the idle arm above).
+                self.flush_deferred_attention(agent_id, workspace_id).await;
+                // Auth-required mapping (intent-hq/intent#3941): the event
+                // carries the same actionable message as the persisted
+                // stop_reason and returned error, not the raw adapter error.
+                let error_text = prompt_auth_message.clone().unwrap_or_else(|| e.to_string());
+                let mut data = json!({ "agentId": agent_id.0, "error": error_text });
                 if let Some(tid) = turn_id {
                     data["turnId"] = json!(tid);
                 }
@@ -2917,6 +3655,10 @@ impl Services {
                 Error::Internal(format!(
                     "session/prompt failed: {e} {PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX}"
                 ))
+            } else if let Some(msg) = prompt_auth_message {
+                // Auth-required failure: identical message to the persisted
+                // stop_reason above (intent-hq/intent#3941).
+                Error::InvalidParams(msg)
             } else {
                 Error::Internal(format!("session/prompt failed: {e}"))
             }
@@ -2945,6 +3687,8 @@ impl Services {
         turn_id: Option<&str>,
         err: AcpError,
     ) -> Result<StopReason> {
+        let correlation_id = message_id.clone();
+        let block_count = blocks.len();
         // Final live-preview values from the partial turn (same contract as the
         // interrupt terminal emit in `agent_manager`).
         let preview_text_blocks = text_block_strings(&blocks);
@@ -2963,6 +3707,13 @@ impl Services {
             flush_pending: false,
             flush_failed: false,
         };
+        // A failed flush deliberately does NOT reap the turn's mid-turn
+        // staged rows (unlike the turn-end/wake failure arms): this path does
+        // not own the slot, so a non-`Appended` outcome here can coexist with
+        // a concurrent teardown whose pinned retry flush is still entitled to
+        // adopt them — reaping would delete the only copy of the heavy bodies
+        // out from under it. Truly orphaned rows are bounded and reaped by the
+        // `Store::open` sweep.
         let interrupted_message_id = self
             .flush_partial_turn_on_interruption(
                 agent_id,
@@ -2971,7 +3722,9 @@ impl Services {
                 None,
                 false,
             )
-            .await;
+            .await
+            .appended_message_id()
+            .map(str::to_owned);
         // Capture the session's running status for restore-on-resume, serialized
         // to the stored form (e.g. "active", "Waiting") exactly like
         // `heal_stale_agent_sessions`. A lookup failure falls back to "active".
@@ -3047,8 +3800,22 @@ impl Services {
             end_data["turnId"] = json!(tid);
         }
         stamp_preview_fields(&mut end_data, &preview_text_blocks);
+        trace_stream_lifecycle(
+            Some(correlation_id.as_str()),
+            "message",
+            "agent_stream_end",
+            None,
+            block_count,
+            "interrupted",
+        );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
+        // A suspend interruption also ends the turn — surface a mid-turn
+        // attention raise now, after the interrupted terminal emit (spec:
+        // surface on ANY turn end). Without this the raise would stay parked
+        // until a later resumed turn happens to finish — or indefinitely if
+        // no resume completes.
+        self.flush_deferred_attention(agent_id, workspace_id).await;
         tracing::info!(
             agent = %agent_id,
             error = %err,
@@ -3084,11 +3851,9 @@ impl Services {
     /// which owns the single-flight slot.
     ///
     /// Returns a [`HarnessWakeOutcome`]: the persisted assistant `messageId`
-    /// (`None` when the burst persisted nothing) plus the empty-response
-    /// classification (intent-hq/monorepo#3262) — `true` when the turn
-    /// OPENED but its finalized transcript carried no meaningful content
-    /// (whitespace-only text/thinking blocks), the signature of a failed
-    /// recovery wake the caller must not accept as a successful completion.
+    /// (`None` when the burst persisted nothing), the empty-response
+    /// classification (intent-hq/monorepo#3262), and the content-free
+    /// correlation needed by the caller's later idle diagnostic.
     pub(crate) async fn run_harness_wake_turn(
         &self,
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
@@ -3097,6 +3862,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         settle: std::time::Duration,
     ) -> HarnessWakeOutcome {
+        let turn_started = Instant::now();
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone());
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
@@ -3154,8 +3920,12 @@ impl Services {
                 .await;
         }
         let blocks = transcript.into_blocks();
+        let block_count = blocks.len();
         let preview_text_blocks = text_block_strings(&blocks);
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        // Same pre-append proposal-id scan as the prompt-turn persist
+        // (PROTOCOL §5.5, pending proposals).
+        let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
         // Empty-response classification (intent-hq/monorepo#3262): the wake
         // turn OPENED (a chunk/tool-call materialized content) but finalized
         // with nothing meaningful — whitespace-only text/thinking blocks, the
@@ -3165,9 +3935,12 @@ impl Services {
         let empty_response = harness_wake_response_is_empty(&blocks);
         let mut message_persisted = false;
         if !blocks.is_empty() {
+            // Prestaged variant (0109, intent-hq/intent#3884 part 2): wake
+            // turns route through the same `route_notification` prestage as
+            // prompt turns, so the append adopts any mid-turn staged rows.
             match self
                 .store
-                .append_agent_message_with_id(
+                .append_agent_message_prestaged(
                     agent_id,
                     &message_id,
                     "assistant",
@@ -3178,6 +3951,14 @@ impl Services {
                 .await
             {
                 Ok(message) => {
+                    trace_stream_lifecycle(
+                        Some(message_id.as_str()),
+                        "message",
+                        "assistant_persisted",
+                        Some(turn_started.elapsed()),
+                        block_count,
+                        "complete",
+                    );
                     self.invalidate_agent_list_cache(workspace_id);
                     // Same persisted-row event pair as the prompt-turn flush
                     // (§6.5); wake turns carry no turn correlation id.
@@ -3187,13 +3968,28 @@ impl Services {
                 }
                 Err(e) => {
                     tracing::warn!(agent = %agent_id, error = %e, "harness-wake turn persist failed");
+                    // The envelope will never be appended: reap this turn's
+                    // staged rows (guarded server-side — no-op if a racing
+                    // flush persisted the envelope under this id).
+                    if let Err(del) = self
+                        .store
+                        .delete_prestaged_agent_message_payloads(&message_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            message_id = %message_id,
+                            error = %del,
+                            "failed to reap prestaged payloads after wake-turn persist failure (#3884)"
+                        );
+                    }
                 }
             }
         } else if !updates_applied {
             tracing::debug!(agent = %agent_id, "harness-wake turn produced no content");
         }
         // Same stored-on-write pending-questions marker as the prompt-turn
-        // persist: a question-bearing wake tail arms the hold (question-free
+        // persist: a question-bearing wake tail arms the marker (question-free
         // tails leave the marker untouched).
         let marker_moved = if message_persisted && questions_persisted {
             self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
@@ -3202,9 +3998,15 @@ impl Services {
             false
         };
         // Same §6.5 step-0 recompute as the prompt-turn persist: only a
-        // question-bearing tail moves the question-hold derivation.
+        // question-bearing tail moves the pending-questions derivation.
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
+        }
+        // Same stored-on-write pending-proposals recording as the prompt-turn
+        // persist (PROTOCOL §5.5).
+        if message_persisted && !proposal_ids.is_empty() {
+            self.record_pending_proposals(workspace_id, agent_id, &message_id, &proposal_ids)
+                .await;
         }
         // Pin-respecting, same as the prompt-turn end above (monorepo#2110).
         self.clear_unpinned_live_turn(agent_id);
@@ -3215,11 +4017,23 @@ impl Services {
         // Final live-preview values, same contract as the prompt-turn
         // terminal `agent:stream:end` above.
         stamp_preview_fields(&mut end_data, &preview_text_blocks);
+        trace_stream_lifecycle(
+            Some(message_id.as_str()),
+            "message",
+            "agent_stream_end",
+            Some(turn_started.elapsed()),
+            block_count,
+            "complete",
+        );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
         HarnessWakeOutcome {
-            message_id: message_persisted.then_some(message_id),
+            message_id: message_persisted.then_some(message_id.clone()),
             empty_response,
+            lifecycle: HarnessWakeLifecycle {
+                correlation_id: message_id,
+                block_count,
+            },
         }
     }
 
@@ -3328,6 +4142,7 @@ impl Services {
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
+        lifecycle: &HarnessWakeLifecycle,
         empty_wake_response: bool,
     ) {
         if self.has_ready_to_send(agent_id) {
@@ -3337,6 +4152,9 @@ impl Services {
             );
             return;
         }
+        // Surface an attention request the wake turn raised mid-flight before
+        // the idle emit (same ordering as the prompt-turn idle).
+        self.flush_deferred_attention(agent_id, workspace_id).await;
         let mut data = json!({
             "agentId": agent_id.0,
             "reason": "harness_wake_complete",
@@ -3371,6 +4189,14 @@ impl Services {
             .await;
         self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
             .await;
+        trace_stream_lifecycle(
+            Some(lifecycle.correlation_id.as_str()),
+            "message",
+            "agent_idle",
+            None,
+            lifecycle.block_count,
+            "complete",
+        );
         self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
             .await;
     }
@@ -3428,21 +4254,70 @@ impl Services {
             .await;
     }
 
+    /// Synthesize the standard per-turn usage report from the
+    /// `PromptResponse._meta.usage` whole-prompt bill for providers that
+    /// report usage only there (grok, intent-hq/intent#3803; audit §8.4).
+    /// Called by the turn-end bookkeeping task when the standard `usage`
+    /// field was absent: parses the bill first (cheap, no I/O — most
+    /// providers have no such `_meta` shape) and only then resolves the
+    /// session's provider to gate on
+    /// [`reads_prompt_meta_usage`](crate::usage_semantics::reads_prompt_meta_usage),
+    /// so a non-grok provider that happens to attach a similar `_meta` never
+    /// gets misread. `None` when there is no bill, it is empty, or the
+    /// provider does not report via `_meta` — the caller then proceeds
+    /// exactly as before (report-less turn).
+    pub(crate) async fn prompt_meta_turn_usage(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        meta: Option<&Meta>,
+    ) -> Option<(session::Usage, Option<UsageCost>)> {
+        let bill = crate::usage_semantics::prompt_meta_usage_bill(meta?)?;
+        let provider_id = match self
+            .store
+            .get_agent_session_token_usage(workspace_id, agent_id)
+            .await
+        {
+            Ok((_, _, provider, _)) => resolve_provider_id(
+                provider.as_deref(),
+                derived_default_provider(&self.effective_settings()).as_deref(),
+            ),
+            // Fail closed: without the provider column the gate cannot
+            // confirm a `_meta`-billing provider — skip rather than misread.
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "read provider for _meta usage failed");
+                return None;
+            }
+        };
+        crate::usage_semantics::reads_prompt_meta_usage(provider_id.as_deref()).then_some(bill)
+    }
+
     /// Persist one turn's end-of-turn usage report and refresh the workspace
-    /// tally (§5.23). The report is interpreted as the session's cumulative
-    /// snapshot (see `token_usage::snapshot_from_turn_usage`), so it REPLACES
-    /// the previously stored snapshot; the workspace `TokenUsage` is then
-    /// re-aggregated, persisted, and `workspace:tokenUsage-changed` emitted
-    /// when it changed. Best-effort: errors are logged, never propagated —
-    /// usage bookkeeping must not fail an otherwise-successful turn.
+    /// tally (§5.23). How the report folds into the stored cumulative
+    /// snapshot is provider-keyed (see `usage_semantics`,
+    /// intent-hq/intent#3794/#3795): for spec-compliant cumulative providers
+    /// the mapped report REPLACES the previously stored snapshot; for
+    /// per-turn / last-request providers it SUMS into it. Either way the
+    /// STORED snapshot remains cumulative per ACP session — the recreate
+    /// baseline fold (monorepo#737) is unaffected. The workspace
+    /// `TokenUsage` is then re-aggregated, persisted, and
+    /// `workspace:tokenUsage-changed` emitted when it changed. Best-effort:
+    /// errors are logged, never propagated — usage bookkeeping must not fail
+    /// an otherwise-successful turn.
     ///
     /// `cost` is the latest ACP `usage_update` cost observed during the turn,
-    /// also cumulative per ACP session (latest wins). The two reports are
+    /// cumulative per ACP session (latest wins). The two reports are
     /// independent — a provider may send either alone — so each part of the
     /// stored snapshot falls back to its previously persisted value when this
     /// turn carried no fresh report for it: a cost-only turn never zeroes the
     /// counters, and a counters-only turn never drops a cost already
     /// reported for the session.
+    ///
+    /// Exception: for a provider whose cost arrives on the per-turn
+    /// `_meta.usage` bill (grok, #3803 — `reads_prompt_meta_usage`), `cost`
+    /// covers the just-finished prompt only, so it SUMS into the stored cost
+    /// (`UsageCost::merge`) instead of replacing it — mirroring the counters'
+    /// `PerTurn` fold.
     pub(crate) async fn persist_turn_token_usage(
         &self,
         agent_id: &AgentId,
@@ -3450,31 +4325,86 @@ impl Services {
         usage: Option<&session::Usage>,
         cost: Option<UsageCost>,
     ) {
-        let stored = if usage.is_none() || cost.is_none() {
-            match self
-                .store
-                .get_agent_session_token_usage(workspace_id, agent_id)
-                .await
-            {
-                Ok((_, _, _, stored)) => stored,
-                // Degrade, never drop: the read only recovers the half of the
-                // snapshot this turn carries no fresh report for, so a failure
-                // must not discard the half we do have. The lost fallback is
-                // self-healing — both reports are cumulative, so the next one
-                // restores it.
-                Err(e) => {
-                    tracing::warn!(agent = %agent_id, error = %e, "read prior token usage failed");
-                    None
-                }
+        // The session row is read unconditionally: the stored snapshot backs
+        // both the missing-half fallback and the SUM accumulation, and the
+        // provider column keys the report semantics. The configured default
+        // is passed through so the resolution mirrors the spawn precedence
+        // exactly: a session with `provider = NULL` actually runs on the
+        // settings-derived default, and classifying it as the Cumulative
+        // default would reintroduce the undercount for a SUM default
+        // provider (#3794/#3795).
+        let (stored, semantics, per_turn_cost, thought_subset) = match self
+            .store
+            .get_agent_session_token_usage(workspace_id, agent_id)
+            .await
+        {
+            Ok((_, _, provider, stored)) => {
+                let provider_id = resolve_provider_id(
+                    provider.as_deref(),
+                    derived_default_provider(&self.effective_settings()).as_deref(),
+                );
+                (
+                    stored,
+                    crate::usage_semantics::usage_report_semantics(provider_id.as_deref()),
+                    crate::usage_semantics::reads_prompt_meta_usage(provider_id.as_deref()),
+                    crate::usage_semantics::reports_thought_subset_of_output(
+                        provider_id.as_deref(),
+                    ),
+                )
             }
-        } else {
-            None
+            // Degrade, never drop: with no readable prior snapshot the report
+            // is persisted as-is (the semantics fall to the REPLACE default —
+            // a SUM provider under-counts this one turn rather than
+            // re-counting or dropping history).
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "read prior token usage failed");
+                (
+                    None,
+                    crate::usage_semantics::UsageReportSemantics::Cumulative,
+                    false,
+                    false,
+                )
+            }
         };
         let mut snapshot = match usage {
-            Some(usage) => token_usage::snapshot_from_turn_usage(usage),
+            Some(usage) => {
+                let mut report = token_usage::snapshot_from_turn_usage(usage);
+                if thought_subset {
+                    // codex reports thoughtTokens ⊂ outputTokens; normalize
+                    // to the disjoint storage convention (#3796).
+                    crate::usage_semantics::carve_thought_from_output(&mut report);
+                }
+                if semantics.sums_reports() {
+                    // Per-turn / last-request report: SUM into the stored
+                    // cumulative snapshot (#3794/#3795).
+                    let mut acc = stored.clone().unwrap_or_default();
+                    token_usage::add_totals(&mut acc, &report);
+                    acc
+                } else {
+                    // Cumulative report: the mapped report IS the snapshot.
+                    report
+                }
+            }
             None => stored.clone().unwrap_or_default(),
         };
-        snapshot.cost = cost.or_else(|| stored.and_then(|s| s.cost));
+        let stored_cost = stored.and_then(|s| s.cost);
+        snapshot.cost = if per_turn_cost {
+            // Per-turn `_meta.usage` bill (#3803): the fresh figure covers
+            // one prompt — SUM with the stored session cost. `merge` also
+            // covers the either-half-absent fallbacks.
+            //
+            // INVARIANT: SUM is safe only because a `reads_prompt_meta_usage`
+            // provider's costs all originate from per-turn meta bills — grok
+            // never emits `usage_update` costs (audit §8.1), so the cumulative
+            // figures `persist_cost_only_ordered` routes through here (and the
+            // seam's `turn_cost.or(cost)` preference) can never reach this
+            // branch. If grok ever grows `usage_update` costs, key this on the
+            // cost's SOURCE (meta bill vs usage_update), not the provider.
+            UsageCost::merge(stored_cost.as_ref(), cost.as_ref())
+        } else {
+            // Cumulative `usage_update` cost: latest wins, stored fallback.
+            cost.or(stored_cost)
+        };
         if let Err(e) = self
             .store
             .set_agent_session_token_usage(workspace_id, agent_id, &snapshot)
@@ -3496,18 +4426,21 @@ impl Services {
     }
 
     /// Record one finished prompt turn into the global `usage_stats_hourly`
-    /// store (usage-stats cards): the per-turn token delta — the new
-    /// cumulative snapshot minus the previously persisted one, clamped ≥ 0
-    /// per counter — plus, for completed turns only (agent runs = completed
-    /// prompt turns), a `runs` increment and the turn's wall-clock duration
-    /// folded into the bucket's `longest_run_ms` MAX. Counters land in the
-    /// current UTC hour bucket keyed by the session's stats model key —
-    /// normalized model name, falling back to the provider id for
-    /// placeholder/absent models, `"unknown"` only when the provider is
-    /// unknowable too (D13) — with no workspace dimension, stamped with the
-    /// daemon's local wall-clock (D12). MUST run BEFORE
-    /// `persist_turn_token_usage` replaces the session snapshot the delta is
-    /// computed against — the per-agent chained bookkeeping task spawned in
+    /// store (usage-stats cards): the per-turn token delta — provider-keyed
+    /// (see `usage_semantics`, intent-hq/intent#3794/#3795): for cumulative
+    /// providers the new snapshot minus the previously persisted one,
+    /// clamped ≥ 0 per counter; for per-turn / last-request providers the
+    /// report itself IS the delta (no subtraction) — plus, for completed
+    /// turns only (agent runs = completed prompt turns), a `runs` increment
+    /// and the turn's wall-clock duration folded into the bucket's
+    /// `longest_run_ms` MAX. Counters land in the current UTC hour bucket
+    /// keyed by the session's stats model key — normalized model name,
+    /// falling back to the provider id for placeholder/absent models,
+    /// `"unknown"` only when the provider is unknowable too (D13) — with no
+    /// workspace dimension, stamped with the daemon's local wall-clock
+    /// (D12). MUST run BEFORE `persist_turn_token_usage` updates the session
+    /// snapshot the cumulative delta is computed against — the per-agent
+    /// chained bookkeeping task spawned in
     /// [`run_prompt_turn`](Self::run_prompt_turn) calls the two in that
     /// order. Best-effort: errors are logged, never propagated — stats
     /// bookkeeping must not fail a turn.
@@ -3536,11 +4469,40 @@ impl Services {
                 (None, None, None, None, false)
             }
         };
+        // Resolution mirrors the spawn precedence (provider field →
+        // configured default) so a session with `provider = NULL` — which
+        // actually runs on the settings-derived default — keys the correct
+        // report semantics instead of falling to the Cumulative default
+        // (#3794/#3795). A still-unresolvable provider falls to the
+        // `"unknown"` stats tail (and the cumulative semantics default
+        // below).
+        let provider_id = prev_readable
+            .then(|| {
+                resolve_provider_id(
+                    provider.as_deref(),
+                    derived_default_provider(&self.effective_settings()).as_deref(),
+                )
+            })
+            .flatten();
+        let semantics = crate::usage_semantics::usage_report_semantics(provider_id.as_deref());
+        // codex reports thoughtTokens ⊂ outputTokens; normalize each mapped
+        // report to the disjoint storage convention (#3796) — same carve as
+        // the session-snapshot seam so the stats delta matches what
+        // `persist_turn_token_usage` banks.
+        let map_report = |u: &session::Usage| {
+            let mut report = token_usage::snapshot_from_turn_usage(u);
+            if crate::usage_semantics::reports_thought_subset_of_output(provider_id.as_deref()) {
+                crate::usage_semantics::carve_thought_from_output(&mut report);
+            }
+            report
+        };
         let tokens = match usage {
-            Some(u) if prev_readable => usage_stats::turn_token_delta(
-                prev.as_ref(),
-                &token_usage::snapshot_from_turn_usage(u),
-            ),
+            // Per-turn / last-request report: the report IS the turn's delta
+            // (no snapshot subtraction — #3794/#3795).
+            Some(u) if semantics.sums_reports() => map_report(u),
+            Some(u) if prev_readable => {
+                usage_stats::turn_token_delta(prev.as_ref(), &map_report(u))
+            }
             _ => intent_core::TokenUsageTotals::default(),
         };
         let delta = intent_store::UsageStatsDelta {
@@ -3564,13 +4526,6 @@ impl Services {
         let now = turn_end;
         let bucket = usage_stats::hour_bucket_utc(now);
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
-        // Stats attribution only: no configured-default upgrade here (unlike
-        // the spawn-adjacent call sites above), matching the pre-existing
-        // `usage_stats.rs` helpers this mirrors — out of scope for D2. An
-        // unresolvable provider falls to the `"unknown"` stats tail.
-        let provider_id = prev_readable
-            .then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None))
-            .flatten();
         let model = usage_stats::stats_model_key(
             model.as_deref(),
             resolved_model.as_deref(),
@@ -3605,6 +4560,46 @@ impl Services {
                 }
                 if let Err(e) = self.store.add_usage_rate(&bucket, &part).await {
                     tracing::warn!(agent = %agent_id, error = %e, "record turn usage rate failed");
+                }
+            }
+        }
+    }
+
+    /// Mid-turn heavy-payload prestage (0109, intent-hq/intent#3884 part 2):
+    /// stage each listed transcript block's over-threshold body into
+    /// `agent_message_payload` under the live turn's message id and substitute
+    /// the returned slim placeholder in place, so the end-of-turn
+    /// [`Store::append_agent_message_prestaged`] adopts the rows instead of
+    /// re-writing the heavy bytes. Under-threshold (or already-placeholder)
+    /// blocks stage nothing and stay untouched. Fail-soft: a staging error
+    /// leaves the full block inline — the one-shot extraction inside the
+    /// final append still externalizes it — so a mid-turn store hiccup never
+    /// fails the turn.
+    async fn prestage_completed_tool_blocks(
+        &self,
+        agent_id: &AgentId,
+        transcript: &mut Transcript,
+        ordinals: impl IntoIterator<Item = usize>,
+    ) {
+        for ordinal in ordinals {
+            let Some(block) = transcript.blocks.get(ordinal) else {
+                continue;
+            };
+            match self
+                .store
+                .prestage_agent_message_payload(agent_id, &transcript.message_id, ordinal, block)
+                .await
+            {
+                Ok(Some(placeholder)) => transcript.blocks[ordinal] = placeholder,
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        message_id = %transcript.message_id,
+                        block_ordinal = ordinal,
+                        error = %e,
+                        "mid-turn payload prestage failed — leaving block inline (#3884)"
+                    );
                 }
             }
         }
@@ -3693,16 +4688,23 @@ impl Services {
                     .await;
                 }
             }
-            MappedUpdate::UsageCost(cost) => {
+            MappedUpdate::Usage(usage) => {
+                // Context-window occupancy (intent-hq/intent#3797): recorded
+                // latest-wins in the in-memory per-agent registry — a signal
+                // for the `contextUsage` read overlay, NEVER folded into the
+                // token tallies.
+                self.record_context_usage(agent_id, usage.used, usage.size);
                 // §5.23: cumulative per ACP session, so the latest report
                 // wins. Recorded on the transcript and persisted with the
                 // turn's token snapshot; it materializes no transcript
                 // content and publishes no event, so this is NOT a turn
                 // update (the redrive eligibility must stay unaffected).
-                transcript.usage_cost = Some(UsageCost {
-                    amount: cost.amount,
-                    currency: cost.currency,
-                });
+                if let Some(cost) = usage.cost {
+                    transcript.usage_cost = Some(UsageCost {
+                        amount: cost.amount,
+                        currency: cost.currency,
+                    });
+                }
                 return false;
             }
             MappedUpdate::ToolCall(tc) => {
@@ -3809,6 +4811,35 @@ impl Services {
                 }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_TOOL_CALL, data)
                     .await;
+                // Mid-turn heavy-payload prestage (0109, intent-hq/intent#3884
+                // part 2): a terminal status means this call's blocks are
+                // final — stage any over-threshold `tool_use.input` /
+                // `tool_result.output` body into `agent_message_payload` NOW
+                // (under the turn's minted message id) and substitute the
+                // returned placeholder in the transcript, so the end-of-turn
+                // append writes only the remaining delta. The live event
+                // above already carried the full content. A re-patched block
+                // (record_tool stripped its slim flags) re-stages here —
+                // upsert in place. Runs AFTER the event publish so staging
+                // latency never delays the live stream.
+                if tc.status == "completed" || tc.status == "error" {
+                    // Sync the live-turn slot FIRST: the staging await below
+                    // is a suspension point, and an interruption that pins the
+                    // slot mid-await must flush a snapshot that already
+                    // carries this update (inline heavy body — the prestaged
+                    // append's reconcile then drops any newly staged row as
+                    // stale and extracts one-shot), never a pre-update
+                    // snapshot adopted under fresher staged rows.
+                    self.update_live_turn(agent_id, transcript);
+                    self.prestage_completed_tool_blocks(
+                        agent_id,
+                        transcript,
+                        [Some(block_index), recorded.result_index]
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .await;
+                }
                 // External activity signal (§7): tool calls keep the liveness
                 // tick (and the pushed preview) alive through tool-heavy
                 // stretches where no assistant text streams — otherwise a
@@ -3876,6 +4907,62 @@ impl Services {
             }),
         )
         .await;
+    }
+
+    /// Publish the mid-turn `stalled` `agent:stream:status`
+    /// (intent-hq/monorepo#3402): the [`Self::publish_status_event`] shape
+    /// plus the additive `silentMs` field carrying the measured silence at
+    /// emission, `level: "warn"`. Advisory only — emitted while the turn keeps
+    /// running; the FE clears the presentation on `resumed`, any new stream
+    /// delta, or turn end/failure.
+    async fn publish_stalled_status_event(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        silent_ms: u64,
+    ) {
+        self.publish_agent_event(
+            workspace_id,
+            agent_id,
+            AGENT_STREAM_STATUS,
+            json!({
+                "agentId": agent_id.0,
+                "workspaceId": workspace_id,
+                "phase": "stalled",
+                "message": format!("No model activity for {}s", silent_ms / 1000),
+                "level": "warn",
+                "silentMs": silent_ms,
+                "timestamp": now_epoch_ms(),
+            }),
+        )
+        .await;
+    }
+
+    /// Clear an emitted mid-turn stall on stream activity
+    /// (intent-hq/monorepo#3402): when a `stalled` status is outstanding,
+    /// publish the paired `resumed` `agent:stream:status` and re-arm the
+    /// detector. Called from EVERY point `run_prompt_turn` observes a
+    /// `session/update` — the select-loop arm AND the buffered `try_recv`
+    /// drains (`prompt_fut` can win the `select!` with notes still queued;
+    /// without this, a stalled turn that resolves with buffered activity
+    /// would end on `stalled` → `stream:end` with no `resumed` between).
+    async fn clear_stream_stall(
+        &self,
+        stall_emitted: &mut bool,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        if *stall_emitted {
+            *stall_emitted = false;
+            self.publish_status_event(
+                workspace_id,
+                agent_id,
+                "resumed",
+                "Stream activity resumed",
+                "info",
+            )
+            .await;
+        }
     }
 
     /// Build and publish an agent streaming event onto the bus (§6.6/§10).

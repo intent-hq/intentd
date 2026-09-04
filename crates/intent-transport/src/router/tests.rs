@@ -50,6 +50,7 @@ fn sample_ws() -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -147,6 +148,36 @@ impl WorkspaceApi for FakeApi {
                     "breakdown": [],
                 },
                 "refreshing": true,
+            }))
+        })
+    }
+    fn workspace_local_changes(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(serde_json::json!({
+                "roots": [
+                    {
+                        "kind": "primary",
+                        "path": "/tmp/ws-1",
+                        "branch": "feat/x",
+                        "hasRemoteRefs": true,
+                        "unpushedCount": 3,
+                        "uncommittedCount": 2,
+                    },
+                    {
+                        "kind": "secondary",
+                        "gitRootId": "gr-1",
+                        "path": "/tmp/ws-1/vendor/sub",
+                        "hasRemoteRefs": false,
+                        "unpushedCount": 0,
+                        "uncommittedCount": 0,
+                        "error": "boom",
+                    },
+                ],
+                "hasUnpushedCommits": true,
+                "hasUncommittedChanges": true,
             }))
         })
     }
@@ -633,6 +664,7 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         _workspace_id: WorkspaceId,
@@ -641,6 +673,7 @@ impl WorkspaceApi for FakeApi {
         _text: Option<String>,
         status: Option<String>,
         _expected: Option<String>,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
         Box::pin(async move {
             Ok(TaskUpdateResult {
@@ -872,6 +905,10 @@ impl WorkspaceApi for FakeApi {
                     files: vec![],
                     has_uncommitted_changes: false,
                     has_untracked_files: false,
+                    files_truncated: false,
+                    total_files: None,
+                    has_upstream: false,
+                    unpushed_count: None,
                 });
             }
             if force_refresh {
@@ -883,6 +920,10 @@ impl WorkspaceApi for FakeApi {
                     files: vec![],
                     has_uncommitted_changes: false,
                     has_untracked_files: false,
+                    files_truncated: false,
+                    total_files: None,
+                    has_upstream: false,
+                    unpushed_count: None,
                 });
             }
             if workspace_id.as_str() == "empty" {
@@ -894,6 +935,10 @@ impl WorkspaceApi for FakeApi {
                     files: vec![],
                     has_uncommitted_changes: false,
                     has_untracked_files: false,
+                    files_truncated: false,
+                    total_files: None,
+                    has_upstream: false,
+                    unpushed_count: None,
                 });
             }
             Ok(GitStatus {
@@ -911,6 +956,10 @@ impl WorkspaceApi for FakeApi {
                 }],
                 has_uncommitted_changes: true,
                 has_untracked_files: false,
+                files_truncated: false,
+                total_files: None,
+                has_upstream: true,
+                unpushed_count: Some(1),
             })
         })
     }
@@ -1265,6 +1314,7 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -1273,12 +1323,22 @@ impl WorkspaceApi for FakeApi {
         _linked_note_id: Option<NoteId>,
         files: Option<Vec<String>>,
         _user_requested: bool,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
         Box::pin(async move {
+            // Mirrors the services-level resolution: an unknown/foreign id
+            // fails exactly like the six §5.6 root-scoped reads.
+            let hash = match &git_root_id {
+                Some(id) if id.as_str() == "root-1" => "root-def456",
+                Some(id) => {
+                    return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
+                }
+                None => "def456",
+            };
             let files = files.unwrap_or_else(|| vec!["src/a.ts".to_string()]);
             let file_count = i64::try_from(files.len()).expect("value fits in i64");
             Ok(GitAgentCommitResult {
-                hash: "def456".to_string(),
+                hash: hash.to_string(),
                 files,
                 file_count,
             })
@@ -2234,6 +2294,58 @@ async fn success_results_are_objects() {
     assert!(notes["result"]["notes"].is_array());
 }
 
+/// The `note.list` `projection` param (§5.2, monorepo#3573): absent /
+/// `null` / `"full"` serve identical full rows (structural `Value`
+/// equality), `"slim"` serves rows with `content` replaced by
+/// `contentPreview` + `contentLength` (every other field untouched), and
+/// any other value is `-32602` naming the accepted values.
+#[tokio::test]
+async fn note_list_projection_param() {
+    let full =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"note.list","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.list","params":{"workspaceId":"ws-1","projection":null}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.list","params":{"workspaceId":"ws-1","projection":"full"}}"#,
+    ] {
+        let v = call(msg).await.unwrap();
+        assert_eq!(v["result"], full["result"], "identical full rows: {msg}");
+    }
+    let full_row = &full["result"]["notes"][0];
+    assert_eq!(full_row["content"], "# Hi");
+    assert!(full_row.get("contentPreview").is_none());
+    assert!(full_row.get("contentLength").is_none());
+
+    let slim = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"note.list","params":{"workspaceId":"ws-1","projection":"slim"}}"#,
+    )
+    .await
+    .unwrap();
+    let row = &slim["result"]["notes"][0];
+    assert!(row.get("content").is_none(), "slim omits content: {row}");
+    assert_eq!(row["contentPreview"], "# Hi");
+    assert_eq!(row["contentLength"], 4);
+    // Every other field matches the full row.
+    for (k, v) in full_row.as_object().unwrap() {
+        if k != "content" {
+            assert_eq!(&row[k], v, "field {k} unchanged");
+        }
+    }
+
+    for bad in [r#""compact""#, "5", "true", "{}"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"note.list","params":{{"workspaceId":"ws-1","projection":{bad}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "projection={bad}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("projection must be \"slim\" or \"full\"")
+        );
+    }
+}
+
 #[tokio::test]
 async fn parse_error_is_minus_32700() {
     let v = call("{not json").await.unwrap();
@@ -2567,6 +2679,59 @@ async fn workspace_disk_usage_missing_id_is_minus_32602() {
 async fn workspace_disk_usage_not_found_maps_to_workspace_err() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
+/// `workspace.localChanges` returns the service payload verbatim:
+/// `{ roots, hasUnpushedCommits, hasUncommittedChanges }` with no extra
+/// envelope nesting (PROTOCOL §5.1).
+#[tokio::test]
+async fn workspace_local_changes_returns_payload() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.localChanges","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["hasUnpushedCommits"], serde_json::json!(true));
+    assert_eq!(
+        v["result"]["hasUncommittedChanges"],
+        serde_json::json!(true)
+    );
+    let roots = v["result"]["roots"].as_array().expect("roots array");
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0]["kind"], serde_json::json!("primary"));
+    assert!(roots[0].get("gitRootId").is_none());
+    assert_eq!(roots[0]["branch"], serde_json::json!("feat/x"));
+    assert_eq!(roots[0]["unpushedCount"], serde_json::json!(3));
+    assert_eq!(roots[0]["uncommittedCount"], serde_json::json!(2));
+    assert_eq!(roots[1]["kind"], serde_json::json!("secondary"));
+    assert_eq!(roots[1]["gitRootId"], serde_json::json!("gr-1"));
+    assert_eq!(roots[1]["error"], serde_json::json!("boom"));
+}
+
+#[tokio::test]
+async fn workspace_local_changes_missing_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.localChanges","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+}
+
+#[tokio::test]
+async fn workspace_local_changes_not_found_maps_to_workspace_err() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.localChanges","params":{"workspaceId":"missing"}}"#,
     )
     .await
     .unwrap();
@@ -3606,6 +3771,18 @@ async fn agent_methods_validate_required_params() {
         serde_json::json!("workspaceId is required")
     );
 
+    // agent.list with the contradictory includeRetired + retiredOnly pair.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","includeRetired":true,"retiredOnly":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("includeRetired and retiredOnly are mutually exclusive")
+    );
+
     // agent.get without agentId.
     let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"agent.get","params":{}}"#)
         .await
@@ -4615,6 +4792,51 @@ async fn git_agent_commit_missing_message_is_minus_32602() {
 }
 
 #[tokio::test]
+async fn git_agent_commit_with_git_root_id_targets_root() {
+    // §5.6 extension (monorepo#2053 follow-up): `gitRootId` targets the
+    // commit at the registered root instead of the workspace worktree.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.agentCommit","params":{"workspaceId":"ws-1","message":"msg","files":["a.ts"],"gitRootId":"root-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["hash"], serde_json::json!("root-def456"));
+    assert_eq!(v["result"]["files"], serde_json::json!(["a.ts"]));
+    assert_eq!(v["result"]["fileCount"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn git_agent_commit_unknown_git_root_id_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.agentCommit","params":{"workspaceId":"ws-1","message":"msg","gitRootId":"nope"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    // Identical message to the six gitRootId-scoped reads (§5.6): the
+    // domain error maps through `domain_to_rpc`, which prefixes
+    // `invalid params:` exactly like the `git.status` arm above.
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+}
+
+#[tokio::test]
+async fn git_agent_commit_empty_git_root_id_is_treated_as_absent() {
+    // §5.6: an empty/whitespace-only `gitRootId` reads as absent — the
+    // primary-worktree behavior, not an unknown-root error.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.agentCommit","params":{"workspaceId":"ws-1","message":"msg","files":["a.ts"],"gitRootId":"  "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["hash"], serde_json::json!("def456"));
+}
+
+#[tokio::test]
 async fn git_check_merge_conflicts_returns_conflict_shape() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"git.checkMergeConflicts","params":{"workspaceId":"ws-1","targetBranch":"develop"}}"#,
@@ -4652,6 +4874,7 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
         "file-tracking.getChanges",
         "file-tracking.loadCommits",
         "file-tracking.getLineStats",
+        "file-tracking.getAgentLocks",
     ] {
         let msg = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-1"}}}}"#
@@ -4663,7 +4886,11 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
 
 #[tokio::test]
 async fn file_tracking_reads_require_workspace_id() {
-    for method in ["file-tracking.getChanges", "file-tracking.getLineStats"] {
+    for method in [
+        "file-tracking.getChanges",
+        "file-tracking.getLineStats",
+        "file-tracking.getAgentLocks",
+    ] {
         let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
         let v = call(&msg).await.unwrap();
         assert_eq!(err_code(&v), -32602);
@@ -5470,6 +5697,7 @@ async fn github_methods_are_routed_not_unknown() {
         r#"{"jsonrpc":"2.0","id":6,"method":"github.pulls.updateBranch","params":{"owner":"o","repo":"r","number":1}}"#,
         r#"{"jsonrpc":"2.0","id":7,"method":"github.issues.list","params":{"owner":"o","repo":"r"}}"#,
         r#"{"jsonrpc":"2.0","id":8,"method":"github.issues.search","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":14,"method":"github.issues.get","params":{"owner":"o","repo":"r","number":1}}"#,
         r#"{"jsonrpc":"2.0","id":9,"method":"github.listReviewComments","params":{"owner":"o","repo":"r","number":1}}"#,
         r#"{"jsonrpc":"2.0","id":10,"method":"github.replyReviewComment","params":{"owner":"o","repo":"r","number":1,"commentId":2,"body":"b"}}"#,
         r#"{"jsonrpc":"2.0","id":11,"method":"github.getReviewThreads","params":{"owner":"o","repo":"r","number":1}}"#,
@@ -5489,6 +5717,9 @@ async fn github_missing_required_params_are_minus_32602() {
         r#"{"jsonrpc":"2.0","id":2,"method":"github.pulls.get","params":{"owner":"o","repo":"r"}}"#,
         // missing number
         r#"{"jsonrpc":"2.0","id":3,"method":"github.pulls.merge","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"github.issues.get","params":{"owner":"o","repo":"r"}}"#,
+        // missing owner
+        r#"{"jsonrpc":"2.0","id":8,"method":"github.issues.get","params":{"repo":"r","number":1}}"#,
         // missing required create fields
         r#"{"jsonrpc":"2.0","id":4,"method":"github.pulls.create","params":{"owner":"o","repo":"r","title":"t"}}"#,
         // missing commentId / body
@@ -5769,9 +6000,38 @@ mod send_message_payload_forwarding {
         handle_message(&api, send).await.expect("send response");
         assert!(api.send.lock().unwrap().message_metadata.is_none());
     }
+
+    /// The sender-attribution fields (PROTOCOL §5.5) are reserved: they are
+    /// daemon-stamped by the MCP bindings for agent callers only, so the
+    /// user-origin RPC front door strips them — a wire caller must not be
+    /// able to forge an agent-origin send (the fields gate the A2A sender
+    /// header, the single-pending-message guard and `removeQueuedMessage`
+    /// ownership). Other metadata fields still pass through verbatim.
+    #[tokio::test]
+    async fn send_message_strips_reserved_attribution_fields() {
+        let api = RecordingApi::default();
+        let send = r#"{
+            "jsonrpc":"2.0","id":13,"method":"agent.sendMessage",
+            "params":{
+                "workspaceId":"ws-1","agentId":"agent-1","content":"hi",
+                "messageMetadata":{
+                    "fromAgentId":"agent-spoof",
+                    "fromAgentName":"Fake Coordinator",
+                    "source":"system"
+                }
+            }
+        }"#;
+        handle_message(&api, send).await.expect("send response");
+        let cap = api.send.lock().unwrap().clone();
+        assert_eq!(
+            cap.message_metadata,
+            Some(json!({"source": "system"})),
+            "attribution fields must be stripped, other fields preserved"
+        );
+    }
 }
 
-/// `agent.dismissQuestions` (PROTOCOL §5.5, question hold): the dispatch arm
+/// `agent.dismissQuestions` (PROTOCOL §5.5, pending questions): the dispatch arm
 /// forwards `workspaceId`/`agentId`/`messageId` verbatim and rejects missing
 /// params with `-32602` before any API call.
 mod dismiss_questions_dispatch {

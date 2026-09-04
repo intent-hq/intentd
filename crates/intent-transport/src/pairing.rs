@@ -22,7 +22,10 @@ use intent_core::{Error, Result};
 pub(crate) const PAIRING_PAYLOAD_VERSION: u32 = 1;
 
 /// Build the pairing payload URI:
-/// `intent://pair?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&token=<t>`.
+/// `intent://pair?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&token=<t>[&tc=<addr>]`.
+///
+/// The `tc=` parameter is additive (appended only when the tailcat tunnel is
+/// running); clients that don't know it tolerate the unknown query param.
 ///
 /// Query values are percent-encoded defensively. Generated values (dotted-quad
 /// IPv4 hosts, colon-separated hex fingerprints, 64-char hex tokens) pass
@@ -34,17 +37,22 @@ pub(crate) fn build_pairing_uri(
     port: u16,
     fingerprint: &str,
     token: &str,
+    tc_address: Option<&str>,
 ) -> String {
     let hosts = hosts
         .iter()
         .map(|h| encode_query_value(h))
         .collect::<Vec<_>>()
         .join(",");
-    format!(
+    let mut uri = format!(
         "intent://pair?v={PAIRING_PAYLOAD_VERSION}&host={hosts}&port={port}&fp={}&token={}",
         encode_query_value(fingerprint),
         encode_query_value(token)
-    )
+    );
+    if let Some(tc) = tc_address {
+        let _ = write!(uri, "&tc={}", encode_query_value(tc));
+    }
+    uri
 }
 
 /// Percent-encode a query value, passing through unreserved characters
@@ -134,30 +142,61 @@ pub(crate) async fn handle(
 /// Build the `pairing.getInfo` result JSON: `{ uri, hosts, port, fingerprint,
 /// token, version }`. Errors clearly when the TCP listener is not running —
 /// there is no port to embed in the payload, so pairing is impossible
-/// ([`Error::ListenerDown`], surfaced with `error.data.code = "listener-down"`).
+/// ([`Error::ListenerDown`], surfaced with `error.data.code = "listener-down"`)
+/// — and when there is no dialable route at all (no non-loopback host and no
+/// tunnel): a payload without a route would report pairing as successful while
+/// no other device can connect through it.
 async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let snapshot = provider.pairing_snapshot().await;
     let port = snapshot.port.ok_or(Error::ListenerDown)?;
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
-    // Bind-aware hosts: a specific bind (loopback included) advertises exactly
-    // that address; only an unspecified/unknown bind enumerates local IPs.
+    // Bind-aware hosts: a specific bind advertises exactly its non-loopback
+    // addresses (loopback is never dialable from another device, so it is
+    // filtered even when bound); only an unspecified/unknown bind enumerates
+    // local IPs. Pairing needs at least one dialable route — a direct host or
+    // the tunnel — so an empty set with no tunnel errors instead of minting a
+    // payload no other device can connect through. With the tunnel up, an
+    // empty host list still pairs: the tc= route carries it.
     let hosts = pairing_hosts(&snapshot);
-    if hosts.is_empty() {
-        return Err(Error::Unsupported(
+    if hosts.is_empty() && snapshot.tc_address.is_none() {
+        let enumerated = snapshot
+            .bind_addresses
+            .as_deref()
+            .is_none_or(|a| a.is_empty() || a.iter().any(std::net::IpAddr::is_unspecified));
+        let msg = if enumerated {
             "no non-loopback IPv4 address found — connect this machine to a network before pairing"
-                .to_string(),
-        ));
+        } else {
+            "listener is bound to loopback only and no tunnel is active — set \
+             server.bindAddress to a LAN address or enable the tunnel \
+             (server.tunnel.enabled) before pairing"
+        };
+        return Err(Error::Unsupported(msg.to_string()));
     }
-    let uri = build_pairing_uri(&hosts, port, &cert.fingerprint256, &token);
-    Ok(json!({
+    let uri = build_pairing_uri(
+        &hosts,
+        port,
+        &cert.fingerprint256,
+        &token,
+        snapshot.tc_address.as_deref(),
+    );
+    let mut result = json!({
         "uri": uri,
         "hosts": hosts,
         "port": port,
         "fingerprint": cert.fingerprint256,
         "token": token,
         "version": PAIRING_PAYLOAD_VERSION,
-    }))
+    });
+    // Additive tunnel route (presence-detected): omitted when the tunnel is
+    // disabled or down, so older clients are unaffected.
+    if let Some(tc) = &snapshot.tc_address {
+        result
+            .as_object_mut()
+            .expect("get_info_json literal is an object")
+            .insert("tcAddress".into(), tc.clone().into());
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

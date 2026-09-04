@@ -1,6 +1,7 @@
 //! Unit tests: open a temp `SQLite` DB, run migrations, and round-trip
 //! workspaces and notes including the `include_archived` filter.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use intent_core::{
@@ -72,6 +73,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived,
         archived_at: if archived { Some(now_iso()) } else { None },
         task_stats: None,
@@ -101,7 +103,8 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+            110, 111, 112, 113, 114, 115, 116, 117, 118
         ]
     );
     assert_eq!(
@@ -111,7 +114,8 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+            110, 111, 112, 113, 114, 115, 116, 117, 118
         ]
     );
 }
@@ -316,6 +320,52 @@ async fn workspace_round_trip_and_archive_filter() {
     assert_eq!(got.path, Some("/tmp/ws-meta".to_string()));
     assert_eq!(got.repository_path, Some("/tmp/repo".to_string()));
     assert!(!got.archived);
+}
+
+/// `unarchive_workspace_if_archived` is a single atomic flip: the archived
+/// row flips exactly once (`true`), a repeat call — or one against an
+/// already-Active row — declines (`false`, row untouched), and a missing
+/// workspace reports `NotFound`.
+#[tokio::test]
+async fn workspace_conditional_unarchive_flips_exactly_once() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&id, "Archived WS", true))
+        .await
+        .expect("insert archived");
+
+    let ts = now_iso();
+    let flipped = store
+        .unarchive_workspace_if_archived(&id, &ts)
+        .await
+        .expect("first flip");
+    assert!(flipped, "the archived row flips");
+    let row = store.get_workspace(&id).await.expect("row after flip");
+    assert!(!row.archived);
+    assert_eq!(row.status, WorkspaceStatus::Active);
+    assert_eq!(row.archived_at, None);
+    assert_eq!(row.updated_at, ts);
+
+    // The losing racer: the row is Active now, so the guard declines and
+    // nothing (including `updated_at`) is rewritten.
+    let again = store
+        .unarchive_workspace_if_archived(&id, &now_iso())
+        .await
+        .expect("second call");
+    assert!(!again, "an Active row declines the flip");
+    let row = store.get_workspace(&id).await.expect("row after decline");
+    assert_eq!(row.updated_at, ts, "a declined flip touches nothing");
+
+    let missing = store
+        .unarchive_workspace_if_archived(&WorkspaceId::new(), &now_iso())
+        .await;
+    assert!(
+        matches!(missing, Err(Error::NotFound(_))),
+        "missing workspace reports NotFound, got {missing:?}"
+    );
 }
 
 /// `bump_workspace_last_activity` (monorepo#1580) is scoped and monotonic:
@@ -605,6 +655,45 @@ async fn workspace_pull_requests_round_trip_and_clear() {
     assert!(reread.pull_requests.is_none());
 }
 
+/// `context_links` round-trips through insert → get and clears via a full-row
+/// update (`None` drops the JSON column, so the wire shape omits it again).
+#[tokio::test]
+async fn workspace_context_links_round_trip_and_clear() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    let mut ws = sample_workspace(&id, "Context links", false);
+    let links = vec![
+        intent_core::ContextLink {
+            kind: intent_core::ContextLinkKind::Issue,
+            url: "https://github.com/intent-hq/intent/issues/42".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intent".to_string(),
+            number: 42,
+        },
+        intent_core::ContextLink {
+            kind: intent_core::ContextLinkKind::Pr,
+            url: "https://github.com/intent-hq/intentd/pull/7".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intentd".to_string(),
+            number: 7,
+        },
+    ];
+    ws.context_links = Some(links.clone());
+    store.insert_workspace(&ws).await.expect("insert");
+
+    let got = store.get_workspace(&id).await.expect("get");
+    assert_eq!(got.context_links.as_deref(), Some(&links[..]));
+
+    // Clear via update: `context_links = None` drops the column.
+    let mut cleared = got.clone();
+    cleared.context_links = None;
+    store.update_workspace(&cleared).await.expect("update");
+    let reread = store.get_workspace(&id).await.expect("re-get");
+    assert!(reread.context_links.is_none());
+}
+
 /// `update_workspace_pr_linkage` writes ONLY the PR columns + `updated_at`:
 /// a stale snapshot carrying old values for other columns (title, archived)
 /// must never clobber a concurrent mutation of those columns.
@@ -756,6 +845,95 @@ async fn note_round_trip() {
 
     let fetched = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(fetched.id, note.id);
+}
+
+/// `count_tasks_by_status`: one GROUP BY aggregate over
+/// `json_extract(task_json, '$.status')` keyed by the wire status string —
+/// every task note in the workspace regardless of parent/archive state
+/// except the spec itself (`task.list` population parity), non-task notes
+/// ignored, absent statuses absent, an unknown stored status folded into
+/// `not_started`, and scoped per workspace.
+#[tokio::test]
+async fn count_tasks_by_status_groups_by_wire_status() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mk_note = |id: &str, status: Option<TaskStatus>, archived: bool| Note {
+        id: NoteId::from(id),
+        workspace_id: ws_id.clone(),
+        title: id.to_string(),
+        content: "body".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: archived,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata {
+            task: status.map(|status| TaskMetadata {
+                status,
+                ..Default::default()
+            }),
+        },
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts.clone(),
+    };
+    for (id, status, archived) in [
+        ("t-review", Some(TaskStatus::ReviewRequired), false),
+        ("t-prog-1", Some(TaskStatus::InProgress), false),
+        ("t-prog-2", Some(TaskStatus::InProgress), true),
+        ("t-done", Some(TaskStatus::Complete), false),
+        ("t-cancel", Some(TaskStatus::Cancelled), false),
+        ("n-plain", None, false),
+        // A spec carrying task metadata is excluded, like `task.list`.
+        ("spec", Some(TaskStatus::Blocked), false),
+    ] {
+        store
+            .insert_note(&mk_note(id, status, archived))
+            .await
+            .expect("insert");
+    }
+    // An unrecognised stored status folds into `not_started`.
+    sqlx::query("UPDATE note SET task_json = '{\"status\":\"bogus\"}' WHERE id = 't-done'")
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt status");
+
+    let counts = store.count_tasks_by_status(&ws_id).await.expect("counts");
+    let expected: BTreeMap<String, u64> = [
+        ("cancelled".to_string(), 1),
+        ("in_progress".to_string(), 2),
+        ("not_started".to_string(), 1),
+        ("review_required".to_string(), 1),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(counts, expected);
+    assert!(
+        !counts.contains_key("blocked"),
+        "spec row with task metadata must not be counted: {counts:?}"
+    );
+
+    // Scoped per workspace: another workspace reads empty.
+    let other = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&other, "Other", false))
+        .await
+        .expect("insert other ws");
+    assert!(store
+        .count_tasks_by_status(&other)
+        .await
+        .expect("other counts")
+        .is_empty());
 }
 
 /// `max_note_updated_at` (monorepo#3058): the newest note `updated_at` per
@@ -3390,6 +3568,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,
@@ -3779,9 +3958,10 @@ async fn agent_session_status_only_lookup() {
 }
 
 /// `set_agent_session_resolved_model` (D13/D14) guard: the write lands only
-/// while `model` still equals `expected_model` (`None` matches NULL) — a
-/// mismatch (concurrent `agent.setModel`) returns `false` and leaves
-/// `resolved_model` untouched.
+/// while the NORMALIZED `model` still equals `expected_model` (`None`
+/// matches NULL) — callers hold the model surfaced by reads, which the 0113
+/// backstop always splits — and a mismatch (concurrent `agent.setModel`)
+/// returns `false` and leaves `resolved_model` untouched.
 /// `clear_agent_session_resolved_model` is idempotent (already-NULL column
 /// and absent row are both no-ops).
 #[tokio::test]
@@ -3803,12 +3983,7 @@ async fn agent_session_resolved_model_guard_and_clear() {
 
     // Guard failure: expected_model no longer matches → false, no write.
     let landed = store
-        .set_agent_session_resolved_model(
-            &ws,
-            &agent_id,
-            Some("claude-code:sonnet"),
-            Some("Sonnet 5"),
-        )
+        .set_agent_session_resolved_model(&ws, &agent_id, Some("sonnet"), Some("Sonnet 5"))
         .await
         .expect("guarded write");
     assert!(!landed, "mismatched expected_model must not land");
@@ -3825,12 +4000,13 @@ async fn agent_session_resolved_model_guard_and_clear() {
         .expect("guarded write");
     assert!(!landed, "None expected_model must not match a set model");
 
-    // Guard success: matching expected_model lands the resolution.
+    // Guard success: the split model (what a read of this legacy compound
+    // row surfaces) lands the resolution.
     let landed = store
         .set_agent_session_resolved_model(
             &ws,
             &agent_id,
-            Some("claude-code:claude-fable-5[1m]"),
+            Some("claude-fable-5[1m]"),
             Some("Fable 5"),
         )
         .await
@@ -3844,12 +4020,7 @@ async fn agent_session_resolved_model_guard_and_clear() {
 
     // A None resolution overwrites (clears) via the same guarded write.
     let landed = store
-        .set_agent_session_resolved_model(
-            &ws,
-            &agent_id,
-            Some("claude-code:claude-fable-5[1m]"),
-            None,
-        )
+        .set_agent_session_resolved_model(&ws, &agent_id, Some("claude-fable-5[1m]"), None)
         .await
         .expect("guarded clear");
     assert!(landed);
@@ -5239,6 +5410,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     pr_status: None,
                     active_pull_request: None,
                     pull_requests: None,
+                    context_links: None,
                     archived: false,
                     archived_at: None,
                     task_stats: None,
@@ -5522,6 +5694,43 @@ async fn agent_queue_replace_load_delete_round_trip() {
         .await
         .expect("load queues")
         .is_empty());
+}
+
+/// Regression test for intent-hq/monorepo#3540: the write-through queue
+/// persist used to insert one row per statement, so every send against an
+/// N-entry queue cost O(N) statements. The bulk insert is chunked at 4096
+/// rows per statement — a snapshot crossing the chunk boundary must still
+/// round-trip completely and in order.
+#[tokio::test]
+async fn agent_queue_replace_round_trips_across_chunk_boundary() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .expect("insert session");
+
+    // 4100 rows: one full 4096-row chunk plus a 4-row tail chunk.
+    let rows: Vec<AgentQueueRow> = (0..4100)
+        .map(|i| queue_row(&agent, i, &format!("m{i}")))
+        .collect();
+    store
+        .replace_agent_queue(&agent, &rows)
+        .await
+        .expect("replace queue");
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert_eq!(loaded.len(), 4100);
+    assert!(loaded
+        .iter()
+        .enumerate()
+        .all(|(i, r)| r.position == i64::try_from(i).unwrap()
+            && r.payload["content"] == format!("m{i}").as_str()));
 }
 
 #[tokio::test]
@@ -5935,6 +6144,8 @@ fn sample_hook(id: &HookId, ws: &WorkspaceId, agent: &AgentId, name: &str) -> Ho
         name: name.to_string(),
         code: "return { dispatch: false }".to_string(),
         delay_ms: 60_000,
+        cron: None,
+        run_at: None,
         state: HookState::Scheduled,
         created_at: now_iso(),
         last_run_at: None,
@@ -5982,6 +6193,52 @@ async fn hook_insert_get_round_trip() {
     let missing = HookId("hook-missing".to_string());
     let err = store.get_hook(&missing).await.expect_err("missing hook");
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+}
+
+/// Schedule-kind columns: `cron` / `run_at` round-trip when set, and a
+/// legacy row inserted without them (pre-0106 column list) reads back with
+/// both `None`.
+#[tokio::test]
+async fn hook_schedule_kind_columns_round_trip_and_legacy_null() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+
+    let cron_id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    let mut cron_hook = sample_hook(&cron_id, &ws, &agent, "cron-kind");
+    cron_hook.delay_ms = 0;
+    cron_hook.cron = Some("*/5 * * * *".to_string());
+    store.insert_hook(&cron_hook).await.expect("insert cron");
+    assert_eq!(store.get_hook(&cron_id).await.expect("get"), cron_hook);
+
+    let run_at_id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    let mut run_at_hook = sample_hook(&run_at_id, &ws, &agent, "run-at-kind");
+    run_at_hook.delay_ms = 0;
+    run_at_hook.run_at = Some("2027-01-02T03:04:05Z".to_string());
+    store.insert_hook(&run_at_hook).await.expect("insert runAt");
+    assert_eq!(store.get_hook(&run_at_id).await.expect("get"), run_at_hook);
+
+    // A legacy row (inserted without the 0106 columns) reads back null.
+    let legacy_id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    sqlx::query(
+        "INSERT INTO hook (hook_id, workspace_id, agent_id, name, code, delay_ms, state, \
+         created_at, run_count, perpetual, dispatch_count) \
+         VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, 0, 0, 0)",
+    )
+    .bind(&legacy_id.0)
+    .bind(&ws.0)
+    .bind(&agent.0)
+    .bind("legacy")
+    .bind("return { dispatch: false }")
+    .bind(60_000_i64)
+    .bind(now_iso())
+    .execute(store.write_pool())
+    .await
+    .expect("insert legacy row");
+    let legacy = store.get_hook(&legacy_id).await.expect("get legacy");
+    assert_eq!(legacy.cron, None);
+    assert_eq!(legacy.run_at, None);
+    assert_eq!(legacy.delay_ms, 60_000);
 }
 
 /// A perpetual hook round-trips its `perpetual` / `dispatch_count` columns,
@@ -6409,4 +6666,130 @@ async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
             .expect("list a after cascade"),
         vec![(ws.clone(), NoteId::from("task-keep"))]
     );
+}
+
+/// Batched `clear_stop_redeliveries` (intent-hq/monorepo#4130): one
+/// statement deletes exactly the listed agents' payloads, an unlisted
+/// agent's row survives, and an empty list is a no-op.
+#[tokio::test]
+async fn clear_stop_redeliveries_deletes_only_listed_agents() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let ids: Vec<AgentId> = (0..3)
+        .map(|i| AgentId::from(format!("agent-4130-stop-{i}")))
+        .collect();
+    for id in &ids {
+        store
+            .insert_agent_session(&sample_agent_session(id, &ws))
+            .await
+            .expect("insert session");
+        store
+            .set_stop_redelivery(id, &json!({ "content": id.0 }), "2026-01-01T00:00:00Z")
+            .await
+            .expect("arm payload");
+    }
+    let armed = |rows: Vec<crate::stop_redelivery_repo::StopRedeliveryRow>| {
+        rows.into_iter().map(|r| r.agent_id).collect::<Vec<_>>()
+    };
+
+    store
+        .clear_stop_redeliveries(&[])
+        .await
+        .expect("empty clear");
+    assert_eq!(
+        armed(store.load_all_stop_redeliveries().await.expect("load")),
+        ids,
+        "empty list is a no-op"
+    );
+
+    store
+        .clear_stop_redeliveries(&ids[..2])
+        .await
+        .expect("batched clear");
+    assert_eq!(
+        armed(store.load_all_stop_redeliveries().await.expect("load")),
+        vec![ids[2].clone()],
+        "only the listed agents' payloads are deleted"
+    );
+
+    // Re-clearing an already-cleared id alongside the survivor is fine.
+    store
+        .clear_stop_redeliveries(&[ids[0].clone(), ids[2].clone()])
+        .await
+        .expect("mixed clear");
+    assert!(store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load")
+        .is_empty());
+}
+
+/// Batched `clear_advisory_wake_deliveries_for_children`
+/// (intent-hq/monorepo#4130): one statement clears every marker whose CHILD
+/// is a listed agent — a marker where a listed agent appears only as the
+/// PARENT survives (it belongs to that parent's watch on some other child),
+/// as does any pair not touching the list, and an empty list is a no-op.
+#[tokio::test]
+async fn clear_advisory_wake_deliveries_for_children_matches_child_side_only() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let parent = AgentId::from("agent-4130-adv-parent");
+    let child_a = AgentId::from("agent-4130-adv-child-a");
+    let child_b = AgentId::from("agent-4130-adv-child-b");
+    let other = AgentId::from("agent-4130-adv-other");
+    for id in [&parent, &child_a, &child_b, &other] {
+        store
+            .insert_agent_session(&sample_agent_session(id, &ws))
+            .await
+            .expect("insert session");
+    }
+    let pairs = [
+        (&parent, &child_a),
+        (&parent, &child_b),
+        // child_a as PARENT of `other`: must survive a clear listing child_a.
+        (&child_a, &other),
+        // Untouched by the list.
+        (&other, &parent),
+    ];
+    for (p, c) in pairs {
+        store
+            .record_advisory_wake_delivery(p, c, "2026-01-01T00:00:00Z")
+            .await
+            .expect("record marker");
+    }
+    let has = |p: &AgentId, c: &AgentId| {
+        let (p, c) = (p.clone(), c.clone());
+        let store = &store;
+        async move { store.has_advisory_wake_delivery(&p, &c).await.expect("has") }
+    };
+
+    store
+        .clear_advisory_wake_deliveries_for_children(&[])
+        .await
+        .expect("empty clear");
+    for (p, c) in pairs {
+        assert!(has(p, c).await, "empty list is a no-op: ({p:?}, {c:?})");
+    }
+
+    store
+        .clear_advisory_wake_deliveries_for_children(&[child_a.clone(), child_b.clone()])
+        .await
+        .expect("batched clear");
+    assert!(!has(&parent, &child_a).await, "child_a marker cleared");
+    assert!(!has(&parent, &child_b).await, "child_b marker cleared");
+    assert!(
+        has(&child_a, &other).await,
+        "a marker where the listed id is only the parent survives"
+    );
+    assert!(has(&other, &parent).await, "unrelated pair survives");
 }

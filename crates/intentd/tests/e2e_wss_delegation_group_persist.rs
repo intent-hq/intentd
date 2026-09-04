@@ -419,6 +419,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -509,11 +510,11 @@ async fn baseline_plus_aggregated_wake() {
     let report_a_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_A));
     let report_b_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_B));
     let delegate_a_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'default', provider: 'mock' }});",
         json!(CHILD_A),
     );
     let delegate_b_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'default', provider: 'mock' }});",
         json!(CHILD_B),
     );
 
@@ -566,7 +567,7 @@ async fn baseline_plus_aggregated_wake() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]

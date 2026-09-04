@@ -54,6 +54,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -487,6 +488,168 @@ async fn agent_bindings_list_and_status() {
     }
 }
 
+/// `ws.agent.listSpecialists` over the real MCP loop: the project tier
+/// (`.intent/specialists/`) applies via the workspace path, rows carry the
+/// compact dispatch shape (no prompt bodies), and `defaultModel` reflects
+/// per-specialist resolution — a compound-`model` pin wins over the settings
+/// default provider (auggie in this harness).
+#[tokio::test]
+async fn agent_bindings_list_specialists() {
+    let Some(script) = gate() else { return };
+
+    let ws_root = std::env::temp_dir().join(format!("itd-e2e-spec-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(ws_root.join(".intent/specialists")).expect("mkdir specialists");
+    std::fs::write(
+        ws_root.join(".intent/specialists/e2e-pinned.md"),
+        "---\nname: \"E2E Pinned\"\ndescription: \"Project-tier pinned specialist\"\ncodingAgent: \"codex\"\nmodel: \"test-model\"\n---\n\nYou are a project-tier e2e specialist.\n",
+    )
+    .expect("write project specialist");
+
+    let db = std::env::temp_dir().join(format!("intentd-e2e-spec-{}.db", uuid::Uuid::new_v4()));
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.clone())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root))
+        .with_event_bus(bus.clone());
+
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&ws, Some(ws_root.clone())))
+        .await
+        .expect("insert ws");
+
+    let agent_val = services
+        .agent_create(
+            ws.clone(),
+            Some("E2E Specialists".into()),
+            None,
+            None,
+            None,
+            None,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create agent");
+    let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+
+    // Persist the rows through ws.file.write so the test can assert the
+    // projected shape from outside the agent loop.
+    let js = r"
+        const rows = await ws.agent.listSpecialists();
+        await ws.file.write('specialists.json', JSON.stringify(rows));
+        return { count: rows.length };
+    ";
+
+    let behavior = serde_json::json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "list specialists e2e" }
+        },
+        "response": "specialists listed",
+    })
+    .to_string();
+
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = AgentManager::new(services.clone(), sink, 8)
+        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+
+    manager
+        .create_agent(
+            agent_id.clone(),
+            ws.clone(),
+            "E2E Specialists",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&agent_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(serde_json::json!({ "type": "text", "text": "list specialists" }))
+            .unwrap();
+    let stop = manager
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
+        .await
+        .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
+
+    let workspace_record = services
+        .get_workspace(ws.clone())
+        .await
+        .expect("get workspace");
+    let actual_ws_root = std::path::PathBuf::from(
+        workspace_record
+            .worktree_path
+            .expect("workspace should have worktree_path"),
+    );
+    let raw = std::fs::read_to_string(actual_ws_root.join("specialists.json"))
+        .expect("specialists.json written by the agent");
+    let rows: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    let rows = rows.as_array().expect("listSpecialists returns an array");
+    assert!(!rows.is_empty(), "catalog is never empty (bundled tier)");
+    for row in rows {
+        assert!(row.get("id").is_some() && row.get("name").is_some());
+        assert!(
+            row.get("modelOptions")
+                .is_some_and(serde_json::Value::is_array),
+            "modelOptions always present as an array: {row}"
+        );
+        for key in ["prompt", "behaviorPrompt", "source", "isCustomized"] {
+            assert!(row.get(key).is_none(), "{key} must never reach a row");
+        }
+    }
+    assert!(
+        rows.iter().any(|r| r["id"] == "implementor"),
+        "bundled tier listed"
+    );
+    let pinned = rows
+        .iter()
+        .find(|r| r["id"] == "e2e-pinned")
+        .expect("project-tier specialist listed");
+    assert_eq!(pinned["name"], "E2E Pinned");
+    assert_eq!(
+        pinned["defaultModel"],
+        serde_json::json!({ "provider": "codex", "model": "test-model" }),
+        "codingAgent pin resolved per-specialist, not via the settings default"
+    );
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&ws_root);
+}
+
 /// `ws.agent.getQueue` + `ws.agent.removeQueuedMessage` + the queue merged
 /// into `ws.agent.status`: another sender's entry surfaces with attribution
 /// (full content in getQueue, 200-char truncation in status), ordering is
@@ -706,6 +869,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("get conversation");
@@ -790,7 +954,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
 }
 
 /// Single-pending-message guard on `ws.agent.send` / `ws.agent.sendToTask`:
-/// the target is pinned behind a question hold so agent-origin sends park in
+/// the target lives in an archived workspace so agent-origin sends park in
 /// its queue. The caller's FIRST send parks fine (a pre-seeded FOREIGN entry
 /// does not trigger the guard); the second send and a `sendToTask` against
 /// the same target are refused with `ok: false` + the full queue echo
@@ -817,9 +981,17 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .await
         .expect("disable toonOutput");
 
+    // The workspace is ARCHIVED up front (intent-hq/monorepo#2732): every
+    // agent-origin send into an archived workspace parks in the target's
+    // queue instead of driving a turn — the deterministic way to exercise
+    // the guard. The caller's own turn below is driven directly through
+    // `run_turn`, which does not consult the archived gate.
     let ws = WorkspaceId::new();
+    let mut archived_ws = workspace(&ws, None);
+    archived_ws.archived = true;
+    archived_ws.archived_at = Some(now_iso());
     store
-        .insert_workspace(&workspace(&ws, None))
+        .insert_workspace(&archived_ws)
         .await
         .expect("insert ws");
 
@@ -849,27 +1021,6 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .await
         .expect("create target");
     let target_id = AgentId::from(target_val["agent"]["id"].as_str().unwrap());
-
-    // Pin the target behind a question hold (PROTOCOL §5.5): its last
-    // transcript message is an assistant row carrying a question resource
-    // block, so every agent-origin send parks in the queue instead of
-    // driving a turn — the deterministic way to exercise the guard.
-    store
-        .append_agent_message(
-            &target_id,
-            "assistant",
-            &serde_json::json!([{
-                "type": "resource",
-                "resource": {
-                    "uri": "question://hold-1",
-                    "mimeType": "application/vnd.intent.question+json",
-                    "text": "{\"question\":\"Which environment?\"}",
-                },
-            }]),
-            &now_iso(),
-        )
-        .await
-        .expect("seed question hold");
 
     // Seed a FOREIGN pending entry (long content — the refusal echo must
     // truncate it): another agent's parked send must NOT trigger the guard
@@ -967,6 +1118,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
         out.toTask = await ws.agent.sendToTask('{}', 'task: status update please');
         out.removed = await ws.agent.removeQueuedMessage(target, out.first.queuedMessage.id);
         out.resend = await ws.agent.send(target, 'combined: review diff AND check tests');
+        out.replace = await ws.agent.send(target, 'replacement: final combined ask', {{ replacePending: true }});
         return out;
         ",
         target_id.0, task_note.id.0
@@ -1037,6 +1189,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("get conversation");
@@ -1057,13 +1210,17 @@ async fn agent_bindings_send_single_pending_message_guard() {
     let out: serde_json::Value =
         serde_json::from_str(last_output).expect("tool output should be JSON");
 
-    // First send parks (question hold) despite the pre-seeded FOREIGN entry:
+    // First send parks (archived gate) despite the pre-seeded FOREIGN entry:
     // another sender's pending message never triggers the guard. Omitted
     // priority resolves to interrupt in the binding, so the entry parks
     // AHEAD of the foreign normal entry.
     assert_eq!(out["first"]["ok"], true, "{out}");
     assert_eq!(out["first"]["queued"], true, "{out}");
-    assert_eq!(out["first"]["heldForQuestions"], true, "{out}");
+    assert_eq!(out["first"]["archivedParked"], true, "{out}");
+    assert_eq!(
+        out["first"]["delivery"], "queued",
+        "archived park is self-describing: {out}"
+    );
     let first_id = out["first"]["queuedMessage"]["id"]
         .as_str()
         .expect("first parked entry id");
@@ -1072,6 +1229,11 @@ async fn agent_bindings_send_single_pending_message_guard() {
     // target's full queue in drain order with 200-char truncation.
     let second = &out["second"];
     assert_eq!(second["ok"], false, "{out}");
+    assert_eq!(second["refused"], true, "refusal discriminator: {out}");
+    assert!(
+        second.get("delivery").is_none(),
+        "a refused send makes no delivery claim: {second}"
+    );
     assert_eq!(second["agentId"], target_id.0, "{out}");
     assert_eq!(second["pendingMessageId"], first_id, "{out}");
     assert!(
@@ -1079,11 +1241,32 @@ async fn agent_bindings_send_single_pending_message_guard() {
         "refusal names the pending entry: {second}"
     );
     assert!(
+        second["error"]
+            .as_str()
+            .unwrap()
+            .contains("only one pending message per target"),
+        "refusal error names the rule: {second}"
+    );
+    assert!(
+        second["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("replacePending"),
+        "refusal instruction recommends the atomic replace: {second}"
+    );
+    assert!(
         second["instruction"]
             .as_str()
             .unwrap()
             .contains("removeQueuedMessage"),
-        "refusal instructs retract-and-resend: {second}"
+        "refusal instruction keeps the manual fallback: {second}"
+    );
+    assert!(
+        second["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("NOT atomic"),
+        "refusal instruction warns manual remove + re-send is not atomic: {second}"
     );
     assert_eq!(second["queueLength"], 2, "{out}");
     let echo = second["queue"].as_array().expect("queue echo");
@@ -1108,12 +1291,14 @@ async fn agent_bindings_send_single_pending_message_guard() {
     // interrupts get no exemption from the single-pending-message guard.
     let interrupt = &out["interrupt"];
     assert_eq!(interrupt["ok"], false, "{out}");
+    assert_eq!(interrupt["refused"], true, "{out}");
     assert_eq!(interrupt["agentId"], target_id.0, "{out}");
     assert_eq!(interrupt["pendingMessageId"], first_id, "{out}");
 
     // sendToTask against the same target: same refusal, tagged with the task.
     let to_task = &out["toTask"];
     assert_eq!(to_task["ok"], false, "{out}");
+    assert_eq!(to_task["refused"], true, "{out}");
     assert_eq!(to_task["agentId"], target_id.0, "{out}");
     assert_eq!(to_task["taskNoteId"], task_note.id.0, "{out}");
     assert_eq!(to_task["pendingMessageId"], first_id, "{out}");
@@ -1122,10 +1307,27 @@ async fn agent_bindings_send_single_pending_message_guard() {
     assert_eq!(out["removed"]["ok"], true, "{out}");
     assert_eq!(out["resend"]["ok"], true, "{out}");
     assert_eq!(out["resend"]["queued"], true, "{out}");
+    assert_eq!(out["resend"]["delivery"], "queued", "{out}");
+    let resend_id = out["resend"]["queuedMessage"]["id"]
+        .as_str()
+        .expect("resend parked entry id");
+
+    // Atomic replace: `replacePending: true` parks the replacement and then
+    // retracts the caller's pending entry (the re-send) in one call —
+    // send-first, so a failed send would leave the entry intact — reporting
+    // the retracted id.
+    let replace = &out["replace"];
+    assert_eq!(replace["ok"], true, "{out}");
+    assert_eq!(replace["replaced"], true, "{out}");
+    assert_eq!(replace["replacedMessageId"], resend_id, "{out}");
+    assert!(replace.get("refused").is_none(), "{replace}");
+    assert_eq!(replace["queued"], true, "{out}");
+    assert_eq!(replace["delivery"], "queued", "{out}");
 
     // Backend state: foreign entry untouched, caller's queue slot holds ONLY
-    // the combined re-send (the refused sends never parked). The re-send is
-    // default-interrupt, so it parks ahead of the foreign normal entry.
+    // the replacement (the refused sends never parked; the combined re-send
+    // was atomically retracted). The replacement is default-interrupt, so it
+    // parks ahead of the foreign normal entry.
     let remaining = services
         .agent_get_queue(target_id.clone(), Some(ws.clone()))
         .await
@@ -1141,9 +1343,11 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .iter()
         .map(|e| e["content"].as_str().unwrap())
         .collect();
+    // Agent-origin content carries the A2A sender header (monorepo#1015)
+    // prepended at the send front door; the caller's text follows it.
     assert!(
-        contents[0].starts_with("combined:"),
-        "only the re-send parked: {contents:?}"
+        contents[0].starts_with("[MESSAGE FROM AGENT") && contents[0].contains("replacement:"),
+        "only the atomic replacement parked (with sender header): {contents:?}"
     );
 
     manager.shutdown().await;

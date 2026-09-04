@@ -200,6 +200,7 @@ async fn seed_workspace(data_dir: &Path) -> String {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -281,7 +282,7 @@ async fn list_active_tracks_only_mid_turn_agents_over_real_wss() {
         &mut ws,
         2,
         "agent.create",
-        json!({ "workspaceId": workspace_id, "name": "Busy", "model": "mock:default" }),
+        json!({ "workspaceId": workspace_id, "name": "Busy", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["result"]["agent"]["id"]

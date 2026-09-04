@@ -24,6 +24,10 @@ const SESSION_ID = 'mock-session-1';
 // daemon resumes into sees `true`; a fresh `session/new` resets it. Drives the
 // `failPromptIfLoadedRpcError` behavior (monorepo#940 poisoned-session e2e).
 let sessionFromLoad = false;
+// Optional stateful model selector. Prompts report this accepted state, not
+// the last requested value, so rejected selections expose default-model turns.
+let effectiveModel = null;
+let effectiveEffort = null;
 
 // Per-process turn counter + the ids of prompts parked by `blockUntilCancel`.
 // These persist across messages within ONE child, so a follow-up prompt landing
@@ -60,20 +64,28 @@ function log(msg) {
 }
 
 // Session-lifecycle log: one JSON line per session/new | session/load —
-// { method, sessionId, pid, meta } — when MOCK_AGENT_SESSION_LOG points at a
-// file. Lets e2e tests assert exactly which session ids the daemon offered to
-// which child process (e.g. that a cross-provider switch never issues
-// session/load with the old provider's id — monorepo#907). `meta` carries the
-// request's `_meta` verbatim (null when absent) so tests can assert the exact
-// provider-specific payload on the wire (e.g. codex `sessionTitle`,
-// monorepo#3151).
+// { method, sessionId, pid, meta, nodeOptions } — when MOCK_AGENT_SESSION_LOG
+// points at a file. Lets e2e tests assert exactly which session ids the daemon
+// offered to which child process (e.g. that a cross-provider switch never
+// issues session/load with the old provider's id — monorepo#907). `meta`
+// carries the request's `_meta` verbatim (null when absent) so tests can
+// assert the exact provider-specific payload on the wire (e.g. codex
+// `sessionTitle`, monorepo#3151). `nodeOptions` is the child's inherited
+// NODE_OPTIONS (null when unset) so tests can assert the daemon-injected V8
+// heap cap (`agents.acpNodeMaxOldSpaceMb`, intent-hq/intent#4330).
 function logSessionCall(method, sessionId, meta) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
   try {
     fs.appendFileSync(
       path,
-      JSON.stringify({ method, sessionId, pid: process.pid, meta: meta ?? null }) + '\n'
+      JSON.stringify({
+        method,
+        sessionId,
+        pid: process.pid,
+        meta: meta ?? null,
+        nodeOptions: process.env.NODE_OPTIONS ?? null,
+      }) + '\n'
     );
   } catch (err) {
     log(`session log write failed: ${err.message}`);
@@ -315,7 +327,26 @@ function selectBehavior(behavior, promptText) {
 // it) with `category: "thought_level"` — the category the daemon's generic
 // effort application discovers it by (PROTOCOL §5.5). Omitted by default so
 // existing tests see the bare `{ sessionId }` result.
-function sessionConfigOptions() {
+function sessionConfigOptions(behavior = {}) {
+  if (process.env.MOCK_AGENT_SESSION_RESULT) {
+    return JSON.parse(process.env.MOCK_AGENT_SESSION_RESULT);
+  }
+  if (behavior.modelSelection) {
+    return {
+      configOptions: [
+        {
+          id: 'model', name: 'Model', category: 'model', type: 'select',
+          currentValue: effectiveModel,
+          options: behavior.modelSelection.models.map(value => ({ value, name: value })),
+        },
+        {
+          id: 'effort', name: 'Effort', category: 'thought_level', type: 'select',
+          currentValue: effectiveEffort,
+          options: ['low', 'medium', 'high'].map(value => ({ value, name: value })),
+        },
+      ],
+    };
+  }
   const current = process.env.MOCK_AGENT_THOUGHT_LEVEL;
   if (!current) return {};
   return {
@@ -355,6 +386,7 @@ async function handlePrompt(id, params) {
         promptLog,
         JSON.stringify({
           turn: promptCount,
+          ...(effectiveModel !== null ? { effectiveModel, effectiveEffort } : {}),
           text: extractPromptText(params),
           blockTypes: blocks.map((b) => (b && typeof b.type === 'string' ? b.type : '')),
         }) + '\n',
@@ -387,6 +419,18 @@ async function handlePrompt(id, params) {
       : 0;
   const attempt = exitGate > 0 || rpcGate > 0 ? getAndIncrementAttempt() : 0;
   if (exitGate > 0 && attempt <= exitGate) {
+    // Pipe-holding descendant (monorepo#3592): on the LAST gated attempt (the
+    // one the daemon classifies as a terminal failure), leave a same-group
+    // `sleep` holding this process's inherited stderr write end open across
+    // the exit, so the daemon's stderr drain cannot hit EOF until its group
+    // sweep kills the descendant — the exact scenario the terminal-failure
+    // capture hint must sweep-then-settle for. Last-attempt-only so earlier
+    // deaths (consumed by the silent redrive) leave no stray holder behind.
+    if (behavior.holdStderrOpenOnExit && attempt === exitGate) {
+      const holder = spawn('sleep', ['300'], { stdio: ['ignore', 'ignore', 'inherit'] });
+      holder.on('error', (err) => log(`stderr holder spawn failed: ${err.message}`));
+      log(`spawned stderr-holding descendant pid=${holder.pid}`);
+    }
     log(`exiting during prompt (attempt ${attempt}/${exitGate})`);
     process.exit(1);
   }
@@ -660,7 +704,28 @@ async function handlePrompt(id, params) {
       }
     }
   }
-  const base = active.response || behavior.response || 'Mock agent completed.';
+  let base = active.response || behavior.response || 'Mock agent completed.';
+  if (behavior.modelSelection) {
+    base = `effective-model=${effectiveModel} effort=${effectiveEffort} loaded=${sessionFromLoad}`;
+  }
+  // Opt-in dynamic response for E2E cases where the agent-side JS must derive
+  // its final prose from the real MCP result (for example, an exact message
+  // link returned after reading a conversation).
+  if (typeof active.responseFromToolResultField === 'string') {
+    const lastResult = toolResults.at(-1)?.result;
+    const textItem = lastResult?.content?.find((item) => item?.type === 'text');
+    try {
+      const parsed = JSON.parse(textItem?.text || '');
+      const derived = parsed?.[active.responseFromToolResultField];
+      if (typeof derived !== 'string' || derived.length === 0) {
+        throw new Error(`missing string field ${active.responseFromToolResultField}`);
+      }
+      base = derived;
+    } catch (err) {
+      log(`tool-result response derivation failed: ${err.message}`);
+      return result(id, { stopReason: 'refusal' });
+    }
+  }
   // In keep-alive mode, stamp the turn count so a resumed follow-up turn is
   // distinguishable from a fresh spawn (which would report `turn=1`).
   // With echoCwd, stamp the child's working directory so e2e tests can assert
@@ -779,6 +844,13 @@ async function handlePrompt(id, params) {
   if (active.usage && typeof active.usage === 'object') {
     payload.usage = active.usage;
   }
+  // Optional `_meta` extension payload on the PromptResponse: when the active
+  // behavior/rule carries a `promptMeta` object it is echoed verbatim as
+  // `_meta`, letting e2e tests drive provider extension paths — e.g. grok's
+  // whole-prompt `_meta.usage` bill (intent-hq/intent#3803).
+  if (active.promptMeta && typeof active.promptMeta === 'object') {
+    payload._meta = active.promptMeta;
+  }
   result(id, payload);
 }
 
@@ -801,6 +873,12 @@ function getAndIncrementAttempt() {
 }
 
 async function dispatch(msg) {
+  if (process.env.MOCK_AGENT_RPC_LOG) {
+    fs.appendFileSync(process.env.MOCK_AGENT_RPC_LOG, JSON.stringify({
+      method: msg.method, params: msg.params, pid: process.pid,
+      geminiHome: process.env.GEMINI_HOME,
+    }) + '\n');
+  }
   let behavior = {};
   try {
     behavior = JSON.parse(process.env.MOCK_AGENT_BEHAVIOR || '{}');
@@ -832,6 +910,10 @@ async function dispatch(msg) {
     case 'authenticate':
       return result(msg.id, {});
     case 'session/new': {
+      if (behavior.modelSelection) {
+        effectiveModel = behavior.modelSelection.defaultModel;
+        effectiveEffort = 'high';
+      }
       // Deterministic failure mode: ignore session/new for the first N attempts
       if (typeof behavior.ignoreSessionNewAttempts === 'number' && behavior.ignoreSessionNewAttempts > 0) {
         const attempt = getAndIncrementAttempt();
@@ -850,9 +932,13 @@ async function dispatch(msg) {
         : [];
       sessionFromLoad = false;
       logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta);
-      return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions() });
+      return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions(behavior) });
     }
     case 'session/load':
+      if (behavior.modelSelection) {
+        effectiveModel = behavior.modelSelection.defaultModel;
+        effectiveEffort = 'high';
+      }
       // Mirror session/new's stash-overwrite so a loadSession-capable run (or
       // a test sending session/load first) can't observe a stale list.
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
@@ -870,7 +956,7 @@ async function dispatch(msg) {
         if (behavior.advertiseLoadSession === true) {
           sessionFromLoad = true;
         }
-        return result(msg.id, sessionConfigOptions());
+        return result(msg.id, sessionConfigOptions(behavior));
       }
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
     case 'session/set_mode':
@@ -919,6 +1005,12 @@ async function dispatch(msg) {
           log(`config log write failed: ${err.message}`);
         }
       }
+      // Close the actual ACP pipe before accepting the model on the first
+      // N child launches. The shared attempt file lets a fresh child recover.
+      if (msg.params?.configId === 'model' && behavior.exitOnModelConfigForAttempts > 0) {
+        const attempt = getAndIncrementAttempt();
+        if (attempt <= behavior.exitOnModelConfigForAttempts) process.exit(1);
+      }
       // Deterministic failure mode: reject the call (invalid params, e.g. an
       // unknown model id) so tests can assert the daemon logs a warning and
       // the turn still completes on the provider's default model.
@@ -928,6 +1020,20 @@ async function dispatch(msg) {
           id: msg.id,
           error: { code: -32602, message: 'unknown config value' },
         });
+      }
+      if (behavior.modelSelection) {
+        const { configId, value } = msg.params || {};
+        if (configId === 'model' && behavior.modelSelection.models.includes(value)) {
+          effectiveModel = value;
+        } else if (configId === 'effort' && ['low', 'medium', 'high'].includes(value)) {
+          effectiveEffort = value;
+        } else {
+          return send({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32602, message: 'unknown config value' },
+          });
+        }
+        return result(msg.id, sessionConfigOptions(behavior));
       }
       return result(msg.id, {
         configOptions: [
@@ -986,6 +1092,39 @@ async function dispatch(msg) {
       // existing cancel behavior is unaffected.
       if (behavior.neverResolveOnCancel) {
         log('neverResolveOnCancel: leaving parked prompt(s) unresolved');
+        return;
+      }
+      // Post-cancel zombie stream (monorepo#2763): with the opt-in
+      // `zombieAfterCancel` config set ({ marker, count?, intervalMs? }),
+      // resolve the parked prompt as `cancelled` but KEEP streaming marker
+      // chunks on a timer for longer than the daemon's bounded 500ms
+      // post-interrupt drain cap — modelling a provider whose cancellation is
+      // unreliable (auggie): the child acknowledges the cancel yet keeps
+      // emitting late `session/update`s for the dead turn. Without the
+      // `kills_child_on_interrupt` teardown these stragglers outlive the
+      // drain window, buffer in the kept-alive child's notifications channel,
+      // and bleed into the NEXT turn's transcript. Strictly gated on the new
+      // key so every existing cancel behavior is unaffected.
+      if (behavior.zombieAfterCancel && typeof behavior.zombieAfterCancel.marker === 'string') {
+        const zombie = behavior.zombieAfterCancel;
+        const count = Number.isFinite(zombie.count) ? zombie.count : 30;
+        const intervalMs = Number.isFinite(zombie.intervalMs) ? zombie.intervalMs : 100;
+        while (pendingPromptIds.length) {
+          result(pendingPromptIds.shift(), { stopReason: 'cancelled' });
+        }
+        log(`zombieAfterCancel: streaming ${count} marker chunks every ${intervalMs}ms`);
+        let emitted = 0;
+        const timer = setInterval(() => {
+          emitted += 1;
+          note('session/update', {
+            sessionId: SESSION_ID,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `${zombie.marker}-${emitted}\n` },
+            },
+          });
+          if (emitted >= count) clearInterval(timer);
+        }, intervalMs);
         return;
       }
       // Resolve any turn parked by `blockUntilCancel` with a `cancelled` stop

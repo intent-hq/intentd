@@ -254,6 +254,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -376,7 +377,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         json!({
             "workspaceId": ws_id,
             "name": "Test Agent",
-            "model": "mock:default"
+            "model": "default", "provider": "mock"
         }),
     )
     .await;
@@ -555,7 +556,7 @@ async fn setting_on_resumes_without_resume_all_flag() {
         json!({
             "workspaceId": ws_id,
             "name": "Test Agent",
-            "model": "mock:default"
+            "model": "default", "provider": "mock"
         }),
     )
     .await;

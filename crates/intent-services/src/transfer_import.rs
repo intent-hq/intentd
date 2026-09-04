@@ -949,22 +949,26 @@ async fn materialize_imported_attachments(
                      root — import rejected"
                 ))
             };
+            // The root may not exist yet on repo-less imports; the import
+            // owns creating it, and `resolve_attachment_source`'s
+            // symlink-aware gate needs it on disk to canonicalize — ensure
+            // it before resolving.
+            tokio::fs::create_dir_all(root)
+                .await
+                .map_err(|e| Error::Internal(format!("create workspace root failed: {e}")))?;
             let dest = crate::file_ops::resolve_attachment_source(root, stored_path)
                 .map_err(|_| escape_err())?;
             let file_name = dest.file_name().map(PathBuf::from).ok_or_else(escape_err)?;
             let parent = dest.parent().ok_or_else(escape_err)?;
-            // The lexical guard above is not enough on its own: the git
-            // bundle just materialized tracked content, which can include a
+            // `resolve_attachment_source` already re-checks containment
+            // through symlinks, but the checks below stay: the git bundle
+            // just materialized tracked content, which can include a
             // symlinked ancestor (e.g. a tracked `.intent` symlink) pointing
             // outside the checkout, and both `create_dir_all` and `copy`
             // would follow it. Canonicalize the deepest EXISTING ancestor
             // and require it inside the canonical root BEFORE creating
-            // anything — a symlinked escape fails the commit. (The root may
-            // not exist yet on repo-less imports; the import owns creating
-            // it, so ensure it first.)
-            tokio::fs::create_dir_all(root)
-                .await
-                .map_err(|e| Error::Internal(format!("create workspace root failed: {e}")))?;
+            // anything — a symlinked escape fails the commit — and re-verify
+            // the created parent afterwards (TOCTOU belt-and-braces).
             let canon_root = tokio::fs::canonicalize(root)
                 .await
                 .map_err(|e| Error::Internal(format!("canonicalize workspace root failed: {e}")))?;
@@ -1089,6 +1093,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         pending_delete_at: None,
@@ -1139,8 +1144,12 @@ fn sandbox_for_materialize(row: &serde_json::Value) -> Sandbox {
 /// `workspace_id` column must match it, `completion_watch` must touch it
 /// from at least one end, and `agent_message`/`agent_queue` rows (scoped
 /// through their owning session) must name an `agent_session` in the
-/// archive. Collision validation ran only for the manifest's id, so
-/// anything else would land unvalidated.
+/// archive. `agent_message_payload` rows additionally must name an
+/// `agent_message` in the archive — the row attaches (and hydrates) by
+/// `message_id`, so an in-scope `agent_id` alone would let a hostile
+/// archive splice payload bytes into an existing message elsewhere.
+/// Collision validation ran only for the manifest's id, so anything else
+/// would land unvalidated.
 fn validate_row_scope(
     rows: &[(String, Vec<serde_json::Value>)],
     workspace_id: &WorkspaceId,
@@ -1148,6 +1157,12 @@ fn validate_row_scope(
     let session_ids: std::collections::HashSet<&str> = rows
         .iter()
         .filter(|(t, _)| t == "agent_session")
+        .flat_map(|(_, objects)| objects)
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+        .collect();
+    let message_ids: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|(t, _)| t == "agent_message")
         .flat_map(|(_, objects)| objects)
         .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
         .collect();
@@ -1163,6 +1178,10 @@ fn validate_row_scope(
                 "workspace" => field(row, "id") == workspace_id.0,
                 "agent_message" | "agent_queue" => {
                     session_ids.contains(field(row, "agent_id").as_str())
+                }
+                "agent_message_payload" => {
+                    session_ids.contains(field(row, "agent_id").as_str())
+                        && message_ids.contains(field(row, "message_id").as_str())
                 }
                 "completion_watch" => {
                     field(row, "parent_workspace_id") == workspace_id.0
@@ -1205,6 +1224,11 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///   in-flight statuses (`active`/`Processing`/`Waiting`) become `idle` with
 ///   a stop reason, and each such agent gains an `interrupted_agent` row
 ///   (`resolution='pending'`) so `agent.listInterrupted` offers resumption.
+///   The 0103 stats counters (`message_count` / `assistant_message_count` /
+///   `conversation_bytes`) are zeroed: the target re-inserts the transferred
+///   `agent_message` rows through the counter triggers, which rebuild them
+///   from zero — importing the exported values would double-count (same
+///   rebuild-on-target approach as the FTS index).
 /// - **sandbox**: `path` rewritten under the target root.
 /// - **script**: absolute `cwd` rewritten under the target root.
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
@@ -1248,6 +1272,13 @@ fn transform_rows(
                     map.insert("acp_session_id".into(), serde_json::Value::Null);
                     map.insert("backend_session_id".into(), serde_json::Value::Null);
                     map.insert("is_active".into(), serde_json::json!(0));
+                    for counter in [
+                        "message_count",
+                        "assistant_message_count",
+                        "conversation_bytes",
+                    ] {
+                        map.insert(counter.into(), serde_json::json!(0));
+                    }
                     let status = map
                         .get("status")
                         .and_then(|v| v.as_str())
@@ -1467,6 +1498,9 @@ mod tests {
             assert_eq!(s["acp_session_id"], serde_json::Value::Null);
             assert_eq!(s["backend_session_id"], serde_json::Value::Null);
             assert_eq!(s["is_active"], 0);
+            assert_eq!(s["message_count"], 0, "0103 counters zeroed for rebuild");
+            assert_eq!(s["assistant_message_count"], 0);
+            assert_eq!(s["conversation_bytes"], 0);
         }
         assert!(sessions[..3].iter().all(|s| s["status"] == "idle"));
         assert!(sessions[..3]
@@ -1581,6 +1615,29 @@ mod tests {
             vec![serde_json::json!({ "id": 1, "agent_id": "agent-elsewhere" })],
         )])
         .is_err());
+        // Payload row with an in-scope agent_id but a message_id pointing
+        // outside the archive: rejected — it would splice payload bytes
+        // into an existing message of another workspace.
+        assert!(scoped(vec![
+            ("workspace", vec![serde_json::json!({ "id": "ws-import" })],),
+            (
+                "agent_session",
+                vec![serde_json::json!({ "id": "agent-a", "workspace_id": "ws-import" })],
+            ),
+            (
+                "agent_message",
+                vec![serde_json::json!({ "id": "msg-a", "agent_id": "agent-a" })],
+            ),
+            (
+                "agent_message_payload",
+                vec![serde_json::json!({
+                    "message_id": "msg-foreign", "agent_id": "agent-a",
+                    "block_ordinal": 0, "kind": "tool_result_output",
+                    "encoding": "none", "body": { "$base64": "e30=" }
+                })],
+            ),
+        ])
+        .is_err());
         assert!(scoped(vec![(
             "completion_watch",
             vec![serde_json::json!({
@@ -1597,7 +1654,15 @@ mod tests {
             ),
             (
                 "agent_message",
-                vec![serde_json::json!({ "id": 1, "agent_id": "agent-a" })],
+                vec![serde_json::json!({ "id": "msg-a", "agent_id": "agent-a" })],
+            ),
+            (
+                "agent_message_payload",
+                vec![serde_json::json!({
+                    "message_id": "msg-a", "agent_id": "agent-a",
+                    "block_ordinal": 0, "kind": "tool_result_output",
+                    "encoding": "none", "body": { "$base64": "e30=" }
+                })],
             ),
             (
                 "completion_watch",
@@ -1868,12 +1933,30 @@ mod tests {
             ),
             (
                 "agent_session",
+                // Exported 0103 counter values are deliberately wrong (999):
+                // the import transform zeroes them and the agent_message
+                // re-inserts below rebuild them through the triggers.
                 vec![serde_json::json!({
                     "id": "agent-live", "workspace_id": ws.0, "name": "A",
                     "status": "active", "is_active": 1,
                     "acp_session_id": "acp-1", "backend_session_id": "b-1",
+                    "message_count": 999, "assistant_message_count": 999,
+                    "conversation_bytes": 999,
                     "created_at": t, "updated_at": t
                 })],
+            ),
+            (
+                "agent_message",
+                vec![
+                    serde_json::json!({
+                        "id": "m-1", "agent_id": "agent-live", "seq": 1,
+                        "role": "user", "content": "[\"hi\"]", "created_at": t
+                    }),
+                    serde_json::json!({
+                        "id": "m-2", "agent_id": "agent-live", "seq": 2,
+                        "role": "assistant", "content": "[\"hello\"]", "created_at": t
+                    }),
+                ],
             ),
             (
                 "hook",
@@ -1990,6 +2073,19 @@ mod tests {
             .expect("session");
         assert_eq!(session.status, intent_core::AgentStatus::RuntimeIdle);
         assert!(session.acp_session_id.is_none());
+
+        // 0103 stats counters rebuilt from the re-inserted messages by the
+        // triggers — not the exported 999s, and not doubled.
+        let stats = svc
+            .store
+            .get_agent_session_message_stats(&ws)
+            .await
+            .expect("message stats");
+        assert_eq!(
+            stats.get("agent-live"),
+            Some(&(2, true, ("[\"hi\"]".len() + "[\"hello\"]".len()) as u64)),
+            "counters must equal a live recompute of the imported messages"
+        );
         assert_eq!(
             committed["interruptedAgents"],
             serde_json::json!(["agent-live"])

@@ -56,6 +56,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>, title: &str) ->
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -214,6 +215,7 @@ async fn chief_agent_ws_app_workspaces_list() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("get conversation");
@@ -389,6 +391,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("read conversation");
@@ -561,6 +564,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("read conversation");
@@ -735,6 +739,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("read conversation");
@@ -913,6 +918,7 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("read conversation");
@@ -1094,6 +1100,7 @@ async fn non_chief_agent_ws_app_gating_error() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("get conversation");

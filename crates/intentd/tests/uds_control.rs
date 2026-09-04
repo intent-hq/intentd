@@ -34,18 +34,24 @@ impl Drop for Daemon {
 }
 
 fn spawn_daemon(data_dir: &PathBuf) -> Child {
+    spawn_daemon_with_env(data_dir, &[])
+}
+
+fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+        .stderr(Stdio::from(log));
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.spawn().expect("spawn intentd serve")
 }
 
 async fn await_socket(socket: &PathBuf) -> bool {
@@ -62,9 +68,13 @@ async fn await_socket(socket: &PathBuf) -> bool {
 }
 
 async fn rpc(socket: &PathBuf, method: &str) -> Value {
+    rpc_with_params(socket, method, json!({})).await
+}
+
+async fn rpc_with_params(socket: &PathBuf, method: &str, params: Value) -> Value {
     let stream = UnixStream::connect(socket).await.expect("connect uds");
     let (read_half, mut write_half) = stream.into_split();
-    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
+    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let mut line = serde_json::to_string(&frame).unwrap();
     line.push('\n');
     write_half.write_all(line.as_bytes()).await.unwrap();
@@ -100,6 +110,15 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     assert!(r["host"]["os"].is_string());
     assert!(r["host"]["arch"].is_string());
     assert!(r["host"]["hasDisplay"].is_boolean());
+    if std::env::consts::OS == "linux" {
+        assert!(r["host"]["deviceKind"].is_string(), "deviceKind: {resp}");
+    }
+    assert!(
+        r["host"]
+            .get("deviceKind")
+            .is_none_or(|value| !value.is_null()),
+        "deviceKind is omitted, never null"
+    );
     assert_eq!(r["agents"], 0);
     // New fields: maxAgents, version, uptimeSeconds.
     assert!(
@@ -115,6 +134,9 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
         r["memoryBytes"].as_u64().unwrap() > 0,
         "memoryBytes > 0: {resp}"
     );
+    // Supervision probe (intent-hq/intent#3875): always present, and false
+    // here — the daemon was spawned by the test harness, not a sitter.
+    assert_eq!(r["updateSupported"], false, "updateSupported: {resp}");
 
     // host.status is the §5.14 capability probe, answered on the same UDS
     // connection with the resolved locality (UDS ⇒ local) and host fields.
@@ -124,7 +146,30 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     assert!(h["os"].is_string());
     assert!(h["arch"].is_string());
     assert!(h["hostname"].is_string());
+    assert!(
+        !h["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty"
+    );
     assert!(h["hasDisplay"].is_boolean());
+    assert_eq!(h.get("deviceKind"), r["host"].get("deviceKind"));
+    assert_eq!(h.get("hardwareModel"), r["host"].get("hardwareModel"));
+    if let Some(kind) = h.get("deviceKind").and_then(Value::as_str) {
+        assert!(
+            [
+                "macMini",
+                "macStudio",
+                "laptop",
+                "desktop",
+                "server",
+                "cloudVm"
+            ]
+            .contains(&kind),
+            "known deviceKind: {host}"
+        );
+    }
 
     // `intentd stop` issues the graceful control RPC then escalates if needed.
     // Run it in a blocking thread while we concurrently reap the daemon: the
@@ -175,4 +220,100 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     let resp = rpc(&socket, "system.status").await;
     assert_eq!(resp["result"]["running"], true, "restart status: {resp}");
     drop(restart);
+}
+
+/// Poll `system.status` until `pred` accepts the `fileWatch` object (absent ⇒
+/// `Value::Null` is passed), or the startup budget elapses; returns the last
+/// full response either way for the caller's assertion message.
+async fn await_file_watch(socket: &PathBuf, pred: impl Fn(&Value) -> bool) -> Value {
+    let deadline = tokio::time::Instant::now() + common::daemon_startup_timeout();
+    loop {
+        let resp = rpc(socket, "system.status").await;
+        if pred(&resp["result"]["fileWatch"]) || tokio::time::Instant::now() >= deadline {
+            return resp;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Watch-coverage health over the wire (intent-hq/intent#3708): `fileWatch`
+/// is absent until the backgrounded watcher registry attaches, reads healthy
+/// (`failedRoots: 0`) on a daemon whose watches register cleanly, and reports
+/// `failedRoots > 0` when watcher creation fails (the test seam stands in for
+/// real inotify-instance exhaustion, which needs a loaded host to reproduce).
+#[tokio::test]
+async fn system_status_surfaces_file_watch_coverage_and_degradation() {
+    // Healthy daemon: once the registry is up, fileWatch is present with a
+    // zero failed count (the hermetic boot has no workspaces, so zero roots).
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdw-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+    let healthy = Daemon {
+        child: spawn_daemon(&data_dir),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_socket(&socket).await, "healthy daemon did not start");
+    let resp = await_file_watch(&socket, Value::is_object).await;
+    let fw = &resp["result"]["fileWatch"];
+    assert!(
+        fw.is_object(),
+        "fileWatch must appear once the registry attaches: {resp}"
+    );
+    assert_eq!(fw["failedRoots"], 0, "clean boot must be healthy: {resp}");
+    assert!(fw["activeStreams"].is_u64(), "activeStreams: {resp}");
+    assert!(fw["totalRoots"].is_u64(), "totalRoots: {resp}");
+    drop(healthy);
+
+    // Degraded daemon: every watcher creation fails (test seam), so watching
+    // a workspace must surface as failed roots rather than a silent WARN.
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdd-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+    let degraded = Daemon {
+        child: spawn_daemon_with_env(&data_dir, &[("INTENTD_TEST_FAIL_WATCHER_CREATION", "1")]),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_socket(&socket).await, "degraded daemon did not start");
+
+    // A workspace over an existing plain directory: `workspace:created` +
+    // the immediate no-script setup completion drive runtime registration,
+    // whose watch requests all settle as failed under the seam.
+    let checkout = data_dir.join("checkout");
+    std::fs::create_dir_all(&checkout).expect("mkdir checkout");
+    let create = rpc_with_params(
+        &socket,
+        "workspace.create",
+        json!({
+            "title": "Degraded",
+            "branch": "main",
+            "skipWorktree": true,
+            "path": checkout.to_string_lossy(),
+        }),
+    )
+    .await;
+    assert!(
+        create["result"]["workspace"]["id"].is_string(),
+        "workspace.create failed: {create}"
+    );
+
+    let resp = await_file_watch(&socket, |fw| {
+        fw["failedRoots"].as_u64().is_some_and(|n| n > 0)
+    })
+    .await;
+    let fw = &resp["result"]["fileWatch"];
+    assert!(
+        fw["failedRoots"].as_u64().is_some_and(|n| n > 0),
+        "failed watch registrations must surface in fileWatch: {resp}"
+    );
+    assert!(
+        fw["totalRoots"].as_u64().unwrap() >= fw["failedRoots"].as_u64().unwrap(),
+        "failedRoots is a subset of totalRoots: {resp}"
+    );
+    assert_eq!(
+        fw["activeStreams"], 0,
+        "no watcher can be created under the seam, so no stream is active: {resp}"
+    );
+    drop(degraded);
 }

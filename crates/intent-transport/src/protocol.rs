@@ -217,21 +217,176 @@
 //! passed through verbatim when present; non-user rows are never included,
 //! roles are filtered in SQL and the transcript is never hydrated (unknown
 //! agent or workspace mismatch is not-found) — 296 router methods,
-//! 335 total. Version 7.5 adds
-//! the execution-environment surface (additive; §5.35, §5.1, §5.5b): the
-//! `sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
-//! `sandbox.image.check` router methods, the
-//! `system.capabilities.microvmSupported` field (§5.7), the
-//! `workspace.create` `executionEnvironment` param with the persisted
+//! 335 total. Version 7.5 adds soft agent retirement (additive; §5.5): the
+//! `agent.restore` router method clears a session's `retiredAt` mark
+//! (`{ success, restored }`; restoring a non-retired session is the no-op
+//! `restored: false`), `agent.list` gains the optional `includeRetired`
+//! boolean param (default `false` — retired rows are excluded; `true` serves
+//! them carrying the additive presence-detected `retiredAt` field, also on
+//! `agent.get` / `agent.getSession`), the `agent:retired` event joins the
+//! agent family alongside the now-emitted `agent:restored`, and retirement
+//! itself stays MCP-only (`ws.agent.retire`, self-scoped, gated by
+//! `agentFeatures.peerAgents`) per the §6.8 principle — 297 router methods,
+//! 336 total. Version 8.0 makes the slim conversation projection the wire
+//! default (BREAKING; §5.5): an absent / `null` `projection` on
+//! `agent.getConversation` and `chat.subscribe` now serves slim (bounded
+//! tool/image block bodies + the slim page byte budget) instead of full
+//! fidelity, so no unbudgeted read remains on the conversation surfaces
+//! (`agent.getSession` still serves the full `messages` log and is the
+//! remaining known unbudgeted transcript read) — full block bodies are
+//! read on demand via `agent.getMessageBlock`;
+//! `projection: "slim"` remains accepted as an explicit no-op and any other
+//! value stays `-32602`. No method-catalog change — 297 router methods,
+//! 336 total. Version 8.1 adds the optional `projection` param on
+//! `note.list` (additive; §5.2): absent / `null` / `"full"` keep the full
+//! rows byte-identical to before (full stays the default — consumers still
+//! read `content` off list rows, monorepo#3573); `"slim"` serves bounded
+//! listing rows with `content` omitted, replaced by `contentPreview` (first
+//! 500 chars) plus `contentLength` (total chars, the `note.listVersions`
+//! unit), every other Note field unchanged; any other value is `-32602`.
+//! No method-catalog change — 297 router methods, 336 total. Version 8.2
+//! extends the same optional `projection` param to `note.subscribe`
+//! (additive; §6.9, monorepo#3586 — the subscription half of the note.list
+//! slim story): absent / `null` / `"full"` keep the full rows byte-identical
+//! to before (full stays the default, matching `note.list`); `"slim"`,
+//! fixed for the subscription's lifetime, serves the same bounded slim rows
+//! (`content` → `contentPreview` + `contentLength`) on the seq-0 snapshot
+//! AND every `added`/`updated` delta re-read, so a slim-adopting client has
+//! no unbounded note-channel frame class left; any other value is `-32602`.
+//! The `task`/`agent` channels are untouched (the param stays an ignored
+//! unknown key there). No method-catalog change — 297 router methods,
+//! 336 total. Version 8.3 adds the `agent.list` retired-bin read
+//! (additive; §5.5): the optional `retiredOnly` param serves ONLY
+//! soft-retired rows (each carrying `retiredAt`, via an SQL-side
+//! `retired_at IS NOT NULL` filter; `includeRetired` + `retiredOnly`
+//! together is `-32602`), and every response variant gains the
+//! always-present `retiredCount` field (one SQL COUNT of the workspace's
+//! soft-retired sessions). No method-catalog change — 297 router methods,
+//! 336 total. Version 8.4 caps the `git.status` wire response (additive;
+//! §5.6, monorepo#3635): `files` is truncated to at most 5000 entries per
+//! response — tracked changes preferred over untracked, relative order
+//! preserved — and a truncated result carries the additive
+//! `filesTruncated: true` + `totalFiles` (full pre-cap count) markers, both
+//! omitted on an untruncated result so the pre-8.4 shape is preserved
+//! byte-for-byte; aggregate flags (`hasUncommittedChanges`,
+//! `hasUntrackedFiles`) still reflect the full scan, and `git.changes` is
+//! deliberately uncapped. No method-catalog change — 297 router methods,
+//! 336 total. Version 8.5 adds agent liveness observability
+//! (additive; §5.5, monorepo#3647): the optional `includeInProgress`
+//! boolean param on `agent.getConversation` (absent / `null` / `false`
+//! byte-identical; non-boolean `-32602`) — when `true` and the served page
+//! ends at the live tail, the in-flight turn's partial assistant message
+//! (streamed blocks so far, slim-bounded like persisted rows, excluded
+//! from `totalMessages`/pagination) is appended as a trailing
+//! `inProgress: true` row (its blocks hydrate via `agent.getMessageBlock`
+//! mid-turn: an unpersisted message id matching the live turn resolves
+//! from the slot's streamed blocks); `AgentLite.lastActivity` is overlaid
+//! mid-turn with the live-turn stream stamp (max of persisted `updatedAt`
+//! and `lastStreamActivityAt`) so it advances on tool-call/stream
+//! activity; and `agent.diagnostics` rows key `staleResponding` on that
+//! same liveness-aware max, additionally serving the raw
+//! `lastStreamActivityAt?` (presence-detected, omitted when no turn is
+//! streaming). No method-catalog change — 297 router methods, 336 total.
+//! Version 8.6 adds the `system.requestUpdate` fast-path method (additive;
+//! §5.7): no params, served on BOTH transports (unlike `system.shutdown` —
+//! a remote client is exactly who needs to trigger an update); the daemon
+//! locates the supervising sitter's pidfile (`<data_dir>/sitter/sitter.pid`),
+//! verifies the pid is live, and sends it SIGUSR1 (the sitter's "check for
+//! updates now" signal), returning `{ ok: true }`; a daemon that is not
+//! sitter-supervised (missing/stale pidfile, or a platform without unix
+//! signals) gets `-32603` with the reason. Method catalog grows by one
+//! fast-path method — 297 router methods, 337 total. Version 8.7 adds the
+//! always-present `updateSupported` boolean result field to `system.status`
+//! (additive; §5.7, intent-hq/intent#3875): true exactly when the daemon is
+//! currently sitter-supervised — the same pidfile + parent/name verification
+//! `system.requestUpdate` performs, evaluated signal-free at read time — so
+//! a client can gate its update affordance without probing
+//! `system.requestUpdate`; always `false` on platforms without unix signals.
+//! No method-catalog change — 297 router methods, 337 total. Version 9.0
+//! removes the legacy workspace importer (breaking; §5.7): the
+//! `system.importLegacy` fast-path method is gone from the catalog — callers
+//! now get `-32601` — along with the `intentd import` / `intentd
+//! import-legacy` CLI subcommands and the first-boot auto-import in `serve`.
+//! Method catalog shrinks by one fast-path method — 298 router methods,
+//! 337 total. Version 9.1 restores the legacy workspace importer (additive;
+//! §5.7): the `system.importLegacy` UDS-only fast-path method is back in the
+//! catalog exactly as before the 9.0 removal, along with the `intentd
+//! import` / `intentd import-legacy` CLI subcommands and the first-boot
+//! auto-import in `serve`. 9.0 already shipped, so the restoration lands as
+//! an additive minor bump rather than a rollback of 9.0. Method catalog
+//! grows by one fast-path method — 298 router methods, 338 total. Version
+//! 9.2 adds the optional `gitRootId` param to `git.agentCommit` (additive;
+//! §5.6, monorepo#2053 follow-up): the commit targets the registered
+//! secondary git root instead of the workspace worktree, resolved exactly
+//! like the six root-scoped reads (empty/whitespace-only treated as absent;
+//! unknown/foreign id → `-32602` "Unknown git root: <id>"), and the
+//! resulting `git:commit` / `changes:git-status` events carry an additive
+//! `gitRootId` field. No method-catalog change — 298 router methods, 338
+//! total. Version 9.3 adds the `host.providerTestPrompt` fast-path method
+//! (additive; §5.14): one live end-to-end ACP prompt ("say hello") against a
+//! provider's adapter — the only conclusive auth check for providers that
+//! serve local probes uncredentialed and fail only at `session/prompt`
+//! (claude-code). Success `{ ok: true }` promotes the cached
+//! `host.providerAuthStatus` verdict to a hard `true`; failures are
+//! structured `{ ok: false, reason, message }` (`reason` ∈ `unsupported |
+//! not-installed | spawn-failed | auth-required | busy | timeout | error`,
+//! never a
+//! wire error — only an unknown `providerId` is `-32602`), and an
+//! auth-required failure demotes the verdict like the runtime spawn seam.
+//! `providers.catalog` rows gain the always-present `supportsTestPrompt`
+//! boolean (`false` only for unsloth, whose first prompt can trigger a very
+//! long model download). Method catalog grows by one fast-path method —
+//! 298 router methods, 39 fast-path, 339 total. Version 9.4 adds provider
+//! auth identity metadata (additive; §5.14): `host.providerAuthStatus`
+//! entries gain the optional `identity: { email?, orgName?,
+//! subscriptionType? }` object, captured from claude-code's logged-in
+//! `claude auth status` JSON report, riding the cached verdict (demotion
+//! clears it, test-prompt promotion preserves it) and absent for providers
+//! without identity. No method-catalog change — 298 router methods,
+//! 39 fast-path, 339 total. Version 9.5 retires the question-hold delivery
+//! gate (§5.5): pending questions no longer park automatic deliveries —
+//! agent-to-agent sends, `agent.sendToTask`, parent/subscription wakes and
+//! the queue drain all proceed while `pendingQuestionsMessageId` is set, so
+//! the `heldForQuestions: true` result flag (and the MCP `ws.agent.send` /
+//! `ws.agent.sendToTask` `delivery: "held"` outcome) is never produced and
+//! is removed from the wire. The pending-question marker lifecycle
+//! (set/clear, `agent.dismissQuestions` + its system notice, the
+//! `needs_attention` derivation and `agent:updated` projections) is
+//! unchanged. No method-catalog change — 298 router methods, 39 fast-path,
+//! 339 total. Version 9.6 adds the single-issue read `github.issues.get`
+//! (`{ owner, repo, number }` → `{ issue: GithubIssue }`; §5.27) and enriches
+//! the `GithubIssue` DTO: `user.login`, `createdAt` and `updatedAt` are now
+//! populated from the forge payload (additive — the keys already existed as
+//! placeholders) on `github.issues.get` / `.list` / `.search`. Method
+//! catalog grows by one router method — 299 router methods, 39 fast-path,
+//! 340 total. Version 9.7 is an additive minor bump over 9.6 that adds the
+//! `workspace.localChanges` method (§5.1): the local git work archiving or
+//! deleting a workspace would lose —
+//! `{ roots: [...], hasUnpushedCommits, hasUncommittedChanges }`
+//! with one row per evaluated root (the primary worktree first, skipped when
+//! the workspace is remote or not a git repository; then every registered
+//! secondary root in `gitRoot.list` order, always evaluated), each carrying
+//! `kind`, `gitRootId` (secondary only), `path`, `branch?`, `hasRemoteRefs`,
+//! `unpushedCount` (commits no `refs/remotes/*` ref reaches, saturating at
+//! 1000 — exact for never-pushed branches, unlike the upstream-relative
+//! `git.status.ahead`), `uncommittedCount` (distinct paths in the
+//! `git.status.files` entry set), and `error` only when the root could not
+//! be read (counts then 0). Unknown workspace → `-32602`. Method catalog
+//! grows by one router method — 300 router methods, 39 fast-path, 341
+//! total. Version 9.8 adds the execution-environment surface (additive;
+//! §5.35, §5.1, §5.5b): the `sandbox.profiles.list` /
+//! `sandbox.profiles.update` / `sandbox.options` / `sandbox.image.check`
+//! router methods, the `system.capabilities.microvmSupported` field (§5.7),
+//! the `workspace.create` `executionEnvironment` param with the persisted
 //! `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
-//! error payloads (§9) — 300 router methods, 339 total.
+//! error payloads (§9) — 304 router methods, 39 fast-path, 345 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.5";
+pub const PROTOCOL_VERSION: &str = "9.8";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

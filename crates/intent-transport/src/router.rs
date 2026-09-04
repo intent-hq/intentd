@@ -461,6 +461,14 @@ async fn dispatch(
             let result = api.workspace_disk_usage(id).await.map_err(workspace_err)?;
             Ok(result)
         }
+        "workspace.localChanges" => {
+            let id = require_workspace_id(params)?;
+            let result = api
+                .workspace_local_changes(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(result)
+        }
         "workspace.transfer.plan" => {
             let id = require_workspace_id(params)?;
             let plan = api
@@ -703,8 +711,18 @@ async fn dispatch(
                 Some(s) if !s.is_empty() => WorkspaceId::from(s),
                 _ => return Err(invalid_params("workspaceId is required")),
             };
+            let projection = parse_note_list_projection(params)?;
             let notes = api.list_notes(&ws_id).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "notes": notes }))
+            match projection {
+                Some(intent_core::NoteListProjection::Slim) => {
+                    let rows: Vec<Value> = notes
+                        .into_iter()
+                        .map(intent_core::note_list_slim_row)
+                        .collect();
+                    Ok(json!({ "notes": rows }))
+                }
+                None => Ok(json!({ "notes": notes })),
+            }
         }
         "note.get" => {
             let ws = require_ws_note(params)?;
@@ -915,8 +933,11 @@ async fn dispatch(
             let note_id = require_note_id(params)?;
             let task_text = require_str_param(params, "taskText")?;
             let status = require_str_param(params, "status")?;
+            // FE/RPC front door: no agent provenance (the MCP path passes the
+            // caller agent so a redirected write's `task:status-changed`
+            // carries `agentId`).
             let result = api
-                .task_update_status(ws, note_id, task_text, status)
+                .task_update_status(ws, note_id, task_text, status, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -945,7 +966,7 @@ async fn dispatch(
             let status = opt_str(params, "status");
             let expected = opt_str(params, "expected");
             let result = api
-                .task_update(ws, note_id, line, text, status, expected)
+                .task_update(ws, note_id, line, text, status, expected, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -1219,8 +1240,46 @@ async fn dispatch(
         }
         "agent.list" => {
             let ws = require_ws_note(params)?;
-            let agents = api.agent_list(ws).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "agents": agents }))
+            // Soft retire (§5.5): retired rows are excluded by default;
+            // `includeRetired: true` serves them too, `retiredOnly: true`
+            // serves ONLY them (retired rows carrying `retiredAt`). The two
+            // flags together are contradictory → `-32602`. Both flags are
+            // deliberately lenient — a non-bool value coerces to `false`
+            // (documented `includeRetired` precedent), it is NOT `-32602`
+            // like v8.1 `note.list` `projection`. Every variant additionally
+            // carries `retiredCount` (one covering-index SQL COUNT of the
+            // workspace's soft-retired sessions, v8.2). The count is a
+            // second statement after the rows read, with no snapshot
+            // isolation across the two: a retire/restore landing between
+            // them can skew `retiredCount` off the returned rows by one —
+            // tolerated by design, since the paired `agent:retired` /
+            // `agent:restored` events let clients reconcile.
+            let include_retired = params
+                .get("includeRetired")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let retired_only = params
+                .get("retiredOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if include_retired && retired_only {
+                return Err(invalid_params(
+                    "includeRetired and retiredOnly are mutually exclusive",
+                ));
+            }
+            let agents = if retired_only {
+                api.agent_list_retired_only(ws.clone())
+                    .await
+                    .map_err(domain_to_rpc)?
+            } else if include_retired {
+                api.agent_list_including_retired(ws.clone())
+                    .await
+                    .map_err(domain_to_rpc)?
+            } else {
+                api.agent_list(ws.clone()).await.map_err(domain_to_rpc)?
+            };
+            let retired_count = api.agent_retired_count(ws).await.map_err(domain_to_rpc)?;
+            Ok(json!({ "agents": agents, "retiredCount": retired_count }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
         "agent.get" => {
@@ -1261,11 +1320,22 @@ async fn dispatch(
                     "aroundMessageId and aroundIndex are mutually exclusive",
                 ));
             }
-            // Additive `projection` param (§5.5): absent / null keeps the
-            // response byte-identical to before; `"slim"` bounds tool/image
-            // block bodies; any other value is `-32602` (a silently ignored
-            // typo would hand the client full-size frames it opted out of).
+            // `projection` param (§5.5): slim is the wire default since
+            // v8.0 — absent / null and the explicit `"slim"` all serve
+            // bounded tool/image block bodies; any other value is `-32602`.
             let projection = parse_projection(params)?;
+            // Additive `includeInProgress` param (§5.5, monorepo#3647):
+            // opt-in to the in-flight turn's partial assistant message as a
+            // trailing `inProgress: true` row on tail pages. Absent / null /
+            // false keep responses byte-identical; any non-boolean is
+            // `-32602`.
+            let include_in_progress = match params.get("includeInProgress") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(invalid_params("includeInProgress must be a boolean"));
+                }
+            };
             match api
                 .agent_get_conversation(
                     agent_id,
@@ -1275,6 +1345,7 @@ async fn dispatch(
                     around_message_id,
                     around_index,
                     projection,
+                    include_in_progress,
                 )
                 .await
             {
@@ -1452,7 +1523,9 @@ async fn dispatch(
             let priority = opt_str(params, "priority");
             // Same opaque per-message payload as `agent.sendMessage` below
             // (PROTOCOL §5.5) — persisted on the assignee's user row.
-            let message_metadata = opt_value(params, "messageMetadata");
+            // Attribution fields are reserved (daemon-stamped, agent callers
+            // only) and stripped at this user-origin front door.
+            let message_metadata = strip_sender_attribution(opt_value(params, "messageMetadata"));
             let result = api
                 .agent_send_to_task(ws, task_note_id, message, priority, message_metadata)
                 .await
@@ -1477,9 +1550,11 @@ async fn dispatch(
             let context_references = opt_value(params, "contextReferences");
             // Opaque per-message payload (PROTOCOL §5.5): the FE attaches
             // arbitrary JSON to distinguish daemon-initiated turns (e.g.
-            // `{ source: "system" }`). Passed through unmodified and persisted
-            // on the user message row via the store's metadata-aware append.
-            let message_metadata = opt_value(params, "messageMetadata");
+            // `{ source: "system" }`). Persisted on the user message row via
+            // the store's metadata-aware append — passed through unmodified
+            // except the reserved attribution fields, which are stripped at
+            // this user-origin front door.
+            let message_metadata = strip_sender_attribution(opt_value(params, "messageMetadata"));
             // `userAppMessageId` (PROTOCOL §5.5): the FE's client-minted
             // logical identity for its optimistic user message. Folded into
             // the row `metadata` here so it persists without a schema change,
@@ -1490,9 +1565,9 @@ async fn dispatch(
             // unconsumed: assistant rows are keyed on the server-minted
             // UUIDv7 id.
             let message_metadata = merge_user_app_message_id(params, message_metadata)?;
-            // Question hold (PROTOCOL §5.5): the FE RPC front door is the
-            // ONLY user-originated entry point — user sends are never held.
-            // They do not release the hold either: only an answer-tagged row
+            // Origin (PROTOCOL §5.5): the FE RPC front door is the ONLY
+            // user-originated entry point. A user send does not by itself
+            // resolve pending questions: only an answer-tagged row
             // (`messageMetadata.type = "question_answers"`) or
             // `agent.dismissQuestions` retires the pending Q&A.
             let result = api
@@ -1530,6 +1605,18 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let result = api
                 .agent_dismiss_questions(ws, agent_id, message_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.resolveProposal" => {
+            let agent_id = require_agent_id(params)?;
+            let proposal_id = require_str_param(params, "proposalId")?;
+            let outcome = require_str_param(params, "outcome")?;
+            let detail = opt_str(params, "detail");
+            let ws = require_ws_note(params)?;
+            let result = api
+                .agent_resolve_proposal(ws, agent_id, proposal_id, outcome, detail)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -1831,6 +1918,19 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "cancelled": cancelled }))
         }
+        "agent.restore" => {
+            // Soft retire undo (§5.5): clear `retiredAt`, returning the
+            // session to normal service. User/FE-initiated only — there is
+            // deliberately no MCP binding. Restoring a non-retired session
+            // is the no-op `{ success: true, restored: false }`.
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let result = api
+                .agent_restore(agent_id, ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.retry" => {
             let agent_id = require_agent_id(params)?;
             let ws = require_ws_note(params)?;
@@ -1864,7 +1964,9 @@ async fn dispatch(
                 caller_agent_id: opt_nonempty_str(params, "callerAgentId")
                     .map(|s| AgentId::from(s.as_str())),
                 delegation_depth: params.get("delegationDepth").and_then(Value::as_i64),
-                message_metadata: opt_value(params, "messageMetadata"),
+                // Reserved attribution fields stripped: same user-origin
+                // front door rule as `agent.sendMessage` / `agent.sendToTask`.
+                message_metadata: strip_sender_attribution(opt_value(params, "messageMetadata")),
                 create,
             };
             let result = api
@@ -2324,11 +2426,15 @@ async fn dispatch(
             let message = require_str_param(params, "message")?;
             let files = opt_str_array(params, "files");
             let user_requested = parse_bool(params, "userRequested");
+            // §5.6 extension (monorepo#2053 follow-up): optional `gitRootId`
+            // targets the commit at a registered git root; an unknown/foreign
+            // id is -32602, identical to the six root-scoped reads.
+            let git_root_id = opt_git_root_id(params);
             // The FE/transport path has no agent context, so no attribution
             // trailers are written here (mirrors the reference, which composes
             // attribution at the agent-context MCP layer).
             let r = api
-                .git_agent_commit(ws, message, None, None, files, user_requested)
+                .git_agent_commit(ws, message, None, None, files, user_requested, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({
@@ -2553,6 +2659,16 @@ async fn dispatch(
             let number = require_u64(params, "number")?;
             let r = api
                 .github_pulls_get(owner, repo, number)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.issues.get" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let number = require_u64(params, "number")?;
+            let r = api
+                .github_issues_get(owner, repo, number)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2914,6 +3030,14 @@ async fn dispatch(
             let include_older = params.get("includeOlder").and_then(Value::as_bool);
             let r = api
                 .file_tracking_load_commits(ws, limit, page_token, include_older)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "file-tracking.getAgentLocks" => {
+            let ws = require_ws_note(params)?;
+            let r = api
+                .file_tracking_get_agent_locks(ws)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3687,7 +3811,23 @@ async fn dispatch(
                 .get("enabled")
                 .and_then(Value::as_bool)
                 .ok_or_else(|| invalid_params("enabled is required"))?;
-            match api.mcp_servers_toggle(server_id, enabled).await {
+            // Optional workspaceId scopes the toggle to the per-workspace
+            // disabled layer (PROTOCOL §5.22); absent/null → global toggle.
+            // Strict on this mutating arm: a present-but-malformed value must
+            // NOT silently degrade into a global toggle.
+            let workspace_id = match params.get("workspaceId") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(WorkspaceId::from)
+                        .ok_or_else(|| invalid_params("workspaceId must be a non-empty string"))?,
+                ),
+            };
+            match api
+                .mcp_servers_toggle(server_id, enabled, workspace_id)
+                .await
+            {
                 Ok(v) => Ok(v),
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(Error::NotFound(m)) => Err(not_found(m)),
@@ -3792,6 +3932,26 @@ fn opt_value(params: &Map<String, Value>, name: &str) -> Option<Value> {
     match params.get(name) {
         None | Some(Value::Null) => None,
         Some(v) => Some(v.clone()),
+    }
+}
+
+/// Strip the reserved sender-attribution fields (`fromAgentId` /
+/// `fromAgentName`, PROTOCOL §5.5) from a caller-supplied `messageMetadata`
+/// object. The RPC router is the user/FE front door: attribution is
+/// daemon-stamped by the MCP bindings for agent callers only, so a wire
+/// caller must not be able to forge an agent-origin send (the attribution
+/// gates the A2A sender header, the single-pending-message guard and
+/// `removeQueuedMessage` ownership). All other fields pass through
+/// untouched; non-object metadata cannot carry attribution and is returned
+/// as-is.
+fn strip_sender_attribution(message_metadata: Option<Value>) -> Option<Value> {
+    match message_metadata {
+        Some(Value::Object(mut obj)) => {
+            obj.remove("fromAgentId");
+            obj.remove("fromAgentName");
+            Some(Value::Object(obj))
+        }
+        other => other,
     }
 }
 
@@ -4086,17 +4246,36 @@ fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
 }
 
 /// Parse the optional `projection` param on conversation reads (§5.5):
-/// absent / `null` mean full fidelity (`None`), `"slim"` selects the bounded
-/// tool/image projection, anything else is `-32602`.
+/// absent / `null` and the explicit `"slim"` all select the bounded
+/// tool/image projection — slim is the wire default since v8.0, so the
+/// unbudgeted full read is unreachable over the wire (full blocks are
+/// served per-block by `agent.getMessageBlock`); anything else is `-32602`.
 fn parse_projection(
     params: &Map<String, Value>,
 ) -> Result<Option<intent_core::ConversationProjection>, RpcErr> {
     match params.get("projection") {
-        None | Some(Value::Null) => Ok(None),
+        None | Some(Value::Null) => Ok(Some(intent_core::ConversationProjection::Slim)),
         Some(Value::String(s)) if s == "slim" => {
             Ok(Some(intent_core::ConversationProjection::Slim))
         }
         Some(_) => Err(invalid_params("projection must be \"slim\"")),
+    }
+}
+
+/// Parse the optional `projection` param on `note.list` (§5.2): absent /
+/// `null` / `"full"` mean full rows (`None` — byte-identical to before, so
+/// existing clients are unaffected), `"slim"` selects the bounded listing
+/// rows (`content` → `contentPreview` + `contentLength`), anything else is
+/// `-32602`. Unlike the conversation reads above, full stays the default —
+/// consumers (iOS) still read `content` off list rows (monorepo#3573).
+fn parse_note_list_projection(
+    params: &Map<String, Value>,
+) -> Result<Option<intent_core::NoteListProjection>, RpcErr> {
+    match params.get("projection") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s == "full" => Ok(None),
+        Some(Value::String(s)) if s == "slim" => Ok(Some(intent_core::NoteListProjection::Slim)),
+        Some(_) => Err(invalid_params("projection must be \"slim\" or \"full\"")),
     }
 }
 

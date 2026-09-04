@@ -312,6 +312,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -392,7 +393,7 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-ARCHIVE", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-ARCHIVE", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

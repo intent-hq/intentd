@@ -5,10 +5,11 @@
 //! task parsing, and asset-id parsing. User-facing failures surface as
 //! [`Error::Internal`] so the router maps them to `-32603` with the original
 //! message in `data`, matching the TS handler — except comment anchoring
-//! failures, which are [`Error::InvalidParams`] (`-32602`) so clients see the
-//! actionable message directly.
+//! failures and the numbered-`note.read`-presentation write guard, which are
+//! [`Error::InvalidParams`] (`-32602`) so clients see the actionable message
+//! directly.
 
-use intent_core::{Error, NoteTaskRow, Result};
+use intent_core::{Error, NoteTaskRow, Result, TaskStatus};
 use std::fmt::Write as _;
 
 /// JS `\s` (ASCII subset): space, tab, the line terminators, FF and VT.
@@ -198,11 +199,78 @@ pub(crate) fn clean_set_content(content: &str) -> Result<String> {
     Ok(clean)
 }
 
-fn is_hex_or_dash(b: u8) -> bool {
-    b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-'
+/// Separator the agent-facing `note.read` binding emits between a task note's
+/// numbered body and its metadata footer.
+const TASK_METADATA_TRAILER: &str = "\n\n--- Task Metadata ---\n";
+
+/// Field width of the `{:>4}` line-number column in `note.read` output.
+const READ_NUMBER_WIDTH: usize = 4;
+
+/// Line number of a `note.read` display line (`{:>4} | {line}`); `None` when
+/// the line is not in that shape. The number column is exactly the
+/// right-aligned 4-wide field the binding renders (wider only once the number
+/// itself outgrows it), so an indented code block such as `    1 | x` does
+/// not qualify. A blank source line renders as `   N | `, so a bare `N |`
+/// (trailing space trimmed by the caller) also counts.
+fn numbered_read_line(line: &str) -> Option<u64> {
+    let rest = line.trim_start_matches(' ');
+    let pad = line.len() - rest.len();
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits_end == 0 || pad + digits_end != READ_NUMBER_WIDTH.max(digits_end) {
+        return None;
+    }
+    let after = &rest[digits_end..];
+    if after.starts_with(" | ") || after == " |" {
+        rest[..digits_end].parse().ok()
+    } else {
+        None
+    }
+}
+
+/// True when `content` is (or starts as) the line-numbered *display*
+/// presentation that `ws.note.read` returns in `content` (as opposed to
+/// `rawContent`): the content opens with at least two lines carrying
+/// consecutive `   N | ` prefixes, blank lines included — whatever follows is
+/// irrelevant, so `read.content + "\n- [ ] new item"` is caught too. A task
+/// note's read that carries only the metadata footer (empty body) also
+/// counts. A lone `N | text` line, ordered lists, tables, indented code and
+/// fenced listings do not match (monorepo#4208).
+#[must_use]
+pub fn is_numbered_read_presentation(content: &str) -> bool {
+    let (body, has_trailer) = content
+        .split_once(TASK_METADATA_TRAILER)
+        .map_or((content, false), |(body, _)| (body, true));
+    if has_trailer && body.is_empty() {
+        return true;
+    }
+    let mut lines = body.split('\n');
+    let Some(first) = lines.next().and_then(numbered_read_line) else {
+        return false;
+    };
+    lines.next().and_then(numbered_read_line) == Some(first + 1)
+}
+
+/// Write-path guard for every content-accepting `ws.note.*` mutation and
+/// `task.createPrerequisite`'s `content` (monorepo#4299): reject the numbered
+/// `note.read` presentation instead of persisting it, since the
+/// `   N | ` prefixes turn headings and checkboxes into literal text. The
+/// caller keeps the note untouched and the error names the fix.
+pub(crate) fn reject_numbered_read_presentation(content: &str) -> Result<()> {
+    if is_numbered_read_presentation(content) {
+        return Err(Error::InvalidParams(
+            "Content looks like the line-numbered display returned by note.read (lines prefixed with `   N | `). Writing it back would corrupt the note's Markdown, so it was rejected and the note is unchanged. Use the `rawContent` field from note.read (or remove the `   N | ` prefixes) and retry; wrap intentionally numbered text in a code fence.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// First `[label](intent://local/task/<id>)` link; returns `(label, id)`.
+///
+/// The id is everything up to the closing `)` — the same alphabet as
+/// `intent_core::extract_spec_task_ids` (the materialization prefilter):
+/// `NoteId` is an arbitrary string, so `t1` / `task-a` link like UUIDs do.
 fn find_task_link(s: &str) -> Option<(String, String)> {
     const PREFIX: &str = "](intent://local/task/";
     let bytes = s.as_bytes();
@@ -216,12 +284,13 @@ fn find_task_link(s: &str) -> Option<(String, String)> {
             }
             if j < bytes.len() && j > label_start && s[j..].starts_with(PREFIX) {
                 let id_start = j + PREFIX.len();
-                let mut k = id_start;
-                while k < bytes.len() && is_hex_or_dash(bytes[k]) {
-                    k += 1;
-                }
-                if k > id_start && k < bytes.len() && bytes[k] == b')' {
-                    return Some((s[label_start..j].to_string(), s[id_start..k].to_string()));
+                if let Some(len) = s[id_start..].find(')') {
+                    if len > 0 {
+                        return Some((
+                            s[label_start..j].to_string(),
+                            s[id_start..id_start + len].to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -341,6 +410,115 @@ pub(crate) fn checkbox_for(word: &str) -> Option<&'static str> {
         "done" => Some("[x]"),
         _ => None,
     }
+}
+
+/// Checkbox marker a task-note status materializes as on the lines linking
+/// it: `complete` → `[x]`, `in_progress` → `[/]`, every other status → `[ ]`.
+pub(crate) fn checkbox_for_task_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Complete => "[x]",
+        TaskStatus::InProgress => "[/]",
+        _ => "[ ]",
+    }
+}
+
+/// Byte span of the `[c]` checkbox on a `match_task_line`-shaped line:
+/// `(box_start, after_bracket, checkbox_char)`.
+fn checkbox_span(line: &str) -> Option<(usize, usize, char)> {
+    let mut it = line.char_indices().peekable();
+    while matches!(it.peek(), Some((_, c)) if is_js_space_char(*c)) {
+        it.next();
+    }
+    match it.next() {
+        Some((_, '-' | '*')) => {}
+        _ => return None,
+    }
+    while matches!(it.peek(), Some((_, c)) if is_js_space_char(*c)) {
+        it.next();
+    }
+    let (box_start, '[') = it.next()? else {
+        return None;
+    };
+    let (_, cb @ (' ' | 'x' | 'X' | '/')) = it.next()? else {
+        return None;
+    };
+    let (close, ']') = it.next()? else {
+        return None;
+    };
+    Some((box_start, close + 1, cb))
+}
+
+/// Set the checkbox of every checkbox line whose first task link names
+/// `task_id` (`[label](intent://local/task/{task_id})`) to `checkbox`
+/// (a bracket marker such as `[x]`). Lines already carrying the marker
+/// (`[X]` counts as `[x]`), unlinked lines and lines linking other tasks are
+/// left as-is. Returns `None` when no line changed.
+pub(crate) fn set_linked_checkbox(content: &str, task_id: &str, checkbox: &str) -> Option<String> {
+    let target = checkbox.chars().nth(1)?;
+    let mut changed = false;
+    let out: Vec<String> = content
+        .split('\n')
+        .map(|line| {
+            let Some((box_start, after_idx, cb)) = checkbox_span(line) else {
+                return line.to_string();
+            };
+            if cb.eq_ignore_ascii_case(&target) {
+                return line.to_string();
+            }
+            match find_task_link(&line[after_idx..]) {
+                Some((_, id)) if id == task_id => {
+                    changed = true;
+                    format!("{}{}{}", &line[..box_start], checkbox, &line[after_idx..])
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect();
+    changed.then(|| out.join("\n"))
+}
+
+/// Status word (`todo` / `in-progress` / `done`) a task-note status projects
+/// to on a linked checkbox line — the word form of [`checkbox_for_task_status`].
+pub(crate) fn status_word_for_task_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Complete => "done",
+        TaskStatus::InProgress => "in-progress",
+        _ => "todo",
+    }
+}
+
+/// Task note id linked by the line `task.updateStatus` would rewrite for
+/// `task_text`: the first exact-match checkbox line, else the first linked
+/// line whose link label equals the text (what `note.listTasks` returns as a
+/// linked row's `text`), else the first checkbox line containing the text
+/// ([`apply_task_status`]'s fallback). `None` when no line matches or the
+/// matched line carries no task link.
+pub(crate) fn linked_task_for_text(content: &str, task_text: &str) -> Option<String> {
+    let normalized = task_text.trim();
+    let lines = || {
+        content
+            .split('\n')
+            .filter_map(|line| parse_dash_checkbox(line).map(|(_, after_idx, _)| (line, after_idx)))
+    };
+    let exact = lines().find(|(line, after_idx)| line[*after_idx..].trim() == normalized);
+    let label = || {
+        lines().find(|(line, after_idx)| {
+            find_task_link(&line[*after_idx..]).is_some_and(|(label, _)| label.trim() == normalized)
+        })
+    };
+    let (line, after_idx) = exact
+        .or_else(label)
+        .or_else(|| lines().find(|(line, _)| line.contains(normalized)))?;
+    find_task_link(&line[after_idx..]).map(|(_, id)| id)
+}
+
+/// Task note id linked by checkbox line `line` (1-based); `None` when the
+/// line is out of range, not a checkbox line, or carries no task link.
+pub(crate) fn linked_task_at_line(content: &str, line: i64) -> Option<String> {
+    let index = usize::try_from(line.checked_sub(1)?).ok()?;
+    let current = content.split('\n').nth(index)?;
+    let (_, after_idx, _) = parse_dash_checkbox(current)?;
+    find_task_link(&current[after_idx..]).map(|(_, id)| id)
 }
 
 /// Map a checkbox character to its status word (TS `currentStatus` mapping).
@@ -1579,15 +1757,7 @@ fn strip_leading_headers(s: &str) -> String {
 /// File extension (with leading dot) for a mime type (default `.png`), the
 /// inverse of [`mime_from_extension`], per the TS `getExtensionFromMimeType`.
 pub(crate) fn extension_from_mime(mime_type: &str) -> &'static str {
-    match mime_type {
-        "image/jpeg" | "image/jpg" => ".jpg",
-        "image/gif" => ".gif",
-        "image/webp" => ".webp",
-        "image/svg+xml" => ".svg",
-        "image/bmp" => ".bmp",
-        "image/tiff" => ".tiff",
-        _ => ".png",
-    }
+    intent_core::asset_extension_from_mime(mime_type).unwrap_or(".png")
 }
 
 /// Strip an optional `data:<mime>;base64,` URL prefix from an asset payload,
@@ -1650,6 +1820,8 @@ pub(crate) fn mime_from_extension(asset_id: &str) -> String {
         "svg" => "image/svg+xml",
         "bmp" => "image/bmp",
         "tiff" => "image/tiff",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
         _ => "image/png",
     }
     .to_string()
@@ -1753,6 +1925,77 @@ mod tests {
     }
 
     #[test]
+    fn numbered_read_presentation_detects_note_read_shape() {
+        // Exact `note.read` rendering, blank line included (`   2 | `).
+        assert!(is_numbered_read_presentation(
+            "   1 | # Spec\n   2 | \n   3 | ## Goal\n   4 | - [ ] item"
+        ));
+        // Blank-line trailing space trimmed by the caller, trailing newline.
+        assert!(is_numbered_read_presentation(
+            "   1 | # Spec\n   2 |\n   3 | ## Goal\n"
+        ));
+        // A snippet from the middle of a read (editLines / edit `new`).
+        assert!(is_numbered_read_presentation("  12 | ## Goal\n  13 | body"));
+        // Wide numbers past the 4-column pad.
+        assert!(is_numbered_read_presentation(
+            "9999 | a\n10000 | b\n10001 | c"
+        ));
+        // Task-note read: numbered body plus the metadata trailer.
+        assert!(is_numbered_read_presentation(
+            "   1 | # T\n   2 | body\n\n--- Task Metadata ---\nStatus: in_progress"
+        ));
+        // Empty task note: the read is only the metadata trailer.
+        assert!(is_numbered_read_presentation(
+            "\n\n--- Task Metadata ---\nStatus: not_started"
+        ));
+        // The incident shape: `read.content + "\n- [ ] new item"` — the
+        // appended raw line must not launder the numbered body.
+        assert!(is_numbered_read_presentation(
+            "   1 | # Spec\n   2 | \n   3 | - [ ] item\n- [ ] new item"
+        ));
+        assert!(is_numbered_read_presentation(
+            "   1 | # Spec\n   2 | body\n\n## Added section\nprose"
+        ));
+    }
+
+    #[test]
+    fn numbered_read_presentation_ignores_legitimate_content() {
+        // Plain Markdown, ordered lists, tables, and fenced listings.
+        assert!(!is_numbered_read_presentation(
+            "# Spec\n\n## Goal\n- [ ] item"
+        ));
+        assert!(!is_numbered_read_presentation("1. first\n2. second"));
+        assert!(!is_numbered_read_presentation(
+            "| n | name |\n| --- | --- |\n| 1 | a |\n| 2 | b |"
+        ));
+        assert!(!is_numbered_read_presentation(
+            "```text\n   1 | listing\n   2 | example\n```"
+        ));
+        // Indented (4-space) code block: wider than the `{:>4}` column.
+        assert!(!is_numbered_read_presentation(
+            "    1 | listing\n    2 | example"
+        ));
+        assert!(!is_numbered_read_presentation(" 10000 | a\n 10001 | b"));
+        // Prose before a numbered run, or a non-consecutive opening pair.
+        assert!(!is_numbered_read_presentation("intro\n   1 | a\n   2 | b"));
+        assert!(!is_numbered_read_presentation("   1 | a\nplain\n   3 | c"));
+        assert!(!is_numbered_read_presentation("   1 | a\n   3 | c"));
+        assert!(!is_numbered_read_presentation("   2 | a\n   1 | b"));
+        // A single line is too little signal to reject.
+        assert!(!is_numbered_read_presentation("   1 | only"));
+        assert!(!is_numbered_read_presentation("   1 | only\nplain"));
+        assert!(!is_numbered_read_presentation(""));
+        // `N|x` without the surrounding spaces is not the read shape, nor are
+        // unpadded GFM table body rows without a leading pipe.
+        assert!(!is_numbered_read_presentation("1|a\n2|b"));
+        assert!(!is_numbered_read_presentation("1 | Alice\n2 | Bob"));
+        // A task-style trailer after a real body is ordinary Markdown.
+        assert!(!is_numbered_read_presentation(
+            "# T\n\n--- Task Metadata ---\nStatus: x"
+        ));
+    }
+
+    #[test]
     fn parse_tasks_reads_checkboxes_and_links() {
         let content = concat!(
             "- [ ] todo item\n",
@@ -1798,6 +2041,139 @@ mod tests {
         let content = "- [ ] alpha beta gamma";
         let out = apply_task_status(content, "beta", "[x]").unwrap();
         assert_eq!(out, "- [x] alpha beta gamma");
+    }
+
+    #[test]
+    fn set_linked_checkbox_rewrites_only_lines_linking_the_task() {
+        let body = |a: &str, b: &str| {
+            format!(
+                "# H\n- {a} [T](intent://local/task/a1)\n- [ ] plain\n\
+                 - [ ] [O](intent://local/task/b2)\n  * {b} [T2](intent://local/task/a1) tail\n\
+                 not a task [x](intent://local/task/a1)"
+            )
+        };
+        let content = body("[ ]", "[/]");
+        let out = set_linked_checkbox(&content, "a1", "[x]").expect("changed");
+        assert_eq!(out, body("[x]", "[x]"));
+        // Every linked line already carries the marker → no change.
+        assert_eq!(set_linked_checkbox(&out, "a1", "[x]"), None);
+        // `[X]` counts as already-done for the `[x]` marker.
+        assert_eq!(
+            set_linked_checkbox("- [X] [T](intent://local/task/a1)", "a1", "[x]"),
+            None
+        );
+        // No line links the task → no change.
+        assert_eq!(set_linked_checkbox(&content, "d9", "[x]"), None);
+        // Reverse: `[x]` → `[/]` → `[ ]`.
+        let back = set_linked_checkbox(&out, "a1", "[/]").expect("changed");
+        assert_eq!(back, body("[/]", "[/]"));
+        let open = set_linked_checkbox(&back, "a1", "[ ]").expect("changed");
+        assert_eq!(open, body("[ ]", "[ ]"));
+        // A partial-id prefix is not a link to the task.
+        assert_eq!(
+            set_linked_checkbox("- [ ] [T](intent://local/task/a10)", "a1", "[x]"),
+            None
+        );
+    }
+
+    #[test]
+    fn task_link_ids_share_the_prefilter_alphabet() {
+        // `NoteId` is an arbitrary string: every id `extract_spec_task_ids`
+        // (the materialization prefilter) yields is one the rewriter and the
+        // redirect resolvers accept too — not just hex/dash UUID shapes.
+        for id in ["t1", "task-a", "Task_A.v2", "ZZ"] {
+            let line = format!("- [ ] [T](intent://local/task/{id})");
+            let ids = intent_core::extract_spec_task_ids(&line);
+            assert!(ids.contains(id), "prefilter yields {id}");
+            assert_eq!(
+                find_task_link(&line),
+                Some(("T".to_string(), id.to_string())),
+                "{id}"
+            );
+            assert_eq!(
+                set_linked_checkbox(&line, id, "[x]").as_deref(),
+                Some(format!("- [x] [T](intent://local/task/{id})").as_str()),
+                "{id}"
+            );
+            assert_eq!(linked_task_at_line(&line, 1).as_deref(), Some(id));
+            assert_eq!(linked_task_for_text(&line, "T").as_deref(), Some(id));
+        }
+        // An empty id or an unterminated link is still no link.
+        assert_eq!(find_task_link("[T](intent://local/task/)"), None);
+        assert_eq!(find_task_link("[T](intent://local/task/t1"), None);
+    }
+
+    #[test]
+    fn linked_task_resolvers_follow_the_apply_matching_rules() {
+        let content = "# H\n- [ ] [T](intent://local/task/a1)\n- [ ] plain\n\
+                       - [/] alpha [O](intent://local/task/b2)\n- [x] alpha\nnot a task";
+        // Exact match wins over an earlier containing line.
+        assert_eq!(linked_task_for_text(content, "alpha"), None);
+        assert_eq!(
+            linked_task_for_text(content, "alpha [O](intent://local/task/b2)"),
+            Some("b2".to_string())
+        );
+        // Fallback: first checkbox line containing the text.
+        assert_eq!(linked_task_for_text(content, "T"), Some("a1".to_string()));
+        assert_eq!(
+            linked_task_for_text(content, "  T  "),
+            Some("a1".to_string())
+        );
+        assert_eq!(linked_task_for_text(content, "plain"), None);
+        assert_eq!(linked_task_for_text(content, "missing"), None);
+
+        assert_eq!(linked_task_at_line(content, 2), Some("a1".to_string()));
+        assert_eq!(linked_task_at_line(content, 3), None);
+        assert_eq!(linked_task_at_line(content, 4), Some("b2".to_string()));
+        assert_eq!(linked_task_at_line(content, 1), None);
+        assert_eq!(linked_task_at_line(content, 6), None);
+        assert_eq!(linked_task_at_line(content, 7), None);
+        assert_eq!(linked_task_at_line(content, 0), None);
+    }
+
+    /// `note.listTasks` returns a linked row's link label as its `text`, so a
+    /// label match must beat the `contains` fallback: two linked lines whose
+    /// labels share a substring each resolve to their own task.
+    #[test]
+    fn linked_task_for_text_prefers_a_label_match_over_the_contains_fallback() {
+        let content = "- [ ] [Ship It](intent://local/task/b2)\n\
+                       - [ ] [Ship](intent://local/task/a1)\n\
+                       - [ ] [Ship](intent://local/task/c3)";
+        assert_eq!(
+            linked_task_for_text(content, "Ship"),
+            Some("a1".to_string())
+        );
+        assert_eq!(
+            linked_task_for_text(content, " Ship "),
+            Some("a1".to_string())
+        );
+        assert_eq!(
+            linked_task_for_text(content, "Ship It"),
+            Some("b2".to_string())
+        );
+        // An exact line match still wins over a label match.
+        assert_eq!(
+            linked_task_for_text(content, "[Ship](intent://local/task/c3)"),
+            Some("c3".to_string())
+        );
+        // No label matches: the contains fallback still applies.
+        assert_eq!(linked_task_for_text(content, "Shi"), Some("b2".to_string()));
+    }
+
+    #[test]
+    fn checkbox_for_task_status_mapping() {
+        assert_eq!(checkbox_for_task_status(TaskStatus::Complete), "[x]");
+        assert_eq!(checkbox_for_task_status(TaskStatus::InProgress), "[/]");
+        for status in [
+            TaskStatus::NotStarted,
+            TaskStatus::Waiting,
+            TaskStatus::Blocked,
+            TaskStatus::DiscussionNeeded,
+            TaskStatus::ReviewRequired,
+            TaskStatus::Cancelled,
+        ] {
+            assert_eq!(checkbox_for_task_status(status), "[ ]", "{status:?}");
+        }
     }
 
     #[test]
@@ -2407,6 +2783,10 @@ mod tests {
     fn save_asset_helpers() {
         assert_eq!(extension_from_mime("image/jpeg"), ".jpg");
         assert_eq!(extension_from_mime("image/webp"), ".webp");
+        assert_eq!(extension_from_mime("video/mp4"), ".mp4");
+        assert_eq!(extension_from_mime("video/webm"), ".webm");
+        assert_eq!(mime_from_extension("clip.mp4"), "video/mp4");
+        assert_eq!(mime_from_extension("clip.webm"), "video/webm");
         assert_eq!(extension_from_mime("application/pdf"), ".png");
 
         assert_eq!(strip_data_url_prefix("data:image/png;base64,AAAA"), "AAAA");

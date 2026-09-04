@@ -1,33 +1,34 @@
 # Steps injected into v-release.yml's build-local-artifacts job via the
 # `github-build-setup` dist setting (dist-workspace.toml). NOT a standalone
-# workflow. Needed because the self-hosted runners (tinybox / 5090pc) don't
-# guarantee the preinstalled toolchain state of GitHub-hosted images:
-# tinybox has no rustup at all, and no runner (self-hosted or GitHub-hosted
-# macOS) necessarily has the pinned toolchain or the cross targets
-# (x86_64-apple-darwin on the arm64 Mac, musl on Linux) installed.
+# workflow. Needed because no runner image guarantees the toolchain state
+# the build needs: no runner (GitHub-hosted or self-hosted) necessarily has
+# the pinned rust-toolchain.toml channel or the cross targets
+# (x86_64-apple-darwin on the arm64 Mac, musl on Linux) installed, and
+# self-hosted runners may lack rustup entirely.
 #
-# On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the WSL
+# On a self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the WSL
 # stub) shadows Git Bash in PATH, and WSL bash can't execute the runner's
 # Windows-path step scripts. Prepend Git's bin dir so every later
 # `shell: bash` step resolves Git Bash instead (same workaround as ci.yml's
-# build job).
+# build job). No-op on the GitHub-hosted windows-2022 image.
 - name: Put Git Bash first on PATH (Windows)
   if: runner.os == 'Windows'
   shell: cmd
   run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
 # dist's generated "Install dependencies" step runs `sudo apt-get install`
 # without -y. GitHub-hosted Ubuntu images make that non-interactive via
-# /etc/apt/apt.conf.d/90assumeyes; tinybox doesn't have it, so apt prompts,
-# reads EOF, and aborts. Mirror the hosted-image config and export
+# /etc/apt/apt.conf.d/90assumeyes; a self-hosted runner may not, so apt
+# prompts, reads EOF, and aborts. Assert the hosted-image config
+# (idempotent where it already exists) and export
 # DEBIAN_FRONTEND=noninteractive for the later steps.
 # Also set DPkg::Lock::Timeout system-wide so every later `apt-get install`
 # — including the one in the generated "Install dependencies" step, which
 # can't be edited — waits up to 300s for the dpkg/frontend/archives locks
-# instead of failing instantly when a concurrent job on the shared
-# self-hosted runner holds them (monorepo#1515). Note this option does NOT
-# cover /var/lib/apt/lists/lock, which `apt-get update` takes (Debian bug
-# #1069167, unimplemented as of apt 2.4 on tinybox) — the shim step below
-# handles that.
+# instead of failing instantly when a concurrent process holds them
+# (monorepo#1515; on hosted images that's the background apt maintenance
+# jobs). Note this option does NOT cover /var/lib/apt/lists/lock, which
+# `apt-get update` takes (Debian bug #1069167, unimplemented as of apt 2.4)
+# — the shim step below handles that.
 - name: Make apt-get non-interactive and lock-tolerant (Linux)
   if: runner.os == 'Linux'
   shell: bash
@@ -36,15 +37,14 @@
     echo 'DPkg::Lock::Timeout "300";' | sudo tee /etc/apt/apt.conf.d/90lock-timeout >/dev/null
     echo "DEBIAN_FRONTEND=noninteractive" >> "$GITHUB_ENV"
 # The generated "Install dependencies" step starts with `sudo apt-get
-# update`, whose lists lock has no wait option (Debian bug #1069167), and
-# both musl legs run that step concurrently on tinybox — exactly the race
-# that failed the v0.5.0 aarch64-musl leg (monorepo#1515). The step's
-# content is plan-time matrix output (`matrix.packages_install`), so it
-# can't be wrapped in a retry here. Instead, shim apt-get via
-# /usr/local/bin — ahead of /usr/bin on sudo's secure_path — to retry with
-# backoff when apt fails on lock contention. Idempotent rewrite on every
-# run; only ever lands on the self-hosted Linux runners (the v-release
-# Linux legs all run on tinybox).
+# update`, whose lists lock has no wait option (Debian bug #1069167) — the
+# race that failed the v0.5.0 aarch64-musl leg when both musl legs shared
+# one self-hosted runner (monorepo#1515), and that background apt
+# maintenance can still trigger on hosted images. The step's content is
+# plan-time matrix output (`matrix.packages_install`), so it can't be
+# wrapped in a retry here. Instead, shim apt-get via /usr/local/bin —
+# ahead of /usr/bin on sudo's secure_path — to retry with backoff when apt
+# fails on lock contention. Idempotent rewrite on every run; Linux-only.
 - name: Install retrying apt-get shim (Linux)
   if: runner.os == 'Linux'
   shell: bash
@@ -71,7 +71,10 @@
     done
     EOF
     sudo chmod 0755 /usr/local/bin/apt-get
-- name: Provision Rust toolchain and matrix targets (self-hosted runners)
+# Runs on every runner (not gated on self-hosted): hosted images preinstall
+# a Rust toolchain, but not necessarily the pinned rust-toolchain.toml
+# channel or the cross targets the matrix leg needs.
+- name: Provision Rust toolchain and matrix targets
   shell: bash
   run: |
     if ! command -v rustup >/dev/null 2>&1; then
@@ -99,3 +102,71 @@
     # not on the runner service's PATH.
     mkdir -p "$HOME/.local/bin"
     echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+# Stage the pinned tailcat sidecar binary (tunnel support, server.tunnel.*)
+# into packaging/libexec/ so dist's `include` packs it into this target's
+# archive next to tailcat.LICENSE (committed; BSD-3-Clause compliance for
+# the non-crate binary cargo-deny can't cover). Linux/Windows use the
+# checksum-verified prebuilt release assets; macOS has no prebuilt assets,
+# so it's a source build of the same pinned tag with the upstream release
+# build tags (build-tags.txt) and flags (goreleaser: CGO_ENABLED=0,
+# -s -w, -X main.version). Bump TAILCAT_VERSION and the pinned sha256s
+# together (sha256s from the release's checksums.txt).
+- name: Stage tailcat sidecar binary
+  shell: bash
+  run: |
+    set -euo pipefail
+    TAILCAT_VERSION=0.4.0
+    TAILCAT_SHA256_LINUX_AMD64=8b819c43dfdf806b5663e23535aba557bb106075b0b5839df289af9bba70bec2
+    TAILCAT_SHA256_LINUX_ARM64=3b77322350f64d229d5b2119b159b863b4bcffa0a62a0294682423a19956dc76
+    TAILCAT_SHA256_WINDOWS_AMD64=c238a4e8d3b460423a67e5ad400888b73ffa0b28e15173fd32c9acb699a3a89e
+    base="https://github.com/tailscale/tailcat/releases/download/v${TAILCAT_VERSION}"
+    dest=packaging/libexec
+    tmp=$(mktemp -d)
+    fetch_prebuilt() { # $1=asset $2=sha256 $3=binary-name-in-archive
+      curl -fsSL --retry 3 -o "$tmp/$1" "$base/$1"
+      # Git Bash on the hosted windows-2022 runner ships coreutils'
+      # sha256sum but not the perl shasum; Linux runners have both.
+      if command -v sha256sum >/dev/null 2>&1; then
+        echo "$2  $tmp/$1" | sha256sum -c -
+      else
+        echo "$2  $tmp/$1" | shasum -a 256 -c -
+      fi
+      case "$1" in
+        *.zip)
+          # unzip is absent from Git Bash and the windows-2022 image;
+          # the image ships 7-Zip (7z on PATH) instead.
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q "$tmp/$1" -d "$tmp/x"
+          else
+            7z x -y -o"$tmp/x" "$tmp/$1" >/dev/null
+          fi ;;
+        *) mkdir -p "$tmp/x" && tar -xzf "$tmp/$1" -C "$tmp/x" ;;
+      esac
+      mv "$tmp/x/$3" "$dest/$3"
+    }
+    build_from_source() { # $1=GOARCH
+      if ! command -v go >/dev/null 2>&1; then brew install go; fi
+      git clone --depth 1 --branch "v${TAILCAT_VERSION}" \
+        https://github.com/tailscale/tailcat "$tmp/src"
+      tags=$(tr -d '[:space:]' < "$tmp/src/build-tags.txt")
+      (cd "$tmp/src" && CGO_ENABLED=0 GOARCH="$1" go build \
+        -tags="$tags" \
+        -ldflags="-s -w -X main.version=v${TAILCAT_VERSION}" \
+        -o tailcat ./cmd/tailcat)
+      mv "$tmp/src/tailcat" "$dest/tailcat"
+    }
+    case "${{ join(matrix.targets, ' ') }}" in
+      x86_64-unknown-linux-musl)
+        fetch_prebuilt "tailcat_${TAILCAT_VERSION}_linux_amd64.tar.gz" \
+          "$TAILCAT_SHA256_LINUX_AMD64" tailcat ;;
+      aarch64-unknown-linux-musl)
+        fetch_prebuilt "tailcat_${TAILCAT_VERSION}_linux_arm64.tar.gz" \
+          "$TAILCAT_SHA256_LINUX_ARM64" tailcat ;;
+      x86_64-pc-windows-msvc)
+        fetch_prebuilt "tailcat_${TAILCAT_VERSION}_windows_amd64.zip" \
+          "$TAILCAT_SHA256_WINDOWS_AMD64" tailcat.exe ;;
+      aarch64-apple-darwin)  build_from_source arm64 ;;
+      x86_64-apple-darwin)   build_from_source amd64 ;;
+      *) echo "no tailcat mapping for target '${{ join(matrix.targets, ' ') }}'" >&2; exit 1 ;;
+    esac
+    ls -l "$dest"

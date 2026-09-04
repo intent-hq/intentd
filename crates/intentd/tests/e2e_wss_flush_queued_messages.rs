@@ -302,6 +302,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -406,7 +407,7 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-FLUSH", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-FLUSH", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

@@ -178,9 +178,9 @@ pub(crate) fn issue_to_json(issue: &Issue, owner: &str, repo: &str) -> Value {
         "body": issue.body,
         "state": issue.state,
         "htmlUrl": issue.url,
-        "createdAt": "",
-        "updatedAt": "",
-        "user": user_json(""),
+        "createdAt": issue.created_at,
+        "updatedAt": issue.updated_at,
+        "user": user_json(&issue.author),
         "labels": Vec::<String>::new(),
         "comments": 0,
         "owner": owner,
@@ -275,6 +275,9 @@ mod tests {
             body: Some("desc".into()),
             state: "open".into(),
             url: "https://github.com/o/r/issues/7".into(),
+            author: "octocat".into(),
+            created_at: "2026-01-01".into(),
+            updated_at: "2026-01-02".into(),
         };
         let v = issue_to_json(&issue, "o", "r");
         assert_eq!(v["number"], json!(7));
@@ -282,6 +285,10 @@ mod tests {
         assert_eq!(v["owner"], json!("o"));
         assert_eq!(v["repo"], json!("r"));
         assert_eq!(v["labels"], json!([]));
+        assert_eq!(v["user"]["login"], json!("octocat"));
+        assert_eq!(v["createdAt"], json!("2026-01-01"));
+        assert_eq!(v["updatedAt"], json!("2026-01-02"));
+        assert_eq!(v["comments"], json!(0));
     }
 
     #[test]

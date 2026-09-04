@@ -764,6 +764,20 @@ pub struct MergeRequirementsApprovals {
     pub changes_requested: i64,
 }
 
+/// The `mergeQueueEjection` block: the PR's latest merge-queue removal event
+/// (when the queue ejected the PR and why). Mirrors
+/// [`intent_sourcecontrol::MergeQueueRemoval`] onto the wire.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeQueueEjection {
+    /// When the removal happened (RFC 3339).
+    pub at: String,
+    /// The host's raw removal reason (e.g. `failed_checks`); omitted when
+    /// the host does not report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// The `threads` block of the checklist.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -811,6 +825,18 @@ pub struct MergeRequirements {
     /// checklist where `approvals.needed` / `threads.resolutionRequired` are
     /// simply unknown.
     pub rules_known: bool,
+    /// Whether the PR is currently queued in the host's merge queue (GitHub
+    /// GraphQL `isInMergeQueue`). Presence-detected: `Some(true)` exactly when
+    /// the host reports the PR queued; the key is omitted (never null) when
+    /// not queued or unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_in_merge_queue: Option<bool>,
+    /// The PR's latest merge-queue removal event; omitted when the host does
+    /// not report one (no merge-queue support) or the PR was never ejected.
+    /// Serde-defaulted so persisted monitor baselines written before the
+    /// field existed still parse (without phantom diff lines).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_ejection: Option<MergeQueueEjection>,
 }
 
 /// The checklist word for a rollup check's state.
@@ -920,6 +946,13 @@ pub(crate) fn merge_requirements(
         merge_state_status,
         merge_blocked_reason: merge_blocked_reason(state, pr.mergeable, mergeable_state),
         rules_known: rules.is_some(),
+        is_in_merge_queue: signals.and_then(|s| s.is_in_merge_queue).filter(|&q| q),
+        merge_queue_ejection: signals
+            .and_then(|s| s.merge_queue_removal.as_ref())
+            .map(|r| MergeQueueEjection {
+                at: r.at.clone(),
+                reason: r.reason.clone(),
+            }),
     }
 }
 
@@ -939,37 +972,42 @@ pub(crate) async fn fetch_merge_requirements(
     repo_ref: &RepoRef,
     number: u64,
 ) -> Result<MergeRequirements> {
-    let (_, requirements, _) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
+    let (_, requirements, _, _) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
     Ok(requirements)
 }
 
-/// [`fetch_merge_requirements`] plus the two by-products the PR monitor needs
+/// [`fetch_merge_requirements`] plus the by-products the PR monitor needs
 /// for its own snapshot — the [`PullRequest`] the checklist was composed from
-/// (title / url / head SHA) and the review-comment count from the same thread
-/// fetch — so a poll never repeats the `get_pr` / thread reads.
+/// (title / url / head SHA), the review-comment count from the same thread
+/// fetch, and the probe-answered flag (see [`merge_requirements_for_pr`]) —
+/// so a poll never repeats the `get_pr` / thread reads.
 pub(crate) async fn fetch_merge_requirements_detailed(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-) -> Result<(PullRequest, MergeRequirements, i64)> {
+) -> Result<(PullRequest, MergeRequirements, i64, bool)> {
     let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
-    let (requirements, review_comments) =
+    let (requirements, review_comments, ejection_known) =
         merge_requirements_for_pr(sc, repo_ref, number, &pr).await;
-    Ok((pr, requirements, review_comments))
+    Ok((pr, requirements, review_comments, ejection_known))
 }
 
 /// [`fetch_merge_requirements_detailed`] for a [`PullRequest`] the caller
 /// already read — the composition shared by the PR monitor and the one-shot
 /// `ws.pr.snapshot`, so both surfaces describe a PR with the same object.
 /// Infallible: every forge sub-read degrades on its own (see
-/// [`fetch_merge_requirements`]). Returns the checklist plus the
-/// review-comment count from the same thread fetch.
+/// [`fetch_merge_requirements`]). Returns the checklist, the review-comment
+/// count from the same thread fetch, and whether the merge-requirements
+/// probe itself answered — the probe is the ONLY source of the merge-queue
+/// ejection signal, so `false` means the checklist's `mergeQueueEjection` is
+/// "unknown", not "no ejection" (the PR monitor keeps its previously
+/// observed event instead of dropping it).
 pub(crate) async fn merge_requirements_for_pr(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
     pr: &PullRequest,
-) -> (MergeRequirements, i64) {
+) -> (MergeRequirements, i64, bool) {
     let (signals, reviews) = tokio::join!(
         sc.merge_requirements(repo_ref, number),
         sc.list_reviews(repo_ref, number)
@@ -983,6 +1021,9 @@ pub(crate) async fn merge_requirements_for_pr(
             );
         })
         .ok();
+    // Captured BEFORE the review-decision backfill below can fabricate a
+    // stub `signals` for a failed probe.
+    let ejection_known = signals.is_some();
     let agg = aggregate_reviews(&reviews.unwrap_or_default());
 
     // The probe carries the forge's `reviewDecision`; when it did not — no
@@ -1054,7 +1095,7 @@ pub(crate) async fn merge_requirements_for_pr(
     };
 
     let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
-    (requirements, review_comments)
+    (requirements, review_comments, ejection_known)
 }
 
 // ===========================================================================
@@ -1564,6 +1605,8 @@ mod tests {
                 required_conversation_resolution: Some(true),
                 required_status_checks: vec!["build".into(), "test".into(), "e2e".into()],
             }),
+            is_in_merge_queue: None,
+            merge_queue_removal: None,
         };
         let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 3);
 
@@ -1619,6 +1662,8 @@ mod tests {
             checks: vec![rollup("build", CheckState::Success, false)],
             checks_known: true,
             branch_rules: None,
+            is_in_merge_queue: None,
+            merge_queue_removal: None,
         };
         let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 0);
 
@@ -1704,6 +1749,80 @@ mod tests {
         let req = merge_requirements(&unknown, Some(&signals), &[], &agg(0, 0), 0);
         assert!(req.is_behind);
         assert!(!req.has_conflicts);
+    }
+
+    #[test]
+    fn merge_requirements_reports_merge_queue_presence_only_when_queued() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let queued = MergeRequirementSignals {
+            merge_state_status: Some("CLEAN".into()),
+            is_in_merge_queue: Some(true),
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&queued), &[], &agg(0, 0), 0);
+        assert_eq!(req.is_in_merge_queue, Some(true));
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["isInMergeQueue"], serde_json::json!(true));
+
+        // Not queued, host does not report it, or no probe at all: the key
+        // is omitted from the wire, never null.
+        for signals in [
+            Some(MergeRequirementSignals {
+                is_in_merge_queue: Some(false),
+                ..Default::default()
+            }),
+            Some(MergeRequirementSignals::default()),
+            None,
+        ] {
+            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), 0);
+            assert_eq!(req.is_in_merge_queue, None);
+            let wire = serde_json::to_value(&req).unwrap();
+            assert!(wire.get("isInMergeQueue").is_none());
+        }
+    }
+
+    /// The probe's removal event maps onto the wire as `mergeQueueEjection`
+    /// — raw reason value preserved — and the key is omitted when the host
+    /// reports no event.
+    #[test]
+    fn merge_requirements_carries_merge_queue_ejection_raw_on_the_wire() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let signals = MergeRequirementSignals {
+            merge_queue_removal: Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-01-02T03:04:05Z".into(),
+                reason: Some("failed_checks".into()),
+            }),
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), 0);
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            wire["mergeQueueEjection"],
+            serde_json::json!({ "at": "2026-01-02T03:04:05Z", "reason": "failed_checks" })
+        );
+
+        // No event, or no probe at all: the key is omitted, never null.
+        for signals in [Some(MergeRequirementSignals::default()), None] {
+            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), 0);
+            assert_eq!(req.merge_queue_ejection, None);
+            let wire = serde_json::to_value(&req).unwrap();
+            assert!(wire.get("mergeQueueEjection").is_none());
+        }
+
+        // A reason-less event omits `reason` inside the block.
+        let no_reason = MergeRequirementSignals {
+            merge_queue_removal: Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-01-02T03:04:05Z".into(),
+                reason: None,
+            }),
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&no_reason), &[], &agg(0, 0), 0);
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            wire["mergeQueueEjection"],
+            serde_json::json!({ "at": "2026-01-02T03:04:05Z" })
+        );
     }
 
     #[test]

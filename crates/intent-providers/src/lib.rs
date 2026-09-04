@@ -36,10 +36,10 @@ pub use args::{
 };
 pub use config::{
     all_provider_ids, auth_error_message, find_provider, first_provider_id,
-    is_provider_authentication_error, provider_config, InjectionMechanism, ProviderConfig,
-    ACP_PROVIDERS, AUGGIE_CLI_MIN_VERSION, AUGGIE_CLI_REQUIREMENT,
-    CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
-    PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
+    is_provider_authentication_error, login_command, provider_config, InjectionMechanism,
+    ProviderConfig, ToolRemovalStyle, ACP_PROVIDERS, AUGGIE_CLI_MIN_VERSION,
+    AUGGIE_CLI_REQUIREMENT, CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE,
+    CLAUDE_AGENT_ACP_VERSION, PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
 };
 #[cfg(test)]
 pub(crate) use config::{
@@ -48,15 +48,14 @@ pub(crate) use config::{
 pub use discover::{
     discover_providers_with_overrides, find_auggie_candidates, find_npx, find_pi_cli,
     find_provider_binary, gated_reason, gated_reason_with_env, not_installed_detail, probe_npx,
-    provider_availability_for, resolve_on_path, ProviderAvailability,
+    provider_availability_for, resolve_npx_only_override, resolve_on_path, ProviderAvailability,
 };
 #[cfg(test)]
 pub(crate) use models::{
-    create_compound_model_id, fuzzy_match_model_in_pool, is_model_valid_for_provider,
-    parse_codex_reasoning_effort, parse_grok_initialize_models,
+    fuzzy_match_model_in_pool, parse_codex_reasoning_effort, parse_grok_initialize_models,
     parse_grok_initialize_response_from_stdout, resolve_preferred_model,
 };
-pub use models::{parse_compound_model_id, parse_grok_models_command_output, GrokModel};
+pub use models::{parse_grok_models_command_output, GrokModel};
 pub use version_gate::{
     auggie_cli_gate, auggie_gate_reason, pi_cli_gate, pi_gate_reason, PiCliGate, PiCliProbe,
 };

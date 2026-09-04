@@ -12,7 +12,8 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -393,6 +394,7 @@ async fn boot_seeded(
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -422,7 +424,7 @@ async fn boot_seeded(
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
     let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
@@ -740,4 +742,116 @@ async fn removed_pr_methods_return_method_not_found_over_wss() {
             "{method} error envelope: {resp}"
         );
     }
+}
+
+/// Run `git` in `cwd` with a hermetic identity, asserting success.
+fn run_git(args: &[&str], cwd: &Path) {
+    let out = Command::new("git")
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "e2e")
+        .env("GIT_AUTHOR_EMAIL", "e2e@example.com")
+        .env("GIT_COMMITTER_NAME", "e2e")
+        .env("GIT_COMMITTER_EMAIL", "e2e@example.com")
+        .current_dir(cwd)
+        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .expect("run git");
+    assert!(out.success(), "git {args:?} failed");
+}
+
+/// PR-aware `workspace.create` over the wire (§5.1): a pr-kind `contextLinks`
+/// entry drives the whole flow through the JSON-RPC/WSS envelope — the
+/// response workspace is on the PR head branch (`feature`, materialized from
+/// the remote-only ref with its commits), `baseRef` is the PR base (`main`),
+/// `prNumber`/`prUrl` are seeded, and `baseCommitSha` records the base
+/// boundary (the merge-base), not the checked-out PR head tip.
+#[tokio::test]
+async fn workspace_create_with_pr_context_link_over_wss() {
+    let git_ok = matches!(
+        Command::new("git")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+        Ok(s) if s.success()
+    );
+    if !git_ok {
+        eprintln!("skipping PR-aware create WSS e2e: git not on PATH");
+        return;
+    }
+    let fx = boot(StubForge::default()).await;
+
+    // A local "remote" whose PR head exists only as a remote-tracking ref in
+    // the clone the daemon provisions from: `main` (base) + one commit ahead
+    // on `feature` (the PR head), cloned with `main` checked out.
+    let scratch = std::env::temp_dir().join(format!(
+        "intentd-pr-create-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let _scratch = TempDir(scratch.clone());
+    let origin = scratch.join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    run_git(&["init", "-q", "-b", "main"], &origin);
+    std::fs::write(origin.join("base.txt"), "base\n").unwrap();
+    run_git(&["add", "base.txt"], &origin);
+    run_git(&["commit", "-q", "-m", "base"], &origin);
+    run_git(&["checkout", "-q", "-b", "feature"], &origin);
+    std::fs::write(origin.join("pr.txt"), "pr change\n").unwrap();
+    run_git(&["add", "pr.txt"], &origin);
+    run_git(&["commit", "-q", "-m", "pr head"], &origin);
+    run_git(&["checkout", "-q", "main"], &origin);
+    let clone = scratch.join("clone");
+    run_git(
+        &[
+            "clone",
+            "-q",
+            origin.to_string_lossy().as_ref(),
+            clone.to_string_lossy().as_ref(),
+        ],
+        &scratch,
+    );
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({
+            "title": "PR-aware create",
+            "repositoryPath": clone.to_string_lossy(),
+            "repositoryName": "r",
+            "contextLinks": [{
+                "kind": "pr",
+                "url": "https://github.com/o/r/pull/42",
+                "owner": "o",
+                "repo": "r",
+                "number": 42,
+            }],
+        }),
+    )
+    .await;
+    let ws = &created["workspace"];
+    assert_eq!(ws["branch"], "feature", "PR head branch: {created}");
+    assert_eq!(ws["baseRef"], "main", "PR base branch: {created}");
+    assert_eq!(ws["prNumber"], 42, "PR linkage: {created}");
+    assert_eq!(ws["prUrl"], "https://github.com/o/r/pull/42");
+
+    // The checkout carries the PR head commit (materialized from the
+    // remote-only ref, not a fresh branch at the base commit).
+    let wt = PathBuf::from(ws["worktreePath"].as_str().expect("worktreePath"));
+    assert!(wt.join("pr.txt").exists(), "PR head commit checked out");
+
+    // `baseCommitSha` records the base boundary, not the PR head tip.
+    let head = {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt)
+            .output()
+            .expect("rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let base_sha = ws["baseCommitSha"].as_str().expect("baseCommitSha");
+    assert_ne!(base_sha, head, "boundary is not the checked-out PR head");
 }

@@ -59,6 +59,7 @@ fn workspace(id: &WorkspaceId, path: &Path) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -216,6 +217,7 @@ async fn agent_conversation_and_summary() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("get conversation");

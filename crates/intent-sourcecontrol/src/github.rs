@@ -17,10 +17,10 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
-    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
-    NewPullRequest, Page, PageParams, PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, Repo,
-    RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
-    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
+    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment, ReviewDecision,
+    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
 
@@ -235,7 +235,25 @@ pub(crate) fn map_issue(value: Value) -> Result<Issue> {
         body: i.body,
         state: i.state.unwrap_or_default(),
         url: i.html_url.unwrap_or_default(),
+        author: login_of(i.user.as_ref()),
+        created_at: i.created_at.unwrap_or_default(),
+        updated_at: i.updated_at.unwrap_or_default(),
     })
+}
+
+/// [`map_issue`] for `get_issue`'s single-item fetch: GitHub's
+/// `/issues/{number}` endpoint returns a PR's issue-shaped payload when
+/// `number` names a pull request (the REST API models every PR as an issue,
+/// tagged with a `pull_request` key). Reject that case as not-found instead
+/// of mapping it, so `github.issues.get` never leaks a PR as an issue --
+/// callers get the same not-found treatment as a number that doesn't exist.
+pub(crate) fn map_issue_at_number(value: Value, number: u64) -> Result<Issue> {
+    if value.get("pull_request").is_some() {
+        return Err(Error::NotFound(format!(
+            "#{number} is a pull request, not an issue"
+        )));
+    }
+    map_issue(value)
 }
 
 pub(crate) fn map_repo(value: Value) -> Result<Repo> {
@@ -644,6 +662,9 @@ mod dto {
         pub body: Option<String>,
         pub state: Option<String>,
         pub html_url: Option<String>,
+        pub user: Option<User>,
+        pub created_at: Option<String>,
+        pub updated_at: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -746,6 +767,15 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
       mergeStateStatus
+      isInMergeQueue
+      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          ... on RemovedFromMergeQueueEvent {
+            createdAt
+            reason
+          }
+        }
+      }
       reviewDecision
       baseRefName
       commits(last: 1) {
@@ -778,6 +808,63 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
   }
 }
 ";
+
+/// The merge-queue removal-event selection of [`MERGE_REQUIREMENTS_QUERY`],
+/// verbatim, so the schema fallback can strip it. The `last: 1` timeline
+/// window fetches only the LATEST removal event — the one the monitor diffs
+/// on — in the same round trip as the rest of the probe.
+const MERGE_QUEUE_TIMELINE_SELECTION: &str = "
+      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          ... on RemovedFromMergeQueueEvent {
+            createdAt
+            reason
+          }
+        }
+      }";
+
+/// [`MERGE_REQUIREMENTS_QUERY`] minus the merge-queue selections
+/// (`isInMergeQueue` and the removal-event timeline items), for hosts whose
+/// GraphQL schema predates merge queues (older GHES): GraphQL rejects the
+/// WHOLE query on an unknown field, so the probe retries once with this
+/// selection and the signals degrade to `None` instead of failing the entire
+/// checklist. A schema lacking `isInMergeQueue` also lacks
+/// `RemovedFromMergeQueueEvent`, so both go together.
+fn merge_requirements_query_without_merge_queue() -> String {
+    MERGE_REQUIREMENTS_QUERY
+        .replace("\n      isInMergeQueue", "")
+        .replace(MERGE_QUEUE_TIMELINE_SELECTION, "")
+}
+
+/// True when a merge-requirements probe error is GraphQL rejecting one of the
+/// merge-queue selections as unknown (the schema-validation wording is
+/// `Field 'isInMergeQueue' doesn't exist on type 'PullRequest'`, and a schema
+/// without merge queues likewise rejects the `RemovedFromMergeQueueEvent`
+/// timeline selection; octocrab folds GraphQL errors into their message text,
+/// which [`From`] maps onto [`Error::Api`]). Any other error — auth, rate
+/// limit, network — stays a hard failure.
+fn merge_queue_field_unsupported(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Api(msg) if msg.contains("isInMergeQueue")
+            || msg.contains("RemovedFromMergeQueueEvent")
+            || msg.contains("REMOVED_FROM_MERGE_QUEUE_EVENT")
+    )
+}
+
+/// Extract the PR's latest merge-queue removal event from the probe's
+/// `timelineItems` selection. `None` when the host does not report the
+/// selection (schema fallback), the PR was never ejected, or the node lacks
+/// `createdAt`; a missing `reason` degrades to `None` on the event instead.
+fn parse_merge_queue_removal(pr: Option<&Value>) -> Option<MergeQueueRemoval> {
+    let nodes = pr?.pointer("/timelineItems/nodes")?.as_array()?;
+    nodes.iter().rev().find_map(|node| {
+        Some(MergeQueueRemoval {
+            at: node.get("createdAt")?.as_str()?.to_string(),
+            reason: node.get("reason").and_then(Value::as_str).map(String::from),
+        })
+    })
+}
 
 /// The GraphQL pointer to the PR's status-check rollup contexts (the last
 /// commit on the PR is its head).
@@ -1293,21 +1380,48 @@ impl SourceControl for GitHubSourceControl {
         repo: &RepoRef,
         number: u64,
     ) -> Result<MergeRequirementSignals> {
+        let variables = json!({
+            "owner": repo.owner,
+            "repo": repo.name,
+            "prNumber": number,
+        });
         let payload = json!({
             "query": MERGE_REQUIREMENTS_QUERY,
-            "variables": {
-                "owner": repo.owner,
-                "repo": repo.name,
-                "prNumber": number,
-            },
+            "variables": variables,
         });
-        let resp: Value = self.client.graphql(&payload).await?;
+        // Schema tolerance: a host whose GraphQL schema lacks
+        // `isInMergeQueue` (older GHES) rejects the WHOLE query, so retry
+        // once without that selection — the signal degrades to `None`
+        // instead of failing the entire checklist.
+        let resp: Value = match self.client.graphql(&payload).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let err = Error::from(err);
+                if !merge_queue_field_unsupported(&err) {
+                    return Err(err);
+                }
+                tracing::debug!(
+                    pr_number = number,
+                    "merge_requirements: host schema lacks isInMergeQueue, retrying without it"
+                );
+                let fallback = json!({
+                    "query": merge_requirements_query_without_merge_queue(),
+                    "variables": variables,
+                });
+                self.client.graphql(&fallback).await?
+            }
+        };
         let data = graphql_data(resp)?;
         let pr = data.pointer("/repository/pullRequest");
         let merge_state_status = pr
             .and_then(|p| p.get("mergeStateStatus"))
             .and_then(Value::as_str)
             .map(String::from);
+        // Absent on hosts that do not report it: degrades to `None`.
+        let is_in_merge_queue = pr
+            .and_then(|p| p.get("isInMergeQueue"))
+            .and_then(Value::as_bool);
+        let merge_queue_removal = parse_merge_queue_removal(pr);
         let rollup = data
             .pointer(ROLLUP_CONTEXTS_POINTER)
             .and_then(Value::as_array);
@@ -1349,6 +1463,8 @@ impl SourceControl for GitHubSourceControl {
             checks,
             checks_known: rollup.is_some(),
             branch_rules,
+            is_in_merge_queue,
+            merge_queue_removal,
         })
     }
 
@@ -1521,7 +1637,7 @@ impl SourceControl for GitHubSourceControl {
     async fn get_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue> {
         let route = Self::repo_path(repo, &format!("/issues/{number}"));
         let v: Value = self.client.get(&route, None::<&()>).await?;
-        map_issue(v)
+        map_issue_at_number(v, number)
     }
 
     async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>> {
@@ -1806,6 +1922,69 @@ mod tests {
     }
 
     #[test]
+    fn merge_queue_fallback_query_drops_only_those_selections() {
+        // The degraded query differs from the primary by exactly the
+        // `isInMergeQueue` line and the removal-event timeline block —
+        // everything else survives verbatim.
+        let fallback = merge_requirements_query_without_merge_queue();
+        assert!(!fallback.contains("isInMergeQueue"));
+        assert!(!fallback.contains("timelineItems"));
+        assert!(!fallback.contains("RemovedFromMergeQueueEvent"));
+        assert!(MERGE_REQUIREMENTS_QUERY.contains("isInMergeQueue"));
+        assert!(
+            MERGE_REQUIREMENTS_QUERY.contains(MERGE_QUEUE_TIMELINE_SELECTION),
+            "the strip target must match the primary query verbatim"
+        );
+        for kept in [
+            "mergeStateStatus",
+            "reviewDecision",
+            "baseRefName",
+            "statusCheckRollup",
+        ] {
+            assert!(fallback.contains(kept), "fallback keeps {kept}");
+        }
+        assert_eq!(
+            fallback.lines().count(),
+            MERGE_REQUIREMENTS_QUERY.lines().count()
+                - 1
+                - MERGE_QUEUE_TIMELINE_SELECTION.matches('\n').count(),
+            "exactly the merge-queue lines removed"
+        );
+    }
+
+    #[test]
+    fn merge_queue_field_unsupported_matches_only_the_schema_rejection() {
+        // The GraphQL schema-validation wording on a host that predates
+        // merge queues names the unknown field; octocrab folds GraphQL
+        // errors into `Error::Api` message text.
+        let schema = Error::Api(
+            "GraphQL Error: Field 'isInMergeQueue' doesn't exist on type 'PullRequest'".into(),
+        );
+        assert!(merge_queue_field_unsupported(&schema));
+        // The removal-event selection is rejected with the same wording on
+        // hosts that lack it.
+        let timeline =
+            Error::Api("GraphQL Error: Field 'RemovedFromMergeQueueEvent' doesn't exist".into());
+        assert!(merge_queue_field_unsupported(&timeline));
+        let item_type = Error::Api(
+            "GraphQL Error: Value 'REMOVED_FROM_MERGE_QUEUE_EVENT' doesn't exist in \
+             'PullRequestTimelineItemsItemType' enum"
+                .into(),
+        );
+        assert!(merge_queue_field_unsupported(&item_type));
+
+        // Any other failure — auth, rate limit, unrelated API error — stays
+        // a hard failure rather than triggering the degraded retry.
+        for hard in [
+            Error::Api("500: something broke".into()),
+            Error::Auth("Bad credentials".into()),
+            Error::RateLimited("API rate limit exceeded".into()),
+        ] {
+            assert!(!merge_queue_field_unsupported(&hard), "{hard:?}");
+        }
+    }
+
+    #[test]
     fn parses_review_decision_including_null() {
         let data = |v: Value| json!({ "repository": { "pullRequest": { "reviewDecision": v } } });
         assert_eq!(
@@ -1930,9 +2109,17 @@ mod tests {
                 required_conversation_resolution: Some(true),
                 required_status_checks: vec!["build".into()],
             }),
+            is_in_merge_queue: Some(true),
+            merge_queue_removal: Some(MergeQueueRemoval {
+                at: "2026-08-27T00:00:00Z".into(),
+                reason: Some("failed_checks".into()),
+            }),
         };
         let wire = serde_json::to_value(&signals).unwrap();
         assert_eq!(wire["mergeStateStatus"], "BLOCKED");
+        assert_eq!(wire["isInMergeQueue"], true);
+        assert_eq!(wire["mergeQueueRemoval"]["at"], "2026-08-27T00:00:00Z");
+        assert_eq!(wire["mergeQueueRemoval"]["reason"], "failed_checks");
         assert_eq!(wire["reviewDecision"], "review_required");
         assert_eq!(wire["checksKnown"], true);
         assert_eq!(wire["checks"][0]["isRequired"], true);
@@ -1948,17 +2135,89 @@ mod tests {
             wire["branchRules"]["requiredStatusChecks"],
             json!(["build"])
         );
+
+        // A host that does not report the merge-queue signals omits the keys.
+        let wire = serde_json::to_value(MergeRequirementSignals::default()).unwrap();
+        assert!(wire.get("isInMergeQueue").is_none());
+        assert!(wire.get("mergeQueueRemoval").is_none());
+
+        // A persisted payload predating the removal field still parses.
+        let old: MergeRequirementSignals = serde_json::from_value(json!({
+            "mergeStateStatus": "CLEAN",
+            "reviewDecision": null,
+            "checks": [],
+            "checksKnown": false,
+            "branchRules": null,
+        }))
+        .unwrap();
+        assert_eq!(old.merge_queue_removal, None);
+    }
+
+    #[test]
+    fn parses_latest_merge_queue_removal_event() {
+        let pr = json!({
+            "timelineItems": { "nodes": [{
+                "createdAt": "2026-08-26T22:26:36Z",
+                "reason": "failed_checks"
+            }] }
+        });
+        assert_eq!(
+            parse_merge_queue_removal(Some(&pr)),
+            Some(MergeQueueRemoval {
+                at: "2026-08-26T22:26:36Z".into(),
+                reason: Some("failed_checks".into()),
+            })
+        );
+
+        // A host that reports the event without a reason still yields it.
+        let no_reason = json!({
+            "timelineItems": { "nodes": [{ "createdAt": "2026-08-26T22:26:36Z" }] }
+        });
+        assert_eq!(
+            parse_merge_queue_removal(Some(&no_reason))
+                .expect("event without reason")
+                .reason,
+            None
+        );
+    }
+
+    #[test]
+    fn merge_queue_removal_degrades_to_none_without_event() {
+        // Never ejected: the timeline window is empty.
+        let empty = json!({ "timelineItems": { "nodes": [] } });
+        assert_eq!(parse_merge_queue_removal(Some(&empty)), None);
+        // Schema fallback: the selection is absent entirely.
+        let absent = json!({ "mergeStateStatus": "CLEAN" });
+        assert_eq!(parse_merge_queue_removal(Some(&absent)), None);
+        assert_eq!(parse_merge_queue_removal(None), None);
+        // A malformed node (no createdAt) degrades rather than panics.
+        let malformed = json!({
+            "timelineItems": { "nodes": [{ "reason": "failed_checks" }] }
+        });
+        assert_eq!(parse_merge_queue_removal(Some(&malformed)), None);
     }
 
     #[test]
     fn maps_issue_and_comment() {
         let issue = map_issue(json!({
             "number": 7, "title": "bug", "body": "broken", "state": "open",
-            "html_url": "https://github.com/o/r/issues/7"
+            "html_url": "https://github.com/o/r/issues/7",
+            "user": { "login": "octocat" },
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z"
         }))
         .unwrap();
         assert_eq!(issue.number, 7);
         assert_eq!(issue.state, "open");
+        assert_eq!(issue.author, "octocat");
+        assert_eq!(issue.created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(issue.updated_at, "2026-01-02T00:00:00Z");
+
+        // Missing author/timestamps default like the other REST mappers.
+        let bare = map_issue(json!({ "number": 8 })).unwrap();
+        assert_eq!(bare.author, "unknown");
+        assert_eq!(bare.created_at, "");
+        assert_eq!(bare.updated_at, "");
 
         let c = map_issue_comment(json!({
             "id": 99, "user": { "login": "u" }, "body": "hello",
@@ -1968,6 +2227,29 @@ mod tests {
         assert_eq!(c.id, "99");
         assert_eq!(c.author, "u");
         assert!(c.path.is_none());
+    }
+
+    #[test]
+    fn get_issue_rejects_pull_request_shaped_payload() {
+        // `/issues/{number}` on a PR number comes back issue-shaped but
+        // carries a `pull_request` key -- must be rejected as not-found,
+        // never mapped as an issue.
+        let err = map_issue_at_number(
+            json!({
+                "number": 42,
+                "title": "Add thing",
+                "pull_request": { "url": "https://api.github.com/repos/o/r/pulls/42" }
+            }),
+            42,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(msg) if msg.contains("#42") && msg.contains("pull request"))
+        );
+
+        // A genuine issue payload (no `pull_request` key) still maps normally.
+        let issue = map_issue_at_number(json!({ "number": 7, "title": "bug" }), 7).unwrap();
+        assert_eq!(issue.number, 7);
     }
 
     #[test]

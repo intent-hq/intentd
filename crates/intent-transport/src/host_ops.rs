@@ -150,9 +150,22 @@ where
     if name.is_empty() {
         return None;
     }
-    // nvm can leave several Node versions installed while the inherited PATH
-    // still names an older one. enriched_tool_dirs orders nvm installs newest
-    // first, so honor that order before consulting PATH for Node specifically.
+    // 1. PATH which/where (ranked so Windows prefers a runnable extension)
+    if let Some(path) = path_lookup(name) {
+        if path.is_file() || path.is_symlink() {
+            if name == "node" {
+                tracing::info!(
+                    candidate_source = "inherited_path",
+                    "selected Node candidate"
+                );
+            }
+            return Some(path);
+        }
+    }
+    // nvm can leave several Node versions installed without exposing one on
+    // the inherited PATH (notably when a GUI app starts outside a login
+    // shell). In that case, fall back to the newest usable nvm installation.
+    // Never let a merely installed version override the host's active Node.
     if name == "node" {
         let nvm_dirs: Vec<PathBuf> = enriched_tool_dirs
             .iter()
@@ -160,12 +173,7 @@ where
             .cloned()
             .collect();
         if let Some(path) = find_executable_in_dir_candidates(name, &nvm_dirs) {
-            return Some(path);
-        }
-    }
-    // 1. PATH which/where (ranked so Windows prefers a runnable extension)
-    if let Some(path) = path_lookup(name) {
-        if path.is_file() || path.is_symlink() {
+            tracing::info!(candidate_source = "nvm_fallback", "selected Node candidate");
             return Some(path);
         }
     }
@@ -173,16 +181,34 @@ where
     for candidate in common_paths {
         let candidate = PathBuf::from(candidate);
         if candidate.is_file() || candidate.is_symlink() {
+            if name == "node" {
+                tracing::info!(candidate_source = "caller_hint", "selected Node candidate");
+            }
             return Some(candidate);
         }
     }
     // 3. Enriched tool directories (hardcoded + login-shell PATH)
     if let Some(path) = find_in_dir_candidates(name, enriched_tool_dirs) {
+        if name == "node" {
+            tracing::info!(
+                candidate_source = "enriched_path",
+                "selected Node candidate"
+            );
+        }
         return Some(path);
     }
     // 4. Common OS directories (fallback)
     if let Some(path) = find_in_dir_candidates(name, &common_dirs()) {
+        if name == "node" {
+            tracing::info!(
+                candidate_source = "common_os_path",
+                "selected Node candidate"
+            );
+        }
         return Some(path);
+    }
+    if name == "node" {
+        tracing::info!("no usable Node candidate found");
     }
     None
 }
@@ -431,7 +457,13 @@ pub(crate) fn check_node_with(resolver: &dyn BinaryResolver, probe: &dyn Version
 
 /// Production `check_node` — uses the real resolver + version probe.
 pub(crate) fn check_node() -> Value {
-    check_node_with(&OsBinaryResolver, &OsVersionProbe)
+    let result = check_node_with(&OsBinaryResolver, &OsVersionProbe);
+    tracing::info!(
+        available = result["available"].as_bool().unwrap_or(false),
+        version = result["version"].as_str().unwrap_or("unavailable"),
+        "completed Node version probe"
+    );
+    result
 }
 
 /// Build the `host.checkGh` result. Same contract as [`check_git_with`]:

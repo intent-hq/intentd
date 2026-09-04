@@ -28,6 +28,7 @@ pub(crate) mod git;
 pub(crate) mod help;
 pub(crate) mod hook;
 pub(crate) mod host;
+pub(crate) mod mcp;
 pub(crate) mod note;
 pub(crate) mod pr;
 pub(crate) mod primitive;
@@ -53,6 +54,7 @@ pub fn prelude() -> String {
 /// omitted entirely, so agent code touching them fails with a clear
 /// `ws.<ns> is undefined` `TypeError`. With every toggle on — the default —
 /// nothing is omitted.
+#[cfg(test)]
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
     prelude_for_bridge(features, false)
 }
@@ -76,9 +78,10 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
         features
     };
     let pr = pr::prelude_for(features);
+    let workspace = workspace::prelude_for(is_sub_agent);
     let mut fragments: Vec<&str> = vec![
         help::PRELUDE,
-        workspace::PRELUDE,
+        workspace.as_str(),
         note::PRELUDE,
         task::PRELUDE,
         comment::PRELUDE,
@@ -103,6 +106,9 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
     if features.terminal_access {
         fragments.push(terminal::PRELUDE);
     }
+    if features.mcp_tools {
+        fragments.push(mcp::PRELUDE);
+    }
     fragments.push(file::PRELUDE);
     let app = app::prelude_for(features);
     fragments.push(&app);
@@ -119,7 +125,7 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
 /// (`workspace.setAgentName` / `git.commit` /
 /// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods — `create`,
 /// `delegate`, `send`, `sendToTask`, `wakeOrCreate`, `reportToParent`,
-/// `requestDiscussion`, `reportBlocker`) can do so.
+/// `requestDiscussion`, `reportBlocker`, `retire`) can do so.
 /// `turn_attachments` threads the §7.1 turn-attachment registry to the
 /// bindings that register attachments mid-dispatch (`ws.app.question.ask`);
 /// `None` keeps those bindings inert (FE front door, tests).
@@ -215,6 +221,9 @@ pub(crate) async fn try_dispatch(
         return terminal::dispatch(api, workspace_id, rest, args)
             .await
             .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("mcp.") {
+        return mcp::dispatch(api, workspace_id, rest, args).await.map(Some);
     }
     if let Some(rest) = method.strip_prefix("file.") {
         return file::dispatch(api, workspace_id, caller_agent_id, rest, args)
@@ -335,6 +344,7 @@ mod prelude_tests {
             ("ws.terminal = {", |f| f.terminal_access = false),
             ("ws.browser = {", |f| f.browser_automation = false),
             ("ws.app.question = {", |f| f.structured_questions = false),
+            ("ws.mcp = {", |f| f.mcp_tools = false),
         ];
         let markers: Vec<&str> = cases.iter().map(|(m, _)| *m).collect();
         for (marker, disable) in &cases {
@@ -410,6 +420,65 @@ mod prelude_tests {
         assert!(!js.contains("reportBlocker:"));
         for kept in ["ws.agent = {", "reportToParent:", "wakeOrCreate:"] {
             assert!(js.contains(kept), "`{kept}` was wrongly dropped");
+        }
+    }
+
+    // Guard: the retire segment gated by `peerAgents` still matches the
+    // `ws.agent` prelude verbatim, so the `replacen` scrub cannot silently
+    // become a no-op after a prelude edit.
+    #[test]
+    fn retire_prelude_segment_matches_agent_prelude() {
+        assert!(agent::PRELUDE.contains(agent::RETIRE_PRELUDE_SEGMENT));
+    }
+
+    // `peerAgents` defaults OFF (the one opt-in toggle): the default prelude
+    // omits the `retire` installer; opting in installs it, and the
+    // `ws.agent` scrubs compose independently.
+    #[test]
+    fn peer_agents_gates_retire_installer_in_prelude() {
+        let js = prelude_for(&AgentFeaturesSettings::default());
+        assert!(
+            !js.contains("retire:"),
+            "retire installed with peerAgents off"
+        );
+        assert!(
+            js.contains("reportBlocker:"),
+            "attention installers must survive"
+        );
+
+        let js = prelude_for(&AgentFeaturesSettings {
+            peer_agents: true,
+            ..AgentFeaturesSettings::default()
+        });
+        assert!(js.contains("retire:"), "opting in must install retire");
+
+        let js = prelude_for(&AgentFeaturesSettings {
+            peer_agents: true,
+            attention_requests: false,
+            ..AgentFeaturesSettings::default()
+        });
+        assert!(js.contains("retire:"));
+        assert!(!js.contains("reportBlocker:"));
+        assert!(js.contains("reportToParent:"));
+    }
+
+    // The merged create API: `spawnPeer` no longer exists as a binding —
+    // the `ws.agent` prelude installs `create` (which carries the
+    // `topLevel` option) and never a `spawnPeer` installer, on both
+    // top-level and sub-agent bridges.
+    #[test]
+    fn prelude_has_no_spawn_peer_installer() {
+        let features = AgentFeaturesSettings {
+            peer_agents: true,
+            ..AgentFeaturesSettings::default()
+        };
+        for is_sub_agent in [false, true] {
+            let js = prelude_for_bridge(&features, is_sub_agent);
+            assert!(
+                !js.contains("spawnPeer"),
+                "spawnPeer must not appear in the prelude (is_sub_agent = {is_sub_agent})"
+            );
+            assert!(js.contains("create:"), "create installer must survive");
         }
     }
 }

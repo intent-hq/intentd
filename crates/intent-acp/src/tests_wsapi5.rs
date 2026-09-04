@@ -19,12 +19,15 @@ use serde_json::{json, Value};
 
 use crate::WorkspaceMcpServer;
 
+/// Recorded `git_agent_commit` call: (message, `agent_id`, `user_requested`,
+/// `git_root_id`).
+type AgentCommitCall = (String, Option<String>, bool, Option<String>);
+
 // `status_message_state` is `Option<Option<_>>`: no-override vs landed value.
 #[allow(clippy::option_option)]
 #[derive(Default)]
 struct FakeApi {
-    /// Recorded `git_agent_commit` calls: (message, `agent_id`, `user_requested`).
-    agent_commit_calls: Mutex<Vec<(String, Option<String>, bool)>>,
+    agent_commit_calls: Mutex<Vec<AgentCommitCall>>,
     script_list_calls: Mutex<u32>,
     script_create_calls: Mutex<Vec<ScriptCreateParams>>,
     script_start_calls: Mutex<Vec<String>>,
@@ -104,6 +107,7 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -265,6 +269,7 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         _id: WorkspaceId,
@@ -273,11 +278,13 @@ impl WorkspaceApi for FakeApi {
         _linked_note_id: Option<NoteId>,
         _files: Option<Vec<String>>,
         user_requested: bool,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
         self.agent_commit_calls.lock().unwrap().push((
             message,
             agent_id.as_ref().map(|a| a.as_str().to_string()),
             user_requested,
+            git_root_id.map(|g| g.0),
         ));
         Box::pin(async {
             Ok(GitAgentCommitResult {
@@ -795,6 +802,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         waiting_on_pr_monitors: vec![],
         turn_in_flight: false,
         last_stream_activity_at: None,
+        context_usage: None,
         stats: None,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -812,6 +820,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
         metadata: AgentMetadata {
             is_background: false,
             specialist: None,
@@ -823,14 +832,16 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
             attention_request_reason: None,
             attention_request_timestamp: None,
             delegation_depth: None,
-            initial_message: None,
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
             dismissed_questions_message_id: None,
             pending_questions_message_id: None,
+            pending_proposals: Vec::new(),
+            proposal_resolutions: serde_json::Map::new(),
             last_seen_message_id: None,
             is_initial_agent: None,
+            sponsor_agent_id: None,
         },
     }
 }
@@ -967,6 +978,7 @@ async fn git_commit_returns_file_count_shape() {
     let calls = api.agent_commit_calls.lock().unwrap();
     assert_eq!(calls[0].1.as_deref(), Some("agent-9"));
     assert!(calls[0].2);
+    assert!(calls[0].3.is_none());
 }
 
 #[tokio::test]
@@ -977,6 +989,33 @@ async fn git_commit_defaults_user_requested_to_false() {
     let calls = api.agent_commit_calls.lock().unwrap();
     assert_eq!(calls[0].0, "feat: x");
     assert!(!calls[0].2);
+}
+
+#[tokio::test]
+async fn git_commit_forwards_git_root_id() {
+    let (srv, api) = server_with_caller("agent-9");
+    let resp = call(
+        &srv,
+        "return await ws.git.commit('feat: x', { gitRootId: 'gitroot-7', files: ['a.txt'] });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let calls = api.agent_commit_calls.lock().unwrap();
+    assert_eq!(calls[0].3.as_deref(), Some("gitroot-7"));
+}
+
+#[tokio::test]
+async fn git_commit_treats_blank_git_root_id_as_absent() {
+    // Empty/whitespace `gitRootId` maps to the primary-worktree behavior,
+    // matching the §5.6 reads' boundary parse.
+    let (srv, api) = server_with_caller("agent-9");
+    for (i, blank) in ["''", "'   '"].iter().enumerate() {
+        let code = format!("return await ws.git.commit('feat: x', {{ gitRootId: {blank} }});");
+        let resp = call(&srv, &code).await;
+        assert_eq!(resp["result"]["isError"], json!(false), "gitRootId {blank}");
+        let calls = api.agent_commit_calls.lock().unwrap();
+        assert!(calls[i].3.is_none(), "gitRootId {blank} must forward None");
+    }
 }
 
 #[tokio::test]

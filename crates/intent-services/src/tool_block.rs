@@ -26,11 +26,11 @@
 //! subscriber's accumulated state stays byte-identical to a fresh slim
 //! snapshot — the same invariant the factory above upholds for block shape.
 
-use intent_core::{cap_json_value, slim_body_size, SLIM_PROJECTION_BUDGET_BYTES};
+use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
 use serde_json::{json, Map, Value};
 
-/// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
-/// `projection: "slim"`) to one served message's content blocks: oversized
+/// Apply the slim conversation projection (PROTOCOL §5.5, the wire default
+/// since v8.0) to one served message's content blocks: oversized
 /// `tool_use.input` / `tool_result.output` bodies are replaced by a
 /// structure-preserving preview bounded by [`SLIM_PROJECTION_BUDGET_BYTES`]
 /// with additive `inputTruncated`/`inputBytes` (resp.
@@ -69,23 +69,22 @@ pub fn slim_tool_block(block: &mut Value) {
 
 /// Slim one `tool_use.input` / `tool_result.output` body in place: measured
 /// against [`SLIM_PROJECTION_BUDGET_BYTES`] (string bodies by length, JSON
-/// bodies by serialized length), an over-budget body is replaced by
-/// [`cap_json_value`]'s bounded preview plus the additive truncation flags.
+/// bodies by serialized length), an over-budget body is replaced by the
+/// bounded preview plus the additive truncation flags. Delegates to
+/// [`intent_core::slim_heavy_body`] — the SAME transform the write-time
+/// heavy-payload extraction persists (intent-store `message_payload`), so a
+/// stored placeholder served without hydration is byte-identical to slimming
+/// the full body here; that sharing is also why an already-flagged block
+/// (a persisted write-time preview) passes through untouched instead of
+/// being re-capped. The extracted original body is dropped (serve side).
 fn slim_body(block: &mut Value, field: &str, truncated_flag: &str, bytes_flag: &str) {
-    let Some(body) = block.get(field) else {
-        return;
-    };
-    let size = slim_body_size(body);
-    if size <= SLIM_PROJECTION_BUDGET_BYTES {
-        return;
-    }
-    let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
-    let capped = cap_json_value(body, &mut budget);
-    if let Some(obj) = block.as_object_mut() {
-        obj.insert(field.to_string(), capped);
-        obj.insert(truncated_flag.to_string(), json!(true));
-        obj.insert(bytes_flag.to_string(), json!(size));
-    }
+    drop(intent_core::slim_heavy_body(
+        block,
+        field,
+        truncated_flag,
+        bytes_flag,
+        SLIM_PROJECTION_BUDGET_BYTES,
+    ));
 }
 
 /// Slim one `image` block in place: an over-budget base64 `data` is replaced
@@ -301,6 +300,81 @@ fn repair_wrapped_json(text: &str) -> Option<String> {
         repaired.push(c);
     }
     removed.then_some(repaired)
+}
+
+/// The proposal identity of one lifted proposal-resource block:
+/// `applyToolCallId ?? preview.title` parsed from the block's embedded
+/// proposal JSON (`resource.text`) — the SAME identity
+/// `intent_acp::mcp_server::proposal_resource_uri` encodes into the resource
+/// URI, so pending-tracking and rendering agree on which proposal is which.
+/// `None` for non-proposal blocks (wrong type/MIME), unparseable `text`, or
+/// a proposal carrying neither identity field (no fabricated fallback: an
+/// identity-less proposal cannot be deduped or resolved, so it is not
+/// tracked).
+pub(crate) fn proposal_block_id(block: &Value) -> Option<String> {
+    if block.get("type").and_then(Value::as_str) != Some("resource") {
+        return None;
+    }
+    let resource = block.get("resource")?;
+    if resource.get("mimeType").and_then(Value::as_str) != Some(PROPOSAL_RESOURCE_MIME) {
+        return None;
+    }
+    let proposal: Value = serde_json::from_str(resource.get("text")?.as_str()?).ok()?;
+    proposal
+        .get("applyToolCallId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            proposal
+                .get("preview")
+                .and_then(|p| p.get("title"))
+                .and_then(Value::as_str)
+        })
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// The human-readable `preview.title` of the proposal-resource block whose
+/// identity ([`proposal_block_id`]) equals `proposal_id`, scanning `blocks`
+/// in order (last match wins, consistent with [`proposal_ids_in`] dedupe).
+/// `None` when no block carries the id or the matching proposal has no
+/// title — callers fall back to the id itself.
+pub(crate) fn proposal_title_in(blocks: &[Value], proposal_id: &str) -> Option<String> {
+    let mut title = None;
+    for block in blocks {
+        if proposal_block_id(block).as_deref() == Some(proposal_id) {
+            title = block
+                .get("resource")
+                .and_then(|r| r.get("text"))
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .and_then(|proposal| {
+                    proposal
+                        .get("preview")
+                        .and_then(|p| p.get("title"))
+                        .and_then(Value::as_str)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                });
+        }
+    }
+    title
+}
+
+/// Proposal ids carried by a message's content blocks, in block order,
+/// deduped within the slice (a later duplicate wins its position — last
+/// occurrence order). Backs the turn-end pending-proposals recording: both
+/// the registry/array path and the wrapped-echo path in `record_tool` land
+/// as lifted proposal-resource blocks in the persisted array, so one scan
+/// covers both.
+pub(crate) fn proposal_ids_in(blocks: &[Value]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for block in blocks {
+        if let Some(id) = proposal_block_id(block) {
+            ids.retain(|existing| existing != &id);
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 /// Rebuild the MCP proposal resource item exactly as the `ws.app.*` bindings
@@ -727,6 +801,72 @@ mod tests {
         let lifted: Value =
             serde_json::from_str(item["resource"]["text"].as_str().unwrap()).unwrap();
         assert_eq!(lifted["preview"]["title"], "Tab");
+    }
+
+    /// A persisted proposal-resource block carrying `proposal_json` as its
+    /// embedded `resource.text`, id-stamped like the turn-end drain leaves it.
+    fn proposal_block(proposal: &Value) -> Value {
+        json!({
+            "type": "resource",
+            "id": "m:5",
+            "resource": {
+                "uri": intent_acp::mcp_server::proposal_resource_uri(proposal),
+                "name": "P",
+                "mimeType": PROPOSAL_RESOURCE_MIME,
+                "text": serde_json::to_string(proposal).unwrap(),
+            }
+        })
+    }
+
+    #[test]
+    fn proposal_block_id_prefers_apply_tool_call_id() {
+        let mut proposal = valid_proposal();
+        proposal["applyToolCallId"] = json!("tc-apply-9");
+        assert_eq!(
+            proposal_block_id(&proposal_block(&proposal)).as_deref(),
+            Some("tc-apply-9")
+        );
+    }
+
+    #[test]
+    fn proposal_block_id_falls_back_to_preview_title() {
+        assert_eq!(
+            proposal_block_id(&proposal_block(&valid_proposal())).as_deref(),
+            Some("Update Test Setting")
+        );
+    }
+
+    #[test]
+    fn proposal_block_id_rejects_non_proposal_and_malformed_blocks() {
+        // Wrong type / MIME.
+        assert!(proposal_block_id(&json!({ "type": "text", "text": "hi" })).is_none());
+        let mut wrong_mime = proposal_block(&valid_proposal());
+        wrong_mime["resource"]["mimeType"] = json!("text/plain");
+        assert!(proposal_block_id(&wrong_mime).is_none());
+        // Unparseable embedded text.
+        let mut bad_text = proposal_block(&valid_proposal());
+        bad_text["resource"]["text"] = json!("not json");
+        assert!(proposal_block_id(&bad_text).is_none());
+        // No identity: neither applyToolCallId nor preview.title.
+        let mut no_identity = valid_proposal();
+        no_identity["preview"] = json!({});
+        assert!(proposal_block_id(&proposal_block(&no_identity)).is_none());
+    }
+
+    #[test]
+    fn proposal_ids_in_collects_in_order_and_dedupes_last_wins() {
+        let mut a = valid_proposal();
+        a["applyToolCallId"] = json!("tc-a");
+        let mut b = valid_proposal();
+        b["applyToolCallId"] = json!("tc-b");
+        let blocks = vec![
+            json!({ "type": "text", "text": "two proposals" }),
+            proposal_block(&a),
+            proposal_block(&b),
+            proposal_block(&a),
+        ];
+        assert_eq!(proposal_ids_in(&blocks), vec!["tc-b", "tc-a"]);
+        assert!(proposal_ids_in(&[json!({ "type": "text", "text": "none" })]).is_empty());
     }
 
     #[test]

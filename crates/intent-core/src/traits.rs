@@ -93,6 +93,27 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.localChanges`: local git work that archiving or deleting
+    /// the workspace would lose or orphan (PROTOCOL §5.1) —
+    /// `{ roots: [...], hasUnpushedCommits, hasUncommittedChanges }`. One
+    /// row per evaluated root: the primary worktree first (skipped when the
+    /// workspace is remote or the worktree is not a git repository), then
+    /// every registered secondary git root in `gitRoot.list` order (always
+    /// evaluated — registered paths are host-local by construction). Each
+    /// row carries `kind`, `gitRootId` (secondary only), `path`, and the
+    /// per-repository signals (`branch?`, `hasRemoteRefs`, `unpushedCount`,
+    /// `uncommittedCount`); a root that cannot be read yields an `error` row
+    /// with zero counts instead of failing the call. `NotFound` only if the
+    /// workspace is absent.
+    fn workspace_local_changes(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_local_changes not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `workspace.transfer.plan`: read-only preview of a workspace transfer
     /// (PROTOCOL §5.1) — the versioned [`crate::transfer::TransferManifest`]
     /// plus a size estimate broken down as DB row bytes + asset bytes +
@@ -1054,14 +1075,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.updateStatus`: flip a checkbox by exact task text (PROTOCOL §5.4).
+    /// `caller_agent_id` attributes a write redirected to a linked task note
+    /// (its `task:status-changed` / flipped-completion) to the calling agent.
     fn task_update_status(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         task_text: String,
         status: String,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateStatusResult>> {
-        let _ = (workspace_id, note_id, task_text, status);
+        let _ = (workspace_id, note_id, task_text, status, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update_status not implemented".to_string(),
@@ -1098,6 +1122,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.update`: atomic single-line edit with `expected` conflict check (§5.4).
+    /// `caller_agent_id` attributes a write redirected to a linked task note
+    /// (its `task:status-changed` / flipped-completion) to the calling agent.
+    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -1106,8 +1133,17 @@ pub trait WorkspaceApi: Send + Sync {
         text: Option<String>,
         status: Option<String>,
         expected: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
-        let _ = (workspace_id, note_id, line, text, status, expected);
+        let _ = (
+            workspace_id,
+            note_id,
+            line,
+            text,
+            status,
+            expected,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_update not implemented".to_string(),
@@ -1333,12 +1369,53 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.list`: workspace agents as the stripped [`AgentLite`] projection
-    /// (PROTOCOL §5.5).
+    /// (PROTOCOL §5.5). Excludes soft-retired sessions (`retiredAt` set) —
+    /// the wire `includeRetired: true` variant is
+    /// [`WorkspaceApi::agent_list_including_retired`].
     fn agent_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
         let _ = workspace_id;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.list` with `includeRetired: true` (PROTOCOL §5.5): every
+    /// session including soft-retired ones, whose rows carry `retiredAt`.
+    fn agent_list_including_retired(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_including_retired not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.list` with `retiredOnly: true` (PROTOCOL §5.5): ONLY
+    /// soft-retired sessions, whose rows carry `retiredAt`.
+    fn agent_list_retired_only(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_retired_only not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Number of soft-retired sessions in a workspace — the `retiredCount`
+    /// field attached to every `agent.list` response variant (PROTOCOL §5.5).
+    fn agent_retired_count(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<u64>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_retired_count not implemented".to_string(),
             ))
         })
     }
@@ -1376,8 +1453,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// `[0, totalMessages - 1]`. The two seek params are mutually exclusive
     /// (enforced at the transport boundary). The optional `projection`
     /// requests bounded tool/image block bodies
-    /// ([`crate::ConversationProjection`]); absent all optional params,
-    /// behavior is byte-identical to before.
+    /// ([`crate::ConversationProjection`]). When `include_in_progress` is
+    /// `true` and the served page ends at the live tail, the in-flight
+    /// turn's partial assistant message (streamed blocks so far) is appended
+    /// as a trailing `inProgress: true` row (monorepo#3647); absent all
+    /// optional params, behavior is byte-identical to before.
     #[allow(clippy::too_many_arguments)]
     fn agent_get_conversation(
         &self,
@@ -1388,6 +1468,7 @@ pub trait WorkspaceApi: Send + Sync {
         around_message_id: Option<String>,
         around_index: Option<i64>,
         projection: Option<crate::ConversationProjection>,
+        include_in_progress: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             agent_id,
@@ -1397,6 +1478,7 @@ pub trait WorkspaceApi: Send + Sync {
             around_message_id,
             around_index,
             projection,
+            include_in_progress,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -1675,11 +1757,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// through to the prompt builder for downstream note-image /
     /// context-reference resolution.
     ///
-    /// `origin` marks who originated the delivery (question hold, PROTOCOL
-    /// §5.5): the FE RPC front door passes [`MessageOrigin::User`] (never
-    /// held); the MCP front door and every internal wake/continuation path
-    /// pass [`MessageOrigin::Automatic`], which enqueues instead of starting
-    /// a turn while the target agent's question hold is active.
+    /// `origin` marks who originated the delivery (PROTOCOL §5.5): the FE
+    /// RPC front door passes [`MessageOrigin::User`]; the MCP front door and
+    /// every internal wake/continuation path pass
+    /// [`MessageOrigin::Automatic`], which enqueues instead of starting a
+    /// turn while the target's workspace is archived. Pending questions gate
+    /// neither origin.
     #[allow(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
@@ -1740,7 +1823,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.dismissQuestions`: persist the question-dismissal marker
     /// (`message_id` — the assistant message whose trailing question resource
     /// blocks the user dismissed) on the agent session, emit `agent:updated`,
-    /// and kick the queue drain so messages held by the question hold resume
+    /// deliver the questions-dismissed system notice, and kick the queue
+    /// drain so entries parked for other reasons (busy race) resume
     /// (PROTOCOL §5.5). Idempotent: re-dismissing the same message succeeds.
     fn agent_dismiss_questions(
         &self,
@@ -1752,6 +1836,30 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_dismiss_questions not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.resolveProposal`: record the user's resolution of a pending
+    /// proposal (`outcome` is `"applied"` or `"dismissed"`) — remove the
+    /// entry from the session's `pendingProposals` list, persist the
+    /// `proposalId -> outcome` resolution, emit `agent:updated`, and deliver
+    /// a system-origin notice to the agent naming the proposal and outcome
+    /// (PROTOCOL §5.5). Idempotent: re-resolving an already-resolved id
+    /// succeeds without a duplicate notice. Unknown `proposalId` (never
+    /// pending, never resolved) → `NotFound`.
+    fn agent_resolve_proposal(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        proposal_id: String,
+        outcome: String,
+        detail: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, proposal_id, outcome, detail);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_resolve_proposal not implemented".to_string(),
             ))
         })
     }
@@ -1782,7 +1890,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// the next prompt (the truncated history replays as `<supervisor>` XML so
     /// the provider does not retain the truncated turns), then sends `content`
     /// as a fresh user message with the same per-turn semantics as
-    /// `agent.sendMessage`.
+    /// `agent.sendMessage`. An explicit `model` must be a bare model id
+    /// (compound `provider:model` ids reject `-32602` at the wire boundary,
+    /// §5.5).
     #[allow(clippy::too_many_arguments)]
     fn agent_edit_and_regenerate(
         &self,
@@ -1933,11 +2043,12 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.setModel`: change an agent's model (PROTOCOL §5.5).
-    /// `provider_id` optionally names the intended provider explicitly
-    /// (additive param): absent keeps the historical behavior; present it
-    /// must be a registered provider, must agree with a compound
-    /// `model_id`'s prefix, and owns the validation of a bare `model_id`
-    /// (session.provider is reconciled to it on success).
+    /// `model_id` is a bare model id (compound `provider:model` ids reject
+    /// `-32602` at the wire boundary). `provider_id` optionally names the
+    /// intended provider explicitly (additive param): absent keeps the
+    /// historical behavior; present it must be a registered provider and
+    /// owns the validation of the model id (session.provider is reconciled
+    /// to it on success).
     fn agent_set_model(
         &self,
         workspace_id: WorkspaceId,
@@ -1974,8 +2085,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// a failed probe may serve the last-good cached list with `stale`/
     /// `warning` fields added. With a `provider_id` the catalog comes from
     /// that provider's registered source through the generic per-provider
-    /// cache (version-keyed, served indefinitely; a probe runs only on a
-    /// miss or forced read), returning
+    /// cache (version-keyed; a probe runs on a miss, on an entry at or past
+    /// the 24h staleness threshold, or on a forced read — a failed re-probe
+    /// serves the last-good list labeled `stale` + `warning`), returning
     /// `{ providerId, models, source, stale?, warning? }`. `force_refresh`
     /// skips the cache read and awaits a fresh probe.
     fn models_list(
@@ -2032,6 +2144,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.enhancePrompt`: one-shot prompt-enhance / AI-layout generation via
     /// the auggie CLI — `{ enhanced, original, mode }`; `mode` is `"enhance"` or
     /// `"layout"`, `workspaceId` optionally pins the CLI's cwd (PROTOCOL §5.31).
+    /// `model` must be a bare model id (compound `provider:model` ids reject
+    /// `-32602` at the wire boundary, §5.5).
     fn agent_enhance_prompt(
         &self,
         prompt: String,
@@ -2057,7 +2171,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// `quick_action_type` is the optional quick-action `type` hint keying
     /// `quickActions.typeOverrides`; with no explicit `model` the daemon
     /// resolves that override then `quickActions.defaultModel` before the
-    /// provider CLI default (monorepo#1734).
+    /// provider CLI default (monorepo#1734). An explicit `model` must be a
+    /// bare model id (compound `provider:model` ids reject `-32602` at the
+    /// wire boundary, §5.5).
     fn agent_complete_once(
         &self,
         prompt: String,
@@ -2141,6 +2257,54 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Whether `agent_id`'s session is soft-retired (`retiredAt` set) — the
+    /// cheap point read backing the MCP dispatch guard that keeps a caller
+    /// inert for the remainder of the turn that retired it (retirement lands
+    /// mid-turn; the ACP stream only stops at the turn boundary). Missing
+    /// sessions and read errors report `false`: absence is handled by the
+    /// per-method `require_*` guards, and a transient store error must not
+    /// blanket-deny every `workspace_api` call. Default `false` so non-agent
+    /// `WorkspaceApi` impls need not implement it.
+    fn agent_is_retired(&self, agent_id: AgentId) -> BoxFuture<'_, bool> {
+        let _ = agent_id;
+        Box::pin(async { false })
+    }
+
+    /// Soft retire (`ws.agent.retire`): set `retiredAt` on the session,
+    /// keeping the row and its full conversation intact. The retired session
+    /// is inert until `agent.restore` clears the mark. Emits `agent:retired`;
+    /// idempotent on an already-retired session.
+    fn agent_retire(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        reason: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, reason);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_retire not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.restore` (PROTOCOL §5.5): clear a session's `retiredAt`,
+    /// returning it to normal service. Restoring a non-retired session is a
+    /// no-op (`{ success: true, restored: false }`); a real restore emits
+    /// `agent:restored`.
+    fn agent_restore(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_restore not implemented".to_string(),
             ))
         })
     }
@@ -2267,8 +2431,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.agent.snapshot` (MCP-only, PROTOCOL §7.1): the calling agent's own
     /// compact state digest — active hooks, completion watches, queued
-    /// messages, event subscriptions, unsettled children, pending structured
-    /// questions, pending attention request, current UTC time. Zero-count and
+    /// messages, event subscriptions, actively running (in-flight) children,
+    /// pending structured questions, pending attention request, current UTC
+    /// time. Zero-count and
     /// null fields are omitted from the returned object; `time` is always
     /// present. Never gated by `agentFeatures.stateSnapshot` (the toggle
     /// governs only the per-turn prompt injection). A workspace mismatch
@@ -2492,6 +2657,57 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::app_agents_wait not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `app.agents.send` (the Chief-only `ws.app.agents.send` MCP binding):
+    /// resolve a target agent across workspaces and deliver an automatically
+    /// attributed message through the ordinary agent message path.
+    fn app_agents_send(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            caller_agent_id,
+            target_agent_id,
+            message,
+            priority,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_agents_send not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `app.agents.ask` (the Chief-only `ws.app.agents.ask` MCP binding):
+    /// deliver an attributed message through the ordinary send path and arm
+    /// one durable completion watch. Direct replies remain ordinary messages;
+    /// only target settlement consumes the watch and wakes the Chief.
+    fn app_agents_ask(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        message: String,
+        priority: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            caller_agent_id,
+            target_agent_id,
+            message,
+            priority,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_agents_ask not implemented".to_string(),
             ))
         })
     }
@@ -3168,6 +3384,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// §5.6). When `agent_id` (and optionally `linked_note_id`) are present, the
     /// commit body carries `Agent-Id:` / `Linked-Note-Id:` attribution trailers;
     /// the FE/transport path passes `None` for both (no agent context).
+    ///
+    /// With `git_root_id` the commit targets the registered secondary git
+    /// root instead of the workspace worktree (monorepo#2053): an unknown id
+    /// — or one registered to a different workspace — is `InvalidParams`
+    /// (`-32602`). `None` preserves the primary-worktree behavior exactly.
+    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -3176,6 +3398,7 @@ pub trait WorkspaceApi: Send + Sync {
         linked_note_id: Option<NoteId>,
         files: Option<Vec<String>>,
         user_requested: bool,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
         let _ = (
             workspace_id,
@@ -3184,6 +3407,7 @@ pub trait WorkspaceApi: Send + Sync {
             linked_note_id,
             files,
             user_requested,
+            git_root_id,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -3834,6 +4058,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.issues.get`: `GET /repos/{owner}/{repo}/issues/{number}` → `{ issue }`.
+    fn github_issues_get(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_issues_get not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.issues.list`: `GET /repos/{owner}/{repo}/issues` (PRs filtered
     /// out) → `{ issues, nextToken }`.
     #[allow(clippy::too_many_arguments)]
@@ -4368,6 +4607,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `file-tracking.getAgentLocks`: the daemon-computed agent-lock snapshot
+    /// (`{ autoCommitEnabled, lockedAgentIds, lockedFilePaths }`) (PROTOCOL
+    /// §5.19). The hydration read for the `changes:agent-locks` event (§6.5).
+    fn file_tracking_get_agent_locks(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_tracking_get_agent_locks not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.loadCommits`: commit history with attribution
     /// (`{ commits: CommitWithAttribution[], boundarySha, nextToken }`).
     /// Wire shape details pending docs/protocol/ update (see monorepo Task 3).
@@ -4498,7 +4752,7 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `settings.get`: one setting as `{ path, value, definition }`; the value is
+    /// `settings.get`: one setting as `{ path, value, definition, origin?, revision }`; the value is
     /// redacted when sensitive; unknown path → `-32602` (PROTOCOL §5.12).
     fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = path;
@@ -4542,8 +4796,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// the providers discovery reported as installed. When no default
     /// provider is derivable from settings and at least one installed
     /// provider exists, the implementation persists the first installed
-    /// provider as `providers.active` (and, when a cached model catalog
-    /// exists for it, its default model as a compound `model.default`).
+    /// provider as `model.defaultProvider` (and, when a cached model catalog
+    /// exists for it, its default model as a bare `model.default`).
     /// Idempotent, and never overwrites an existing settings value. Returns
     /// `{ healed: boolean, ... }`. Default: no-op (read-only wirings).
     fn settings_heal_default_provider(
@@ -4728,6 +4982,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.listSpecialists` (the `ws.agent.listSpecialists` MCP binding):
+    /// the same resolved catalog as [`Self::specialist_list`], but the
+    /// `resolvedModel`/`resolvedProvider` preview fields are computed
+    /// per-specialist — each row against the provider a no-`model`
+    /// `agent.delegate` of that specialist would actually spawn on (its own
+    /// frontmatter `codingAgent` pin first, else the
+    /// settings-derived default) — instead of one shared caller/settings
+    /// provider context. Matches the session-start specialist hints.
+    fn specialist_list_dispatch(
+        &self,
+        workspace_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_path;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::specialist_list_dispatch not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `specialist.get` → `{ specialist: SpecialistDef }`, the resolved view;
     /// unknown id → `-32602` (PROTOCOL §5.11). An optional `provider` supplies
     /// the resolution context for the additive `resolvedModel`/
@@ -4873,13 +5147,18 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `mcp.servers.toggle` → enable (start) / disable (stop) a server; returns
-    /// `{ status: McpServerStatus }` (PROTOCOL §5.22).
+    /// `{ status: McpServerStatus }` (PROTOCOL §5.22). With a `workspace_id`
+    /// scope the toggle sets/clears the **per-workspace** disabled marker
+    /// instead of the global config/lifecycle, returning
+    /// `{ status, workspaceDisabled }` — global disable always wins; the
+    /// workspace layer only narrows an otherwise-enabled server.
     fn mcp_servers_toggle(
         &self,
         server_id: String,
         enabled: bool,
+        workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (server_id, enabled);
+        let _ = (server_id, enabled, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mcp_servers_toggle not implemented".to_string(),
@@ -4977,6 +5256,65 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mcp_test_connection not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.mcp.listServers` (agent bridge/hook surface only — no wire
+    /// method): the configured external MCP servers projected to a
+    /// non-sensitive allowlist — `{ servers: [{ id, name, transport,
+    /// enabled, state, toolCount?, workspaceDisabled? }] }`. `env`/`headers`
+    /// never appear. Gated server-side on `agentFeatures.mcpTools` and
+    /// `mcp.enableUserServers`. `workspace_id` scopes the per-workspace
+    /// disabled layer (`workspaceDisabled: true` on servers disabled in that
+    /// workspace).
+    fn mcp_list_servers(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_list_servers not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.mcp.listTools` (agent bridge/hook surface only — no wire method):
+    /// forward `tools/list` to one running external MCP server, returning
+    /// the raw MCP result (`{ tools: [...] }`). Same settings gates as
+    /// [`Self::mcp_list_servers`], plus the per-server disabled list and the
+    /// per-workspace disabled layer for `workspace_id`.
+    fn mcp_list_tools(
+        &self,
+        server_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_list_tools not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.mcp.callTool` (agent bridge/hook surface only — no wire method):
+    /// forward `tools/call` to one running external MCP server, returning
+    /// the raw MCP result. `timeout_ms` is a caller override the hub caps at
+    /// its own bound. Same settings gates as [`Self::mcp_list_tools`],
+    /// including the per-workspace disabled layer for `workspace_id`.
+    fn mcp_call_tool(
+        &self,
+        server_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        timeout_ms: Option<u64>,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, tool_name, args, timeout_ms, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_call_tool not implemented".to_string(),
             ))
         })
     }
@@ -6090,7 +6428,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.hook.schedule` / wire `hook.schedule`: register a background hook
     /// (an agent-owned scheduled script) after one immediate real run.
-    /// `params` carries `{ name, code, delayMs }`; `agent_id` is the owning
+    /// `params` carries `{ name, code }` plus exactly one schedule kind —
+    /// `delayMs` (fixed cadence), `cron` (recurring UTC expression), or
+    /// `runAt` (one-shot RFC3339 fire time); `agent_id` is the owning
     /// agent (the MCP caller). Returns the persisted hook on success.
     fn hook_schedule(
         &self,
@@ -6121,6 +6461,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.hook.get` (MCP-only, no wire method): one hook row by id — the
+    /// full row including `code`, for active AND terminal (retired) hooks,
+    /// so an agent can recover a retired hook's script to re-arm it. Hooks
+    /// belonging to another workspace read as `NotFound`.
+    fn hook_get(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: HookId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, hook_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_get not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `ws.hook.cancel` / wire `hook.cancel`: stop an active hook. `caller`
     /// is the cancelling agent (MCP): an agent may only cancel its own hooks
     /// — a non-owner is rejected — and an owner cancel delivers no self-wake.
@@ -6141,7 +6498,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `ws.hook.runNow` / wire `hook.runNow`: trigger an immediate run of an
-    /// active hook, resetting its inter-run timer.
+    /// active hook, resetting its inter-run timer. On a `runAt` hook the
+    /// triggered run IS the one-shot fire: the hook fires early and retires
+    /// (the one-shot contract is honored over the timestamp).
     fn hook_run_now(
         &self,
         workspace_id: WorkspaceId,

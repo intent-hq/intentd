@@ -317,6 +317,7 @@ async fn interrupted_agents_persisted_across_restart() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store
             .insert_agent_session(&session)
@@ -527,7 +528,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Graceful Agent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Graceful Agent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -675,6 +676,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,

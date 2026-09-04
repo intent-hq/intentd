@@ -12,6 +12,7 @@
 //! ```text
 //! sitter/
 //! ├── versions/<version>/intentd[.exe]   # installed daemon binaries
+//! ├── versions/<version>/libexec/…       # sidecar payload from the archive (tailcat + LICENSE)
 //! ├── tmp/                               # in-flight downloads/extractions
 //! ├── config.toml                        # user-editable channel pin
 //! ├── state.json                         # persisted sitter state
@@ -52,7 +53,8 @@ pub struct SitterPaths {
     /// `<sitter_dir>/config.toml` — user-editable channel pin.
     pub config_path: PathBuf,
     /// `<sitter_dir>/sitter.pid` — pid of the serve-mode sitter while it
-    /// runs (`intentd restart` reads it to find the supervisor).
+    /// runs (`intentd restart` reads it to find the supervisor; on Windows
+    /// `install.ps1` reads it as the upgrade-allowance ownership witness).
     pub pid_path: PathBuf,
 }
 

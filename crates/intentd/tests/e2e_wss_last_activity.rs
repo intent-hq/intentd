@@ -429,7 +429,7 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         &mut rpc,
         3,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "TestAgent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "TestAgent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().expect("agent id");
@@ -601,7 +601,7 @@ async fn last_activity_persisted_for_workspace_subscribe_snapshot() {
         &mut rpc,
         3,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "PersistAgent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "PersistAgent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().expect("agent id");
@@ -753,7 +753,7 @@ async fn last_activity_debounce_coalesces_burst() {
         &mut rpc,
         3,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "BurstAgent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "BurstAgent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().expect("agent id");

@@ -292,6 +292,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -458,7 +459,7 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "IdleTO", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "IdleTO", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -669,7 +670,7 @@ async fn idle_timeout_tail_does_not_bleed_into_warning_turn_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "IdleTail", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "IdleTail", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -837,7 +838,7 @@ async fn idle_timeout_unresolved_cancel_tears_down_child_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "IdleTear", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "IdleTear", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -975,7 +976,7 @@ async fn delegated_child_idle_timeout_does_not_wake_parent_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'immediate', model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'immediate', model: 'default', provider: 'mock' }});",
         json!(CHILD_MARKER),
     );
     // One behavior drives all three roles: the parent's opening turn (matched
@@ -1052,7 +1053,7 @@ async fn delegated_child_idle_timeout_does_not_wake_parent_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -1269,7 +1270,7 @@ async fn idle_timeout_cap_fails_terminally_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "IdleCap", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "IdleCap", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

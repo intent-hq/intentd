@@ -57,6 +57,7 @@ const SNAPSHOT_PREFIX: &str = "current ws.agent.snapshot() => ";
 /// Turn-1 trigger marker: the mock's `rules` entry matches on this, so the
 /// subscription-registering tool call fires ONLY on the first user turn.
 const SUBSCRIBE_MARKER: &str = "SUBSCRIBE_NOW_E2E";
+const CHILD_COUNTER_MARKER: &str = "KEEP_CHILD_ACTIVE_FOR_SNAPSHOT_E2E";
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
@@ -430,6 +431,10 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
                 },
             }],
             "response": "subscribed",
+        }, {
+            "ifPromptContains": CHILD_COUNTER_MARKER,
+            "delayMs": 5000,
+            "response": "child done",
         }],
         "response": "done",
     })
@@ -498,7 +503,7 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
             "initialAgent": {
                 "prompt": format!("first turn {SUBSCRIBE_MARKER}"),
                 "name": "Snapshot Agent",
-                "model": "mock:default",
+                "model": "default", "provider": "mock",
             },
         }),
     )
@@ -566,7 +571,7 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
         &mut rpc,
         14,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Gated Agent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Gated Agent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent2 = created2["result"]["agent"]["id"]
@@ -724,5 +729,670 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
         v2["eventSubscriptions"],
         json!(1),
         "gated session's tool still reports its subscription: {v2}"
+    );
+
+    // Create a real delegated child through the MCP bridge, keep its provider
+    // turn in flight, then verify all three child counters over WSS. The legacy
+    // field remains the unsettled alias.
+    let create_code = format!(
+        "return await ws.agent.create('Snapshot Child', '{CHILD_COUNTER_MARKER}', {{ model: 'default', provider: 'mock' }})"
+    );
+    let (create_err, create_text) = bridge.call_js(&create_code).await;
+    assert!(!create_err, "child creation must succeed: {create_text}");
+    let (child_err, child_text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!child_err, "child snapshot must succeed: {child_text}");
+    let child_snapshot: Value =
+        serde_json::from_str(&child_text).expect("child snapshot returns JSON");
+    assert_eq!(
+        child_snapshot["activeSubAgents"],
+        json!(1),
+        "{child_snapshot}"
+    );
+    assert_eq!(
+        child_snapshot["unsettledSubAgents"],
+        json!(1),
+        "{child_snapshot}"
+    );
+    assert_eq!(
+        child_snapshot["runningSubAgents"],
+        json!(1),
+        "legacy running count preserves in-flight status semantics: {child_snapshot}"
+    );
+}
+
+/// monorepo#3384: `runningSubAgents` through the production WSS/MCP path —
+/// the parent's `ws.agent.snapshot()` counts a delegated child only while it
+/// is genuinely in flight, and once the child's turn ends (status settles to
+/// idle) the field disappears. Pre-fix the count was backed by an
+/// unsettled-children blocklist, so the settled-idle poll below never
+/// converged: an idle child was reported as running forever.
+#[tokio::test]
+async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
+    const SPAWN_MARKER: &str = "SNAP3384_SPAWN_GO";
+    const CHILD_MARKER: &str = "SNAP3384_CHILD_GO";
+    let Some(script) = gate("runningSubAgents idle-child E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // The child's rule holds its turn open for a few seconds so the
+    // parent-bridge poll below observes the in-flight child deterministically.
+    let spawn_js = format!(
+        "const r = await ws.agent.create('SnapChild', '{CHILD_MARKER} do the work', \
+         {{ model: 'default', provider: 'mock' }}); return 'spawned=' + r.ok;"
+    );
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "wake acknowledged" },
+            {
+                "ifPromptContains": SPAWN_MARKER,
+                "toolCalls": [{
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_js, "summary": "spawn the child" },
+                }],
+                "response": "child spawned",
+            },
+            { "ifPromptContains": CHILD_MARKER, "delayMs": 3000, "response": "child done" },
+        ],
+        "response": "done",
+    })
+    .to_string();
+
+    let mut _daemon = Daemon {
+        child: spawn_serve(
+            &data_dir,
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("INTENTD_TCP_PORT", "0"),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_BEHAVIOR", &behavior),
+            ],
+        ),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let fp = status["result"]["fingerprint"].as_str().expect("fp");
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(fp);
+
+    let mut sub = wss_connect(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["result"]["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = wss_connect(port, cfg.clone()).await;
+
+    // Plain-JSON tool bodies so the snapshot polls below parse as JSON.
+    let toon_off = wss_rpc(
+        &mut rpc,
+        5,
+        "settings.update",
+        json!({ "changes": [{ "path": "workspaceApi.toonOutput", "value": false }] }),
+    )
+    .await;
+    assert_eq!(
+        toon_off["result"]["applied"][0]["value"],
+        json!(false),
+        "toonOutput off: {toon_off}"
+    );
+
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "runningSubAgents WS",
+            "branch": "feat/running-sub-agents-e2e",
+            "idempotencyKey": "running-sub-agents-e2e-1",
+            "initialAgent": {
+                "prompt": "plain first turn",
+                "name": "SnapParent",
+                "model": "default", "provider": "mock",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let parent = created["result"]["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent id")
+        .to_string();
+    await_stream_end(&mut sub, &parent).await;
+
+    // The parent's bridge config, captured while it is the only agent.
+    let parent_configs = mcp_config_files(&data_dir);
+    assert_eq!(
+        parent_configs.len(),
+        1,
+        "one agent → one mcp config: {parent_configs:?}"
+    );
+    let mut bridge = BridgeClient::connect(&bridge_addr_from_config(&parent_configs[0])).await;
+
+    // Baseline: no children → the field is absent (omitted when zero).
+    let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!err, "snapshot baseline: {text}");
+    let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+    assert!(v.get("runningSubAgents").is_none(), "no children yet: {v}");
+
+    // Spawn the child; its held turn keeps it in flight for the poll below.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": parent,
+            "content": format!("go {SPAWN_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["success"], true, "sendMessage ok: {sent}");
+
+    // In flight: the parent's snapshot must count exactly the running child.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+        assert!(!err, "snapshot poll (in flight): {text}");
+        let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+        if v["runningSubAgents"] == json!(1) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "child never observed in flight: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Settled: once the child's turn ends it persists idle and must drop out
+    // of the count. Pre-fix this poll never converged — the idle child is
+    // non-terminal, so the unsettled blocklist kept reporting it as running.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+        assert!(!err, "snapshot poll (settled): {text}");
+        let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+        if v.get("runningSubAgents").is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle child still counted as running: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The snapshot's `prs` field over the production WSS/MCP path: tracked open
+/// PRs (persisted on the workspace row via `workspace.update`) surface in
+/// `ws.agent.snapshot()` grouped by state with merged/closed excluded, open
+/// tracked PRs alone force the per-turn injection line, and once no open PR
+/// remains the field is omitted and the snapshot goes back to trivial (no
+/// injection line).
+#[tokio::test]
+async fn snapshot_prs_groups_tracked_open_prs_over_wss() {
+    let Some(script) = gate("snapshot prs E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+    let prompt_log = data_dir.join("prompt-log.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "done" }).to_string();
+
+    let mut _daemon = Daemon {
+        child: spawn_serve(
+            &data_dir,
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("INTENTD_TCP_PORT", "0"),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_BEHAVIOR", &behavior),
+                ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+            ],
+        ),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let fp = status["result"]["fingerprint"].as_str().expect("fp");
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(fp);
+
+    let mut sub = wss_connect(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["result"]["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = wss_connect(port, cfg.clone()).await;
+
+    // Plain-JSON tool bodies so the bridge probes parse as JSON.
+    let toon_off = wss_rpc(
+        &mut rpc,
+        5,
+        "settings.update",
+        json!({ "changes": [{ "path": "workspaceApi.toonOutput", "value": false }] }),
+    )
+    .await;
+    assert_eq!(
+        toon_off["result"]["applied"][0]["value"],
+        json!(false),
+        "toonOutput off: {toon_off}"
+    );
+
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "snapshot prs WS",
+            "branch": "feat/snapshot-prs-e2e",
+            "idempotencyKey": "snapshot-prs-e2e-1",
+            "initialAgent": {
+                "prompt": "plain first turn",
+                "name": "PrsAgent",
+                "model": "default", "provider": "mock",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let agent = created["result"]["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent id")
+        .to_string();
+    await_stream_end(&mut sub, &agent).await;
+
+    let configs = mcp_config_files(&data_dir);
+    assert_eq!(configs.len(), 1, "one agent → one mcp config: {configs:?}");
+    let mut bridge = BridgeClient::connect(&bridge_addr_from_config(&configs[0])).await;
+
+    // Baseline: no tracked PRs → the field is absent (omitted when empty).
+    let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!err, "snapshot baseline: {text}");
+    let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+    assert!(v.get("prs").is_none(), "no tracked PRs yet: {v}");
+
+    // Seed the workspace pool over the wire: repo identity + a tracked-PR
+    // list covering every group plus a merged PR that must never appear.
+    let ts = "2026-01-01T00:00:00Z";
+    let pr = |number: u64, status: &str, extra: Value| {
+        let mut base = json!({
+            "id": format!("PR_{number}"),
+            "number": number,
+            "url": format!("https://github.com/o/r/pull/{number}"),
+            "title": format!("pr {number}"),
+            "status": status,
+            "createdAt": ts,
+            "updatedAt": ts,
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        base
+    };
+    let updated = wss_rpc(
+        &mut rpc,
+        11,
+        "workspace.update",
+        json!({
+            "workspaceId": ws_id,
+            "repositoryOwner": "o",
+            "repositoryName": "r",
+            "pullRequests": [
+                pr(1, "Open", json!({ "isDraft": true })),
+                pr(2, "Open", json!({ "mergeableState": "dirty" })),
+                pr(3, "Open", json!({ "mergeable": true, "mergeableState": "clean" })),
+                pr(4, "Open", json!({})),
+                pr(5, "Merged", json!({})),
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(
+        updated["result"]["workspace"]["pullRequests"]
+            .as_array()
+            .map(Vec::len),
+        Some(5),
+        "tracked PRs persisted: {updated}"
+    );
+
+    // The tool groups the open PRs by state; the merged PR is excluded.
+    let expected_prs = json!({
+        "draft": ["o/r#1"],
+        "blocked": ["o/r#2"],
+        "mergeable": ["o/r#3"],
+        "unknown": ["o/r#4"],
+    });
+    let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!err, "snapshot with tracked PRs: {text}");
+    let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+    assert_eq!(v["prs"], expected_prs, "grouped open PRs: {v}");
+
+    // Open tracked PRs alone force the injection line on the next turn.
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent, "content": "second turn" }),
+    )
+    .await;
+    assert_eq!(sent["result"]["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, &agent).await;
+
+    // No open PR left (merged/closed only): the field drops out and the
+    // snapshot goes back to trivial, so turn 3 must carry no line.
+    let cleared = wss_rpc(
+        &mut rpc,
+        13,
+        "workspace.update",
+        json!({
+            "workspaceId": ws_id,
+            "pullRequests": [pr(1, "Merged", json!({})), pr(2, "Closed", json!({}))],
+        }),
+    )
+    .await;
+    assert_eq!(
+        cleared["result"]["workspace"]["pullRequests"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "tracked PRs replaced: {cleared}"
+    );
+    let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!err, "snapshot after clear: {text}");
+    let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+    assert!(
+        v.get("prs").is_none(),
+        "merged/closed-only pools omit prs: {v}"
+    );
+
+    let sent3 = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent, "content": "third turn" }),
+    )
+    .await;
+    assert_eq!(sent3["result"]["success"], true, "sendMessage ok: {sent3}");
+    await_stream_end(&mut sub, &agent).await;
+
+    // ---- Prompt-log assertions ----
+    let log = read_prompt_log(&prompt_log);
+    assert!(
+        log.len() >= 3,
+        "expected 3 logged prompts, got {}: {log:?}",
+        log.len()
+    );
+
+    // Turn 1: no tracked PRs → trivial snapshot → NO line.
+    let (_, first) = &log[0];
+    assert!(
+        !first.contains(SNAPSHOT_PREFIX),
+        "trivial snapshot must not inject on turn 1: {first:?}"
+    );
+
+    // Turn 2: open tracked PRs alone make the snapshot non-trivial → the
+    // line leads the prompt and carries the grouped labels.
+    let (_, second) = &log[1];
+    let (snap, _) = split_snapshot(second)
+        .unwrap_or_else(|| panic!("turn 2 must start with the snapshot line: {second:?}"));
+    assert_eq!(snap["prs"], expected_prs, "prs rides the line: {snap}");
+    assert!(snap["time"].is_string(), "time always present: {snap}");
+
+    // Turn 3: merged/closed only → trivial again → NO line.
+    let (_, third) = &log[2];
+    assert!(
+        !third.contains(SNAPSHOT_PREFIX),
+        "no open tracked PR must not inject on turn 3: {third:?}"
+    );
+}
+
+/// The snapshot's `tasks` field over the production WSS/MCP path: task notes
+/// created over the wire (`note.create` + `task.markAsTask`) surface in
+/// `ws.agent.snapshot()` as per-status counts keyed by the wire `snake_case`
+/// status with `complete` excluded, open tasks alone force the per-turn
+/// injection line, and once every task is `complete` the field is omitted
+/// and the snapshot goes back to trivial (no injection line).
+#[tokio::test]
+async fn snapshot_tasks_counts_open_task_notes_over_wss() {
+    let Some(script) = gate("snapshot tasks E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+    let prompt_log = data_dir.join("prompt-log.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "done" }).to_string();
+
+    let mut _daemon = Daemon {
+        child: spawn_serve(
+            &data_dir,
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("INTENTD_TCP_PORT", "0"),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_BEHAVIOR", &behavior),
+                ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+            ],
+        ),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let fp = status["result"]["fingerprint"].as_str().expect("fp");
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(fp);
+
+    let mut sub = wss_connect(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["result"]["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = wss_connect(port, cfg.clone()).await;
+
+    // Plain-JSON tool bodies so the bridge probes parse as JSON.
+    let toon_off = wss_rpc(
+        &mut rpc,
+        5,
+        "settings.update",
+        json!({ "changes": [{ "path": "workspaceApi.toonOutput", "value": false }] }),
+    )
+    .await;
+    assert_eq!(
+        toon_off["result"]["applied"][0]["value"],
+        json!(false),
+        "toonOutput off: {toon_off}"
+    );
+
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "snapshot tasks WS",
+            "branch": "feat/snapshot-tasks-e2e",
+            "idempotencyKey": "snapshot-tasks-e2e-1",
+            "initialAgent": {
+                "prompt": "plain first turn",
+                "name": "TasksAgent",
+                "model": "default", "provider": "mock",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let agent = created["result"]["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent id")
+        .to_string();
+    await_stream_end(&mut sub, &agent).await;
+
+    let configs = mcp_config_files(&data_dir);
+    assert_eq!(configs.len(), 1, "one agent → one mcp config: {configs:?}");
+    let mut bridge = BridgeClient::connect(&bridge_addr_from_config(&configs[0])).await;
+
+    // Baseline: no task notes → the field is absent (omitted when empty).
+    let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!err, "snapshot baseline: {text}");
+    let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+    assert!(v.get("tasks").is_none(), "no task notes yet: {v}");
+
+    // Seed three task notes over the wire — one per status under test,
+    // including a `complete` one that must never be counted.
+    let mut next_id = 11;
+    let mut open_tasks = Vec::new();
+    for status in ["review_required", "in_progress", "complete"] {
+        let note = wss_rpc(
+            &mut rpc,
+            next_id,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": format!("task {status}") }),
+        )
+        .await;
+        next_id += 1;
+        let note_id = note["result"]["note"]["id"]
+            .as_str()
+            .expect("note id")
+            .to_string();
+        let marked = wss_rpc(
+            &mut rpc,
+            next_id,
+            "task.markAsTask",
+            json!({ "workspaceId": ws_id, "noteId": note_id, "status": status }),
+        )
+        .await;
+        next_id += 1;
+        assert_eq!(marked["result"]["ok"], true, "markAsTask ok: {marked}");
+        if status != "complete" {
+            open_tasks.push(note_id);
+        }
+    }
+
+    // The tool counts the open tasks per wire status; `complete` is excluded.
+    let expected_tasks = json!({ "in_progress": 1, "review_required": 1 });
+    let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!err, "snapshot with task notes: {text}");
+    let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+    assert_eq!(v["tasks"], expected_tasks, "open task counts: {v}");
+
+    // Open tasks alone force the injection line on the next turn.
+    let sent = wss_rpc(
+        &mut rpc,
+        next_id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent, "content": "second turn" }),
+    )
+    .await;
+    next_id += 1;
+    assert_eq!(sent["result"]["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, &agent).await;
+
+    // Every task `complete`: the field drops out and the snapshot goes back
+    // to trivial, so turn 3 must carry no line.
+    for note_id in &open_tasks {
+        let done = wss_rpc(
+            &mut rpc,
+            next_id,
+            "task.updateNoteStatus",
+            json!({ "workspaceId": ws_id, "noteId": note_id, "status": "complete" }),
+        )
+        .await;
+        next_id += 1;
+        assert_eq!(done["result"]["ok"], true, "updateNoteStatus ok: {done}");
+    }
+    let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!err, "snapshot after completion: {text}");
+    let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+    assert!(
+        v.get("tasks").is_none(),
+        "complete-only task notes omit tasks: {v}"
+    );
+
+    let sent3 = wss_rpc(
+        &mut rpc,
+        next_id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent, "content": "third turn" }),
+    )
+    .await;
+    assert_eq!(sent3["result"]["success"], true, "sendMessage ok: {sent3}");
+    await_stream_end(&mut sub, &agent).await;
+
+    // ---- Prompt-log assertions ----
+    let log = read_prompt_log(&prompt_log);
+    assert!(
+        log.len() >= 3,
+        "expected 3 logged prompts, got {}: {log:?}",
+        log.len()
+    );
+
+    // Turn 1: no task notes → trivial snapshot → NO line.
+    let (_, first) = &log[0];
+    assert!(
+        !first.contains(SNAPSHOT_PREFIX),
+        "trivial snapshot must not inject on turn 1: {first:?}"
+    );
+
+    // Turn 2: open tasks alone make the snapshot non-trivial → the line
+    // leads the prompt and carries the per-status counts.
+    let (_, second) = &log[1];
+    let (snap, _) = split_snapshot(second)
+        .unwrap_or_else(|| panic!("turn 2 must start with the snapshot line: {second:?}"));
+    assert_eq!(
+        snap["tasks"], expected_tasks,
+        "tasks rides the line: {snap}"
+    );
+    assert!(snap["time"].is_string(), "time always present: {snap}");
+
+    // Turn 3: every task complete → trivial again → NO line.
+    let (_, third) = &log[2];
+    assert!(
+        !third.contains(SNAPSHOT_PREFIX),
+        "complete-only task notes must not inject on turn 3: {third:?}"
     );
 }

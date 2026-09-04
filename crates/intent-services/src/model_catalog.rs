@@ -3,21 +3,36 @@
 //! One cache implementation serves every provider: entries are keyed by
 //! provider id and carry a version key (e.g. a pinned ACP adapter version) so
 //! a pin bump invalidates the cached list automatically. Successful non-empty
-//! fetches are persisted in the daemon data dir and served **indefinitely** —
-//! there is no age-based expiry (empty-but-successful results are served but
-//! not cached). A probe runs only on a true cache miss (no entry for the
-//! provider under its current version key) or on a `force_refresh` read;
-//! either falls back to the last-good list — labeled with a `warning` — only
-//! when the probe fails.
+//! fetches are persisted in the daemon data dir and served as fresh for
+//! [`MODELS_STALE_AFTER`] (empty-but-successful results are served but not
+//! cached). A non-forced read never blocks on a probe while there is any
+//! last-good list to serve (intent-hq/intent#3874, stale-while-revalidate):
+//! a fresh entry is a plain hit, and an **aged** entry (at or past the
+//! staleness threshold) is served immediately — labeled `stale` with a
+//! `warning` — while a refresh probe runs in the background so newly
+//! released provider models appear without a manual refresh. A blocking
+//! probe remains only where it is unavoidable: a true cache miss (no entry
+//! for the provider under its current version key) and a `force_refresh`
+//! read; each falls back to the last-good list — labeled `stale` with a
+//! `warning` — only when the probe fails, so an aged entry whose provider
+//! is unreachable never degrades below the last-good list.
 //!
-//! Probes are bounded two ways so a broken adapter cannot be re-spawned on
+//! Probes are bounded four ways so a broken adapter cannot be re-spawned on
 //! every `models.list` call: concurrent fetches for one (provider, version
-//! key) are **single-flighted** (one probe runs, everyone shares its result),
-//! and a failed probe is **negatively cached** for [`MODELS_NEGATIVE_TTL`] —
-//! within that window a non-forced miss reports nothing to serve without
-//! re-probing (a matching last-good entry would have been a plain cache hit
-//! before the negative window is even consulted). `force_refresh` bypasses
-//! the negative entry but still single-flights.
+//! key) are **single-flighted** (one probe runs; blocking callers share its
+//! result, and a stale-serving read neither starts a second probe nor awaits
+//! the running one), a failed probe is **negatively cached** for
+//! [`MODELS_NEGATIVE_TTL`] — within that window a non-forced read that is
+//! not a fresh hit skips the probe and serves what the cache has: the
+//! stale-labeled last-good list for an aged entry (a fresh entry is a plain
+//! hit before the negative window is even consulted), or nothing to serve on
+//! a true miss — a background refresh is bounded by a hard timeout
+//! ([`MODELS_BACKGROUND_REFRESH_TIMEOUT`]) that records a negative entry and
+//! releases the in-flight slot, so a wedged probe cannot pin it forever, and
+//! background refreshes across providers share a daemon-wide concurrency cap
+//! ([`MODELS_BACKGROUND_REFRESH_CONCURRENCY`]), so simultaneous stale reads
+//! cannot fan out one adapter/CLI spawn per provider at once.
+//! `force_refresh` bypasses the negative entry but still single-flights.
 //!
 //! The registry lists every provider with a daemon-side model source: auggie
 //! (rich CLI fetch), cortex (empty catalog — the provider CLI owns model
@@ -42,6 +57,34 @@ pub(crate) const MODELS_CACHE_FILE: &str = "models-cache.json";
 /// probe spawns an adapter/CLI, so a persistent failure must not be retried
 /// on every `models.list` call (PROTOCOL §5.30).
 pub(crate) const MODELS_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a cached success is served as fresh before a non-forced read
+/// re-probes the provider (age-based staleness threshold): without it a
+/// cached catalog is served forever and newly released provider models never
+/// appear until a manual forced refresh (intent-hq/intent#3682). A failed
+/// re-probe never degrades service — the aged entry keeps being served,
+/// labeled `stale` + `warning` (PROTOCOL §5.30).
+pub(crate) const MODELS_STALE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Hard cap on a background stale-while-revalidate refresh probe
+/// (intent-hq/intent#3874): on expiry the probe is abandoned (the fetch
+/// future is dropped), the failure is negatively cached like any other probe
+/// failure, and the in-flight slot is released — a wedged adapter can never
+/// pin the slot and block future refreshes. Generous relative to observed
+/// probe latency (~1s): the timeout only exists to unwedge, not to race.
+pub(crate) const MODELS_BACKGROUND_REFRESH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Daemon-wide cap on concurrently running background refresh probes — the
+/// global concurrency cap the RPC cost contract requires on a rung-2
+/// (stale-while-revalidate) refresher (AGENTS.md → Performance). Every
+/// (provider, version key) slot reaches the spawn independently, so without
+/// this cap simultaneous stale reads across providers would spawn one
+/// adapter/CLI subprocess per provider at once. Excess refreshes queue on
+/// the semaphore — they are detached and latency-insensitive — and the hard
+/// timeout starts only once the fetch actually runs.
+pub(crate) const MODELS_BACKGROUND_REFRESH_CONCURRENCY: usize = 2;
 
 /// Outcome of one provider model probe: `models: None` means the probe failed
 /// (CLI unavailable / nothing parseable) and the caller may fall back;
@@ -69,6 +112,41 @@ pub(crate) struct ModelSource {
 /// No version pin: sources whose output does not depend on a pinned adapter.
 fn no_version() -> String {
     String::new()
+}
+
+/// Resolve once so the cache key and probe refer to the same executable.
+/// No provider process is started by this lookup or by cache-only readers.
+pub(crate) struct AntigravityModelSource {
+    pub binary: Option<PathBuf>,
+    pub version_key: String,
+}
+
+impl AntigravityModelSource {
+    pub(crate) fn resolve(explicit_path: Option<&str>) -> Self {
+        use sha2::{Digest, Sha256};
+        let binary =
+            intent_providers::find_provider_binary("antigravity", "antigravity-acp", explicit_path);
+        let version_key = binary.as_ref().map_or_else(
+            || "antigravity-executable-v1:missing".to_string(),
+            |path| {
+                use std::fmt::Write;
+                Sha256::digest(path.as_os_str().as_encoded_bytes())
+                    .iter()
+                    .fold("antigravity-executable-v1:".to_string(), |mut key, byte| {
+                        let _ = write!(key, "{byte:02x}");
+                        key
+                    })
+            },
+        );
+        Self {
+            binary,
+            version_key,
+        }
+    }
+}
+
+fn antigravity_version_key() -> String {
+    AntigravityModelSource::resolve(None).version_key
 }
 
 /// Auggie catalog wire-shape version. Bump when daemon-side filtering or
@@ -99,26 +177,29 @@ fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     })
 }
 
-/// cortex source: registry-gated catalog. The gate is open by default —
-/// cortex's config demands no env var or feature code (un-gated,
-/// monorepo#1902) — but the check stays wired through
-/// [`intent_providers::gated_reason`] (the single gate shared with
-/// `providers.catalog` and discovery's `gatedOff`) so a future gating field
-/// re-closes it; closed means an empty list + warning (mirroring the
-/// reference FE's default-deny). Cortex has no dynamic model discovery (and
-/// the static tier catalog is retired), so an open gate also serves an empty
-/// list — the provider CLI owns model selection.
+/// Evaluate a provider's registry gate ([`intent_providers::gated_reason`] —
+/// the single gate shared with `providers.catalog` and discovery's
+/// `gatedOff`). A missing provider config is treated as gated (explicit
+/// default-deny), not as an open gate.
+fn source_gated_reason(provider_id: &str) -> Option<String> {
+    match intent_providers::find_provider(provider_id) {
+        None => Some("provider config missing".to_string()),
+        Some(cfg) => intent_providers::gated_reason(cfg),
+    }
+}
+
+/// cortex source: registry-gated catalog. Cortex is gated behind
+/// `INTENTD_ENABLE_CORTEX` (hidden by default — not yet well-tested); a
+/// closed gate means an empty list + warning (mirroring the reference FE's
+/// default-deny). Cortex has no dynamic model discovery (and the static tier
+/// catalog is retired), so an open gate also serves an empty list — the
+/// provider CLI owns model selection.
 fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
-        // A missing provider config is treated as gated (explicit default-deny),
-        // not as an open gate.
-        let gated = match intent_providers::find_provider("cortex") {
-            None => Some("provider config missing".to_string()),
-            Some(cfg) => intent_providers::gated_reason(cfg),
-        };
         ModelFetchResult {
             models: Some(Vec::new()),
-            warning: gated.map(|reason| format!("Cortex not available ({reason})")),
+            warning: source_gated_reason("cortex")
+                .map(|reason| format!("Cortex not available ({reason})")),
         }
     })
 }
@@ -126,7 +207,9 @@ fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
 /// Adapt a completed [`crate::provider_models`] fetch into the cache's fetch
 /// result (same `Option<rows>` + warning semantics, so a probe failure flows
 /// into the cache's last-good/stale fallback).
-fn from_provider_fetch(fetched: crate::provider_models::ProviderModelsFetch) -> ModelFetchResult {
+pub(crate) fn from_provider_fetch(
+    fetched: crate::provider_models::ProviderModelsFetch,
+) -> ModelFetchResult {
     ModelFetchResult {
         models: fetched.models,
         warning: fetched.warning,
@@ -187,8 +270,20 @@ fn pi_version() -> String {
 }
 
 /// droid source: ACP probe via a resolved `droid` binary (no adapter pin).
+/// Droid is gated behind `INTENTD_ENABLE_DROID` (hidden by default — not yet
+/// well-tested): a closed gate serves an empty list + warning without ever
+/// probing the binary (empty successes are never cached, so a gated probe
+/// cannot masquerade as a last-good list).
 fn droid_fetch() -> BoxFuture<'static, ModelFetchResult> {
-    provider_models_fetch("droid")
+    Box::pin(async {
+        if let Some(reason) = source_gated_reason("droid") {
+            return ModelFetchResult {
+                models: Some(Vec::new()),
+                warning: Some(format!("Droid not available ({reason})")),
+            };
+        }
+        from_provider_fetch(crate::provider_models::fetch_provider_models("droid").await)
+    })
 }
 
 /// opencode source: native `opencode models` CLI (no adapter pin).
@@ -210,6 +305,11 @@ fn unsloth_fetch() -> BoxFuture<'static, ModelFetchResult> {
 /// The provider→source registry: every provider with a daemon-side model
 /// source.
 static SOURCES: &[ModelSource] = &[
+    ModelSource {
+        provider_id: "antigravity",
+        version_key: antigravity_version_key,
+        fetch: || provider_models_fetch("antigravity"),
+    },
     ModelSource {
         provider_id: "auggie",
         version_key: auggie_catalog_version,
@@ -310,39 +410,38 @@ pub(crate) struct ModelCatalogCache {
     negative: Mutex<HashMap<String, NegativeEntry>>,
     /// In-flight probes keyed by (provider id, version key).
     inflight: Mutex<HashMap<(String, String), InflightCell>>,
+    /// Cache-wide permit pool bounding concurrent background refresh probes
+    /// ([`MODELS_BACKGROUND_REFRESH_CONCURRENCY`]); the production daemon
+    /// holds one cache, so this is the daemon-wide refresher cap the RPC
+    /// cost contract requires. Never closed.
+    refresh_permits: tokio::sync::Semaphore,
 }
 
-impl ModelCatalogCache {
-    /// Build the cache, seeding from `persist_path` when it holds a readable
-    /// current-version snapshot (corrupt/old files are ignored, not errors).
-    pub(crate) fn new(persist_path: Option<PathBuf>) -> Self {
-        let entries = persist_path
-            .as_deref()
-            .and_then(load_persisted)
-            .unwrap_or_default();
-        Self {
-            entries: Mutex::new(entries),
-            persist_path,
-            negative: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+/// A probe-free catalog view using a snapshot of the effective provider settings.
+pub(crate) struct ModelCatalogReader<'a> {
+    cache: &'a ModelCatalogCache,
+    antigravity_path: Option<String>,
+}
+
+impl crate::Services {
+    pub(crate) fn cached_models(&self) -> ModelCatalogReader<'_> {
+        self.models_catalog.reader(
+            self.effective_settings()
+                .providers
+                .paths
+                .get("antigravity")
+                .cloned(),
+        )
+    }
+}
+
+impl ModelCatalogReader<'_> {
+    fn version_key(&self, source: &ModelSource) -> String {
+        if source.provider_id == "antigravity" {
+            AntigravityModelSource::resolve(self.antigravity_path.as_deref()).version_key
+        } else {
+            (source.version_key)()
         }
-    }
-
-    /// Current unix time in milliseconds (the cache clock).
-    pub(crate) fn now_ms() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-    }
-
-    /// The last successfully fetched rows for `provider_id` regardless of
-    /// age, provided they were fetched under `version_key` — a version-pin
-    /// bump invalidates automatically. This is the cache-hit read: entries
-    /// never expire by age, so it doubles as the failure fallback source.
-    fn last_good(&self, provider_id: &str, version_key: &str) -> Option<Vec<Value>> {
-        let entries = self.entries.lock().expect("model catalog cache poisoned");
-        let entry = entries.get(provider_id)?;
-        (entry.version_key == version_key).then(|| entry.models.clone())
     }
 
     /// Cached-catalog ownership evidence for one provider (monorepo#607):
@@ -352,15 +451,20 @@ impl ModelCatalogCache {
     /// version-key mismatch — stale-pin entries are not evidence).
     /// Synchronous and read-only: no probe, no negative-cache interaction —
     /// the bare-model ownership guard must never block on or trigger a fetch.
-    /// Trade-off of serving entries regardless of age: a `Some(false)`
+    /// Trade-off of consulting entries regardless of age: a `Some(false)`
     /// disproof can outlive the provider's real catalog (e.g. a model added
-    /// upstream after the last fetch keeps being rejected until a forced
-    /// `models.list` refresh replaces the entry); a compound `provider:model`
-    /// id always bypasses the bare-model guard, so callers are never wedged.
+    /// upstream after the last fetch keeps being rejected until the entry
+    /// ages past [`MODELS_STALE_AFTER`] and a `models.list` read — or a
+    /// forced refresh — replaces it); a stale entry is repaired by the next
+    /// catalog refresh, so callers are never wedged for good.
     pub(crate) fn cached_catalog_claims(&self, provider_id: &str, bare_id: &str) -> Option<bool> {
         let source = source_for(provider_id)?;
-        let version_key = (source.version_key)();
-        let entries = self.entries.lock().expect("model catalog cache poisoned");
+        let version_key = self.version_key(source);
+        let entries = self
+            .cache
+            .entries
+            .lock()
+            .expect("model catalog cache poisoned");
         let entry = entries.get(provider_id)?;
         (entry.version_key == version_key)
             .then(|| rows_claim_model(provider_id, &entry.models, bare_id))
@@ -383,7 +487,11 @@ impl ModelCatalogCache {
     pub(crate) fn cached_default_model(&self, provider_id: &str) -> Option<String> {
         let source = source_for(provider_id)?;
         let (entry_version_key, default_id) = {
-            let entries = self.entries.lock().expect("model catalog cache poisoned");
+            let entries = self
+                .cache
+                .entries
+                .lock()
+                .expect("model catalog cache poisoned");
             let entry = entries.get(provider_id)?;
             let default_id = entry
                 .models
@@ -394,7 +502,7 @@ impl ModelCatalogCache {
                 .map(str::to_string)?;
             (entry.version_key.clone(), default_id)
         };
-        (entry_version_key == (source.version_key)()).then_some(default_id)
+        (entry_version_key == self.version_key(source)).then_some(default_id)
     }
 
     /// The cached catalog's default-model id for `provider_id`, falling back
@@ -410,7 +518,11 @@ impl ModelCatalogCache {
         }
         let source = source_for(provider_id)?;
         let (entry_version_key, first_id) = {
-            let entries = self.entries.lock().expect("model catalog cache poisoned");
+            let entries = self
+                .cache
+                .entries
+                .lock()
+                .expect("model catalog cache poisoned");
             let entry = entries.get(provider_id)?;
             let first_id = entry
                 .models
@@ -420,13 +532,14 @@ impl ModelCatalogCache {
                 .map(str::to_string)?;
             (entry.version_key.clone(), first_id)
         };
-        (entry_version_key == (source.version_key)()).then_some(first_id)
+        (entry_version_key == self.version_key(source)).then_some(first_id)
     }
 
     /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).
-    /// `model_id` may be compound (`provider:model`, restricting the search to
-    /// that provider) or bare (searched across every registered provider in
-    /// registry order). Returns the first non-empty `effortLevels` list found
+    /// `model_id` is a bare id (searched across every registered provider in
+    /// registry order); a legacy compound `provider:model` value from an old
+    /// session row still restricts the search to its named provider.
+    /// Returns the first non-empty `effortLevels` list found
     /// on a matching cached row, or `None` when there is no evidence — no
     /// cached entry, no matching row, or a row that declares no levels.
     /// Synchronous, read-only, and probe-free like
@@ -437,7 +550,11 @@ impl ModelCatalogCache {
             Some((prefix, bare)) if source_for(prefix).is_some() => (Some(prefix), bare),
             _ => (None, model_id),
         };
-        let entries = self.entries.lock().expect("model catalog cache poisoned");
+        let entries = self
+            .cache
+            .entries
+            .lock()
+            .expect("model catalog cache poisoned");
         for source in SOURCES {
             if scoped_provider.is_some_and(|p| p != source.provider_id) {
                 continue;
@@ -445,7 +562,7 @@ impl ModelCatalogCache {
             let Some(entry) = entries.get(source.provider_id) else {
                 continue;
             };
-            if entry.version_key != (source.version_key)() {
+            if entry.version_key != self.version_key(source) {
                 continue;
             }
             let levels = entry
@@ -473,14 +590,6 @@ impl ModelCatalogCache {
         None
     }
 
-    /// Seed a cache entry from tests in other modules (the real
-    /// [`Self::store`] is module-private). No persistence side effects: the
-    /// snapshot write is skipped when no `persist_path` is configured.
-    #[cfg(test)]
-    pub(crate) fn store_for_test(&self, provider_id: &str, version_key: &str, models: Vec<Value>) {
-        self.store(provider_id, version_key, models, Self::now_ms());
-    }
-
     /// Provider ids whose cached catalog claims `bare_id` (see
     /// [`Self::cached_catalog_claims`]), in registry order.
     pub(crate) fn providers_claiming_model_cached(&self, bare_id: &str) -> Vec<String> {
@@ -489,6 +598,72 @@ impl ModelCatalogCache {
             .filter(|s| self.cached_catalog_claims(s.provider_id, bare_id) == Some(true))
             .map(|s| s.provider_id.to_string())
             .collect()
+    }
+}
+
+impl ModelCatalogCache {
+    pub(crate) fn reader(&self, antigravity_path: Option<String>) -> ModelCatalogReader<'_> {
+        ModelCatalogReader {
+            cache: self,
+            antigravity_path,
+        }
+    }
+
+    /// Build the cache, seeding from `persist_path` when it holds a readable
+    /// current-version snapshot (corrupt/old files are ignored, not errors).
+    pub(crate) fn new(persist_path: Option<PathBuf>) -> Self {
+        let entries = persist_path
+            .as_deref()
+            .and_then(load_persisted)
+            .unwrap_or_default();
+        Self {
+            entries: Mutex::new(entries),
+            persist_path,
+            negative: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
+            refresh_permits: tokio::sync::Semaphore::new(MODELS_BACKGROUND_REFRESH_CONCURRENCY),
+        }
+    }
+
+    /// Current unix time in milliseconds (the cache clock).
+    pub(crate) fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// The last successfully fetched rows for `provider_id` regardless of
+    /// age, provided they were fetched under `version_key` — a version-pin
+    /// bump invalidates automatically. This is the failure fallback source:
+    /// entries never expire by age for fallback purposes (the fresh-serving
+    /// read is [`Self::fresh_hit`]).
+    fn last_good(&self, provider_id: &str, version_key: &str) -> Option<Vec<Value>> {
+        let entries = self.entries.lock().expect("model catalog cache poisoned");
+        let entry = entries.get(provider_id)?;
+        (entry.version_key == version_key).then(|| entry.models.clone())
+    }
+
+    /// The cache-hit read: [`Self::last_good`] restricted to entries younger
+    /// than [`MODELS_STALE_AFTER`]. Age is a saturating subtraction, so an
+    /// entry stamped ahead of `now` (system clock moved backwards) reads as
+    /// age zero — served as fresh until the wall clock catches up.
+    fn fresh_hit(&self, provider_id: &str, version_key: &str, now_ms: u64) -> Option<Vec<Value>> {
+        let entries = self.entries.lock().expect("model catalog cache poisoned");
+        let entry = entries.get(provider_id)?;
+        if entry.version_key != version_key {
+            return None;
+        }
+        let age = now_ms.saturating_sub(entry.fetched_at_ms);
+        (age < u64::try_from(MODELS_STALE_AFTER.as_millis()).unwrap_or(u64::MAX))
+            .then(|| entry.models.clone())
+    }
+
+    /// Seed a cache entry from tests in other modules (the real
+    /// [`Self::store`] is module-private). No persistence side effects: the
+    /// snapshot write is skipped when no `persist_path` is configured.
+    #[cfg(test)]
+    pub(crate) fn store_for_test(&self, provider_id: &str, version_key: &str, models: Vec<Value>) {
+        self.store(provider_id, version_key, models, Self::now_ms());
     }
 
     /// Record a successful fetch and best-effort persist the snapshot. The
@@ -575,6 +750,21 @@ impl ModelCatalogCache {
             .clone()
     }
 
+    /// Claim the in-flight probe slot for `(provider_id, version_key)` only
+    /// when none exists — the stale-while-revalidate entry point
+    /// (intent-hq/intent#3874): a stale-serving read must neither start a
+    /// second probe nor await the running one, so `None` (a probe is already
+    /// in flight) means "do nothing".
+    fn try_claim_inflight(&self, provider_id: &str, version_key: &str) -> Option<InflightCell> {
+        let mut inflight = self.inflight.lock().expect("model inflight map poisoned");
+        match inflight.entry((provider_id.to_string(), version_key.to_string())) {
+            std::collections::hash_map::Entry::Occupied(_) => None,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                Some(slot.insert(InflightCell::default()).clone())
+            }
+        }
+    }
+
     /// Release the in-flight slot once its outcome has been recorded in the
     /// success/negative caches. Only removes `cell` itself (`ptr_eq`), so a
     /// late finisher cannot evict a newer probe's slot.
@@ -609,6 +799,17 @@ impl ModelCatalogCache {
         now_ms: u64,
     ) -> Option<String> {
         self.negative_reason(provider_id, version_key, now_ms)
+    }
+
+    /// Test-only in-flight observation: whether the `(provider_id,
+    /// version_key)` probe slot is currently held — lets tests prove a
+    /// background refresh released (or still holds) the slot.
+    #[cfg(test)]
+    pub(crate) fn test_inflight_active(&self, provider_id: &str, version_key: &str) -> bool {
+        self.inflight
+            .lock()
+            .expect("model inflight map poisoned")
+            .contains_key(&(provider_id.to_string(), version_key.to_string()))
     }
 }
 
@@ -666,19 +867,42 @@ pub(crate) struct ResolvedModels {
 }
 
 /// The single cache policy every provider goes through (PROTOCOL §5.30):
-/// non-forced reads serve a cached entry indefinitely — regardless of age —
-/// so a probe runs only on a true miss (no entry under the current version
-/// key) or a forced read; a fresh negative entry (recent probe failure)
-/// short-circuits a miss to the failure fallback without re-probing
+/// non-forced reads serve a cached entry while it is fresh (younger than
+/// [`MODELS_STALE_AFTER`]), and an **aged** entry is served immediately —
+/// labeled `stale` + `warning` — while a refresh probe runs in the
+/// background (stale-while-revalidate, intent-hq/intent#3874): the read
+/// never blocks while any last-good list exists under the current version
+/// key. A blocking probe runs only on a true miss (no entry under the
+/// current version key) or on a forced read; a fresh negative entry (recent
+/// probe failure) short-circuits a miss or aged read to the failure fallback
+/// without probing — an aged entry within the negative window keeps being
+/// served as the stale-labeled last-good list with no background refresh
 /// (`force_refresh` skips both cache reads). Concurrent probes for one
-/// (provider, version key) are single-flighted — one fetch runs, everyone
-/// shares its result. A successful non-empty probe is stored (empty successes
-/// are served but not cached, so they never masquerade as a last-good list)
-/// and any success clears the negative entry; a failed probe records a
-/// negative entry and falls back to the last-good list labeled `stale` +
+/// (provider, version key) are single-flighted — at most one fetch runs;
+/// blocking callers share its result, and a stale-serving read whose slot is
+/// already taken simply skips spawning (it neither starts a second probe nor
+/// awaits the running one). A background refresh is additionally bounded by
+/// [`MODELS_BACKGROUND_REFRESH_TIMEOUT`]: on expiry the fetch future is
+/// dropped, the timeout is recorded as a negative entry, and the slot is
+/// released. Outcome recording is identical on both paths: a successful
+/// non-empty probe is stored (empty successes are served but not cached, so
+/// they never masquerade as a last-good list) and any success clears the
+/// negative entry; a failed probe records a negative entry and — on the
+/// blocking path — falls back to the last-good list labeled `stale` +
 /// `warning`, or reports nothing to serve.
+///
+/// Empty-success edge: a probe that returns an **empty success** stores
+/// nothing and clears no ground for negative caching, so while an aged entry
+/// sits next to an empty-success source every non-forced read serves the
+/// stale list and spawns another background refresh — bounded only by
+/// single-flighting, with no negative-window suppression (a blocking miss
+/// read serves the empty list inline, uncached, and re-probes likewise).
+/// This is acceptable while every registered empty-success source is a cheap
+/// env-var check (cortex/droid gating; unsloth converts empty to failure);
+/// a future source with a costly probe that can return empty success would
+/// need its own guard (e.g. converting empty to failure like unsloth does).
 pub(crate) async fn resolve_with_cache<F>(
-    cache: &ModelCatalogCache,
+    cache: &Arc<ModelCatalogCache>,
     provider_id: &str,
     version_key: &str,
     force_refresh: bool,
@@ -686,10 +910,10 @@ pub(crate) async fn resolve_with_cache<F>(
     fetch: F,
 ) -> ResolvedModels
 where
-    F: FnOnce() -> BoxFuture<'static, ModelFetchResult>,
+    F: FnOnce() -> BoxFuture<'static, ModelFetchResult> + Send + 'static,
 {
     if !force_refresh {
-        if let Some(models) = cache.last_good(provider_id, version_key) {
+        if let Some(models) = cache.fresh_hit(provider_id, version_key, now_ms) {
             return ResolvedModels {
                 models: Some(models),
                 stale: false,
@@ -698,6 +922,18 @@ where
         }
         if let Some(reason) = cache.negative_reason(provider_id, version_key, now_ms) {
             return failure_fallback(cache, provider_id, version_key, reason);
+        }
+        // Stale-while-revalidate: any last-good list under the current
+        // version key is served immediately; the refresh runs detached.
+        if let Some(models) = cache.last_good(provider_id, version_key) {
+            spawn_background_refresh(cache, provider_id, version_key, now_ms, fetch);
+            return ResolvedModels {
+                models: Some(models),
+                stale: true,
+                warning: Some(format!(
+                    "cached model list for '{provider_id}' is stale; refreshing in the background"
+                )),
+            };
         }
     }
     let cell = cache.join_inflight(provider_id, version_key);
@@ -709,18 +945,7 @@ where
     let fetched = cell
         .get_or_init(|| async {
             let fetched = fetch().await;
-            if let Some(models) = &fetched.models {
-                cache.clear_negative(provider_id);
-                if !models.is_empty() {
-                    cache.store(provider_id, version_key, models.clone(), now_ms);
-                }
-            } else {
-                let reason = fetched
-                    .warning
-                    .clone()
-                    .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-                cache.store_negative(provider_id, version_key, reason, now_ms);
-            }
+            record_probe_outcome(cache, provider_id, version_key, &fetched, now_ms);
             fetched
         })
         .await
@@ -738,6 +963,97 @@ where
             .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
         failure_fallback(cache, provider_id, version_key, reason)
     }
+}
+
+/// Record one probe outcome in the success/negative caches — the shared
+/// tail of the blocking and background paths, so stale-while-revalidate
+/// cannot drift from the blocking semantics: a success clears the negative
+/// entry and stores non-empty rows; a failure records a negative entry.
+fn record_probe_outcome(
+    cache: &ModelCatalogCache,
+    provider_id: &str,
+    version_key: &str,
+    fetched: &ModelFetchResult,
+    now_ms: u64,
+) {
+    if let Some(models) = &fetched.models {
+        cache.clear_negative(provider_id);
+        if !models.is_empty() {
+            cache.store(provider_id, version_key, models.clone(), now_ms);
+        }
+    } else {
+        let reason = fetched
+            .warning
+            .clone()
+            .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+        cache.store_negative(provider_id, version_key, reason, now_ms);
+    }
+}
+
+/// Kick off the detached stale-while-revalidate refresh probe
+/// (intent-hq/intent#3874) — a no-op when the (provider, version key) slot
+/// is already in flight, so concurrent stale reads spawn at most one probe.
+/// The claimed cell is initialized through the same `get_or_init` protocol
+/// as the blocking path, so a `force_refresh` caller arriving mid-refresh
+/// joins this probe and awaits its result rather than racing a second fetch.
+/// The fetch waits for a cache-wide permit
+/// ([`MODELS_BACKGROUND_REFRESH_CONCURRENCY`]) before running — the
+/// daemon-wide cap on concurrent refresh adapter/CLI spawns — and is then
+/// capped at [`MODELS_BACKGROUND_REFRESH_TIMEOUT`]; on expiry the future is
+/// dropped, the timeout is negatively cached (like any probe failure, so
+/// stale reads within [`MODELS_NEGATIVE_TTL`] do not re-spawn a wedged
+/// adapter), and the slot is released either way. Outcomes are stamped at
+/// **completion** time (`now_ms` + elapsed on the tokio clock), so the
+/// negative window always runs its full TTL from when the failure was
+/// observed — a probe that spends 30s timing out must not burn 30s of the
+/// 60s window before it even starts.
+fn spawn_background_refresh<F>(
+    cache: &Arc<ModelCatalogCache>,
+    provider_id: &str,
+    version_key: &str,
+    now_ms: u64,
+    fetch: F,
+) where
+    F: FnOnce() -> BoxFuture<'static, ModelFetchResult> + Send + 'static,
+{
+    let Some(cell) = cache.try_claim_inflight(provider_id, version_key) else {
+        return;
+    };
+    let cache = Arc::clone(cache);
+    let provider_id = provider_id.to_string();
+    let version_key = version_key.to_string();
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let outcome_ms = |started: tokio::time::Instant| {
+            now_ms.saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+        };
+        cell.get_or_init(|| async {
+            let _permit = cache
+                .refresh_permits
+                .acquire()
+                .await
+                .expect("refresh semaphore is never closed");
+            let fetched = tokio::time::timeout(MODELS_BACKGROUND_REFRESH_TIMEOUT, fetch())
+                .await
+                .unwrap_or_else(|_| ModelFetchResult {
+                    models: None,
+                    warning: Some(format!(
+                        "model discovery for '{provider_id}' timed out after {}s",
+                        MODELS_BACKGROUND_REFRESH_TIMEOUT.as_secs()
+                    )),
+                });
+            record_probe_outcome(
+                &cache,
+                &provider_id,
+                &version_key,
+                &fetched,
+                outcome_ms(started),
+            );
+            fetched
+        })
+        .await;
+        cache.finish_inflight(&provider_id, &version_key, &cell);
+    });
 }
 
 /// What a failed (or negatively cached) probe serves: the last-good list

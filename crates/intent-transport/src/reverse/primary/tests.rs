@@ -108,6 +108,57 @@ async fn dropping_a_non_primary_leaves_the_head_unchanged() {
 }
 
 #[tokio::test]
+async fn dropping_guard_closes_an_accepted_request() {
+    let reg = PrimaryReverseRegistry::new();
+    let (channel, mut rx) = idle_channel();
+    let guard = reg.register(channel);
+    let dispatch = tokio::spawn({
+        let reg = reg.clone();
+        async move {
+            reg.dispatch(
+                "browser.exec",
+                json!({ "actions": [{ "action": "screenshot" }] }),
+            )
+            .await
+        }
+    });
+    let frame = rx.recv().await.expect("accepted frame");
+    assert!(frame.contains("screenshot"));
+
+    drop(guard);
+    let err = dispatch
+        .await
+        .expect("join")
+        .expect_err("guard drop closes request");
+    assert!(matches!(err, ReverseDispatchError::Transport { .. }));
+    assert!(reg.is_empty());
+}
+
+#[tokio::test]
+async fn stale_primary_clone_cannot_request_after_guard_drop() {
+    let reg = PrimaryReverseRegistry::new();
+    let (channel, mut rx) = idle_channel();
+    let guard = reg.register(channel);
+    let stale = reg.primary().expect("primary clone");
+
+    drop(guard);
+    let err = stale
+        .request(
+            "browser.exec",
+            json!({ "actions": [{ "action": "screenshot" }] }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("closed state rejects stale clone");
+    assert!(err.message.contains("closed"));
+    assert!(
+        rx.try_recv().is_err(),
+        "closed clone cannot enqueue a frame"
+    );
+    assert!(reg.is_empty());
+}
+
+#[tokio::test]
 async fn dispatch_without_clients_reports_no_client() {
     let reg = PrimaryReverseRegistry::new();
     let err = reg

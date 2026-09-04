@@ -161,7 +161,7 @@ async fn start() -> Server {
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
     let ws =
@@ -401,6 +401,7 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         let contents: Vec<serde_json::Value> = (0..60)
             .map(|m| {

@@ -26,6 +26,30 @@ use tokio::sync::{mpsc, oneshot};
 /// generous than the ACP request timeout.
 pub(crate) const DEFAULT_REVERSE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Screenshot reverse requests must settle before the agent JavaScript tool's
+/// 30-second outer deadline so the caller receives the transport error.
+const SCREENSHOT_REVERSE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Select the reverse deadline without changing the global default. A mixed
+/// `browser.exec` batch uses the screenshot deadline when any action captures
+/// an image because the full batch shares one reverse response.
+pub(crate) fn request_timeout(method: &str, params: &Value) -> Duration {
+    let includes_screenshot = method == "browser.exec"
+        && params
+            .get("actions")
+            .and_then(Value::as_array)
+            .is_some_and(|actions| {
+                actions.iter().any(|action| {
+                    action.get("action").and_then(Value::as_str) == Some("screenshot")
+                })
+            });
+    if includes_screenshot {
+        SCREENSHOT_REVERSE_TIMEOUT
+    } else {
+        DEFAULT_REVERSE_TIMEOUT
+    }
+}
+
 /// A JSON-RPC error returned by the client to a reverse request.
 #[derive(Debug, Clone)]
 pub struct ReverseError {
@@ -33,7 +57,14 @@ pub struct ReverseError {
     pub message: String,
 }
 
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, ReverseError>>>>>;
+type PendingSender = oneshot::Sender<Result<Value, ReverseError>>;
+
+struct ReverseState {
+    requests: HashMap<String, PendingSender>,
+    closed: bool,
+}
+
+type Pending = Arc<Mutex<ReverseState>>;
 
 /// Daemon→client reverse-RPC channel for one connection. Cheap to clone (`Arc`
 /// inside); cloning shares the same pending map and id counter.
@@ -51,7 +82,10 @@ impl ReverseChannel {
     pub fn new(out_tx: mpsc::Sender<String>) -> Self {
         Self {
             out_tx,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(ReverseState {
+                requests: HashMap::new(),
+                closed: false,
+            })),
             next_id: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -81,43 +115,48 @@ impl ReverseChannel {
     ) -> Result<Value, ReverseError> {
         let id = self.mint_id();
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("reverse pending poisoned")
-            .insert(id.clone(), tx);
+        {
+            let mut state = self.pending.lock().expect("reverse pending poisoned");
+            if state.closed {
+                return Err(ReverseError {
+                    code: 0,
+                    message: "client connection closed".to_string(),
+                });
+            }
+            state.requests.insert(id.clone(), tx);
+        }
 
         let frame = serde_json::to_string(&json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params,
         }))
         .unwrap_or_default();
-        if self.out_tx.send(frame).await.is_err() {
-            self.pending
-                .lock()
-                .expect("reverse pending poisoned")
-                .remove(&id);
-            return Err(ReverseError {
+        let result = match tokio::time::timeout(timeout, async {
+            self.out_tx.send(frame).await.map_err(|_| ReverseError {
                 code: 0,
                 message: "client connection closed".to_string(),
-            });
-        }
-
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ReverseError {
+            })?;
+            rx.await.map_err(|_| ReverseError {
                 code: 0,
                 message: "reverse response channel dropped".to_string(),
+            })?
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ReverseError {
+                code: 0,
+                message: format!("reverse request timed out: {method}"),
             }),
-            Err(_) => {
-                self.pending
-                    .lock()
-                    .expect("reverse pending poisoned")
-                    .remove(&id);
-                Err(ReverseError {
-                    code: 0,
-                    message: format!("reverse request timed out: {method}"),
-                })
-            }
-        }
+        };
+        // `route_response` normally removes the entry first. Every other exit
+        // (queue timeout, response timeout, or closed connection) cleans it up
+        // here so a late response cannot address an abandoned request.
+        self.pending
+            .lock()
+            .expect("reverse pending poisoned")
+            .requests
+            .remove(&id);
+        result
     }
 
     /// Try to route an inbound frame as a response to a pending reverse request.
@@ -138,6 +177,7 @@ impl ReverseChannel {
             .pending
             .lock()
             .expect("reverse pending poisoned")
+            .requests
             .remove(id);
         let Some(sender) = sender else {
             return false;
@@ -155,6 +195,22 @@ impl ReverseChannel {
             let _ = sender.send(Ok(obj.get("result").cloned().unwrap_or(Value::Null)));
         }
         true
+    }
+
+    /// Fail all accepted requests when the owning client connection closes.
+    /// This also wakes requests whose frames already left the outbound queue.
+    pub(crate) fn close(&self) {
+        let pending = {
+            let mut state = self.pending.lock().expect("reverse pending poisoned");
+            state.closed = true;
+            std::mem::take(&mut state.requests)
+        };
+        for (_, sender) in pending {
+            let _ = sender.send(Err(ReverseError {
+                code: 0,
+                message: "client connection closed".to_string(),
+            }));
+        }
     }
 }
 

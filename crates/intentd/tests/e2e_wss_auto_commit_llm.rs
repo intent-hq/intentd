@@ -335,6 +335,7 @@ async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) ->
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -351,12 +352,12 @@ async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) ->
     };
     store.insert_workspace(&ws).await.expect("insert workspace");
     // Seed context.auggiePath via config.toml (TOML-backed setting) so the
-    // daemon's settings registry picks it up on boot. providers.active must
+    // daemon's settings registry picks it up on boot. model.defaultProvider must
     // be set too: unset provider settings resolve the completeOnce gate
     // CLOSED, which would skip LLM generation entirely.
     if let Some(bin) = auggie_bin {
         let toml = format!(
-            "[context]\nauggiePath = {:?}\n\n[providers]\nactive = \"auggie\"\n",
+            "[context]\nauggiePath = {:?}\n\n[model]\ndefaultProvider = \"auggie\"\n",
             bin.to_string_lossy()
         );
         std::fs::write(data_dir.join("config.toml"), toml).expect("write config.toml");
@@ -466,9 +467,10 @@ async fn auto_commit_uses_generated_message_over_wss() {
             "workspaceId": ws_id,
             "taskNoteId": task_note_id,
             "contextMessage": "do the task",
-            "model": "mock:default",
+            "model": "default",
             "create": {
-                "name": "WSS Builder"
+                "name": "WSS Builder",
+                "provider": "mock"
             }
         }),
     )
@@ -659,7 +661,7 @@ async fn auto_commit_falls_back_when_auggie_missing() {
         &mut rpc,
         12,
         "agent.wakeOrCreate",
-        json!({ "workspaceId": ws_id, "taskNoteId": task_id, "contextMessage": "write a file", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "taskNoteId": task_id, "contextMessage": "write a file", "model": "default", "create": { "provider": "mock" } }),
     )
     .await;
     let agent_id = woke["agentId"].as_str().expect("agent id").to_string();

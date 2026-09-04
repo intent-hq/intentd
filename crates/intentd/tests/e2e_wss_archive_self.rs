@@ -299,6 +299,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -390,7 +391,7 @@ async fn agent_archiving_its_own_workspace_completes_its_turn_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-ARCHIVE-SELF", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-ARCHIVE-SELF", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

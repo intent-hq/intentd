@@ -774,7 +774,7 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
         json!({
             "workspaceId": ws_id,
             "agentInstructions": "do sandboxed work",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -978,7 +978,7 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
         json!({
             "workspaceId": ws_id,
             "agentInstructions": "do slow-sandboxed work",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -1092,7 +1092,7 @@ async fn delegate_falls_back_to_shared_mode_when_provisioning_fails() {
         json!({
             "workspaceId": ws_id,
             "agentInstructions": "do work that cannot be sandboxed",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
         }),
     )
     .await;
@@ -1869,7 +1869,7 @@ async fn top_level_agent_in_cow_workspace_gets_sandbox_and_merges_over_wss() {
         &mut rpc,
         3,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Top Level", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Top Level", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

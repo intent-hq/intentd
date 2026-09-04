@@ -34,6 +34,15 @@
 # pass under NEXTEST_TEST_THREADS=8 + llvm-cov), delay-invariant, not locally
 # reproducible. Mechanism not pinned; serialization removes the load condition.
 #
+# The WSS MCP e2e binaries (e2e_wss_mcp_servers, e2e_wss_mcp_oauth_refresh)
+# also run isolated: each test spawns a real daemon plus node mock-MCP
+# fixtures, and the daemon-side HTTP probe runs against hardcoded production
+# handshake/probe timeouts (10s/15s, mcp_servers.rs) with no test seam. Under
+# full-suite parallel load the localhost fixture/daemon starve past those
+# bounds and the probe reports error/timeout instead of connected/running
+# (monorepo#4231); isolation removes the load condition, same as the
+# daemon-spawning binaries above.
+#
 # e2e_wss_pool_contention_stress also runs isolated: its tests assert
 # read-latency bounds (workspace.list / note.list mid-write-storm), which
 # measure pool behavior, not machine load. Under llvm-cov with 32+ parallel
@@ -45,15 +54,35 @@
 #
 # timing-serial test-group (max-threads = 1): A class of timing-sensitive unit
 # tests — filesystem-watcher tests (specialists/skills/root/registry/config
-# watchers, which use fixed startup sleeps and drain deadlines) and provider
+# watchers, which use fixed startup sleeps and drain deadlines), provider
 # child-spawn tests (auggie/opencode/grok, which shell out to fake binaries with
-# wall-clock budgets) — flakes under nextest's parallel cross-binary load. Unlike
+# wall-clock budgets), and the event-bus idle-flush latency assertion
+# (idle_publish_resolves_without_batch_window_delay, which bounds 20 SQLite
+# commits under 350ms — a measurement of bus behavior, not machine load) —
+# flakes under nextest's parallel cross-binary load. Unlike
 # the in-process mutexes those tests carry (which only serialize within a single
 # test binary, and are kept as a harmless aid to plain `cargo test`), a nextest
 # test-group serializes them GLOBALLY across binaries under nextest's
 # per-process model — running one at a time while the rest of the suite stays
 # parallel. This mirrors the intentd CI flake class and keeps `make test` green
 # under load.
+#
+# Priorities (nextest >= 0.9.91; intent-hq/monorepo#4260): nextest schedules
+# tests of equal priority in lexicographic (binary, test) order, which cost the
+# coverage-all job ~140s of near-idle test phase (50% CPU utilization over
+# 330s). Two causes: (1) an exclusive binary (threads-required =
+# num-test-threads, above) reaching the head of the queue mid-run blocks every
+# later test until all running ones drain, and while it waits only the
+# timing-serial trickle is executing; (2) the longest sleep-based tests
+# (66-68s) sort late and end up running alone at the tail. Fix: the exclusive
+# binaries run FIRST (priority 100 — back-to-back at the start, when nothing
+# else holds a thread, so nothing is blocked behind them), then the >=20s
+# sleep-based tests start (priority 90) so they overlap the rest of the suite
+# instead of stretching its tail. The timing-serial group deliberately stays at
+# priority 0: its tests flake under load, and lexicographic order already
+# spreads them through the lighter phase rather than the unit-test burst.
+# Priority tiers are distinct on purpose — at a shared priority the 68s test
+# would sort before the exclusive binaries and re-create the head-of-line stall.
 [profile.default]
 retries = 1
 slow-timeout = { period = "90s", terminate-after = 2 }
@@ -62,9 +91,19 @@ slow-timeout = { period = "90s", terminate-after = 2 }
 timing-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all) | binary_id(=intentd::e2e_wss_pool_contention_stress)'
+filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all) | binary_id(=intentd::e2e_wss_pool_contention_stress) | binary_id(=intentd::e2e_wss_mcp_servers) | binary_id(=intentd::e2e_wss_mcp_oauth_refresh)'
 threads-required = 'num-test-threads'
+priority = 100
+
+# Long wall-clock tests (>= 20s under coverage): the installer's literal 60s
+# crash-window replay (66s), a hook scheduled at the 60s delayMs minimum (68s),
+# a ~30s watch-retention wait, and two 20s screenshot outer-deadline timeouts.
+# Matched by exact (binary, test) so a renamed test drops out of the tier
+# instead of silently widening it.
+[[profile.default.overrides]]
+filter = '(binary_id(=intentd::e2e_hook_lifecycle) & test(=hook_lifecycle_over_wss)) | (binary_id(=intentd-sitter::install_sh_startup) & test(=a_crash_after_the_old_sixty_second_window_is_still_reported)) | (binary_id(=intentd::e2e_wss_agent_watch) & test(=report_progress_keeps_original_watch_for_terminal_completion_over_wss)) | (binary_id(=intentd::e2e_wss_sticky_reverse) & test(=agent_screenshot_timeout_returns_before_outer_deadline)) | (binary_id(=intentd::e2e_wss_browser_exec) & test(=browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss))'
+priority = 90
 
 [[profile.default.overrides]]
-filter = 'test(/specialists_watcher::/) | test(/skills_watcher::/) | test(/root_watch::/) | test(/events::registry::/) | test(/config_watcher::/) | test(/run_auggie/) | test(/availability_available_via_fake_binary/) | test(/opencode_cli_timeout/) | test(/opencode_timeout/) | test(/opencode_models_cli_child_path/) | test(/grok_cli_timeout/) | test(/grok_models_cli/)'
+filter = 'test(/specialists_watcher::/) | test(/skills_watcher::/) | test(/root_watch::/) | test(/events::registry::/) | test(/config_watcher::/) | test(/run_auggie/) | test(/availability_available_via_fake_binary/) | test(/opencode_cli_timeout/) | test(/opencode_timeout/) | test(/opencode_models_cli_child_path/) | test(/grok_cli_timeout/) | test(/grok_models_cli/) | test(idle_publish_resolves_without_batch_window_delay)'
 test-group = 'timing-serial'

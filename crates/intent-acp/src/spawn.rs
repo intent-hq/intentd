@@ -63,6 +63,12 @@ pub struct SpawnOptions<'a> {
     /// The package spec to pass to npx when `npx_fallback_binary` is set (may
     /// carry a pinned `@<version>` suffix).
     pub npx_fallback_package: Option<&'static str>,
+    /// The `agents.acpNodeMaxOldSpaceMb` setting at spawn time: the V8
+    /// `--max-old-space-size` cap (MB) injected via `NODE_OPTIONS` for
+    /// Node/Electron children (and npx spawns). `None` means unset — the
+    /// built-in 8192 MB default applies. The `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB`
+    /// env var still overrides either. Native runtimes ignore it.
+    pub node_max_old_space_mb: Option<u32>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -95,6 +101,7 @@ impl<'a> SpawnOptions<'a> {
             tools_to_remove: Vec::new(),
             npx_fallback_binary: None,
             npx_fallback_package: None,
+            node_max_old_space_mb: None,
         }
     }
 }
@@ -207,6 +214,7 @@ fn build_command_with_captured_env(
         opts.env_mcp_config,
         opts.unsloth_endpoint,
         via_npx,
+        opts.node_max_old_space_mb,
     );
     for (key, value) in &provider_env {
         cmd.env(key, value);
@@ -417,16 +425,32 @@ mod build_args_tests {
     }
 
     #[test]
+    fn build_args_propagates_tools_to_remove_for_droid() {
+        // droid takes a single comma-joined denylist flag.
+        let droid = intent_providers::find_provider("droid").unwrap();
+        let mut opts = SpawnOptions::new(droid);
+        opts.tools_to_remove = vec!["Edit", "Create", "ApplyPatch", "Task"];
+        let args = build_args(&opts);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--disabled-tools", "Edit,Create,ApplyPatch,Task"]),
+            "droid spawn args missing comma-joined denylist: {args:?}"
+        );
+    }
+
+    #[test]
     fn build_args_omits_remove_tool_flags_for_non_supporting_providers() {
-        // claude-code / codex etc. don't advertise --remove-tool support; the
-        // spawn layer must not leak an unknown flag to them.
+        // claude-code / codex etc. don't advertise a spawn-time tool-removal
+        // flag; the spawn layer must not leak an unknown flag to them. grok
+        // is in this set: its `--disallowed-tools` flag is headless-only and
+        // clap-rejected on `agent stdio`, so the registry leaves it unset.
         for id in [
             "claude-code",
             "codex",
             "cortex",
-            "opencode",
-            "droid",
             "grok",
+            "opencode",
+            "pi",
             "mock",
         ] {
             let provider = intent_providers::find_provider(id).unwrap();
@@ -434,8 +458,10 @@ mod build_args_tests {
             opts.tools_to_remove = vec!["str-replace-editor"];
             let args = build_args(&opts);
             assert!(
-                !args.iter().any(|a| a == "--remove-tool"),
-                "{id} spawn args unexpectedly include --remove-tool: {args:?}"
+                !args.iter().any(|a| a == "--remove-tool"
+                    || a == "--disallowed-tools"
+                    || a == "--disabled-tools"),
+                "{id} spawn args unexpectedly include a tool-removal flag: {args:?}"
             );
         }
     }
@@ -682,18 +708,38 @@ mod build_command_tests {
             args,
             vec![
                 "-y".to_string(),
-                format!(
-                    "@agentclientprotocol/claude-agent-acp@{}",
-                    intent_providers::CLAUDE_AGENT_ACP_VERSION
-                ),
-            ]
+                "@agentclientprotocol/claude-agent-acp@0.73.0".to_string(),
+            ],
+            "bumping the adapter pin is a deliberate change — update this literal with it"
+        );
+        assert_eq!(intent_providers::CLAUDE_AGENT_ACP_VERSION, "0.73.0");
+    }
+
+    #[test]
+    fn claude_code_override_binary_spawns_directly_without_npx() {
+        // monorepo#4352: a validated `providers.paths["claude-code"]` override
+        // arrives as `provider_binary` with the npx fields unset — the argv is
+        // the override alone, no `npx -y <pinned>`.
+        let provider = intent_providers::find_provider("claude-code").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let adapter = PathBuf::from(
+            "/opt/lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js",
+        );
+        opts.provider_binary = Some(&adapter);
+        let cmd = build_command(&opts);
+        assert_eq!(cmd.as_std().get_program(), adapter.as_os_str());
+        assert!(!opts.via_npx());
+        let args = build_args(&opts);
+        assert!(
+            args.is_empty(),
+            "no npx args on the override path: {args:?}"
         );
     }
 
     #[test]
     fn build_command_prefers_provider_binary_over_npx_fallback() {
-        // Uses codex (a fallback-npx provider) — claude-code is npx-only and
-        // never resolves a provider binary.
+        // Uses codex (a fallback-npx provider) — claude-code only resolves a
+        // provider binary from an explicit override (monorepo#4352).
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let provider_binary = PathBuf::from("/custom/codex-acp");
@@ -818,6 +864,37 @@ mod build_command_tests {
                 "NODE_OPTIONS must carry the heap cap, got: {v}"
             );
         }
+    }
+
+    #[test]
+    fn build_command_threads_configured_heap_cap_into_node_options() {
+        // `agents.acpNodeMaxOldSpaceMb` rides SpawnOptions into the injected
+        // NODE_OPTIONS for a Node-runtime provider (intent-hq/intent#4330).
+        // Skipped when the ambient env pins the cap itself (env var / inherited
+        // NODE_OPTIONS), since both legitimately win over the setting.
+        if std::env::var_os("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB").is_some()
+            || std::env::var("NODE_OPTIONS").is_ok_and(|v| v.contains("--max-old-space-size"))
+        {
+            return;
+        }
+        let provider = intent_providers::find_provider("mock").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.node_max_old_space_mb = Some(4096);
+        let cmd = build_command(&opts);
+        let v = env_value(&cmd, "NODE_OPTIONS").expect("Node provider must set NODE_OPTIONS");
+        assert!(
+            v.contains("--max-old-space-size=4096"),
+            "NODE_OPTIONS must carry the configured cap, got: {v}"
+        );
+
+        // Unset setting keeps the built-in default.
+        let opts = SpawnOptions::new(provider);
+        let cmd = build_command(&opts);
+        let v = env_value(&cmd, "NODE_OPTIONS").expect("Node provider must set NODE_OPTIONS");
+        assert!(
+            v.contains("--max-old-space-size=8192"),
+            "unset setting must fall back to the 8192 default, got: {v}"
+        );
     }
 
     #[test]

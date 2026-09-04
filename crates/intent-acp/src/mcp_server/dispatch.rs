@@ -183,7 +183,8 @@ impl WorkspaceMcpServer {
         // `serde_json::Value` cannot represent on its own. `__k` is `"u"` for
         // an undefined return (prints "(no return value)") and `"v"` for a
         // JSON-serializable value (prints as pretty JSON, including `null`).
-        let bindings_prelude = super::bindings::prelude_for(&effective_features);
+        let bindings_prelude =
+            super::bindings::prelude_for_bridge(&effective_features, self.is_sub_agent);
         let full_code = format!(
             "{bindings_prelude}\n\
              const __wsapi_user = await (async () => {{ {code}\n}})();\n\
@@ -415,7 +416,8 @@ impl WorkspaceMcpServer {
     /// Write one oversized output to
     /// `<workspace-folder>/tool-outputs/<utc-timestamp>-<short-id>.<ext>`,
     /// resolving `<workspace-folder>` as the parent of the workspace's
-    /// checkout (`worktreePath`, else `path`) — today's layout is
+    /// checkout ([`Workspace::effective_path`]: `path`, else `worktreePath`,
+    /// else `repositoryPath` — monorepo#3778) — today's layout is
     /// `<workspaces-root>/<workspace-name>/<repo-name>`, so the file lands
     /// next to (not inside) the git tree and needs no git exclusion. Writes
     /// through direct tokio fs on purpose: the `ws.file.*` surface is
@@ -432,10 +434,7 @@ impl WorkspaceMcpServer {
             .await
             .map_err(|e| format!("get_workspace: {e}"))?;
         let checkout = ws
-            .worktree_path
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .or(ws.path.as_deref().filter(|p| !p.is_empty()))
+            .effective_path()
             .ok_or_else(|| "workspace has no on-disk checkout path".to_string())?;
         let folder = std::path::Path::new(checkout)
             .parent()
@@ -728,6 +727,17 @@ pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
      ws.agent.requestDiscussion when you need user/coordinator input, or report \
      progress with ws.agent.reportToParent";
 
+/// The dispatch-layer denial for a sub-agent's sibling-workspace proposal.
+pub(super) const SUB_AGENT_PROPOSE_SIBLING_DENIED: &str =
+    "ws.workspace.proposeSibling is only available to foreground top-level agents — report the opportunity to your parent with ws.agent.reportToParent";
+
+/// The dispatch-layer denial for a sub-agent's `agent.create` frame with
+/// `topLevel: true` — creating independent top-level agents is a
+/// top-level-agent capability.
+pub(super) const SUB_AGENT_CREATE_TOP_LEVEL_DENIED: &str =
+    "ws.agent.create with topLevel: true is only available to top-level agents — use \
+     ws.agent.create (without topLevel) or ws.agent.delegate to start sub-agents instead";
+
 /// Route one `host({method, args})` frame to a `WorkspaceApi` method via
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
 /// trait mapping. Sub-agent `app.question.*` frames and methods gated by a
@@ -752,10 +762,52 @@ async fn workspace_host_dispatch(
     if is_sub_agent && method.starts_with("app.question.") {
         return Err(format!("host: {SUB_AGENT_QUESTION_DENIED}"));
     }
+    if is_sub_agent && method == "workspace.proposeSibling" {
+        return Err(format!("host: {SUB_AGENT_PROPOSE_SIBLING_DENIED}"));
+    }
+    // Top-level-only rule for creating independent top-level agents (the
+    // arg-conditional `agent.create` + `topLevel: true` path): like the
+    // question gate, this redirect must win over the feature-gate denial so
+    // a sub-agent gets the actionable message rather than a settings
+    // complaint.
+    let create_top_level = method == "agent.create"
+        && arg
+            .get("args")
+            .and_then(|a| a.get("topLevel"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if is_sub_agent && create_top_level {
+        return Err(format!("host: {SUB_AGENT_CREATE_TOP_LEVEL_DENIED}"));
+    }
+    // Arg-conditional `peerAgents` gate for create-with-topLevel: plain
+    // `agent.create` is never feature-gated, so the method-level
+    // `denied_feature` table cannot express this split.
+    if create_top_level && !agent_features.peer_agents {
+        return Err(
+            "host: `agent.create` with topLevel: true is disabled in settings \
+             (agentFeatures.peerAgents = false)"
+                .to_string(),
+        );
+    }
     if let Some(feature) = super::tools::denied_feature(agent_features, method) {
         return Err(format!(
             "host: method `{method}` is disabled in settings ({feature} = false)"
         ));
+    }
+    // Retired-caller guard: retirement lands mid-turn (`ws.agent.retire` is
+    // terminal by contract, but the ACP stream only stops at the turn
+    // boundary), so without this check the retiring turn could keep issuing
+    // workspace_api calls after the mark landed. Fail closed on every
+    // subsequent frame from a retired caller — the same inertness the
+    // service layer enforces for inbound interaction.
+    if let Some(caller) = caller_agent_id.as_ref() {
+        if api.agent_is_retired(caller.clone()).await {
+            return Err(
+                "host: this agent session is retired — the session is inert and no further \
+                 workspace_api calls run (only the user can restore it via agent.restore)"
+                    .to_string(),
+            );
+        }
     }
     let args = arg.get("args").cloned().unwrap_or(Value::Null);
     if let Some(v) = super::bindings::try_dispatch(

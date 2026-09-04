@@ -49,7 +49,13 @@ on:
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
-    runs-on: "tinybox"
+    # LOCAL CUSTOMIZATION: fork PRs get no CI — external PRs are not accepted
+    # (intent-hq/monorepo#417; close-fork-prs.yml auto-closes them). Skipping
+    # plan cascades over the needs chain to every other job, so a fork PR
+    # never runs any of this workflow's jobs. Tag pushes and same-repo PRs
+    # are unaffected. Re-apply this after any `dist generate`.
+    if: ${{ !github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: "ubuntu-latest"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -104,7 +110,11 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+    # LOCAL CUSTOMIZATION: the leading `needs.plan.result == 'success'` guard
+    # short-circuits the fromJson calls when plan was skipped (fork PR — see
+    # plan's comment), which would otherwise choke on plan's empty outputs.
+    # Re-apply this after any `dist generate`.
+    if: ${{ needs.plan.result == 'success' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
@@ -175,7 +185,7 @@ jobs:
           EOF
           sudo chmod 0755 /usr/local/bin/apt-get
         shell: "bash"
-      - name: "Provision Rust toolchain and matrix targets (self-hosted runners)"
+      - name: "Provision Rust toolchain and matrix targets"
         run: |
           if ! command -v rustup >/dev/null 2>&1; then
             if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
@@ -202,6 +212,65 @@ jobs:
           # not on the runner service's PATH.
           mkdir -p "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        shell: "bash"
+      - name: "Stage tailcat sidecar binary"
+        run: |
+          set -euo pipefail
+          TAILCAT_VERSION=0.4.0
+          TAILCAT_SHA256_LINUX_AMD64=8b819c43dfdf806b5663e23535aba557bb106075b0b5839df289af9bba70bec2
+          TAILCAT_SHA256_LINUX_ARM64=3b77322350f64d229d5b2119b159b863b4bcffa0a62a0294682423a19956dc76
+          TAILCAT_SHA256_WINDOWS_AMD64=c238a4e8d3b460423a67e5ad400888b73ffa0b28e15173fd32c9acb699a3a89e
+          base="https://github.com/tailscale/tailcat/releases/download/v${TAILCAT_VERSION}"
+          dest=packaging/libexec
+          tmp=$(mktemp -d)
+          fetch_prebuilt() { # $1=asset $2=sha256 $3=binary-name-in-archive
+            curl -fsSL --retry 3 -o "$tmp/$1" "$base/$1"
+            # Git Bash on the hosted windows-2022 runner ships coreutils'
+            # sha256sum but not the perl shasum; Linux runners have both.
+            if command -v sha256sum >/dev/null 2>&1; then
+              echo "$2  $tmp/$1" | sha256sum -c -
+            else
+              echo "$2  $tmp/$1" | shasum -a 256 -c -
+            fi
+            case "$1" in
+              *.zip)
+                # unzip is absent from Git Bash and the windows-2022 image;
+                # the image ships 7-Zip (7z on PATH) instead.
+                if command -v unzip >/dev/null 2>&1; then
+                  unzip -q "$tmp/$1" -d "$tmp/x"
+                else
+                  7z x -y -o"$tmp/x" "$tmp/$1" >/dev/null
+                fi ;;
+              *) mkdir -p "$tmp/x" && tar -xzf "$tmp/$1" -C "$tmp/x" ;;
+            esac
+            mv "$tmp/x/$3" "$dest/$3"
+          }
+          build_from_source() { # $1=GOARCH
+            if ! command -v go >/dev/null 2>&1; then brew install go; fi
+            git clone --depth 1 --branch "v${TAILCAT_VERSION}" \
+              https://github.com/tailscale/tailcat "$tmp/src"
+            tags=$(tr -d '[:space:]' < "$tmp/src/build-tags.txt")
+            (cd "$tmp/src" && CGO_ENABLED=0 GOARCH="$1" go build \
+              -tags="$tags" \
+              -ldflags="-s -w -X main.version=v${TAILCAT_VERSION}" \
+              -o tailcat ./cmd/tailcat)
+            mv "$tmp/src/tailcat" "$dest/tailcat"
+          }
+          case "${{ join(matrix.targets, ' ') }}" in
+            x86_64-unknown-linux-musl)
+              fetch_prebuilt "tailcat_${TAILCAT_VERSION}_linux_amd64.tar.gz" \
+                "$TAILCAT_SHA256_LINUX_AMD64" tailcat ;;
+            aarch64-unknown-linux-musl)
+              fetch_prebuilt "tailcat_${TAILCAT_VERSION}_linux_arm64.tar.gz" \
+                "$TAILCAT_SHA256_LINUX_ARM64" tailcat ;;
+            x86_64-pc-windows-msvc)
+              fetch_prebuilt "tailcat_${TAILCAT_VERSION}_windows_amd64.zip" \
+                "$TAILCAT_SHA256_WINDOWS_AMD64" tailcat.exe ;;
+            aarch64-apple-darwin)  build_from_source arm64 ;;
+            x86_64-apple-darwin)   build_from_source amd64 ;;
+            *) echo "no tailcat mapping for target '${{ join(matrix.targets, ' ') }}'" >&2; exit 1 ;;
+          esac
+          ls -l "$dest"
         shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
@@ -246,7 +315,7 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
-    runs-on: "tinybox"
+    runs-on: "ubuntu-latest"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
@@ -297,7 +366,7 @@ jobs:
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: "tinybox"
+    runs-on: "ubuntu-latest"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
@@ -371,7 +440,7 @@ jobs:
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "tinybox"
+    runs-on: "ubuntu-latest"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:

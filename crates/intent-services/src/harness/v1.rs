@@ -1,4 +1,4 @@
-//! Harness **v1**: today's post-#2457 text set, byte-pinned by
+//! Harness **v1**: the original post-#2457 text set, byte-pinned by
 //! `crate::v1_goldens` and `agent_manager::v1_turn_envelope_goldens`. Every
 //! string here was moved verbatim from `rules.rs` / `agent_manager.rs` /
 //! `lib.rs` / `agent_ops.rs` (H5 byte-neutral refactor); any edit MUST fail
@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
+use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::TaskStatus;
 
 use super::{ChildSettlementParams, Doctrine, Harness, HarnessEntry, TurnEnvelopeParams};
@@ -24,8 +24,8 @@ static DOCTRINE: Doctrine = Doctrine {
     specialists: crate::specialists::EMBEDDED_BUNDLED_V1,
 };
 
-/// The v1 registry row. `version` is intent-core's stamped `"1.0"` (asserted
-/// equal to `CURRENT_HARNESS_VERSION` by registry tests); the feature
+/// The v1 registry row. `version` is the stamped `"1.0"` every pre-1.1
+/// session carries (and the migration-0096 backfill value); the feature
 /// defaults are the `[agentFeatures]` defaults this doctrine was written
 /// against (all on), used to gate legacy NULL-snapshot sessions the way a
 /// live read would have when v1 was current.
@@ -38,7 +38,8 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
 };
 
 /// Human-readable labels for every `agentFeatures` toggle v1 knows about.
-const FEATURE_LABELS: &[(&str, &str)] = &[
+/// Shared with later harness versions, whose feature surface is unchanged.
+pub(crate) const FEATURE_LABELS: &[(&str, &str)] = &[
     ("backgroundHooks", "Background hooks (ws.hook.*)"),
     ("hostExec", "Host command execution (ws.host.exec)"),
     ("scripts", "Saved scripts (ws.script.*)"),
@@ -78,6 +79,15 @@ pub(crate) const STALE_REDRIVE_NOTE_PREFIX: &str =
 /// before you completed"), so the two checks never shadow each other.
 pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
 
+/// Stable prefix of [`Harness::a2a_sender_note`], asserted by the goldens
+/// as the contract the FE's header-strip regex keys on. NOT the annotation
+/// skip condition: the idempotency guard rebuilds the exact header from the
+/// entry's stamped attribution and compares byte-for-byte, so a
+/// caller-authored lookalike prefix cannot suppress the genuine header
+/// (spoof resistance).
+#[cfg(test)]
+pub(crate) const A2A_SENDER_NOTE_PREFIX: &str = "[MESSAGE FROM AGENT";
+
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wakes.
 pub(crate) const HOOK_WAKE_LOGS_CAP: usize = 2048;
@@ -97,6 +107,7 @@ fn settlement_kind(event_type: &str) -> &str {
         AGENT_IDLE => "completed",
         AGENT_FAILED => "failed",
         AGENT_DELETED => "was deleted",
+        AGENT_RETIRED => "retired",
         other => other,
     }
 }
@@ -109,6 +120,18 @@ fn stall_suffix_text(task_title: &str, task_status: &str) -> String {
          agent may have stalled rather than finished (monorepo#1016). Consider \
          ws.agent.wakeOrCreate to resume it."
     )
+}
+
+/// The relationship label for a watch-delivered wake
+/// (intent-hq/monorepo#3906): "Child agent" only when the settling agent is
+/// a genuine child of the recipient; any other watched agent (a top-level
+/// peer, a non-child send target) is a "Watched agent".
+fn relationship_label(child_of_recipient: bool) -> &'static str {
+    if child_of_recipient {
+        "Child agent"
+    } else {
+        "Watched agent"
+    }
 }
 
 /// The kind-flavored attention verb (`requests a discussion` / `reports a
@@ -202,6 +225,8 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
 /// landed yet).
 pub(crate) const GENERIC_NAMING_TOOL_REFERENCE: &str =
     "the `set_workspace_title` tool from the workspace MCP server";
+pub(crate) const GENERIC_AGENT_NAMING_TOOL_REFERENCE: &str =
+    "the `workspace_api` tool from the workspace MCP server";
 
 impl Harness for V1 {
     fn join_prompt_layers(&self, parts: &[String]) -> String {
@@ -390,10 +415,34 @@ impl Harness for V1 {
         }
     }
 
-    fn naming_nudge(&self, tool_reference: &str) -> String {
-        format!(
-            "<system>\nThis workspace needs a title. As your first action, call {tool_reference} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
-        )
+    fn agent_naming_tool_reference(&self, provider_id: &str) -> &'static str {
+        match provider_id {
+            "auggie" => "the `workspace_api_workspace-mcp` tool",
+            "opencode" => "the `workspace-mcp_workspace_api` tool",
+            _ => GENERIC_AGENT_NAMING_TOOL_REFERENCE,
+        }
+    }
+
+    fn naming_nudge(
+        &self,
+        agent_tool_reference: Option<&str>,
+        workspace_tool_reference: Option<&str>,
+    ) -> String {
+        let mut instructions = Vec::new();
+        if let Some(tool_reference) = agent_tool_reference {
+            instructions.push(format!(
+                "This agent still has a generated name. Early in your first turn, call \
+                 `ws.workspace.setAgentName` through {tool_reference} with a short 1–5 word \
+                 task-specific name. Do this independently of workspace title naming and in \
+                 parallel with information-gathering."
+            ));
+        }
+        if let Some(tool_reference) = workspace_tool_reference {
+            instructions.push(format!(
+                "This workspace needs a title. As your first action, call {tool_reference} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering."
+            ));
+        }
+        format!("<system>\n{}\n</system>", instructions.join("\n"))
     }
 
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String {
@@ -437,6 +486,28 @@ impl Harness for V1 {
         format!(
             "[SYSTEM NOTE] This message was queued at {queued_at} and waited {waited} before delivery."
         )
+    }
+
+    fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String {
+        // The header MUST stay single-line (the FE strips it with a
+        // single-line regex, and the exact-match idempotency guard keys on
+        // it): collapse newlines/control chars in the display name to
+        // single spaces so a hostile agent name cannot inject header-like
+        // lines, and drop a name that sanitizes to empty.
+        let name = name
+            .map(|n| {
+                n.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|n| !n.is_empty());
+        match name {
+            Some(name) => format!("[MESSAGE FROM AGENT {name} ({agent_id})]"),
+            None => format!("[MESSAGE FROM AGENT ({agent_id})]"),
+        }
     }
 
     fn wait_duration(&self, secs: i64) -> String {
@@ -507,10 +578,23 @@ impl Harness for V1 {
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String {
         let kind = settlement_kind(params.event_type);
         let label = child_label(params);
-        let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
+        let relationship = relationship_label(params.child_of_recipient);
+        let mut msg = format!("[WORKSPACE EVENTS] {relationship} {label} {kind}.");
         let mut report_rendered = false;
         if let Some(report) = params.completion_report {
-            let _ = write!(msg, " Report: {report}");
+            // monorepo#4026: when the caller proved this exact report was
+            // already delivered by a report-time wake, reference it instead
+            // of repeating it verbatim. Counts as a rendered report for the
+            // stall-suffix guard below — the report exists, it is just not
+            // repeated.
+            if params.report_already_delivered {
+                msg.push_str(
+                    " Its completion report was already delivered in a previous message \
+                     (unchanged since).",
+                );
+            } else {
+                let _ = write!(msg, " Report: {report}");
+            }
             report_rendered = true;
         } else if let Some(summary) = params.last_response_summary {
             let _ = write!(msg, " Summary: {summary}");
@@ -531,11 +615,18 @@ impl Harness for V1 {
             // A deleted agent fails closed in `agent.watch` (rejected as
             // unknown) and has no next completion, so the deleted-kind wake
             // must not carry the re-arm pointer — say the agent cannot be
-            // re-watched instead.
+            // re-watched instead. A retired agent is inert the same way
+            // (`agent.watch` rejects it), so its wake drops the re-arm
+            // pointer too.
             if params.event_type == AGENT_DELETED {
                 msg.push_str(
                     " NOTE: this wake consumed your one-shot watch on this agent — the watch is \
                      now retired. The agent was deleted, so it cannot be re-watched.",
+                );
+            } else if params.event_type == AGENT_RETIRED {
+                msg.push_str(
+                    " NOTE: this wake consumed your one-shot watch on this agent — the watch is \
+                     now retired. The agent retired and cannot be re-watched or woken again.",
                 );
             } else {
                 let _ = write!(msg, " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
@@ -754,16 +845,20 @@ impl Harness for V1 {
         )
     }
 
-    fn hook_dispatch_retired_note(&self) -> String {
-        "[This hook is now retired and will not run again — reschedule via \
-         ws.hook.schedule if still needed.]"
-            .to_string()
+    fn hook_dispatch_retired_note(&self, hook_id: &str) -> String {
+        format!(
+            "[This hook is now retired and will not run again — recover its \
+             script via ws.hook.get(\"{hook_id}\") and reschedule via \
+             ws.hook.schedule if still needed.]"
+        )
     }
 
-    fn hook_evicted_state_note(&self) -> String {
-        "[This hook will not run again. Schedule a new hook via \
-         ws.hook.schedule if the condition is still worth watching.]"
-            .to_string()
+    fn hook_evicted_state_note(&self, hook_id: &str) -> String {
+        format!(
+            "[This hook will not run again. Recover its script via \
+             ws.hook.get(\"{hook_id}\") and schedule a new hook via \
+             ws.hook.schedule if the condition is still worth watching.]"
+        )
     }
 
     fn hook_evicted_failed_run_notice(&self, hook_name: &str, error: &str) -> String {
@@ -777,6 +872,7 @@ impl Harness for V1 {
     fn hook_expired_notice(
         &self,
         hook_name: &str,
+        hook_id: &str,
         perpetual: bool,
         run_count: i64,
         dispatch_count: i64,
@@ -798,7 +894,16 @@ impl Harness for V1 {
         };
         format!(
             "Your background hook \"{hook_name}\" expired after reaching its TTL ({tally}). \
-             Schedule a new hook via ws.hook.schedule if the condition is still worth watching."
+             Schedule a new hook via ws.hook.schedule if the condition is still worth \
+             watching — the original script is retrievable via ws.hook.get(\"{hook_id}\")."
+        )
+    }
+
+    fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String {
+        format!(
+            "Your one-shot timer hook \"{hook_name}\" (scheduled for {run_at}) fired and is \
+             now retired. Schedule a new hook via ws.hook.schedule if you need another timer \
+             — the original script is retrievable via ws.hook.get(\"{hook_id}\")."
         )
     }
 
@@ -870,6 +975,9 @@ impl Harness for V1 {
         }
         if r.is_behind {
             lines.push("branch is behind its base".to_string());
+        }
+        if r.is_in_merge_queue == Some(true) {
+            lines.push("in merge queue".to_string());
         }
         if let Some(reason) = &r.merge_blocked_reason {
             lines.push(format!("blocked: {reason}"));
@@ -984,36 +1092,76 @@ impl Harness for V1 {
             });
         }
 
-        // Mergeability + residual signals.
-        if o.has_conflicts != n.has_conflicts {
+        // Mergeability + residual signals. `unknown` is a transient GitHub
+        // state ("still recomputing", e.g. while a merge-queue group is
+        // processed), never an actionable signal — and the recomputation
+        // also resets the derived conflict/behind/blocked signals, so while
+        // the NEW snapshot's mergeability is unknown their clearing
+        // direction is suppressed alongside the raw `mergeable`/`merge
+        // state` transitions (the appearing direction always reports). A
+        // blip either reverts (net silent against the emit baseline) or
+        // settles at a known value, which then reports as a single
+        // old → new line.
+        let merge_state_known = n
+            .merge_state_status
+            .as_deref()
+            .is_some_and(|s| s != "UNKNOWN");
+        let recomputing = n.mergeable.is_none() || !merge_state_known;
+        if o.has_conflicts != n.has_conflicts && (n.has_conflicts || !recomputing) {
             changes.push(if n.has_conflicts {
                 "merge conflicts appeared".to_string()
             } else {
                 "merge conflicts resolved".to_string()
             });
         }
-        if o.is_behind != n.is_behind {
+        if o.is_behind != n.is_behind && (n.is_behind || !recomputing) {
             changes.push(if n.is_behind {
                 "branch is now behind its base".to_string()
             } else {
                 "branch is no longer behind its base".to_string()
             });
         }
-        if o.mergeable != n.mergeable {
+        if o.is_in_merge_queue != n.is_in_merge_queue {
+            changes.push(if n.is_in_merge_queue == Some(true) {
+                "entered the merge queue".to_string()
+            } else {
+                "left the merge queue".to_string()
+            });
+        }
+        // Keyed on the event identity (`at`), not the queued flag: an
+        // enter→eject pair that nets out on `isInMergeQueue` still yields
+        // this reportable line.
+        let ejection_at = |r: &crate::pr_ops::MergeRequirements| {
+            r.merge_queue_ejection.as_ref().map(|e| e.at.clone())
+        };
+        if ejection_at(o) != ejection_at(n) {
+            if let Some(e) = &n.merge_queue_ejection {
+                changes.push(match &e.reason {
+                    Some(reason) => format!(
+                        "removed from the merge queue ({})",
+                        reason.replace('_', " ")
+                    ),
+                    None => "removed from the merge queue".to_string(),
+                });
+            }
+        }
+        if o.mergeable != n.mergeable && n.mergeable.is_some() {
             changes.push(format!(
                 "mergeable: {} → {}",
                 describe_opt(o.mergeable),
                 describe_opt(n.mergeable)
             ));
         }
-        if o.merge_state_status != n.merge_state_status {
+        if o.merge_state_status != n.merge_state_status && merge_state_known {
             changes.push(format!(
                 "merge state: {} → {}",
                 o.merge_state_status.as_deref().unwrap_or("unknown"),
                 n.merge_state_status.as_deref().unwrap_or("unknown")
             ));
         }
-        if o.merge_blocked_reason != n.merge_blocked_reason {
+        if o.merge_blocked_reason != n.merge_blocked_reason
+            && (n.merge_blocked_reason.is_some() || !recomputing)
+        {
             changes.push(match &n.merge_blocked_reason {
                 Some(reason) => format!("merge blocked: {reason}"),
                 None => "merge is no longer blocked".to_string(),
@@ -1119,6 +1267,23 @@ impl Harness for V1 {
             "User dismissed your {noun} without answering. This is an informative \
              notice only — do not re-ask and do not proceed with any work; end \
              your turn and wait for the user's next message."
+        )
+    }
+
+    fn proposal_applied_notice(&self, title: &str, detail: Option<&str>) -> String {
+        let mut notice = format!("User applied the proposal '{title}'.");
+        if let Some(detail) = detail {
+            notice.push(' ');
+            notice.push_str(detail);
+        }
+        notice
+    }
+
+    fn proposal_dismissed_notice(&self, title: &str) -> String {
+        format!(
+            "User dismissed the proposal '{title}' without applying it. This is \
+             an informative notice only — do not re-propose it; continue with \
+             your other work or end your turn."
         )
     }
 }

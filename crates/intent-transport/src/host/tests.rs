@@ -35,6 +35,57 @@ impl intent_core::WorkspaceApi for AuggiePathApi {
     }
 }
 
+/// `WorkspaceApi` that returns a fixed JSON value for every `settings_get`,
+/// so the numeric-setting reader can be exercised against the exact wire shape
+/// (`Number` settings arrive as floats, e.g. `4096.0`).
+struct FixedSettingApi(Value);
+
+impl intent_core::WorkspaceApi for FixedSettingApi {
+    fn settings_get(&self, path: String) -> BoxFuture<'_, intent_core::Result<Value>> {
+        let v = json!({ "path": path, "value": self.0 });
+        Box::pin(async move { Ok(v) })
+    }
+}
+
+#[tokio::test]
+async fn read_setting_u32_accepts_float_encoded_whole_numbers() {
+    // Regression: `settings.get` reports `agents.acpNodeMaxOldSpaceMb` as
+    // `4096.0`; an `as_u64` read was always `None`, so the probe silently
+    // fell back to the default cap.
+    let api = FixedSettingApi(json!(4096.0));
+    assert_eq!(
+        read_setting_u32(&api, "agents.acpNodeMaxOldSpaceMb").await,
+        Some(4096)
+    );
+    let api = FixedSettingApi(json!(16384));
+    assert_eq!(
+        read_setting_u32(&api, "agents.acpNodeMaxOldSpaceMb").await,
+        Some(16384)
+    );
+}
+
+#[tokio::test]
+async fn read_setting_u32_rejects_null_fractional_negative_and_out_of_range() {
+    for v in [
+        Value::Null,
+        json!(4096.5),
+        json!(-1.0),
+        json!(f64::from(u32::MAX) + 1.0),
+        json!("4096"),
+    ] {
+        let api = FixedSettingApi(v.clone());
+        assert_eq!(
+            read_setting_u32(&api, "agents.acpNodeMaxOldSpaceMb").await,
+            None,
+            "value {v} must not parse"
+        );
+    }
+    assert_eq!(
+        read_setting_u32(&NoopApi, "agents.acpNodeMaxOldSpaceMb").await,
+        None
+    );
+}
+
 /// An [`ExternalOpener`] that records opened URLs and can be told to fail.
 struct RecordingOpener {
     ok: bool,
@@ -207,6 +258,10 @@ fn classify_matches_host_status_and_host_services() {
         classify(&json!({ "jsonrpc": "2.0", "id": 9, "method": "host.providerAuthStatus" }))
             .is_some()
     );
+    assert!(
+        classify(&json!({ "jsonrpc": "2.0", "id": 10, "method": "host.providerTestPrompt" }))
+            .is_some()
+    );
     // `host.openExternal` (FE-served reverse RPC) / wrong version / bad id fall through.
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "host.openExternal" })).is_none()
@@ -217,21 +272,42 @@ fn classify_matches_host_status_and_host_services() {
 
 #[test]
 fn status_json_local_includes_all_fields() {
-    let v = host_status_json("linux", "x86_64", "build-01", true, Some("wayland"), true);
+    let v = host_status_json(
+        "linux",
+        "x86_64",
+        "build-01",
+        "Build Server 01",
+        true,
+        Some("wayland"),
+        Some("server"),
+        Some("PowerEdge R760"),
+        true,
+    );
     assert_eq!(v["os"], "linux");
     assert_eq!(v["arch"], "x86_64");
     assert_eq!(v["hostname"], "build-01");
+    assert_eq!(v["prettyHostname"], "Build Server 01");
     assert_eq!(v["hasDisplay"], true);
     assert_eq!(v["locality"], "local");
     assert_eq!(v["displayServer"], "wayland");
+    assert_eq!(v["deviceKind"], "server");
+    assert_eq!(v["hardwareModel"], "PowerEdge R760");
 }
 
 #[test]
 fn status_json_remote_omits_absent_display_server() {
-    let v = host_status_json("linux", "x86_64", "build-01", false, None, false);
+    let v = host_status_json(
+        "linux", "x86_64", "build-01", "build-01", false, None, None, None, false,
+    );
     assert_eq!(v["locality"], "remote");
     assert_eq!(v["hasDisplay"], false);
+    assert_eq!(
+        v["prettyHostname"], "build-01",
+        "falls back to hostname when no pretty name exists"
+    );
     assert_eq!(v.get("displayServer"), None, "omitted when not detected");
+    assert_eq!(v.get("deviceKind"), None, "omitted when unknown");
+    assert_eq!(v.get("hardwareModel"), None, "omitted when unknown");
 }
 
 #[tokio::test]
@@ -246,6 +322,13 @@ async fn handle_status_returns_a_response_frame() {
     assert!(parsed["result"]["os"].is_string());
     assert!(parsed["result"]["arch"].is_string());
     assert!(parsed["result"]["hostname"].is_string());
+    assert!(
+        !parsed["result"]["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty"
+    );
     assert!(parsed["result"]["hasDisplay"].is_boolean());
 }
 
@@ -561,6 +644,85 @@ async fn handle_provider_auth_status_scoped_to_grok_returns_one_entry() {
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0]["id"], "grok");
     assert!(providers[0]["authenticated"].is_boolean() || providers[0]["authenticated"].is_null());
+}
+
+#[tokio::test]
+async fn handle_provider_test_prompt_requires_provider_id() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 28,
+        "method": "host.providerTestPrompt",
+        "params": {}
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("missing providerId produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 28);
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(
+        parsed["error"]["message"],
+        "Missing required parameter: providerId"
+    );
+}
+
+#[tokio::test]
+async fn handle_provider_test_prompt_unknown_provider_is_invalid_params() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 29,
+        "method": "host.providerTestPrompt",
+        "params": { "providerId": "not-a-provider" }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("unknown provider produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 29);
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
+}
+
+#[tokio::test]
+async fn handle_provider_test_prompt_rejects_non_string_model() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "host.providerTestPrompt",
+        "params": { "providerId": "codex", "model": 42 }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("non-string model produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 31);
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
+}
+
+#[tokio::test]
+async fn handle_provider_test_prompt_unsupported_provider_is_structured_result() {
+    // unsloth opts out (`supports_test_prompt: false`): the reply is a
+    // success frame carrying `{ ok: false, reason: "unsupported" }` — never a
+    // wire error, and nothing is resolved or spawned.
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "host.providerTestPrompt",
+        "params": { "providerId": "unsloth" }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("unsupported provider still replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 32);
+    assert_eq!(parsed["result"]["ok"], false);
+    assert_eq!(parsed["result"]["reason"], "unsupported");
+    assert!(parsed["result"]["message"].is_string());
 }
 
 #[tokio::test]

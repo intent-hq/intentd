@@ -50,6 +50,7 @@ fn seed_workspace(id: &WorkspaceId) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -600,7 +601,7 @@ async fn uds_slice_end_to_end() {
     // (p) agent.create → { agent: { id, name } } on the seeded workspace.
     let resp = send(
         &config.socket_path,
-        r#"{"jsonrpc":"2.0","id":23,"method":"agent.create","params":{"workspaceId":"ws-seed","name":"E2E Agent","model":"auggie:sonnet4.5"}}"#,
+        r#"{"jsonrpc":"2.0","id":23,"method":"agent.create","params":{"workspaceId":"ws-seed","name":"E2E Agent","model":"sonnet4.5","provider":"auggie"}}"#,
     )
     .await;
     let agent_id = resp["result"]["agent"]["id"]

@@ -70,7 +70,7 @@ async fn boot() -> Fixture {
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
     let ws = WsApiServer::new_insecure_with_reverse(api.clone(), bus, opts, registry.clone(), None);
@@ -317,5 +317,54 @@ async fn agent_browser_exec_without_any_client_reports_no_client_error() {
         .expect_err("no client");
     let s = err.to_string();
     assert!(s.contains("no client connected"), "unexpected error: {s}");
+    fx.ws.stop().await;
+}
+
+#[tokio::test]
+async fn agent_screenshot_timeout_returns_before_outer_deadline() {
+    let fx = boot().await;
+    let mut client = connect(fx.port).await;
+    let _ = wss_rpc(
+        &mut client,
+        1,
+        "client.hello",
+        json!({ "name": "timeout-client" }),
+    )
+    .await;
+    let started = Instant::now();
+    let call = tokio::spawn({
+        let api = fx.api.clone();
+        async move {
+            api.browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({ "action": "screenshot" })],
+                None,
+                None,
+            )
+            .await
+        }
+    });
+
+    let reverse = try_read_text(&mut client, Duration::from_secs(2))
+        .await
+        .expect("primary should receive screenshot reverse request");
+    assert_eq!(reverse["method"], "browser.exec");
+    assert_eq!(reverse["params"]["actions"][0]["action"], "screenshot");
+    // Leave the reverse request unanswered and prove the same sticky-primary
+    // path used by ws.browser.exec reports the error inside the outer budget.
+    let err = timeout(Duration::from_secs(25), call)
+        .await
+        .expect("inner screenshot timeout must settle first")
+        .expect("join")
+        .expect_err("unanswered screenshot must fail");
+    let elapsed = started.elapsed();
+    assert!(
+        err.to_string()
+            .contains("reverse request timed out: browser.exec"),
+        "unexpected error: {err}"
+    );
+    assert!(elapsed >= Duration::from_secs(19), "elapsed={elapsed:?}");
+    assert!(elapsed < Duration::from_secs(30), "elapsed={elapsed:?}");
+
     fx.ws.stop().await;
 }

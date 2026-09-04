@@ -287,7 +287,7 @@ fn proposal_resource_uri(proposal: &Value) -> String {
 
 /// Return a proposal with dual text+resource content items.
 #[allow(clippy::unnecessary_wraps)] // dispatch arm helper; keeps the uniform Result shape
-fn proposal_result(proposal: &Value) -> Result<Value, String> {
+pub(crate) fn proposal_result(proposal: &Value) -> Result<Value, String> {
     // Build resource name from preview.title
     let name = proposal
         .get("preview")
@@ -1169,6 +1169,7 @@ mod tests {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,

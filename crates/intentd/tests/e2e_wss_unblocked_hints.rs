@@ -313,6 +313,7 @@ async fn seed_workspace_and_task_notes(data_dir: &Path) -> String {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -398,7 +399,7 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
     .expect("seed config.toml with agentFeatures.taskGraph");
 
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_TASK_NOTE_ID),
         json!(CHILD_MARK),
     );
@@ -474,7 +475,7 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]
@@ -593,7 +594,7 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     .expect("seed config.toml with agentFeatures.taskGraph");
 
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(CHILD_TASK_NOTE_ID),
         json!(VF_IMPLEMENTOR_MARK),
     );
@@ -607,7 +608,7 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     );
     // The verifier is a plain child with NO linked task note.
     let spawn_js = format!(
-        "return await ws.agent.create('Verifier', {}, {{ model: 'mock:default' }});",
+        "return await ws.agent.create('Verifier', {}, {{ model: 'default', provider: 'mock' }});",
         json!(VF_VERIFIER_MARK),
     );
     // The verifier flips the IMPLEMENTOR's task complete — an OTHER-task
@@ -696,11 +697,27 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     );
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    // The flow audits the implementor's IMMEDIATE report wake — disable the
+    // report debounce (default 30s), which would otherwise park that wake and
+    // fold it into the terminal wake.
+    let upd = wss_rpc(
+        &mut rpc,
+        9,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "agents.reportToParentDebounceSeconds", "value": 0 }
+        ] }),
+    )
+    .await;
+    assert_eq!(
+        upd["applied"][0]["path"], "agents.reportToParentDebounceSeconds",
+        "debounce disabled: {upd}"
+    );
     let parent = wss_rpc(
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]

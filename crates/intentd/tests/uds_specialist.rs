@@ -220,15 +220,19 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     let mut r = BufReader::new(read);
     let wp = h.work_dir.to_string_lossy().to_string();
 
-    // list — bundled tier visible (no workspaceId required). The eight embedded
-    // reference specialists (PP-2) are always present; the two dir-seeded files
-    // override the embedded copies for the same ids.
+    // list — bundled tier visible (no workspaceId required). Eight of the nine
+    // embedded reference specialists are catalog-visible; retired Ralph remains
+    // directly resolvable. The two dir-seeded files override embedded copies.
     let list = ok(&mut w, &mut r, 1, "specialist.list", json!({})).await;
     let specs = list["specialists"].as_array().expect("specialists array");
     assert_eq!(
         specs.len(),
         8,
-        "eight embedded ids, two overridden from dir"
+        "eight catalog-visible embedded ids, two overridden from dir"
+    );
+    assert!(
+        specs.iter().all(|s| s["id"] != "ralph"),
+        "retired Ralph is absent from specialist.list"
     );
     let imp = specs.iter().find(|s| s["id"] == "implementor").unwrap();
     assert_eq!(imp["source"], "bundled");
@@ -244,6 +248,12 @@ async fn specialist_full_crud_and_three_tier_resolution() {
         imp.get("hidden").is_none(),
         "non-hidden specialists omit the field"
     );
+    let scanner = specs
+        .iter()
+        .find(|s| s["id"] == "vulnerability-scanner")
+        .expect("vulnerability scanner listed");
+    assert!(scanner.get("codingAgent").is_none());
+    assert!(scanner.get("model").is_none());
 
     // get — resolved view of a bundled id.
     let got = ok(
@@ -256,6 +266,23 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     .await;
     assert_eq!(got["specialist"]["source"], "bundled");
     assert_eq!(got["specialist"]["prompt"], "You verify.");
+
+    // get — the retired v1 Ralph definition remains resolvable for respawns.
+    let ralph = ok(
+        &mut w,
+        &mut r,
+        20,
+        "specialist.get",
+        json!({ "id": "ralph" }),
+    )
+    .await;
+    assert_eq!(ralph["specialist"]["source"], "bundled");
+    assert_eq!(ralph["specialist"]["hidden"], true);
+    assert_eq!(ralph["specialist"]["agentType"], "ralph-loop");
+    assert!(ralph["specialist"]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("Iterative Work/Test Loop"));
 
     // create — user scope (default) authors a new specialist file. A retired
     // `modelTier` in the spec is tolerated-and-ignored (never echoed).
@@ -396,11 +423,10 @@ async fn specialist_full_frontmatter_wire_parity() {
     // list — same fields visible in the list projection.
     let list = ok(&mut w, &mut r, 2, "specialist.list", json!({})).await;
     let specs = list["specialists"].as_array().unwrap();
-    let ralph = specs.iter().find(|s| s["id"] == "ralph").unwrap();
-    assert_eq!(ralph["agentType"], "ralph-loop");
-    assert_eq!(ralph["roleReminder"], "Never stop early");
-    assert_eq!(ralph["isCustomized"], false);
-    assert_eq!(ralph["hidden"], true, "hidden surfaces in list");
+    assert!(
+        specs.iter().all(|s| s["id"] != "ralph"),
+        "Ralph is omitted from catalogs even when overridden on disk"
+    );
 
     // create→get round-trip: a user specialist persists every live field
     // losslessly (the retired `modelTier` is dropped), and the body may be
@@ -646,7 +672,7 @@ fn find_spec<'a>(list: &'a Value, id: &str) -> &'a Value {
 async fn specialist_resolution_preview() {
     // monorepo#3044: the preview's "default provider" context derives from
     // settings only (no positional fallback), so pin auggie explicitly.
-    let h = start_with_settings("[providers]\nactive = \"auggie\"\n").await;
+    let h = start_with_settings("[model]\ndefaultProvider = \"auggie\"\n").await;
     // Pinned frontmatter model — bare ids are provider-agnostic while no
     // cached catalog disproves ownership (cold caches in this harness).
     write_specialist_frontmatter(&h.user_dir, "pinner", "model: \"opus4.5\"");
@@ -758,19 +784,14 @@ async fn specialist_resolution_preview() {
 }
 
 /// monorepo#3044 follow-up: with NO settings-derived default provider and no
-/// `provider` param, a specialist whose own frontmatter pins a provider (a
-/// compound `model` prefix, or `codingAgent` + bare `model`) must still
-/// preview the concrete provider/model `agent.delegate` would pin — not
+/// `provider` param, a specialist whose own frontmatter pins a provider
+/// (`codingAgent`, optionally with a bare `model`) must still preview the
+/// concrete provider/model `agent.delegate` would pin — not
 /// "Provider default". A specialist with no pin of its own stays
 /// undecorated.
 #[tokio::test]
 async fn specialist_preview_uses_own_pin_without_global_default() {
     let h = start().await;
-    write_specialist_frontmatter(
-        &h.user_dir,
-        "compound-pin",
-        "model: \"codex:gpt-5.3-codex\"",
-    );
     write_specialist_frontmatter(
         &h.user_dir,
         "agent-pin",
@@ -782,10 +803,6 @@ async fn specialist_preview_uses_own_pin_without_global_default() {
     let mut r = BufReader::new(read);
 
     let list = ok(&mut w, &mut r, 1, "specialist.list", json!({})).await;
-    // Compound model prefix names the provider the delegate would spawn on.
-    let compound = find_spec(&list, "compound-pin");
-    assert_eq!(compound["resolvedModel"], "codex:gpt-5.3-codex");
-    assert_eq!(compound["resolvedProvider"], "codex");
     // Frontmatter codingAgent pins the provider; the bare model rides it
     // (cold caches — absence of ownership evidence passes).
     let agent_pin = find_spec(&list, "agent-pin");
@@ -802,11 +819,11 @@ async fn specialist_preview_uses_own_pin_without_global_default() {
         &mut r,
         2,
         "specialist.get",
-        json!({ "id": "compound-pin" }),
+        json!({ "id": "agent-pin" }),
     )
     .await;
-    assert_eq!(got["specialist"]["resolvedModel"], "codex:gpt-5.3-codex");
-    assert_eq!(got["specialist"]["resolvedProvider"], "codex");
+    assert_eq!(got["specialist"]["resolvedModel"], "grok-4");
+    assert_eq!(got["specialist"]["resolvedProvider"], "grok");
 
     // An explicit provider param still wins over the specialist's own pin.
     let got = ok(
@@ -825,7 +842,7 @@ async fn specialist_preview_uses_own_pin_without_global_default() {
 #[tokio::test]
 async fn specialist_resolution_preview_inherits_settings() {
     let h = start_with_settings(
-        "[providers]\nactive = \"auggie\"\n\n[model]\ndefault = \"sonnet4.5\"\n\n[model.providerDefaults]\ncodex = \"gpt-5.3-codex/high\"\n",
+        "[model]\ndefaultProvider = \"auggie\"\ndefault = \"sonnet4.5\"\n\n[model.providerDefaults]\ncodex = \"gpt-5.3-codex/high\"\n",
     )
     .await;
     // No frontmatter model config → settings chain decides.

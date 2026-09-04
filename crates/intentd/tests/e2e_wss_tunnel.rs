@@ -26,7 +26,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio_tungstenite::tungstenite::Message;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client in tests.
@@ -140,6 +140,15 @@ async fn start() -> Server {
 /// Build + start a WSS listener with custom `/tunnel` limits (tests shrink
 /// the timeouts to make idle/connect/forward teardown observable).
 async fn start_with(limits: TunnelLimits) -> Server {
+    start_with_heartbeat(limits, None).await
+}
+
+/// [`start_with`] plus an optional `(heartbeat_interval, heartbeat_timeout)`
+/// override for heartbeat-focused tests.
+async fn start_with_heartbeat(
+    limits: TunnelLimits,
+    heartbeat: Option<(Duration, Duration)>,
+) -> Server {
     let dir = common::test_tempdir("intentd-wss-tunnel-");
     let store = Store::open(&dir.path().join("intentd.db"))
         .await
@@ -155,12 +164,16 @@ async fn start_with(limits: TunnelLimits) -> Server {
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
-    let opts = WsOptions {
+    let mut opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         tunnel_limits: limits,
         ..WsOptions::default()
     };
+    if let Some((interval, timeout)) = heartbeat {
+        opts.heartbeat_interval = interval;
+        opts.heartbeat_timeout = timeout;
+    }
     let ws =
         WsApiServer::new(api.clone(), bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
@@ -231,15 +244,16 @@ async fn spawn_echo_listener() -> u16 {
     port
 }
 
-/// Reserve a loopback port with nothing listening on it (bind, read the port,
-/// drop the listener). Connects to it are refused.
-async fn closed_port() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
+/// Reserve a loopback port that refuses connects for as long as the returned
+/// socket is held: bound but never listening, so the kernel answers connects
+/// with RST while the live bind keeps concurrent processes from reusing the
+/// port (the bind-and-drop pattern raced under parallel test load,
+/// intent-hq/monorepo#3499).
+fn closed_port() -> (TcpSocket, u16) {
+    let socket = TcpSocket::new_v4().expect("socket");
+    socket.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("bind");
+    let port = socket.local_addr().expect("local addr").port();
+    (socket, port)
 }
 
 /// OPEN a live echo port, push data both ways, then tear down with EOF: the
@@ -332,7 +346,7 @@ async fn tunnel_close_tears_down_and_frees_stream_id() {
 #[tokio::test]
 async fn tunnel_open_err_for_closed_port_keeps_connection_alive() {
     let srv = start().await;
-    let dead_port = closed_port().await;
+    let (_port_reservation, dead_port) = closed_port();
     let echo_port = spawn_echo_listener().await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
 
@@ -702,14 +716,27 @@ async fn tunnel_connect_timeout_answers_open_err() {
     srv.ws.stop().await;
 }
 
-/// A `DATA` payload over the 1 MiB per-frame cap closes the connection: the
-/// WebSocket-level message cap rejects it with `1009 Message Too Big`.
+/// A `DATA` message over the inbound message cap closes the connection with
+/// `1009 Message Too Big`, and an over-limit single frame still terminates
+/// the connection.
 #[tokio::test]
 async fn tunnel_oversize_data_closes_with_1009() {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame as WsFrame;
+
     let srv = start().await;
     let echo_port = spawn_echo_listener().await;
-    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
 
+    // Over-limit fragmented `DATA` on a live stream (the WS-level cap fires
+    // before frame decode, so the open stream isn't required — it's kept for
+    // the realistic live-stream shape): the first fragment sits
+    // exactly at the cap (legal on its own), the continuation pushes the
+    // accumulated size past it, surfacing tungstenite's message-capacity
+    // error only after the client has finished writing — so the 1009 close
+    // frame the server sends is reliably delivered even under parallel suite
+    // load: no bytes are left in flight to reset the socket (monorepo#3469,
+    // mirroring the `/ws` oversize coverage in `wss_integration`).
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
     send_frame(
         &mut ws,
         Frame::Open {
@@ -719,14 +746,32 @@ async fn tunnel_oversize_data_closes_with_1009() {
     )
     .await;
     assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: 1 });
-    send_frame(
-        &mut ws,
-        Frame::Data {
-            stream_id: 1,
-            payload: vec![0u8; MAX_TUNNEL_MESSAGE_BYTES + 1],
-        },
-    )
-    .await;
+    let header_len = Frame::Data {
+        stream_id: 1,
+        payload: Vec::new(),
+    }
+    .encode()
+    .len();
+    let at_cap = Frame::Data {
+        stream_id: 1,
+        payload: vec![0u8; MAX_TUNNEL_MESSAGE_BYTES - header_len],
+    }
+    .encode();
+    assert_eq!(at_cap.len(), MAX_TUNNEL_MESSAGE_BYTES);
+    ws.send(Message::Frame(WsFrame::message(
+        at_cap,
+        OpCode::Data(Data::Binary),
+        false,
+    )))
+    .await
+    .expect("send first fragment");
+    ws.send(Message::Frame(WsFrame::message(
+        vec![0u8; 1024],
+        OpCode::Data(Data::Continue),
+        true,
+    )))
+    .await
+    .expect("send continuation");
     loop {
         let next = tokio::time::timeout(common::test_timeout(Duration::from_secs(10)), ws.next())
             .await
@@ -742,6 +787,42 @@ async fn tunnel_oversize_data_closes_with_1009() {
             other => panic!("expected 1009 close, got {other:?}"),
         }
     }
+
+    // Over-limit single frame: rejected fast on the frame header, without
+    // buffering the payload — so the teardown can reset the socket while the
+    // client is still mid-write, and the 1009 close frame may be lost to the
+    // reset. Only termination is asserted (the close code is still checked
+    // opportunistically when a close frame does arrive).
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    let _ = ws
+        .send(Message::Binary(
+            Frame::Data {
+                stream_id: 1,
+                payload: vec![0u8; MAX_TUNNEL_MESSAGE_BYTES + 1],
+            }
+            .encode()
+            .into(),
+        ))
+        .await;
+    let closed = tokio::time::timeout(common::test_timeout(Duration::from_secs(10)), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) => break,
+                Some(Ok(Message::Close(frame))) => {
+                    if let Some(frame) = frame {
+                        assert_eq!(u16::from(frame.code), 1009, "close frame: {frame:?}");
+                    }
+                    break;
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "oversized frame must terminate the connection"
+    );
     srv.ws.stop().await;
 }
 
@@ -837,4 +918,38 @@ async fn tunnel_connections_counted_in_health_and_stopped() {
     .await;
     deadline.expect("tunnel connection closed by stop()");
     assert_eq!(srv.ws.client_count(), 0);
+}
+
+/// Regression guard for intent-hq/intent#3712 on the `/tunnel` path
+/// (companion to `heartbeat_keeps_responsive_client_alive` in
+/// `wss_integration.rs`, which covers `/ws`): a tunnel client that keeps
+/// polling its stream (auto-ponging every server ping) must SURVIVE many
+/// heartbeat interval+timeout cycles. `run_tunnel_connection` has its own
+/// pong-bookkeeping arm, so a mixed-clock regression there (wall-clock stamp
+/// vs monotonic reaper, or vice versa) would reap this responsive client
+/// within one timeout window without ever failing the `/ws` test.
+#[tokio::test]
+async fn heartbeat_keeps_responsive_tunnel_client_alive() {
+    let srv = start_with_heartbeat(
+        TunnelLimits::default(),
+        Some((Duration::from_millis(100), Duration::from_millis(200))),
+    )
+    .await;
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    // Keep the stream polled so tungstenite answers each Ping with a Pong.
+    let poller = tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+    let deadline = Instant::now() + common::test_timeout(Duration::from_secs(10));
+    while srv.ws.client_count() != 1 {
+        assert!(Instant::now() < deadline, "tunnel client never registered");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Outlive many timeout windows (2s >> 200ms timeout, >= 20 ping cycles).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        srv.ws.client_count(),
+        1,
+        "responsive tunnel client must survive heartbeat cycles"
+    );
+    poller.abort();
+    srv.ws.stop().await;
 }

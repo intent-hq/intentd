@@ -320,6 +320,7 @@ async fn seed_workspace(data_dir: &Path) -> String {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -517,7 +518,7 @@ async fn drive_turn(
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": name, "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

@@ -87,6 +87,7 @@ fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSe
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     }
 }
 
@@ -332,6 +333,8 @@ async fn seed_source(
             name: "watcher".to_string(),
             code: "return { dispatch: false }".to_string(),
             delay_ms: 10_000,
+            cron: None,
+            run_at: None,
             state: HookState::Scheduled,
             created_at: t.clone(),
             last_run_at: None,

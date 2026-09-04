@@ -6,8 +6,11 @@
 //! - retired `model.workspaceOverrides`: `settings.update` over WSS
 //!   tolerates-and-ignores the retired path while `settings.get` rejects it;
 //! - default-provider switch (monorepo#3177): a `settings.update` batch
-//!   switching `providers.active` re-resolves `model.default` for the new
-//!   provider (cached catalog default, else cleared).
+//!   switching `model.defaultProvider` re-resolves `model.default` for the new
+//!   provider (cached catalog default, else cleared);
+//! - `tokenImpact` annotations: every `agentFeatures.*` definition in
+//!   `settings.list` carries its approximate token-impact string, and
+//!   unannotated definitions omit the optional key.
 
 #![cfg(unix)]
 
@@ -423,6 +426,81 @@ async fn retired_workspace_overrides_over_wss() {
     );
 }
 
+/// `tokenImpact` over WSS (§5.12): every `agentFeatures.*` definition in
+/// `settings.list` carries its approximate token-impact annotation, and
+/// unannotated definitions omit the key entirely.
+#[tokio::test]
+async fn agent_features_token_impact_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let resp = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_success_envelope(&resp, 1);
+    let settings = resp["result"]["settings"]
+        .as_array()
+        .expect("settings array");
+    let entry = |path: &str| {
+        settings
+            .iter()
+            .find(|e| e["path"] == json!(path))
+            .unwrap_or_else(|| panic!("missing setting {path}"))
+    };
+
+    for (path, impact) in [
+        ("agentFeatures.backgroundHooks", "~620 tokens/session"),
+        ("agentFeatures.hostExec", "~50 tokens/session"),
+        ("agentFeatures.scripts", "~240 tokens/session"),
+        ("agentFeatures.terminalAccess", "~50 tokens/session"),
+        ("agentFeatures.browserAutomation", "~50 tokens/session"),
+        ("agentFeatures.richChatBlocks", "~310 tokens/session"),
+        ("agentFeatures.structuredQuestions", "~180 tokens/session"),
+        ("agentFeatures.attentionRequests", "~340 tokens/session"),
+        ("agentFeatures.stateSnapshot", "~50 tokens/turn"),
+        ("agentFeatures.prMonitor", "~290 tokens/session"),
+        (
+            "agentFeatures.taskGraph",
+            "~170 tokens/session + variable per completion wake",
+        ),
+        ("agentFeatures.peerAgents", "~80 tokens/session"),
+    ] {
+        assert_eq!(
+            entry(path)["tokenImpact"],
+            json!(impact),
+            "{path} tokenImpact over the wire"
+        );
+    }
+
+    // Unannotated definitions omit the key entirely (optional field).
+    assert!(
+        !entry("git.autoCommit")
+            .as_object()
+            .expect("setting object")
+            .contains_key("tokenImpact"),
+        "unannotated setting must omit tokenImpact"
+    );
+}
+
 /// Pump a subscriber connection until a `settings:changed` `events.event`
 /// frame arrives; returns the event's `data.changes` array. Bounded wait so
 /// a missing event fails the test instead of hanging it.
@@ -468,7 +546,7 @@ fn model_default_values(changes: &Value) -> Vec<Value> {
 }
 
 /// Default-provider switch over WSS (monorepo#3177): a `settings.update`
-/// batch that switches `providers.active` re-resolves `model.default` for the
+/// batch that switches `model.defaultProvider` re-resolves `model.default` for the
 /// new provider — the cached catalog default as a compound id when the cache
 /// is warm (seeded `models-cache.json`), a blank clearing value when it is
 /// cold — and the injected entry rides the same response `applied` list AND
@@ -532,15 +610,16 @@ async fn provider_switch_reresolves_default_model_over_wss() {
     assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
 
     // Baseline: an explicit model pick in the same batch is authoritative —
-    // the side effect must not run even though providers.active is written.
+    // the side effect must not run even though model.defaultProvider is
+    // written.
     let resp = wss_rpc(
         &mut ws,
         1,
         "settings.update",
         json!({
             "changes": [
-                {"path": "providers.active", "value": "auggie"},
-                {"path": "model.default", "value": "auggie:fable-5"}
+                {"path": "model.defaultProvider", "value": "auggie"},
+                {"path": "model.default", "value": "fable-5"}
             ]
         }),
     )
@@ -551,21 +630,21 @@ async fn provider_switch_reresolves_default_model_over_wss() {
     let changes = next_settings_changed(&mut sub).await;
     assert_eq!(
         model_default_values(&changes),
-        vec![json!("auggie:fable-5")],
+        vec![json!("fable-5")],
         "explicit pick rides the event verbatim, exactly once: {changes}"
     );
     let resp = wss_rpc(&mut ws, 2, "settings.get", json!({"path": "model.default"})).await;
-    assert_eq!(resp["result"]["value"], json!("auggie:fable-5"));
+    assert_eq!(resp["result"]["value"], json!("fable-5"));
 
     // Switch to grok (warm cache): the batch gains a re-resolved
-    // model.default — the catalog row marked isDefault, compound-prefixed.
+    // model.default — the catalog row marked isDefault, as a bare id.
     let resp = wss_rpc(
         &mut ws,
         3,
         "settings.update",
         json!({
             "changes": [
-                {"path": "providers.active", "value": "grok"}
+                {"path": "model.defaultProvider", "value": "grok"}
             ]
         }),
     )
@@ -577,17 +656,17 @@ async fn provider_switch_reresolves_default_model_over_wss() {
         2,
         "switch must apply provider + re-resolved model: {resp}"
     );
-    assert_eq!(applied[0]["path"], json!("providers.active"), "{resp}");
+    assert_eq!(applied[0]["path"], json!("model.defaultProvider"), "{resp}");
     assert_eq!(applied[1]["path"], json!("model.default"), "{resp}");
-    assert_eq!(applied[1]["value"], json!("grok:grok-code-fast"), "{resp}");
+    assert_eq!(applied[1]["value"], json!("grok-code-fast"), "{resp}");
     let changes = next_settings_changed(&mut sub).await;
     assert_eq!(
         model_default_values(&changes),
-        vec![json!("grok:grok-code-fast")],
+        vec![json!("grok-code-fast")],
         "injected re-resolved model rides the event exactly once: {changes}"
     );
     let resp = wss_rpc(&mut ws, 4, "settings.get", json!({"path": "model.default"})).await;
-    assert_eq!(resp["result"]["value"], json!("grok:grok-code-fast"));
+    assert_eq!(resp["result"]["value"], json!("grok-code-fast"));
 
     // Switch back to auggie (cold cache — nothing seeded for it): the stale
     // grok model is CLEARED, never left shadowing the switched provider.
@@ -597,7 +676,7 @@ async fn provider_switch_reresolves_default_model_over_wss() {
         "settings.update",
         json!({
             "changes": [
-                {"path": "providers.active", "value": "auggie"}
+                {"path": "model.defaultProvider", "value": "auggie"}
             ]
         }),
     )
@@ -605,6 +684,7 @@ async fn provider_switch_reresolves_default_model_over_wss() {
     assert_success_envelope(&resp, 5);
     let applied = resp["result"]["applied"].as_array().expect("applied array");
     assert_eq!(applied.len(), 2, "{resp}");
+    assert!(applied.iter().all(|change| change["origin"] == "file"));
     assert_eq!(applied[1]["path"], json!("model.default"), "{resp}");
     assert_eq!(applied[1]["value"], json!(""), "{resp}");
     let changes = next_settings_changed(&mut sub).await;
@@ -619,7 +699,7 @@ async fn provider_switch_reresolves_default_model_over_wss() {
         &mut ws,
         7,
         "settings.get",
-        json!({"path": "providers.active"}),
+        json!({"path": "model.defaultProvider"}),
     )
     .await;
     assert_eq!(resp["result"]["value"], json!("auggie"));
@@ -657,6 +737,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
 
     // settings.list — both keys advertised with their definitions + defaults.
     let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_eq!(list["result"]["revision"], json!(0));
     let settings = list["result"]["settings"]
         .as_array()
         .expect("settings array");
@@ -677,6 +758,29 @@ async fn workspace_api_settings_round_trip_over_wss() {
     assert_eq!(toon["value"], json!(true));
     assert_eq!(toon["origin"], json!("default"));
 
+    // Persisting the effective default changes only its origin. The applied
+    // delta must still converge a cached definition without a follow-up list.
+    let resp = wss_rpc(
+        &mut ws,
+        20,
+        "settings.update",
+        json!({ "changes": [{"path": "workspaceApi.toonOutput", "value": true}] }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["applied"][0],
+        json!({"path": "workspaceApi.toonOutput", "value": true, "origin": "file"})
+    );
+    let resp = wss_rpc(
+        &mut ws,
+        21,
+        "settings.reset",
+        json!({"path": "workspaceApi.toonOutput"}),
+    )
+    .await;
+    assert_eq!(resp["result"]["value"], json!(true));
+    assert_eq!(resp["result"]["origin"], json!("default"));
+
     // Update both → applied, get reads back with `file` origin.
     let resp = wss_rpc(
         &mut ws,
@@ -689,6 +793,10 @@ async fn workspace_api_settings_round_trip_over_wss() {
     )
     .await;
     assert!(resp.get("error").is_none(), "update errored: {resp}");
+    let update_revision = resp["result"]["revision"]
+        .as_u64()
+        .expect("settings.update revision");
+    assert!(update_revision > 0);
     let applied = resp["result"]["applied"].as_array().expect("applied array");
     assert_eq!(applied.len(), 2, "{resp}");
     let resp = wss_rpc(
@@ -702,6 +810,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
     // `wire_value`), matching the numeric shape of the catalog defaults.
     assert_eq!(resp["result"]["value"], json!(250_000.0));
     assert_eq!(resp["result"]["origin"], json!("file"));
+    assert_eq!(resp["result"]["revision"], json!(update_revision));
     let resp = wss_rpc(
         &mut ws,
         4,
@@ -743,6 +852,11 @@ async fn workspace_api_settings_round_trip_over_wss() {
     )
     .await;
     assert_eq!(resp["result"]["value"], json!(100_000.0));
+    assert_eq!(resp["result"]["origin"], json!("default"));
+    assert!(
+        resp["result"]["revision"].as_u64().unwrap() > update_revision,
+        "settings.reset must advance the revision: {resp}"
+    );
     let resp = wss_rpc(
         &mut ws,
         8,

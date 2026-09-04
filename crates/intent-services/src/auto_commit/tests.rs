@@ -92,6 +92,7 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -181,6 +182,7 @@ fn session(
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     }
 }
 
@@ -286,9 +288,9 @@ fn last_commit_trailers(dir: &std::path::Path) -> (Option<String>, Option<String
     (head.agent_id, head.linked_note_id, head.message)
 }
 
-/// Registry with `providers.active = "auggie"` so the completeOnce provider
-/// gate is open: unset settings resolve the gate CLOSED, so generation tests
-/// that expect the CLI to be reached must opt in explicitly.
+/// Registry with `model.defaultProvider = "auggie"` so the completeOnce
+/// provider gate is open: unset settings resolve the gate CLOSED, so
+/// generation tests that expect the CLI to be reached must opt in explicitly.
 #[cfg(unix)]
 fn auggie_active_registry() -> (tempfile::TempDir, std::sync::Arc<crate::SettingsRegistry>) {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -297,8 +299,8 @@ fn auggie_active_registry() -> (tempfile::TempDir, std::sync::Arc<crate::Setting
             .expect("load registry"),
     );
     registry
-        .apply(&[("providers.active".to_string(), json!("auggie"))])
-        .expect("set providers.active");
+        .apply(&[("model.defaultProvider".to_string(), json!("auggie"))])
+        .expect("set model.defaultProvider");
     (config_dir, registry)
 }
 
@@ -333,6 +335,38 @@ async fn task_linked_idle_commits_with_both_trailers() {
     assert!(
         message.starts_with("Port auto-commit"),
         "subject: {message}"
+    );
+}
+
+/// A direct-checkout workspace persisting only `repositoryPath`
+/// (monorepo#3778) must still auto-commit on idle: the path resolution falls
+/// back to `repositoryPath` instead of silently skipping on the missing
+/// `worktreePath`.
+#[tokio::test]
+async fn repository_only_workspace_auto_commits_via_repository_path() {
+    let repo = init_git_repo();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let mut ws = workspace_with_repo(&ws_id, &repo);
+    ws.worktree_path = None;
+    ws.repository_path = Some(repo.dir.to_string_lossy().to_string());
+    store.insert_workspace(&ws).await.expect("insert ws");
+    std::fs::write(repo.dir.join("change.txt"), "agent edit\n").unwrap();
+    let svc =
+        Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+
+    let agent = session("agent-r1", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-r1").await;
+    let event = idle_event(&ws_id, "agent-r1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+
+    let (agent_id, _linked, _message) = last_commit_trailers(&repo.dir);
+    assert_eq!(
+        agent_id.as_deref(),
+        Some("agent-r1"),
+        "repository-only workspace must auto-commit via repositoryPath fallback"
     );
 }
 
@@ -740,7 +774,16 @@ async fn generation_timeout_falls_back_to_subject() {
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "agent-t1").await;
     let event = idle_event(&ws_id, "agent-t1", "end_turn");
+    let started = std::time::Instant::now();
     svc.handle_agent_idle_auto_commit(&event).await;
+    // monorepo#4032: a stalled CLI must be cut off at the auto-commit budget
+    // (250 ms here) — not any interactive-enhancement default — and still
+    // yield a non-error commit. Generous slack for slow CI.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "auto-commit was not bounded by its own budget: {:?}",
+        started.elapsed()
+    );
     let (_a, _l, message) = last_commit_trailers(&repo.dir);
     // Fell back to the agent name.
     assert!(message.starts_with("Timeout Agent"), "got: {message}");

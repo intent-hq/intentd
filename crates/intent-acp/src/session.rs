@@ -9,8 +9,10 @@
 //! without a canonical `WorkspaceEvent` in `events/types.ts`
 //! (plan/mode/commands/…) map to `None`: emitting invented event
 //! strings would break wire parity with the live iOS client. `usage_update`
-//! emits no event either, but its cumulative `cost` is mapped so the service
-//! layer can fold it into the workspace `TokenUsage` tally (§5.23).
+//! emits no event either, but it maps: `used`/`size` carry the live session's
+//! context-window occupancy (a latest-wins signal, never a token-tally input)
+//! and the cumulative `cost`, when reported, is folded into the workspace
+//! `TokenUsage` tally by the service layer (§5.23).
 //!
 //! ## Session lifetime semantics
 //!
@@ -203,6 +205,12 @@ pub struct PromptOutcome {
     pub stop_reason: StopReason,
     /// Cumulative-per-session token usage reported at end of turn, if any.
     pub usage: Option<Usage>,
+    /// The response's raw `_meta` extension payload, if any. Some providers
+    /// report usage only here instead of the standard `usage` field (grok's
+    /// `_meta.usage` whole-prompt bill, intent-hq/intent#3803); the service
+    /// layer owns interpreting it. Best-effort like `usage`: a malformed
+    /// `_meta` deserializes to `None`.
+    pub meta: Option<Meta>,
 }
 
 /// `session/prompt` with the user content blocks → drives a turn; the agent
@@ -246,6 +254,7 @@ pub async fn prompt(
                 return Ok(PromptOutcome {
                     stop_reason: response.stop_reason,
                     usage: response.usage,
+                    meta: response.meta,
                 });
             }
             () = tokio::time::sleep(poll_interval) => {
@@ -299,10 +308,25 @@ pub async fn set_session_config_option(
     config_id: &str,
     value: &str,
 ) -> AcpResult<()> {
+    set_session_config_option_response(conn, session_id, config_id, value).await?;
+    Ok(())
+}
+
+/// Apply a config option and retain the response for providers that require
+/// confirmation of the exact selected value before a prompt may run.
+///
+/// # Errors
+///
+/// Propagates the transport/RPC error if the request fails.
+pub async fn set_session_config_option_response(
+    conn: &Connection,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) -> AcpResult<Value> {
     let params =
         serde_json::json!({ "sessionId": session_id, "configId": config_id, "value": value });
-    conn.request("session/set_config_option", params).await?;
-    Ok(())
+    conn.request("session/set_config_option", params).await
 }
 
 /// `session/cancel` to interrupt the current turn (fire-and-forget notification;
@@ -346,11 +370,26 @@ pub enum MappedUpdate {
     },
     /// `tool_call` / `tool_call_update` → `agent:tool:call`.
     ToolCall(MappedToolCall),
-    /// `usage_update` → no canonical `WorkspaceEvent`, but its cumulative
-    /// per-ACP-session `cost` feeds the workspace `TokenUsage` tally (§5.23).
-    /// Mapped only when the notification actually carries a cost object; the
-    /// context-window fields (`used`/`size`) are not consumed here.
-    UsageCost(MappedUsageCost),
+    /// `usage_update` → no canonical `WorkspaceEvent`. The context-window
+    /// occupancy (`used`/`size`) is recorded latest-wins per live session
+    /// (never folded into token tallies), and the cumulative per-ACP-session
+    /// `cost`, when reported, feeds the workspace `TokenUsage` tally (§5.23).
+    Usage(MappedUsage),
+}
+
+/// The context-window occupancy and optional cumulative cost carried by an
+/// ACP `usage_update` (§5.23). `used`/`size` are point-in-time context
+/// occupancy (input + cache vs. the model's window) — a signal, not a
+/// billing counter; only `cost` ever contributes to the token tally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MappedUsage {
+    /// Tokens currently in the session's context window.
+    pub used: u64,
+    /// Total context window size in tokens.
+    pub size: u64,
+    /// Cumulative session cost, when the provider reports one — absence is
+    /// never coerced to a zero figure.
+    pub cost: Option<MappedUsageCost>,
 }
 
 /// The cumulative session cost carried by an ACP `usage_update` (§5.23).
@@ -384,8 +423,9 @@ pub struct MappedToolCall {
 
 /// Map a `session/update` to a [`MappedUpdate`], or `None` when the variant has
 /// no canonical `WorkspaceEvent` and nothing else to accumulate
-/// (plan/mode/commands/…) (§6.6). `usage_update` maps only when it
-/// carries a `cost` object (§5.23).
+/// (plan/mode/commands/…) (§6.6). `usage_update` always maps: `used`/`size`
+/// are required schema fields (the context-occupancy signal), and `cost`
+/// rides along when reported (§5.23).
 pub(crate) fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
@@ -410,12 +450,14 @@ pub(crate) fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate>
         SessionUpdate::ToolCallUpdate(update) => {
             Some(MappedUpdate::ToolCall(map_tool_call_update(update)))
         }
-        SessionUpdate::UsageUpdate(usage) => usage.cost.as_ref().map(|cost| {
-            MappedUpdate::UsageCost(MappedUsageCost {
+        SessionUpdate::UsageUpdate(usage) => Some(MappedUpdate::Usage(MappedUsage {
+            used: usage.used,
+            size: usage.size,
+            cost: usage.cost.as_ref().map(|cost| MappedUsageCost {
                 amount: cost.amount,
                 currency: cost.currency.clone(),
-            })
-        }),
+            }),
+        })),
         _ => None,
     }
 }
@@ -477,7 +519,36 @@ fn unwrap_codex_mcp_input(raw_input: Option<&Value>) -> Option<(Value, String)> 
 /// yields `read_note` while other servers keep the `{server}_{tool}` name.
 /// Otherwise the input passes through verbatim and the name derives from the
 /// ACP `title`.
-fn resolve_input_and_name(title: &str, raw_input: Option<&Value>) -> (Value, String) {
+fn resolve_input_and_name(
+    title: &str,
+    raw_input: Option<&Value>,
+    meta: Option<&serde_json::Map<String, Value>>,
+) -> (Value, String) {
+    // Antigravity wraps MCP arguments and identifies the tool in ACP metadata.
+    // Require both captured markers and the matching title to avoid unwrapping
+    // an unrelated provider's legitimate `arguments` parameter.
+    if let Some(meta) = meta.filter(|meta| meta.get("is_mcp_tool_call") == Some(&Value::Bool(true)))
+    {
+        if let (Some(server), Some(tool), Some(arguments)) = (
+            meta.get("mcp")
+                .and_then(|m| m.get("server"))
+                .and_then(Value::as_str),
+            meta.get("mcp")
+                .and_then(|m| m.get("tool"))
+                .and_then(Value::as_str),
+            raw_input
+                .and_then(|v| v.get("arguments"))
+                .and_then(Value::as_object),
+        ) {
+            if title == format!("{server}_{tool}") {
+                let mut input = arguments.clone();
+                if let Some(acp_title) = raw_input.and_then(|v| v.get("_acpTitle")) {
+                    input.insert("_acpTitle".into(), acp_title.clone());
+                }
+                return (Value::Object(input), strip_workspace_mcp_affix(title));
+            }
+        }
+    }
     if let Some((input, rewritten)) = unwrap_codex_mcp_input(raw_input) {
         let name = derive_tool_name(&rewritten, Some(&input));
         return (input, name);
@@ -489,7 +560,11 @@ fn resolve_input_and_name(title: &str, raw_input: Option<&Value>) -> (Value, Str
 /// Map a fresh `tool_call` (status defaults to "started").
 fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
     let title = tool_call.title.clone();
-    let (input, tool_name) = resolve_input_and_name(&title, tool_call.raw_input.as_ref());
+    let (input, tool_name) = resolve_input_and_name(
+        &title,
+        tool_call.raw_input.as_ref(),
+        tool_call.meta.as_ref(),
+    );
     MappedToolCall {
         tool_call_id: tool_call.tool_call_id.0.to_string(),
         tool_kind: tool_kind_word(tool_call.kind, &tool_name),
@@ -505,7 +580,8 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
 fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
     let fields = &update.fields;
     let title = fields.title.clone().unwrap_or_default();
-    let (input, tool_name) = resolve_input_and_name(&title, fields.raw_input.as_ref());
+    let (input, tool_name) =
+        resolve_input_and_name(&title, fields.raw_input.as_ref(), update.meta.as_ref());
     MappedToolCall {
         tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
         // A bare progress update (no status) is still mid-flight → "started".
@@ -610,6 +686,22 @@ pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
 /// first match wins.
 fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
     let obj = input.as_object()?;
+    // Official Antigravity ACP frames. Require the captured input shapes;
+    // do not infer tool identity from arbitrary prose titles.
+    if is_non_empty_string(obj.get("CommandLine")) && is_non_empty_string(obj.get("Cwd")) {
+        return Some("run_command".to_string());
+    }
+    if title == "Running client_view_file" && is_non_empty_string(obj.get("absolute_path")) {
+        return Some("client_view_file".to_string());
+    }
+    if matches!(
+        title,
+        "Run client_create_file?" | "Running client_create_file"
+    ) && is_non_empty_string(obj.get("target_file"))
+        && obj.get("code_content").and_then(Value::as_str).is_some()
+    {
+        return Some("client_create_file".to_string());
+    }
     // command ∈ {str_replace, insert, create} → str-replace-editor
     if let Some(cmd) = obj.get("command").and_then(Value::as_str) {
         if matches!(cmd, "str_replace" | "insert" | "create") {

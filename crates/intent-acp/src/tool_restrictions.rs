@@ -7,7 +7,7 @@
 //! than an allowlist, so new tools are denied by default for restricted agents.
 
 /// File modification tools — agents with these can edit the codebase.
-pub(crate) const FILE_WRITE_TOOLS: &[&str] = &[
+pub const FILE_WRITE_TOOLS: &[&str] = &[
     // Built-in auggie tools
     "str-replace-editor",
     "save-file",
@@ -75,7 +75,7 @@ pub(crate) const UNIFIED_WORKSPACE_TOOLS: &[&str] =
     &["workspace_api", "workspace_api_workspace-mcp"];
 
 /// Process/command execution tools.
-pub(crate) const EXECUTION_TOOLS: &[&str] = &["launch-process", "execute_command"];
+pub const EXECUTION_TOOLS: &[&str] = &["launch-process", "execute_command"];
 
 /// External communication tools.
 pub(crate) const EXTERNAL_TOOLS: &[&str] = &["web-fetch", "web-search", "github-api"];
@@ -117,6 +117,37 @@ pub const SUBAGENT_TOOLS: &[&str] = &[
 /// Built-in tools that conflict with their workspace-MCP equivalents and are
 /// always removed (the MCP versions integrate with the agent lifecycle).
 pub(crate) const CONFLICTING_BUILTIN_TOOLS: &[&str] = &["create_agent"];
+
+/// Claude Agent SDK built-in file-write tools disallowed for orchestrator-role
+/// agents on the claude-code provider, delivered via
+/// `_meta.claudeCode.options.disallowedTools` on `session/new`/`session/load`
+/// (the claude-code counterpart of [`FILE_WRITE_TOOLS`], whose auggie-native /
+/// MCP names the SDK never exposes). Bare names remove the tool from the
+/// model's context entirely — no tool schema, no permission prompt.
+///
+/// Names match Claude Agent SDK 0.3.220 (pinned by claude-agent-acp 0.66.0):
+/// `Edit` covers single- and multi-edit (the SDK has no separate `MultiEdit`),
+/// `Write` creates/overwrites files, `NotebookEdit` edits notebook cells.
+/// `Task` (native subagents) is denied separately for EVERY claude-code agent,
+/// not just orchestrators (see `build_session_meta` in `intent-services`).
+/// `Bash` is deliberately NOT listed: orchestrators legitimately run read-only
+/// commands (git status, builds, searches), and the role prompt — not tool
+/// removal — governs not-editing-via-shell.
+pub const CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
+
+/// Droid built-in tools disallowed for orchestrator-role agents, delivered via
+/// droid's `--disabled-tools` spawn flag (comma-separated list of tool IDs).
+/// `Edit`/`Create`/`ApplyPatch` are the file-write tools, `Task` spawns
+/// subagents. `Execute` (shell) is deliberately NOT listed — same rationale
+/// as the claude-code list above.
+///
+/// Naming: tool IDs are case-sensitive `PascalCase`, sourced from
+/// docs.factory.ai (custom-droid `tools` arrays like `["Read", "Edit",
+/// "Execute"]`, hook matchers `Execute`/`Read`/`Edit`/`Create`/`ApplyPatch`/
+/// `Task`, and the sandbox enforcement table) — no droid binary was available
+/// to run `droid exec --list-tools` against; re-verify if a droid release
+/// renames its built-ins.
+pub const DROID_ORCHESTRATOR_DISALLOWED_TOOLS: &[&str] = &["Edit", "Create", "ApplyPatch", "Task"];
 
 /// The full set of categories denied for pure text-generation/analysis agents.
 fn full_denylist() -> Vec<&'static str> {
@@ -186,8 +217,12 @@ pub(crate) fn background_agent_types() -> &'static [&'static str] {
 /// (port of `getToolRestrictionsForAgent` in the reference `acp-provider.ts`).
 ///
 /// Precedence:
-/// 1. Coordinator / spec-writer specialist: [`FILE_WRITE_TOOLS`] +
-///    [`SUBAGENT_TOOLS`] + [`CONFLICTING_BUILTIN_TOOLS`]. Note: the reference
+/// 1. Orchestrator-role specialist (`is_orchestrator` — resolved by the
+///    caller from the specialist registry's `role` frontmatter, with a
+///    name-based fallback for the historical `spec-writer`/`coordinator`
+///    ids; see `SpecialistsService::resolve_is_orchestrator` in
+///    `intent-services`): [`FILE_WRITE_TOOLS`] + [`SUBAGENT_TOOLS`] +
+///    [`CONFLICTING_BUILTIN_TOOLS`]. Note: the reference
 ///    comment mentions `EXECUTION_TOOLS` should also be removed here, but the
 ///    reference **code** does not include it — we match the code to preserve
 ///    parity (documented in the PR).
@@ -201,8 +236,8 @@ pub(crate) fn background_agent_types() -> &'static [&'static str] {
 ///    sub-agents have no UI representation, so every agent must go through the
 ///    workspace `ws.agent.*` surface instead of the auggie-native sub-agent.
 #[must_use]
-pub fn get_tools_to_remove(specialist: Option<&str>, agent_type: &str) -> Vec<&'static str> {
-    if matches!(specialist, Some("spec-writer" | "coordinator")) {
+pub fn get_tools_to_remove(is_orchestrator: bool, agent_type: &str) -> Vec<&'static str> {
+    if is_orchestrator {
         let mut out = Vec::with_capacity(
             FILE_WRITE_TOOLS.len() + SUBAGENT_TOOLS.len() + CONFLICTING_BUILTIN_TOOLS.len(),
         );
@@ -226,6 +261,44 @@ pub fn get_tools_to_remove(specialist: Option<&str>, agent_type: &str) -> Vec<&'
     out
 }
 
+/// Resolve the provider-NATIVE tools to strip via the provider's spawn-time
+/// removal flag (`ProviderConfig::remove_tool_flag`). Each provider names its
+/// built-in tools differently, so the generic categories (file-write,
+/// sub-agents) map to per-provider name lists — this mapping lives here (not
+/// in `intent-providers`) because it extends the §18.4 denylist policy that
+/// this module owns.
+///
+/// - `auggie`: the full [`get_tools_to_remove`] resolution (orchestrator,
+///   background-type, and global-fallback paths — auggie-native + MCP names).
+/// - `droid`: orchestrator-role agents get the provider's file-write and
+///   subagent tool IDs ([`DROID_ORCHESTRATOR_DISALLOWED_TOOLS`]); everyone
+///   else gets nothing — MCP-side filtering (§6.8) still covers workspace
+///   tools, and the background-agent denylist names are auggie/MCP-specific.
+///   Deliberate scope cut: unlike auggie (global fallback strips
+///   [`SUBAGENT_TOOLS`] for every agent) and claude-code (`Task` denied for
+///   every agent in `build_session_meta`), droid's `Task` is only stripped
+///   for orchestrators here — non-orchestrator droid agents keep native
+///   sub-agent spawning until a follow-up extends the denylist.
+/// - every other provider: nothing. claude-code delivers its orchestrator
+///   denylist via `session/new` `_meta` instead (see
+///   [`CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS`]); grok has no reachable
+///   spawn-time knob — its `--disallowed-tools` flag is headless-mode
+///   (`grok -p …`) only and is not defined on the `agent stdio` (ACP)
+///   subcommand (see the grok entry in `intent-providers`' registry), so
+///   grok orchestrator restrictions are prompt-only.
+#[must_use]
+pub fn get_native_tools_to_remove(
+    provider_id: &str,
+    is_orchestrator: bool,
+    agent_type: &str,
+) -> Vec<&'static str> {
+    match provider_id {
+        "auggie" => get_tools_to_remove(is_orchestrator, agent_type),
+        "droid" if is_orchestrator => DROID_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,25 +308,18 @@ mod tests {
     }
 
     #[test]
-    fn spec_writer_removes_file_write_and_subagents() {
-        let tools = get_tools_to_remove(Some("spec-writer"), "interactive");
+    fn orchestrator_removes_file_write_and_subagents() {
+        let tools = get_tools_to_remove(true, "interactive");
         assert!(contains_all(&tools, FILE_WRITE_TOOLS));
         assert!(contains_all(&tools, SUBAGENT_TOOLS));
         assert!(contains_all(&tools, CONFLICTING_BUILTIN_TOOLS));
-        // Reference code does NOT include EXECUTION_TOOLS for spec-writer.
+        // Reference code does NOT include EXECUTION_TOOLS for orchestrators.
         assert!(!tools.contains(&"launch-process"));
     }
 
     #[test]
-    fn coordinator_alias_matches_spec_writer() {
-        let a = get_tools_to_remove(Some("spec-writer"), "interactive");
-        let b = get_tools_to_remove(Some("coordinator"), "interactive");
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn background_task_loop_gets_subagent_block_plus_conflicts() {
-        let tools = get_tools_to_remove(None, "task-loop");
+        let tools = get_tools_to_remove(false, "task-loop");
         assert!(contains_all(&tools, SUBAGENT_TOOLS));
         assert!(contains_all(&tools, CONFLICTING_BUILTIN_TOOLS));
         // task-loop denylist is SUBAGENT_TOOLS only — no file-write.
@@ -262,7 +328,7 @@ mod tests {
 
     #[test]
     fn background_pure_text_agent_gets_full_denylist() {
-        let tools = get_tools_to_remove(None, "commit-message");
+        let tools = get_tools_to_remove(false, "commit-message");
         assert!(contains_all(&tools, FILE_WRITE_TOOLS));
         assert!(contains_all(&tools, EXECUTION_TOOLS));
         assert!(contains_all(&tools, SUBAGENT_TOOLS));
@@ -271,7 +337,9 @@ mod tests {
 
     #[test]
     fn interactive_agent_gets_global_subagent_block() {
-        let tools = get_tools_to_remove(None, "interactive");
+        // Non-orchestrator agents (plain or non-orchestrator specialist)
+        // take the global fallback path.
+        let tools = get_tools_to_remove(false, "interactive");
         assert!(contains_all(&tools, SUBAGENT_TOOLS));
         assert!(contains_all(&tools, CONFLICTING_BUILTIN_TOOLS));
         // Non-restricted agents keep file-write, execution, etc.
@@ -280,19 +348,56 @@ mod tests {
     }
 
     #[test]
-    fn implementor_specialist_gets_global_only() {
-        // Non-coordinator specialists take the global fallback path.
-        let tools = get_tools_to_remove(Some("implementor"), "interactive");
-        assert!(contains_all(&tools, SUBAGENT_TOOLS));
-        assert!(!tools.contains(&"str-replace-editor"));
+    fn orchestrator_beats_background_agent_type() {
+        // An orchestrator running as a background task-loop still gets the
+        // orchestrator restrictions (the orchestrator check runs first).
+        let tools = get_tools_to_remove(true, "task-loop");
+        assert!(contains_all(&tools, FILE_WRITE_TOOLS));
     }
 
     #[test]
-    fn specialist_beats_background_agent_type() {
-        // spec-writer running as a background task-loop still gets the
-        // spec-writer restrictions (specialist check runs first).
-        let tools = get_tools_to_remove(Some("spec-writer"), "task-loop");
-        assert!(contains_all(&tools, FILE_WRITE_TOOLS));
+    fn native_resolution_maps_auggie_to_full_denylist_flow() {
+        assert_eq!(
+            get_native_tools_to_remove("auggie", true, "interactive"),
+            get_tools_to_remove(true, "interactive")
+        );
+        assert_eq!(
+            get_native_tools_to_remove("auggie", false, "task-loop"),
+            get_tools_to_remove(false, "task-loop")
+        );
+    }
+
+    #[test]
+    fn native_resolution_droid_orchestrator_only() {
+        assert_eq!(
+            get_native_tools_to_remove("droid", true, "interactive"),
+            DROID_ORCHESTRATOR_DISALLOWED_TOOLS.to_vec()
+        );
+        // Non-orchestrator agents on droid get no CLI-side stripping —
+        // MCP-side filtering (§6.8) still applies.
+        assert!(get_native_tools_to_remove("droid", false, "interactive").is_empty());
+        assert!(get_native_tools_to_remove("droid", false, "task-loop").is_empty());
+    }
+
+    #[test]
+    fn native_resolution_other_providers_get_nothing() {
+        // grok included: its `--disallowed-tools` flag is headless-only and
+        // unreachable from `agent stdio`, so grok must resolve to nothing
+        // even for orchestrators.
+        for id in [
+            "claude-code",
+            "codex",
+            "cortex",
+            "grok",
+            "opencode",
+            "pi",
+            "mock",
+        ] {
+            assert!(
+                get_native_tools_to_remove(id, true, "interactive").is_empty(),
+                "{id} unexpectedly received native tools to remove"
+            );
+        }
     }
 
     #[test]

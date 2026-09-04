@@ -1,6 +1,8 @@
 //! Unit tests for the generic per-provider model cache (PROTOCOL §5.30):
-//! indefinite serving, version-key invalidation, forceRefresh bypass, failure
-//! fallback, single-flighting, negative caching, and persistence.
+//! fresh-window serving, stale-while-revalidate background refresh past
+//! [`MODELS_STALE_AFTER`] (intent-hq/intent#3874), version-key invalidation,
+//! forceRefresh bypass, failure fallback, single-flighting, negative
+//! caching, and persistence.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -57,13 +59,26 @@ fn counting_fetch(
     }
 }
 
-// `try_from` is not const-callable; the TTL is far below `u64::MAX` millis.
+// `try_from` is not const-callable; the TTLs are far below `u64::MAX` millis.
 #[allow(clippy::cast_possible_truncation)]
 const NEG_TTL_MS: u64 = super::MODELS_NEGATIVE_TTL.as_millis() as u64;
 
-/// An arbitrarily large age (~10 years in ms): cached entries have no TTL,
-/// so an entry this old must still be served without a probe.
-const OLD_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1_000;
+/// The staleness threshold in millis (see `NEG_TTL_MS` for the cast note).
+#[allow(clippy::cast_possible_truncation)]
+const STALE_MS: u64 = super::MODELS_STALE_AFTER.as_millis() as u64;
+
+/// Await a detached background-refresh outcome: poll `cond` until it holds
+/// or the budget expires. Under a paused clock the sleeps auto-advance, so
+/// this never slows a test down.
+async fn wait_until(mut cond: impl FnMut() -> bool) {
+    for _ in 0..1_000 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("condition not reached within the polling budget");
+}
 
 #[test]
 fn auggie_catalog_version_invalidates_pre_legacy_cache() {
@@ -74,7 +89,7 @@ fn auggie_catalog_version_invalidates_pre_legacy_cache() {
 
 #[tokio::test]
 async fn cache_hit_skips_fetch() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     cache.store("p", "v1", rows("cached"), 1_000);
     let r = resolve_with_cache(&cache, "p", "v1", false, 1_001, panicking_fetch()).await;
     assert_eq!(r.models, Some(rows("cached")));
@@ -83,22 +98,262 @@ async fn cache_hit_skips_fetch() {
 }
 
 #[tokio::test]
-async fn arbitrarily_old_entry_is_served_without_probe() {
-    // Regression (no more 5-minute TTL): an entry of any age is a cache hit —
-    // a non-forced read must never spawn a probe when an entry exists.
-    let cache = ModelCatalogCache::new(None);
-    cache.store("p", "v1", rows("old"), 1_000);
-    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000 + OLD_MS, panicking_fetch()).await;
-    assert_eq!(r.models, Some(rows("old")));
+async fn entry_below_stale_threshold_is_served_without_probe() {
+    // Just under the staleness threshold the entry is still a plain hit — a
+    // non-forced read must not spawn a probe while the entry is fresh.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("aging"), 1_000);
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        false,
+        1_000 + STALE_MS - 1,
+        panicking_fetch(),
+    )
+    .await;
+    assert_eq!(r.models, Some(rows("aging")));
     assert!(!r.stale);
     assert!(r.warning.is_none());
 }
 
 #[tokio::test]
+async fn aged_entry_served_stale_while_background_refresh_stores_result() {
+    // Stale-while-revalidate (intent-hq/intent#3874): an entry at or past
+    // MODELS_STALE_AFTER is served immediately — labeled stale + warning —
+    // and the refresh probe runs detached, so newly released provider models
+    // still show up (intent-hq/intent#3682) without the read blocking.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("old"), 1_000);
+    let now = 1_000 + STALE_MS;
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, ok_fetch("refreshed")).await;
+    assert_eq!(r.models, Some(rows("old")), "the stale list serves as-is");
+    assert!(r.stale);
+    let warning = r.warning.expect("stale data must be labeled");
+    assert!(
+        warning.contains("refreshing in the background"),
+        "{warning}"
+    );
+    // The background refresh lands in the cache and releases its slot; the
+    // next read is then a plain fresh hit of the refreshed rows — no probe.
+    wait_until(|| {
+        cache.last_good("p", "v1") == Some(rows("refreshed"))
+            && !cache.test_inflight_active("p", "v1")
+    })
+    .await;
+    let r = resolve_with_cache(&cache, "p", "v1", false, now + 1, panicking_fetch()).await;
+    assert_eq!(r.models, Some(rows("refreshed")));
+    assert!(!r.stale);
+    assert!(r.warning.is_none());
+}
+
+#[tokio::test]
+async fn aged_entry_failed_background_refresh_arms_negative_window() {
+    // An aged entry whose background refresh fails keeps serving: the read
+    // that spawned the refresh already returned the stale-labeled last-good
+    // list, the failure lands in the negative cache, and within the window
+    // subsequent non-forced reads keep serving the stale list without
+    // re-spawning the probe (and without spawning a background refresh —
+    // panicking_fetch proves the closure is never invoked).
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("last-good"), 1_000);
+    let now = 1_000 + STALE_MS;
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, failing_fetch()).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    assert!(r.warning.is_some());
+    // The negative entry is stamped at probe *completion* (spawn `now` plus
+    // the probe's real elapsed time), so observe it a little after `now`.
+    wait_until(|| cache.test_negative_reason("p", "v1", now + 5_000).is_some()).await;
+    assert!(!cache.test_inflight_active("p", "v1"), "slot released");
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        false,
+        now + NEG_TTL_MS - 1,
+        panicking_fetch(),
+    )
+    .await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    let warning = r.warning.expect("stale data must be labeled");
+    assert!(warning.contains("probe failed"), "{warning}");
+}
+
+#[tokio::test]
+async fn concurrent_aged_reads_single_flight_one_background_probe() {
+    // Concurrent stale reads spawn at most one background probe — none of
+    // them awaits it, and every response serves immediately (the stale list,
+    // or the refreshed rows once the probe has landed).
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("old"), 1_000);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let now = 1_000 + STALE_MS;
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let cache = cache.clone();
+            let fetch = counting_fetch(&calls, "refreshed");
+            tokio::spawn(
+                async move { resolve_with_cache(&cache, "p", "v1", false, now, fetch).await },
+            )
+        })
+        .collect();
+    for h in handles {
+        let r = h.await.expect("join");
+        let models = r.models.expect("every read serves");
+        if r.stale {
+            assert_eq!(models, rows("old"));
+        } else {
+            assert_eq!(
+                models,
+                rows("refreshed"),
+                "post-refresh reads are fresh hits"
+            );
+        }
+    }
+    wait_until(|| {
+        cache.last_good("p", "v1") == Some(rows("refreshed"))
+            && !cache.test_inflight_active("p", "v1")
+    })
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one probe runs");
+}
+
+#[tokio::test]
+async fn stale_read_does_not_await_or_duplicate_running_probe() {
+    // While a probe for the (provider, version key) is already in flight, a
+    // stale-serving read neither starts a second probe (panicking_fetch
+    // proves the closure is never invoked) nor awaits the running one — it
+    // returns the stale list immediately.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("last-good"), 1_000);
+    let _held = cache.join_inflight("p", "v1"); // simulate a running probe
+    let now = 1_000 + STALE_MS;
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, panicking_fetch()).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    assert!(cache.test_inflight_active("p", "v1"), "slot still held");
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_refresh_timeout_releases_slot_and_negative_caches() {
+    // A wedged background probe cannot pin the in-flight slot: at
+    // MODELS_BACKGROUND_REFRESH_TIMEOUT the fetch future is dropped, the
+    // timeout is recorded as a negative entry, and the slot is released —
+    // while the stale entry keeps serving throughout.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("last-good"), 1_000);
+    let now = 1_000 + STALE_MS;
+    let wedged = || Box::pin(std::future::pending()) as BoxFuture<'static, ModelFetchResult>;
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, wedged).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    assert!(cache.test_inflight_active("p", "v1"), "probe in flight");
+    // Advance the paused clock past the hard timeout (the sleep yields to
+    // the background task, whose timeout then fires), then let the released
+    // slot become observable.
+    tokio::time::sleep(MODELS_BACKGROUND_REFRESH_TIMEOUT + std::time::Duration::from_secs(1)).await;
+    wait_until(|| !cache.test_inflight_active("p", "v1")).await;
+    // The negative entry is stamped at *completion* (spawn time + the ~30s
+    // the probe spent timing out), so it runs its full TTL from when the
+    // failure was observed: at `now + NEG_TTL_MS` — where a spawn-time stamp
+    // would already have expired — the window is still armed.
+    let reason = cache
+        .test_negative_reason("p", "v1", now + NEG_TTL_MS)
+        .expect("negative TTL counts from the timeout, not the spawn");
+    assert!(reason.contains("timed out"), "{reason}");
+    assert_eq!(cache.last_good("p", "v1"), Some(rows("last-good")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_refreshes_respect_global_concurrency_cap() {
+    // Each (provider, version key) slot reaches the spawn independently, so
+    // simultaneous stale reads across providers would otherwise fan out one
+    // adapter/CLI spawn per provider at once; the cache-wide semaphore caps
+    // concurrent background fetches at MODELS_BACKGROUND_REFRESH_CONCURRENCY
+    // (the RPC cost contract's global cap on a rung-2 refresher). Excess
+    // refreshes queue and still complete.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let providers: Vec<String> = (0..5).map(|i| format!("p{i}")).collect();
+    for p in &providers {
+        cache.store(p, "v1", rows("old"), 1_000);
+    }
+    let now = 1_000 + STALE_MS;
+    let current = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    for p in &providers {
+        let current = current.clone();
+        let max_seen = max_seen.clone();
+        let fetch = move || -> BoxFuture<'static, ModelFetchResult> {
+            Box::pin(async move {
+                let running = current.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(running, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                current.fetch_sub(1, Ordering::SeqCst);
+                ModelFetchResult {
+                    models: Some(rows("refreshed")),
+                    warning: None,
+                }
+            })
+        };
+        let r = resolve_with_cache(&cache, p, "v1", false, now, fetch).await;
+        assert_eq!(r.models, Some(rows("old")), "every read serves immediately");
+        assert!(r.stale);
+    }
+    wait_until(|| {
+        providers
+            .iter()
+            .all(|p| cache.last_good(p, "v1") == Some(rows("refreshed")))
+    })
+    .await;
+    assert!(
+        max_seen.load(Ordering::SeqCst) <= MODELS_BACKGROUND_REFRESH_CONCURRENCY,
+        "at most {MODELS_BACKGROUND_REFRESH_CONCURRENCY} refreshes may run concurrently, saw {}",
+        max_seen.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn aged_entry_empty_success_background_refresh_stores_nothing() {
+    // Pins the documented empty-success edge (see `resolve_with_cache`): a
+    // background refresh that returns an empty success stores nothing and
+    // clears no ground for negative caching — the aged last-good list keeps
+    // serving, and the next non-forced read spawns another refresh (which,
+    // succeeding non-empty here, finally replaces the entry). Acceptable
+    // while all empty-success sources are cheap env checks; a costly source
+    // must convert empty to failure instead.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("last-good"), 1_000);
+    let now = 1_000 + STALE_MS;
+    let empty_fetch = || {
+        Box::pin(async {
+            ModelFetchResult {
+                models: Some(vec![]),
+                warning: None,
+            }
+        }) as BoxFuture<'static, ModelFetchResult>
+    };
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, empty_fetch).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    wait_until(|| !cache.test_inflight_active("p", "v1")).await;
+    // Not stored: the last-good list is untouched and still aged, and no
+    // negative window suppresses the next read's refresh.
+    assert_eq!(cache.last_good("p", "v1"), Some(rows("last-good")));
+    assert!(cache.test_negative_reason("p", "v1", now).is_none());
+    let r = resolve_with_cache(&cache, "p", "v1", false, now + 1, ok_fetch("recovered")).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    wait_until(|| cache.last_good("p", "v1") == Some(rows("recovered"))).await;
+}
+
+#[tokio::test]
 async fn entry_fetched_in_the_future_is_still_served() {
-    // System clock moved backwards: with no age-based expiry there is nothing
-    // for a future-stamped entry to outlive, so it is served like any hit.
-    let cache = ModelCatalogCache::new(None);
+    // System clock moved backwards: age uses saturating subtraction, so a
+    // future-stamped entry reads as age zero (fresh) and is served like any
+    // hit; the wall clock eventually catches up and the TTL applies again.
+    let cache = Arc::new(ModelCatalogCache::new(None));
     cache.store("p", "v1", rows("future"), 10_000);
     let r = resolve_with_cache(&cache, "p", "v1", false, 5_000, panicking_fetch()).await;
     assert_eq!(r.models, Some(rows("future")));
@@ -107,7 +362,7 @@ async fn entry_fetched_in_the_future_is_still_served() {
 
 #[tokio::test]
 async fn cache_miss_awaits_probe_and_stores() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     let now = 1_000;
     let r = resolve_with_cache(&cache, "p", "v1", false, now, ok_fetch("new")).await;
     assert_eq!(r.models, Some(rows("new")));
@@ -119,13 +374,13 @@ async fn cache_miss_awaits_probe_and_stores() {
 
 #[tokio::test]
 async fn version_key_bump_invalidates_cached_entry() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     cache.store("p", "v1", rows("pinned-old"), 1_000);
     // Same instant, new version key → cache miss, fetch served + stored.
     let r = resolve_with_cache(&cache, "p", "v2", false, 1_001, ok_fetch("pinned-new")).await;
     assert_eq!(r.models, Some(rows("pinned-new")));
     // And a failed probe must not fall back to rows from another version key.
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     cache.store("p", "v1", rows("pinned-old"), 1_000);
     let r = resolve_with_cache(&cache, "p", "v2", false, 1_001, failing_fetch()).await;
     assert!(r.models.is_none());
@@ -133,7 +388,7 @@ async fn version_key_bump_invalidates_cached_entry() {
 
 #[tokio::test]
 async fn force_refresh_bypasses_cache() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     cache.store("p", "v1", rows("cached"), 1_000);
     let r = resolve_with_cache(&cache, "p", "v1", true, 1_001, ok_fetch("forced")).await;
     assert_eq!(r.models, Some(rows("forced")));
@@ -143,7 +398,7 @@ async fn force_refresh_bypasses_cache() {
 
 #[tokio::test]
 async fn force_refresh_failure_serves_last_good_with_warning() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     cache.store("p", "v1", rows("last-good"), 1_000);
     let r = resolve_with_cache(&cache, "p", "v1", true, 1_001, failing_fetch()).await;
     assert_eq!(r.models, Some(rows("last-good")));
@@ -154,7 +409,7 @@ async fn force_refresh_failure_serves_last_good_with_warning() {
 
 #[tokio::test]
 async fn failure_without_last_good_reports_nothing_to_serve() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
     assert!(r.models.is_none());
     assert!(!r.stale);
@@ -163,7 +418,7 @@ async fn failure_without_last_good_reports_nothing_to_serve() {
 
 #[tokio::test]
 async fn empty_success_is_served_but_not_cached() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     let empty = || -> BoxFuture<'static, ModelFetchResult> {
         Box::pin(async {
             ModelFetchResult {
@@ -186,6 +441,15 @@ fn persistence_roundtrips_across_instances() {
     cache.store("p", "v1", rows("persisted"), 1_000);
     let reloaded = ModelCatalogCache::new(Some(path.clone()));
     assert_eq!(reloaded.last_good("p", "v1"), Some(rows("persisted")));
+    // `fetchedAtMs` survives the reload: staleness carries across a daemon
+    // restart — an entry persisted past the threshold is not a fresh hit
+    // (the first read after restart re-probes) while the last-good list
+    // remains available as the failure fallback.
+    assert_eq!(
+        reloaded.fresh_hit("p", "v1", 1_000 + STALE_MS - 1),
+        Some(rows("persisted"))
+    );
+    assert!(reloaded.fresh_hit("p", "v1", 1_000 + STALE_MS).is_none());
     // A version-key bump invalidates the reloaded entry too.
     assert!(reloaded.last_good("p", "v2").is_none());
     // Corrupt files are ignored, not errors.
@@ -269,18 +533,38 @@ fn persistence_load_drops_stale_default_pseudo_row() {
     assert_eq!(reloaded.last_good("opencode", "pin@1"), Some(opencode));
 }
 
-/// cortex is un-gated (monorepo#1902): its source serves an open-gate empty
-/// list with no warning — the provider CLI owns model selection.
+/// cortex is hidden by default (gated on `INTENTD_ENABLE_CORTEX`, unset in
+/// the test environment): its source serves an empty list with a gating
+/// warning naming the env var — the default-deny shape.
 #[tokio::test]
-async fn cortex_source_serves_open_gate_empty_list() {
+async fn cortex_source_serves_gated_empty_list_by_default() {
     let r = (source_for("cortex").unwrap().fetch)().await;
     assert_eq!(r.models, Some(Vec::new()));
-    assert_eq!(r.warning, None);
+    let warning = r.warning.expect("gated cortex carries a warning");
+    assert!(
+        warning.contains("INTENTD_ENABLE_CORTEX"),
+        "gate warning names the env var: {warning}"
+    );
+}
+
+/// droid is hidden by default (gated on `INTENTD_ENABLE_DROID`, unset in the
+/// test environment): its source serves an empty list with a gating warning
+/// without probing the droid binary.
+#[tokio::test]
+async fn droid_source_serves_gated_empty_list_by_default() {
+    let r = (source_for("droid").unwrap().fetch)().await;
+    assert_eq!(r.models, Some(Vec::new()));
+    let warning = r.warning.expect("gated droid carries a warning");
+    assert!(
+        warning.contains("INTENTD_ENABLE_DROID"),
+        "gate warning names the env var: {warning}"
+    );
 }
 
 #[test]
-fn registry_covers_all_nine_providers() {
+fn registry_covers_dynamic_providers() {
     for provider in [
+        "antigravity",
         "auggie",
         "cortex",
         "claude-code",
@@ -327,7 +611,7 @@ async fn provider_fetch_failure_yields_stale_last_good_through_cache() {
     // A provider_models probe failure (models: None + warning) adapted via
     // `from_provider_fetch` must flow into the cache's stale fallback. Forced
     // read: a non-forced one would serve the cached entry without probing.
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     cache.store("droid", "", rows("droid-last-good"), 1_000);
     let failed = || -> BoxFuture<'static, ModelFetchResult> {
         Box::pin(async {
@@ -390,7 +674,7 @@ async fn concurrent_forced_reads_single_flight_one_probe() {
 async fn inflight_slot_is_released_after_probe() {
     // A later (post-completion) read must run its own probe, not the stale
     // shared cell — i.e. finish_inflight released the slot.
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     let calls = Arc::new(AtomicUsize::new(0));
     let r = resolve_with_cache(
         &cache,
@@ -417,7 +701,7 @@ async fn inflight_slot_is_released_after_probe() {
 
 #[tokio::test]
 async fn negative_window_suppresses_reprobe_without_last_good() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
     assert!(r.models.is_none());
     // Within the negative window the fetch must not run again.
@@ -440,7 +724,7 @@ async fn cache_hit_ignores_negative_window() {
     // A cached entry under the current version key is a hit — no probe would
     // run — so a fresh negative entry (e.g. a failed forced probe moments
     // ago) never degrades a non-forced read to the stale fallback.
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     cache.store("p", "v1", rows("last-good"), 1_000);
     let r = resolve_with_cache(&cache, "p", "v1", true, 1_001, failing_fetch()).await;
     assert_eq!(r.models, Some(rows("last-good")));
@@ -462,7 +746,7 @@ async fn cache_hit_ignores_negative_window() {
 
 #[tokio::test]
 async fn negative_entry_expires_and_reprobe_succeeds() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
     assert!(r.models.is_none());
     // Past the negative TTL the probe runs again; success clears the entry.
@@ -475,7 +759,7 @@ async fn negative_entry_expires_and_reprobe_succeeds() {
 
 #[tokio::test]
 async fn force_refresh_bypasses_negative_window() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
     assert!(r.models.is_none());
     // Within the window a forced read still probes — and its success clears
@@ -492,7 +776,7 @@ async fn only_the_leader_records_the_probe_outcome() {
     // after a newer forced probe succeeded and cleared it. Recording lives
     // inside the get_or_init initializer, so a pre-resolved cell (follower's
     // view) must leave the caches untouched.
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     let cell = cache.join_inflight("p", "v1");
     assert!(cell
         .set(ModelFetchResult {
@@ -517,7 +801,7 @@ async fn only_the_leader_records_the_probe_outcome() {
 
 #[tokio::test]
 async fn negative_entry_is_version_key_scoped() {
-    let cache = ModelCatalogCache::new(None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
     let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
     assert!(r.models.is_none());
     // A version-key bump must not be blocked by the old key's failure.
@@ -544,20 +828,37 @@ fn cached_catalog_claims_matches_bare_and_compound_row_ids() {
     );
     // Exact bare id and the bare part of a self-prefixed compound row id
     // both claim.
-    assert_eq!(cache.cached_catalog_claims("auggie", "fable-5"), Some(true));
-    assert_eq!(cache.cached_catalog_claims("auggie", "fable-6"), Some(true));
+    assert_eq!(
+        cache
+            .reader(None)
+            .cached_catalog_claims("auggie", "fable-5"),
+        Some(true)
+    );
+    assert_eq!(
+        cache
+            .reader(None)
+            .cached_catalog_claims("auggie", "fable-6"),
+        Some(true)
+    );
     // A foreign-prefixed row id is not an ownership claim.
     assert_eq!(
-        cache.cached_catalog_claims("auggie", "foreign-model"),
+        cache
+            .reader(None)
+            .cached_catalog_claims("auggie", "foreign-model"),
         Some(false)
     );
     // Present catalog without the id is affirmative disproof.
     assert_eq!(
-        cache.cached_catalog_claims("auggie", "grok-4-fast"),
+        cache
+            .reader(None)
+            .cached_catalog_claims("auggie", "grok-4-fast"),
         Some(false)
     );
     // Prefix/substring must not match.
-    assert_eq!(cache.cached_catalog_claims("auggie", "fable"), Some(false));
+    assert_eq!(
+        cache.reader(None).cached_catalog_claims("auggie", "fable"),
+        Some(false)
+    );
 }
 
 #[test]
@@ -574,30 +875,41 @@ fn cached_effort_levels_reads_matching_row() {
         1_000,
     );
     assert_eq!(
-        cache.cached_effort_levels("fable-5"),
+        cache.reader(None).cached_effort_levels("fable-5"),
         Some(vec!["low".to_string(), "high".to_string()])
     );
     // A compound id scopes the search to its provider and matches the bare part.
     assert_eq!(
-        cache.cached_effort_levels("auggie:fable-5"),
+        cache.reader(None).cached_effort_levels("auggie:fable-5"),
         Some(vec!["low".to_string(), "high".to_string()])
     );
     // A row that declares no levels, an unknown id, and a foreign-scoped
     // compound id all carry no evidence.
-    assert_eq!(cache.cached_effort_levels("fable-6"), None);
-    assert_eq!(cache.cached_effort_levels("unknown-model"), None);
-    assert_eq!(cache.cached_effort_levels("grok:fable-5"), None);
+    assert_eq!(cache.reader(None).cached_effort_levels("fable-6"), None);
+    assert_eq!(
+        cache.reader(None).cached_effort_levels("unknown-model"),
+        None
+    );
+    assert_eq!(
+        cache.reader(None).cached_effort_levels("grok:fable-5"),
+        None
+    );
 }
 
 #[test]
 fn cached_catalog_claims_none_without_usable_entry() {
     let cache = ModelCatalogCache::new(None);
     // No entry at all → no evidence.
-    assert_eq!(cache.cached_catalog_claims("grok", "fable-5"), None);
+    assert_eq!(
+        cache.reader(None).cached_catalog_claims("grok", "fable-5"),
+        None
+    );
     // Unregistered provider id → no evidence.
     cache.store("not-a-provider", "", rows("fable-5"), 1_000);
     assert_eq!(
-        cache.cached_catalog_claims("not-a-provider", "fable-5"),
+        cache
+            .reader(None)
+            .cached_catalog_claims("not-a-provider", "fable-5"),
         None
     );
     // Version-key mismatch (stale pin) → the entry is not evidence.
@@ -607,7 +919,10 @@ fn cached_catalog_claims_none_without_usable_entry() {
         vec![json!({ "id": "fable-5", "name": "x", "provider": "codex" })],
         1_000,
     );
-    assert_eq!(cache.cached_catalog_claims("codex", "fable-5"), None);
+    assert_eq!(
+        cache.reader(None).cached_catalog_claims("codex", "fable-5"),
+        None
+    );
 }
 
 #[test]
@@ -624,7 +939,7 @@ fn cached_default_model_reads_is_default_row() {
         1_000,
     );
     assert_eq!(
-        cache.cached_default_model("auggie"),
+        cache.reader(None).cached_default_model("auggie"),
         Some("sonnet5".to_string())
     );
 }
@@ -633,7 +948,7 @@ fn cached_default_model_reads_is_default_row() {
 fn cached_default_model_none_without_usable_entry() {
     let cache = ModelCatalogCache::new(None);
     // No entry at all → None.
-    assert_eq!(cache.cached_default_model("auggie"), None);
+    assert_eq!(cache.reader(None).cached_default_model("auggie"), None);
     // Catalog without an isDefault row (including an explicit false) → None.
     cache.store(
         "auggie",
@@ -645,7 +960,7 @@ fn cached_default_model_none_without_usable_entry() {
         ],
         1_000,
     );
-    assert_eq!(cache.cached_default_model("auggie"), None);
+    assert_eq!(cache.reader(None).cached_default_model("auggie"), None);
     // Unregistered provider id → None.
     cache.store(
         "not-a-provider",
@@ -656,7 +971,10 @@ fn cached_default_model_none_without_usable_entry() {
         ],
         1_000,
     );
-    assert_eq!(cache.cached_default_model("not-a-provider"), None);
+    assert_eq!(
+        cache.reader(None).cached_default_model("not-a-provider"),
+        None
+    );
     // Version-key mismatch (stale pin) → the entry is not usable.
     cache.store(
         "codex",
@@ -665,13 +983,16 @@ fn cached_default_model_none_without_usable_entry() {
                      "isDefault": true })],
         1_000,
     );
-    assert_eq!(cache.cached_default_model("codex"), None);
+    assert_eq!(cache.reader(None).cached_default_model("codex"), None);
 }
 
 #[test]
 fn providers_claiming_model_cached_walks_registry() {
     let cache = ModelCatalogCache::new(None);
-    assert!(cache.providers_claiming_model_cached("fable-5").is_empty());
+    assert!(cache
+        .reader(None)
+        .providers_claiming_model_cached("fable-5")
+        .is_empty());
     cache.store(
         "auggie",
         AUGGIE_CATALOG_VERSION,
@@ -685,11 +1006,130 @@ fn providers_claiming_model_cached_walks_registry() {
         1_000,
     );
     assert_eq!(
-        cache.providers_claiming_model_cached("fable-5"),
+        cache
+            .reader(None)
+            .providers_claiming_model_cached("fable-5"),
         vec!["auggie".to_string()]
     );
     assert_eq!(
-        cache.providers_claiming_model_cached("grok-4-fast"),
+        cache
+            .reader(None)
+            .providers_claiming_model_cached("grok-4-fast"),
         vec!["grok".to_string()]
     );
+}
+
+#[cfg(unix)]
+fn antigravity_executables() -> (tempfile::TempDir, String, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = ["provider-a", "provider-b"]
+        .into_iter()
+        .map(|name| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 99\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path.to_str().unwrap().to_string()
+        })
+        .collect();
+    (dir, paths[0].clone(), paths[1].clone())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_identity_scopes_persisted_fallback_and_cache_only_evidence() {
+    let (dir, a, b) = antigravity_executables();
+    let key_a = AntigravityModelSource::resolve(Some(&a)).version_key;
+    let key_b = AntigravityModelSource::resolve(Some(&b)).version_key;
+    assert_ne!(key_a, key_b);
+    let path = dir.path().join("models.json");
+    let cache = Arc::new(ModelCatalogCache::new(Some(path.clone())));
+    let models = vec![json!({"id":"model-a", "isDefault":true, "effortLevels":["high"]})];
+    cache.store("antigravity", "", models.clone(), 1);
+    assert_eq!(
+        cache
+            .reader(Some(a.clone()))
+            .cached_default_model("antigravity"),
+        None
+    );
+    cache.store("antigravity", &key_a, models, 1);
+    let a_reader = cache.reader(Some(a.clone()));
+    assert_eq!(
+        a_reader.cached_default_model("antigravity").as_deref(),
+        Some("model-a")
+    );
+    assert_eq!(
+        a_reader.cached_catalog_claims("antigravity", "model-a"),
+        Some(true)
+    );
+    assert_eq!(
+        a_reader.cached_effort_levels("antigravity:model-a"),
+        Some(vec!["high".into()])
+    );
+    assert!(a_reader
+        .providers_claiming_model_cached("model-a")
+        .contains(&"antigravity".into()));
+    let cache = Arc::new(ModelCatalogCache::new(Some(path)));
+    let reader = cache.reader(Some(b));
+    assert_eq!(reader.cached_default_model("antigravity"), None);
+    assert_eq!(reader.cached_default_or_first_model("antigravity"), None);
+    assert_eq!(reader.cached_catalog_claims("antigravity", "model-a"), None);
+    assert_eq!(reader.cached_effort_levels("antigravity:model-a"), None);
+    assert!(!reader
+        .providers_claiming_model_cached("model-a")
+        .contains(&"antigravity".into()));
+    let failed = resolve_with_cache(&cache, "antigravity", &key_b, false, 2, failing_fetch()).await;
+    assert!(
+        failed.models.is_none(),
+        "A cannot be B's last-good fallback"
+    );
+    let fresh =
+        resolve_with_cache(&cache, "antigravity", &key_a, false, 2, panicking_fetch()).await;
+    assert_eq!(fresh.models.unwrap()[0]["id"], "model-a");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_inflight_and_negative_results_cannot_cross_executables() {
+    let (_dir, a, b) = antigravity_executables();
+    let key_a = AntigravityModelSource::resolve(Some(&a)).version_key;
+    let key_b = AntigravityModelSource::resolve(Some(&b)).version_key;
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let other = cache.clone();
+    let old_key = key_a.clone();
+    let pending = tokio::spawn(async move {
+        resolve_with_cache(&other, "antigravity", &old_key, false, 1, || {
+            Box::pin(async {
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                ModelFetchResult {
+                    models: Some(rows("model-a")),
+                    warning: None,
+                }
+            })
+        })
+        .await
+    });
+    started_rx.await.unwrap();
+    let b_result =
+        resolve_with_cache(&cache, "antigravity", &key_b, false, 1, ok_fetch("model-b")).await;
+    assert_eq!(b_result.models.unwrap()[0]["id"], "model-b");
+    finish_tx.send(()).unwrap();
+    assert_eq!(pending.await.unwrap().models.unwrap()[0]["id"], "model-a");
+    let b_result =
+        resolve_with_cache(&cache, "antigravity", &key_b, false, 2, ok_fetch("model-b")).await;
+    assert_eq!(b_result.models.unwrap()[0]["id"], "model-b");
+    let _ = resolve_with_cache(&cache, "antigravity", &key_a, true, 3, failing_fetch()).await;
+    let b_result = resolve_with_cache(
+        &cache,
+        "antigravity",
+        &key_b,
+        true,
+        3,
+        ok_fetch("model-b-new"),
+    )
+    .await;
+    assert_eq!(b_result.models.unwrap()[0]["id"], "model-b-new");
 }

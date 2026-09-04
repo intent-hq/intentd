@@ -351,7 +351,7 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         &mut rpc,
         11,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Reap Agent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Reap Agent", "model": "default", "provider": "mock" }),
     )
     .await;
     assert!(
@@ -473,6 +473,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,

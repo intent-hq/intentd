@@ -326,7 +326,7 @@ async fn get_subscriptions_stays_within_statement_budget() {
     let resp = rpc_with_params(
         &socket,
         "agent.create",
-        json!({ "workspaceId": workspace_id, "name": "Subs Agent", "model": "auggie:sonnet4.5" }),
+        json!({ "workspaceId": workspace_id, "name": "Subs Agent", "model": "sonnet4.5", "provider": "auggie" }),
     )
     .await;
     let agent_id = resp["result"]["agent"]["id"]
@@ -377,6 +377,98 @@ async fn get_subscriptions_stays_within_statement_budget() {
         ),
         0,
         "agent.getSubscriptions exceeded the lowered statement budget, log:\n{log}"
+    );
+}
+
+/// Regression test for intent-hq/monorepo#3540: every queue mutation
+/// persists the agent's WHOLE queue write-through, and the persist used to
+/// insert one row per statement — so the Nth send/queue against an N-entry
+/// queue cost O(N) statements (150 statements / 1.2s observed on a single
+/// `agent.sendMessage` at coordinator fan-out scale). The snapshot insert is
+/// now a chunked bulk statement, keeping every queue mutation at a flat
+/// statement count regardless of queue depth.
+///
+/// Hermetic shape: the workspace is archived, whose drain gate parks
+/// automatic-origin entries (no provider turn ever spawns). 40
+/// `agent.queueMessage` calls then grow the queue to 40 entries; pre-fix the
+/// later dispatches ran 40+ statements each (DELETE + one INSERT per entry),
+/// tripping the default budget of 25 — the batched shape stays at a handful
+/// per call.
+#[tokio::test]
+async fn queue_mutations_stay_within_statement_budget_at_depth() {
+    let (_daemon, socket, log_path) = spawn_daemon("itdp-queue", &[]);
+    assert!(await_socket(&socket).await, "daemon did not start");
+
+    let repo = create_repo_with_config("{}");
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.create",
+        json!({ "repositoryPath": repo.0.to_str().unwrap() }),
+    )
+    .await;
+    let workspace_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let resp = rpc_with_params(
+        &socket,
+        "agent.create",
+        json!({ "workspaceId": workspace_id, "name": "Queue Agent", "model": "sonnet4.5", "provider": "auggie" }),
+    )
+    .await;
+    let agent_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Archive the workspace so queued entries park instead of draining into
+    // a (non-hermetic) provider turn.
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.archive",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    assert!(resp["error"].is_null(), "workspace archive failed: {resp}");
+
+    for i in 0..40 {
+        let resp = rpc_with_params(
+            &socket,
+            "agent.queueMessage",
+            json!({
+                "workspaceId": workspace_id,
+                "agentId": agent_id,
+                "content": format!("queued message {i}"),
+            }),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "queueMessage {i} failed: {resp}");
+    }
+
+    // All 40 entries are parked (the workspace stays archived).
+    let resp = rpc_with_params(
+        &socket,
+        "agent.getQueue",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["queue"].as_array().map(Vec::len),
+        Some(40),
+        "resp: {resp}"
+    );
+
+    // The WARNs (were they wrongly emitted) land on stderr before each
+    // response frame is written, so a single read after the calls suffices.
+    let log = std::fs::read_to_string(&log_path).expect("read daemon log");
+    assert_eq!(
+        count_lines(
+            &log,
+            &["exceeded SQL statement budget", "method=agent.queueMessage"]
+        ),
+        0,
+        "agent.queueMessage exceeded the statement budget at queue depth, log:\n{log}"
     );
 }
 
@@ -436,7 +528,7 @@ async fn transfer_plan_stays_within_statement_budget() {
 /// fold `updated_at` and count task stats, read the agent-session summaries
 /// TWICE per workspace (once for `agentSummary`/`lastActivity`, once inside
 /// the attention probe), and issued a per-session store probe for the
-/// question hold even when the summary already carried the persisted marker
+/// pending questions even when the summary already carried the persisted marker
 /// — so dispatch duration scaled with stored note bytes and session count,
 /// blowing the 1s duration budget at ~120-agent scale. The enrichment now
 /// reads the note MAX aggregate + counting query, passes its one summaries
@@ -481,7 +573,7 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
         let resp = rpc_with_params(
             &socket,
             "agent.create",
-            json!({ "workspaceId": workspace_id, "name": format!("A{i}"), "model": "auggie:sonnet4.5" }),
+            json!({ "workspaceId": workspace_id, "name": format!("A{i}"), "model": "sonnet4.5", "provider": "auggie" }),
         )
         .await;
         let agent_id = resp["result"]["agent"]["id"]
@@ -548,5 +640,118 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
         ),
         0,
         "workspace.get enrichment exceeded the lowered statement budget, log:\n{log}"
+    );
+}
+
+/// Regression test for intent-hq/monorepo#4130: `workspace.delete` used to
+/// run 4 statements per contained agent on top of its constant sweep —
+/// `list_agent_sessions` hydrated every session's transcript (message +
+/// payload SELECTs) just to read `id`/`name`, and the per-agent teardown ran
+/// one `agent_stop_redelivery` DELETE plus one `advisory_wake_delivery` DELETE
+/// each — 128 statements / 180 ms observed for a 30-agent workspace, over the
+/// compound budget of 100. The sweep now reads session summaries and folds
+/// both clears into one batched `IN`-list statement each, so the dispatch
+/// executes a constant ~10 statements regardless of how many agents, messages
+/// or notes the workspace holds. The compound threshold is lowered to 20 so
+/// even a small N+1 regression (≥ 3 agents) fires the WARN.
+#[tokio::test]
+async fn workspace_delete_stays_within_statement_budget_at_scale() {
+    let (_daemon, socket, log_path) = spawn_daemon(
+        "itdp-wsdel",
+        &[("INTENTD_RPC_COMPOUND_STATEMENT_WARN_THRESHOLD", "20")],
+    );
+    assert!(await_socket(&socket).await, "daemon did not start");
+
+    let repo = create_repo_with_config("{}");
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.create",
+        json!({ "repositoryPath": repo.0.to_str().unwrap() }),
+    )
+    .await;
+    let workspace_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    for a in 0..30 {
+        let resp = rpc_with_params(
+            &socket,
+            "agent.create",
+            json!({ "workspaceId": workspace_id, "name": format!("Agent {a}"), "model": "sonnet4.5", "provider": "auggie" }),
+        )
+        .await;
+        let agent_id = resp["result"]["agent"]["id"]
+            .as_str()
+            .expect("agent id")
+            .to_string();
+        // A transcript per agent — the rows the pre-fix sweep hydrated.
+        for m in 0..3 {
+            let resp = rpc_with_params(
+                &socket,
+                "agent.appendMessage",
+                json!({
+                    "workspaceId": workspace_id,
+                    "agentId": agent_id,
+                    "role": "user",
+                    "contentBlocks": [{ "type": "text", "text": format!("message {m}") }],
+                }),
+            )
+            .await;
+            assert!(resp["error"].is_null(), "append failed: {resp}");
+        }
+    }
+    for n in 0..20 {
+        let resp = rpc_with_params(
+            &socket,
+            "note.create",
+            json!({ "workspaceId": workspace_id, "title": format!("Note {n}"), "content": format!("body {n}") }),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "note.create failed: {resp}");
+    }
+
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.delete",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true), "resp: {resp}");
+
+    // The cascade removed the workspace and everything under it.
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.get",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    assert!(
+        !resp["error"].is_null(),
+        "deleted workspace still readable: {resp}"
+    );
+    let resp = rpc_with_params(
+        &socket,
+        "agent.list",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    assert!(
+        resp["result"]["agents"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "deleted workspace still lists agents: {resp}"
+    );
+
+    // The WARN (were it wrongly emitted) lands on stderr before the response
+    // frame is written, so a single read after the response is sufficient.
+    let log = std::fs::read_to_string(&log_path).expect("read daemon log");
+    assert_eq!(
+        count_lines(
+            &log,
+            &["exceeded SQL statement budget", "method=workspace.delete"]
+        ),
+        0,
+        "workspace.delete exceeded the lowered compound statement budget, log:\n{log}"
     );
 }

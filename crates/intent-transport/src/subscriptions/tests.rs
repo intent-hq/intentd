@@ -246,6 +246,128 @@ fn workspace_params_are_global() {
 }
 
 #[test]
+fn channel_name_covers_every_channel() {
+    assert_eq!(channel_name(Channel::Note), "note");
+    assert_eq!(channel_name(Channel::Task), "task");
+    assert_eq!(channel_name(Channel::Agent), "agent");
+    assert_eq!(channel_name(Channel::Workspace), "workspace");
+    assert_eq!(channel_name(Channel::Comment), "comment");
+    assert_eq!(channel_name(Channel::Chat), "chat");
+}
+
+#[test]
+fn slow_snapshot_warn_fires_only_above_threshold() {
+    let threshold = Duration::from_millis(200);
+    assert!(
+        maybe_warn_slow_snapshot("chat", "agent-1", Duration::from_millis(201), threshold, 1),
+        "above the threshold must WARN"
+    );
+    assert!(
+        !maybe_warn_slow_snapshot("chat", "agent-1", Duration::from_millis(200), threshold, 1),
+        "at the threshold must not WARN"
+    );
+    assert!(
+        !maybe_warn_slow_snapshot("note", "ws-1", Duration::from_millis(3), threshold, 1),
+        "below the threshold must not WARN"
+    );
+}
+
+#[test]
+fn slow_snapshot_warn_carries_channel_scope_and_counts() {
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        maybe_warn_slow_snapshot(
+            "chat",
+            "agent-1",
+            Duration::from_millis(950),
+            Duration::from_millis(200),
+            3,
+        );
+    });
+    assert_eq!(lines.len(), 1, "exactly one WARN event: {lines:?}");
+    let (level, rendered) = &lines[0];
+    assert_eq!(*level, tracing::Level::WARN);
+    for needle in [
+        "channel=\"chat\"",
+        "scope=\"agent-1\"",
+        "elapsed_ms=950.0",
+        "threshold_ms=200",
+        "in_flight=3",
+        "exceeded duration budget",
+    ] {
+        assert!(
+            rendered.contains(needle),
+            "missing `{needle}` in {rendered}"
+        );
+    }
+}
+
+#[test]
+fn slow_snapshot_warn_logs_fractional_millis_for_marginal_breach() {
+    // A 200.5ms breach of a 200ms budget must not truncate to
+    // elapsed_ms=200 == threshold_ms=200 (indistinguishable from a
+    // non-breach in threshold-based log queries).
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        maybe_warn_slow_snapshot(
+            "note",
+            "ws-1",
+            Duration::from_micros(200_500),
+            Duration::from_millis(200),
+            1,
+        );
+    });
+    assert_eq!(lines.len(), 1, "exactly one WARN event: {lines:?}");
+    let rendered = &lines[0].1;
+    assert!(
+        rendered.contains("elapsed_ms=200.5"),
+        "fractional elapsed_ms preserved in {rendered}"
+    );
+    assert!(
+        rendered.contains("threshold_ms=200"),
+        "threshold_ms present in {rendered}"
+    );
+}
+
+#[test]
+fn snapshot_warn_threshold_parses_override_and_falls_back() {
+    assert_eq!(
+        snapshot_warn_threshold_from(Some("50".to_string())),
+        Duration::from_millis(50)
+    );
+    assert_eq!(
+        snapshot_warn_threshold_from(Some(" 75 ".to_string())),
+        Duration::from_millis(75)
+    );
+    assert_eq!(
+        snapshot_warn_threshold_from(Some("nonsense".to_string())),
+        Duration::from_millis(DEFAULT_SNAPSHOT_DURATION_WARN_MS)
+    );
+    assert_eq!(
+        snapshot_warn_threshold_from(None),
+        Duration::from_millis(DEFAULT_SNAPSHOT_DURATION_WARN_MS)
+    );
+}
+
+#[test]
+fn snapshot_timer_tracks_in_flight_count() {
+    let base = SNAPSHOT_IN_FLIGHT.load(Ordering::Relaxed);
+    let t1 = SnapshotTimer::start(Channel::Chat, "agent-1");
+    let t2 = SnapshotTimer::start(Channel::Note, "ws-1");
+    assert_eq!(SNAPSHOT_IN_FLIGHT.load(Ordering::Relaxed), base + 2);
+    t1.snapshot_emitted();
+    assert_eq!(
+        SNAPSHOT_IN_FLIGHT.load(Ordering::Relaxed),
+        base + 1,
+        "a completed snapshot releases its slot"
+    );
+    drop(t2);
+    assert_eq!(
+        SNAPSHOT_IN_FLIGHT.load(Ordering::Relaxed),
+        base,
+        "an abandoned timer (send failure) still releases its slot"
+    );
+}
+
+#[test]
 fn channel_event_types_exclude_chat_stream() {
     let agent = channel_event_types(Channel::Agent);
     assert!(agent.iter().any(|t| t == "agent:deleted"));
@@ -305,6 +427,42 @@ fn subscribe_params_require_workspace_id() {
         let err = parse_subscribe_params(v.as_object().unwrap()).unwrap_err();
         assert!(err.contains("workspaceId is required"));
     }
+}
+
+#[test]
+fn note_subscribe_params_projection_mirrors_note_list() {
+    // Absent / null / "full" → full rows (None); "slim" opts in (v8.2,
+    // monorepo#3586 — the same semantics as note.list's param, §5.2).
+    for (raw, want) in [
+        (r#"{"workspaceId":"w"}"#, None),
+        (r#"{"workspaceId":"w","projection":null}"#, None),
+        (r#"{"workspaceId":"w","projection":"full"}"#, None),
+        (
+            r#"{"workspaceId":"w","projection":"slim"}"#,
+            Some(NoteListProjection::Slim),
+        ),
+    ] {
+        let v = parse(raw);
+        let p = parse_note_subscribe_params(v.as_object().unwrap()).unwrap();
+        assert_eq!(p.projection, want, "{raw}");
+        assert_eq!(p.workspace_id, "w");
+    }
+
+    // Any other value is a -32602, never coerced.
+    for bad in [
+        r#"{"workspaceId":"w","projection":"bogus"}"#,
+        r#"{"workspaceId":"w","projection":5}"#,
+    ] {
+        let v = parse(bad);
+        let err = parse_note_subscribe_params(v.as_object().unwrap()).unwrap_err();
+        assert!(err.contains("projection"), "{err}");
+    }
+
+    // The shared parser (task/agent channels) keeps treating the key as an
+    // ignored unknown param — no new validation on those channels.
+    let v = parse(r#"{"workspaceId":"w","projection":"bogus"}"#);
+    let p = parse_subscribe_params(v.as_object().unwrap()).unwrap();
+    assert!(p.projection.is_none());
 }
 
 #[test]
@@ -1677,6 +1835,37 @@ mod task_delta_re_read {
     }
 
     #[tokio::test]
+    async fn note_delta_slim_projection_bounds_re_read_rows() {
+        // The note channel's slim projection (v8.2, monorepo#3586) shapes the
+        // `added`/`updated` delta re-reads like the seq-0 snapshot: `content`
+        // omitted, `contentPreview` (500 chars) + `contentLength` in its
+        // place; full (None) keeps the complete wire Note.
+        let mut note = note_with(None);
+        note.content = "x".repeat(1000);
+        let api = StaticNoteApi::new(Some(note));
+        for (event_type, key) in [(NOTE_CREATED, "added"), (NOTE_UPDATED, "updated")] {
+            let delta = note_delta(
+                &api,
+                &ws(),
+                &note_event(event_type, "n-1"),
+                Some(NoteListProjection::Slim),
+            )
+            .await
+            .expect("delta");
+            let row = &delta[key][0];
+            assert!(row.get("content").is_none(), "slim omits content: {row}");
+            assert_eq!(row["contentPreview"].as_str().map(str::len), Some(500));
+            assert_eq!(row["contentLength"].as_i64(), Some(1000));
+        }
+        let delta = note_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"), None)
+            .await
+            .expect("delta");
+        let row = &delta["updated"][0];
+        assert_eq!(row["content"].as_str().map(str::len), Some(1000));
+        assert!(row.get("contentPreview").is_none(), "full row: {row}");
+    }
+
+    #[tokio::test]
     async fn note_updated_emits_removed_ids_when_task_was_demoted() {
         // The re-read note no longer projects a task → the delta must remove it
         // from every subscribed task list.
@@ -1922,6 +2111,7 @@ mod chat_snapshot_bounded {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             // The snapshot must ask for the newest page (no cursor) and must
@@ -2086,6 +2276,7 @@ mod chat_snapshot_bounded {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             self.seen.lock().unwrap().push(projection);
             Box::pin(async move {
@@ -2159,6 +2350,7 @@ mod chat_message_delta {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.projections.lock().unwrap().push(projection);
@@ -2569,6 +2761,7 @@ mod chat_snapshot_interrupt_window {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             let flushed = self.phase() == Phase::Flushed;
             Box::pin(async move {
@@ -2640,6 +2833,7 @@ mod chat_snapshot_interrupt_window {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2695,6 +2889,7 @@ mod chat_snapshot_interrupt_window {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2753,6 +2948,7 @@ mod chat_snapshot_interrupt_window {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -3010,6 +3206,7 @@ mod chat_terminal_message_id_fallback {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();
@@ -3219,6 +3416,7 @@ mod chat_terminal_reconcile_failure {
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
             _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
         ) -> BoxFuture<'_, Result<Value>> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();

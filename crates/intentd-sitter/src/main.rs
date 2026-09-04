@@ -7,12 +7,15 @@
 //! crashes. One-shot subcommands run the installed daemon exactly once with
 //! no updater activity. The intercepted `intentd sitter channel`,
 //! `intentd restart`, and `intentd update` commands are handled entirely
-//! here — they never spawn the daemon.
+//! here — they never spawn a serving daemon (`update` only probes readiness
+//! with one-shot `call system.status` invocations after a restart).
 
 use intentd_sitter::cli::{self, SitterArgs, SitterCommand};
 use intentd_sitter::config;
 use intentd_sitter::manifest;
 use intentd_sitter::paths::SitterPaths;
+#[cfg(unix)]
+use intentd_sitter::readiness;
 use intentd_sitter::supervisor::{self, SupervisorConfig, MANIFEST_BASE_URL_ENV};
 use intentd_sitter::updater::{UpdateCheck, UpdateOutcome, Updater};
 
@@ -179,7 +182,11 @@ fn run_channel_command(
 /// from the channel the running service follows (config pin > stable
 /// default — service definitions pass no flag or env): silently restarting
 /// a stable-pinned service onto a beta binary would put it on the wrong
-/// channel.
+/// channel. After a restart the command blocks until the new daemon answers
+/// on the socket (see [`wait_for_restarted_daemon`]) and exits nonzero if it
+/// does not within the readiness budget — the install itself has already
+/// succeeded at that point, so scripts must read a nonzero exit as "not
+/// confirmed up", not "not installed".
 fn run_update_command(
     check: bool,
     args: &SitterArgs,
@@ -245,7 +252,7 @@ fn run_update_command(
                 );
                 return 0;
             }
-            apply_installed_update(paths)
+            apply_installed_update(paths, &version)
         }
         Err(e) => {
             eprintln!("intentd-sitter: update on channel {channel} failed: {e}");
@@ -268,10 +275,13 @@ fn send_sighup_to_sitter(pid: nix::unistd::Pid) -> i32 {
 }
 
 /// Activate a freshly installed daemon: when a supervised serve-mode sitter
-/// is running, SIGHUP it so it respawns on the new version now; otherwise
-/// the new binary simply takes effect on the next start.
+/// is running, SIGHUP it so it respawns on the new version now — then wait
+/// for the restarted daemon to answer on the socket before returning, so a
+/// chained command (`intentd update && intentd pair`) doesn't race the
+/// restart window (intent-hq/intent#4276). No running daemon means nothing
+/// was restarted, so nothing to wait for.
 #[cfg(unix)]
-fn apply_installed_update(paths: &SitterPaths) -> i32 {
+fn apply_installed_update(paths: &SitterPaths, version: &str) -> i32 {
     let Some(pid) = supervisor::read_live_pid(&paths.pid_path) else {
         println!(
             "no running supervised intentd found; the new version takes \
@@ -279,13 +289,55 @@ fn apply_installed_update(paths: &SitterPaths) -> i32 {
         );
         return 0;
     };
-    send_sighup_to_sitter(pid)
+    let code = send_sighup_to_sitter(pid);
+    if code != 0 {
+        return code;
+    }
+    wait_for_restarted_daemon(paths, version)
+}
+
+/// Block until the daemon restarted by [`apply_installed_update`] reports
+/// `version` via `system.status` (probed through the freshly installed
+/// binary, distinguishing the new daemon from the old one still shutting
+/// down). Nonzero with guidance on timeout.
+#[cfg(unix)]
+fn wait_for_restarted_daemon(paths: &SitterPaths, version: &str) -> i32 {
+    let timeout = readiness::timeout_from_env();
+    println!(
+        "waiting for the daemon to respond (up to {}s)...",
+        timeout.as_secs()
+    );
+    let binary = paths.daemon_binary(version);
+    match readiness::wait_for_version(version, timeout, readiness::DEFAULT_POLL_INTERVAL, || {
+        readiness::probe_daemon_version(&binary)
+    }) {
+        readiness::WaitOutcome::Ready => {
+            println!("daemon is up — intentd {version} is responding");
+            0
+        }
+        readiness::WaitOutcome::TimedOut { last_seen } => {
+            let still = match last_seen {
+                Some(last) => format!(" (a daemon still answers as intentd {last})"),
+                None => String::new(),
+            };
+            eprintln!(
+                "intentd-sitter: intentd {version} was installed and the restart \
+                 was requested, but the daemon has not come back as intentd \
+                 {version} within {}s{still}; the install is done — re-running \
+                 `intentd update` will not help. Check `intentd status` and the \
+                 service (`systemctl --user status intentd` / \
+                 `brew services info intentd`)",
+                timeout.as_secs()
+            );
+            1
+        }
+    }
 }
 
 /// No SIGHUP on windows: the new binary takes effect on the next (service)
 /// restart instead.
 #[cfg(not(unix))]
-fn apply_installed_update(_paths: &SitterPaths) -> i32 {
+fn apply_installed_update(_paths: &SitterPaths, _version: &str) -> i32 {
     println!("restart the intentd service to start using the new version");
     0
 }

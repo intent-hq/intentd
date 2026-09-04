@@ -382,6 +382,89 @@ async fn workspace_update_emits_workspace_updated_over_wss() {
     );
 }
 
+/// End-to-end: `file-tracking.getAgentLocks` over WSS returns the daemon's
+/// agent-lock snapshot (§5.19), and toggling the workspace auto-commit policy
+/// republishes `changes:agent-locks` (§6.5) so a subscribed client tracks the
+/// lock state without polling.
+#[tokio::test]
+async fn agent_locks_read_and_event_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let _ = &daemon;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Locks", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Hydration read: fresh workspace has no tracked changes, so the snapshot
+    // is empty with the schema-default auto-commit (enabled).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let locks = wss_rpc(
+        &mut rpc,
+        2,
+        "file-tracking.getAgentLocks",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(locks["autoCommitEnabled"], json!(true), "locks: {locks}");
+    assert_eq!(locks["lockedAgentIds"], json!([]));
+    assert_eq!(locks["lockedFilePaths"], json!([]));
+
+    // Missing workspaceId is an invalid-params error, not a fallback.
+    let err = wss_rpc_envelope(&mut rpc, 3, "file-tracking.getAgentLocks", json!({})).await;
+    assert_eq!(err["error"]["code"], json!(-32602), "envelope: {err}");
+
+    // Subscribe, then flip the workspace auto-commit policy: the agent-locks
+    // worker recomputes and publishes the changed (auto-commit off) snapshot.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["changes:agent-locks"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    wss_rpc(
+        &mut rpc,
+        4,
+        "workspace.setAutoCommit",
+        json!({ "workspaceId": ws_id, "enabled": false }),
+    )
+    .await;
+
+    let evt = next_event(&mut sub, &["changes:agent-locks"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        evt["data"],
+        json!({
+            "workspaceId": ws_id,
+            "autoCommitEnabled": false,
+            "lockedAgentIds": [],
+            "lockedFilePaths": [],
+        })
+    );
+
+    // The read agrees with the pushed snapshot.
+    let locks = wss_rpc(
+        &mut rpc,
+        5,
+        "file-tracking.getAgentLocks",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(locks["autoCommitEnabled"], json!(false));
+}
+
 /// End-to-end: `workspace.delete` over WSS publishes `workspace:deleted` with
 /// the minimal `{ workspaceId }` payload (§6.5). The event fires only after
 /// the store row is actually removed.
@@ -881,6 +964,14 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!(task_id),
         "assign updated: {evt}"
     );
+    // The in_progress status materializes onto the parent's linked checkbox
+    // line (`[ ]` → `[/]`), which takes its own `note:updated`.
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(parent_id),
+        "parent materialized: {evt}"
+    );
 
     let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
     assert_eq!(evt["data"]["noteId"], json!(task_id));
@@ -920,6 +1011,64 @@ async fn task_block_author_list_assign_flow_over_wss() {
     )
     .await;
     assert_eq!(got["task"]["status"], json!("in_progress"), "task: {got}");
+
+    // The parent's linked row now reads the materialized in-progress char.
+    let tasks = wss_rpc(
+        &mut rpc,
+        6,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    assert_eq!(tasks[0]["status"], json!("in-progress"), "rows: {tasks}");
+    assert_eq!(tasks[0]["taskNoteId"], json!(task_id));
+
+    // Complete: a checkbox-level write on the parent's linked line redirects
+    // to the task note (intent-hq/intent#4255) — the task transitions
+    // in_progress → complete and the parent char follows via materialization.
+    let done = wss_rpc(
+        &mut rpc,
+        7,
+        "task.updateStatus",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": parent_id,
+            "taskText": "Ship It",
+            "status": "done",
+        }),
+    )
+    .await;
+    assert_eq!(
+        done,
+        json!({ "ok": true, "noteId": parent_id, "taskText": "Ship It", "status": "done" }),
+        "updateStatus: {done}"
+    );
+    let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
+    assert_eq!(evt["data"]["noteId"], json!(task_id), "redirected: {evt}");
+    assert_eq!(evt["data"]["previousStatus"], json!("in_progress"));
+    assert_eq!(evt["data"]["newStatus"], json!("complete"));
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(parent_id),
+        "parent materialized: {evt}"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        8,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": task_id }),
+    )
+    .await;
+    assert_eq!(got["task"]["status"], json!("complete"), "task: {got}");
+    let tasks = wss_rpc(
+        &mut rpc,
+        9,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    assert_eq!(tasks[0]["status"], json!("done"), "rows: {tasks}");
 }
 
 /// End-to-end `task:created` over WSS (docs/protocol/06-events.md §6.5): every path where a
@@ -1176,6 +1325,68 @@ async fn note_list_reseeds_missing_spec_over_wss() {
     assert!(
         extra.is_err(),
         "reseed must publish exactly one note:created, got extra: {extra:?}"
+    );
+}
+
+/// Regression guard for monorepo#3404 over the wire: `note.list` for a
+/// workspace that does not exist (deleted, or never created) returns the
+/// standard not-found error envelope (`-32602` with `error.data.code:
+/// "not-found"`, §9) instead of a best-effort empty list — the spec reseed
+/// verifies the workspace row before attempting any INSERT, so no raw FK
+/// violation is logged and no `note:created` is emitted.
+#[tokio::test]
+async fn note_list_unknown_workspace_not_found_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    // Bootstrap then delete a workspace off the UDS so the WSS call runs
+    // against a genuinely-deleted row (the shape from the issue: a client
+    // holding a stale workspace id across a deletion).
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "GoneSoon", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let del = uds_rpc(
+        &socket,
+        3,
+        "workspace.delete",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(del.get("error").is_none(), "workspace.delete: {del}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Deleted workspace: standard not-found error envelope.
+    let stale = wss_rpc_envelope(&mut rpc, 4, "note.list", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(stale["jsonrpc"], json!("2.0"));
+    assert_eq!(stale["error"]["code"], json!(-32602), "{stale}");
+    assert_eq!(
+        stale["error"]["data"]["code"],
+        json!("not-found"),
+        "{stale}"
+    );
+
+    // Never-existed workspace id: same envelope.
+    let missing = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "note.list",
+        json!({ "workspaceId": "ws_does_not_exist" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], json!(-32602), "{missing}");
+    assert_eq!(
+        missing["error"]["data"]["code"],
+        json!("not-found"),
+        "{missing}"
     );
 }
 
@@ -4225,4 +4436,178 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
         json!([gamma_id]),
         "seeded dep: {got}"
     );
+}
+
+/// Regression for monorepo#3586 over the real WSS wire: the `note.subscribe`
+/// seq-0 snapshot (and note-channel deltas) serialized FULL note rows, so a
+/// client that adopted `projection: "slim"` on `note.list` (v8.1,
+/// monorepo#3573) to stay under the 1 MiB outbound cap still received
+/// full-content frames on the subscription surface. `projection: "slim"` on
+/// `note.subscribe` (v8.2) serves the same bounded rows — `content` omitted,
+/// replaced by `contentPreview` (500 chars) + `contentLength` — on the
+/// snapshot AND every `added` / `updated` delta; the default (absent /
+/// `null` / `"full"`) stays full rows byte-identical to before, and any
+/// other value is `-32602`, mirroring `note.list`.
+#[tokio::test]
+async fn note_subscribe_slim_projection_bounds_snapshot_and_deltas() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        1,
+        "workspace.create",
+        json!({ "title": "SlimSub", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // One giant note (~1.1 MiB) reproduces the oversized-frame report.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let big = "x".repeat(1_100_000);
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Giant", "content": big }),
+    )
+    .await;
+    let giant_id = created["note"]["id"].as_str().expect("note id").to_string();
+
+    // Any projection value other than absent/null/"full"/"slim" is -32602.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let bad = wss_rpc_envelope(
+        &mut sub,
+        1,
+        "note.subscribe",
+        json!({ "workspaceId": ws_id, "projection": "bogus" }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    // Slim subscribe: seq-0 snapshot rows are bounded.
+    let slim_res = wss_rpc(
+        &mut sub,
+        2,
+        "note.subscribe",
+        json!({ "workspaceId": ws_id, "projection": "slim" }),
+    )
+    .await;
+    assert!(slim_res["subscriptionId"].is_string(), "sub: {slim_res}");
+    let push = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(push["kind"], json!("snapshot"), "push kind");
+    let snap = push["snapshot"].as_array().expect("snapshot array");
+    let giant = snap
+        .iter()
+        .find(|n| n["id"] == json!(giant_id))
+        .expect("giant note in snapshot");
+    assert!(
+        giant.get("content").is_none(),
+        "slim snapshot omits content: {giant}"
+    );
+    assert_eq!(
+        giant["contentPreview"].as_str().map(str::len),
+        Some(500),
+        "preview bounded: {giant}"
+    );
+    assert_eq!(giant["contentLength"].as_i64(), Some(1_100_000));
+    let frame = serde_json::to_string(&push).expect("serialize");
+    assert!(
+        frame.len() < 256 * 1024,
+        "slim snapshot stays bounded: {} bytes",
+        frame.len()
+    );
+
+    // `added` delta (note:created re-read) is slim too.
+    let big2 = "y".repeat(1_100_000);
+    let created2 = wss_rpc(
+        &mut rpc,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Giant2", "content": big2 }),
+    )
+    .await;
+    let second_id = created2["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    let added = 'added: loop {
+        let push = next_subscription_push(&mut sub, 10).await;
+        assert_eq!(push["kind"], json!("delta"), "push: {push}");
+        if let Some(rows) = push["delta"]["added"].as_array() {
+            for row in rows {
+                if row["id"] == json!(second_id) {
+                    break 'added row.clone();
+                }
+            }
+        }
+    };
+    assert!(
+        added.get("content").is_none(),
+        "slim added delta omits content: {added}"
+    );
+    assert_eq!(
+        added["contentPreview"].as_str().map(str::len),
+        Some(500),
+        "added preview bounded: {added}"
+    );
+    assert_eq!(added["contentLength"].as_i64(), Some(1_100_000));
+
+    // `updated` delta (note:updated re-read) is slim too.
+    let big3 = "z".repeat(1_100_000);
+    wss_rpc(
+        &mut rpc,
+        4,
+        "note.setContent",
+        json!({ "workspaceId": ws_id, "noteId": giant_id, "content": big3 }),
+    )
+    .await;
+    let updated = 'updated: loop {
+        let push = next_subscription_push(&mut sub, 10).await;
+        assert_eq!(push["kind"], json!("delta"), "push: {push}");
+        if let Some(rows) = push["delta"]["updated"].as_array() {
+            for row in rows {
+                if row["id"] == json!(giant_id) {
+                    break 'updated row.clone();
+                }
+            }
+        }
+    };
+    assert!(
+        updated.get("content").is_none(),
+        "slim updated delta omits content: {updated}"
+    );
+    assert_eq!(
+        updated["contentPreview"].as_str().map(str::len),
+        Some(500),
+        "updated preview bounded: {updated}"
+    );
+    assert_eq!(updated["contentLength"].as_i64(), Some(1_100_000));
+
+    // Default (absent projection): full rows, complete content intact — the
+    // pre-8.2 wire shape for existing clients. Explicit "full" matches.
+    for (id, params) in [
+        (1, json!({ "workspaceId": ws_id })),
+        (2, json!({ "workspaceId": ws_id, "projection": "full" })),
+    ] {
+        let mut full_sub = connect_ws(port, cfg.clone()).await;
+        let res = wss_rpc(&mut full_sub, id, "note.subscribe", params).await;
+        assert!(res["subscriptionId"].is_string(), "sub: {res}");
+        let push = next_subscription_push(&mut full_sub, 10).await;
+        assert_eq!(push["kind"], json!("snapshot"), "push kind");
+        let snap = push["snapshot"].as_array().expect("snapshot array");
+        let giant = snap
+            .iter()
+            .find(|n| n["id"] == json!(giant_id))
+            .expect("giant note in snapshot");
+        assert_eq!(
+            giant["content"].as_str().map(str::len),
+            Some(1_100_000),
+            "full snapshot keeps content"
+        );
+        assert!(giant.get("contentPreview").is_none(), "no preview: {giant}");
+    }
 }

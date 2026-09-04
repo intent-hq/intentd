@@ -12,7 +12,7 @@
 //! Deliberately excluded from this schema:
 //! - **Secrets** (`mcp.servers`, `server.auth.token`, `sourceControl.github.
 //!   token`, `linear.token`, `accounts.sentry.token`) — they
-//!   live in `secrets.json` ([`crate::FileSecretStore`]) and must never
+//!   live in `.secrets.json` ([`crate::FileSecretStore`]) and must never
 //!   appear in `config.toml`.
 //! - **Machine-state blobs** (`workspace.changeHistory`,
 //!   `workspaceInitializer.state`, `hardwareConsole.state`, `repos.known`,
@@ -35,12 +35,13 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS,
+    ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN, DEFAULT_HOOKS_MAX_PER_AGENT,
+    DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
     DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_POLL_SECONDS,
-    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
-    MAX_CONCURRENT_ADAPTERS_LIMIT,
+    DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT, MAX_CONCURRENT_ADAPTERS_LIMIT,
 };
 use crate::error::{Error, Result};
 
@@ -79,7 +80,9 @@ pub struct SettingsFile {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProvidersSettings {
-    /// `providers.active` — default agent provider.
+    /// `providers.active` — deprecated legacy default-provider key, superseded
+    /// by `model.defaultProvider`. Still parsed so an upgraded config loads,
+    /// but the boot migration carries it over and removes it from the file.
     pub active: Option<String>,
     /// `providers.enabled` — providers offered to users (id → enabled).
     pub enabled: Option<BTreeMap<String, bool>>,
@@ -93,8 +96,14 @@ pub struct ProvidersSettings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ModelSettings {
-    /// `model.default` — fallback model for new agents.
+    /// `model.default` — fallback model for new agents (a bare model id;
+    /// pair with `model.defaultProvider`).
     pub default: Option<String>,
+    /// `model.defaultProvider` — the provider leg of the default-model
+    /// triple: the provider new agents run on when none is requested
+    /// explicitly. A blank value reads as unset.
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub default_provider: Option<String>,
     /// `model.providerDefaults` — default model per provider.
     pub provider_defaults: BTreeMap<String, String>,
     /// `model.defaultReasoningEffort` — fallback reasoning effort for new
@@ -128,6 +137,11 @@ pub struct QuickActionsSettings {
 pub struct SpecialistsSettings {
     /// `specialists.default` — specialist applied when none is chosen.
     pub default: Option<String>,
+    /// `specialists.dir` — base specialist directory replacing the built-in
+    /// set. Read-only on the wire: it takes a value via the
+    /// `INTENTD_SPECIALISTS_DIR` startup pin (or `--specialists-dir`), else a
+    /// file-written `[specialists] dir` in config.toml.
+    pub dir: Option<String>,
 }
 
 /// `[workspace]` — workspace/git-adjacent knobs (`workspace.*`).
@@ -301,7 +315,7 @@ pub struct MicrovmImageOverride {
 }
 
 /// `[mcp]` — MCP server lifecycle knobs (`mcp.*`). The server catalog itself
-/// (`mcp.servers`) is a secret and lives in `secrets.json`.
+/// (`mcp.servers`) is a secret and lives in `.secrets.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct McpSettings {
@@ -355,17 +369,136 @@ pub struct RtkSettings {
     pub enabled: bool,
 }
 
+/// `server.bindAddress` — a single IP string (back-compat) or a list of IP
+/// strings, so selected interfaces (e.g. LAN + Tailscale) can be bound
+/// without resorting to `0.0.0.0` (monorepo#3314). Serializes back to the
+/// shape it was written in (`One` → string, `Many` → array).
+///
+/// Shape-only at the type level: [`BindAddress::resolve`] performs the
+/// semantic validation (every entry a valid IP; no duplicates; an
+/// unspecified `0.0.0.0`/`::` only allowed alone), which
+/// [`SettingsFile::validate`] enforces at parse/write time.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum BindAddress {
+    /// The historical single-string form (`bindAddress = "127.0.0.1"`).
+    One(String),
+    /// The list form (`bindAddress = ["192.168.1.7", "100.64.0.3"]`).
+    Many(Vec<String>),
+}
+
+impl Default for BindAddress {
+    fn default() -> Self {
+        BindAddress::One("127.0.0.1".to_string())
+    }
+}
+
+// Manual visitor instead of `#[serde(untagged)]` deserialize so a wrong type
+// still yields a precise "expected …" message (untagged buffering reports
+// only "data did not match any variant").
+impl<'de> Deserialize<'de> for BindAddress {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BindAddressVisitor;
+        impl<'de> serde::de::Visitor<'de> for BindAddressVisitor {
+            type Value = BindAddress;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an IP address string or an array of IP address strings")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(BindAddress::One(v.to_string()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = seq.next_element::<String>()? {
+                    entries.push(entry);
+                }
+                Ok(BindAddress::Many(entries))
+            }
+        }
+        deserializer.deserialize_any(BindAddressVisitor)
+    }
+}
+
+impl BindAddress {
+    /// The raw configured entries, list-shaped regardless of the input form.
+    #[must_use]
+    pub fn entries(&self) -> &[String] {
+        match self {
+            BindAddress::One(s) => std::slice::from_ref(s),
+            BindAddress::Many(v) => v.as_slice(),
+        }
+    }
+
+    /// Parse + semantically validate the configured entries into the bind
+    /// set: every entry must be a valid IP, duplicates are rejected, an
+    /// unspecified address (`0.0.0.0` / `::`) is only allowed as the sole
+    /// entry, and the list form must not be empty. Entries are canonicalized
+    /// (v4-mapped IPv6 → IPv4), so `::ffff:127.0.0.1` duplicates `127.0.0.1`
+    /// instead of colliding at bind time on dual-stack hosts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message (no key prefix — callers name the
+    /// key) describing the first violation.
+    pub fn resolve(&self) -> std::result::Result<Vec<std::net::IpAddr>, String> {
+        let entries = self.entries();
+        if entries.is_empty() {
+            return Err("must list at least one IP address".to_string());
+        }
+        let mut addrs: Vec<std::net::IpAddr> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let addr: std::net::IpAddr = entry.parse().map_err(|_| {
+                format!("must be an IP address (e.g. 127.0.0.1 or 0.0.0.0), got {entry:?}")
+            })?;
+            let addr = addr.to_canonical();
+            if addrs.contains(&addr) {
+                return Err(format!("duplicate address {addr}"));
+            }
+            addrs.push(addr);
+        }
+        if addrs.len() > 1 {
+            if let Some(wide) = addrs.iter().find(|a| a.is_unspecified()) {
+                return Err(format!(
+                    "unspecified address {wide} binds every interface and must be the only entry"
+                ));
+            }
+        }
+        Ok(addrs)
+    }
+}
+
+impl std::fmt::Display for BindAddress {
+    /// Comma-separated entries (`"127.0.0.1"` / `"192.168.1.7, 100.64.0.3"`)
+    /// for log and warning messages.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.entries().join(", "))
+    }
+}
+
 /// `[server]` — transport/listener config (`server.*`). The bearer token
-/// (`server.auth.token`) is a secret and lives in `secrets.json`.
+/// (`server.auth.token`) is a secret and lives in `.secrets.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServerSettings {
     /// `server.socketPath` — Unix socket path for the UDS listener.
     pub socket_path: Option<String>,
-    /// `server.bindAddress` — address the TCP listener binds. Defaults to
-    /// loopback (`127.0.0.1`); set `0.0.0.0` to expose the listener on every
-    /// interface, including untrusted networks.
-    pub bind_address: String,
+    /// `server.bindAddress` — address(es) the TCP listener binds: a single IP
+    /// string or a list of IP strings (one listener per address, same port).
+    /// Defaults to loopback (`127.0.0.1`); set `0.0.0.0` to expose the
+    /// listener on every interface, including untrusted networks.
+    pub bind_address: BindAddress,
     /// `server.port` — TCP port for the WSS listener (1024–65535).
     pub port: u16,
     /// `server.originAllowList` — permitted WS origins.
@@ -375,6 +508,8 @@ pub struct ServerSettings {
     pub max_outstanding_rpcs: u32,
     /// `[server.wsApi]` — WSS API listener runtime toggle.
     pub ws_api: WsApiSettings,
+    /// `[server.tunnel]` — tailcat tunnel sidecar (`server.tunnel.*`).
+    pub tunnel: TunnelSettings,
     /// `[server.tls]` — TLS for the TCP listener.
     pub tls: TlsSettings,
     /// `[server.auth]` — bearer-token auth on TCP.
@@ -385,11 +520,12 @@ impl Default for ServerSettings {
     fn default() -> Self {
         Self {
             socket_path: None,
-            bind_address: "127.0.0.1".to_string(),
+            bind_address: BindAddress::default(),
             port: 5181,
             origin_allow_list: None,
             max_outstanding_rpcs: DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
             ws_api: WsApiSettings::default(),
+            tunnel: TunnelSettings::default(),
             tls: TlsSettings::default(),
             auth: AuthSettings::default(),
         }
@@ -415,6 +551,24 @@ impl Default for WsApiSettings {
     }
 }
 
+/// `[server.tunnel]` — tailcat tunnel sidecar (`server.tunnel.*`). When
+/// enabled and the WSS listener is up, the daemon supervises a bundled
+/// `tailcat` process that forwards tunnel traffic to the local WSS port,
+/// giving the daemon a stable `tc...` address across restarts (the tailcat
+/// key is persisted in the data dir).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct TunnelSettings {
+    /// `server.tunnel.enabled` — run the tailcat tunnel sidecar.
+    pub enabled: bool,
+    /// `server.tunnel.derpUrl` — optional self-hosted DERP relay URL; empty
+    /// means tailcat's default relay.
+    pub derp_url: Option<String>,
+    /// `server.tunnel.only` — accept tunnel-forwarded traffic only: the WSS
+    /// listener binds loopback, refusing direct LAN connections.
+    pub only: bool,
+}
+
 /// `[server.tls]` — TLS toggle (`server.tls.*`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -438,7 +592,7 @@ impl Default for AuthSettings {
 }
 
 /// `[sourceControl]` — forge integration (`sourceControl.*`). The GitHub PAT
-/// (`sourceControl.github.token`) is a secret and lives in `secrets.json`.
+/// (`sourceControl.github.token`) is a secret and lives in `.secrets.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SourceControlSettings {
@@ -504,7 +658,7 @@ pub enum GithubTokenSource {
 }
 
 /// `[accounts]` — external account config (`accounts.*`). The Sentry API
-/// token (`accounts.sentry.token`) is a secret and lives in `secrets.json`.
+/// token (`accounts.sentry.token`) is a secret and lives in `.secrets.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AccountsSettings {
@@ -523,7 +677,7 @@ pub struct SentrySettings {
 
 /// `[voice]` — speech-to-text (`voice.*`). The provider API keys
 /// (`voice.elevenlabs.apiKey`, `voice.openai.apiKey`) are secrets and live in
-/// `secrets.json`.
+/// `.secrets.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct VoiceSettings {
@@ -549,7 +703,7 @@ pub enum VoiceProvider {
 }
 
 /// `[voice.openai]` — `OpenAI` speech-to-text tuning (`voice.openai.*`,
-/// non-secret; the API key is a secret in `secrets.json`).
+/// non-secret; the API key is a secret in `.secrets.json`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct VoiceOpenAiSettings {
@@ -669,6 +823,16 @@ pub struct AgentsSettings {
     /// positive = budget in MB (changes apply on daemon restart; max
     /// 1,024,000).
     pub memory_budget_mb: Option<u32>,
+    /// `agents.acpNodeMaxOldSpaceMb` — V8 `--max-old-space-size` cap in MB
+    /// injected via `NODE_OPTIONS` into Node/Electron ACP provider processes.
+    /// Absent (`None`, the default) = [`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB`]
+    /// (8192); an explicit value must lie within
+    /// [`ACP_NODE_MAX_OLD_SPACE_MB_MIN`]–[`ACP_NODE_MAX_OLD_SPACE_MB_MAX`].
+    /// Applies to newly started agent processes; the
+    /// `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var overrides it.
+    ///
+    /// [`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB`]: crate::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB
+    pub acp_node_max_old_space_mb: Option<u32>,
     /// `agents.maxConcurrentAdapters` — daemon-wide cap on concurrently live
     /// ephemeral ACP adapters (one-shot `agent.completeOnce` completions and
     /// model probes; changes apply on daemon restart; range 1–64). Unlike
@@ -677,9 +841,21 @@ pub struct AgentsSettings {
     /// agent slot, so removing the ceiling is exactly the failure being
     /// fixed (monorepo#2062).
     pub max_concurrent_adapters: u32,
+    /// `agents.maxTopLevelAgents` — cap on live top-level (parentless)
+    /// agents per workspace, enforced on the top-level-create path
+    /// (`ws.agent.create({ topLevel: true })`) as the runaway-spawn guard;
+    /// user/FE-created agents are never blocked by it (minimum 1; no
+    /// unlimited value).
+    pub max_top_level_agents: u32,
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
+    /// `agents.reportToParentDebounceSeconds` — grace window in seconds
+    /// before an ungrouped child's `reportToParent` wake is delivered to the
+    /// parent, so a child that finishes its turn within the window produces
+    /// one combined wake instead of two (0 disables the debounce — legacy
+    /// immediate wake; read live per call, no restart required).
+    pub report_to_parent_debounce_seconds: u32,
     /// `agents.flushQueuedMessages` — how the whole queued-message backlog
     /// is delivered when an idle agent drains its queue: `all` batches every
     /// ready entry into one turn, `systemOnly` batches only system-origin
@@ -699,8 +875,11 @@ impl Default for AgentsSettings {
         Self {
             max_concurrent: 0,
             memory_budget_mb: None,
+            acp_node_max_old_space_mb: None,
             max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
+            max_top_level_agents: DEFAULT_MAX_TOP_LEVEL_AGENTS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
+            report_to_parent_debounce_seconds: DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
             flush_queued_messages: FlushQueuedMessagesMode::All,
             resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
         }
@@ -708,7 +887,9 @@ impl Default for AgentsSettings {
 }
 
 /// `agents.resumeInterruptedOnStart` values. Serializes as lowercase strings
-/// (`"auto"`, `"on"`, `"off"`).
+/// (`"auto"`, `"on"`, `"off"`). Governs plain starts only: update-triggered
+/// restarts (the sitter respawning a freshly installed version, signaled via
+/// `INTENTD_UPDATE_RESTART=1`) always resume, regardless of this setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResumeInterruptedOnStart {
@@ -717,7 +898,8 @@ pub enum ResumeInterruptedOnStart {
     Auto,
     /// Always resume interrupted agents at startup.
     On,
-    /// Never resume interrupted agents at startup.
+    /// Never resume interrupted agents at startup (except update-triggered
+    /// restarts, which always resume).
     Off,
 }
 
@@ -833,8 +1015,8 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on**; changes apply to new agent
-/// sessions only.
+/// (`agentFeatures.*`). All default **on** except the opt-in `peerAgents`;
+/// changes apply to new agent sessions only.
 // One bool per independent settings toggle; the flat shape IS the settings
 // file contract.
 #[allow(clippy::struct_excessive_bools)]
@@ -885,6 +1067,15 @@ pub struct AgentFeaturesSettings {
     /// Defaults **on** like the other toggles (originally opt-in —
     /// intent-hq/monorepo#2445 — before the default flipped).
     pub task_graph: bool,
+    /// `agentFeatures.peerAgents` — expose independent top-level-agent
+    /// creation (`ws.agent.create({ topLevel: true })`) to agents. Defaults
+    /// **off** (opt-in), unlike the other toggles.
+    pub peer_agents: bool,
+    /// `agentFeatures.mcpTools` — expose the user's external MCP servers'
+    /// tools to agents (`ws.mcp.*`). Unlike the prompt-gating toggles, this
+    /// is also enforced server-side on every forwarded call, reading the
+    /// live setting.
+    pub mcp_tools: bool,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -901,6 +1092,8 @@ impl Default for AgentFeaturesSettings {
             state_snapshot: true,
             pr_monitor: true,
             task_graph: true,
+            peer_agents: false,
+            mcp_tools: true,
         }
     }
 }
@@ -1040,6 +1233,11 @@ impl SettingsFile {
                 Error::InvalidInput(format!("invalid config.toml at `{key_path}`: {detail}"))
             }
         })?;
+        // Normalize BEFORE validating so semantic checks (present and
+        // future) always observe split values — the same shape every
+        // downstream consumer sees.
+        let mut file = file;
+        file.normalize_legacy_compounds();
         file.validate()?;
         Ok(file)
     }
@@ -1085,8 +1283,60 @@ impl SettingsFile {
                     Error::InvalidInput(format!("invalid config.toml at `{key_path}`: {detail}"))
                 }
             })?;
+        // Normalize before validating — see `parse_str`.
+        let mut file = file;
+        file.normalize_legacy_compounds();
         file.validate()?;
         Ok((file, legacy))
+    }
+
+    /// Normalize legacy compound `provider:model` values on read (the
+    /// settings model triple): user-authored TOML that predates the bare-id
+    /// wire contract is split, never rejected.
+    ///
+    /// - A compound `model.default` splits at the first `:`: the prefix
+    ///   fills `model.defaultProvider` when that key is unset (an explicit
+    ///   split-form value always wins), the remainder becomes the bare
+    ///   `model.default`. Blank halves read as unset.
+    /// - A `model.providerDefaults` entry whose value carries its own map
+    ///   key as the prefix (`codex = "codex:gpt-5"`) is stripped to the bare
+    ///   id, with both halves trimmed exactly like `model.default`; a blank
+    ///   remainder (`codex = "codex:"`) reads as unset (the entry is
+    ///   removed). A foreign prefix is left as-is — the read-side ownership
+    ///   guards drop it per use, exactly like any other foreign model id.
+    ///
+    /// Runs in both parse entry points BEFORE `validate()`, so semantic
+    /// validation and every layer built on a parsed file (registry
+    /// snapshots, effective JSON, consumers) observe only split values; a
+    /// legacy file behaves identically to its split form. The on-disk TOML
+    /// is deliberately NOT rewritten.
+    fn normalize_legacy_compounds(&mut self) {
+        if let Some((provider, model)) = self
+            .model
+            .default
+            .as_deref()
+            .and_then(|raw| raw.split_once(':'))
+        {
+            let provider = provider.trim();
+            let model = model.trim();
+            if self.model.default_provider.is_none() && !provider.is_empty() {
+                self.model.default_provider = Some(provider.to_string());
+            }
+            self.model.default = (!model.is_empty()).then(|| model.to_string());
+        }
+        for (provider, value) in &mut self.model.provider_defaults {
+            if let Some(rest) = value
+                .trim()
+                .strip_prefix(provider.as_str())
+                .map(str::trim_start)
+                .and_then(|r| r.strip_prefix(':'))
+            {
+                *value = rest.trim().to_string();
+            }
+        }
+        // A stripped-to-blank remainder reads as unset, mirroring
+        // `model.default = "codex:"`.
+        self.model.provider_defaults.retain(|_, v| !v.is_empty());
     }
 
     /// Range/semantic checks the type system cannot express. Errors name the
@@ -1121,22 +1371,12 @@ impl SettingsFile {
                 ),
             ));
         }
-        // Reject non-IP bind addresses at write time (settings.update
+        // Reject invalid bind sets at write time (settings.update
         // re-validates through here) instead of deferring the failure to the
-        // next listener start (monorepo#2900 review).
-        if self
-            .server
-            .bind_address
-            .parse::<std::net::IpAddr>()
-            .is_err()
-        {
-            return Err(bad(
-                "server.bindAddress",
-                &format!(
-                    "must be an IP address (e.g. 127.0.0.1 or 0.0.0.0), got {:?}",
-                    self.server.bind_address
-                ),
-            ));
+        // next listener start (monorepo#2900 review): every entry a valid IP,
+        // no duplicates, unspecified (0.0.0.0/::) only alone (monorepo#3314).
+        if let Err(msg) = self.server.bind_address.resolve() {
+            return Err(bad("server.bindAddress", &msg));
         }
         // Mirrors the catalog bound so a hand-edited config.toml cannot boot a
         // cap the `settings.update` RPC would have rejected (`0` = unlimited).
@@ -1166,6 +1406,17 @@ impl SettingsFile {
                 ));
             }
         }
+        if let Some(mb) = self.agents.acp_node_max_old_space_mb {
+            if !(ACP_NODE_MAX_OLD_SPACE_MB_MIN..=ACP_NODE_MAX_OLD_SPACE_MB_MAX).contains(&mb) {
+                return Err(bad(
+                    "agents.acpNodeMaxOldSpaceMb",
+                    &format!(
+                        "must be absent (default {}) or between {ACP_NODE_MAX_OLD_SPACE_MB_MIN} and {ACP_NODE_MAX_OLD_SPACE_MB_MAX}, got {mb}",
+                        crate::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB
+                    ),
+                ));
+            }
+        }
         // No `0` escape hatch here (unlike maxOutstandingRpcs): an unbounded
         // adapter spawn is the monorepo#2062 failure itself, so a hand-edited
         // config.toml cannot boot without a ceiling.
@@ -1174,6 +1425,15 @@ impl SettingsFile {
             return Err(bad(
                 "agents.maxConcurrentAdapters",
                 &format!("must be between 1 and {MAX_CONCURRENT_ADAPTERS_LIMIT}, got {adapters}"),
+            ));
+        }
+        // Minimum 1, no unlimited value: the cap is the runaway-spawn guard,
+        // so a hand-edited config.toml cannot disable it.
+        let top_level = self.agents.max_top_level_agents;
+        if top_level < 1 {
+            return Err(bad(
+                "agents.maxTopLevelAgents",
+                &format!("must be at least 1, got {top_level}"),
             ));
         }
         let chars = self.workspace_api.max_output_chars;
@@ -1310,19 +1570,21 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret
 #
 # Strictly parsed: unknown keys, wrong types, and out-of-range values are
 # startup errors. Secrets (API tokens, MCP server configs) never live here --
-# they belong in secrets.json next to this file.
+# they belong in .secrets.json next to this file.
 
 [providers]
-# Active provider -- default agent provider.
-# active = "claude-code"
 # Enabled providers -- providers offered to users (id -> enabled).
 # enabled = { claude-code = true }
 # Provider paths -- per-provider CLI path overrides.
 paths = {}
 
 [model]
-# Default model -- fallback model for new agents.
+# Default model -- fallback model for new agents (a bare model id; pair with
+# defaultProvider).
 # default = "claude-sonnet-4-5"
+# Default provider -- the provider leg of the default-model triple: the
+# provider new agents run on when none is requested explicitly.
+# defaultProvider = "claude-code"
 # Provider default models -- default model per provider.
 providerDefaults = {}
 # Default reasoning effort -- fallback reasoning effort for new agents; the
@@ -1415,8 +1677,9 @@ enabled = false
 [server]
 # Socket path -- Unix socket path for the UDS listener.
 # socketPath = "/path/to/intentd.sock"
-# Bind address -- address the TCP listener binds; 0.0.0.0 exposes it on every
-# interface, including untrusted networks.
+# Bind address -- address(es) the TCP listener binds: a single IP or a list of
+# IPs (e.g. ["192.168.1.7", "100.64.0.3"] -- one listener per address, same
+# port); 0.0.0.0 exposes it on every interface, including untrusted networks.
 bindAddress = "127.0.0.1"
 # WS port -- TCP port for the WSS listener (1024-65535).
 port = 5181
@@ -1433,13 +1696,24 @@ enabled = false
 # WSS API port -- TCP port for the WSS listener (1024-65535).
 port = 5181
 
+[server.tunnel]
+# Tunnel enabled -- run the bundled tailcat sidecar forwarding tunnel traffic
+# to the local WSS port (requires the WSS listener to be enabled).
+enabled = false
+# DERP URL -- optional self-hosted DERP relay URL; unset uses tailcat's
+# default relay.
+# derpUrl = "https://derp.example.com"
+# Tunnel only -- accept tunnel-forwarded traffic only: the WSS listener binds
+# loopback, refusing direct LAN connections.
+only = false
+
 [server.tls]
 # TLS enabled -- enable TLS for the TCP listener.
 enabled = false
 
 [server.auth]
 # Auth enabled -- require a bearer token on TCP. The bearer token itself is a
-# secret and lives in secrets.json.
+# secret and lives in .secrets.json.
 enabled = true
 
 [sourceControl]
@@ -1467,7 +1741,7 @@ exposeGitCredentialToChildren = true
 
 [voice]
 # Voice provider -- active speech-to-text provider: "elevenlabs" or "openai".
-# The API keys are secrets and live in secrets.json (voice.elevenlabs.apiKey /
+# The API keys are secrets and live in .secrets.json (voice.elevenlabs.apiKey /
 # voice.openai.apiKey).
 provider = "elevenlabs"
 # Voice language -- default transcription language hint (ISO-639-1 code)
@@ -1511,7 +1785,7 @@ level = "info"
 [agents]
 # What an agent subtree actually costs, and what each knob below does and does
 # not bound, is written up under "Agent process-tree memory" in
-# docs/ARCHITECTURE.md of the intent-hq/monorepo repo. Every figure quoted in
+# docs/ARCHITECTURE.md of the intent-hq/intent repo. Every figure quoted in
 # this table is measured (monorepo#2062, #2063, #2109).
 # Max concurrent agents -- concurrent agent session cap (0 = auto based on
 # system RAM; changes apply on daemon restart; max 200). This is a concurrency
@@ -1539,6 +1813,11 @@ maxConcurrent = 0
 # workload grows (a test suite) is never re-checked and can carry the tree
 # past the budget by itself.
 # memoryBudgetMb = 8192
+# ACP Node heap limit (MB) -- V8 --max-old-space-size cap injected via
+# NODE_OPTIONS into Node/Electron ACP provider processes (1024-65536; applies
+# to newly started agent processes). Absent (the default, as in this file) =
+# 8192. The INTENTD_ACP_NODE_MAX_OLD_SPACE_MB env var overrides it.
+# acpNodeMaxOldSpaceMb = 8192
 # Max concurrent adapters -- daemon-wide cap on concurrently live ephemeral ACP
 # adapters (one-shot completions and model probes). Each costs ~610 MB and
 # holds no agent slot; over-limit calls queue and fail with "adapter-busy" if
@@ -1548,6 +1827,10 @@ maxConcurrent = 0
 # peaks at its own size). The over-limit caller has spawned nothing, so its
 # retry is always safe.
 maxConcurrentAdapters = 6
+# Max top-level agents -- cap on live top-level (parentless) agents per
+# workspace, enforced on the peer-spawn path as the runaway-spawn guard;
+# user-created agents are never blocked by it (minimum 1; no unlimited value).
+maxTopLevelAgents = 20
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
 # reaping). The main lever on resident memory: every agent touched inside the
 # window keeps its whole subtree alive (~0.66 GB each when idle), so a seat
@@ -1565,6 +1848,12 @@ maxConcurrentAdapters = 6
 # memory comes back as each kill completes, so a large idle set drains over a
 # tail rather than all at once.
 idleReapMinutes = 10
+# Report-to-parent debounce seconds -- grace window before an ungrouped
+# child's reportToParent wake is delivered to the parent, so a child that
+# finishes its turn within the window produces one combined wake instead of
+# two (0 disables the debounce -- immediate wake; read live per call, no
+# restart required).
+reportToParentDebounceSeconds = 30
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
 flushQueuedMessages = "all"
@@ -1667,6 +1956,7 @@ mod tests {
         assert_eq!(d.providers.enabled, None);
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
+        assert_eq!(d.model.default_provider, None);
         assert_eq!(d.model.default_reasoning_effort, None);
         assert!(d.quick_actions.provider_settings.is_empty());
         assert!(!d.workspace.cow_isolation);
@@ -1686,7 +1976,10 @@ mod tests {
         assert!(d.notifications.sound_only_when_unfocused);
         assert_eq!(d.notifications.volume, 0.5);
         assert!(!d.rtk.enabled);
-        assert_eq!(d.server.bind_address, "127.0.0.1");
+        assert_eq!(
+            d.server.bind_address,
+            BindAddress::One("127.0.0.1".to_string())
+        );
         assert_eq!(d.server.port, 5181);
         assert_eq!(d.server.origin_allow_list, None);
         assert!(!d.server.ws_api.enabled);
@@ -1722,6 +2015,7 @@ mod tests {
         assert!(d.context.allow_indexing);
         assert_eq!(d.logging.level, LogLevel::Info);
         assert_eq!(d.agents.max_concurrent, 0);
+        assert_eq!(d.agents.max_top_level_agents, DEFAULT_MAX_TOP_LEVEL_AGENTS);
         assert_eq!(d.agents.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
         assert_eq!(d.agents.flush_queued_messages, FlushQueuedMessagesMode::All);
         assert_eq!(
@@ -1746,6 +2040,7 @@ mod tests {
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
         assert!(d.agent_features.state_snapshot);
+        assert!(!d.agent_features.peer_agents);
         assert_eq!(d.wake_resume.enabled, DEFAULT_WAKE_RESUME_ENABLED);
         assert_eq!(
             d.wake_resume.threshold_seconds,
@@ -1783,6 +2078,8 @@ mod tests {
         assert!(parsed.agent_features.state_snapshot);
         assert!(parsed.agent_features.pr_monitor);
         assert!(parsed.agent_features.task_graph);
+        // peerAgents is the one default-off toggle.
+        assert!(!parsed.agent_features.peer_agents);
     }
 
     #[test]
@@ -1934,6 +2231,10 @@ mod tests {
             ("[server.wsApi]\nport = 80\n", "server.wsApi.port"),
             ("[agents]\nmaxConcurrent = 500\n", "agents.maxConcurrent"),
             (
+                "[agents]\nmaxTopLevelAgents = 0\n",
+                "agents.maxTopLevelAgents",
+            ),
+            (
                 "[workspaceApi]\nmaxOutputChars = 500\n",
                 "workspaceApi.maxOutputChars",
             ),
@@ -1969,8 +2270,97 @@ mod tests {
         for addr in ["127.0.0.1", "0.0.0.0", "192.168.1.7", "::", "::1"] {
             let body = format!("[server]\nbindAddress = \"{addr}\"\n");
             let parsed = SettingsFile::parse_str(&body).unwrap();
-            assert_eq!(parsed.server.bind_address, addr);
+            assert_eq!(
+                parsed.server.bind_address,
+                BindAddress::One(addr.to_string())
+            );
         }
+    }
+
+    #[test]
+    fn bind_address_accepts_a_list_of_ips() {
+        // monorepo#3314: the array form binds selected interfaces.
+        let parsed = SettingsFile::parse_str(
+            "[server]\nbindAddress = [\"192.168.1.7\", \"100.64.0.3\", \"::1\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.server.bind_address,
+            BindAddress::Many(vec![
+                "192.168.1.7".to_string(),
+                "100.64.0.3".to_string(),
+                "::1".to_string(),
+            ])
+        );
+        assert_eq!(
+            parsed.server.bind_address.resolve().unwrap(),
+            vec![
+                "192.168.1.7".parse::<std::net::IpAddr>().unwrap(),
+                "100.64.0.3".parse().unwrap(),
+                "::1".parse().unwrap(),
+            ]
+        );
+        // A single-entry list is equivalent to the string form.
+        let parsed = SettingsFile::parse_str("[server]\nbindAddress = [\"127.0.0.1\"]\n").unwrap();
+        assert_eq!(
+            parsed.server.bind_address.resolve().unwrap(),
+            vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn bind_address_list_rejects_invalid_sets() {
+        // Every entry an IP, no duplicates, unspecified only alone, non-empty.
+        for body in [
+            "[server]\nbindAddress = []\n",
+            "[server]\nbindAddress = [\"not-an-ip\"]\n",
+            "[server]\nbindAddress = [\"127.0.0.1\", \"not-an-ip\"]\n",
+            "[server]\nbindAddress = [\"127.0.0.1\", \"127.0.0.1\"]\n",
+            // v4-mapped IPv6 canonicalizes to the IPv4 it would collide with
+            // at bind time on dual-stack hosts.
+            "[server]\nbindAddress = [\"127.0.0.1\", \"::ffff:127.0.0.1\"]\n",
+            "[server]\nbindAddress = [\"0.0.0.0\", \"192.168.1.7\"]\n",
+            "[server]\nbindAddress = [\"::\", \"::1\"]\n",
+            "[server]\nbindAddress = [\"192.168.1.7\", \"0.0.0.0\"]\n",
+            "[server]\nbindAddress = 5181\n",
+        ] {
+            let err = SettingsFile::parse_str(body).unwrap_err();
+            assert!(
+                err.to_string().contains("server.bindAddress"),
+                "{body:?} should fail naming `server.bindAddress`: {err}"
+            );
+        }
+        // A sole unspecified entry stays valid in both shapes.
+        for body in [
+            "[server]\nbindAddress = \"0.0.0.0\"\n",
+            "[server]\nbindAddress = [\"0.0.0.0\"]\n",
+            "[server]\nbindAddress = [\"::\"]\n",
+        ] {
+            SettingsFile::parse_str(body).unwrap_or_else(|e| panic!("{body:?} should parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn bind_address_display_joins_entries() {
+        assert_eq!(
+            BindAddress::One("127.0.0.1".into()).to_string(),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            BindAddress::Many(vec!["192.168.1.7".into(), "100.64.0.3".into()]).to_string(),
+            "192.168.1.7, 100.64.0.3"
+        );
+    }
+
+    #[test]
+    fn bind_address_serializes_in_its_written_shape() {
+        // String stays a string; list stays a list — round-trip through the
+        // JSON tree the settings registry uses for path-keyed access.
+        let one = serde_json::to_value(BindAddress::One("127.0.0.1".into())).unwrap();
+        assert_eq!(one, serde_json::json!("127.0.0.1"));
+        let many = serde_json::to_value(BindAddress::Many(vec!["::1".into(), "127.0.0.1".into()]))
+            .unwrap();
+        assert_eq!(many, serde_json::json!(["::1", "127.0.0.1"]));
     }
 
     #[test]
@@ -2269,6 +2659,137 @@ mod tests {
     }
 
     #[test]
+    fn model_default_provider_parses_as_an_optional_string() {
+        let parsed =
+            SettingsFile::parse_str("[model]\ndefault = \"m0\"\ndefaultProvider = \"codex\"\n")
+                .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("m0"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("codex"));
+
+        // Absent from `[model]` leaves it unset.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"m0\"\n").expect("parse");
+        assert_eq!(parsed.model.default_provider, None);
+
+        // A blank value reads as unset, so no consumer ever observes an
+        // explicit empty provider.
+        for text in [
+            "[model]\ndefaultProvider = \"\"\n",
+            "[model]\ndefaultProvider = \"   \"\n",
+        ] {
+            let parsed = SettingsFile::parse_str(text).expect("parse");
+            assert_eq!(parsed.model.default_provider, None, "{text}");
+        }
+    }
+
+    #[test]
+    fn legacy_compound_model_default_splits_into_the_triple() {
+        // A legacy compound `model.default` normalizes on read into the
+        // split (defaultProvider, default) form — never rejected — so a
+        // legacy file behaves identically to the split form.
+        let parsed =
+            SettingsFile::parse_str("[model]\ndefault = \"codex:gpt-5\"\n").expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("codex"));
+        let split =
+            SettingsFile::parse_str("[model]\ndefault = \"gpt-5\"\ndefaultProvider = \"codex\"\n")
+                .expect("parse");
+        assert_eq!(parsed, split, "legacy and split forms must be identical");
+
+        // An explicit defaultProvider wins over the compound prefix; the
+        // model half is still stripped bare.
+        let parsed = SettingsFile::parse_str(
+            "[model]\ndefault = \"codex:gpt-5\"\ndefaultProvider = \"auggie\"\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("auggie"));
+
+        // Only the FIRST colon splits; the rest stays in the model id.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"pi:org:m1\"\n").expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("org:m1"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("pi"));
+
+        // Blank halves read as unset — nothing is invented.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"codex:\"\n").expect("parse");
+        assert_eq!(parsed.model.default, None);
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("codex"));
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \":gpt-5\"\n").expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.model.default_provider, None);
+
+        // The tolerant legacy-path parse normalizes identically.
+        let (file, _) = SettingsFile::parse_str_with_legacy(
+            "[model]\ndefault = \"codex:gpt-5\"\nworkspaceOverrides = { ws1 = \"m1\" }\n",
+        )
+        .expect("tolerant parse");
+        assert_eq!(file.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(file.model.default_provider.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn legacy_compound_provider_defaults_strip_their_own_prefix() {
+        // A providerDefaults value prefixed with its own map key strips to
+        // the bare id; a foreign prefix is left as-is for the read-side
+        // ownership guards to drop per use.
+        let parsed = SettingsFile::parse_str(
+            "[model]\nproviderDefaults = { codex = \"codex:gpt-5\", auggie = \"codex:gpt-5\", pi = \"m2\" }\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed
+                .model
+                .provider_defaults
+                .get("codex")
+                .map(String::as_str),
+            Some("gpt-5"),
+            "own-prefix compound strips to the bare id"
+        );
+        assert_eq!(
+            parsed
+                .model
+                .provider_defaults
+                .get("auggie")
+                .map(String::as_str),
+            Some("codex:gpt-5"),
+            "a foreign prefix is left untouched"
+        );
+        assert_eq!(
+            parsed.model.provider_defaults.get("pi").map(String::as_str),
+            Some("m2"),
+            "bare values pass through"
+        );
+
+        // Both halves are trimmed exactly like `model.default`: padding
+        // around the value, the prefix, or the remainder never defeats the
+        // own-prefix strip.
+        let parsed = SettingsFile::parse_str(
+            "[model]\nproviderDefaults = { codex = \" codex : gpt-5 \" }\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed
+                .model
+                .provider_defaults
+                .get("codex")
+                .map(String::as_str),
+            Some("gpt-5"),
+            "padded own-prefix compound still strips and trims"
+        );
+
+        // An own-prefix with a blank remainder reads as unset — the entry is
+        // removed, mirroring `model.default = \"codex:\"`.
+        let parsed = SettingsFile::parse_str(
+            "[model]\nproviderDefaults = { codex = \"codex:\", pi = \"pi:  \" }\n",
+        )
+        .expect("parse");
+        assert!(
+            parsed.model.provider_defaults.is_empty(),
+            "blank remainders read as unset, got {:?}",
+            parsed.model.provider_defaults
+        );
+    }
+
+    #[test]
     fn legacy_parse_captures_and_tolerates_workspace_overrides() {
         let text =
             "[model]\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\", ws2 = \"m2\" }\n";
@@ -2436,6 +2957,48 @@ mod tests {
             SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 1024000\n").is_ok(),
             "the upper bound itself is legal"
         );
+    }
+
+    /// The `agents.acpNodeMaxOldSpaceMb` parse matrix: an absent key is the
+    /// default (`None`, resolved to 8192 by the spawn path), an in-range value
+    /// is an explicit MB cap, both bounds are legal, and out-of-range values
+    /// are rejected naming the key.
+    #[test]
+    fn acp_node_max_old_space_mb_absent_default_in_range_explicit() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.agents.acp_node_max_old_space_mb, None,
+            "absent key = default"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TEMPLATE.contains("\nacpNodeMaxOldSpaceMb ="),
+            "the template for new installs must not write the key (default)"
+        );
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("# acpNodeMaxOldSpaceMb = 8192"),
+            "the template documents the key as a commented-out example"
+        );
+
+        let overridden = SettingsFile::parse_str("[agents]\nacpNodeMaxOldSpaceMb = 16384\n")
+            .expect("override parses");
+        assert_eq!(overridden.agents.acp_node_max_old_space_mb, Some(16_384));
+
+        for bound in [ACP_NODE_MAX_OLD_SPACE_MB_MIN, ACP_NODE_MAX_OLD_SPACE_MB_MAX] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agents]\nacpNodeMaxOldSpaceMb = {bound}\n"))
+                    .expect("both bounds are legal");
+            assert_eq!(parsed.agents.acp_node_max_old_space_mb, Some(bound));
+        }
+
+        for bad in ["0", "1023", "65537"] {
+            let err = SettingsFile::parse_str(&format!("[agents]\nacpNodeMaxOldSpaceMb = {bad}\n"))
+                .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("agents.acpNodeMaxOldSpaceMb") && msg.contains(bad),
+                "error names the offending key and value: {msg}"
+            );
+        }
     }
 
     /// The ephemeral-adapter bound ships enabled: an empty file and the

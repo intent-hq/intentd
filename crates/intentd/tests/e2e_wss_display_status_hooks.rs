@@ -313,6 +313,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -462,7 +463,7 @@ async fn active_hook_serves_waiting_and_hook_cancel_drops_it_over_wss() {
     let created = wss_rpc(
         &mut rpc,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "hookowner", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "hookowner", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

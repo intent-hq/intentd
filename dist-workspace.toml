@@ -34,6 +34,13 @@ tag-namespace = "v"
 github-releases-repo = "intent-hq/intentd"
 # Whether to install an updater program
 install-updater = false
+# Bundle the tailcat tunnel sidecar next to the daemon binary: the archive
+# carries libexec/tailcat (staged per-target by the "Stage tailcat sidecar
+# binary" step in dist-build-setup.yml) plus libexec/tailcat.LICENSE
+# (committed; BSD-3-Clause text for the non-crate binary, which cargo-deny
+# does not cover). The daemon resolves the sidecar at
+# <exe-dir>/libexec/tailcat (see crates/intentd/src/tunnel.rs).
+include = ["packaging/libexec"]
 # Post-announce: publish/update the alpha.json channel manifest
 post-announce-jobs = ["./publish-channel-manifest"]
 # The reusable publish-channel-manifest.yml job requests
@@ -50,15 +57,20 @@ github-custom-job-permissions = { "publish-channel-manifest" = { contents = "wri
 # check is relaxed here. Re-apply the customization after any `dist init` /
 # `dist generate`; it is marked LOCAL CUSTOMIZATION in v-release.yml.
 allow-dirty = ["ci"]
-# Injected into build-local-artifacts: provisions rustup/toolchain/targets on
-# the self-hosted runners, which don't have the hosted images' preinstalled
-# toolchains (see the file header for details).
+# Injected into build-local-artifacts: provisions the pinned
+# rust-toolchain.toml channel and the matrix's cross targets, which no
+# runner image guarantees (see the file header for details).
 github-build-setup = "../dist-build-setup.yml"
 
-# Linux build jobs run on the org's self-hosted tinybox runner (Linux x64,
-# Ubuntu 22.04). Runner values must be single labels here (the generated
-# workflow interpolates them as strings), and each machine exposes its
-# hostname as a label.
+# Every job runs on GitHub-hosted runners: the self-hosted fleet (tinybox)
+# is a single point of failure for releases — with it offline, tagged
+# releases queue forever (v0.8.13). Runner values must be single labels here
+# (the generated workflow interpolates them as strings).
+#
+# The Linux musl builds run on the org's 16-core GitHub-hosted larger runner
+# (gh-linux-16x, Linux x64) — the same burst runner ci.yml uses for its
+# heavy Linux jobs. They previously ran on the self-hosted tinybox, and
+# before that on GitHub-hosted ubuntu-22.04.
 #
 # The macOS builds run on GitHub-hosted Apple Silicon runners (macos-14):
 # the self-hosted m1mac went offline and release builds queued forever
@@ -71,22 +83,21 @@ github-build-setup = "../dist-build-setup.yml"
 # can't read back ("stream did not contain valid UTF-8"). Move it back to
 # 5090pc once pwsh 7 is installed there.
 #
-# The global jobs (plan / build-global-artifacts / host / announce) also
-# run on tinybox: they sat on GitHub-hosted runners while tinybox had a
-# single slot (`plan` runs on every PR and queueing it behind the heavy CI
-# jobs was the intentd#805 rationale), but with 8 tinybox slots that
-# queue-isolation concern is gone.
+# The global jobs (plan / build-global-artifacts / host / announce) run on
+# ubuntu-latest: they are light orchestration jobs (no compilation), so the
+# standard hosted runner is enough.
 #
 # `host` overrides tell dist the actual host triple where it differs from the
 # runner-name heuristic, so it picks the right cross strategy:
 # - macos-14 is arm64 (host pinned explicitly on both apple targets so the
 #   arch never depends on dist's runner-name heuristic), so
 #   x86_64-apple-darwin is a cross build (rustup target).
-# - tinybox runs the musl builds as cross builds from the glibc host triple,
-#   mirroring the previous ubuntu-22.04 setup (aarch64 musl via
-#   cargo-zigbuild, x86_64 musl via musl-tools).
+# - gh-linux-16x is an x64 glibc host dist's runner-name heuristic can't
+#   parse; pinning the host triple keeps the musl builds on the same cross
+#   strategy that worked on tinybox and ubuntu-22.04 before it (aarch64
+#   musl via cargo-zigbuild, x86_64 musl via musl-tools).
 [dist.github-custom-runners]
-global = "tinybox"
+global = "ubuntu-latest"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
 runner = "macos-14"
@@ -97,11 +108,11 @@ runner = "macos-14"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-unknown-linux-musl]
-runner = "tinybox"
+runner = "gh-linux-16x"
 host = "x86_64-unknown-linux-gnu"
 
 [dist.github-custom-runners.aarch64-unknown-linux-musl]
-runner = "tinybox"
+runner = "gh-linux-16x"
 host = "x86_64-unknown-linux-gnu"
 
 [dist.github-custom-runners.x86_64-pc-windows-msvc]

@@ -38,25 +38,43 @@ impl TokenStore for MemoryStore {
 /// Mock pairing info provider for tests.
 struct MockPairingInfo {
     port: Option<u16>,
+    bind_addresses: Option<Vec<std::net::IpAddr>>,
+    tc_address: Option<String>,
     data_dir: PathBuf,
     token_store: crate::AsyncTokenStore,
+    host_environment: crate::host_env::HostEnvironment,
 }
 
 impl ServerPairingInfo for MockPairingInfo {
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>> {
         let port = self.port;
+        let bind_addresses = self.bind_addresses.clone();
+        let tc_address = self.tc_address.clone();
         Box::pin(async move {
             PairingSnapshot {
                 port,
-                bind_address: None,
+                bind_addresses,
+                tc_address,
             }
         })
+    }
+    fn host_environment(&self) -> crate::host_env::HostEnvironment {
+        self.host_environment.clone()
     }
     fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }
     fn token_store(&self) -> &crate::AsyncTokenStore {
         &self.token_store
+    }
+}
+
+fn host_environment(device_kind: Option<&str>) -> crate::host_env::HostEnvironment {
+    crate::host_env::HostEnvironment {
+        hostname: "build-01".to_string(),
+        pretty_hostname: "Build Server 01".to_string(),
+        device_kind: device_kind.map(str::to_string),
+        hardware_model: device_kind.map(|_| "PowerEdge R760".to_string()),
     }
 }
 
@@ -103,8 +121,11 @@ async fn handle_pairing_info_local_success() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        bind_addresses: None,
+        tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store,
+        host_environment: host_environment(Some("server")),
     });
 
     let req = ServerRequest {
@@ -123,7 +144,101 @@ async fn handle_pairing_info_local_success() {
     assert_eq!(result["path"], "/ws");
     assert!(result["certFingerprint"].is_string());
     assert!(result["localIps"].is_array());
-    assert!(result["hostname"].is_string());
+    // availableIps is always present and is exactly the bind-candidate
+    // enumeration (machine-dependent contents, so compare against the source).
+    assert_eq!(result["availableIps"], json!(collect_local_ips()));
+    assert_eq!(result["hostname"], "build-01");
+    assert!(
+        !result["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty"
+    );
+    assert_eq!(result["deviceKind"], "server");
+    assert_eq!(result["hardwareModel"], "PowerEdge R760");
+    // No tunnel in the snapshot: tcAddress is ABSENT, not null.
+    assert!(result.get("tcAddress").is_none());
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+#[tokio::test]
+async fn handle_pairing_info_available_ips_ignore_loopback_bind() {
+    // A loopback-only bind advertises no pairing host (localIps is empty),
+    // but availableIps still lists every bind candidate — the FE's bind
+    // picker needs the candidates precisely when the daemon is locked to
+    // loopback. Loopback itself is never in the candidate list.
+    use std::env;
+    let tmpdir = env::temp_dir().join(format!(
+        "intentd-test-{}-{}",
+        std::process::id(),
+        "pairing_info_available_ips"
+    ));
+    std::fs::create_dir_all(&tmpdir).unwrap();
+    let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
+    let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
+        port: Some(5181),
+        bind_addresses: Some(vec!["127.0.0.1".parse().unwrap()]),
+        tc_address: None,
+        data_dir: tmpdir.clone(),
+        token_store: store,
+        host_environment: host_environment(Some("server")),
+    });
+
+    let req = ServerRequest {
+        method: ServerMethod::PairingInfo,
+        id_present: true,
+        id_echo: json!(1),
+    };
+
+    let resp = handle(req, &provider, true).await.unwrap();
+    let parsed: Value = serde_json::from_str(&resp).unwrap();
+    let result = &parsed["result"];
+    assert_eq!(result["localIps"], json!([]));
+    assert_eq!(result["availableIps"], json!(collect_local_ips()));
+    let available = result["availableIps"].as_array().unwrap();
+    assert!(
+        available.iter().all(|v| !v
+            .as_str()
+            .unwrap()
+            .parse::<std::net::IpAddr>()
+            .unwrap()
+            .is_loopback()),
+        "availableIps never contains loopback: {available:?}"
+    );
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+#[tokio::test]
+async fn handle_pairing_info_includes_tc_address_when_tunnel_up() {
+    use std::env;
+    let tmpdir = env::temp_dir().join(format!(
+        "intentd-test-{}-{}",
+        std::process::id(),
+        "pairing_info_tc"
+    ));
+    std::fs::create_dir_all(&tmpdir).unwrap();
+    let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("test-token-abc123")));
+    let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
+        port: Some(5181),
+        bind_addresses: None,
+        tc_address: Some("tc7f2a91.tailcat.net".to_string()),
+        data_dir: tmpdir.clone(),
+        token_store: store,
+        host_environment: host_environment(None),
+    });
+
+    let req = ServerRequest {
+        method: ServerMethod::PairingInfo,
+        id_present: true,
+        id_echo: json!(1),
+    };
+
+    let resp = handle(req, &provider, true).await.unwrap();
+    let parsed: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(parsed["result"]["tcAddress"], "tc7f2a91.tailcat.net");
+    assert!(parsed["result"].get("deviceKind").is_none());
+    assert!(parsed["result"].get("hardwareModel").is_none());
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
@@ -139,8 +254,11 @@ async fn handle_pairing_info_remote_rejects() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::default()));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        bind_addresses: None,
+        tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store,
+        host_environment: host_environment(Some("server")),
     });
 
     let req = ServerRequest {
@@ -185,8 +303,11 @@ async fn handle_rotate_token_local_success() {
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("old-token")));
     let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port: Some(5181),
+        bind_addresses: None,
+        tc_address: None,
         data_dir: tmpdir.clone(),
         token_store: store.clone(),
+        host_environment: host_environment(Some("server")),
     });
 
     let req = ServerRequest {
@@ -202,6 +323,8 @@ async fn handle_rotate_token_local_success() {
     let new_token = parsed["result"]["token"].as_str().unwrap();
     assert_ne!(new_token, "old-token");
     assert_eq!(new_token.len(), 64);
+    // Same shape as server.pairingInfo: the additive bind-candidate set rides along.
+    assert_eq!(parsed["result"]["availableIps"], json!(collect_local_ips()));
 
     let _ = std::fs::remove_dir_all(&tmpdir);
     // _guard drops here, restoring the original env var value
@@ -209,15 +332,60 @@ async fn handle_rotate_token_local_success() {
 
 #[test]
 fn pairing_hosts_specific_bind_advertises_only_that_address() {
-    // A listener bound to one address (loopback or a single interface) is
-    // reachable only there (monorepo#2900).
-    for addr in ["127.0.0.1", "192.168.1.23"] {
-        let snapshot = PairingSnapshot {
+    // A listener bound to one address is reachable only there
+    // (monorepo#2900).
+    let snapshot = PairingSnapshot {
+        port: Some(5181),
+        bind_addresses: Some(vec!["192.168.1.23".parse().unwrap()]),
+        tc_address: None,
+    };
+    assert_eq!(pairing_hosts(&snapshot), vec!["192.168.1.23".to_string()]);
+}
+
+#[test]
+fn pairing_hosts_never_advertise_loopback() {
+    // Pairing hosts feed remote clients (QR payload, keychain sync), and
+    // loopback is not dialable from another device: a bound loopback entry
+    // is dropped — a mixed bind keeps only the non-loopback entries, and a
+    // loopback-only bind advertises nothing.
+    let mixed = PairingSnapshot {
+        port: Some(5181),
+        bind_addresses: Some(vec![
+            "127.0.0.1".parse().unwrap(),
+            "192.168.1.23".parse().unwrap(),
+        ]),
+        tc_address: None,
+    };
+    assert_eq!(pairing_hosts(&mixed), vec!["192.168.1.23".to_string()]);
+    for lo in ["127.0.0.1", "::1"] {
+        let loopback_only = PairingSnapshot {
             port: Some(5181),
-            bind_address: Some(addr.parse().unwrap()),
+            bind_addresses: Some(vec![lo.parse().unwrap()]),
+            tc_address: None,
         };
-        assert_eq!(pairing_hosts(&snapshot), vec![addr.to_string()]);
+        assert_eq!(
+            pairing_hosts(&loopback_only),
+            Vec::<String>::new(),
+            "loopback-only bind ({lo}) advertises nothing"
+        );
     }
+}
+
+#[test]
+fn pairing_hosts_multi_bind_advertises_every_address() {
+    // A list bind (monorepo#3314) is reachable on exactly its entries.
+    let snapshot = PairingSnapshot {
+        port: Some(5181),
+        bind_addresses: Some(vec![
+            "192.168.1.23".parse().unwrap(),
+            "100.64.0.3".parse().unwrap(),
+        ]),
+        tc_address: None,
+    };
+    assert_eq!(
+        pairing_hosts(&snapshot),
+        vec!["192.168.1.23".to_string(), "100.64.0.3".to_string()]
+    );
 }
 
 #[test]
@@ -228,11 +396,13 @@ fn pairing_hosts_unspecified_or_unknown_bind_enumerates_local_ips() {
     // machine's interfaces vary.
     let unspecified = PairingSnapshot {
         port: Some(5181),
-        bind_address: Some("0.0.0.0".parse().unwrap()),
+        bind_addresses: Some(vec!["0.0.0.0".parse().unwrap()]),
+        tc_address: None,
     };
     let unknown = PairingSnapshot {
         port: Some(5181),
-        bind_address: None,
+        bind_addresses: None,
+        tc_address: None,
     };
     assert_eq!(pairing_hosts(&unspecified), collect_local_ips());
     assert_eq!(pairing_hosts(&unknown), collect_local_ips());
@@ -245,7 +415,8 @@ fn pairing_hosts_v6_unspecified_bind_includes_v4_and_specific_v6_stays_exact() {
     // prefix). A SPECIFIC v6 bind still advertises exactly that address.
     let v6_unspecified = PairingSnapshot {
         port: Some(5181),
-        bind_address: Some("::".parse().unwrap()),
+        bind_addresses: Some(vec!["::".parse().unwrap()]),
+        tc_address: None,
     };
     let hosts = pairing_hosts(&v6_unspecified);
     let v4 = collect_local_ips();
@@ -260,9 +431,46 @@ fn pairing_hosts_v6_unspecified_bind_includes_v4_and_specific_v6_stays_exact() {
 
     let v6_specific = PairingSnapshot {
         port: Some(5181),
-        bind_address: Some("2001:db8::7".parse().unwrap()),
+        bind_addresses: Some(vec!["2001:db8::7".parse().unwrap()]),
+        tc_address: None,
     };
     assert_eq!(pairing_hosts(&v6_specific), vec!["2001:db8::7".to_string()]);
+}
+
+#[test]
+fn advertised_hosts_filters_by_bind_set_deterministically() {
+    // Pure core shared by pairing.getInfo and system.status localIps: with
+    // fixed enumerations, every bind shape maps to a deterministic host set.
+    let bind = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    let v4 = vec!["192.168.1.23".to_string(), "100.64.0.3".to_string()];
+    let v6 = vec!["2001:db8::7".to_string()];
+
+    // Specific binds (loopback included) advertise exactly those addresses —
+    // never the full enumeration.
+    assert_eq!(
+        advertised_hosts(Some(&[bind("127.0.0.1")]), &v4, &v6),
+        vec!["127.0.0.1".to_string()]
+    );
+    assert_eq!(
+        advertised_hosts(Some(&[bind("192.168.1.23"), bind("100.64.0.3")]), &v4, &v6),
+        vec!["192.168.1.23".to_string(), "100.64.0.3".to_string()]
+    );
+
+    // 0.0.0.0 → the v4 enumeration only; :: → v4 + v6.
+    assert_eq!(advertised_hosts(Some(&[bind("0.0.0.0")]), &v4, &v6), v4);
+    assert_eq!(
+        advertised_hosts(Some(&[bind("::")]), &v4, &v6),
+        vec![
+            "192.168.1.23".to_string(),
+            "100.64.0.3".to_string(),
+            "2001:db8::7".to_string()
+        ]
+    );
+
+    // Unknown bind set (None) and an empty bind list keep the historical
+    // v4 enumeration fallback.
+    assert_eq!(advertised_hosts(None, &v4, &v6), v4);
+    assert_eq!(advertised_hosts(Some(&[]), &v4, &v6), v4);
 }
 
 #[test]

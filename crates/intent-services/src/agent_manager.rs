@@ -44,7 +44,9 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_ops::{new_message_id, user_message_blocks, QueuedMessage, MAX_MESSAGE_ID_LEN};
-use crate::agent_session::{agent_actor, InterruptReason, InterruptedBy, ThoughtLevelOption};
+use crate::agent_session::{
+    agent_actor, InterruptFlushOutcome, InterruptReason, InterruptedBy, ThoughtLevelOption,
+};
 use crate::events::EventBus;
 use crate::microvm::{
     self, orchestrator::GUEST_MCP_BRIDGE_PATH, MicrovmSpawnSpec, MicrovmVm, GUEST_WORKSPACE_DIR,
@@ -53,21 +55,6 @@ use crate::Services;
 
 #[cfg(test)]
 pub(crate) mod tests;
-
-/// Capitalize the leading ASCII byte of `s` (leaves the rest of the string
-/// untouched). Used to normalize OAuth `token_type` values into the
-/// conventional `Bearer` header form when a bag stores the RFC 6749 lower-case
-/// spelling.
-fn title_case_ascii(s: &str) -> String {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    let mut out = String::with_capacity(s.len());
-    out.push(first.to_ascii_uppercase());
-    out.push_str(chars.as_str());
-    out
-}
 
 /// Deterministic system note appended to a STALE queued-message redrive (#576)
 /// so a delegated child that already delivered its completion report does not
@@ -108,6 +95,17 @@ use crate::harness::v1::DEQUEUE_WAIT_NOTE_PREFIX;
 /// (no [SYSTEM NOTE], no `queueInfo` stamp). Waits at/above the threshold are
 /// annotated unchanged (PROTOCOL §5.5).
 const DEQUEUE_WAIT_ANNOTATION_MIN_MS: i128 = 5_000;
+
+/// Transcript text of the `auto_unarchived` system row persisted when a turn
+/// start auto-unarchives an archived workspace (spec Contract wording).
+pub(crate) const AUTO_UNARCHIVE_NOTICE_TEXT: &str =
+    "Workspace was automatically unarchived because a message was sent to this agent.";
+
+/// Trailing prompt block injected into the SAME turn that triggered the
+/// auto-unarchive so the model knows the workspace flipped (spec Contract
+/// wording). Never replayed on later turns.
+pub(crate) const AUTO_UNARCHIVE_PROMPT_NOTICE: &str =
+    "[SYSTEM NOTICE] This workspace was archived; it has been automatically unarchived because this message was sent.";
 
 /// [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`] with an `INTENTD_DEQUEUE_WAIT_MIN_MS`
 /// env override (whole milliseconds). Primarily for tests/CI — the e2e
@@ -444,15 +442,13 @@ pub struct TurnOptions {
     /// `publish_error_status_and_requeue` threads it onto the requeued entry
     /// so a retry of the same logical turn keeps the original id.
     pub turn_id: Option<String>,
-    /// Who originated this delivery (question hold, PROTOCOL §5.5):
-    /// `MessageOrigin::User` (FE `agent.sendMessage` / explicit user actions)
-    /// is never held (but never releases the hold either); the `Automatic`
-    /// default fails closed — an automatic send to an agent whose question
-    /// hold is active enqueues instead of claiming the turn slot, so a
-    /// pending Q&A is never buried by a system/agent turn.
+    /// Who originated this delivery: `MessageOrigin::User` (FE
+    /// `agent.sendMessage` / explicit user actions) clears a pending
+    /// attention request and is exempt from the archived-workspace park;
+    /// the `Automatic` default is a system/agent delivery.
     pub origin: intent_core::MessageOrigin,
     /// `true` when this delivery carries `priority: "interrupt"`. Every
-    /// fallback path that parks the message in the queue (question hold,
+    /// fallback path that parks the message in the queue (archived park,
     /// busy race, quarantine park, append-failure auto-queue, terminal-
     /// failure requeue) inserts it with interrupt priority — front of the
     /// queue, behind earlier interrupts (user decision, spec §Decisions).
@@ -483,8 +479,8 @@ impl TurnOptions {
 
 /// Reconstruct a [`TurnOptions::origin`] from a `QueuedMessage`'s persisted
 /// `user_origin` flag at the queue-drain handoffs, so a drained entry keeps
-/// its originator's semantics (question-hold bypass recorded at enqueue time;
-/// attention-request clear gated on user origin).
+/// its originator's semantics (archived-park exemption recorded at enqueue
+/// time; attention-request clear gated on user origin).
 fn origin_from_user_flag(user_origin: bool) -> intent_core::MessageOrigin {
     if user_origin {
         intent_core::MessageOrigin::User
@@ -2003,6 +1999,7 @@ struct AgentHandle {
     /// Bundled pi-extension MCP delivery files (extension + wrapper script),
     /// removed when the handle drops (pi only).
     _pi_extension: Option<PiExtensionDelivery>,
+    antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
     /// consume them there (claude-code, codex, droid, grok). Empty for providers
@@ -2124,6 +2121,8 @@ pub struct AgentManager {
     /// and sweeps leftovers at startup; `None` (tests / bare wiring) falls
     /// back to the OS temp dir.
     agent_config_root: Option<PathBuf>,
+    /// Persistent Antigravity conversation profiles, never startup-swept.
+    antigravity_state_root: Option<PathBuf>,
     /// Dedicated, daemon-owned, empty spawn cwd for chief provider children
     /// (STAB-50). The composition root wires `<data_dir>/chief-cwd`; `None`
     /// (tests / bare wiring) falls back to the temp dir.
@@ -2237,6 +2236,15 @@ pub struct AgentManager {
     /// `agent.diagnostics` can serve per-agent subtree attribution whether or
     /// not a budget is configured. Absent in tests / bare wiring.
     tree_probe: std::sync::OnceLock<Arc<dyn TreeMemoryProbe>>,
+    /// Agents whose current claim's turn start actually auto-unarchived the
+    /// workspace (the #1216 flip persisted). Armed by
+    /// [`AgentManager::try_begin_outcome`] on a confirmed flip, consumed by
+    /// [`AgentManager::build_turn_prompt`] so the SAME turn's outbound prompt
+    /// carries one trailing `[SYSTEM NOTICE]` block — never replayed on later
+    /// turns. A claim that never builds a prompt (harness wake turns) has the
+    /// stale flag cleared by [`AgentManager::release_slot_sync`] when the
+    /// slot is released. In-memory only, same gap as `recreated`.
+    auto_unarchived: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl AgentManager {
@@ -2295,6 +2303,7 @@ impl AgentManager {
             data_dir: None,
             agent_log_root: None,
             agent_config_root: None,
+            antigravity_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
@@ -2308,6 +2317,7 @@ impl AgentManager {
             stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
+            auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -2359,6 +2369,13 @@ impl AgentManager {
     #[must_use]
     pub fn with_data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.data_dir = Some(dir.into());
+        self
+    }
+
+    /// Set the private persistent root for Antigravity conversation state.
+    #[must_use]
+    pub fn with_antigravity_state_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.antigravity_state_root = Some(root.into());
         self
     }
 
@@ -2672,6 +2689,30 @@ impl AgentManager {
                 // the full reference rides the system prompt below.
                 .with_compact_tool_descriptions(opts.provider.truncates_tool_descriptions),
         );
+        let antigravity_profile = if opts.provider.id == "antigravity" {
+            let root = self.antigravity_state_root.as_deref().ok_or_else(|| {
+                Error::InvalidInput(
+                    "Antigravity persistent state directory is not configured on this daemon"
+                        .into(),
+                )
+            })?;
+            Some(
+                crate::antigravity::SessionProfile::new(
+                    root,
+                    &format!("{}\0{}", workspace_id.0, agent_id.0),
+                    &self.mcp_bridge_exe,
+                    server.available_tool_names().into_iter().map(str::to_owned),
+                    &opts.tools_to_remove,
+                )
+                .map_err(|err| {
+                    Error::InvalidInput(format!(
+                        "Cannot prepare private Antigravity configuration: {err}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
         let bridge = serve_workspace_mcp_tcp(Arc::clone(&server))
             .await
             .map_err(|e| Error::Internal(format!("mcp bridge bind failed: {e}")))?;
@@ -2782,18 +2823,20 @@ impl AgentManager {
             // directive, matching the reference `isSubAgent` derivation.
             // Fetch workspace for mode-dependent prompt hints (Task 6).
             let workspace = self.services.store.get_workspace(&workspace_id).await.ok();
-            // Truncating providers get the full `workspace_api` reference in
-            // the prompt (this bridge's exact per-agent assembly — gating,
-            // chief-ness, and model options identical to what a non-flagged
-            // provider's tools/list would serve). Invariant: truncating
-            // providers must go through this `rules_file.is_none()` branch —
-            // the bridge serves the compact description unconditionally, so a
-            // caller-supplied rules file would leave its "Workspace API
-            // Reference" pointer dangling (ws.help() as the only fallback).
+            // Truncating providers get the condensed `workspace_api`
+            // reference in the prompt (this bridge's exact per-agent assembly
+            // — gating, chief-ness, and model options as a non-flagged
+            // provider's tools/list — with method summaries cut at the first
+            // sentence; full docs stay reachable via ws.help()). Invariant:
+            // truncating providers must go through this `rules_file.is_none()`
+            // branch — the bridge serves the compact description
+            // unconditionally, so a caller-supplied rules file would leave
+            // its "Workspace API Reference" pointer dangling (ws.help() as
+            // the only fallback).
             let workspace_api_docs = opts
                 .provider
                 .truncates_tool_descriptions
-                .then(|| server.full_workspace_api_description());
+                .then(|| server.condensed_workspace_api_description());
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
@@ -2839,13 +2882,33 @@ impl AgentManager {
             mcp_config_path.as_deref(),
             env_mcp_config.as_deref(),
         );
+        // `agents.acpNodeMaxOldSpaceMb` is read live per spawn (not pinned at
+        // boot), so a settings change applies to the next spawned/respawned
+        // provider process without a daemon restart (intent-hq/intent#4330).
+        // A caller-supplied cap (tests / embedders) still wins.
+        if spawn_opts.node_max_old_space_mb.is_none() {
+            spawn_opts.node_max_old_space_mb = self
+                .services
+                .effective_settings()
+                .agents
+                .acp_node_max_old_space_mb;
+        }
         if let Some(delivery) = &pi_extension {
             delivery.apply_spawn_env(&mut spawn_opts.extra_env, bridge.connect_addr());
+        }
+        if let Some(profile) = &antigravity_profile {
+            spawn_opts.extra_env.extend(profile.env().map_err(|err| {
+                Error::InvalidInput(format!(
+                    "Cannot configure unattended Antigravity launch: {err}"
+                ))
+            })?);
         }
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let hooks = ConnectionHooks {
+            auth_required_stdout_marker: (opts.provider.id == "antigravity")
+                .then_some(crate::antigravity::AUTH_REQUIRED_MARKER),
             requests: Some(req_tx),
             notifications: Some(note_tx),
             auth_error_patterns: opts
@@ -2911,6 +2974,7 @@ impl AgentManager {
                 self.services.pty(),
                 self.services.settings_registry(),
                 opts.provider.terminal_requires_shell,
+                Some(cwd.clone()),
             ));
         // microVM sessions run the provider against guest paths
         // (`/workspace/...`): alias that prefix onto the host-side CoW clone
@@ -2954,6 +3018,7 @@ impl AgentManager {
             _mcp_config: mcp_config,
             _rules_config: rules_config,
             _pi_extension: pi_extension,
+            antigravity_profile,
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
@@ -3417,10 +3482,10 @@ impl AgentManager {
 
     /// Reshape one `mcp.servers` entry into the shape [`normalize_mcp_servers`]
     /// expects — stdio entries stay untouched (`command`/`args`/`env`), remote
-    /// entries get a `type` tag plus an `Authorization` header sourced from the
-    /// persisted OAuth bag when the config does not already set one. Returns
-    /// `None` for malformed entries (missing `command`/`url`) so they drop out
-    /// of the merge silently.
+    /// entries get a `type` tag plus an `Authorization` header built by the
+    /// refresh-aware [`crate::mcp_oauth::McpOauthService::authorization_header`]
+    /// when the config does not already set one. Returns `None` for malformed
+    /// entries (missing `command`/`url`) so they drop out of the merge silently.
     async fn reshape_user_mcp_config(
         &self,
         id: &str,
@@ -3451,7 +3516,10 @@ impl AgentManager {
                     .keys()
                     .any(|k| k.eq_ignore_ascii_case("authorization"));
                 if !has_auth {
-                    if let Some(auth) = self.oauth_authorization_header(id).await? {
+                    let auth = crate::mcp_oauth::McpOauthService::new(&self.services.store)
+                        .authorization_header(id)
+                        .await?;
+                    if let Some(auth) = auth {
                         headers.insert("Authorization".to_string(), Value::String(auth));
                     }
                 }
@@ -3477,33 +3545,6 @@ impl AgentManager {
             }
         }
         Ok(Some(Value::Object(out)))
-    }
-
-    /// Build the `Authorization: <token_type> <access_token>` header value from
-    /// the persisted OAuth bag for `server_id`, or `None` when no bag is
-    /// stored / the bag is malformed / `access_token` is missing. `token_type`
-    /// defaults to `Bearer` and is title-cased so a bag storing the RFC 6749
-    /// lower-case `bearer` still produces the conventional header form.
-    async fn oauth_authorization_header(&self, server_id: &str) -> Result<Option<String>> {
-        let Some(raw) = self.services.store.get_mcp_oauth_token(server_id).await? else {
-            return Ok(None);
-        };
-        let Ok(bag) = serde_json::from_str::<Value>(&raw) else {
-            return Ok(None);
-        };
-        let Some(access) = bag
-            .get("access_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(None);
-        };
-        let token_type = bag
-            .get("token_type")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Bearer");
-        Ok(Some(format!("{} {}", title_case_ascii(token_type), access)))
     }
 
     /// Complete the connection handshake and establish an ACP session for a
@@ -3539,7 +3580,7 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<String> {
-        let (conn, session_mcp_servers, wake_gate, is_microvm) = {
+        let (conn, session_mcp_servers, wake_gate, is_microvm, antigravity_profile) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
@@ -3549,6 +3590,7 @@ impl AgentManager {
                 handle.session_mcp_servers.clone(),
                 handle.wake_gate.clone(),
                 handle.vm.is_some(),
+                handle.antigravity_profile.clone(),
             )
         };
         // microVM agents (monorepo#1120, EE-5): the provider runs INSIDE the
@@ -3609,18 +3651,38 @@ impl AgentManager {
             })
             .collect();
 
-        // The persisted model (bare part of a compound id) feeds the
-        // post-session model application for providers whose adapter takes
-        // the model over ACP — `session/set_model` (grok) or
-        // `session/set_config_option` (claude-code, codex) — see
-        // `maybe_apply_session_model`.
+        if let Some(profile) = &antigravity_profile {
+            let names = session_mcp_servers
+                .iter()
+                .filter_map(|server| match server {
+                    McpServer::Stdio(server) => Some(server.name.clone()),
+                    McpServer::Http(server) => Some(server.name.clone()),
+                    McpServer::Sse(server) => Some(server.name.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            profile.configure_servers(&names).map_err(|err| {
+                Error::InvalidInput(format!(
+                    "Cannot enforce Antigravity MCP restrictions: {err}"
+                ))
+            })?;
+        }
+
+        // The persisted model (a bare id) feeds the post-session model
+        // application for providers whose adapter takes the model over ACP —
+        // `session/set_model` (grok) or `session/set_config_option`
+        // (claude-code, codex) — see `maybe_apply_session_model`.
         let stored_model = session_record.model.clone();
 
         // The persisted `reasoningEffort` (PROTOCOL §5.5) feeds the generic
         // post-session effort application through whatever `thought_level`
         // config option the provider advertised — see
         // `install_and_apply_thought_level`.
-        let stored_effort = session_record.reasoning_effort.clone();
+        let stored_effort = Self::session_model_effort(
+            provider,
+            stored_model.as_deref(),
+            session_record.reasoning_effort.as_deref(),
+        );
 
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
@@ -3675,13 +3737,14 @@ impl AgentManager {
                     opened.modes.as_ref(),
                 )
                 .await;
-                Self::maybe_apply_session_model(
+                self.maybe_apply_session_model(
                     conn.as_ref(),
+                    agent_id,
                     provider,
                     &opened.session_id,
                     stored_model.as_deref(),
                 )
-                .await;
+                .await?;
                 self.install_and_apply_thought_level(
                     conn.as_ref(),
                     agent_id,
@@ -3693,10 +3756,54 @@ impl AgentManager {
                 return Ok(opened.session_id);
             }
             Ok(None) => {}
+            // Auth-required resume failure (intent-hq/intent#3941): the
+            // provider said it is not logged in — propagate the actionable
+            // login error instead of recreating. For claude-code the
+            // recreate's `session/new` can succeed while logged out, which
+            // would defer the failure to an opaque first-prompt error.
+            Err(e) if crate::agent_session::load_auth_required_error(&e) => {
+                return Err(e);
+            }
             // `session/load` was attempted but failed → fall through to recreate.
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "session/load failed; recreating");
             }
+        }
+
+        // Antigravity requires mode/model confirmation before a candidate
+        // becomes resumable. A failed attempt leaves the prior stored ID and
+        // transcript intact, including across a daemon restart.
+        if provider.id == "antigravity" {
+            let prepared = self
+                .services
+                .prepare_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
+                .await?;
+            self.maybe_apply_session_model(
+                conn.as_ref(),
+                agent_id,
+                provider,
+                &prepared.response.session_id.0,
+                stored_model.as_deref(),
+            )
+            .await?;
+            let opened = self
+                .services
+                .commit_antigravity_acp_session(prepared, stored_id.as_deref())
+                .await?;
+            self.force_recreate.lock().unwrap().remove(agent_id);
+            if stored_id.is_some() {
+                self.recreated.lock().unwrap().insert(agent_id.clone());
+            }
+            self.arm_first_turn_prepend(agent_id, provider);
+            self.install_and_apply_thought_level(
+                conn.as_ref(),
+                agent_id,
+                &opened.session_id,
+                opened.thought_level.clone(),
+                stored_effort.as_deref(),
+            )
+            .await;
+            return Ok(opened.session_id);
         }
 
         // 2) Resume impossible but a session existed → recreate + flag for resend.
@@ -3727,13 +3834,14 @@ impl AgentManager {
                 opened.modes.as_ref(),
             )
             .await;
-            Self::maybe_apply_session_model(
+            self.maybe_apply_session_model(
                 conn.as_ref(),
+                agent_id,
                 provider,
                 &opened.session_id,
                 stored_model.as_deref(),
             )
-            .await;
+            .await?;
             self.install_and_apply_thought_level(
                 conn.as_ref(),
                 agent_id,
@@ -3759,13 +3867,14 @@ impl AgentManager {
             opened.modes.as_ref(),
         )
         .await;
-        Self::maybe_apply_session_model(
+        self.maybe_apply_session_model(
             conn.as_ref(),
+            agent_id,
             provider,
             &opened.session_id,
             stored_model.as_deref(),
         )
-        .await;
+        .await?;
         self.install_and_apply_thought_level(
             conn.as_ref(),
             agent_id,
@@ -3898,14 +4007,57 @@ impl AgentManager {
     /// are honored only when their provider prefix matches the running
     /// provider (a stale id from a pre-spawn provider switch must not be
     /// sent); bare ids are treated as provider-local. The `default` sentinel
-    /// and empty ids are no-ops. Failures are logged at WARN and never fail
-    /// session startup.
+    /// and empty ids are no-ops. Codex rejection fails startup and discards
+    /// the child so a retry cannot reuse its default model. Antigravity
+    /// requires default permission mode and exact model confirmation,
+    /// including after cold load. Other providers retain best-effort behavior.
     async fn maybe_apply_session_model(
+        &self,
         conn: &Connection,
+        agent_id: &AgentId,
         provider: &ProviderConfig,
         acp_session_id: &str,
         stored_model: Option<&str>,
-    ) {
+    ) -> Result<()> {
+        if provider.id == "antigravity" {
+            intent_acp::handshake::set_session_mode(conn, acp_session_id, "default")
+                .await
+                .map_err(|error| {
+                    antigravity_setup_error(
+                        "session/set_mode",
+                        &error,
+                        "Antigravity could not enter default permission mode; no prompt was sent"
+                            .into(),
+                    )
+                })?;
+            let raw = stored_model.unwrap_or_default();
+            let bare = raw.strip_prefix("antigravity:").unwrap_or(raw);
+            if bare.is_empty() || bare.eq_ignore_ascii_case("default") {
+                return Ok(());
+            }
+            let model = Self::provider_local_model_target(provider, stored_model).ok_or_else(|| {
+                Error::InvalidInput("Invalid Antigravity model ID. Refresh models and select an available Antigravity model.".into())
+            })?;
+            let result = intent_acp::session::set_session_config_option_response(conn, acp_session_id, "model", model)
+                .await.map_err(|error| antigravity_setup_error("session/set_config_option", &error, format!(
+                    "Antigravity rejected model {model}. Refresh models and select an available model; no prompt was sent."
+                )))?;
+            let confirmed = result
+                .get("configOptions")
+                .and_then(Value::as_array)
+                .is_some_and(|options| {
+                    options.iter().any(|option| {
+                        option.get("id").and_then(Value::as_str) == Some("model")
+                            && option.get("currentValue").and_then(Value::as_str) == Some(model)
+                    })
+                });
+            if !confirmed {
+                return Err(Error::InvalidInput(format!(
+                    "Antigravity did not confirm model {model}; no prompt was sent. Refresh models and retry."
+                )));
+            }
+            return Ok(());
+        }
         if let Some(model_id) = Self::set_model_target(provider, stored_model) {
             match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
                 Ok(()) => {
@@ -3945,6 +4097,25 @@ impl AgentManager {
                     );
                 }
                 Err(e) => {
+                    // Codex is the only production provider with this
+                    // capability. Its explicit selection must succeed before
+                    // any prompt (or successful model-change notice) is sent.
+                    if provider.config_option_model_strips_effort {
+                        self.kill_child_only(agent_id).await;
+                        return Err(match &e {
+                            intent_acp::AcpError::Rpc(rpc) if rpc.code == -32602 => {
+                                Error::InvalidParams(format!(
+                                    "Could not apply Codex model '{model_id}': {e}. Select a supported model and retry."
+                                ))
+                            }
+                            // Preserve the ACP detail for the existing spawn
+                            // retry classifier; a transport or timeout failure
+                            // does not mean the selected model is unsupported.
+                            _ => Error::Internal(format!(
+                                "session/set_config_option failed: {e}"
+                            )),
+                        });
+                    }
                     tracing::warn!(
                         provider = provider.id,
                         session_id = acp_session_id,
@@ -3955,6 +4126,7 @@ impl AgentManager {
                 }
             }
         }
+        Ok(())
     }
 
     /// Resolve the model id `maybe_apply_session_model` should send via
@@ -3977,8 +4149,8 @@ impl AgentManager {
     /// `supports_config_option_model`, or ids rejected by
     /// [`Self::provider_local_model_target`]. For providers whose stored ids
     /// may embed a reasoning effort (`config_option_model_strips_effort`;
-    /// codex `{base}/{effort}` ids), the suffix is stripped: the adapter's
-    /// model select values are bare base ids, and the effort rides the
+    /// codex `{base}/{effort}` and `{base}[effort]` ids), the suffix is stripped:
+    /// the model select values are bare base ids, and the effort rides the
     /// separate `thought_level` config option.
     fn config_option_model_target<'m>(
         provider: &ProviderConfig,
@@ -3989,10 +4161,48 @@ impl AgentManager {
         }
         let target = Self::provider_local_model_target(provider, stored_model)?;
         if provider.config_option_model_strips_effort {
-            let base = target.split_once('/').map_or(target, |(base, _)| base);
+            let (base, _) = Self::split_codex_model_effort(target);
             return (!base.is_empty()).then_some(base);
         }
         Some(target)
+    }
+
+    /// Legacy Codex slash ids retain their existing parsing. Bracket ids
+    /// split only for recognized catalog effort levels; arbitrary/malformed
+    /// brackets must reach the adapter unchanged and be rejected there.
+    fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
+        if let Some((base, effort)) = model.split_once('/') {
+            return (base, Some(effort));
+        }
+        if let Some((base, effort)) = model.strip_suffix(']').and_then(|m| m.split_once('[')) {
+            if !base.is_empty() && !base.contains(']') {
+                if let Some(level) = ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
+                    .into_iter()
+                    .find(|level| effort.eq_ignore_ascii_case(level))
+                {
+                    return (base, Some(level));
+                }
+            }
+        }
+        (model, None)
+    }
+
+    /// The explicit field is canonical. Embedded legacy Codex effort is a
+    /// fallback only when that field is absent/empty, both at startup and
+    /// when reusing a child; otherwise reuse would reset suffix-only effort.
+    fn session_model_effort(
+        provider: &ProviderConfig,
+        model: Option<&str>,
+        explicit: Option<&str>,
+    ) -> Option<String> {
+        explicit
+            .filter(|effort| !effort.trim().is_empty())
+            .or_else(|| {
+                provider.config_option_model_strips_effort.then_some(())?;
+                let model = Self::provider_local_model_target(provider, model)?;
+                Self::split_codex_model_effort(model).1
+            })
+            .map(str::to_string)
     }
 
     /// Shared gating for the post-session model-application paths: `None` for
@@ -4099,24 +4309,22 @@ impl AgentManager {
         }
         Some(crate::harness::latest().first_turn_prepend_block(prompt))
     }
-    /// Compute the fire-once workspace-naming instruction for the outbound
-    /// prompt, or `None` when it should be omitted. Ported from the reference
+    /// Compute the fire-once agent/workspace naming instruction for the
+    /// outbound prompt, or `None` when both independently gated instructions
+    /// should be omitted. Ported from the reference
     /// `agent-backend-handler.service.ts` (`namingInstructions` block):
     ///
     /// * Fires only on the agent's **first** turn — detected by the absence of
     ///   any prior `assistant` message in the persisted transcript.
-    /// * Fires only when the workspace lookup succeeds AND the current title
-    ///   is empty/whitespace OR still shaped like an auto-generated slug
-    ///   ([`intent_core::slug::is_workspace_slug`]).
-    /// * Names the concrete daemon tool the agent must call — spelled the way
-    ///   the session's provider will actually surface it (see
-    ///   [`workspace_naming_tool_reference`]) — not the FE `workspace_api`
-    ///   JS surface (which daemon-spawned agents do not have).
-    ///
-    /// The agent-rename half of the reference block is intentionally SKIPPED:
-    /// the daemon currently exposes no `set_agent_name` tool. Restore that
-    /// branch once such a tool exists.
-    async fn build_workspace_naming_instruction(
+    /// * Agent naming fires only when the name was not explicitly set and the
+    ///   session has no recognized specialist. It uses the provider-correct
+    ///   workspace API MCP tool to call `ws.workspace.setAgentName`.
+    /// * Workspace naming fires only when the workspace lookup succeeds AND
+    ///   the current title is empty/whitespace or still shaped like an
+    ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]).
+    /// * Workspace naming names the concrete daemon tool the session's
+    ///   provider surfaces (see [`workspace_naming_tool_reference`]).
+    async fn build_first_turn_naming_instruction(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
@@ -4130,32 +4338,48 @@ impl AgentManager {
         if messages.iter().any(|m| m.role == "assistant") {
             return None;
         }
-        let workspace = self.services.store.get_workspace(workspace_id).await.ok()?;
-        let title = workspace.title.trim();
-        let needs_rename = title.is_empty() || is_workspace_slug(title);
-        if !needs_rename {
+        let session = self.services.store.get_agent_session(agent_id).await;
+        let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        let workspace_path = workspace.as_ref().and_then(crate::git_ops::worktree_path);
+        let needs_agent_name = session.as_ref().is_ok_and(|s| {
+            !s.name_explicitly_set
+                && !self
+                    .services
+                    .session_has_recognized_specialist(s, workspace_path.as_deref())
+        });
+        let needs_workspace_title = workspace.as_ref().is_some_and(|workspace| {
+            let title = workspace.title.trim();
+            title.is_empty() || is_workspace_slug(title)
+        });
+        if !needs_agent_name && !needs_workspace_title {
             return None;
         }
-        // Spell the rename tool the way this session's provider surfaces it;
-        // a failed session lookup (or an unresolvable provider) falls back to
-        // the generic phrasing.
         let configured_default =
             crate::agent_session::derived_default_provider(&self.services.effective_settings());
-        let tool_ref = match self.services.store.get_agent_session(agent_id).await {
-            Ok(s) => session_provider_id(&s, configured_default.as_deref())
-                .map_or(GENERIC_NAMING_TOOL_REFERENCE, |p| {
-                    workspace_naming_tool_reference(&p)
-                }),
+        let provider_id = match &session {
+            Ok(s) => session_provider_id(s, configured_default.as_deref()),
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id,
                     error = %e,
                     "naming nudge: session lookup failed; using generic tool phrasing"
                 );
-                GENERIC_NAMING_TOOL_REFERENCE
+                None
             }
         };
-        Some(crate::harness::latest().naming_nudge(tool_ref))
+        let agent_tool_ref = needs_agent_name.then(|| {
+            provider_id.as_deref().map_or(
+                GENERIC_AGENT_NAMING_TOOL_REFERENCE,
+                agent_naming_tool_reference,
+            )
+        });
+        let workspace_tool_ref = needs_workspace_title.then(|| {
+            provider_id.as_deref().map_or(
+                GENERIC_NAMING_TOOL_REFERENCE,
+                workspace_naming_tool_reference,
+            )
+        });
+        Some(crate::harness::latest().naming_nudge(agent_tool_ref, workspace_tool_ref))
     }
 
     /// Build the prompt blocks for an agent's next turn. Normally just the user
@@ -4206,15 +4430,13 @@ impl AgentManager {
         // it also covers the session-recreated case handled by `build_turn_body`.
         let reminder = self.services.agent_role_reminder(agent_id).await;
         let body = self.build_turn_body(agent_id, &combined).await;
-        // Fire-once workspace-naming instruction (port of
+        // Fire-once agent/workspace naming instruction (port of
         // `agent-backend-handler.service.ts` `namingInstructions`): on the
-        // first turn of an agent in a still-untitled / slug-titled workspace,
-        // a `<system>` block asking the agent to set the workspace title as
-        // its first action. Never mutates the persisted user message;
-        // agent-rename half is deferred until the daemon exposes a
-        // `set_agent_name` tool.
+        // first turn, a `<system>` block asks eligible ordinary agents to name
+        // themselves and independently asks for a workspace title when needed.
+        // Never mutates the persisted user message.
         let naming = self
-            .build_workspace_naming_instruction(agent_id, workspace_id)
+            .build_first_turn_naming_instruction(agent_id, workspace_id)
             .await;
         // `stdinContext` renders verbatim as a `Context:` block; the
         // trailing separator matches the reference `acp-provider.ts` so
@@ -4261,7 +4483,30 @@ impl AgentManager {
                 body: &body,
             });
         let mut blocks = text_prompt(&prompt_text);
-        append_attachment_blocks(&mut blocks, options);
+        // Image-reference resolution (monorepo#3338): attachment-registry
+        // references in this turn's (and any preempted prepend's) image
+        // blocks are resolved to inline bytes HERE — the single prompt
+        // assembly choke point — so the ACP receives them exactly as inline
+        // blocks, whatever ingress path carried the reference. No-op when no
+        // references are present.
+        let has_image_refs = !crate::agent_ops::image_block_ref_ids(options.image_blocks.as_ref())
+            .is_empty()
+            || !crate::agent_ops::image_block_ref_ids(options.prepend_image_blocks.as_ref())
+                .is_empty();
+        if has_image_refs {
+            let mut resolved = options.clone();
+            resolved.image_blocks = self
+                .services
+                .resolve_image_block_refs(resolved.image_blocks.take())
+                .await;
+            resolved.prepend_image_blocks = self
+                .services
+                .resolve_image_block_refs(resolved.prepend_image_blocks.take())
+                .await;
+            append_attachment_blocks(&mut blocks, &resolved);
+        } else {
+            append_attachment_blocks(&mut blocks, options);
+        }
         // Resolve `noteIds` to `workspace-asset://` image content blocks
         // (Fidelity B, PROTOCOL §5.5): each note is scanned for markdown
         // image references whose URL is a workspace-asset in the current
@@ -4297,6 +4542,16 @@ impl AgentManager {
                     blocks.extend(text_prompt(&notice));
                 }
             }
+        }
+        // Auto-unarchive prompt notice: the claim that started THIS turn
+        // actually flipped the workspace from Archived to Active
+        // (`try_begin_outcome` armed the one-shot flag on the confirmed
+        // flip), so the model is told via one trailing text block. Consumed
+        // here so only the triggering turn carries it — the persisted
+        // `auto_unarchived` system row stays excluded from history replay
+        // like every system row.
+        if self.auto_unarchived.lock().unwrap().remove(agent_id) {
+            blocks.extend(text_prompt(AUTO_UNARCHIVE_PROMPT_NOTICE));
         }
         blocks
     }
@@ -4430,12 +4685,22 @@ impl AgentManager {
             stopping: Arc::clone(&self.stopping),
             ids: agent_ids.to_vec(),
         };
+        // `sync_store: false` per detach, then ONE batched clear below: each
+        // detach drops the agent's in-memory stop-redelivery payload, so the
+        // durable mirror's outcome for every swept agent is "cleared" — the
+        // per-agent DELETE that `detach()` would run is folded into a single
+        // `IN`-list statement, keeping the sweep's statement count bounded in
+        // the agent count (intent-hq/monorepo#4130). Same durable result as
+        // the per-agent sync (the stale-row no-op included).
         let mut children = Vec::new();
         for id in agent_ids {
-            let (_, child) = self.detach(id).await;
+            let (_, child) = self.detach_with_redelivery(id, None, false).await;
             if let Some(child) = child {
                 children.push(child);
             }
+        }
+        if let Err(e) = self.services.store.clear_stop_redeliveries(agent_ids).await {
+            tracing::warn!(error = %e, "stop-redelivery persistence sync failed for batch stop");
         }
         if !children.is_empty() {
             kill_child_trees(children).await;
@@ -4462,10 +4727,13 @@ impl AgentManager {
     /// arming after the teardown (the previous shape) lost that race.
     ///
     /// `sync_store` controls the durable stop-redelivery mirror
-    /// (intent-hq/monorepo#1899): `true` (every hard-stop path) writes the
-    /// in-memory outcome through to `agent_stop_redelivery`; `false` (the
-    /// graceful-shutdown sweep) leaves the persisted row untouched so an
-    /// armed payload survives the restart and is rehydrated at next boot.
+    /// (intent-hq/monorepo#1899): `true` (every single-agent hard-stop path)
+    /// writes the in-memory outcome through to `agent_stop_redelivery`;
+    /// `false` leaves the persisted row untouched — the graceful-shutdown
+    /// sweep relies on that so an armed payload survives the restart and is
+    /// rehydrated at next boot, while [`Self::stop_many`] uses it to skip the
+    /// per-agent round trip and clears every swept agent's row in ONE batched
+    /// statement after the detach loop (intent-hq/monorepo#4130).
     async fn detach_with_redelivery(
         &self,
         agent_id: &AgentId,
@@ -4661,10 +4929,32 @@ impl AgentManager {
         // as it really ended (monorepo#2110) — including the zero-output
         // completion that persists no row of its own and must therefore still
         // produce the marker row and arm the redelivery below.
-        let (interrupted_message_id, interrupted_text_blocks, had_output) = match flushed {
-            Some(f) => (f.message_id, f.text_blocks, f.had_output),
-            None => (None, Vec::new(), false),
+        let (flush_outcome, interrupted_text_blocks, interrupted_block_count, had_output) =
+            match flushed {
+                Some(f) => (f.outcome, f.text_blocks, f.block_count, f.had_output),
+                None => (InterruptFlushOutcome::Failed, Vec::new(), 0, false),
+            };
+        // `AlreadyPersisted` (the `agent_message.id` UNIQUE collision with a
+        // row NOT tagged interrupted) means the worker's own full row won: the
+        // interrupt landed in the persist→exit gap of a turn that COMPLETED
+        // normally. That row is the turn's real assistant message with normal
+        // metadata, so the terminal emit below must close the stream as the
+        // completion it was — a `stopReason: "interrupted"` there would pin a
+        // spurious Stopped marker on a finished message. `AlreadyInterrupted`
+        // is the same collision against a row a CONCURRENT interrupt flush
+        // wrote (the suspend enrollment racing this teardown): the emit stays
+        // interrupted-shaped and mirrors that row's metadata. The return value
+        // stays `None` on both: no marker row was appended for callers to
+        // exclude.
+        let (completed_message_id, already_interrupted) = match &flush_outcome {
+            InterruptFlushOutcome::AlreadyPersisted(id) => (Some(id.clone()), None),
+            InterruptFlushOutcome::AlreadyInterrupted {
+                message_id,
+                metadata,
+            } => (None, Some((message_id.clone(), metadata.clone()))),
+            InterruptFlushOutcome::Appended(_) | InterruptFlushOutcome::Failed => (None, None),
         };
+        let interrupted_message_id = flush_outcome.appended_message_id().map(str::to_owned);
         // Zero-output user stop (intent-hq/monorepo#1757): the cancelled
         // provider turn dropped the stopped message before producing any
         // output, so arm the prompt-only redelivery payload for the NEXT
@@ -4720,6 +5010,42 @@ impl AgentManager {
                 self.kill_child_only(agent_id).await;
             }
         }
+        // Provider quirk teardown (intent-hq/monorepo#2763): providers with
+        // unreliable cancellation (auggie) leak the cancelled turn's
+        // subprocesses and keep burning tokens after `session/cancel`, so
+        // keeping their child alive buys nothing. Tear the CHILD down after
+        // the polite cancel above gave the provider its chance to settle —
+        // `kill_child_only` preserves the persisted `acpSessionId`, so the
+        // AGENT stays resumable: the next send respawns the child and resumes
+        // the session via the `start_session` resume ladder. The STAB-124
+        // drain and `mark_idle` below then no-op (handle removed, registry
+        // deregistered), same as the wedged-transport kill; idempotent when
+        // the wedged arm already tore the child down.
+        let session_provider = session.as_ref().and_then(|s| {
+            session_provider_id(
+                s,
+                crate::agent_session::derived_default_provider(&self.services.effective_settings())
+                    .as_deref(),
+            )
+        });
+        let provider_kills_on_interrupt = session_provider
+            .as_deref()
+            .and_then(intent_providers::find_provider)
+            .is_some_and(|p| p.kills_child_on_interrupt)
+            // `MOCK_AGENT_KILLS_ON_INTERRUPT=1` grants the mock provider the
+            // quirk (auggie-like) so the E2E suite can exercise this teardown
+            // fence against the real daemon — the quirk lookup is static, so
+            // the seam lives here rather than in the spawn resolution's
+            // MOCK_AGENT_* overrides.
+            || (session_provider.as_deref() == Some("mock")
+                && std::env::var("MOCK_AGENT_KILLS_ON_INTERRUPT").is_ok_and(|v| v == "1"));
+        if provider_kills_on_interrupt {
+            tracing::info!(
+                agent = %agent_id,
+                "provider kills_child_on_interrupt quirk: tearing the child down after session/cancel (monorepo#2763)"
+            );
+            self.kill_child_only(agent_id).await;
+        }
         // STAB-124: the cancelled child echoes `tool_call_update`s for the
         // aborted tool call (title-less, status failed). With the worker gone,
         // they buffer in the handle's notification channel and would be drained
@@ -4756,7 +5082,10 @@ impl AgentManager {
         // aborted worker's `run_prompt_turn` no longer reaches its own emit.
         // Unlike the normal-completion emit, the interrupt terminal carries
         // `stopReason: "interrupted"` (+ `messageId` when an interrupted row
-        // was persisted) so clients can render the Stopped indicator live.
+        // was persisted) so clients can render the Stopped indicator live —
+        // EXCEPT when the flush found the turn already fully persisted
+        // (`completed_message_id`): then the emit takes the normal-completion
+        // shape, since the turn was not cut short.
         //
         // Deliberately NO `trailingBlocks` here (monorepo#732): the interrupt
         // flush persists only the streamed-so-far live-turn snapshot — the
@@ -4766,23 +5095,64 @@ impl AgentManager {
         // blocks for the event to mirror; carrying undrained entries would
         // break the byte-identical persisted↔event invariant.
         if let Some(workspace_id) = workspace_id {
-            // `interruptReason`/`interruptedBy` mirror the persisted row's
-            // metadata so clients can render the reason-specific Stopped
-            // indicator live, without refetching the transcript.
-            let mut end_data = json!({
-                "agentId": agent_id.0,
-                "stopReason": "interrupted",
-                "interruptReason": reason.as_str(),
-            });
-            // Same reason gate as the persisted row: `interruptedBy` is
-            // defined only for message preemption.
-            if reason == InterruptReason::PreemptedByMessage {
-                if let Some(ref by) = interrupted_by {
-                    end_data["interruptedBy"] = by.to_json();
-                }
-            }
-            if let Some(ref message_id) = interrupted_message_id {
+            let diagnostic_id = completed_message_id
+                .as_deref()
+                .or(interrupted_message_id.as_deref())
+                .or(already_interrupted.as_ref().map(|(id, _)| id.as_str()));
+            let mut end_data = json!({ "agentId": agent_id.0 });
+            if let Some(ref message_id) = completed_message_id {
+                // The turn completed before the interrupt could cut it short:
+                // normal-completion shape — `messageId` names the worker's
+                // durable full row, and none of the interrupted fields apply.
+                crate::agent_session::trace_stream_lifecycle(
+                    diagnostic_id,
+                    "message",
+                    "agent_stream_end",
+                    None,
+                    interrupted_block_count,
+                    "complete",
+                );
                 end_data["messageId"] = json!(message_id);
+            } else {
+                crate::agent_session::trace_stream_lifecycle(
+                    diagnostic_id,
+                    "message",
+                    "agent_stream_end",
+                    None,
+                    interrupted_block_count,
+                    "interrupted",
+                );
+                // `interruptReason`/`interruptedBy` mirror the persisted row's
+                // metadata so clients can render the reason-specific Stopped
+                // indicator live, without refetching the transcript.
+                end_data["stopReason"] = json!("interrupted");
+                if let Some((ref message_id, ref row_metadata)) = already_interrupted {
+                    // A concurrent interrupt flush's row won the collision:
+                    // mirror THAT row's metadata (its reason may differ from
+                    // this interrupt's, e.g. `system_suspend`), falling back
+                    // to this interrupt's reason when the row was unreadable.
+                    end_data["interruptReason"] = row_metadata
+                        .get("interruptReason")
+                        .filter(|r| r.is_string())
+                        .cloned()
+                        .unwrap_or_else(|| json!(reason.as_str()));
+                    if let Some(by) = row_metadata.get("interruptedBy") {
+                        end_data["interruptedBy"] = by.clone();
+                    }
+                    end_data["messageId"] = json!(message_id);
+                } else {
+                    end_data["interruptReason"] = json!(reason.as_str());
+                    // Same reason gate as the persisted row: `interruptedBy`
+                    // is defined only for message preemption.
+                    if reason == InterruptReason::PreemptedByMessage {
+                        if let Some(ref by) = interrupted_by {
+                            end_data["interruptedBy"] = by.to_json();
+                        }
+                    }
+                    if let Some(ref message_id) = interrupted_message_id {
+                        end_data["messageId"] = json!(message_id);
+                    }
+                }
             }
             // Final live-preview values from the flushed partial turn (same
             // contract as the normal-completion terminal emit in
@@ -4809,6 +5179,24 @@ impl AgentManager {
             // content has not been queued yet at this point, so the
             // ready-to-send check alone cannot see the imminent interrupt turn).
             if !suppress_idle_emit && !self.services.has_ready_to_send(agent_id) {
+                crate::agent_session::trace_stream_lifecycle(
+                    diagnostic_id,
+                    "message",
+                    "agent_idle",
+                    None,
+                    interrupted_block_count,
+                    "interrupted",
+                );
+                // A user interrupt ends the turn — surface an attention
+                // request the aborted turn raised mid-flight before the idle
+                // emit (same ordering as the settlement idle in
+                // `run_prompt_turn`). An interrupt-with-message
+                // (`suppress_idle_emit`) skips this: the follow-up delivery
+                // clears the pending request at turn begin, retiring the
+                // deferred marker without surfacing.
+                self.services
+                    .flush_deferred_attention(agent_id, &workspace_id)
+                    .await;
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "interrupted",
@@ -5151,10 +5539,56 @@ impl AgentManager {
             // triggers this. Suppressed (`auto_unarchive = false`) only by
             // the worker's raced re-claim, whose own post-claim archived
             // re-check parks instead of un-archiving (monorepo#2513).
-            if auto_unarchive {
-                self.services
+            if auto_unarchive
+                && self
+                    .services
                     .auto_unarchive_on_turn_start(workspace_id, agent_id)
+                    .await
+            {
+                // The flip actually persisted: record the `auto_unarchived`
+                // system transcript row and arm the one-shot prompt-notice
+                // flag so THIS turn's outbound prompt tells the model the
+                // workspace was auto-unarchived. Both best-effort — never
+                // block the turn.
+                self.persist_auto_unarchive_notice(agent_id, workspace_id)
                     .await;
+                self.arm_auto_unarchive_flag_if_slot_held(agent_id);
+            }
+            // Pre-upgrade pending-questions marker (PROTOCOL §5.5): a session
+            // whose marker key was never written derives pendingness from the
+            // transcript tail, and this turn's user row is about to become
+            // that tail. Materialize the marker HERE — the single choke point
+            // every runtime delivery (user or automatic, direct, drained, or
+            // wake) claims through before its user row INSERT — so a pending
+            // set live across the upgrade stays sticky instead of vanishing
+            // under the first delivery. One session-row read on the
+            // post-upgrade norm (marker written); best-effort, never blocks
+            // the turn.
+            self.services
+                .materialize_legacy_pending_questions_marker(agent_id)
+                .await;
+            // A real turn is starting: this agent's monitoring-idle waiting
+            // period (if any) is over, so clear its once-per-period advisory
+            // markers — the NEXT hook-/PR-monitor-waiting idle opens a NEW
+            // period and may advise its still-armed watchers again. Without
+            // this, the markers only cleared at genuine settlement, so a
+            // child woken mid-wait (user message, hook dispatch) that
+            // stalled monitoring-idle again parked its watchers in silence
+            // indefinitely. Best-effort: a failed clear only suppresses one
+            // future advisory, never a real wake — settlement still clears.
+            self.services
+                .clear_advisory_wake_periods_in_memory_for_child(agent_id);
+            if let Err(e) = self
+                .services
+                .store
+                .clear_advisory_wake_deliveries_for_child(agent_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    agent = %agent_id.0,
+                    "failed to clear advisory-wake markers at turn start"
+                );
             }
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
@@ -5164,6 +5598,7 @@ impl AgentManager {
                 AgentStatus::Active,
                 true,
                 Some(None),
+                true,
             )
             .await;
         }
@@ -5192,7 +5627,33 @@ impl AgentManager {
         if !busy.remove(agent_id) {
             return None;
         }
+        // Drop a stale auto-unarchive prompt flag with the slot: a claim
+        // whose turn never built a prompt (harness wake turns, a persist
+        // failure releasing before spawn) must not leak the notice into a
+        // later unrelated turn.
+        self.auto_unarchived.lock().unwrap().remove(agent_id);
         Some(self.agent_ws.lock().unwrap().remove(agent_id))
+    }
+
+    /// Arm the one-shot auto-unarchive prompt flag, but only while the agent
+    /// still holds its in-flight slot — decided atomically under the `busy`
+    /// lock (lock order busy → `auto_unarchived`, matching
+    /// [`Self::release_slot_sync`]). The flag is armed AFTER the awaits on
+    /// `auto_unarchive_on_turn_start` / `persist_auto_unarchive_notice`, so
+    /// a concurrent stop/teardown can run `release_slot_sync` in that window;
+    /// its clear finds nothing, and an unconditional insert landing after it
+    /// would leak the notice into a later, non-triggering turn. Holding
+    /// `busy` while inserting closes the window: either this claim still owns
+    /// the slot (insert precedes the release's clear) or the slot is gone
+    /// (insert is skipped entirely).
+    fn arm_auto_unarchive_flag_if_slot_held(&self, agent_id: &AgentId) {
+        let busy = self.busy.lock().unwrap();
+        if busy.contains(agent_id) {
+            self.auto_unarchived
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone());
+        }
     }
 
     /// Release the in-flight slot, recomputing the owning workspace's derived
@@ -5290,6 +5751,10 @@ impl AgentManager {
             .await
         {
             Ok(true) => {
+                // A request cleared before its idle flush retires the parked
+                // surfacing outright — the turn-end flush must not resurrect
+                // a request the user's own delivery just dismissed.
+                self.services.take_deferred_attention(agent_id);
                 self.services
                     .publish_agent_mutation_event(
                         workspace_id,
@@ -5418,9 +5883,14 @@ impl AgentManager {
             }),
         };
         crate::publish_event(self.services.event_bus.as_ref(), event).await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.services
-            .schedule_last_activity_event(workspace_id.clone());
+        // Schedule debounced lastActivity event (§10.1) only when the flip
+        // ENDS a turn (transition to a non-active state): lastActivity moves
+        // at turn boundaries, so turn-start/mid-turn status flips must not
+        // churn the workspace ordering.
+        if !is_active {
+            self.services
+                .schedule_last_activity_event(workspace_id.clone());
+        }
     }
 
     /// Persist `agent_session.status` + `is_active` + optional `stop_reason` and
@@ -5429,6 +5899,11 @@ impl AgentManager {
     /// untouched, `Some(None)` clears it, `Some(Some(reason))` sets it. All failures
     /// are logged and swallowed: the runtime turn is the source of truth and a
     /// transient store/bus error must not abort the in-flight slot transition.
+    ///
+    /// `turn_boundary` marks whether a non-active flip actually ENDS a turn:
+    /// the `agent.retry` Error-clear (see [`AgentManager::persist_retry_status`])
+    /// persists a non-active status without any turn having run, so it passes
+    /// `false` and must not bump `lastActivity` (§10.1 turn-boundary policy).
     #[allow(clippy::option_option)] // the nesting IS the untouched/clear/set tri-state
     async fn persist_status_with_stop_reason(
         &self,
@@ -5437,6 +5912,7 @@ impl AgentManager {
         status: AgentStatus,
         is_active: bool,
         stop_reason: Option<Option<String>>,
+        turn_boundary: bool,
     ) {
         let ts = now_iso();
         // Clone stop_reason for event emission (we need it after the store call moves it).
@@ -5492,9 +5968,14 @@ impl AgentManager {
             data,
         };
         crate::publish_event(self.services.event_bus.as_ref(), event).await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.services
-            .schedule_last_activity_event(workspace_id.clone());
+        // Schedule debounced lastActivity event (§10.1) only when the flip
+        // ENDS a turn (transition to a non-active state on a real turn
+        // boundary) — same gate as [`persist_status`], plus the
+        // `turn_boundary` opt-out for the no-turn `agent.retry` Error-clear.
+        if !is_active && turn_boundary {
+            self.services
+                .schedule_last_activity_event(workspace_id.clone());
+        }
     }
 
     /// Forget a finished worker's join handle.
@@ -5519,7 +6000,7 @@ impl AgentManager {
         self: &Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
-        content: String,
+        mut content: String,
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
@@ -5535,6 +6016,20 @@ impl AgentManager {
                 )));
             }
         }
+        // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
+        // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
+        // below (quarantine/archived/hold parks, busy enqueue, direct
+        // persist) so immediate deliveries and queued entries alike carry it
+        // and drain/flush/redrive never re-annotate (exact-header guard).
+        crate::agent_ops::annotate_sender_attribution(
+            &mut content,
+            options.message_metadata.as_ref(),
+        );
+        // Resolve the id before any queue gate so every delivery path carries
+        // the same durable identity. Internal completion wakes supply a stable
+        // id; restart retries then adopt the existing queue entry or transcript
+        // row instead of minting a second wake.
+        let message_id = message_id.unwrap_or_else(new_message_id);
         // monorepo#564: reject nonexistent targets BEFORE any state change —
         // a truncated/mistyped id must not claim the slot or queue a phantom
         // message that never drains (the sender then waits forever).
@@ -5553,8 +6048,9 @@ impl AgentManager {
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
                 "session is quarantined (poisoned); parking message in queue instead of driving a turn"
             );
-            let (queued, position) = self.services.enqueue_message_with_origin(
+            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                 &agent_id,
+                Some(message_id.clone()),
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
@@ -5604,14 +6100,16 @@ impl AgentManager {
         if !options.origin.is_user() && !workspace_id.is_chief() {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    let (queued, position) = self.services.enqueue_message(
+                    let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                         &agent_id,
+                        Some(message_id.clone()),
                         content,
                         options.image_blocks.clone(),
                         options.file_blocks.clone(),
                         options.message_metadata.clone(),
                         options.queued_prepend(),
                         options.interrupt_priority,
+                        false,
                     );
                     let result = json!({
                         "success": true,
@@ -5648,71 +6146,40 @@ impl AgentManager {
                 }
             }
         }
-        // Question hold (PROTOCOL §5.5): an automatic delivery to an agent
-        // with un-dismissed pending questions must NOT start a turn — its
-        // turn would bury the pending Q&A under later transcript rows and
-        // steal the user's chance to answer. Park the message in the queue
-        // instead (interrupt priority included — no exceptions, spec
-        // §Decisions); only `agent.dismissQuestions` or an answer-tagged user
-        // row flips the hold false and kicks the drain. Checked BEFORE
-        // `try_begin` so even an idle agent holds the delivery.
-        if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
-            let (queued, position) = self.services.enqueue_message(
-                &agent_id,
-                content,
-                options.image_blocks.clone(),
-                options.file_blocks.clone(),
-                options.message_metadata.clone(),
-                options.queued_prepend(),
-                options.interrupt_priority,
-            );
-            let result = json!({
-                "success": true,
-                "queued": true,
-                "heldForQuestions": true,
-                "queuedMessage": queued.to_value(position),
-                "turnId": queued.turn_id,
-            });
-            self.services.publish_queue_updated(&agent_id).await;
-            // Race close (hold-check → enqueue vs a concurrent
-            // `dismissQuestions`/answer): the hold may have flipped false
-            // between the check above and the enqueue just completing — the
-            // dismiss's own `try_drain_queue` kick could have fired against
-            // a still-empty queue and found nothing to drain. Re-check and
-            // kick again if the hold has since cleared, so this entry is not
-            // stranded until some unrelated future trigger.
-            if !self.services.question_hold_active(&agent_id).await {
-                self.clone()
-                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                    .await;
-            }
-            return Ok(result);
-        }
-        // FIFO restore under an active hold (monorepo#1791): a USER-origin
-        // send to an agent whose hold has parked ready-to-send entries must
-        // not bypass them with a direct turn — the parked backlog (e.g. an
-        // `after_all` settlement wake) would sit at position 0 while newer
-        // user messages run whole turns past it. Convert the send into a
-        // queue-fallback enqueue (user-origin) and kick the drain: the batch
-        // flush delivers the older parked entries FIFO in the SAME combined
-        // turn as this user message. Requires the `all` flush mode (the
-        // default): without batching no combined turn exists to carry the
-        // parked entries, so the conversion would only add a queue hop —
-        // under `systemOnly`/`off` the direct send stays as documented (the
-        // hold contract for automatic entries is unchanged either way).
-        // Also skipped when nothing is parked, so the common direct-send
-        // path is untouched — and for a session parked in `Error`, whose
-        // documented recovery IS the direct fresh send (the STAB-52 gate in
-        // `try_drain_queue` would strand a converted entry there).
+        // Combined flush of parked archive notices (intent-hq/intent#3883):
+        // a USER send into an ARCHIVED workspace whose queue holds parked
+        // ready-to-send entries (hook/PR-monitor archive-cancellation wakes)
+        // must not bypass them with a direct turn — the model would reason
+        // about the user message first and learn its hooks were cancelled
+        // in later turns, in confusing order. Convert the send into a
+        // queue-fallback enqueue (user-origin) and kick the drain: its
+        // archived gate exempts user-origin entries, the `try_begin` claim
+        // auto-unarchives at the single existing choke point, and the batch
+        // flush delivers the parked entries FIFO in the SAME combined turn
+        // as this user message with the trailing unarchive prompt notice.
+        // Requires the `all` flush mode (without batching no combined turn
+        // exists to carry the parked entries), skipped when nothing is
+        // parked (the common
+        // direct-send path is untouched), and skipped for a session parked
+        // in `Error`, whose documented recovery IS the direct fresh send
+        // (the STAB-52 gate in `try_drain_queue` would strand a converted
+        // entry there). Chief is virtual and never archived, so skip the
+        // row read; fail open on a lookup error — only an affirmatively-
+        // archived row converts.
         if options.origin.is_user()
             && session.status != AgentStatus::Error
+            && !workspace_id.is_chief()
             && self.services.flush_queued_messages_mode()
                 == intent_core::FlushQueuedMessagesMode::All
             && self.services.has_ready_to_send(&agent_id)
-            && self.services.question_hold_active(&agent_id).await
+            && matches!(
+                self.services.store.get_workspace(&workspace_id).await,
+                Ok(ws) if ws.archived
+            )
         {
-            let (queued, position) = self.services.enqueue_message_with_origin(
+            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                 &agent_id,
+                Some(message_id.clone()),
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
@@ -5734,8 +6201,9 @@ impl AgentManager {
             return Ok(result);
         }
         if !self.try_begin(&agent_id, &workspace_id).await {
-            let (queued, position) = self.services.enqueue_message_with_origin(
+            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                 &agent_id,
+                Some(message_id.clone()),
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
@@ -5753,7 +6221,6 @@ impl AgentManager {
             self.services.publish_queue_updated(&agent_id).await;
             return Ok(result);
         }
-        let message_id = message_id.unwrap_or_else(new_message_id);
         // Delivery-time unblocked hints (monorepo#2044), direct-send arm: an
         // idle target delivers the wake immediately, so delivery time is NOW
         // — compute the section here so an unqueued completion wake carries
@@ -5840,8 +6307,9 @@ impl AgentManager {
                         agent_id.0
                     )));
                 }
-                let (queued, position) = self.services.enqueue_message_with_origin(
+                let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                     &agent_id,
+                    Some(message_id.clone()),
                     content,
                     options.image_blocks.clone(),
                     options.file_blocks.clone(),
@@ -5870,13 +6338,20 @@ impl AgentManager {
         self.services
             .publish_agent_message_events(&workspace_id, &agent_id, &message, Some(&turn_id))
             .await;
-        // Answer intake (PROTOCOL §5.5, question hold): a user row tagged
+        // Schedule debounced lastActivity event (§10.1) for USER-origin sends
+        // only: a human sending into the workspace is a turn boundary, an
+        // internal wake/agent-to-agent delivery is not.
+        if options.origin.is_user() {
+            self.services
+                .schedule_last_activity_event(workspace_id.clone());
+        }
+        // Answer intake (PROTOCOL §5.5, pending questions): a user row tagged
         // `question_answers` naming the marked assistant message resolves the
         // pending Q&A and clears the marker (a stale/foreign
         // `answeredQuestionsMessageId` is a no-op). Only an ANSWER retires the
-        // hold now that pendingness is persisted — a plain user row leaves the
-        // marker as it was. Runs BEFORE the displayStatus recompute so the
-        // retired hold is reflected.
+        // marker now that pendingness is persisted — a plain user row leaves
+        // it as it was. Runs BEFORE the displayStatus recompute so the
+        // resolved marker is reflected.
         self.services
             .resolve_pending_questions_for_answer(
                 &workspace_id,
@@ -5884,7 +6359,7 @@ impl AgentManager {
                 options.message_metadata.as_ref(),
             )
             .await;
-        // The retired hold can drop the workspace's needs_attention
+        // The resolved marker can drop the workspace's needs_attention
         // displayStatus (§6.5 step 0): recompute-and-compare. This recompute
         // ALSO produces the visible `failed → in_progress` transition on the
         // errored-agent redrive path (a fresh sendMessage to a non-poisoned
@@ -5928,21 +6403,44 @@ impl AgentManager {
         // turns but KEEPS pending queues persisted, so the automatic drain
         // must not respawn a turn while the workspace is archived — messages
         // park until unarchive, which kicks this drain for every parked
-        // queue (see `unarchive_workspace`). Chief is virtual and never
-        // archived, so skip the row read. Fail open on a lookup error: the
-        // gate only parks affirmatively-archived workspaces; a transient
-        // store error must not strand the queue.
-        if !workspace_id.is_chief() {
+        // queue (see `unarchive_workspace`). A USER-origin entry queued at
+        // or after `archivedAt` is exempt (intent-hq/intent#3883): a user send made
+        // INTO the archived workspace is the explicit resurrection signal,
+        // so the drain proceeds — its `try_begin` claim performs the
+        // auto-unarchive at the single existing choke point, and the batch
+        // flush carries every parked ready entry FIFO in the same combined
+        // turn. The timestamp cut matters: a user entry parked by a busy
+        // race BEFORE archival is not a post-archive user action, so it
+        // stays parked with everything else — without the cut the
+        // interrupted worker's end-of-turn re-kick would find that older
+        // entry and immediately unarchive a freshly archived workspace
+        // (PR #1587 review). With no post-archive user entry ready
+        // everything stays parked (no regression on the archive/
+        // auto-unarchive loop). Chief is virtual and never archived, so
+        // skip the row read. Fail open on a lookup error: the gate only
+        // parks affirmatively-archived workspaces; a transient store error
+        // must not strand the queue. A row missing `archivedAt` (legacy
+        // data) also fails open to the untimed user-origin check.
+        let archived_drain = if workspace_id.is_chief() {
+            false
+        } else {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    tracing::debug!(
-                        agent = %agent_id,
-                        workspace = %workspace_id.as_str(),
-                        "skipping queue drain: workspace is archived"
-                    );
-                    return;
+                    let user_ready = match ws.archived_at.as_deref() {
+                        Some(at) => self.services.has_user_origin_ready_since(&agent_id, at),
+                        None => self.services.has_user_origin_ready(&agent_id),
+                    };
+                    if !user_ready {
+                        tracing::debug!(
+                            agent = %agent_id,
+                            workspace = %workspace_id.as_str(),
+                            "skipping queue drain: workspace is archived"
+                        );
+                        return;
+                    }
+                    true
                 }
-                Ok(_) => {}
+                Ok(_) => false,
                 Err(e) => {
                     tracing::warn!(
                         agent = %agent_id,
@@ -5950,30 +6448,9 @@ impl AgentManager {
                         error = %e,
                         "queue drain: workspace archived-state lookup failed; proceeding"
                     );
+                    false
                 }
             }
-        }
-        // Question hold (PROTOCOL §5.5): AUTOMATIC queued messages stay
-        // parked while the agent has un-dismissed pending questions — the
-        // turn a drained entry starts would bury the pending Q&A. The park
-        // now lasts across turns and daemon restarts (the marker is
-        // persisted): only `agent.dismissQuestions` and an answer-tagged user
-        // row flip the derivation false, and both re-kick this drain (mirrors
-        // the STAB-52 Error gate below). A parked USER-origin entry is
-        // exempt — it may itself BE the answer that releases the hold, so it
-        // drains rather than deadlocking behind it (`hold_drain` below); a
-        // plain user entry drains too but leaves the hold armed.
-        let hold_drain = if self.services.question_hold_active(&agent_id).await {
-            if !self.services.has_user_origin_ready(&agent_id) {
-                tracing::debug!(
-                    agent = %agent_id,
-                    "skipping queue drain: question hold active (awaiting answer or dismissQuestions)"
-                );
-                return;
-            }
-            true
-        } else {
-            false
         };
         // A session parked in `Error` must NOT be auto-redriven (STAB-52): the
         // terminal spawn/turn-failure handler requeues the failed message and
@@ -6023,22 +6500,39 @@ impl AgentManager {
                 return;
             }
         }
+        // Soft-retire gate: a retired session is inert — nothing may start a
+        // turn on it. Queued entries stay parked; `agent.restore` returns the
+        // session to service (a later queue kick drains them). Fail open on a
+        // lookup error, matching the archived-workspace gate above.
+        if let Ok(Some(_)) = self
+            .services
+            .store
+            .get_agent_session_retired_at(&agent_id)
+            .await
+        {
+            tracing::debug!(
+                agent = %agent_id,
+                "skipping queue drain: session is retired (awaiting agent.restore)"
+            );
+            return;
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
         }
         // Batch flush (`agents.flushQueuedMessages`, default `all`): with a
         // batching mode and MORE THAN ONE eligible entry waiting, drain them
         // all into ONE combined provider turn while persisting each entry as
-        // its own transcript row. Under an active hold (`hold_drain`) the
-        // flush fires only because a user-origin entry is ready — the parked
-        // automatic entries ride its combined turn FIFO instead of being
-        // bypassed (monorepo#1791). A single eligible entry (or the `off`
-        // mode) falls through to the existing single-entry path unchanged.
+        // its own transcript row. Under an archived-workspace exemption
+        // (`archived_drain`) the flush fires only because a user-origin
+        // entry is ready — the parked automatic entries ride its combined
+        // turn FIFO instead of being bypassed (intent-hq/intent#3883). A
+        // single eligible entry (or the `off` mode) falls through to the
+        // existing single-entry path unchanged.
         {
             let mode = self.services.flush_queued_messages_mode();
-            if let Some(batch) = self
-                .services
-                .dequeue_flush_batch(&agent_id, mode, hold_drain, 2)
+            if let Some(batch) =
+                self.services
+                    .dequeue_flush_batch(&agent_id, mode, archived_drain, 2)
             {
                 match prepare_flush_turn(&self, &agent_id, &workspace_id, batch).await {
                     FlushPrep::Turn { content, options } => {
@@ -6054,9 +6548,9 @@ impl AgentManager {
                 return;
             }
         }
-        // Under an active hold only a user-origin entry may drain; the
-        // normal path pops the queue head as before.
-        let dequeued = if hold_drain {
+        // Under the archived-workspace exemption only a user-origin entry
+        // may drain; the normal path pops the queue head as before.
+        let dequeued = if archived_drain {
             self.services.dequeue_user_origin_message(&agent_id)
         } else {
             self.services.dequeue_message(&agent_id)
@@ -6121,6 +6615,7 @@ impl AgentManager {
                 next.file_blocks.as_ref(),
                 next.message_metadata.as_ref(),
                 Some(&next.turn_id),
+                next.user_origin,
             )
             .await
         };
@@ -6262,10 +6757,9 @@ impl AgentManager {
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
             prepend_file_blocks: entry.prepend_file_blocks.clone(),
-            // Explicit user action (question hold, PROTOCOL §5.5): "send
-            // now" bypasses the hold by design, and it delivers with
-            // interrupt priority — a terminal-failure requeue keeps the
-            // front-of-queue position.
+            // Explicit user action: "send now" is user-originated and
+            // delivers with interrupt priority — a terminal-failure requeue
+            // keeps the front-of-queue position.
             origin: intent_core::MessageOrigin::User,
             interrupt_priority: true,
             ..TurnOptions::default()
@@ -6278,8 +6772,8 @@ impl AgentManager {
             // the race): restore the entry at the FRONT so it is the next
             // message delivered, and report the queued outcome honestly.
             // The explicit "send now" is a user action: mark the restored
-            // entry user-origin so the winner's end-of-turn drain delivers
-            // it even while the question hold is active (§5.5 bypass).
+            // entry user-origin so the winner's end-of-turn drain keeps its
+            // user-origin semantics (attention clear, archived exemption).
             entry.user_origin = true;
             let restored = entry.to_value(0);
             self.services.requeue_front(&agent_id, entry);
@@ -6339,8 +6833,8 @@ impl AgentManager {
                     Some(entry.turn_id.as_str()),
                 )
                 .await;
-            // Answer intake (PROTOCOL §5.5, question hold): an answer that was
-            // queued and then explicitly sent still resolves the pending Q&A.
+            // Answer intake (PROTOCOL §5.5, pending questions): an answer that
+            // was queued and then explicitly sent still resolves the pending Q&A.
             // An untagged entry leaves the marker (and the workspace's
             // needs_attention displayStatus, §6.5 step 0) untouched, so the
             // recompute only runs on an actual clear.
@@ -6461,11 +6955,10 @@ impl AgentManager {
         if dropped {
             self.sync_stop_redelivery(&agent_id).await;
         }
-        // Explicit user action (question hold, PROTOCOL §5.5): the send is
-        // user-origin so it is never held. The truncation above already
-        // re-derived the pending-questions marker against the post-truncation
-        // transcript, so a Q&A the edit cut away is gone and one that survived
-        // stays pending.
+        // Explicit user action: the send is user-origin. The truncation
+        // above already re-derived the pending-questions marker (PROTOCOL
+        // §5.5) against the post-truncation transcript, so a Q&A the edit
+        // cut away is gone and one that survived stays pending.
         options.origin = intent_core::MessageOrigin::User;
         let mut result = self
             .send_message(agent_id, workspace_id, content, None, options)
@@ -6519,8 +7012,8 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
-        // Every queue fallback below (hold gate, busy race, quarantine park,
-        // append-failure auto-queue) must park this message at the FRONT of
+        // Every queue fallback below (archived gate, busy race, quarantine
+        // park, append-failure auto-queue) must park this message at the FRONT of
         // the queue (spec §Decisions: interrupts always enter ahead of
         // normal entries, arrival-ordered among themselves).
         options.interrupt_priority = true;
@@ -6529,12 +7022,9 @@ impl AgentManager {
         self.services.require_agent_session(&agent_id).await?;
         // Duplicate-delivery guard: check-and-record is atomic under the lock,
         // so of two racing duplicates exactly one proceeds. Runs BEFORE the
-        // hold check below so a held interrupt still records its id — an
-        // interrupt parked by the hold keeps the same at-most-once contract
-        // as one that streamed immediately: a duplicate with the same
-        // `message_id` arriving while the hold is active is deduplicated
-        // instead of double-enqueuing, and a replay arriving after the hold
-        // releases is deduplicated too.
+        // archived gate below so a parked interrupt still records its id and
+        // keeps the same at-most-once contract as one that streamed
+        // immediately.
         if let Some(mid) = message_id.as_deref() {
             let mut ids = self.interrupt_ids.lock().unwrap();
             if ids.get(&agent_id).map(String::as_str) == Some(mid) {
@@ -6546,16 +7036,6 @@ impl AgentManager {
                 }));
             }
             ids.insert(agent_id.clone(), mid.to_string());
-        }
-        // Question hold (PROTOCOL §5.5): an automatic interrupt is ALSO held
-        // — no exceptions (spec §Decisions). Skip the preemption entirely
-        // (there is nothing to preempt: the asking agent is idle, and a busy
-        // agent's hold cannot be active since the Q&A message is terminal)
-        // and let `send_message`'s hold gate park the message front-of-queue.
-        if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
-            return self
-                .send_message(agent_id, workspace_id, content, message_id, options)
-                .await;
         }
         // Archived-workspace gate (intent-hq/monorepo#2732): an automatic
         // interrupt into an archived workspace is ALSO parked — skip the
@@ -6865,11 +7345,11 @@ impl AgentManager {
         if self.busy.lock().unwrap().contains(agent_id) {
             return true;
         }
-        // Perf (PR review, PROTOCOL §5.5): a non-consuming peek — in-memory,
-        // no store round-trip — so the two `question_hold_active` reads
-        // below only run once a notification is actually buffered. Without
-        // this, every idle agent with a live handle costs ~2 SQLite reads
-        // per `HARNESS_WAKE_POLL` tick (50ms) even when nothing is pending.
+        // Perf (PR review): a non-consuming peek — in-memory, no store
+        // round-trip — so the retired-state read below only runs once a
+        // notification is actually buffered. Without this, every idle agent
+        // with a live handle costs a SQLite read per `HARNESS_WAKE_POLL`
+        // tick (50ms) even when nothing is pending.
         {
             let Ok(peek) = notes.try_lock() else {
                 return true;
@@ -6878,11 +7358,19 @@ impl AgentManager {
                 return true;
             }
         }
-        // Question hold (PROTOCOL §5.5): an implicit harness wake turn would
-        // append a fresh assistant message, burying the pending Q&A the hold
-        // protects. Skip the tick (buffered notifications stay untouched)
-        // until the questions are answered or dismissed.
-        if self.services.question_hold_active(agent_id).await {
+        // Soft-retire gate: a retired session is inert — a delayed
+        // `session/update` must not open an implicit harness-wake turn (the
+        // same inertness the queue-drain and retry paths enforce). Skip the
+        // tick, leaving buffered notifications untouched: `agent.restore`
+        // returns the session to service and a later tick consumes them.
+        // Checked after the peek so idle agents cost no store read, and
+        // fail-open on a lookup error like the queue-drain gate.
+        if let Ok(Some(_)) = self
+            .services
+            .store
+            .get_agent_session_retired_at(agent_id)
+            .await
+        {
             return true;
         }
         // Owned lock so the claimed path below can move the receiver guard
@@ -6906,9 +7394,10 @@ impl AgentManager {
         // emit a phantom `stream:start`/`stream:end` pair with no content
         // and pin the busy slot for the settle window.
         //
-        // A `usage_update` cost is the one exception: providers commonly emit
-        // the final cost report after the response, so it can lead a buffered
-        // burst. It materializes no transcript content, so it is persisted
+        // A `usage_update` is the one exception: providers commonly emit
+        // the final usage report after the response, so it can lead a
+        // buffered burst. It materializes no transcript content, so its
+        // context occupancy is recorded in-memory and any cost is persisted
         // cost-only (§5.23) — no turn, no busy slot, no phantom stream events
         // — instead of being dropped.
         match intent_acp::session::map_notification(&first) {
@@ -6918,18 +7407,24 @@ impl AgentManager {
             Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
             Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
                 if !tc.tool_name.trim().is_empty() => {}
-            Some(intent_acp::session::MappedUpdate::UsageCost(cost)) => {
+            Some(intent_acp::session::MappedUpdate::Usage(usage)) => {
                 drop(guard);
+                // Context occupancy (intent-hq/intent#3797): latest-wins
+                // in-memory record, never a token-tally input.
                 self.services
-                    .persist_cost_only_ordered(
-                        agent_id,
-                        workspace_id,
-                        UsageCost {
-                            amount: cost.amount,
-                            currency: cost.currency,
-                        },
-                    )
-                    .await;
+                    .record_context_usage(agent_id, usage.used, usage.size);
+                if let Some(cost) = usage.cost {
+                    self.services
+                        .persist_cost_only_ordered(
+                            agent_id,
+                            workspace_id,
+                            UsageCost {
+                                amount: cost.amount,
+                                currency: cost.currency,
+                            },
+                        )
+                        .await;
+                }
                 return true;
             }
             _ => return true,
@@ -7012,7 +7507,7 @@ impl AgentManager {
             mgr.clear_worker(&id);
             mgr.end_turn(&id).await;
             mgr.services
-                .publish_harness_wake_idle(&id, &ws, outcome.empty_response)
+                .publish_harness_wake_idle(&id, &ws, &outcome.lifecycle, outcome.empty_response)
                 .await;
             // A user send that raced in queued behind this turn's slot (or
             // the recovery nudge above); with the slot released, kick the
@@ -7055,6 +7550,15 @@ impl AgentManager {
     ) -> Result<Value> {
         // Fetch current session status
         let session = self.services.store.get_agent_session(&agent_id).await?;
+
+        // Soft-retire inertness: a retired session must not be redriven —
+        // `agent.restore` is the deliberate return-to-service path.
+        if session.retired_at.is_some() {
+            return Err(Error::InvalidParams(format!(
+                "agent {} is retired; restore it with agent.restore before retrying",
+                agent_id.0
+            )));
+        }
 
         // Only allow retry when the session status is `error`
         if session.status != AgentStatus::Error {
@@ -7165,9 +7669,18 @@ impl AgentManager {
         let is_active = false;
         // Clear stop_reason on retry: the agent is starting fresh, not stuck in an error.
         // Route through persist_status_with_stop_reason to ensure the agent:status-changed
-        // event carries stopReason: null.
-        self.persist_status_with_stop_reason(agent_id, workspace_id, status, is_active, Some(None))
-            .await;
+        // event carries stopReason: null. `turn_boundary: false` — this flip
+        // clears an Error park without any turn having run, so it must not
+        // bump lastActivity (§10.1 turn-boundary policy).
+        self.persist_status_with_stop_reason(
+            agent_id,
+            workspace_id,
+            status,
+            is_active,
+            Some(None),
+            false,
+        )
+        .await;
         // Clearing the Error park retires the `failed` displayStatus rung
         // (§6.5 step 0): recompute-and-compare so the demotion emits.
         self.services
@@ -7321,6 +7834,48 @@ impl AgentManager {
                 .await
             {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to commit last-turn model");
+            }
+        }
+    }
+
+    /// Persist the informational `auto_unarchived` transcript row when this
+    /// turn's start actually auto-unarchived the workspace (the #1216 flip
+    /// persisted — [`AgentManager::try_begin_outcome`] calls this only on a
+    /// confirmed flip, never on the suppressed re-claim or an unarchive
+    /// failure). The row is `role: "system"` — excluded from supervisor-XML
+    /// history replay like the model-change notice — with metadata
+    /// `{ type: "auto_unarchived", reason: "agent_activity" }`. Emits
+    /// `agent:message` so clients update live. Entirely best-effort: an
+    /// append/publish failure is logged and the turn proceeds.
+    async fn persist_auto_unarchive_notice(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) {
+        let content = json!([{
+            "type": "text",
+            "text": AUTO_UNARCHIVE_NOTICE_TEXT,
+        }]);
+        let metadata = json!({
+            "type": "auto_unarchived",
+            "reason": "agent_activity",
+        });
+        match self
+            .services
+            .store
+            .append_agent_message_with_metadata(
+                agent_id,
+                "system",
+                &content,
+                Some(&metadata),
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(message) => {
+                self.services.invalidate_agent_list_cache(workspace_id);
+                self.services
+                    .publish_agent_message_events(workspace_id, agent_id, &message, None)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to persist auto-unarchive notice");
             }
         }
     }
@@ -7512,13 +8067,13 @@ impl AgentManager {
                         .get(agent_id)
                         .map(|h| h.connection.clone());
                     if let Some(conn) = conn {
-                        self.apply_thought_level(
-                            conn.as_ref(),
-                            agent_id,
-                            &acp,
+                        let effort = Self::session_model_effort(
+                            &resolved.provider,
+                            session.model.as_deref(),
                             session.reasoning_effort.as_deref(),
-                        )
-                        .await;
+                        );
+                        self.apply_thought_level(conn.as_ref(), agent_id, &acp, effort.as_deref())
+                            .await;
                     }
                     return Ok(acp);
                 }
@@ -7640,18 +8195,28 @@ impl AgentManager {
             .github
             .expose_git_credential_to_children;
         inject_git_credential_env(&mut opts.extra_env, opts.cwd, git_credential_expose);
+        // Commit identity for `git commit` run by the agent's own tools
+        // (intent-hq/intent#4142) — ungated: identity is not a secret.
+        inject_git_identity_env(&mut opts.extra_env, opts.cwd);
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
             // frontmatter (SP-B); falls back to the default interactive type so
             // plain agents and specialists without `agentType` are unchanged.
             let agent_type = derive_agent_type(&self.services, &session, workspace.as_ref());
-            // §18.4 CLI-side denylist: strip provider-native tools (e.g.
-            // auggie's built-in `str-replace-editor`, `sub-agent-*`) via
-            // `--remove-tool`. MCP-side filtering (§6.8) already blocks
-            // workspace-MCP tools, but the provider's native tools can only be
-            // stripped through this spawn-time flag.
-            opts.tools_to_remove =
-                intent_acp::get_tools_to_remove(session.specialist.as_deref(), &agent_type);
+            // §18.4 CLI-side denylist: strip provider-native tools via the
+            // provider's spawn-time removal flag (auggie `--remove-tool`,
+            // droid `--disabled-tools`). MCP-side
+            // filtering (§6.8) already blocks workspace-MCP tools, but the
+            // provider's native tools can only be stripped through this
+            // spawn-time flag. Tool names are provider-native, so the
+            // resolution is keyed on the provider id. The orchestrator branch
+            // keys off the specialist's resolved `role` (with the historical
+            // name fallback), not a hardcoded specialist name.
+            opts.tools_to_remove = intent_acp::get_native_tools_to_remove(
+                resolved.provider.id,
+                derive_is_orchestrator(&self.services, &session, workspace.as_ref()),
+                &agent_type,
+            );
             self.create_agent(
                 agent_id.clone(),
                 workspace_id.clone(),
@@ -7662,9 +8227,21 @@ impl AgentManager {
             )
             .await?;
         }
-        let acp_session_id = self
+        let session_result = self
             .start_session(agent_id, resolved.cwd.clone(), &resolved.provider)
-            .await?;
+            .await;
+        let acp_session_id = match session_result {
+            Ok(id) => id,
+            Err(error) => {
+                if resolved.provider.id == "antigravity" {
+                    // Never let the next turn reuse an unverified child
+                    // through the fast path. Fresh candidates are not committed
+                    // until confirmation; a failed load keeps its prior ID.
+                    self.kill_child_only(agent_id).await;
+                }
+                return Err(error);
+            }
+        };
         // Model-change transcript notice: only AFTER the child + ACP session
         // are provably up under the new identity — a failed spawn/switch must
         // not persist a notice or commit `last_turn_*` to an identity the
@@ -8079,13 +8656,44 @@ impl AgentManager {
                             } else {
                                 let dead = map.remove(&agent_id);
                                 registry.deregister(&agent_id);
-                                Some((status, dead.and_then(|mut h| h.child.take())))
+                                Some((
+                                    status,
+                                    dead.map(|mut h| (h.child.take(), Arc::clone(&h.connection))),
+                                ))
                             }
                         }
                     }
                 };
-                if let Some((status, dead_child)) = exited {
+                if let Some((status, dead)) = exited {
+                    let (dead_child, dead_conn) =
+                        dead.map_or((None, None), |(child, conn)| (child, Some(conn)));
+                    // The direct child is already reaped (`try_wait` above),
+                    // but same-group descendants can survive it: sweep the
+                    // process group via the spawn-time pid. Swept BEFORE the
+                    // settle await below so a descendant holding the stderr
+                    // write end open is killed first — EOF is then
+                    // deterministic and the capture includes its last output,
+                    // instead of the await burning its full bound and the
+                    // WARN underclaiming (monorepo#3570).
+                    if let Some(dead_child) = dead_child {
+                        kill_child_tree(dead_child, child_pid).await;
+                    }
+                    // Honest capture hint (monorepo#3570): bounded-await the
+                    // stderr drain's settle (EOF + flush — the whole group is
+                    // dead now, so EOF is normally immediate) and only name
+                    // the capture dir when THIS child's connection captured
+                    // stderr (not stale daily files from an earlier run) and
+                    // a capture file actually exists there.
+                    let mut hint = None;
                     if let Some(dir) = &stderr_dir {
+                        if let Some(conn) = &dead_conn {
+                            conn.await_stderr_settled(stderr_settle_timeout()).await;
+                            if conn.stderr_captured() && stderr_capture_dir_populated(dir) {
+                                hint = Some(dir);
+                            }
+                        }
+                    }
+                    if let Some(dir) = hint {
                         tracing::warn!(
                             agent = %agent_id,
                             exit_status = %status,
@@ -8098,12 +8706,6 @@ impl AgentManager {
                             exit_status = %status,
                             "idle agent child exited unexpectedly; handle reaped"
                         );
-                    }
-                    // The direct child is already reaped (`try_wait` above),
-                    // but same-group descendants can survive it: sweep the
-                    // process group via the spawn-time pid.
-                    if let Some(dead_child) = dead_child {
-                        kill_child_tree(dead_child, child_pid).await;
                     }
                     return true;
                 }
@@ -8593,7 +9195,7 @@ const DEFAULT_AGENT_TYPE: &str = "interactive";
 
 /// Derive the spawn `agent_type` for a session (SP-B): when the session was
 /// created with a specialist that declares an `agentType` frontmatter scalar
-/// (e.g. `ralph` → `ralph-loop`), that value becomes the agent's type so the
+/// (e.g. `reviewer` → `task-loop`), that value becomes the agent's type so the
 /// matching internal tool denylist (§18.4,
 /// [`get_tool_denylist_for_agent_type`](intent_acp::get_tool_denylist_for_agent_type))
 /// engages on spawn. Otherwise (no specialist, or a specialist without
@@ -8606,7 +9208,7 @@ fn derive_agent_type(
 ) -> String {
     if let Some(specialist) = session.specialist.as_deref().filter(|s| !s.is_empty()) {
         let workspace_path = workspace
-            .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+            .and_then(intent_core::Workspace::effective_path)
             .map(PathBuf::from);
         if let Some(agent_type) =
             services.specialist_agent_type(specialist, workspace_path.as_deref())
@@ -8617,30 +9219,48 @@ fn derive_agent_type(
     DEFAULT_AGENT_TYPE.to_string()
 }
 
-/// Effective provider id for a session. Provider precedence: when the model
-/// carries an explicit `provider:` prefix (e.g., "opencode:kimi-k3"), that
-/// prefix wins over `session.provider`, because a cross-provider model switch
-/// should spawn the new provider's binary. `session.provider` is only used as
-/// a fallback for bare model ids, then `configured_default` (the settings-
-/// derived default — `model.default` prefix, else `providers.active`).
-/// Delegates to [`crate::agent_session::resolve_provider_id`], which also
-/// guards against malformed compound ids like `:sonnet` (empty prefixes fall
-/// through to the provider field / configured default). `None` when nothing
-/// resolves (monorepo#3044): the spawn must fail loudly instead of running
-/// the positional first registered provider (auggie), which may not be
-/// installed.
+/// Derive whether the session's specialist carries the `orchestrator` role
+/// (registry `role` frontmatter with the historical-name fallback — see
+/// `Services::session_specialist_is_orchestrator`), gating the spawn-time
+/// orchestrator denylist in
+/// [`get_native_tools_to_remove`](intent_acp::get_native_tools_to_remove) (§18.4). The
+/// specialist project tier resolves from the workspace path, like
+/// [`derive_agent_type`].
+fn derive_is_orchestrator(
+    services: &Services,
+    session: &AgentSession,
+    workspace: Option<&intent_core::Workspace>,
+) -> bool {
+    let workspace_path = workspace
+        .and_then(intent_core::Workspace::effective_path)
+        .map(PathBuf::from);
+    services.session_specialist_is_orchestrator(session, workspace_path.as_deref())
+}
+
+/// Effective provider id for a session: `session.provider`, then
+/// `configured_default` (the settings-derived default —
+/// `model.defaultProvider`). Session `model` is always a bare id and never
+/// participates (compound `provider:model` ids are rejected at the wire).
+/// Delegates to [`crate::agent_session::resolve_provider_id`]. `None` when
+/// nothing resolves (monorepo#3044): the spawn must fail loudly instead of
+/// running the positional first registered provider (auggie), which may not
+/// be installed.
 fn session_provider_id(session: &AgentSession, configured_default: Option<&str>) -> Option<String> {
-    crate::agent_session::resolve_provider_id(
-        session.model.as_deref(),
-        session.provider.as_deref(),
-        configured_default,
-    )
+    crate::agent_session::resolve_provider_id(session.provider.as_deref(), configured_default)
 }
 
 /// Fallback phrasing for the workspace-naming nudge when the provider's MCP
 /// tool naming convention is unknown (or its workspace-MCP wiring hasn't
 /// landed yet). Wording owned by the harness (H5).
-pub(crate) use crate::harness::v1::GENERIC_NAMING_TOOL_REFERENCE;
+pub(crate) use crate::harness::v1::{
+    GENERIC_AGENT_NAMING_TOOL_REFERENCE, GENERIC_NAMING_TOOL_REFERENCE,
+};
+
+/// Provider-correct spelling of the workspace API MCP tool used for agent
+/// self-naming.
+pub(crate) fn agent_naming_tool_reference(provider_id: &str) -> &'static str {
+    crate::harness::latest().agent_naming_tool_reference(provider_id)
+}
 
 /// Provider-correct spelling of the workspace-MCP rename tool for the naming
 /// nudge (e.g. auggie → `set_workspace_title_workspace-mcp`, opencode →
@@ -8672,21 +9292,24 @@ fn resolve_spawn(
         crate::agent_session::derived_default_provider(settings).as_deref(),
     )
     .ok_or_else(|| crate::agent_session::no_default_provider_error("agent spawn"))?;
-    // Whitespace-bearing bare ids are effective-model display names persisted
-    // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows, e.g.
-    // `claude-code:Opus 4.8`) — stats/attribution values, not spawnable model
-    // ids. They must not reach `SpawnOptions.model` (CLI `--model` flags,
-    // codex config args, opencode env config); dropping them spawns on the
-    // provider default, exactly what the placeholder resolved from.
+    // Whitespace-bearing ids are effective-model display names persisted
+    // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows,
+    // e.g. `Opus 4.8`) — stats/attribution values, not spawnable model ids.
+    // They must not reach `SpawnOptions.model` (CLI `--model` flags, codex
+    // config args, opencode env config); dropping them spawns on the
+    // provider default, exactly what the placeholder resolved from. Legacy
+    // compound rows (`provider:model`, pre-wire-rejection) are stripped to
+    // their bare part on the same terms.
     let model = session
         .model
         .as_ref()
-        .map(|m| intent_providers::parse_compound_model_id(m).1)
+        .map(|m| m.split_once(':').map_or(m.as_str(), |(_, bare)| bare))
+        .map(str::to_string)
         .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace));
     // Session-level reasoning effort (PROTOCOL §5.5, Option B): threaded to
     // `SpawnOptions.reasoning_effort` so the codex spawn path applies it as
-    // `-c model_reasoning_effort=…` (an effort embedded in a compound
-    // `{base}/{effort}` model id still wins inside the codex arg builder).
+    // `-c model_reasoning_effort=…`. Codex legacy model ids are normalized
+    // below so explicit effort wins over any embedded suffix at spawn too.
     let reasoning_effort = session
         .reasoning_effort
         .clone()
@@ -8809,20 +9432,50 @@ fn resolve_spawn(
     }
 
     let provider = *intent_providers::provider_config(&provider_id);
+    let reasoning_effort = AgentManager::session_model_effort(
+        &provider,
+        model.as_deref(),
+        reasoning_effort.as_deref(),
+    );
+    let model = model.map(|model| {
+        if provider.config_option_model_strips_effort {
+            AgentManager::split_codex_model_effort(&model).0.to_string()
+        } else {
+            model
+        }
+    });
     // Filled by `ensure_started` (unsloth spawn gate) — pure resolution here
     // never starts the managed server.
     let unsloth_endpoint = None;
 
-    // npx-only providers (claude-code) are spawned exclusively via
-    // `npx -y <pinned package>`; local-binary discovery (settings path /
-    // managed bin / PATH scan) is skipped entirely.
+    // npx-only providers (claude-code, pi) are spawned via
+    // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
+    // skipped entirely. For providers that opt in
+    // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
+    // override (absolute, executable) is the one exception: it is exec'd
+    // directly in place of the pinned npx spawn (monorepo#4352); an invalid
+    // override — or any override for pi — is ignored.
     if provider.npx_only_package.is_some() {
-        if read_provider_path_setting(settings, &provider_id).is_some() {
-            tracing::warn!(
+        let explicit_path = read_provider_path_setting(settings, &provider_id);
+        if let Some(binary) =
+            intent_providers::resolve_npx_only_override(&provider, explicit_path.as_deref())
+        {
+            tracing::info!(
                 provider_id = provider_id,
-                "providers.paths override ignored: {} always spawns via pinned npx",
-                provider_id
+                binary = ?binary,
+                "providers.paths override honored: spawning adapter binary in place of pinned npx"
             );
+            return Ok(ResolvedSpawn {
+                provider,
+                model,
+                reasoning_effort,
+                cwd,
+                provider_binary: Some(binary),
+                extra_env,
+                npx_fallback_binary: None,
+                npx_fallback_package: None,
+                unsloth_endpoint,
+            });
         }
         let (npx_binary, npx_package) = resolve_npx_only(&provider, intent_providers::find_npx())?;
         return Ok(ResolvedSpawn {
@@ -8946,6 +9599,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.mcp_config_file = mcp_config_path;
     spawn_opts.env_mcp_config = env_mcp_config;
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
+    spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
     spawn_opts
 }
 
@@ -8974,6 +9628,21 @@ fn inject_git_credential_env(
     };
     let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
     for (key, value) in intent_git::auth::daemon_helper_env(&intentd, cwd, inherited.as_deref()) {
+        extra_env.entry(key).or_insert(value);
+    }
+}
+
+/// Append the commit-identity `GIT_AUTHOR_*`/`GIT_COMMITTER_*` vars to a
+/// provider spawn's extra env, resolved from `cwd`'s repository via the same
+/// config chain `git.commit` uses (intent-hq/intent#4142), so a `git commit`
+/// run by the agent (or any shell it spawns that inherits the provider env)
+/// carries the user's real identity even when the worktree has no local
+/// `user.*` config. No identity resolved ⇒ no changes; a var already in the
+/// daemon's own env is inherited untouched, and pre-existing caller keys are
+/// never clobbered. Identity is not a secret, so this is not gated on
+/// `exposeGitCredentialToChildren`.
+fn inject_git_identity_env(extra_env: &mut BTreeMap<String, String>, cwd: Option<&Path>) {
+    for (key, value) in intent_git::identity::commit_identity_env(cwd) {
         extra_env.entry(key).or_insert(value);
     }
 }
@@ -9165,6 +9834,7 @@ async fn run_message_worker(
                                 None,
                                 Some(&nudge_metadata),
                                 Some(&nudge_turn_id),
+                                false,
                             )
                             .await;
                             content = nudge;
@@ -9325,6 +9995,7 @@ async fn run_message_worker(
                                     None,
                                     None,
                                     Some(&warning_turn_id),
+                                    false,
                                 )
                                 .await;
                                 content = warning;
@@ -9380,6 +10051,7 @@ async fn run_message_worker(
                             .await;
                             mgr.services
                                 .stash_pending_terminal_error(&agent_id, persist);
+                            trace_idle_timeout_cap(options.turn_id.as_deref());
                             let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
                             if let Some(tid) = options.turn_id.as_deref() {
                                 data["turnId"] = json!(tid);
@@ -9460,7 +10132,7 @@ async fn run_message_worker(
                         } else {
                             // STAB-53: on a child-death failure, point at the
                             // captured stderr file so the crash is diagnosable.
-                            match stderr_capture_hint(&mgr, &agent_id, &e) {
+                            match stderr_capture_hint(&mgr, &agent_id, &e).await {
                                 Some(log) => tracing::warn!(
                                     agent = %agent_id,
                                     error = %e,
@@ -9491,7 +10163,7 @@ async fn run_message_worker(
                 }
             }
             Err(e) => {
-                match stderr_capture_hint(&mgr, &agent_id, &e) {
+                match stderr_capture_hint(&mgr, &agent_id, &e).await {
                     Some(log) => tracing::warn!(
                         agent = %agent_id,
                         error = %e,
@@ -9587,32 +10259,13 @@ async fn run_message_worker(
                 }
             }
         }
-        // Question hold (PROTOCOL §5.5): questions may still be pending —
-        // asked by the turn that just ended, or by an earlier turn the hold
-        // has kept armed since — so draining the next AUTOMATIC queued
-        // message would bury them. A parked USER-origin entry (a user answer
-        // that lost the busy race against this very turn) is exempt: it may
-        // itself be the hold's release, so it drains regardless. Otherwise
-        // skip the pre-release drain (no `break 'outer` here!) and fall through to the
-        // post-`end_turn` raced re-check below, which repeats this same
-        // hold-aware `dequeue_user_origin_message` check AFTER the slot is
-        // actually released — closing the window where a user answer enqueued
-        // between `has_user_origin_ready` returning false and the slot's
-        // release would otherwise strand behind a gone worker with nothing to
-        // kick `try_drain_queue`.
-        let hold_active = mgr.services.question_hold_active(&agent_id).await;
         // Batch flush (`agents.flushQueuedMessages`): same contract as the
         // `try_drain_queue` flush arm — ≥2 ready entries drain into one
-        // combined provider turn. Under an active hold the flush fires only
-        // when a user-origin entry is ready, and then carries EVERY ready
-        // entry FIFO (parked automatic wakes included, monorepo#1791);
-        // otherwise the single-entry arm below runs unchanged.
+        // combined provider turn; otherwise the single-entry arm below runs
+        // unchanged.
         {
             let mode = mgr.services.flush_queued_messages_mode();
-            if let Some(batch) = mgr
-                .services
-                .dequeue_flush_batch(&agent_id, mode, hold_active, 2)
-            {
+            if let Some(batch) = mgr.services.dequeue_flush_batch(&agent_id, mode, false, 2) {
                 match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
                     FlushPrep::Turn {
                         content: c,
@@ -9633,20 +10286,7 @@ async fn run_message_worker(
                 }
             }
         }
-        let drained = if hold_active {
-            if mgr.services.has_user_origin_ready(&agent_id) {
-                mgr.services.dequeue_user_origin_message(&agent_id)
-            } else {
-                tracing::debug!(
-                    agent = %agent_id,
-                    "worker drain suspended: question hold active (awaiting answer or dismissQuestions)"
-                );
-                None
-            }
-        } else {
-            mgr.services.dequeue_message(&agent_id)
-        };
-        if let Some(mut next) = drained {
+        if let Some(mut next) = mgr.services.dequeue_message(&agent_id) {
             mgr.services
                 .publish_queue_updated_for(
                     &agent_id,
@@ -9689,6 +10329,7 @@ async fn run_message_worker(
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                     Some(&next.turn_id),
+                    next.user_origin,
                 )
                 .await
             };
@@ -9725,39 +10366,15 @@ async fn run_message_worker(
         // raced in just before / after the release. The re-check is wrapped in
         // the outer `'outer` loop (not its own inner loop) so the agent never
         // goes idle while ready-to-send messages remain — each re-claim of the
-        // slot continues `'outer` and re-enters the drain at the top. Same
-        // question-hold contract as the pre-release arm: while the hold is
-        // active only a user-origin entry may drain.
+        // slot continues `'outer` and re-enters the drain at the top. The
+        // popped entry travels as a batch so the slot-race failure below
+        // hands it back unchanged (`requeue_front_batch`).
         mgr.end_turn(&agent_id).await;
-        let raced_mode = mgr.services.flush_queued_messages_mode();
-        // Under an active hold with the `all` flush mode the raced re-check
-        // pops the WHOLE ready batch in ONE locked call (it fires only when
-        // a user-origin entry is ready). The oldest ready user entry may sit
-        // BEHIND older parked automatic entries, so a user-origin pop
-        // followed by a later batch fold + prepend would persist and prompt
-        // the newer user message ahead of the parked wakes it was dequeued
-        // from behind — a FIFO violation in exactly the race window this
-        // arm handles (monorepo#1791 review). The atomic batch keeps stored
-        // order end-to-end, and the slot-race failure below hands it back
-        // unchanged (`requeue_front_batch`).
-        let mut raced: Vec<QueuedMessage> = if mgr.services.question_hold_active(&agent_id).await {
-            match raced_mode {
-                intent_core::FlushQueuedMessagesMode::All => mgr
-                    .services
-                    .dequeue_ready_batch(&agent_id, true, 1)
-                    .unwrap_or_default(),
-                _ => mgr
-                    .services
-                    .dequeue_user_origin_message(&agent_id)
-                    .into_iter()
-                    .collect(),
-            }
-        } else {
-            mgr.services
-                .dequeue_message(&agent_id)
-                .into_iter()
-                .collect()
-        };
+        let mut raced: Vec<QueuedMessage> = mgr
+            .services
+            .dequeue_message(&agent_id)
+            .into_iter()
+            .collect();
         if raced.is_empty() {
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
@@ -9831,57 +10448,23 @@ async fn run_message_worker(
                     }
                 }
             }
-            // A multi-entry raced pop (hold + `all` above) is already the
-            // complete ready batch in stored order — run it as one combined
-            // turn directly; folding or reordering here would break the
-            // FIFO guarantee the atomic pop just preserved.
-            if raced.len() > 1 {
-                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, raced).await {
-                    FlushPrep::Turn {
-                        content: c,
-                        options: o,
-                    } => {
-                        content = c;
-                        options = *o;
-                        user_persisted = true;
-                        // New messages → fresh silent-redrive budget
-                        // (monorepo#764).
-                        silent_redrive_used = false;
-                        continue 'outer;
-                    }
-                    FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id);
-                        break 'outer;
-                    }
-                }
-            }
             let mut next = raced.pop().expect("raced batch non-empty");
             // Batch flush (`agents.flushQueuedMessages`): the single `next`
             // was popped before the slot re-claim, so fold any FURTHER
             // eligible entries in behind it and run them as one combined
             // turn. Mode `all`: any further ready entry (min 1 more ⇒ ≥2
-            // total; only the multi-entry hold case was handled atomically
-            // above, so a hold armed SINCE the pop still requires a
-            // user-origin entry — see the arm comment below). Mode
-            // `systemOnly`: only when `next` is ITSELF system-origin (and no
-            // hold is active) — a user-origin `next` never batches under
+            // total). Mode `systemOnly`: only when `next` is ITSELF
+            // system-origin — a user-origin `next` never batches under
             // `systemOnly`, so it falls through to the single-entry path
             // below unchanged. With no extra entry (or the `off` mode) the
             // single-entry path below also runs unchanged.
             let mode = mgr.services.flush_queued_messages_mode();
-            let hold = mgr.services.question_hold_active(&agent_id).await;
             let extra_batch = match mode {
                 intent_core::FlushQueuedMessagesMode::All => {
-                    // A single-entry raced pop under hold + `all` means
-                    // `next` was the ONLY ready entry at pop time; a hold
-                    // armed since (or an entry that raced in) still requires
-                    // a ready user-origin entry unless `next` itself is one
-                    // (monorepo#1791).
-                    mgr.services
-                        .dequeue_ready_batch(&agent_id, hold && !next.user_origin, 1)
+                    mgr.services.dequeue_ready_batch(&agent_id, false, 1)
                 }
                 intent_core::FlushQueuedMessagesMode::SystemOnly => {
-                    if hold || next.user_origin {
+                    if next.user_origin {
                         None
                     } else {
                         mgr.services.dequeue_system_only_batch(&agent_id, 1)
@@ -9947,6 +10530,7 @@ async fn run_message_worker(
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                     Some(&next.turn_id),
+                    next.user_origin,
                 )
                 .await
             };
@@ -10138,6 +10722,7 @@ async fn prepare_flush_turn(
             entries[i].file_blocks.as_ref(),
             entries[i].message_metadata.as_ref(),
             Some(&combined_turn_id),
+            entries[i].user_origin,
         )
         .await
         {
@@ -10242,6 +10827,10 @@ async fn prepare_flush_turn(
 /// [`persist_retry_backoff_ms`]); on exhaustion the drain call sites fail
 /// closed — they do NOT start the turn, park the agent in `Error`, and
 /// requeue with `persisted: false` so `agent.retry` re-attempts the append.
+/// `user_origin` marks whether the entry was originated by a human user (the
+/// queue entry's `user_origin` flag): only those appends schedule the
+/// debounced `lastActivity` event (§10.1) — internal wakes, agent-to-agent
+/// deliveries and system-injected turns are not workspace-ordering activity.
 #[allow(clippy::too_many_arguments)]
 async fn persist_user(
     mgr: &AgentManager,
@@ -10252,6 +10841,7 @@ async fn persist_user(
     file_blocks: Option<&Value>,
     message_metadata: Option<&Value>,
     turn_id: Option<&str>,
+    user_origin: bool,
 ) -> bool {
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
@@ -10336,15 +10926,16 @@ async fn persist_user(
         .await
     {
         tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-    } else {
-        // Schedule debounced lastActivity event (§10.1).
+    } else if user_origin {
+        // Schedule debounced lastActivity event (§10.1) for USER-origin
+        // entries only — see the doc comment above.
         mgr.services
             .schedule_last_activity_event(workspace_id.clone());
     }
     mgr.services
         .publish_agent_message_events(workspace_id, agent_id, &message, turn_id)
         .await;
-    // Answer intake (PROTOCOL §5.5, question hold): same contract as the
+    // Answer intake (PROTOCOL §5.5, pending questions): same contract as the
     // direct-send persist — a `question_answers` tag naming the marked
     // assistant message clears the pending-questions marker; anything else is
     // a no-op, and only the clear can move the workspace's needs_attention
@@ -10492,6 +11083,32 @@ fn persist_retry_backoff_ms() -> Vec<u64> {
     )
 }
 
+fn antigravity_setup_error(method: &str, error: &intent_acp::AcpError, rejection: String) -> Error {
+    use intent_acp::AcpError;
+    // Do not forward provider-controlled error text into logs, public errors,
+    // or the string-based spawn retry classifier.
+    match error {
+        AcpError::Timeout(_) => Error::Internal(format!(
+            "Antigravity {method} timed out; no prompt was sent"
+        )),
+        AcpError::Transport(_) => Error::Internal(format!(
+            "Antigravity setup transport closed: {method}; no prompt was sent"
+        )),
+        // The local ACP reader emits this exact sentinel when stdout closes.
+        AcpError::Rpc(rpc)
+            if rpc.code == 0 && rpc.message == "agent stdout closed" && rpc.data.is_none() =>
+        {
+            Error::Internal(format!(
+                "Antigravity {method}: agent stdout closed; no prompt was sent"
+            ))
+        }
+        AcpError::Auth(_) => Error::InvalidParams(crate::provider_auth::not_authenticated_message(
+            "antigravity",
+        )),
+        _ => Error::InvalidParams(rejection),
+    }
+}
+
 /// Classify whether an error from `ensure_started` is retryable. Retryable
 /// errors include session/new or session/load timeouts and handshake failures
 /// (e.g., "agent stdout closed" when the child dies immediately). Non-retryable
@@ -10515,6 +11132,7 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
         || msg.contains("handshake failed")
         || msg.contains("agent stdout closed")
         || msg.contains("timed out")
+        || msg.starts_with("internal error: Antigravity setup transport closed:")
     {
         return true;
     }
@@ -10622,18 +11240,61 @@ async fn publish_terminal_failure_events(
 ) {
     use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "terminal_failure",
+        None,
+        0,
+        "failed",
+    );
     let mut failed_data = json!({ "agentId": agent_id.0, "error": error_msg });
     let mut end_data = json!({ "agentId": agent_id.0 });
     if let Some(tid) = turn_id {
         failed_data["turnId"] = json!(tid);
         end_data["turnId"] = json!(tid);
     }
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "agent_failed",
+        None,
+        0,
+        "failed",
+    );
     mgr.services
         .publish_agent_event(workspace_id, agent_id, AGENT_FAILED, failed_data)
         .await;
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "agent_stream_end",
+        None,
+        0,
+        "failed",
+    );
     mgr.services
         .publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
         .await;
+}
+
+pub(crate) fn trace_idle_timeout_cap(turn_id: Option<&str>) {
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "terminal_failure",
+        None,
+        0,
+        "idle_timeout_cap",
+    );
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "agent_failed",
+        None,
+        0,
+        "idle_timeout_cap",
+    );
 }
 
 /// Durable slice of the terminal-failure path (monorepo#2009): record the
@@ -10832,6 +11493,9 @@ async fn publish_error_status_and_requeue(
         prepend_file_blocks: options.prepend_file_blocks.clone(),
         interrupt_priority: options.interrupt_priority,
         user_origin: options.origin.is_user(),
+        hold_kind: None,
+        hold_until: None,
+        child_agent_id: None,
     };
     mgr.services.requeue_front(agent_id, queued);
 
@@ -10971,6 +11635,7 @@ async fn discard_failure_for_vanished_session(
     mgr.services.clear_failure_streak(agent_id);
     mgr.services.discard_pending_terminal_error(agent_id);
     mgr.services.clear_turn_silent_tail(agent_id);
+    mgr.services.clear_context_usage(agent_id);
     mgr.services.clear_truncation_redrives(agent_id);
     mgr.services.take_truncation_redrive(agent_id);
     true
@@ -11128,7 +11793,18 @@ fn is_benign_turn_error(err: &Error) -> bool {
 /// Matches on the structured `Error::Internal` payload — the transport's
 /// child-death error is always wrapped there (handshake/prompt failures) —
 /// avoiding a Display allocation per check.
-fn stderr_capture_hint(
+///
+/// monorepo#3570: the hint is honest now — it tears down the child's whole
+/// process group FIRST (so a descendant holding the stderr write end open is
+/// killed and EOF is deterministic), then bounded-awaits the stderr drain's
+/// settle signal (EOF + capture-file flush) on the retained connection, and
+/// names the directory only when THIS child's connection actually captured
+/// stderr (`stderr_captured`) and a capture file exists there. The
+/// per-connection flag keeps stale daily files an earlier run left in the
+/// same per-agent dir from turning a silent child into a misleading "stderr
+/// captured at …" claim; a child that never wrote stderr gets the plain WARN
+/// instead.
+async fn stderr_capture_hint(
     mgr: &AgentManager,
     agent_id: &AgentId,
     err: &Error,
@@ -11136,21 +11812,101 @@ fn stderr_capture_hint(
     if !matches!(err, Error::Internal(msg) if msg.contains("agent stdout closed")) {
         return None;
     }
-    mgr.agent_stderr_log_dir(agent_id)
+    let dir = mgr.agent_stderr_log_dir(agent_id)?;
+    // The hint runs BEFORE the failure handlers' own teardown, so the handle
+    // — and its connection's settled watch — is usually still installed.
+    // Spawn-failure paths may have no handle: without a connection to vouch
+    // for a fresh capture, claim nothing.
+    let connection = mgr
+        .handles
+        .lock()
+        .unwrap()
+        .get(agent_id)
+        .map(|h| Arc::clone(&h.connection));
+    let connection = connection?;
+    // Sweep the child's process group BEFORE awaiting settle (same ordering
+    // as the idle-exit watcher): a same-group descendant holding the stderr
+    // write end open is killed first, so EOF is deterministic and the capture
+    // includes its last output — instead of the await burning its full bound
+    // and the WARN underclaiming. The retained connection Arc keeps the
+    // settled watch alive past the handle's removal, and
+    // `handle_terminal_turn_failure`'s own later `kill_child_only` degrades
+    // to a no-op (the handle is already gone).
+    mgr.kill_child_only(agent_id).await;
+    connection
+        .await_stderr_settled(stderr_settle_timeout())
+        .await;
+    (connection.stderr_captured() && stderr_capture_dir_populated(&dir)).then_some(dir)
+}
+
+/// Whether the stderr capture dir exists and holds at least one entry —
+/// gates the "agent stderr captured at …" claim (monorepo#3570). The capture
+/// file is created lazily on the first captured line, so an absent/empty dir
+/// means nothing was captured.
+fn stderr_capture_dir_populated(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+#[cfg(test)]
+mod stderr_capture_hint_tests {
+    //! monorepo#3570: the WARN's "stderr captured at" claim is gated on the
+    //! capture dir actually containing a file.
+
+    use super::stderr_capture_dir_populated;
+
+    #[test]
+    fn dir_populated_gate() {
+        let tmp = crate::tests::test_tempdir("intentd-stderr-hint-");
+        let missing = tmp.path().join("nope");
+        assert!(!stderr_capture_dir_populated(&missing), "missing dir");
+
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(!stderr_capture_dir_populated(&empty), "empty dir");
+
+        std::fs::write(empty.join("2026-08-26.log"), "boom\n").unwrap();
+        assert!(
+            stderr_capture_dir_populated(&empty),
+            "dir with a capture file"
+        );
+    }
+}
+
+/// Bound on waiting for the stderr drain to hit EOF + flush before the
+/// terminal-failure/idle-exit WARN names the capture path (monorepo#3570).
+/// The child is dead (stdout closed / exit observed), so its own stderr
+/// write end is already closed — EOF is normally immediate; the bound covers
+/// a same-group descendant holding the pipe open.
+const STDERR_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// [`STDERR_SETTLE_TIMEOUT`] with an `INTENTD_STDERR_SETTLE_TIMEOUT_MS` env
+/// override (monorepo#3592): the pipe-holding-descendant e2e widens the bound
+/// and requires the WARN well inside it, proving the hint settles via the
+/// group sweep instead of waiting the bound out — a reordering regression
+/// then fails deterministically instead of racing a 2s timeout.
+fn stderr_settle_timeout() -> Duration {
+    std::env::var("INTENTD_STDERR_SETTLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|ms| ms.trim().parse().ok())
+        .map_or(STDERR_SETTLE_TIMEOUT, Duration::from_millis)
 }
 
 /// Whether `run_prompt_turn` already emitted the terminal `agent:failed` +
 /// `agent:stream:end` pair for this error. Its post-prompt failure path wraps
-/// every prompt error as `Internal("session/prompt failed: …")` AFTER emitting
-/// both events; errors WITHOUT that prefix (e.g. the transcript-append store
+/// every prompt error as `Internal("session/prompt failed: …")` — or, for an
+/// auth-required failure (intent-hq/intent#3941), as the actionable
+/// `InvalidParams` mapping recognized by
+/// [`crate::agent_session::prompt_auth_required_turn_error`] — AFTER emitting
+/// both events; errors WITHOUT either shape (e.g. the transcript-append store
 /// error, which propagates via `?` before the emits, or a pre-output
 /// transport failure — see [`pre_output_transport_failure`] — whose emits are
 /// deliberately suppressed for a possible silent redrive) still need the
-/// events. Prefix-anchored on the structured `Error::Internal` payload so an
-/// unrelated error that merely mentions the phrase mid-string cannot
-/// suppress the terminal events.
+/// events. Prefix-anchored on the structured payloads so an unrelated error
+/// that merely mentions the phrases mid-string cannot suppress the terminal
+/// events.
 fn turn_failure_events_already_emitted(err: &Error) -> bool {
     matches!(err, Error::Internal(msg) if msg.starts_with(PROMPT_FAILED_PREFIX))
+        || crate::agent_session::prompt_auth_required_turn_error(err)
 }
 
 /// Whether a `run_turn` error carries the pre-output transport marker from
@@ -11293,6 +12049,13 @@ async fn handle_terminal_turn_failure(
         Some(precomputed) if precomputed.error_text == error_text => precomputed,
         _ => persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await,
     };
+    // A terminal failure ends the turn — surface an attention request the
+    // failed turn raised mid-flight before the failed pair reaches the bus
+    // (the streaming path already flushed in its own `agent:failed` arm; the
+    // flush's consumed marker makes this second call a no-op there).
+    mgr.services
+        .flush_deferred_attention(agent_id, workspace_id)
+        .await;
     if !turn_failure_events_already_emitted(error) {
         publish_terminal_failure_events(
             mgr,
@@ -11366,6 +12129,7 @@ mod role_reminder_tests {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -11397,7 +12161,7 @@ mod role_reminder_tests {
             backend_session_id: None,
             acp_session_id: None,
             name: "Builder".to_string(),
-            name_explicitly_set: false,
+            name_explicitly_set: true,
             model: None,
             reasoning_effort: None,
             effort_levels: None,
@@ -11431,6 +12195,7 @@ mod role_reminder_tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -11471,6 +12236,208 @@ mod role_reminder_tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    async fn configure_agent_name(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        name: &str,
+        explicitly_set: bool,
+        specialist: Option<&str>,
+    ) {
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session(agent_id)
+            .await
+            .expect("session");
+        session.name = name.to_string();
+        session.name_explicitly_set = explicitly_set;
+        session.specialist = specialist.map(str::to_string);
+        let workspace_id = session.workspace_id.clone();
+        mgr.services
+            .store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("update session");
+    }
+
+    async fn set_workspace_title(mgr: &AgentManager, workspace_id: &WorkspaceId, title: &str) {
+        let mut workspace = mgr
+            .services
+            .store
+            .get_workspace(workspace_id)
+            .await
+            .expect("workspace");
+        workspace.title = title.to_string();
+        mgr.services
+            .store
+            .update_workspace(&workspace)
+            .await
+            .expect("update workspace");
+    }
+
+    #[tokio::test]
+    async fn generated_agent_naming_nudge_does_not_depend_on_workspace_title() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "start",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert!(text.contains(
+            "`ws.workspace.setAgentName` through the `workspace_api` tool from the workspace MCP server"
+        ));
+        assert!(!text.contains("This workspace needs a title"));
+    }
+
+    #[tokio::test]
+    async fn generated_agent_naming_nudge_uses_provider_correct_workspace_api_tool() {
+        for (provider, expected) in [
+            ("auggie", "the `workspace_api_workspace-mcp` tool"),
+            ("opencode", "the `workspace-mcp_workspace_api` tool"),
+            (
+                "claude-code",
+                "the `workspace_api` tool from the workspace MCP server",
+            ),
+        ] {
+            let (mgr, agent_id, _db) = manager_with(None, None).await;
+            let workspace_id = WorkspaceId::from("ws-1");
+            configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+            let mut session = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .expect("session");
+            session.provider = Some(provider.to_string());
+            mgr.services
+                .store
+                .update_agent_session(&workspace_id, &session)
+                .await
+                .expect("update provider");
+            let text = prompt_text(
+                &mgr.build_turn_prompt(&agent_id, &workspace_id, "start", &TurnOptions::default())
+                    .await,
+            );
+            assert!(
+                text.contains(expected),
+                "provider {provider} used the wrong workspace API tool: {text:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_agent_and_untitled_workspace_receive_both_naming_instructions() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let workspace_id = WorkspaceId::from("ws-1");
+        configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+        set_workspace_title(&mgr, &workspace_id, "").await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &workspace_id, "start", &TurnOptions::default())
+                .await,
+        );
+        let agent_pos = text
+            .find("ws.workspace.setAgentName")
+            .expect("agent naming");
+        let workspace_pos = text
+            .find("This workspace needs a title")
+            .expect("workspace naming");
+        assert!(agent_pos < workspace_pos);
+    }
+
+    #[tokio::test]
+    async fn explicit_and_specialist_names_do_not_receive_agent_naming_instruction() {
+        let (explicit_mgr, explicit_id, _explicit_db) = manager_with(None, None).await;
+        configure_agent_name(&explicit_mgr, &explicit_id, "User Choice", true, None).await;
+        let explicit = prompt_text(
+            &explicit_mgr
+                .build_turn_prompt(
+                    &explicit_id,
+                    &WorkspaceId::from("ws-1"),
+                    "start",
+                    &TurnOptions::default(),
+                )
+                .await,
+        );
+        assert_eq!(explicit, "start");
+
+        let (specialist_mgr, specialist_id, _specialist_db) =
+            manager_with(Some("implementor"), None).await;
+        configure_agent_name(
+            &specialist_mgr,
+            &specialist_id,
+            "Implementor",
+            false,
+            Some("implementor"),
+        )
+        .await;
+        let specialist = prompt_text(
+            &specialist_mgr
+                .build_turn_prompt(
+                    &specialist_id,
+                    &WorkspaceId::from("ws-1"),
+                    "start",
+                    &TurnOptions::default(),
+                )
+                .await,
+        );
+        assert!(!specialist.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn unknown_specialist_with_generated_name_receives_agent_naming_instruction() {
+        let (mgr, agent_id, _db) = manager_with(Some("no-such-specialist"), None).await;
+        configure_agent_name(
+            &mgr,
+            &agent_id,
+            "Agent abc123",
+            false,
+            Some("no-such-specialist"),
+        )
+        .await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "start",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert!(text.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn agent_naming_instruction_is_first_turn_only() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+        let workspace_id = WorkspaceId::from("ws-1");
+        let first = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &workspace_id, "first", &TurnOptions::default())
+                .await,
+        );
+        assert!(first.contains("ws.workspace.setAgentName"));
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{ "type": "text", "text": "ready" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("assistant message");
+        let later = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &workspace_id, "later", &TurnOptions::default())
+                .await,
+        );
+        assert_eq!(later, "later");
     }
 
     /// `stop()` clears `recreated`/`prepend_pending` (stale-flag hygiene) but
@@ -12292,6 +13259,224 @@ mod role_reminder_tests {
     }
 
     #[test]
+    fn antigravity_setup_errors_preserve_safe_retry_classification() {
+        use intent_acp::{AcpError, JsonRpcError};
+        for method in ["session/set_mode", "session/set_config_option"] {
+            for (error, retryable) in [
+                (AcpError::Timeout("secret-url".into()), true),
+                (AcpError::Transport("secret-url".into()), true),
+                (
+                    AcpError::Rpc(JsonRpcError {
+                        code: 0,
+                        message: "agent stdout closed".into(),
+                        data: None,
+                    }),
+                    true,
+                ),
+                (
+                    AcpError::Rpc(JsonRpcError {
+                        code: -32602,
+                        message: "secret-url timed out".into(),
+                        data: None,
+                    }),
+                    false,
+                ),
+                (
+                    AcpError::Rpc(JsonRpcError {
+                        code: -32603,
+                        message: "secret-url agent stdout closed".into(),
+                        data: None,
+                    }),
+                    false,
+                ),
+                (AcpError::Auth("secret-url".into()), false),
+                (AcpError::Protocol("secret-url timed out".into()), false),
+            ] {
+                let mapped = antigravity_setup_error(
+                    method,
+                    &error,
+                    "Selection was rejected; no prompt was sent".into(),
+                );
+                assert_eq!(is_retryable_spawn_error(&mapped), retryable, "{mapped}");
+                assert!(!mapped.to_string().contains("secret-url"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_mode_and_model_connection_timeouts_are_retryable() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        tokio::time::pause();
+        for stalled_method in ["session/set_mode", "session/set_config_option"] {
+            let (client_write, agent_read) = tokio::io::duplex(4096);
+            let (mut agent_write, client_read) = tokio::io::duplex(4096);
+            let responder = tokio::spawn(async move {
+                let mut lines = BufReader::new(agent_read).lines();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    if request["method"] == stalled_method {
+                        // Keep stdout open: this must be a timeout, not EOF.
+                        std::future::pending::<()>().await;
+                    }
+                    let response = json!({"jsonrpc":"2.0","id":request["id"],"result":{}});
+                    agent_write
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            });
+            let conn = Connection::new(client_write, client_read, None, ConnectionHooks::default());
+            let error = mgr
+                .maybe_apply_session_model(
+                    &conn,
+                    &agent_id,
+                    intent_providers::provider_config("antigravity"),
+                    "candidate",
+                    Some("model-a"),
+                )
+                .await
+                .unwrap_err();
+            assert!(is_retryable_spawn_error(&error));
+            assert!(error
+                .to_string()
+                .contains(&format!("{stalled_method} timed out")));
+            responder.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_session_setup_requires_default_mode_and_exact_model_ack() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        for (provider_id, model, mode_error, model_reply, succeeds, expected_calls) in [
+            (
+                "antigravity",
+                "antigravity:gemini-3.7-flash-low",
+                false,
+                json!({"configOptions":[{"id":"model","currentValue":"gemini-3.7-flash-low"}]}),
+                true,
+                2,
+            ),
+            (
+                "antigravity",
+                "gemini-3.7-flash-low",
+                false,
+                json!({"configOptions":[{"id":"model","currentValue":"different"}]}),
+                false,
+                2,
+            ),
+            (
+                "antigravity",
+                "gemini-3.7-flash-low",
+                false,
+                json!(null),
+                false,
+                2,
+            ),
+            (
+                "antigravity",
+                "gemini-3.7-flash-low",
+                false,
+                json!({}),
+                false,
+                2,
+            ),
+            (
+                "antigravity",
+                "gemini-3.7-flash-low",
+                true,
+                json!({}),
+                false,
+                1,
+            ),
+            ("antigravity", "codex:gpt-5", false, json!({}), false, 1),
+            (
+                "antigravity",
+                "antigravity:Gemini Flash",
+                false,
+                json!({}),
+                false,
+                1,
+            ),
+            (
+                "antigravity",
+                "antigravity:default",
+                false,
+                json!({}),
+                true,
+                1,
+            ),
+            (
+                "claude-code",
+                "claude-code:sonnet",
+                false,
+                json!(null),
+                true,
+                1,
+            ),
+        ] {
+            let (writer, requests) = tokio::io::duplex(4096);
+            let (mut replies, reader) = tokio::io::duplex(4096);
+            let connection = Connection::new(writer, reader, None, ConnectionHooks::default());
+            let responder = tokio::spawn(async move {
+                let mut lines = BufReader::new(requests).lines();
+                let mut calls = Vec::new();
+                for _ in 0..expected_calls {
+                    let line = lines.next_line().await.unwrap().unwrap();
+                    let call: Value = serde_json::from_str(&line).unwrap();
+                    let mode = call["method"] == "session/set_mode";
+                    let mut response = json!({"jsonrpc":"2.0", "id":call["id"]});
+                    if (mode && mode_error) || (!mode && model_reply.is_null()) {
+                        response["error"] =
+                            json!({"code":-32602,"message":"rejected: timed out secret-url"});
+                    } else {
+                        response["result"] = if mode { json!({}) } else { model_reply.clone() };
+                    }
+                    replies
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    calls.push(call);
+                }
+                calls
+            });
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                mgr.maybe_apply_session_model(
+                    &connection,
+                    &agent_id,
+                    intent_providers::find_provider(provider_id).unwrap(),
+                    "sid",
+                    Some(model),
+                ),
+            )
+            .await
+            .expect("bounded model setup");
+            assert_eq!(
+                outcome.is_ok(),
+                succeeds,
+                "{provider_id}/{model}: {outcome:?}"
+            );
+            if provider_id == "antigravity" {
+                if let Err(error) = &outcome {
+                    assert!(!is_retryable_spawn_error(error));
+                    assert!(!error.to_string().contains("secret-url"));
+                }
+            }
+            let calls = responder.await.unwrap();
+            if provider_id == "antigravity" {
+                assert_eq!(calls[0]["method"], "session/set_mode");
+                assert_eq!(calls[0]["params"]["modeId"], "default");
+                if calls.len() == 2 {
+                    assert_eq!(calls[1]["method"], "session/set_config_option");
+                    assert_eq!(calls[1]["params"]["value"], "gemini-3.7-flash-low");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn set_model_target_gates_provider_sentinel_and_compound_prefix() {
         let grok = intent_providers::find_provider("grok").unwrap();
         let auggie = intent_providers::find_provider("auggie").unwrap();
@@ -12550,6 +13735,7 @@ mod dead_child_respawn_tests {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".to_string(),
@@ -13025,7 +14211,7 @@ mod v1_turn_envelope_goldens {
         .unwrap();
         let (mgr, _seeded, _db) =
             manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
-        // Untitled workspace + auggie-modeled agent → deterministic naming
+        // Untitled workspace + auggie-provided agent → deterministic naming
         // nudge with the auggie tool spelling.
         let ws = WorkspaceId::from("ws-untitled");
         let mut w = workspace(&ws);
@@ -13033,7 +14219,8 @@ mod v1_turn_envelope_goldens {
         mgr.services.store.insert_workspace(&w).await.unwrap();
         let agent_id = AgentId::from("agent-env");
         let mut s = session(&agent_id, &ws, Some("implementor"));
-        s.model = Some("auggie:sonnet4.5".to_string());
+        s.provider = Some("auggie".to_string());
+        s.model = Some("sonnet4.5".to_string());
         s.system_prompt = Some("SP body".to_string());
         mgr.services.store.insert_agent_session(&s).await.unwrap();
         // Arm the §18.1 prepend fallback (mock has no native SP mechanism)
@@ -13193,6 +14380,7 @@ mod uniform_isolation_tests {
         let ts = now_iso();
         Workspace {
             pending_delete_at: None,
+            context_links: None,
             waiting: false,
             id: id.clone(),
             title: "Uniform ISO WS".to_string(),
@@ -13780,6 +14968,7 @@ mod rebuild_spawn_opts_tests {
         opts.provider_binary = Some(&binary);
         opts.extra_env = BTreeMap::from([("K".to_string(), "V".to_string())]);
         opts.tools_to_remove = vec!["shell"];
+        opts.node_max_old_space_mb = Some(4096);
 
         let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
         assert_eq!(rebuilt.model, Some("gpt-5"));
@@ -13791,6 +14980,7 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(rebuilt.rules_file, Some("/tmp/rules.md"));
         assert_eq!(rebuilt.mcp_config_file, Some("/tmp/mcp.json"));
         assert_eq!(rebuilt.env_mcp_config, None);
+        assert_eq!(rebuilt.node_max_old_space_mb, Some(4096));
     }
 
     #[test]
@@ -13844,6 +15034,48 @@ mod rebuild_spawn_opts_tests {
             env[intent_git::auth::GIT_CONFIG_PARAMETERS_ENV],
             "caller-set"
         );
+    }
+
+    /// intent-hq/intent#4142: the provider-spawn identity seam exports the
+    /// four `GIT_*` identity vars when the spawn cwd's repository resolves an
+    /// identity, never clobbers a caller-set key, and injects nothing without
+    /// a cwd. The four vars are unset for the test's lifetime: the harness
+    /// itself may inherit them (agent-spawned shells do, post-#4142), and
+    /// `commit_identity_env` correctly gap-fills nothing then
+    /// (intent-hq/monorepo#4191).
+    #[test]
+    fn inject_git_identity_env_from_repo_cwd_never_clobbers() {
+        let _env = super::tests::EnvGuard::apply(&[
+            ("GIT_AUTHOR_NAME", None),
+            ("GIT_AUTHOR_EMAIL", None),
+            ("GIT_COMMITTER_NAME", None),
+            ("GIT_COMMITTER_EMAIL", None),
+        ]);
+        let dir =
+            std::env::temp_dir().join(format!("intentd-agent-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Agent Test").unwrap();
+        cfg.set_str("user.email", "agent@example.com").unwrap();
+        drop(cfg);
+
+        let mut env = BTreeMap::new();
+        inject_git_identity_env(&mut env, Some(&dir));
+        for key in intent_git::identity::GIT_IDENTITY_ENV_VARS {
+            assert!(env.contains_key(key), "missing {key}");
+        }
+        assert_eq!(env["GIT_AUTHOR_EMAIL"], "agent@example.com");
+
+        let mut env = BTreeMap::from([("GIT_AUTHOR_NAME".to_string(), "caller-set".to_string())]);
+        inject_git_identity_env(&mut env, Some(&dir));
+        assert_eq!(env["GIT_AUTHOR_NAME"], "caller-set");
+        assert_eq!(env["GIT_COMMITTER_NAME"], "Agent Test");
+
+        let mut env = BTreeMap::new();
+        inject_git_identity_env(&mut env, None);
+        assert!(env.is_empty(), "no cwd must inject nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -13987,6 +15219,37 @@ mod provider_path_override_tests {
         settings
     }
 
+    #[test]
+    fn codex_spawn_normalizes_legacy_model_and_explicit_effort_before_cli_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = exec_stub(dir.path(), "codex-acp");
+        let settings = settings_with_paths(&[("codex", &stub)]);
+        for model in ["gpt-5.5[low]", "gpt-5.5/low"] {
+            for (explicit, expected) in [(None, "low"), (Some("medium"), "medium")] {
+                let mut session = session(
+                    &AgentId::from("codex-spawn"),
+                    &WorkspaceId::from("ws"),
+                    None,
+                );
+                session.provider = Some("codex".to_string());
+                session.model = Some(model.to_string());
+                session.reasoning_effort = explicit.map(str::to_string);
+                let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
+                assert_eq!(resolved.model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(resolved.reasoning_effort.as_deref(), Some(expected));
+                let mut opts = SpawnOptions::new(&resolved.provider);
+                opts.model = resolved.model.as_deref();
+                opts.reasoning_effort = resolved.reasoning_effort.as_deref();
+                let args = intent_acp::spawn::build_args(&opts);
+                assert!(
+                    args.contains(&format!("model_reasoning_effort=\"{expected}\"")),
+                    "{args:?}"
+                );
+                assert!(args.contains(&"model=\"gpt-5.5\"".to_string()), "{args:?}");
+            }
+        }
+    }
+
     fn unsloth_session() -> AgentSession {
         let mut s = session(
             &AgentId::from("agent-paths-unsloth"),
@@ -14052,6 +15315,61 @@ mod provider_path_override_tests {
         assert_eq!(
             resolved.provider_binary.as_deref(),
             Some(opencode_stub.as_path())
+        );
+    }
+
+    fn claude_code_session() -> AgentSession {
+        let mut s = session(
+            &AgentId::from("agent-paths-claude-code"),
+            &WorkspaceId::from("ws-1"),
+            None,
+        );
+        s.provider = Some("claude-code".to_string());
+        s
+    }
+
+    /// monorepo#4352: a valid `providers.paths["claude-code"]` override is
+    /// exec'd directly — the resolved spawn carries the override as
+    /// `provider_binary` and NO npx fallback, so `build_command` spawns the
+    /// override instead of `npx -y <pinned>`.
+    #[test]
+    fn claude_code_spawn_honors_valid_path_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter_stub = exec_stub(dir.path(), "claude-agent-acp-override");
+        let settings = settings_with_paths(&[("claude-code", &adapter_stub)]);
+
+        let resolved = resolve_spawn(&claude_code_session(), None, &settings, None).unwrap();
+        assert_eq!(
+            resolved.provider_binary.as_deref(),
+            Some(adapter_stub.as_path()),
+            "a valid claude-code override must be the spawned binary"
+        );
+        assert_eq!(resolved.npx_fallback_binary, None);
+        assert_eq!(resolved.npx_fallback_package, None);
+        let mut opts = SpawnOptions::new(&resolved.provider);
+        opts.provider_binary = resolved.provider_binary.as_deref();
+        let cmd = intent_acp::spawn::build_command(&opts);
+        assert_eq!(cmd.as_std().get_program(), adapter_stub.as_os_str());
+    }
+
+    /// An invalid override (missing file) contributes nothing: claude-code
+    /// keeps the pinned npx spawn exactly as if the key were unset.
+    #[test]
+    fn claude_code_spawn_ignores_invalid_path_override() {
+        if intent_providers::find_npx().is_none() {
+            eprintln!("skipping: npx not available on this host");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-claude-agent-acp");
+        let settings = settings_with_paths(&[("claude-code", &missing)]);
+
+        let resolved = resolve_spawn(&claude_code_session(), None, &settings, None).unwrap();
+        assert_eq!(resolved.provider_binary, None);
+        assert!(resolved.npx_fallback_binary.is_some());
+        assert_eq!(
+            resolved.npx_fallback_package,
+            Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
         );
     }
 }
@@ -14407,6 +15725,25 @@ mod turn_failure_tests {
     }
 
     #[test]
+    fn auth_mapped_prompt_failure_means_events_already_emitted() {
+        // The auth-required mapping (intent-hq/intent#3941) also emits the
+        // terminal pair before returning its actionable InvalidParams shape —
+        // the worker must not emit a second pair. Other InvalidParams (e.g.
+        // the create/delegate gate's, prefixed by its own method name) still
+        // need the events.
+        let err = Error::InvalidParams(format!(
+            "session/prompt: {}",
+            crate::provider_auth::not_authenticated_message("claude-code")
+        ));
+        assert!(turn_failure_events_already_emitted(&err));
+        let err = Error::InvalidParams(format!(
+            "agent.create: {}",
+            crate::provider_auth::not_authenticated_message("claude-code")
+        ));
+        assert!(!turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
     fn store_error_needs_events_emitted() {
         // The transcript-append store error propagates via `?` before
         // run_prompt_turn reaches its emit path.
@@ -14560,6 +15897,7 @@ mod agent_retry_tests {
             repository_name: None,
             worktree_path: None,
             pull_requests: None,
+            context_links: None,
             scope: None,
             skip_worktree: false,
             setup_script: None,
@@ -14630,6 +15968,7 @@ mod agent_retry_tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 

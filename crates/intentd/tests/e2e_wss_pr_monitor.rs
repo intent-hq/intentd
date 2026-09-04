@@ -27,10 +27,10 @@ use intent_core::{
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
-    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
-    NewPullRequest, Page, PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef,
-    Result as ScResult, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewVerdict,
-    RollupCheck, ScCapabilities, SourceControl, UserIdentity,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
+    PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewDecision,
+    ReviewThread, ReviewVerdict, RollupCheck, ScCapabilities, SourceControl, UserIdentity,
 };
 use intent_store::{PrMonitorPollUpdate, Store};
 use intent_transport::{
@@ -156,6 +156,10 @@ struct ForgeState {
     checks: Vec<(String, CheckState, bool)>,
     /// The authoritative review decision served by `merge_requirements`.
     review_decision: ReviewDecision,
+    /// The merge-queue signal served by `merge_requirements`.
+    in_merge_queue: Option<bool>,
+    /// The latest merge-queue removal event served by `merge_requirements`.
+    merge_queue_removal: Option<MergeQueueRemoval>,
 }
 
 impl Default for ForgeState {
@@ -166,6 +170,8 @@ impl Default for ForgeState {
             get_pr_calls: 0,
             checks: vec![("build".into(), CheckState::Pending, true)],
             review_decision: ReviewDecision::ReviewRequired,
+            in_merge_queue: None,
+            merge_queue_removal: None,
         }
     }
 }
@@ -311,9 +317,14 @@ impl SourceControl for StubForge {
         Ok(Vec::new())
     }
     async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
-        let (checks, review_decision) = {
+        let (checks, review_decision, in_merge_queue, merge_queue_removal) = {
             let s = self.state.lock().unwrap();
-            (s.checks.clone(), s.review_decision)
+            (
+                s.checks.clone(),
+                s.review_decision,
+                s.in_merge_queue,
+                s.merge_queue_removal.clone(),
+            )
         };
         Ok(MergeRequirementSignals {
             merge_state_status: Some("CLEAN".into()),
@@ -337,6 +348,8 @@ impl SourceControl for StubForge {
                     .map(|(name, _, _)| name.clone())
                     .collect(),
             }),
+            is_in_merge_queue: in_merge_queue,
+            merge_queue_removal,
         })
     }
     async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
@@ -453,6 +466,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -513,6 +527,7 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     }
 }
 
@@ -555,7 +570,7 @@ async fn boot() -> Fixture {
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
     let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
@@ -736,6 +751,168 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
         .await
         .expect("agent snapshot");
     assert_eq!(snap["prMonitors"], json!(["o/r#42"]), "snapshot: {snap}");
+}
+
+/// `isInMergeQueue` over the wire (PROTOCOL §5.42 additive-field convention):
+/// omitted from `prMonitor.list`'s `lastSnapshot` while the forge reports the
+/// PR not queued (or unknown), present as `true` after the PR enters the
+/// merge queue, and the transition surfaces as a `prMonitor:changed` line.
+#[tokio::test]
+async fn pr_monitor_list_carries_is_in_merge_queue_over_wss() {
+    let fx = boot().await;
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    // Not queued at registration: the key is OMITTED (never null/false).
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(row["monitorId"], monitor.monitor_id.as_str());
+    assert!(
+        row["lastSnapshot"].get("isInMergeQueue").is_none(),
+        "not queued: the key is omitted, not null: {row}"
+    );
+
+    // The PR enters the merge queue; the next poll carries the flag over the
+    // wire and the FE-facing changed event names the transition.
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:changed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    fx.forge.edit(|s| s.in_merge_queue = Some(true));
+    fx.services.poll_pr_monitors().await;
+    let evt = next_event(&mut sub, "prMonitor:changed").await;
+    assert_eq!(evt["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert!(
+        evt["data"]["changes"]
+            .as_array()
+            .expect("changes array")
+            .iter()
+            .any(|c| c == "entered the merge queue"),
+        "the transition line names the queue entry: {evt}"
+    );
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(
+        row["lastSnapshot"]["isInMergeQueue"],
+        json!(true),
+        "queued: the flag is present and true: {row}"
+    );
+}
+
+/// `mergeQueueEjection` over the wire (PROTOCOL §5.42 additive-field
+/// convention): omitted from `prMonitor.list`'s `lastSnapshot` while the
+/// forge reports no removal event, present as `{ at, reason }` (raw reason
+/// value) once the host reports one, the transition surfaces as a
+/// `prMonitor:changed` line keyed on the event identity, and the flushed
+/// monitor wake carries the same humanized ejection line.
+#[tokio::test]
+async fn pr_monitor_carries_merge_queue_ejection_over_wss() {
+    let fx = boot().await;
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    // No removal event at registration: the key is OMITTED (never null).
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(row["monitorId"], monitor.monitor_id.as_str());
+    assert!(
+        row["lastSnapshot"].get("mergeQueueEjection").is_none(),
+        "no event: the key is omitted, not null: {row}"
+    );
+
+    // The queue ejects the PR; the next poll carries the block over the
+    // wire and the FE-facing changed event names the ejection with the
+    // humanized reason.
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:changed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    fx.forge.edit(|s| {
+        s.merge_queue_removal = Some(MergeQueueRemoval {
+            at: "2026-01-02T03:04:05Z".into(),
+            reason: Some("failed_checks".into()),
+        });
+    });
+    fx.services.poll_pr_monitors().await;
+    let evt = next_event(&mut sub, "prMonitor:changed").await;
+    assert_eq!(evt["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert!(
+        evt["data"]["changes"]
+            .as_array()
+            .expect("changes array")
+            .iter()
+            .any(|c| c == "removed from the merge queue (failed checks)"),
+        "the transition line names the ejection with the humanized reason: {evt}"
+    );
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(
+        row["lastSnapshot"]["mergeQueueEjection"],
+        json!({ "at": "2026-01-02T03:04:05Z", "reason": "failed_checks" }),
+        "ejected: the block carries the raw reason on the wire: {row}"
+    );
+
+    // The debounced wake, flushed over the wire, includes the ejection line.
+    let flushed = wss_rpc(
+        &mut rpc,
+        4,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": monitor.monitor_id.as_str() }),
+    )
+    .await;
+    assert_eq!(flushed, json!({ "ok": true, "flushed": true }));
+    assert!(
+        owner_messages(&fx)
+            .await
+            .contains("removed from the merge queue (failed checks)"),
+        "the monitor wake carries the ejection diff line"
+    );
 }
 
 /// `prMonitor.flush` over the wire delivers the pending debounced wake right

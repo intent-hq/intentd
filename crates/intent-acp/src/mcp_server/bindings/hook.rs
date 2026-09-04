@@ -7,7 +7,10 @@
 //! context; `list` / `cancel` / `runNow` mirror the wire methods of the same
 //! names. `cancel` is ownership-scoped and therefore also requires an agent
 //! caller context: an agent can only cancel its own hooks, and that cancel
-//! does not wake the owner — only the FE cancel path does.
+//! does not wake the owner — only the FE cancel path does. `get` is MCP-only
+//! like `schedule` but read-only and unguarded (mirrors `list` visibility):
+//! the full hook row including `code`, active or retired, so an agent can
+//! recover a retired hook's script to re-arm it.
 
 use std::sync::Arc;
 
@@ -21,6 +24,7 @@ pub(crate) const PRELUDE: &str = r"
     ws.hook = {
         schedule: (opts) => host({ method: 'hook.schedule', args: opts || {} }),
         list: () => host({ method: 'hook.list' }),
+        get: (hookId) => host({ method: 'hook.get', args: { hookId } }),
         cancel: (hookId) => host({ method: 'hook.cancel', args: { hookId } }),
         runNow: (hookId) => host({ method: 'hook.runNow', args: { hookId } }),
     };
@@ -36,6 +40,7 @@ pub(crate) async fn dispatch(
     match method {
         "schedule" => schedule(api, ws, caller, args).await,
         "list" => list(api, ws).await,
+        "get" => get(api, ws, args).await,
         "cancel" => cancel(api, ws, caller, args).await,
         "runNow" => run_now(api, ws, args).await,
         other => Err(format!("hook: unknown method `hook.{other}`")),
@@ -68,6 +73,13 @@ async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, St
         return Ok(inner.clone());
     }
     Ok(raw)
+}
+
+async fn get(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Result<Value, String> {
+    let hook_id = req_str(args, "hookId").map_err(|_| "hookId is required".to_string())?;
+    api.hook_get(ws.clone(), HookId::from(hook_id.as_str()))
+        .await
+        .map_err(map_err)
 }
 
 async fn cancel(
@@ -115,12 +127,23 @@ mod tests {
     /// were reached at all — the caller-context guards must reject before the
     /// service layer sees the call.
     #[derive(Default)]
+    #[allow(clippy::struct_field_names)]
     struct SpyApi {
         cancel_called: AtomicBool,
         schedule_called: AtomicBool,
+        get_called: AtomicBool,
     }
 
     impl WorkspaceApi for SpyApi {
+        fn hook_get(
+            &self,
+            _workspace_id: WorkspaceId,
+            hook_id: HookId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.get_called.store(true, Ordering::SeqCst);
+            Box::pin(async move { Ok(json!({ "hookId": hook_id.0, "code": "return;" })) })
+        }
+
         fn hook_cancel(
             &self,
             _workspace_id: WorkspaceId,
@@ -196,6 +219,35 @@ mod tests {
         );
         assert!(
             !spy.schedule_called.load(Ordering::SeqCst),
+            "service must not be reached"
+        );
+    }
+
+    /// `hook.get` is read-only and unguarded (mirrors `list` visibility):
+    /// no caller context is required, and the hook row passes through
+    /// verbatim — including `code`.
+    #[tokio::test]
+    async fn get_without_caller_context_reaches_the_service_and_returns_the_row() {
+        let (spy, api, ws) = spy();
+        let row = dispatch(&api, &ws, None, "get", &json!({ "hookId": "hook-1" }))
+            .await
+            .expect("get dispatched");
+        assert!(spy.get_called.load(Ordering::SeqCst));
+        assert_eq!(row, json!({ "hookId": "hook-1", "code": "return;" }));
+    }
+
+    #[tokio::test]
+    async fn get_without_hook_id_is_rejected_before_the_service() {
+        let (spy, api, ws) = spy();
+        let err = dispatch(&api, &ws, None, "get", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("hookId is required"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !spy.get_called.load(Ordering::SeqCst),
             "service must not be reached"
         );
     }

@@ -1,22 +1,39 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    now_iso, CheckoutMode, Error, PullRequestInfo, Result, SandboxType, SetupScript, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, CheckoutMode, ContextLink, Error, PullRequestInfo, Result, SandboxType, SetupScript,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
     CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::agent_repo::fetch_agent_usage_rows;
+use crate::agent_repo::{
+    fetch_agent_usage_rows, UNREAD_TOP_LEVEL_SESSION_INDEX, UNREAD_TOP_LEVEL_SESSION_PREDICATE,
+};
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, Store};
 
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
     status_message, status_image_asset_id, attention, path, repository_path, repository_owner, \
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
-    pr_url, pr_status, active_pull_request, pull_requests, archived, archived_at, tags, \
-    created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
+    pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
+    tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
     execution_environment";
+
+/// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
+/// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
+/// statement (see `SESSION_MESSAGE_STATS_SQL` for the precedent).
+pub(crate) fn clear_workspace_unread_if_all_seen_sql() -> String {
+    format!(
+        "UPDATE workspace SET attention='none' \
+         WHERE id = ? AND attention = 'unread' \
+           AND NOT EXISTS(\
+               SELECT 1 FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
+               WHERE workspace_id = workspace.id \
+                 AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}\
+           )"
+    )
+}
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
@@ -45,7 +62,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -71,6 +88,7 @@ impl Store {
             .bind(pr_status_to_db(ws)?)
             .bind(active_pr_to_db(ws)?)
             .bind(pull_requests_to_db(ws)?)
+            .bind(context_links_to_db(ws)?)
             .bind(i64::from(ws.archived))
             .bind(&ws.archived_at)
             .bind(tags_to_db(&ws.tags)?)
@@ -127,8 +145,8 @@ impl Store {
              status_message=?, status_image_asset_id=?, attention=?, path=?, repository_path=?, \
              repository_owner=?, repository_name=?, worktree_path=?, scope=?, skip_worktree=?, \
              is_remote=?, default_model=?, pr_number=?, pr_url=?, pr_status=?, \
-             active_pull_request=?, pull_requests=?, archived=?, archived_at=?, tags=?, \
-             created_at=?, updated_at=?, \
+             active_pull_request=?, pull_requests=?, context_links=?, archived=?, archived_at=?, \
+             tags=?, created_at=?, updated_at=?, \
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
@@ -156,6 +174,7 @@ impl Store {
         .bind(pr_status_to_db(ws)?)
         .bind(active_pr_to_db(ws)?)
         .bind(pull_requests_to_db(ws)?)
+        .bind(context_links_to_db(ws)?)
         .bind(i64::from(ws.archived))
         .bind(&ws.archived_at)
         .bind(tags_to_db(&ws.tags)?)
@@ -366,6 +385,78 @@ impl Store {
             .fetch_one(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("set attention presence check failed: {e}")))?;
+        if col::<i64>(&row, "present")? == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(false)
+    }
+
+    /// Atomic settle-clear of the stored `unread` flag (§5.1): set
+    /// `attention = none` ONLY when the current value is `unread` AND the
+    /// workspace has no unread top-level session — the derivation re-checked
+    /// INSIDE the same guarded UPDATE (shared predicate with
+    /// [`Store::workspace_has_unread_top_level_session`]), so a message that
+    /// lands between a caller's probe and this write flips the NOT EXISTS
+    /// and the clear declines instead of retiring a freshly-raised unread.
+    /// Scoped to the attention column, `updated_at` untouched (acknowledging
+    /// is not "activity", monorepo#1466). Returns whether a row was written
+    /// (`true` ⇒ stored `unread` was cleared); a missing workspace reads as
+    /// `false` — settle callers are best-effort and never need `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
+        let sql = clear_workspace_unread_if_all_seen_sql();
+        let res = sqlx::query(&sql)
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("settle unread clear failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Scoped, conditional unarchive flip: set `status`/`archived`/
+    /// `archived_at` (plus `updated_at`) back to Active ONLY when the row is
+    /// currently archived, so the write and the "did this call flip it"
+    /// decision are a single atomic statement — two concurrent unarchivers
+    /// (or an unarchive racing a turn-start auto-unarchive) can both read
+    /// `archived: true`, but exactly one write affects a row. Same
+    /// scoped-update discipline as [`Self::set_workspace_attention`]. Returns
+    /// whether a row was written (`true` ⇒ this call performed the flip);
+    /// `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn unarchive_workspace_if_archived(
+        &self,
+        id: &WorkspaceId,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE workspace SET status=?, archived=0, archived_at=NULL, updated_at=? \
+             WHERE id=? AND archived=1",
+        )
+        .bind(enum_to_db(&WorkspaceStatus::Active)?)
+        .bind(updated_at)
+        .bind(&id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("conditional unarchive failed: {e}")))?;
+        if res.rows_affected() > 0 {
+            return Ok(true);
+        }
+        // Zero rows: either the row is already active (no flip) or the
+        // workspace is missing — distinguish so callers keep NotFound
+        // semantics.
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?) AS present")
+            .bind(&id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("conditional unarchive presence check failed: {e}"))
+            })?;
         if col::<i64>(&row, "present")? == 0 {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
@@ -664,6 +755,26 @@ fn pull_requests_from_db(s: Option<String>) -> Result<Option<Vec<PullRequestInfo
     .transpose()
 }
 
+/// Encode the optional `context_links` list to a JSON TEXT column (§5.1).
+fn context_links_to_db(ws: &Workspace) -> Result<Option<String>> {
+    ws.context_links
+        .as_ref()
+        .map(|links| {
+            serde_json::to_string(links)
+                .map_err(|e| Error::Internal(format!("encode context_links failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the optional `context_links` JSON TEXT column (§5.1).
+fn context_links_from_db(s: Option<String>) -> Result<Option<Vec<ContextLink>>> {
+    s.map(|json| {
+        serde_json::from_str::<Vec<ContextLink>>(&json)
+            .map_err(|e| Error::Internal(format!("decode context_links failed: {e}")))
+    })
+    .transpose()
+}
+
 /// Encode the optional `token_usage` snapshot to a JSON TEXT column (§5.23).
 fn token_usage_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.token_usage
@@ -725,6 +836,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
     let active_pull_request =
         active_pr_from_db(col::<Option<String>>(row, "active_pull_request")?)?;
     let pull_requests = pull_requests_from_db(col::<Option<String>>(row, "pull_requests")?)?;
+    let context_links = context_links_from_db(col::<Option<String>>(row, "context_links")?)?;
     let token_usage = token_usage_from_db(col::<Option<String>>(row, "token_usage")?)?;
     let setup_script = setup_script_from_db(col::<Option<String>>(row, "setup_script")?)?;
     let checkout_mode = col::<Option<String>>(row, "checkout_mode")?
@@ -764,6 +876,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         pr_status,
         active_pull_request,
         pull_requests,
+        context_links,
         archived: col::<i64>(row, "archived")? != 0,
         archived_at: col(row, "archived_at")?,
         // Card aggregates are computed on the workspace.list/get emit path

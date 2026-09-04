@@ -290,6 +290,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -369,7 +370,7 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-RETRY", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-RETRY", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -491,7 +492,7 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-EXIT", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-EXIT", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -606,7 +607,7 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-FAIL", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-FAIL", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -734,7 +735,7 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-RECOVER", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-RETRY-RECOVER", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -1121,7 +1122,7 @@ async fn agent_spawn_slow_initialize_succeeds_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-SLOW-INIT", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-SLOW-INIT", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]

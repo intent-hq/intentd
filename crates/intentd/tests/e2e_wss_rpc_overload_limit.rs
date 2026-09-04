@@ -178,7 +178,7 @@ async fn boot(max_outstanding: u32) -> Fixture {
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         rpc_limiter: limiter.clone(),
         ..Default::default()
     };

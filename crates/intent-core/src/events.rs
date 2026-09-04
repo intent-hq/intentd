@@ -47,6 +47,11 @@ pub const AGENT_DELETED: &str = "agent:deleted";
 // flip the pending state without a follow-up read.
 pub const AGENT_DELETE_SCHEDULED: &str = "agent:delete-scheduled";
 pub const AGENT_DELETE_CANCELLED: &str = "agent:delete-cancelled";
+// Soft retire (PROTOCOL §5.5): `agent:retired` marks a session inert
+// (`retired_at` set — `ws.agent.retire`); `agent:restored` clears it
+// (`agent.restore`). Both carry `{ agentId, agentName }`, and the session
+// row survives with its full conversation on both sides.
+pub const AGENT_RETIRED: &str = "agent:retired";
 pub const AGENT_RESTORED: &str = "agent:restored";
 pub const AGENT_RENAMED: &str = "agent:renamed";
 pub const AGENT_UPDATED: &str = "agent:updated";
@@ -363,6 +368,11 @@ pub const COMMENT_RESOLVED: &str = "comment:resolved";
 pub(crate) const CHANGES_TRACKED: &str = "changes:tracked";
 pub const CHANGES_GIT_STATUS: &str = "changes:git-status";
 pub const CHANGES_METRICS_CHANGED: &str = "changes:metrics-changed";
+// `changes:agent-locks` → `{ workspaceId, autoCommitEnabled, lockedAgentIds,
+// lockedFilePaths }` — the daemon-computed agent-lock snapshot (§5.19, §6.5):
+// which agents' files must not be manually staged/reverted because the agent
+// is actively working with auto-commit enabled. Emitted on change only.
+pub const CHANGES_AGENT_LOCKS: &str = "changes:agent-locks";
 
 // Search streaming events (new in intentd; §5.15 / §6.5). Large or long-running
 // `search.*` requests return `{ requestId }` promptly, then the daemon pushes
@@ -494,6 +504,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_DELETED,
     AGENT_DELETE_SCHEDULED,
     AGENT_DELETE_CANCELLED,
+    AGENT_RETIRED,
     AGENT_RESTORED,
     AGENT_RENAMED,
     AGENT_UPDATED,
@@ -597,6 +608,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     CHANGES_TRACKED,
     CHANGES_GIT_STATUS,
     CHANGES_METRICS_CHANGED,
+    CHANGES_AGENT_LOCKS,
     SEARCH_RESULT,
     SEARCH_DONE,
     DRAFT_CHANGED,

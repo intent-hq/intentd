@@ -8,7 +8,11 @@
 //!    key and `settings.get` reflects the file value;
 //! 3. an invalid external edit (TOML syntax error or unknown key) keeps
 //!    last-good values without crashing the daemon, and a subsequent valid
-//!    edit recovers.
+//!    edit recovers;
+//! 4. the one-time boot migration of the deprecated `providers.active`
+//!    rewrites config.toml (key removed, value carried into
+//!    `model.defaultProvider`, comments preserved) and a restart from the
+//!    migrated file never rewrites it again.
 //!
 //! Adjacent coverage lives elsewhere and is intentionally not duplicated:
 //! startup refusal on malformed config + flag-pin precedence in
@@ -395,8 +399,9 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     // §5.12 settings.get result carries the full definition.
     assert_eq!(get["result"]["definition"]["path"], json!("git.autoCommit"));
     assert_eq!(get["result"]["definition"]["type"], json!("boolean"));
+    assert_eq!(get["result"]["revision"], json!(0));
 
-    // settings.update over WSS → §5.12 result { applied: [{ path, value }] }.
+    // settings.update over WSS → §5.12 result with post-commit origin.
     let update = wss_rpc(
         &mut rpc,
         11,
@@ -407,18 +412,25 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     assert_eq!(update["jsonrpc"], json!("2.0"));
     assert_eq!(update["id"], json!(11));
     assert_eq!(
-        update["result"],
-        json!({ "applied": [{ "path": "git.autoCommit", "value": false }] }),
+        update["result"]["applied"],
+        json!([{ "path": "git.autoCommit", "value": false, "origin": "file" }]),
         "settings.update result shape per §5.12: {update}"
     );
+    let update_revision = update["result"]["revision"]
+        .as_u64()
+        .expect("settings.update revision");
 
     // §6.5: settings:changed with data.changes = applied pairs.
     let ev = next_settings_event(&mut sub).await;
     assert_eq!(ev["method"], json!("events.event"));
     assert_eq!(
         ev["params"]["event"]["data"]["changes"],
-        json!([{ "path": "git.autoCommit", "value": false }]),
+        json!([{ "path": "git.autoCommit", "value": false, "origin": "file" }]),
         "{ev}"
+    );
+    assert_eq!(
+        ev["params"]["event"]["data"]["revision"],
+        json!(update_revision)
     );
 
     // The daemon rewrote config.toml on disk: new value present, user comment
@@ -493,13 +505,16 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
         &format!("[workspace]\nbranchPrefix = \"after/\"\n\n{ws_api_block}"),
     );
     let ev = next_settings_event(&mut sub).await;
+    assert!(
+        ev["params"]["event"]["data"]["revision"].as_u64().unwrap() > 0,
+        "live reload must carry a daemon revision: {ev}"
+    );
     let changes = ev["params"]["event"]["data"]["changes"]
         .as_array()
         .expect("changes array");
     assert!(
-        changes
-            .iter()
-            .any(|c| c == &json!({ "path": "workspace.branchPrefix", "value": "after/" })),
+        changes.iter().any(|c| c
+            == &json!({ "path": "workspace.branchPrefix", "value": "after/", "origin": "file" })),
         "live-reload event must carry the edited key: {ev}"
     );
     let get = wss_rpc(
@@ -549,7 +564,7 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
     assert!(
         changes
             .iter()
-            .any(|c| c == &json!({ "path": "workspace.branchPrefix", "value": "recovered/" })),
+            .any(|c| c == &json!({ "path": "workspace.branchPrefix", "value": "recovered/", "origin": "file" })),
         "recovery event must carry the edited key: {ev}"
     );
     let get = wss_rpc(
@@ -636,7 +651,11 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
         json!({ "changes": [{ "path": "backgroundAgents.defaultModel", "value": "auggie:opus" }] }),
     )
     .await;
-    assert_eq!(update["result"], json!({ "applied": [] }), "{update}");
+    assert_eq!(update["result"]["applied"], json!([]), "{update}");
+    assert_eq!(
+        update["result"]["revision"], list["result"]["revision"],
+        "retired-only updates must not advance the revision: {update}"
+    );
     let get = wss_rpc(
         &mut rpc,
         15,
@@ -648,5 +667,174 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
         get["result"]["value"],
         json!("auggie:haiku"),
         "an ignored retired write must not change the renamed key: {get}"
+    );
+}
+
+/// The settings model triple over the wire: a user-authored config carrying
+/// a legacy compound `model.default` (and an own-prefixed
+/// `model.providerDefaults` entry) reads back over WSS as the split triple —
+/// bare `model.default`, split-off `model.defaultProvider`, both with
+/// `origin: file` — while the on-disk file stays untouched at load. The wire
+/// keeps rejecting compound writes (`settings.update` is bare-id only), so
+/// normalization is strictly read-side.
+#[tokio::test]
+async fn legacy_compound_model_default_reads_back_as_the_split_triple_over_wss() {
+    let data_dir = temp_data_dir();
+    let config_path = data_dir.join("config.toml");
+    let seed =
+        "[model]\ndefault = \"codex:gpt-5\"\nproviderDefaults = { codex = \"codex:gpt-5-mini\" }\n";
+    std::fs::write(&config_path, seed).expect("seed legacy config.toml");
+
+    let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
+
+    // The compound reads back split: bare model + split-off provider, both
+    // reporting file origin (the value came from the user's file, not a
+    // schema default — origin badges must not mislabel it).
+    let get = wss_rpc(
+        &mut rpc,
+        10,
+        "settings.get",
+        json!({ "path": "model.default" }),
+    )
+    .await;
+    assert_eq!(get["result"]["value"], json!("gpt-5"), "{get}");
+    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+    let get = wss_rpc(
+        &mut rpc,
+        11,
+        "settings.get",
+        json!({ "path": "model.defaultProvider" }),
+    )
+    .await;
+    assert_eq!(get["result"]["value"], json!("codex"), "{get}");
+    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+
+    // The own-prefixed providerDefaults entry reads back bare.
+    let get = wss_rpc(
+        &mut rpc,
+        12,
+        "settings.get",
+        json!({ "path": "model.providerDefaults" }),
+    )
+    .await;
+    assert_eq!(
+        get["result"]["value"],
+        json!({ "codex": "gpt-5-mini" }),
+        "{get}"
+    );
+
+    // Normalization is read-side only: the user's model section is untouched
+    // at load (the harness boot appends `[server.wsApi]`, so compare the
+    // seeded lines, not the whole file).
+    let text = std::fs::read_to_string(&config_path).expect("read config.toml");
+    assert!(
+        text.starts_with(seed),
+        "normalization must not rewrite the user's model section: {text}"
+    );
+
+    // …and the wire still hard-rejects compound writes.
+    let update = wss_rpc(
+        &mut rpc,
+        13,
+        "settings.update",
+        json!({ "changes": [{ "path": "model.default", "value": "codex:gpt-5" }] }),
+    )
+    .await;
+    assert_eq!(update["error"]["code"], json!(-32602), "{update}");
+}
+
+/// One-time boot migration of the deprecated `providers.active`: a real
+/// daemon boot carries the legacy value into `model.defaultProvider` and
+/// removes the key from config.toml with a comment-preserving rewrite, all
+/// observable over WSS (`settings.get` reports the carried value with
+/// `origin: file` and the legacy key back at its schema default). A restart
+/// from the migrated file leaves it byte-identical — the migration rewrite is
+/// genuinely one-time.
+#[tokio::test]
+async fn active_provider_boot_migration_rewrites_config_once_over_wss() {
+    let data_dir = temp_data_dir();
+    let config_path = data_dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        "# Operator comment — must survive the migration rewrite.\n\
+         [providers]\n\
+         active = \"codex\"\n\
+         \n\
+         [git]\n\
+         autoCommit = false\n",
+    )
+    .expect("seed legacy config.toml");
+
+    let migrated = {
+        let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
+
+        // The legacy value carried over, reading back over the wire with
+        // file origin (it came from the user's config, not a schema default).
+        let get = wss_rpc(
+            &mut rpc,
+            10,
+            "settings.get",
+            json!({ "path": "model.defaultProvider" }),
+        )
+        .await;
+        assert_eq!(get["result"]["value"], json!("codex"), "{get}");
+        assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+
+        // The legacy key is back at its schema default — no file layer left.
+        let get = wss_rpc(
+            &mut rpc,
+            11,
+            "settings.get",
+            json!({ "path": "providers.active" }),
+        )
+        .await;
+        assert_eq!(get["result"]["origin"], json!("default"), "{get}");
+
+        // On disk: key removed, carried value written, comment and untouched
+        // keys preserved (toml_edit comment-preserving rewrite).
+        let text = std::fs::read_to_string(&config_path).expect("read config.toml");
+        let has_active_key = text.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix("active")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        });
+        assert!(
+            !has_active_key,
+            "providers.active must be removed from the file: {text}"
+        );
+        assert!(
+            text.contains("defaultProvider = \"codex\""),
+            "the carried-over value must be persisted: {text}"
+        );
+        assert!(
+            text.contains("# Operator comment — must survive the migration rewrite."),
+            "user comment must survive the migration rewrite: {text}"
+        );
+        assert!(
+            text.contains("autoCommit = false"),
+            "untouched keys must survive the migration rewrite: {text}"
+        );
+        text
+    }; // first daemon killed + data dir removed (Drop)
+
+    // Restart on the migrated file: the migration finds no legacy key and
+    // never rewrites — the file stays byte-identical across the boot. Drop
+    // removed the data dir, so reseed a fresh one with the migrated bytes.
+    std::fs::create_dir_all(&data_dir).expect("recreate data dir for restart");
+    std::fs::write(&config_path, &migrated).expect("reseed migrated config.toml");
+    let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
+    let get = wss_rpc(
+        &mut rpc,
+        12,
+        "settings.get",
+        json!({ "path": "model.defaultProvider" }),
+    )
+    .await;
+    assert_eq!(get["result"]["value"], json!("codex"), "{get}");
+    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+    let after = std::fs::read_to_string(&config_path).expect("re-read config.toml");
+    assert_eq!(
+        after, migrated,
+        "a file without the legacy key is never rewritten at boot"
     );
 }

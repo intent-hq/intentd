@@ -298,6 +298,7 @@ async fn seed_workspace_and_task_note(data_dir: &Path) -> String {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -360,7 +361,7 @@ async fn stall_annotated_wake_reaches_parent_over_wss() {
     // The child idles WITHOUT reportToParent and WITHOUT completing the task
     // note — the exact monorepo#1016 stall shape.
     let delegate_js = format!(
-        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'default', provider: 'mock' }});",
         json!(TASK_NOTE_ID),
         json!(CHILD_MARK),
     );
@@ -426,7 +427,7 @@ async fn stall_annotated_wake_reaches_parent_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "default", "provider": "mock" }),
     )
     .await;
     let parent_id = parent["agent"]["id"]

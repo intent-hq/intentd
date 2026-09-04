@@ -55,16 +55,25 @@ fn temp_data_dir() -> PathBuf {
 
 fn spawn_serve(data_dir: &Path) -> Child {
     common::enable_ws_api(data_dir);
-    spawn_serve_inner(data_dir)
+    spawn_serve_inner(data_dir, &[])
 }
 
 /// Spawn without enabling the WSS listener — the daemon serves UDS only, so
 /// `pairing.getInfo` fails with the listener-down error.
 fn spawn_serve_wss_disabled(data_dir: &Path) -> Child {
-    spawn_serve_inner(data_dir)
+    spawn_serve_inner(data_dir, &[])
 }
 
-fn spawn_serve_inner(data_dir: &Path) -> Child {
+/// Spawn with the WSS listener enabled and a fake tailcat sidecar wired in
+/// via the `INTENTD_TAILCAT_BIN` seam, so `server.tunnel.enabled = true` can
+/// report a stable tc address without the real binary.
+fn spawn_serve_with_tailcat(data_dir: &Path, tailcat_bin: &Path) -> Child {
+    common::enable_ws_api(data_dir);
+    let bin = tailcat_bin.to_string_lossy().to_string();
+    spawn_serve_inner(data_dir, &[("INTENTD_TAILCAT_BIN", &bin)])
+}
+
+fn spawn_serve_inner(data_dir: &Path, extra_env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -78,7 +87,39 @@ fn spawn_serve_inner(data_dir: &Path) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     cmd.env("MOCK_ACP_HOST", "localhost:0");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     cmd.spawn().expect("spawn intentd serve")
+}
+
+/// Write an executable fake-tailcat script into `dir`: `genkey` creates the
+/// key file, `serve` prints the JSON address derived from the key file's
+/// content and sleeps (mirrors the seam in `e2e_wss_runtime_control.rs`).
+fn write_fake_tailcat(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-tailcat.sh");
+    let script = r#"#!/bin/sh
+key=""
+for arg in "$@"; do
+  case "$arg" in
+    --key=*) key="${arg#--key=}" ;;
+  esac
+done
+case "$1" in
+  genkey)
+    printf 'key-%s' $$ > "$key"
+    ;;
+  serve)
+    printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
+    sleep 600
+    ;;
+esac
+"#;
+    std::fs::write(&path, script).expect("write fake tailcat");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake tailcat");
+    path
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -245,7 +286,38 @@ async fn server_pairing_info_over_uds() {
     assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
     assert_eq!(result["path"].as_str().unwrap(), "/ws");
     assert!(result["localIps"].is_array());
+    // Additive bind-candidate set: always present, string entries, never
+    // loopback (the FE renders loopback itself).
+    let available_ips = result["availableIps"]
+        .as_array()
+        .expect("availableIps is array");
+    assert!(
+        available_ips.iter().all(|v| v
+            .as_str()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| !ip.is_loopback())),
+        "availableIps entries are non-loopback IPs: {result}"
+    );
     assert!(result["hostname"].is_string());
+    assert!(
+        !result["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty"
+    );
+    if std::env::consts::OS == "linux" {
+        assert!(result["deviceKind"].is_string(), "deviceKind: {response}");
+    }
+    assert!(
+        result
+            .get("deviceKind")
+            .is_none_or(|value| !value.is_null()),
+        "deviceKind is omitted, never null"
+    );
+    if let Some(model) = result.get("hardwareModel") {
+        assert!(model.is_string(), "hardwareModel: {response}");
+    }
 
     daemon.child.kill().ok();
 }
@@ -296,36 +368,90 @@ async fn server_pairing_info_over_wss_rejects() {
 }
 
 #[tokio::test]
-async fn pairing_get_info_over_uds() {
+async fn pairing_get_info_loopback_default_errors_without_tunnel() {
     let data_dir = temp_data_dir();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
         data_dir: data_dir.clone(),
     };
+    boot(&data_dir).await;
+    let socket = data_dir.join("intentd.sock");
+
+    // Fresh config (no server.bindAddress): the listener binds the loopback
+    // default (monorepo#2900). Loopback is never advertised to pairing
+    // clients (not dialable from another device) and the tunnel is off, so
+    // there is no dialable route at all — pairing.getInfo errors with
+    // actionable guidance instead of minting a payload no other device can
+    // connect through. This is NOT the listener-down error (the listener IS
+    // up — boot() connected over WSS above).
+    let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    let error = &response["error"];
+    let msg = error["message"].as_str().unwrap();
+    assert!(
+        msg.contains("loopback only"),
+        "error names the loopback-only bind: {msg}"
+    );
+    assert!(
+        msg.contains("server.bindAddress") && msg.contains("server.tunnel.enabled"),
+        "guidance names both remediations: {msg}"
+    );
+    assert!(
+        error["data"]["code"] != json!("listener-down"),
+        "must not be the listener-down error: {error}"
+    );
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
+    let data_dir = temp_data_dir();
+    // Persist server.tunnel.enabled BEFORE boot so the daemon auto-starts the
+    // (fake) sidecar; enable_ws_api inside the spawn helper appends the
+    // [server.wsApi] section to the same config.
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server.tunnel]\nenabled = true\n",
+    )
+    .expect("seed config.toml with server.tunnel.enabled");
+    let tailcat_bin = write_fake_tailcat(&data_dir);
+    let mut daemon = Daemon {
+        child: spawn_serve_with_tailcat(&data_dir, &tailcat_bin),
+        data_dir: data_dir.clone(),
+    };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
 
-    // pairing.getInfo over UDS (local) returns the structured QR payload
+    // pairing.getInfo over UDS carries the tunnel address and appends it to
+    // the URI as the additive tc= param. The tunnel is the payload's one
+    // dialable route here (loopback-default bind, so the host list is empty
+    // — loopback is never advertised), and the structured QR payload fields
+    // are exactly the credential sources the daemon serves.
     let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
     let result = &response["result"];
-
+    let tc = result["tcAddress"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tcAddress present: {result}"));
+    assert!(tc.starts_with("tc-"), "fake sidecar address: {tc}");
     assert_eq!(result["token"].as_str().unwrap(), TOKEN);
     assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
     assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
     assert_eq!(result["version"].as_u64().unwrap(), 1);
-    assert!(result["hosts"].is_array());
-
-    // Fresh config (no server.bindAddress): the listener binds the loopback
-    // default (monorepo#2900), so the payload advertises exactly that host.
-    let hosts: Vec<String> = serde_json::from_value(result["hosts"].clone()).unwrap();
-    assert_eq!(hosts, vec!["127.0.0.1".to_string()]);
-
-    // The uri field is consistent with the component fields
-    let expected_uri = format!(
-        "intent://pair?v=1&host={}&port={port}&fp={fp}&token={TOKEN}",
-        hosts.join(",")
-    );
+    assert_eq!(result["hosts"], json!([]));
+    let expected_uri = format!("intent://pair?v=1&host=&port={port}&fp={fp}&token={TOKEN}&tc={tc}");
     assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
+
+    // server.pairingInfo over UDS carries the same field.
+    let response = uds_rpc(&socket, 3, "server.pairingInfo", json!({})).await;
+    assert_eq!(response["result"]["tcAddress"].as_str().unwrap(), tc);
+
+    // system.status serves it to remote (WSS) clients too, alongside
+    // localIps, so a connected client can refresh its stored tunnel route.
+    let frame =
+        json!({ "jsonrpc": "2.0", "id": 4, "method": "system.status", "params": {} }).to_string();
+    let status = wss_call(port, client_config(&fp), &frame).await;
+    assert_eq!(status["result"]["tcAddress"].as_str().unwrap(), tc);
 
     daemon.child.kill().ok();
 }

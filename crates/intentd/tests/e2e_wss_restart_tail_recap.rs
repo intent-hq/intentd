@@ -339,6 +339,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -405,7 +406,7 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         &socket,
         1,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Tail Agent", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "Tail Agent", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["result"]["agent"]["id"]

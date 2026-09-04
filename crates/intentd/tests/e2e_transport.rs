@@ -503,6 +503,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        context_links: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -593,7 +594,7 @@ async fn e2e_idle_session_reaping() {
         &socket,
         2,
         "agent.create",
-        json!({ "workspaceId": ws.0, "name": "reap", "model": "mock:default" }),
+        json!({ "workspaceId": ws.0, "name": "reap", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["result"]["agent"]["id"]

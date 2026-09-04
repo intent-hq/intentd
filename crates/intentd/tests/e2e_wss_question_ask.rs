@@ -49,6 +49,7 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 /// MIME type the FE renders as `QuestionCards` (PROTOCOL §7.x question resource).
 const QUESTION_MIME: &str = "application/vnd.intent.question+json";
+const PROPOSAL_MIME: &str = "application/vnd.intent.proposal+json";
 
 /// Turn-1 trigger marker: the mock's `rules` entry matches on this, so the
 /// tool-calling behavior fires ONLY on the first user turn (the flattened
@@ -310,7 +311,7 @@ fn read_prompt_log(path: &Path) -> Vec<(u64, String)> {
 
 /// Pre-seed the daemon's `SQLite` store with a regular (NON-chief) workspace —
 /// the daemon opens the same data dir on launch.
-async fn seed_workspace_only(data_dir: &Path) -> String {
+async fn seed_workspace_only(data_dir: &Path, repository_path: Option<&Path>) -> String {
     use intent_core::{
         now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
     };
@@ -336,9 +337,9 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             last_activity: None,
             tags: vec![],
             path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
+            repository_path: repository_path.map(|path| path.to_string_lossy().into_owned()),
+            repository_owner: repository_path.map(|_| "intent-hq".to_string()),
+            repository_name: repository_path.map(|_| "intentd".to_string()),
             worktree_path: None,
             scope: None,
             skip_worktree: false,
@@ -350,6 +351,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            context_links: None,
             archived: false,
             archived_at: None,
             task_stats: None,
@@ -413,7 +415,7 @@ async fn question_ask_round_trip_over_wss() {
     };
 
     let data_dir = temp_data_dir();
-    let ws_id = seed_workspace_only(&data_dir).await;
+    let ws_id = seed_workspace_only(&data_dir, None).await;
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     // Two workspace_api invocations, ONE ws.app.question.ask per call — the
@@ -488,7 +490,7 @@ async fn question_ask_round_trip_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "QAsk", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "QAsk", "model": "default", "provider": "mock" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -677,6 +679,454 @@ async fn question_ask_round_trip_over_wss() {
     );
 }
 
+#[tokio::test]
+async fn workspace_sibling_proposal_round_trip_over_wss() {
+    let Some(script) = gate("WSS workspace.proposeSibling E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let repo_path = data_dir.join("source-repository");
+    assert!(Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(&repo_path)
+        .status()
+        .expect("run git init")
+        .success());
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com")] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["config", key, value])
+            .status()
+            .expect("run git config")
+            .success());
+    }
+    std::fs::write(repo_path.join("README.md"), "WSS proposal test\n").unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["add", "README.md"])
+        .status()
+        .expect("run git add")
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["commit", "-m", "initial"])
+        .status()
+        .expect("run git commit")
+        .success());
+
+    let ws_id = seed_workspace_only(&data_dir, Some(&repo_path)).await;
+    let marker = "PROPOSE_SIBLING_NOW_E2E";
+    let proposal_code = r#"return await ws.workspace.proposeSibling({
+        title: "Focused follow-up",
+        initialPrompt: "Implement only the focused follow-up and run its tests.",
+        specialist: "implementor"
+    });"#;
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": marker,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": {
+                    "code": proposal_code,
+                    "summary": "propose focused sibling workspace"
+                }
+            },
+            "response": "I prepared the focused follow-up workspace proposal.",
+            "emitToolBlocks": true
+        }],
+        "response": "plain response"
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "SiblingProposer", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": marker }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+    await_stream_end(&mut sub, &agent_id).await;
+
+    let conversation = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conversation["messages"].as_array().unwrap();
+    let block = messages
+        .iter()
+        .flat_map(|message| message["contentBlocks"].as_array().into_iter().flatten())
+        .find(|block| block["type"] == "resource" && block["resource"]["mimeType"] == PROPOSAL_MIME)
+        .unwrap_or_else(|| panic!("persisted proposal resource: {conversation:#}"));
+    assert!(messages.iter().any(|message| {
+        message["contentBlocks"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["type"] == "tool_result"
+                    && block["output"].as_array().is_some_and(|output| {
+                        output
+                            .iter()
+                            .any(|item| item["resource"]["mimeType"] == PROPOSAL_MIME)
+                    })
+            })
+        })
+    }));
+    let proposal: Value =
+        serde_json::from_str(block["resource"]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(proposal["kind"], "workspace-create");
+    assert_eq!(proposal["preview"]["workspaceCreate"]["mode"], "sibling");
+    assert_eq!(
+        proposal["preview"]["workspaceCreate"]["title"],
+        "Focused follow-up"
+    );
+    assert_eq!(proposal["preview"]["workspaceCreate"]["branch"], "main");
+    assert_eq!(
+        proposal["payload"]["params"]["repositoryPath"],
+        repo_path.to_string_lossy().as_ref()
+    );
+    assert!(proposal["payload"]["params"]["idempotencyKey"]
+        .as_str()
+        .unwrap()
+        .starts_with("sibling-workspace-"));
+}
+
+/// Pending-proposals wire projection (PROTOCOL §5.5) over the real WSS
+/// transport: a proposal-bearing turn (the mock calls
+/// `ws.workspace.proposeSibling`) must
+///
+/// 1. emit `agent:updated` carrying the recorded `pendingProposals` list
+///    (proposal identity = `applyToolCallId ?? preview.title`), and
+/// 2. surface the same list on `agent.get`'s `AgentLite` projection under
+///    `agent.metadata.pendingProposals`, with `messageId` naming the
+///    persisted assistant message whose transcript blocks carry the
+///    proposal resource — so clients can recover the full proposal.
+#[tokio::test]
+async fn pending_proposals_projection_over_wss() {
+    let Some(script) = gate("WSS pendingProposals E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let repo_path = data_dir.join("source-repository");
+    assert!(Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(&repo_path)
+        .status()
+        .expect("run git init")
+        .success());
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com")] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["config", key, value])
+            .status()
+            .expect("run git config")
+            .success());
+    }
+    std::fs::write(repo_path.join("README.md"), "pendingProposals test\n").unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["add", "README.md"])
+        .status()
+        .expect("run git add")
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["commit", "-m", "initial"])
+        .status()
+        .expect("run git commit")
+        .success());
+
+    let ws_id = seed_workspace_only(&data_dir, Some(&repo_path)).await;
+    let marker = "PROPOSE_FOR_PENDING_E2E";
+    let proposal_code = r#"return await ws.workspace.proposeSibling({
+        title: "Pending projection",
+        initialPrompt: "Verify the pendingProposals projection end to end."
+    });"#;
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": marker,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": {
+                    "code": proposal_code,
+                    "summary": "propose sibling workspace"
+                }
+            },
+            "response": "Proposal filed.",
+            "emitToolBlocks": true
+        }],
+        "response": "plain response"
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — before the turn so the `agent:updated` carrying the
+    // recorded list (emitted during turn-end persist, before `stream:end`)
+    // cannot be missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "PendingProposer", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": marker }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+
+    // Drain to stream:end, capturing the `agent:updated` that carries the
+    // recorded pendingProposals list along the way.
+    let mut pending_update: Option<Value> = None;
+    let end_data = loop {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        if ev["type"] == "agent:updated" && ev["data"].get("pendingProposals").is_some() {
+            pending_update = Some(ev["data"].clone());
+        }
+        if ev["type"] == "agent:stream:end" {
+            break ev["data"].clone();
+        }
+    };
+    let turn_message_id = end_data["messageId"].as_str().expect("turn messageId");
+
+    // 1. The live event carried the list: one entry, identity from the
+    //    proposal's `preview.title` (no applyToolCallId on workspace-create
+    //    proposals), messageId naming this turn's persisted assistant row.
+    let update = pending_update.expect("agent:updated with pendingProposals was emitted");
+    assert_eq!(
+        update["pendingProposals"],
+        json!([{
+            "proposalId": "Create workspace: Pending projection",
+            "messageId": turn_message_id,
+        }]),
+        "live event payload: {update}"
+    );
+
+    // 2. The `agent.get` AgentLite projection serves the same list.
+    let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": agent_id })).await;
+    assert_eq!(
+        lite["agent"]["metadata"]["pendingProposals"], update["pendingProposals"],
+        "agent.get projection matches the event: {lite}"
+    );
+
+    // 3. The named message really carries the proposal resource block, so a
+    //    client can recover the full proposal from the transcript.
+    let conversation = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conversation["messages"].as_array().unwrap();
+    let carrier = messages
+        .iter()
+        .find(|m| m["id"] == turn_message_id)
+        .unwrap_or_else(|| panic!("carrier message persisted: {conversation:#}"));
+    let block = carrier["contentBlocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|block| block["type"] == "resource" && block["resource"]["mimeType"] == PROPOSAL_MIME)
+        .unwrap_or_else(|| panic!("proposal resource on the carrier: {carrier:#}"));
+    let proposal: Value =
+        serde_json::from_str(block["resource"]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        proposal["preview"]["title"], "Create workspace: Pending projection",
+        "recovered proposal identity matches the pending entry"
+    );
+
+    // 4. `agent.resolveProposal` (dismissed): the response envelope carries
+    //    `{ success, proposalId, outcome }`, the pending list empties and
+    //    the resolution persists (event + `agent.get` projection), and the
+    //    dismissal notice reaches the model as a system-origin user row
+    //    carrying the `proposal_resolved` messageMetadata.
+    let proposal_id = "Create workspace: Pending projection";
+    let resolved = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.resolveProposal",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "proposalId": proposal_id,
+            "outcome": "dismissed",
+        }),
+    )
+    .await;
+    assert_eq!(resolved["success"], true, "resolve response: {resolved}");
+    assert_eq!(resolved["proposalId"], proposal_id);
+    assert_eq!(resolved["outcome"], "dismissed");
+
+    // The resolution's `agent:updated` carries the emptied list and the
+    // outcome map.
+    let resolve_update = loop {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        if ev["type"] == "agent:updated" && ev["data"].get("proposalResolutions").is_some() {
+            break ev["data"].clone();
+        }
+    };
+    assert_eq!(resolve_update["pendingProposals"], json!([]));
+    assert_eq!(
+        resolve_update["proposalResolutions"],
+        json!({ proposal_id: "dismissed" })
+    );
+
+    // Idempotent re-resolution over the wire: success echoing the persisted
+    // outcome even when the caller asks for the other one.
+    let again = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.resolveProposal",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "proposalId": proposal_id,
+            "outcome": "applied",
+        }),
+    )
+    .await;
+    assert_eq!(again["success"], true);
+    assert_eq!(again["outcome"], "dismissed", "persisted outcome wins");
+
+    // The idle agent got the notice as an immediate turn: drain to its
+    // stream:end, then check the transcript for the notice row.
+    loop {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end"
+            && ev["data"]["agentId"].as_str() == Some(agent_id.as_str())
+        {
+            break;
+        }
+    }
+    let lite = wss_rpc(&mut rpc, 16, "agent.get", json!({ "agentId": agent_id })).await;
+    assert!(
+        lite["agent"]["metadata"].get("pendingProposals").is_none()
+            || lite["agent"]["metadata"]["pendingProposals"] == json!([]),
+        "pending list emptied in the projection: {lite}"
+    );
+    assert_eq!(
+        lite["agent"]["metadata"]["proposalResolutions"],
+        json!({ proposal_id: "dismissed" }),
+        "resolution served on agent.get: {lite}"
+    );
+    let conversation = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let notice = conversation["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| {
+            m["role"] == "user"
+                && m["metadata"]["type"] == "proposal_resolved"
+                && m["metadata"]["outcome"] == "dismissed"
+                && m["metadata"]["proposalId"] == proposal_id
+        })
+        .unwrap_or_else(|| panic!("dismissal notice persisted: {conversation:#}"))
+        .clone();
+    let notice_text = notice["contentBlocks"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        notice_text.starts_with(
+            "User dismissed the proposal 'Create workspace: Pending projection' \
+             without applying it."
+        ),
+        "notice names the proposal: {notice_text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Sub-agent gate: per-agent MCP bridge client (parse the generated
 // `intentd-mcp-*.json` and speak newline-delimited JSON-RPC to the loopback
@@ -822,7 +1272,7 @@ async fn sub_agent_question_ask_denied_over_wss() {
     };
 
     let data_dir = temp_data_dir();
-    let ws_id = seed_workspace_only(&data_dir).await;
+    let ws_id = seed_workspace_only(&data_dir, None).await;
     let behavior = json!({ "response": "done" }).to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -867,7 +1317,7 @@ async fn sub_agent_question_ask_denied_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "TopLevel", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "TopLevel", "model": "default", "provider": "mock" }),
     )
     .await;
     let top_agent = created["agent"]["id"]
@@ -913,7 +1363,7 @@ async fn sub_agent_question_ask_denied_over_wss() {
         json!({
             "workspaceId": ws_id,
             "name": "BgWorker",
-            "model": "mock:default",
+            "model": "default", "provider": "mock",
             "isBackground": true,
         }),
     )

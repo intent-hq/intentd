@@ -10,7 +10,7 @@
 /// one-line code change here.
 macro_rules! claude_agent_acp_version {
     () => {
-        "0.66.0"
+        "0.73.0"
     };
 }
 
@@ -93,6 +93,17 @@ pub enum InjectionMechanism {
     None,
 }
 
+/// How a provider's tool-removal flag consumes the tool-name list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRemovalStyle {
+    /// Flag repeated once per tool name (auggie: `--remove-tool X --remove-tool Y`).
+    Repeated,
+    /// Single flag with a comma-joined value (droid: `--disabled-tools X,Y`
+    /// — droid's list flags accept comma or space separation, comma is used
+    /// for a single argv entry).
+    CommaJoined,
+}
+
 /// Configuration for an ACP provider (port of `ACPProviderConfig`).
 ///
 /// UI-only fields from the TS interface (`ipcChannelPrefix`, `iconPath`) are
@@ -163,11 +174,18 @@ pub struct ProviderConfig {
     pub mcp_config_flag: Option<&'static str>,
     /// Flag for quiet mode (e.g., `--quiet`).
     pub quiet_flag: Option<&'static str>,
-    /// Flag for removing a provider-native tool at spawn time (e.g.
-    /// `--remove-tool`). Repeated once per tool name. `None` when the provider
-    /// exposes no equivalent knob — spawn-time tool restrictions are dropped
-    /// for that provider (MCP-side filtering, §6.8, still applies).
+    /// Flag for removing provider-native tools at spawn time (auggie
+    /// `--remove-tool`, droid `--disabled-tools`).
+    /// Emission shape is governed by [`Self::remove_tool_style`]. `None` when
+    /// the provider exposes no equivalent knob — spawn-time tool restrictions
+    /// are dropped for that provider (MCP-side filtering, §6.8, still
+    /// applies). Tool names are provider-native (each provider names its
+    /// built-in tools differently); the per-provider mapping lives in
+    /// `intent-acp`'s `tool_restrictions` module.
     pub remove_tool_flag: Option<&'static str>,
+    /// How [`Self::remove_tool_flag`] consumes the tool list (repeated flag
+    /// vs single comma-joined value). Only meaningful when the flag is set.
+    pub remove_tool_style: ToolRemovalStyle,
     /// Optional provider-specific mode-map overrides (`logical -> provider`).
     pub mode_map: Option<&'static [(&'static str, &'static str)]>,
     /// Optional filter of available models for this provider.
@@ -190,11 +208,26 @@ pub struct ProviderConfig {
     /// package via `npx -y <package>`. Only set for providers shipped as npm
     /// packages (e.g. codex's `@agentclientprotocol/codex-acp`).
     pub fallback_npx_package: Option<&'static str>,
-    /// When set, the provider is ALWAYS spawned via `npx -y <package>` with a
-    /// version pinned by us — local binary discovery (settings path, managed
-    /// bin, PATH scan) is skipped entirely, so the adapter version is under our
-    /// release cadence (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
+    /// When set, the provider is spawned via `npx -y <package>` with a
+    /// version pinned by us — auto-discovery (managed bin, PATH scan) is
+    /// skipped entirely, so the adapter version is under our release cadence
+    /// (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]). The one exception is
+    /// an explicit `providers.paths[id]` override for providers that opt in
+    /// via [`Self::npx_only_honors_path_override`].
     pub npx_only_package: Option<&'static str>,
+    /// For npx-only providers ([`Self::npx_only_package`]): whether a valid
+    /// (absolute, executable) `providers.paths[id]` override is exec'd
+    /// directly in place of the pinned npx spawn — on every surface (ACP
+    /// session spawn, discovery `installed`, one-shot / test-prompt launches,
+    /// the ACP auth fallback probe) — so users can track the adapter
+    /// themselves (intent-hq/monorepo#4352). An invalid override contributes
+    /// nothing and the pinned spawn applies. Opt-in per provider: claude-code
+    /// (a self-contained adapter). pi stays pinned-npx-only — its adapter
+    /// additionally routes through the version-gated real `pi` CLI and the
+    /// extension wrapper, and its auth probe runs the pinned package, so an
+    /// override there would advertise `installed` for a spawn that still
+    /// fails the `pi` CLI gate.
+    pub npx_only_honors_path_override: bool,
     /// When set, discovery (`discover_providers`) only reports this provider
     /// as `installed` when BOTH `command` AND this secondary CLI resolve.
     /// Unsloth rides the `opencode` binary as its ACP runtime (`command`) but
@@ -216,6 +249,23 @@ pub struct ProviderConfig {
     /// `workspace_api` tool is served a compact description and the full
     /// `ws.*` API reference is appended to the system prompt instead.
     pub truncates_tool_descriptions: bool,
+    /// When true, the keep-alive interrupt (`agent.stop` / message
+    /// preemption) tears the child process down AFTER sending the polite
+    /// `session/cancel`, instead of keeping it alive for an in-place resume.
+    /// For providers whose cancellation is unreliable (auggie leaks the
+    /// cancelled turn's subprocesses and keeps burning tokens — see
+    /// intent-hq/monorepo#2763), a live-but-wedged child is worse than a
+    /// respawn: the persisted `acpSessionId` survives the teardown, so the
+    /// next `agent.sendMessage` respawns the child and resumes the session
+    /// via the normal `session/load` ladder.
+    pub kills_child_on_interrupt: bool,
+    /// Whether the provider supports the live test-prompt probe
+    /// (`host.providerTestPrompt`): an ephemeral end-to-end ACP prompt used
+    /// by onboarding to verify the provider actually answers. `false` for
+    /// unsloth — its first prompt can trigger a very long model
+    /// download/load cycle, so a bounded probe would time out spuriously.
+    /// Antigravity also opts out because it requires a private guarded profile.
+    pub supports_test_prompt: bool,
 }
 
 impl ProviderConfig {
@@ -247,6 +297,7 @@ impl ProviderConfig {
             mcp_config_flag: None,
             quiet_flag: None,
             remove_tool_flag: None,
+            remove_tool_style: ToolRemovalStyle::Repeated,
             mode_map: None,
             supported_models: None,
             can_be_disabled: false,
@@ -258,9 +309,12 @@ impl ProviderConfig {
             login_docs_url: None,
             fallback_npx_package: None,
             npx_only_package: None,
+            npx_only_honors_path_override: false,
             requires_secondary_binary: None,
             terminal_requires_shell: false,
             truncates_tool_descriptions: false,
+            kills_child_on_interrupt: false,
+            supports_test_prompt: true,
         }
     }
 
@@ -319,6 +373,11 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         login_command_hint: Some("auggie login"),
         login_docs_url: Some("https://docs.augmentcode.com/cli/overview"),
         short_name: "Auggie",
+        // auggie's `session/cancel` is unreliable: the cancelled turn's
+        // subprocesses leak and keep consuming tokens
+        // (intent-hq/monorepo#2763), so interrupts tear the child down and
+        // the next send respawns + resumes off the persisted `acpSessionId`.
+        kills_child_on_interrupt: true,
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },
     ProviderConfig {
@@ -335,10 +394,17 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // model flag on the pinned adapter).
         supports_config_option_model: true,
         auth_check_args: Some(&["auth", "status"]),
+        // The auth-error hint must name the real `claude` CLI, not the
+        // adapter `command` the default `{command} login` would produce —
+        // "claude-agent-acp login" is not a runnable command, and
+        // desktop-app-only users need the CLI login step spelled out
+        // (intent-hq/intent#3941).
+        login_command_hint: Some("claude auth login"),
         login_docs_url: Some(
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
         ),
         npx_only_package: Some(CLAUDE_AGENT_ACP_NPX_PACKAGE),
+        npx_only_honors_path_override: true,
         short_name: "Claude Code",
         // Claude Code silently truncates MCP tool descriptions at ~2k chars
         // (anthropics/claude-code#53933): serve the compact `workspace_api`
@@ -380,6 +446,12 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         supports_config_option_model: true,
         config_option_model_strips_effort: true,
         auth_check_args: Some(&["login", "status"]),
+        // The auth-remedy hint must name the real `codex` CLI — the auth
+        // probe runs `codex login status` on it — not the adapter `command`
+        // the default `{command} login` fallback would produce
+        // ("codex-acp login" is not a runnable command; same rationale as
+        // the claude-code hint above).
+        login_command_hint: Some("codex login"),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),
         short_name: "Codex",
@@ -391,7 +463,20 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         runtime: ProviderRuntime::Electron,
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        // Hidden by default (not yet well-tested); set INTENTD_ENABLE_CORTEX
+        // in the daemon environment to re-enable (same mechanism as mock's
+        // MOCK_AGENT_SCRIPT_PATH gate).
+        requires_env_var: Some("INTENTD_ENABLE_CORTEX"),
         short_name: "Cortex",
+        // Cortex defers ALL MCP tools by default (`settings.toolSearch !==
+        // false` — default ON): a names-only reminder ("Schemas are NOT
+        // loaded in your context") replaces description text unless the
+        // model calls `tool_search`. However, this entry has NO MCP delivery
+        // channel yet (no `supports_mcp_config` / `supports_session_mcp_servers`
+        // / env config / pi extension), so the workspace bridge never reaches
+        // cortex sessions — flipping `truncates_tool_descriptions` here would
+        // inject the full ws.* reference for tools cortex cannot call. Flip it
+        // together with bridge delivery: intent-hq/monorepo#3303.
         ..ProviderConfig::empty("cortex", "Snowflake Cortex", "cortex-acp")
     },
     ProviderConfig {
@@ -421,6 +506,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // `unsloth start opencode` directly, independent of the ACP spawn.
         requires_secondary_binary: Some("unsloth"),
         short_name: "Unsloth",
+        // The first prompt can trigger a very long model download/load
+        // cycle, so the bounded `host.providerTestPrompt` probe would time
+        // out spuriously.
+        supports_test_prompt: false,
         ..ProviderConfig::empty("unsloth", "Unsloth", "opencode")
     },
     ProviderConfig {
@@ -459,7 +548,23 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // ACP request is the only spawn-scoped delivery mechanism.
         supports_session_mcp_servers: true,
         login_docs_url: Some("https://docs.factory.ai/cli/getting-started/overview"),
+        // Hidden by default (not yet well-tested); set INTENTD_ENABLE_DROID
+        // in the daemon environment to re-enable.
+        requires_env_var: Some("INTENTD_ENABLE_DROID"),
         short_name: "Droid",
+        // Defensive: droid's remote Statsig feature `mcp_tool_search` defers
+        // every non-github MCP server's tools behind a "Deferred tools:"
+        // reminder whose per-tool summary is the description's first line
+        // truncated to 200 chars — and the flag can flip server-side without
+        // a CLI update. Serve the compact `workspace_api` description and
+        // carry the full ws.* reference in the system prompt
+        // (`--append-system-prompt-file`).
+        truncates_tool_descriptions: true,
+        // Spawn-time tool stripping (§18.4): droid's `--disabled-tools` takes
+        // a comma-or-space-separated list of tool IDs; comma-joined here so
+        // it stays one argv entry (docs.factory.ai CLI reference).
+        remove_tool_flag: Some("--disabled-tools"),
+        remove_tool_style: ToolRemovalStyle::CommaJoined,
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
     ProviderConfig {
@@ -481,13 +586,43 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // in both auth states); the daemon parses that output instead of
         // using ACP `authenticate` (see `models::parse_grok_models_command_output`).
         auth_check_args: Some(&["models"]),
+        // Grok never puts MCP tools in the model's tool list
+        // (`tool_definitions_builtins_only()` filters MCP-qualified names);
+        // discovery rides its `search_tool` meta-tool, which truncates every
+        // description at 2,048 chars (`MAX_MCP_DESCRIPTION_LENGTH`). Serve
+        // the compact `workspace_api` description and carry the full ws.*
+        // reference in the system prompt (first-turn prepend).
+        truncates_tool_descriptions: true,
         login_docs_url: Some("https://docs.x.ai/build/enterprise#authentication"),
         short_name: "Grok",
         // Grok's ACP terminal adapter packs `/bin/bash -lc '…'` into `command`
         // with empty `args` (Node shell:true style). intentd argv-only spawn
         // would ENOENT that string; shell-wrap on terminal/create instead.
         terminal_requires_shell: true,
+        // No spawn-time tool stripping: grok's `--disallowed-tools` is a
+        // top-level headless-mode (`grok -p …`) flag only — it is not defined
+        // on the `agent` subcommand's args and is consumed solely by the
+        // headless single-turn path, so `agent stdio --disallowed-tools X,Y`
+        // would be rejected by clap as an unknown flag (verified against the
+        // xai-org/grok-build source: `PagerArgs.cli_disallowed_tools` vs
+        // `AgentArgs`). Orchestrator restrictions on grok are prompt-only;
+        // MCP-side filtering (§6.8) still covers workspace tools.
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
+    },
+    ProviderConfig {
+        short_name: "Antigravity",
+        can_be_disabled: true,
+        // Generic one-shot probes bypass the private Antigravity profile.
+        supports_test_prompt: false,
+        supports_config_option_model: true,
+        supports_session_mcp_servers: true,
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        auth_error_patterns: Some(&["authentication required", "intent_acp_auth_required"]),
+        login_command_hint: Some("intentd provider login antigravity"),
+        login_docs_url: Some("https://antigravity.google/docs/ide/extensions"),
+        // Saved personal OAuth is reused by session/new. Do not send the
+        // generic authenticate method "none", or map AllowAll to yolo.
+        ..ProviderConfig::empty("antigravity", "Google Antigravity", "antigravity-acp")
     },
     ProviderConfig {
         runtime: ProviderRuntime::Node,
@@ -507,9 +642,8 @@ pub fn find_provider(provider_id: &str) -> Option<&'static ProviderConfig> {
 }
 
 /// The first registered provider — a neutral positional last resort used
-/// ONLY when no settings-derived default (provider of `model.default`, else
-/// `providers.active`) is reachable. No provider carries a privileged
-/// default designation.
+/// ONLY when no settings-derived default (`model.defaultProvider`) is
+/// reachable. No provider carries a privileged default designation.
 pub(crate) fn first_provider_config() -> &'static ProviderConfig {
     ACP_PROVIDERS
         .first()
@@ -574,15 +708,26 @@ pub(crate) fn always_enabled_providers() -> Vec<&'static ProviderConfig> {
         .collect()
 }
 
-/// Build the user-facing authentication-required message for a provider,
-/// including the login command hint (`login_command_hint`, else
-/// `{command} login`). Port of `getProviderAuthErrorMessage`.
-pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
+/// The CLI login command for a provider: its catalog `login_command_hint`
+/// when set, else the generic `{command} login` fallback. Single source for
+/// every auth-remedy message ([`auth_error_message`] and the daemon's
+/// create/delegate auth gate).
+#[must_use]
+pub fn login_command(provider_id: &str) -> String {
     let config = provider_config(provider_id);
-    let login_cmd = config.login_command_hint.map_or_else(
+    config.login_command_hint.map_or_else(
         || format!("{} login", config.command),
         std::string::ToString::to_string,
-    );
+    )
+}
+
+/// Build the user-facing authentication-required message for a provider,
+/// including the login command hint ([`login_command`]). Port of
+/// `getProviderAuthErrorMessage`.
+#[must_use]
+pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
+    let config = provider_config(provider_id);
+    let login_cmd = login_command(provider_id);
 
     if is_remote {
         format!(

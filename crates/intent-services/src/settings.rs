@@ -9,7 +9,7 @@
 //! table (`intent-store`). Sensitive values (`mcp.servers`,
 //! `server.auth.token`, `sourceControl.github.token`, `linear.token`,
 //! `accounts.sentry.token`) live in the file-backed secrets
-//! store (`~/intent/secrets.json`, via [`intent_core::FileSecretStore`])
+//! store (`~/intent/.secrets.json`, via [`intent_core::FileSecretStore`])
 //! behind the [`SecretStore`] seam and are **never** returned in plaintext
 //! over the wire — list/get redact them to presence/placeholder only, and
 //! `server.auth.token` is read-only. `workspace.sshKeyPath` is a plain
@@ -61,6 +61,14 @@ pub(crate) const RETIRED_BACKGROUND_AGENT_PATHS: &[&str] = &[
     "backgroundAgents.providerSettings",
 ];
 
+/// The deprecated legacy default-provider path. Unlike the retired paths
+/// above it keeps a (read-only) catalog entry during the deprecation window,
+/// so `settings.get`/`settings.list` stay answerable — but writes via
+/// `settings.update` are tolerated-and-ignored so a client can never recreate
+/// the key after [`migrate_active_provider_setting`] removed it from
+/// `config.toml`.
+pub(crate) const DEPRECATED_ACTIVE_PROVIDER_PATH: &str = "providers.active";
+
 /// Settings path of the user-editable transcription vocabulary (§5.12).
 pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
 
@@ -91,7 +99,7 @@ pub trait SecretStore: Send + Sync {
 }
 
 /// File-backed production default: delegate to the shared
-/// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`), whose accounts
+/// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`), whose accounts
 /// are the sensitive setting paths (account = setting path).
 impl SecretStore for intent_core::FileSecretStore {
     fn load(&self, account: &str) -> Result<Option<String>> {
@@ -508,6 +516,11 @@ pub(crate) enum SettingType {
         max: Option<f64>,
     },
     String,
+    /// A single string or an array of strings (`server.bindAddress`,
+    /// monorepo#3314). Advertised as `string` on the wire so the FE keeps
+    /// rendering the common single-value form; the array shape is accepted
+    /// on write and echoed as-is on read.
+    StringOrStringArray,
     Enum(&'static [&'static str]),
     /// Structured JSON (objects or arrays), e.g. `string[]` / `mcp.servers`.
     Object,
@@ -518,7 +531,7 @@ impl SettingType {
         match self {
             SettingType::Boolean => "boolean",
             SettingType::Number { .. } => "number",
-            SettingType::String => "string",
+            SettingType::String | SettingType::StringOrStringArray => "string",
             SettingType::Enum(_) => "enum",
             SettingType::Object => "object",
         }
@@ -539,6 +552,11 @@ pub(crate) struct SettingDefinition {
     pub sensitive: bool,
     /// `server.auth.token` is read-only via the API (regenerate, not set).
     pub read_only: bool,
+    /// Approximate prompt-token cost of the feature this setting gates (e.g.
+    /// "~620 tokens/session"), rendered dimmed next to the toggle in the FE.
+    /// Measured per the token-impact methodology (chars/4 on the prompt +
+    /// tool-surface text the toggle adds); omitted from the wire when `None`.
+    pub token_impact: Option<&'static str>,
 }
 
 impl SettingDefinition {
@@ -571,7 +589,17 @@ impl SettingDefinition {
         if self.sensitive {
             m.insert("sensitive".into(), json!(true));
         }
+        if let Some(impact) = self.token_impact {
+            m.insert("tokenImpact".into(), json!(impact));
+        }
         Value::Object(m)
+    }
+
+    /// Attach an approximate token-impact annotation (`tokenImpact` on the
+    /// wire) to this definition.
+    fn with_token_impact(mut self, impact: &'static str) -> Self {
+        self.token_impact = Some(impact);
+        self
     }
 
     /// Validate `value` against this definition (type / enum / min / max).
@@ -587,6 +615,17 @@ impl SettingDefinition {
             SettingType::String => {
                 if !value.is_string() {
                     return invalid(format!("{}: expected a string", self.path));
+                }
+            }
+            SettingType::StringOrStringArray => {
+                let array_of_strings = value
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(Value::is_string));
+                if !value.is_string() && !array_of_strings {
+                    return invalid(format!(
+                        "{}: expected a string or an array of strings",
+                        self.path
+                    ));
                 }
             }
             SettingType::Object => {
@@ -629,6 +668,45 @@ pub(crate) fn find_definition(path: &str) -> Option<SettingDefinition> {
     definitions().into_iter().find(|d| d.path == path)
 }
 
+/// The model-valued settings keys whose string value must be a BARE model id
+/// (no `provider:model` compounds — the wire contract since the compound-id
+/// rejection). Object-shaped siblings (`model.providerDefaults`,
+/// `quickActions.typeOverrides`) enforce the same rule on their map values.
+const BARE_MODEL_STRING_PATHS: &[&str] = &["model.default", "quickActions.defaultModel"];
+const BARE_MODEL_MAP_PATHS: &[&str] = &["model.providerDefaults", "quickActions.typeOverrides"];
+
+/// `settings.update` guard: reject a compound `provider:model` value written
+/// to a model-valued key with `-32602`, instead of persisting a value the
+/// resolvers would then silently discard (they only accept bare ids). Blank
+/// values pass — they read as unset.
+fn validate_bare_model_id(path: &str, value: &Value) -> Result<()> {
+    let reject = |value: &str| {
+        Err(Error::InvalidParams(format!(
+            "{path}: model values must be bare model ids without ':' (got \"{value}\"); \
+             set the provider via model.defaultProvider instead"
+        )))
+    };
+    if BARE_MODEL_STRING_PATHS.contains(&path) {
+        if let Some(s) = value.as_str() {
+            if s.contains(':') {
+                return reject(s);
+            }
+        }
+    }
+    if BARE_MODEL_MAP_PATHS.contains(&path) {
+        if let Some(map) = value.as_object() {
+            for v in map.values() {
+                if let Some(s) = v.as_str() {
+                    if s.contains(':') {
+                        return reject(s);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn boolean(
     path: &'static str,
     label: &'static str,
@@ -645,6 +723,7 @@ fn boolean(
         default_value: Some(json!(default)),
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -664,6 +743,27 @@ fn string(
         default_value: default.map(|s| json!(s)),
         sensitive: false,
         read_only: false,
+        token_impact: None,
+    }
+}
+
+/// `server.bindAddress` (monorepo#3314): a single IP string (back-compat) or
+/// an array of IP strings — one listener per address, same port. Semantic
+/// validation (IP syntax, duplicates, unspecified-only-alone) happens in the
+/// typed registry schema ([`intent_core::settings_file::BindAddress`]).
+fn bind_address_definition() -> SettingDefinition {
+    SettingDefinition {
+        path: "server.bindAddress",
+        label: "Bind address",
+        description: "Address(es) the TCP listener binds: a single IP or a list of IPs \
+                      (one listener per address, same port); 0.0.0.0 exposes it on every \
+                      interface, including untrusted networks",
+        category: "server",
+        ty: SettingType::StringOrStringArray,
+        default_value: Some(json!("127.0.0.1")),
+        sensitive: false,
+        read_only: false,
+        token_impact: None,
     }
 }
 
@@ -682,6 +782,7 @@ fn secret(
         default_value: None,
         sensitive: true,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -703,6 +804,7 @@ fn number(
         default_value: Some(json!(default)),
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -793,6 +895,7 @@ fn enumerated(
         default_value: Some(json!(default)),
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -812,6 +915,7 @@ fn object(
         default_value: default,
         sensitive: false,
         read_only: false,
+        token_impact: None,
     }
 }
 
@@ -825,15 +929,31 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         "server",
     );
     server_auth_token.read_only = true;
+    let mut specialists_dir = string(
+        "specialists.dir",
+        "Specialists directory",
+        "Base specialist directory replacing the built-in set (INTENTD_SPECIALISTS_DIR startup pin or config.toml; read-only on the wire)",
+        "providers",
+        None,
+    );
+    specialists_dir.read_only = true;
+    // Deprecated: kept in the catalog so `settings.get`/`settings.list` stay
+    // answerable during the deprecation window, but read-only so no write path
+    // can recreate the key after [`migrate_active_provider_setting`] removed
+    // it from config.toml (`settings.update` tolerates-and-ignores it before
+    // the read-only rejection would fire, so old clients never fail a batch).
+    let mut providers_active = string(
+        "providers.active",
+        "Active provider (deprecated)",
+        "Deprecated: superseded by model.defaultProvider (carried over and removed from \
+         config.toml once at startup; never consulted; read-only on the wire)",
+        "providers",
+        None,
+    );
+    providers_active.read_only = true;
     vec![
         // --- Group A: providers / agents -----------------------------------
-        string(
-            "providers.active",
-            "Active provider",
-            "Default agent provider",
-            "providers",
-            None,
-        ),
+        providers_active,
         object(
             "providers.enabled",
             "Enabled providers",
@@ -859,7 +979,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         string(
             "model.default",
             "Default model",
-            "Fallback model for new agents",
+            "Fallback model for new agents (a bare model id; pair with model.defaultProvider)",
+            "providers",
+            None,
+        ),
+        string(
+            "model.defaultProvider",
+            "Default provider",
+            "Provider new agents run on when none is requested explicitly (blank means unset)",
             "providers",
             None,
         ),
@@ -905,6 +1032,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "providers",
             None,
         ),
+        specialists_dir,
         // --- Group A: workspace / git ---------------------------------------
         string(
             "workspace.branchPrefix",
@@ -1081,13 +1209,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "server",
             None,
         ),
-        string(
-            "server.bindAddress",
-            "Bind address",
-            "Address the TCP listener binds; 0.0.0.0 exposes it on every interface, including untrusted networks",
-            "server",
-            Some("127.0.0.1"),
-        ),
+        bind_address_definition(),
         number(
             "server.port",
             "WS port",
@@ -1110,6 +1232,30 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "server.wsApi.enabled",
             "WS API enabled",
             "Enable the TCP/WSS listener at runtime",
+            "server",
+            false,
+        ),
+        boolean(
+            "server.tunnel.enabled",
+            "Tunnel enabled",
+            "Run the bundled tailcat sidecar forwarding tunnel traffic to the local WSS \
+             port (requires the WSS listener to be enabled)",
+            "server",
+            false,
+        ),
+        string(
+            "server.tunnel.derpUrl",
+            "Tunnel DERP URL",
+            "Optional self-hosted DERP relay URL for the tailcat tunnel; empty uses \
+             tailcat's default relay",
+            "server",
+            None,
+        ),
+        boolean(
+            "server.tunnel.only",
+            "Tunnel only",
+            "Accept tunnel-forwarded traffic only: the WSS listener binds loopback, \
+             refusing direct LAN connections",
             "server",
             false,
         ),
@@ -1401,7 +1547,17 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             default_value: None,
             sensitive: false,
             read_only: false,
+            token_impact: None,
         },
+        number(
+            "agents.acpNodeMaxOldSpaceMb",
+            "ACP Node heap limit (MB)",
+            "V8 --max-old-space-size cap in MB injected via NODE_OPTIONS into Node/Electron ACP provider processes (applies to newly started agent processes; the INTENTD_ACP_NODE_MAX_OLD_SPACE_MB env var overrides this setting)",
+            "agents",
+            Some(f64::from(intent_core::config::ACP_NODE_MAX_OLD_SPACE_MB_MIN)),
+            Some(f64::from(intent_core::config::ACP_NODE_MAX_OLD_SPACE_MB_MAX)),
+            f64::from(intent_core::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB),
+        ),
         number(
             "agents.maxConcurrentAdapters",
             "Max concurrent one-shot adapters",
@@ -1412,6 +1568,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             f64::from(intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS),
         ),
         number(
+            "agents.maxTopLevelAgents",
+            "Max top-level agents",
+            "Cap on live top-level (parentless) agents per workspace, enforced on the top-level-create path (ws.agent.create with topLevel: true) as the runaway-spawn guard; user-created agents are never blocked by it (minimum 1; no unlimited value)",
+            "agents",
+            Some(1.0),
+            None,
+            f64::from(intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS),
+        ),
+        number(
             "agents.idleReapMinutes",
             "Idle reap minutes",
             "Minutes before an idle agent is reaped (0 disables idle reaping)",
@@ -1419,6 +1584,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(0.0),
             None,
             f64::from(intent_core::config::DEFAULT_IDLE_REAP_MINUTES),
+        ),
+        number(
+            "agents.reportToParentDebounceSeconds",
+            "Report-to-parent debounce seconds",
+            "Grace window in seconds before an ungrouped child's reportToParent wake is delivered to the parent, so a child that finishes its turn within the window produces one combined wake instead of two (0 disables the debounce — immediate wake; applies live, no restart required)",
+            "agents",
+            Some(0.0),
+            None,
+            f64::from(intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS),
         ),
         enumerated(
             "agents.flushQueuedMessages",
@@ -1435,7 +1609,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Resume interrupted agents on start",
             "Whether the daemon resumes interrupted agents at startup when --resume-all is absent: \
              auto resumes only on headless hosts (no display detected), on always resumes, \
-             off never resumes (changes apply on daemon restart)",
+             off never resumes; update-triggered restarts always resume regardless of this \
+             setting (changes apply on daemon restart)",
             "agents",
             &["auto", "on", "off"],
             "auto",
@@ -1465,83 +1640,113 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspaceApi",
             true,
         ),
+        // `tokenImpact` annotations: approximate prompt-token cost per toggle,
+        // measured on intentd main b6c4fe53 (chars/4, rounded to 2 significant
+        // digits). Re-measure when a toggle's prompt/tool surface changes.
         boolean(
             "agentFeatures.backgroundHooks",
             "Background hooks",
             "Expose background hooks (ws.hook.*) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~620 tokens/session"),
         boolean(
             "agentFeatures.hostExec",
             "Host exec",
             "Expose one-shot host command execution (ws.host.exec) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~50 tokens/session"),
         boolean(
             "agentFeatures.scripts",
             "Saved scripts",
             "Expose saved scripts (ws.script.*) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~240 tokens/session"),
         boolean(
             "agentFeatures.terminalAccess",
             "Terminal access",
             "Expose terminal read access (ws.terminal.*) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~50 tokens/session"),
         boolean(
             "agentFeatures.browserAutomation",
             "Browser automation",
             "Expose browser automation (ws.browser.*) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~50 tokens/session"),
         boolean(
             "agentFeatures.richChatBlocks",
             "Rich chat blocks",
             "Include rich chat block guidance (mermaid, ws-block, nav-link) in agent prompts; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~310 tokens/session"),
         boolean(
             "agentFeatures.structuredQuestions",
             "Structured questions",
             "Expose structured questions (ws.app.question.ask) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~180 tokens/session"),
         boolean(
             "agentFeatures.attentionRequests",
             "Attention requests",
             "Expose attention requests (ws.agent.reportBlocker / ws.agent.requestDiscussion) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~340 tokens/session"),
         boolean(
             "agentFeatures.stateSnapshot",
             "State snapshot",
             "Inject the per-turn agent state snapshot line into turn prompts; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~50 tokens/turn"),
         boolean(
             "agentFeatures.prMonitor",
             "PR monitor",
             "Expose centralized PR monitoring (ws.pr.monitor / ws.pr.unmonitor) to agents; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~290 tokens/session"),
         boolean(
             "agentFeatures.taskGraph",
             "Task graph teaching",
             "Teach agents the task-graph workflow (batch delegate, dependsOn/conflictsWith, @@@task fence attributes, unblocked-wake hints); docs/prompt only, APIs always work; applies to new sessions only",
             "agentFeatures",
             true,
-        ),
+        )
+        .with_token_impact("~170 tokens/session + variable per completion wake"),
+        boolean(
+            "agentFeatures.peerAgents",
+            "Top-level agent spawning & retirement",
+            "Expose spawning independent top-level agents (ws.agent.create with topLevel: true) and agent-initiated retirement (ws.agent.retire) to agents; applies to new sessions only",
+            "agentFeatures",
+            false,
+        )
+        .with_token_impact("~80 tokens/session"),
+        boolean(
+            "agentFeatures.mcpTools",
+            "External MCP tools",
+            "Expose external MCP server tools (ws.mcp.*) to agents; enforced server-side on every forwarded call",
+            "agentFeatures",
+            true,
+        )
+        .with_token_impact("~170 tokens/session"),
         number(
             "prMonitor.debounceSeconds",
             "PR monitor debounce seconds",
@@ -1619,6 +1824,16 @@ pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
     } else {
         n
     }
+}
+
+/// The effective `agents.reportToParentDebounceSeconds` setting: the grace
+/// window before an ungrouped child's `reportToParent` wake is delivered to
+/// the parent. `0` disables the debounce (legacy immediate wake), so the
+/// value passes through as-is — read live from the settings snapshot at each
+/// call, no restart required.
+#[must_use]
+pub fn report_to_parent_debounce_seconds(settings: &SettingsFile) -> u32 {
+    settings.agents.report_to_parent_debounce_seconds
 }
 
 /// One-time boot import of legacy `config.toml` keys back into the `SQLite`
@@ -1743,6 +1958,92 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
         tracing::info!(
             paths = ?migrated,
             "migrated legacy [backgroundAgents] into quickActions.*"
+        );
+    }
+    Ok(())
+}
+
+/// One-time boot migration of the deprecated `providers.active` OUT of
+/// `config.toml`: when the file still carries the legacy key, its value is
+/// carried over into `model.defaultProvider` (which superseded it as the
+/// default-provider key; provider resolution never consults
+/// `providers.active` anymore) and the key is removed from the file with a
+/// comment-preserving rewrite. Without the carry-over an upgraded
+/// installation whose config only carries the legacy key would derive NO
+/// default provider and get self-healed to a registry-order pick — silently
+/// switching the user's configured provider.
+///
+/// The value carries over only when it names a registered provider
+/// (whitespace-trimmed) AND `model.defaultProvider` is still unset — an
+/// already-set target always wins, and a blank or unregistered value is
+/// dropped with the key (nothing is invented). Either way the legacy key is
+/// removed and a one-time INFO log records what happened; a file without the
+/// key is never rewritten (the read path stays rewrite-free). Both writes go
+/// through [`SettingsRegistry::apply`] in one atomic batch, so the raw
+/// document, typed file, and effective snapshot stay in sync — origin
+/// tracking and `settings.reset` behave as if the key was never set.
+///
+/// # Errors
+///
+/// Never errors today: migration failures are logged and skipped (the file
+/// stays intact, so the next boot retries). The `Result` keeps parity with
+/// the other startup migrations.
+pub fn migrate_active_provider_setting(registry: &SettingsRegistry) -> Result<()> {
+    let Some(active) = registry
+        .get("providers.active")
+        .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
+    else {
+        return Ok(());
+    };
+    let target_set = registry
+        .get("model.defaultProvider")
+        .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
+        .is_some_and(|v| !v.is_empty());
+    let carried = if target_set || active.is_empty() {
+        None
+    } else {
+        intent_providers::find_provider(&active)
+            .map(|_| intent_providers::provider_config(&active).id)
+    };
+    let mut changes: Vec<(String, Value)> = Vec::with_capacity(2);
+    if let Some(canonical) = carried {
+        changes.push((
+            "model.defaultProvider".to_string(),
+            Value::String(canonical.to_string()),
+        ));
+    }
+    changes.push(("providers.active".to_string(), Value::Null));
+    if let Err(e) = registry.apply(&changes) {
+        tracing::warn!(
+            error = %e,
+            "failed to migrate deprecated providers.active out of config.toml; \
+             continuing (next boot retries)"
+        );
+        return Ok(());
+    }
+    if let Some(canonical) = carried {
+        tracing::info!(
+            provider = canonical,
+            "migrated deprecated providers.active into model.defaultProvider \
+             and removed it from config.toml"
+        );
+    } else if target_set {
+        tracing::info!(
+            value = active,
+            "removed deprecated providers.active from config.toml; the \
+             already-set model.defaultProvider wins"
+        );
+    } else if active.is_empty() {
+        tracing::info!(
+            "removed deprecated providers.active from config.toml; the value \
+             was blank, so nothing was carried over to model.defaultProvider"
+        );
+    } else {
+        tracing::info!(
+            value = active,
+            "removed deprecated providers.active from config.toml; the value \
+             names no registered provider, so nothing was carried over to \
+             model.defaultProvider"
         );
     }
     Ok(())
@@ -1896,7 +2197,7 @@ impl<'a> SettingsService<'a> {
 
     /// The wire `origin` for a TOML-backed key (`default` | `file` | `flag`),
     /// or `None` for secrets / SQLite-backed keys (no origin on the wire).
-    fn origin_for(&self, path: &str) -> Option<&'static str> {
+    pub(crate) fn origin_for(&self, path: &str) -> Option<&'static str> {
         self.registry_for(path)
             .and_then(|reg| reg.origin(path))
             .map(|o| o.as_str())
@@ -2015,7 +2316,7 @@ impl<'a> SettingsService<'a> {
     /// the already-applied registry batch is compensated (prior values
     /// restored, config.toml rewritten back) so an error return never leaves
     /// a durable file change without a `settings:changed` event. Returns the
-    /// **redacted** applied `{ path, value }` pairs for the response +
+    /// **redacted** applied `{ path, value, origin? }` pairs for the response +
     /// `settings:changed` payload.
     pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
         let entries = changes
@@ -2035,8 +2336,13 @@ impl<'a> SettingsService<'a> {
             // monorepo#1729 compatibility: pre-rename clients still write the
             // `backgroundAgents.*` paths. Same tolerate-and-ignore treatment —
             // the renamed `quickActions.*` keys are the only writable surface.
+            // The deprecated `providers.active` gets the same treatment so a
+            // write can never recreate the key `migrate_active_provider_setting`
+            // removed from config.toml (its catalog entry is read-only, but a
+            // hard rejection would fail whole batches from old clients).
             if path == RETIRED_WORKSPACE_OVERRIDES_PATH
                 || RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
+                || path == DEPRECATED_ACTIVE_PROVIDER_PATH
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
@@ -2050,8 +2356,42 @@ impl<'a> SettingsService<'a> {
                 return Err(Error::InvalidParams(format!("{path} is read-only")));
             }
             def.validate(&value)?;
+            validate_bare_model_id(path, &value)?;
             planned.push((def, value));
         }
+
+        // Keep validated entries only when persisting them would change the
+        // observable setting state. For TOML-backed keys, origin is part of
+        // that state: writing an effective default while the key is absent is
+        // a real default -> file transition, while rewriting the same file
+        // value is a no-op. Flag-pinned entries remain in the plan so the
+        // registry preserves its read-only rejection semantics.
+        let mut mutations = Vec::with_capacity(planned.len());
+        for (def, value) in planned {
+            let unchanged = if def.sensitive {
+                let desired = match &value {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
+            } else if let Some(reg) = self.registry_for(def.path) {
+                match reg.origin(def.path) {
+                    Some(SettingOrigin::File) => reg
+                        .get(def.path)
+                        .is_some_and(|current| current == registry_value(&def, &value)),
+                    Some(SettingOrigin::Flag | SettingOrigin::Default) | None => false,
+                }
+            } else {
+                match self.store.get_setting(def.path).await? {
+                    Some(raw) => serde_json::from_str::<Value>(&raw).ok().as_ref() == Some(&value),
+                    None => def.default_value.clone().unwrap_or(Value::Null) == value,
+                }
+            };
+            if !unchanged {
+                mutations.push((def, value));
+            }
+        }
+        let planned = mutations;
 
         // Apply the TOML-backed subset first, as one atomic registry batch:
         // unknown/pinned keys and typed-schema violations reject here with
@@ -2109,7 +2449,12 @@ impl<'a> SettingsService<'a> {
                 }
             };
             match persisted {
-                Ok(entry) => applied.push(entry),
+                Ok(mut entry) => {
+                    if let Some(origin) = self.origin_for(def.path) {
+                        entry["origin"] = json!(origin);
+                    }
+                    applied.push(entry);
+                }
                 Err(e) => {
                     // Compensate the registry batch: without this, the TOML
                     // subset would stay applied on disk while the caller sees
@@ -2134,20 +2479,42 @@ impl<'a> SettingsService<'a> {
 
     /// `settings.reset` → restore the default (remove the key from
     /// `config.toml` for TOML-backed keys / delete the persisted or secret
-    /// value otherwise) and return the **redacted** `{ path, value }`;
+    /// value otherwise) and return the **redacted** `{ path, value, origin? }`;
     /// unknown path → `-32602`, flag-pinned key → `-32602`.
+    #[cfg(test)]
     pub(crate) async fn reset(&self, path: &str) -> Result<Value> {
+        self.reset_with_change(path).await.map(|(result, _)| result)
+    }
+
+    pub(crate) async fn reset_with_change(&self, path: &str) -> Result<(Value, bool)> {
         let def = find_definition(path)
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
-        if def.sensitive {
-            self.secrets.delete(def.path).await?;
+        let changed = if def.sensitive {
+            if self.secrets.load(def.path).await?.is_none() {
+                false
+            } else {
+                self.secrets.delete(def.path).await?;
+                true
+            }
         } else if let Some(reg) = self.registry_for(def.path) {
-            reg.apply(&[(def.path.to_string(), Value::Null)])?;
-        } else {
+            if matches!(reg.origin(def.path), Some(SettingOrigin::Default)) {
+                false
+            } else {
+                reg.apply(&[(def.path.to_string(), Value::Null)])?;
+                true
+            }
+        } else if self.store.get_setting(def.path).await?.is_some() {
             self.store.delete_setting(def.path).await?;
-        }
+            true
+        } else {
+            false
+        };
         let value = self.current_value(&def).await;
-        Ok(json!({ "path": def.path, "value": value }))
+        let mut result = json!({ "path": def.path, "value": value });
+        if let Some(origin) = self.origin_for(def.path) {
+            result["origin"] = json!(origin);
+        }
+        Ok((result, changed))
     }
 }
 
@@ -2665,6 +3032,138 @@ mod tests {
         }
     }
 
+    /// `agents.acpNodeMaxOldSpaceMb` is a TOML-backed bounded number (default
+    /// 8192, min 1024, max 65536) whose default is the *absent* key: the
+    /// catalog advertises the default the spawn path resolves to, while the
+    /// registry reads `null` until the key is written. It persists through
+    /// `settings.update` to config.toml (never `SQLite`) and rejects
+    /// out-of-range values.
+    #[tokio::test]
+    #[allow(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
+    async fn agents_acp_node_max_old_space_mb_round_trip_via_registry() {
+        let path = "agents.acpNodeMaxOldSpaceMb";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(min),
+                max: Some(max)
+            } if min == 1024.0 && max == 65_536.0
+        ));
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert_eq!(def.label, "ACP Node heap limit (MB)");
+        assert_eq!(def.default_value, Some(json!(8192.0)));
+        assert_eq!(
+            intent_core::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB,
+            8192,
+            "catalog default must track the shipped constant"
+        );
+        assert!(
+            def.description
+                .contains("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB"),
+            "description names the env override"
+        );
+        assert!(KNOWN_PATHS.contains(&path));
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-acpheap-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-acpheap-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Absent key: `null` value with `default` origin; the catalog default
+        // is what the spawn path resolves to.
+        let got = svc.get(path).await.expect("get default");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+        assert_eq!(got["definition"]["defaultValue"], json!(8192.0));
+        assert_eq!(
+            registry
+                .snapshot()
+                .effective
+                .agents
+                .acp_node_max_old_space_mb,
+            None
+        );
+        let listed = svc.list().await.expect("list");
+        assert!(
+            listed["settings"]
+                .as_array()
+                .expect("list is an array")
+                .iter()
+                .any(|entry| entry["path"] == json!(path)),
+            "settings.list must carry the new path"
+        );
+
+        // An updated cap persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([{ "path": path, "value": 16384 }]))
+            .await
+            .expect("update to 16384");
+        let got = svc.get(path).await.expect("get updated");
+        assert_eq!(got["value"], json!(16_384.0));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("acpNodeMaxOldSpaceMb = 16384"), "{text}");
+        assert_eq!(
+            store.get_setting(path).await.expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .effective
+                .agents
+                .acp_node_max_old_space_mb,
+            Some(16_384)
+        );
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(reloaded.get(path), Some(json!(16_384)));
+
+        // Out-of-range and wrong-type values are rejected.
+        svc.update(&json!([{ "path": path, "value": 65_537 }]))
+            .await
+            .expect_err("over max must be rejected");
+        svc.update(&json!([{ "path": path, "value": 1023 }]))
+            .await
+            .expect_err("under min must be rejected");
+        svc.update(&json!([{ "path": path, "value": 0 }]))
+            .await
+            .expect_err("0 is not an off value here");
+        svc.update(&json!([{ "path": path, "value": "8192" }]))
+            .await
+            .expect_err("non-number must be rejected");
+        let got = svc.get(path).await.expect("get after rejected updates");
+        assert_eq!(
+            got["value"],
+            json!(16_384.0),
+            "rejected writes leave the value untouched"
+        );
+
+        // Reset removes the key and restores the absent default.
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], serde_json::Value::Null);
+        let got = svc.get(path).await.expect("get after reset");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("acpNodeMaxOldSpaceMb"), "{text}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
     /// The shipped idle-reap default is 10 minutes (lowered from 30,
     /// monorepo#2109) and the catalog advertises the same constant the
     /// config-file layer defaults to — the two drifting apart is exactly how
@@ -2722,6 +3221,84 @@ mod tests {
             max_concurrent_adapters(&settings),
             intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS,
             "a 0 must never reach the semaphore as an unbounded cap"
+        );
+    }
+
+    /// `agents.maxTopLevelAgents` is a TOML-backed bounded number (minimum 1,
+    /// no unlimited value, default 20) registered in `KNOWN_PATHS`, and its
+    /// catalog default matches the schema default so the FE never shows a
+    /// default the daemon does not use.
+    #[test]
+    fn max_top_level_agents_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.maxTopLevelAgents")
+            .expect("agents.maxTopLevelAgents missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(1.0),
+                max: None
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(20.0)));
+        assert_eq!(intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS, 20);
+        assert_eq!(
+            SettingsFile::default().agents.max_top_level_agents,
+            intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.maxTopLevelAgents"));
+        def.validate(&json!(1))
+            .expect("the minimum itself is legal");
+        def.validate(&json!(0))
+            .expect_err("0 must be rejected — there is no unlimited value");
+    }
+
+    /// `agents.reportToParentDebounceSeconds` is a TOML-backed number
+    /// (minimum 0 = disabled/immediate wake, no maximum, default 30)
+    /// registered in `KNOWN_PATHS`, and its catalog default matches the
+    /// schema default so the FE never shows a default the daemon does not
+    /// use.
+    #[test]
+    fn report_to_parent_debounce_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.reportToParentDebounceSeconds")
+            .expect("agents.reportToParentDebounceSeconds missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: None
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(30.0)));
+        assert_eq!(
+            intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+            30
+        );
+        assert_eq!(
+            SettingsFile::default()
+                .agents
+                .report_to_parent_debounce_seconds,
+            intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.reportToParentDebounceSeconds"));
+        def.validate(&json!(0))
+            .expect("0 is legal — it disables the debounce");
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(
+            report_to_parent_debounce_seconds(&settings),
+            intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS
+        );
+        settings.agents.report_to_parent_debounce_seconds = 0;
+        assert_eq!(
+            report_to_parent_debounce_seconds(&settings),
+            0,
+            "0 must pass through — it means disabled, not \"fall back to default\""
         );
     }
 
@@ -3174,9 +3751,10 @@ mod tests {
     }
 
     /// The `agentFeatures.*` toggles are TOML-backed booleans — all default
-    /// `true`: each has a catalog entry in the `agentFeatures` category and a
-    /// `KNOWN_PATHS` entry, and each round-trips through the registry-wired
-    /// service (default origin → file override → reset).
+    /// `true` except `peerAgents` (opt-in, default `false`): each has a
+    /// catalog entry in the `agentFeatures` category and a `KNOWN_PATHS`
+    /// entry, and each round-trips through the registry-wired service
+    /// (default origin → file override → reset).
     #[tokio::test]
     async fn agent_features_toggles_round_trip_via_registry() {
         let paths = [
@@ -3191,6 +3769,8 @@ mod tests {
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
             ("agentFeatures.taskGraph", true),
+            ("agentFeatures.peerAgents", false),
+            ("agentFeatures.mcpTools", true),
         ];
         for (path, default) in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -3257,6 +3837,54 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// Each `agentFeatures.*` toggle carries an approximate `tokenImpact`
+    /// annotation (post-shrink numbers, intentd main b6c4fe53; peerAgents
+    /// measured the same way on main d671bca9 — the condensed-description
+    /// delta of the `ws.agent.retire` doc line, chars/4) serialized as the
+    /// optional `tokenImpact` wire field; unannotated definitions omit the
+    /// key entirely.
+    #[test]
+    fn agent_features_toggles_carry_token_impact_annotations() {
+        let expected = [
+            ("agentFeatures.backgroundHooks", "~620 tokens/session"),
+            ("agentFeatures.hostExec", "~50 tokens/session"),
+            ("agentFeatures.scripts", "~240 tokens/session"),
+            ("agentFeatures.terminalAccess", "~50 tokens/session"),
+            ("agentFeatures.browserAutomation", "~50 tokens/session"),
+            ("agentFeatures.richChatBlocks", "~310 tokens/session"),
+            ("agentFeatures.structuredQuestions", "~180 tokens/session"),
+            ("agentFeatures.attentionRequests", "~340 tokens/session"),
+            ("agentFeatures.stateSnapshot", "~50 tokens/turn"),
+            ("agentFeatures.prMonitor", "~290 tokens/session"),
+            (
+                "agentFeatures.taskGraph",
+                "~170 tokens/session + variable per completion wake",
+            ),
+            ("agentFeatures.peerAgents", "~80 tokens/session"),
+        ];
+        for (path, impact) in expected {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert_eq!(def.token_impact, Some(impact), "{path} token impact");
+            assert_eq!(
+                def.definition_json()["tokenImpact"],
+                json!(impact),
+                "{path} tokenImpact wire field"
+            );
+        }
+
+        // Unannotated definitions omit the wire key entirely.
+        let plain = find_definition("workspaceApi.toonOutput").expect("toonOutput missing");
+        assert_eq!(plain.token_impact, None);
+        assert!(
+            !plain
+                .definition_json()
+                .as_object()
+                .unwrap()
+                .contains_key("tokenImpact"),
+            "unannotated definition must omit tokenImpact"
+        );
     }
 
     /// `[prMonitor]` exposes two TOML-backed numbers with a floor of 10:
@@ -3873,7 +4501,7 @@ mod tests {
         let applied = svc
             .update(&json!([
                 { "path": "backgroundAgents.defaultModel", "value": "auggie:haiku" },
-                { "path": "quickActions.defaultModel", "value": "auggie:opus" },
+                { "path": "quickActions.defaultModel", "value": "opus" },
             ]))
             .await
             .expect("mixed batch must apply its live entry");
@@ -3881,7 +4509,7 @@ mod tests {
         assert_eq!(applied[0]["path"], "quickActions.defaultModel");
         assert_eq!(
             registry.get("quickActions.defaultModel"),
-            Some(json!("auggie:opus"))
+            Some(json!("opus"))
         );
 
         let _ = std::fs::remove_file(&config_path);
@@ -4005,6 +4633,284 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// True when the TOML text still carries an `active` key line — matched
+    /// as a key assignment, not a bare substring, so fixture keys that merely
+    /// contain "active" (e.g. `interactive`) can never false-fail.
+    fn has_active_key(text: &str) -> bool {
+        text.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix("active")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+    }
+
+    /// Upgrade path: a config that predates `model.defaultProvider` and only
+    /// carries the deprecated `providers.active` has that value carried over
+    /// once at boot ([`migrate_active_provider_setting`]) AND the legacy key
+    /// removed from config.toml — provider resolution never consults the
+    /// legacy key, so without the carry-over an upgraded install would
+    /// degrade to "no default" and get self-healed to a registry-order pick
+    /// (a silent provider switch). User comments survive the rewrite, and a
+    /// second boot from the migrated file is a byte-identical no-op.
+    #[tokio::test]
+    async fn active_provider_migration_carries_legacy_value_over_and_removes_key() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-actmig-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# Operator note — must survive the migration rewrite.\n\
+             [providers]\nactive = \" codex \"\n\n[git]\nautoCommit = false\n",
+        )
+        .expect("seed legacy config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_active_provider_setting(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("model.defaultProvider"),
+            Some(json!("codex")),
+            "the trimmed legacy value must carry over"
+        );
+        assert_eq!(
+            registry.origin("model.defaultProvider"),
+            Some(SettingOrigin::File),
+            "the carried-over value is persisted to the file layer"
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read migrated config");
+        assert!(
+            !has_active_key(&text),
+            "providers.active must be removed from the file: {text}"
+        );
+        assert!(
+            text.contains("defaultProvider = \"codex\""),
+            "the carried-over value must be written to the file: {text}"
+        );
+        assert!(
+            text.contains("# Operator note — must survive the migration rewrite."),
+            "user comments must survive the migration rewrite: {text}"
+        );
+        assert!(
+            text.contains("autoCommit = false"),
+            "untouched keys must survive the migration rewrite: {text}"
+        );
+
+        // Next boot from the migrated file: no key → no rewrite, byte-identical.
+        let registry2 = SettingsRegistry::load(&config_path).expect("reload registry");
+        migrate_active_provider_setting(&registry2).expect("migrate again");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("re-read config"),
+            text,
+            "a file without the legacy key is never rewritten"
+        );
+        assert_eq!(registry2.get("model.defaultProvider"), Some(json!("codex")));
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// The migration removes `providers.active` from the file in every case,
+    /// but never clobbers an already-set `model.defaultProvider` and never
+    /// carries over an unregistered value — nothing is invented, and the
+    /// removed key stays gone across reloads (no resurrection via
+    /// `settings.reset`-style Null applies either).
+    #[tokio::test]
+    async fn active_provider_migration_removes_key_without_inventing_values() {
+        let tag = uuid::Uuid::new_v4();
+
+        // Both keys set: the target wins; the legacy key is still removed.
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-actkeep-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[providers]\nactive = \"codex\"\n\n[model]\ndefaultProvider = \"claude-code\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        migrate_active_provider_setting(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("model.defaultProvider"),
+            Some(json!("claude-code")),
+            "a set model.defaultProvider must win over the legacy key"
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            !has_active_key(&text),
+            "the legacy key is removed even when the target is set: {text}"
+        );
+        assert!(text.contains("defaultProvider = \"claude-code\""), "{text}");
+        // A fresh load of the rewritten file agrees: the key is gone for good.
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(
+            reloaded.origin("providers.active"),
+            Some(SettingOrigin::Default),
+            "the removed key must not resurrect on reload"
+        );
+        // settings.reset-style Null apply on the migrated key is a clean no-op
+        // (the doc no longer carries it), not a resurrection.
+        reloaded
+            .apply(&[("providers.active".into(), Value::Null)])
+            .expect("reset after migration");
+        assert_eq!(
+            reloaded.origin("providers.active"),
+            Some(SettingOrigin::Default)
+        );
+        let _ = std::fs::remove_file(&config_path);
+
+        // Unregistered value: dropped with the key, nothing carried over.
+        let config_path2 = std::env::temp_dir().join(format!("intentd-settings-actbad-{tag}.toml"));
+        std::fs::write(&config_path2, "[providers]\nactive = \"not-a-provider\"\n")
+            .expect("seed config");
+        let registry2 = SettingsRegistry::load(&config_path2).expect("load registry");
+        migrate_active_provider_setting(&registry2).expect("migrate");
+        assert_eq!(
+            registry2.origin("model.defaultProvider"),
+            Some(SettingOrigin::Default),
+            "an unregistered legacy value must not carry over"
+        );
+        let text2 = std::fs::read_to_string(&config_path2).expect("read config");
+        assert!(
+            !has_active_key(&text2),
+            "an unregistered legacy value is still removed from the file: {text2}"
+        );
+        let _ = std::fs::remove_file(&config_path2);
+
+        // No legacy key at all: nothing to do, file untouched byte-for-byte.
+        let config_path3 =
+            std::env::temp_dir().join(format!("intentd-settings-actnone-{tag}.toml"));
+        let seed = "# comment only\n[git]\nautoCommit = true\n";
+        std::fs::write(&config_path3, seed).expect("seed config");
+        let registry3 = SettingsRegistry::load(&config_path3).expect("load registry");
+        migrate_active_provider_setting(&registry3).expect("migrate");
+        assert_eq!(
+            registry3.origin("model.defaultProvider"),
+            Some(SettingOrigin::Default)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path3).expect("re-read config"),
+            seed,
+            "a file without the legacy key is never rewritten"
+        );
+        let _ = std::fs::remove_file(&config_path3);
+    }
+
+    /// The deprecated `providers.active` cannot be recreated through the
+    /// settings API after the boot migration removed it: the catalog entry is
+    /// read-only, and `settings.update` tolerates-and-ignores writes to it
+    /// (nothing validated, persisted, echoed, or published) so an old client's
+    /// batch never fails wholesale — mirroring the retired-path treatment.
+    #[tokio::test]
+    async fn active_provider_update_is_tolerated_and_ignored() {
+        let def = find_definition(DEPRECATED_ACTIVE_PROVIDER_PATH)
+            .expect("providers.active must stay in the catalog during deprecation");
+        assert!(
+            def.read_only,
+            "providers.active must be read-only so no write path recreates it"
+        );
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-actwrite-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-actwrite-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // A lone legacy write is ignored: nothing applied, nothing persisted.
+        let applied = svc
+            .update(&json!([
+                { "path": "providers.active", "value": "codex" },
+            ]))
+            .await
+            .expect("legacy providers.active write must be tolerated");
+        assert_eq!(applied, Vec::<Value>::new());
+        assert_eq!(
+            registry.origin("providers.active"),
+            Some(SettingOrigin::Default),
+            "the ignored write must not resurrect the key"
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!has_active_key(&text), "{text}");
+
+        // A batch mixing the legacy path with a live one still applies the
+        // live entry instead of failing wholesale.
+        let applied = svc
+            .update(&json!([
+                { "path": "providers.active", "value": "codex" },
+                { "path": "model.defaultProvider", "value": "codex" },
+            ]))
+            .await
+            .expect("mixed batch must apply its live entry");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["path"], "model.defaultProvider");
+        assert_eq!(registry.get("model.defaultProvider"), Some(json!("codex")));
+
+        // The catalog entry keeps get/reset answerable during deprecation.
+        let got = svc.get("providers.active").await.expect("get");
+        assert_eq!(got["origin"], json!("default"));
+        svc.reset("providers.active").await.expect("reset");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `settings.update` rejects compound `provider:model` values on the
+    /// model-valued keys with `-32602` (string keys and the map values of the
+    /// object-shaped ones) instead of persisting a value the resolvers would
+    /// silently discard; bare ids and blank values still pass.
+    #[tokio::test]
+    async fn update_rejects_compound_model_values() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-baremdl-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-baremdl-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        for (path, value) in [
+            ("model.default", json!("codex:gpt-5")),
+            ("quickActions.defaultModel", json!("auggie:haiku")),
+            ("model.providerDefaults", json!({ "codex": "codex:gpt-5" })),
+            (
+                "quickActions.typeOverrides",
+                json!({ "commit": "auggie:fast" }),
+            ),
+        ] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("compound model value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path}, got {err:?}"
+            );
+        }
+
+        // Bare ids and blanks pass; the map shape accepts bare values.
+        svc.update(&json!([
+            { "path": "model.default", "value": "gpt-5" },
+            { "path": "quickActions.defaultModel", "value": "" },
+            { "path": "model.providerDefaults", "value": { "codex": "gpt-5" } },
+        ]))
+        .await
+        .expect("bare values must pass");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// [`cleanup_retired_settings`] deletes the stale `SQLite` row left behind

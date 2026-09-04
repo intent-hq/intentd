@@ -21,10 +21,11 @@ use intent_services::{
 };
 use intent_store::Store;
 use intent_transport::{
-    collect_local_ips, detect_has_display, ensure_tls_certificate, get_or_create_token,
-    local_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore,
-    PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer,
-    WsOptions,
+    advertised_hosts, collect_local_ips, collect_local_ipv6s, detect_has_display,
+    detect_host_environment, ensure_tls_certificate, get_or_create_token, local_hostname,
+    pretty_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore,
+    HostEnvironment, PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore,
+    WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -33,8 +34,10 @@ mod client;
 mod git_credential;
 mod import;
 mod legacy_import;
+mod provider;
 mod rpc_profile;
 mod suspend;
+mod tunnel;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -51,6 +54,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Provider authentication and internal ACP launch helpers.
+    Provider {
+        #[command(subcommand)]
+        command: provider::ProviderCommand,
+    },
     /// Start the daemon and serve JSON-RPC. The UDS listener always serves;
     /// the HTTPS+WSS listener (0.0.0.0, port from `server.wsApi.port` /
     /// `INTENTD_TCP_PORT`, default 5181) boot-starts iff the effective
@@ -74,6 +82,14 @@ enum Command {
         /// startup instead of waiting for `agent.resolveInterrupted` RPC.
         #[arg(long)]
         resume_all: bool,
+        /// Replace the base specialist tier with this directory: the embedded
+        /// bundle and the bundled `resources/specialists/` directory are
+        /// excluded and only specialists present here (plus user/project
+        /// overrides) exist. Also enabled by `INTENTD_SPECIALISTS_DIR`; the
+        /// flag wins. Pins the `specialists.dir` setting for the process
+        /// lifetime.
+        #[arg(long)]
+        specialists_dir: Option<std::path::PathBuf>,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -164,8 +180,9 @@ enum Command {
     /// are disabled, offers to enable them on the spot (persisting
     /// `server.wsApi.enabled = true` via `settings.update`, which also starts
     /// the listener) — interactively via a [Y/n] prompt followed by a
-    /// bind-address picker (persisted to `server.bindAddress`), or unattended
-    /// with `--yes` (keeps the persisted bind address; default loopback);
+    /// multi-select bind-address picker (persisted to `server.bindAddress`:
+    /// a single IP as a string, several as a list), or unattended with
+    /// `--yes` (keeps the persisted bind address; default loopback);
     /// non-interactive runs without `--yes` refuse instead.
     Pair {
         /// Also write the QR code as a PNG image to this path.
@@ -178,6 +195,14 @@ enum Command {
         /// disabled (persists `server.wsApi.enabled = true`).
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Re-run ONLY the endpoint selection: show the bind-address
+        /// multi-select pre-checked from the persisted `server.bindAddress`,
+        /// persist the new set via `settings.update`, and report the
+        /// effective posture. Never re-pairs (no new token, no QR); requires
+        /// a running daemon. Reads the selection from stdin (one line), so
+        /// it also works piped.
+        #[arg(long, conflicts_with_all = ["png", "svg", "yes", "rotate"])]
+        select_endpoints: bool,
         /// Mint and persist a NEW bearer token (replacing the old one) before
         /// printing, via `server.rotateToken` — only after the listener is
         /// confirmed up, so a declined enable prompt never invalidates
@@ -212,11 +237,46 @@ enum Command {
     },
 }
 
+fn main() -> ExitCode {
+    // Capture-and-scrub the sitter's update-restart marker before the tokio
+    // runtime starts (still single-threaded here, where `env::remove_var` is
+    // sound): the daemon's environment is inherited by every subprocess it
+    // spawns (agent tool shells, etc.), so a leaked marker would make a
+    // nested `intentd serve` launched from such a subprocess falsely force
+    // the resume sweep.
+    UPDATE_RESTART.store(
+        env_flag(UPDATE_RESTART_ENV),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    std::env::remove_var(UPDATE_RESTART_ENV);
+    // Parse the CLI here too — before the tokio runtime — so `serve
+    // --specialists-dir` can fold into INTENTD_SPECIALISTS_DIR while
+    // `env::set_var` is still sound (the flag wins over an inherited env
+    // value). The env var is the single seam `apply_startup_pins` and the
+    // specialists service read.
+    let cli = Cli::parse();
+    if let Command::Serve {
+        specialists_dir: Some(dir),
+        ..
+    } = &cli.command
+    {
+        std::env::set_var("INTENTD_SPECIALISTS_DIR", dir);
+    }
+    async_main(cli)
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn async_main(cli: Cli) -> ExitCode {
+    let command = match cli.command {
+        Command::Provider { command } if command.is_internal_helper() => {
+            // These subprocesses only emit a policy decision or safe auth
+            // signal. Do not initialize file logging or touch daemon state.
+            return provider::run(command).await;
+        }
+        command => command,
+    };
     init_tracing();
     install_panic_hook();
-    let cli = Cli::parse();
     // Rust starts with SIGPIPE ignored, so `println!` to a pipe whose reader
     // closed early (`intentd status | head`) gets EPIPE and panics — and the
     // panic hook logs an ERROR backtrace, making a routine shell pipeline
@@ -227,17 +287,17 @@ async fn main() -> ExitCode {
     // daemon's clients, the MCP bridge) must keep surfacing EPIPE as plain
     // errors — e.g. `stop` falls back to SIGTERM/SIGKILL escalation when the
     // control RPC fails — rather than kill the process mid-write.
-    if !matches!(
-        cli.command,
-        Command::Serve { .. } | Command::McpBridge { .. }
-    ) {
+    if !matches!(command, Command::Serve { .. } | Command::McpBridge { .. }) {
         ONE_SHOT_CLI.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    match cli.command {
+    match command {
+        Command::Provider { command } => provider::run(command).await,
         Command::Serve {
             mode,
             insecure,
             resume_all,
+            // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
+            specialists_dir: _,
         } => to_exit(cmd_serve(mode.as_deref(), insecure, resume_all).await),
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
@@ -273,8 +333,15 @@ async fn main() -> ExitCode {
             png,
             svg,
             yes,
+            select_endpoints,
             rotate,
-        } => to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate).await),
+        } => {
+            if select_endpoints {
+                to_exit(cmd_pair_select_endpoints().await)
+            } else {
+                to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate).await)
+            }
+        }
         Command::GitCredential { operation } => cmd_git_credential(&operation).await,
         #[cfg(feature = "js-engine")]
         Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
@@ -363,22 +430,35 @@ fn confirm_enable_wss() -> anyhow::Result<bool> {
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
 }
 
+/// The `settings.update` value for a bind-address selection: the single IP
+/// as a plain string, several as a string array — matching the
+/// string-or-array `server.bindAddress` shape (monorepo#3314). Pure so the
+/// persisted shape is unit-testable.
+fn bind_addresses_value(addrs: &[std::net::IpAddr]) -> serde_json::Value {
+    if addrs.len() == 1 {
+        json!(addrs[0].to_string())
+    } else {
+        json!(addrs
+            .iter()
+            .map(std::net::IpAddr::to_string)
+            .collect::<Vec<_>>())
+    }
+}
+
 /// Enable external connections via `settings.update` over UDS: persists
 /// `server.wsApi.enabled = true` to config.toml and starts the WSS listener
 /// through the server-control hooks — the same path the FE settings UI uses.
-/// When `bind_address` is `Some` (the interactive picker's choice), it is
-/// persisted to `server.bindAddress` in the SAME batch; the hook ordering
-/// applies value keys before the enable, so the listener starts on the chosen
-/// address. `None` (unattended `--yes` / already-set config) leaves the
-/// persisted value untouched.
+/// `extra_changes` carries the interactive picker's settings writes
+/// (`server.bindAddress`, `server.tunnel.enabled`, `server.tunnel.only` — see
+/// [`listen_selection_changes`]), persisted in the SAME batch; the hook
+/// ordering applies value keys before the enable, so the listener starts on
+/// the chosen address(es). Empty (unattended `--yes` / unchanged selection)
+/// leaves the persisted values untouched.
 async fn enable_wss_listener(
     socket: &Path,
-    bind_address: Option<std::net::IpAddr>,
+    extra_changes: &[serde_json::Value],
 ) -> anyhow::Result<()> {
-    let mut changes = Vec::new();
-    if let Some(addr) = bind_address {
-        changes.push(json!({ "path": "server.bindAddress", "value": addr.to_string() }));
-    }
+    let mut changes = extra_changes.to_vec();
     changes.push(json!({ "path": "server.wsApi.enabled", "value": true }));
     let response = rpc_call(socket, "settings.update", json!({ "changes": changes })).await?;
     if let Some(error) = response.get("error") {
@@ -387,13 +467,18 @@ async fn enable_wss_listener(
             rpc_error_text(error)
         );
     }
-    // Name the address the listener now binds so an unattended run still
+    // Name the address(es) the listener now binds so an unattended run still
     // reports the effective posture (default: loopback) and how to widen it.
-    let effective = match bind_address {
-        Some(addr) => addr.to_string(),
-        None => current_bind_address(socket)
+    // The list form (monorepo#3314) is reported in full, comma-separated.
+    let batch_bind = extra_changes
+        .iter()
+        .find(|c| c["path"] == "server.bindAddress")
+        .and_then(|c| bind_value_display(&c["value"]));
+    let effective = match batch_bind {
+        Some(display) => display,
+        None => current_bind_addresses_display(socket)
             .await
-            .map_or_else(|| "127.0.0.1".to_string(), |a| a.to_string()),
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
     };
     eprintln!(
         "External connections enabled — other Intent apps can now pair with this \
@@ -401,12 +486,38 @@ async fn enable_wss_listener(
          on {effective} — change it via server.bindAddress in config.toml or the \
          settings UI)."
     );
+    if extra_changes
+        .iter()
+        .any(|c| c["path"] == "server.tunnel.enabled" && c["value"] == json!(true))
+    {
+        eprintln!(
+            "Tailcat tunnel enabled (server.tunnel.enabled = true) — the tc address \
+             appears in pairing output once the tunnel is up."
+        );
+    }
     Ok(())
 }
 
-/// Read the effective `server.bindAddress` over UDS; `None` when the RPC
-/// fails or the value is not a parseable IP (callers fall back to loopback).
-async fn current_bind_address(socket: &Path) -> Option<std::net::IpAddr> {
+/// Display form of a `server.bindAddress` settings value: a string as-is,
+/// the list form (monorepo#3314) joined with ", ". `None` for other shapes.
+fn bind_value_display(value: &serde_json::Value) -> Option<String> {
+    if let Some(raw) = value.as_str() {
+        return Some(raw.to_string());
+    }
+    let entries: Vec<&str> = value
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(entries.join(", "))
+}
+
+/// Read the raw effective `server.bindAddress` value over UDS; `None` when
+/// the RPC fails (callers fall back to loopback).
+async fn current_bind_address_value(socket: &Path) -> Option<serde_json::Value> {
     let response = rpc_call(
         socket,
         "settings.get",
@@ -414,7 +525,50 @@ async fn current_bind_address(socket: &Path) -> Option<std::net::IpAddr> {
     )
     .await
     .ok()?;
-    response["result"]["value"].as_str()?.parse().ok()
+    let value = response["result"]["value"].clone();
+    (!value.is_null()).then_some(value)
+}
+
+/// The effective `server.bindAddress` as a parsed address set: a string
+/// value yields one entry, the list form (monorepo#3314) all of them, in
+/// stored order. Entries are canonicalized (v4-mapped IPv6 → IPv4) to match
+/// the daemon-side `BindAddress::resolve`, so a persisted `::ffff:x.y.z.w`
+/// compares equal to its enumerated IPv4 twin instead of showing up as a
+/// duplicate picker entry. Empty when the RPC fails or nothing parses
+/// (callers treat that as "default: loopback").
+async fn current_bind_addresses(socket: &Path) -> Vec<std::net::IpAddr> {
+    let Some(value) = current_bind_address_value(socket).await else {
+        return Vec::new();
+    };
+    let raw_entries: Vec<&str> = match &value {
+        serde_json::Value::String(raw) => vec![raw.as_str()],
+        serde_json::Value::Array(entries) => entries.iter().filter_map(|v| v.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    raw_entries
+        .iter()
+        .filter_map(|raw| raw.parse::<std::net::IpAddr>().ok())
+        .map(|addr| addr.to_canonical())
+        .collect()
+}
+
+/// Display form of the effective `server.bindAddress` for user-facing
+/// output: a single IP as-is, the list form (monorepo#3314) joined with
+/// ", " so every bound address is reported, not just the first.
+async fn current_bind_addresses_display(socket: &Path) -> Option<String> {
+    let value = current_bind_address_value(socket).await?;
+    if let Some(raw) = value.as_str() {
+        return Some(raw.to_string());
+    }
+    let entries: Vec<&str> = value
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(entries.join(", "))
 }
 
 /// One selectable entry in the `intentd pair` bind-address picker.
@@ -423,33 +577,40 @@ struct BindChoice {
     addr: std::net::IpAddr,
 }
 
-/// Build the picker entries from the enumerated `(interface, IPv4)` pairs
-/// (loopback first, per [`intent_transport::collect_bind_interfaces`]), then
-/// an explicit all-interfaces `0.0.0.0` entry carrying its exposure warning.
-/// A loopback entry is always present (synthesized when enumeration found
-/// none) so the first — and thus default — choice is never the wide bind.
-/// Pure over its input so the list shape is unit-testable.
+/// The loopback guarantee: the WSS listener always binds `127.0.0.1` in
+/// addition to the configured `server.bindAddress` set — local clients and
+/// the tailcat sidecar (which forwards tunnel traffic to `127.0.0.1`) must
+/// reach the daemon no matter which endpoints were selected. Appends the
+/// IPv4 loopback unless the set already carries it or an unspecified
+/// address (`0.0.0.0` / `::` — the `::` listener is bound dual-stack, so it
+/// covers `127.0.0.1` too). Applied at listener composition time only (boot
+/// and `start_ws_listener`); the persisted setting is left untouched. Pure
+/// so the matrix is unit-testable.
+fn ensure_loopback_bind(addrs: &mut Vec<std::net::IpAddr>) {
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    if !addrs.iter().any(|a| a.is_unspecified() || *a == loopback) {
+        addrs.push(loopback);
+    }
+}
+
+/// Build the picker entries from the enumerated `(interface, IPv4)` pairs:
+/// the non-loopback addresses (per
+/// [`intent_transport::collect_bind_interfaces`]), then an explicit
+/// all-interfaces `0.0.0.0` entry carrying its exposure warning. Loopback is
+/// NOT offered: the daemon binds `127.0.0.1` unconditionally
+/// ([`ensure_loopback_bind`]), so the picker chooses only the ADDITIONAL
+/// endpoints — and with nothing pre-checked for an empty/loopback-only
+/// persisted set ([`listen_default_indices`]), the default is never the
+/// wide bind. Pure over its input so the list shape is unit-testable.
 fn build_bind_choices(interfaces: &[(String, std::net::Ipv4Addr)]) -> Vec<BindChoice> {
     let mut choices: Vec<BindChoice> = interfaces
         .iter()
+        .filter(|(_, ip)| !ip.is_loopback())
         .map(|(name, ip)| BindChoice {
-            label: if ip.is_loopback() {
-                format!("{ip} ({name}) — this machine only (loopback)")
-            } else {
-                format!("{ip} ({name})")
-            },
+            label: format!("{ip} ({name})"),
             addr: std::net::IpAddr::V4(*ip),
         })
         .collect();
-    if !choices.iter().any(|c| c.addr.is_loopback()) {
-        choices.insert(
-            0,
-            BindChoice {
-                label: "127.0.0.1 — this machine only (loopback)".to_string(),
-                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            },
-        );
-    }
     choices.push(BindChoice {
         label: "0.0.0.0 — ALL interfaces; exposed to every network this machine is on, \
                 including the internet"
@@ -459,45 +620,326 @@ fn build_bind_choices(interfaces: &[(String, std::net::Ipv4Addr)]) -> Vec<BindCh
     choices
 }
 
-/// Parse one line of picker input into a 0-based choice index: empty (plain
-/// Enter) selects `default_index`, otherwise a 1-based number within range;
-/// anything else is `None` (re-prompt).
-fn parse_bind_choice(input: &str, count: usize, default_index: usize) -> Option<usize> {
-    let t = input.trim();
-    if t.is_empty() {
-        return Some(default_index);
+/// Insert persisted `server.bindAddress` entries that match no enumerated
+/// choice (e.g. a tailnet IP whose interface was not discovered, or an IPv6
+/// address) ahead of the all-interfaces entry, labeled as currently
+/// configured — so the multi-select can always pre-check the persisted set
+/// faithfully. Exactly `127.0.0.1` is skipped: that is the one address the
+/// daemon binds unconditionally ([`ensure_loopback_bind`]), so an explicit
+/// selection persisted by older versions never resurrects its row. Other
+/// loopback addresses (`::1`, `127.0.0.2`) are NOT covered by the guarantee
+/// and keep their currently-configured rows — dropping them from the picker
+/// would make Enter rewrite the setting and silently remove their
+/// listeners. Pure so the merged list shape is unit-testable.
+fn merge_current_into_bind_choices(
+    mut choices: Vec<BindChoice>,
+    current: &[std::net::IpAddr],
+) -> Vec<BindChoice> {
+    let unconditional = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    for addr in current {
+        if *addr == unconditional || choices.iter().any(|c| c.addr == *addr) {
+            continue;
+        }
+        // Keep the exclusive all-interfaces entry last.
+        let insert_at = choices
+            .iter()
+            .position(|c| c.addr.is_unspecified())
+            .unwrap_or(choices.len());
+        choices.insert(
+            insert_at,
+            BindChoice {
+                label: format!("{addr} (currently configured)"),
+                addr: *addr,
+            },
+        );
     }
-    match t.parse::<usize>() {
-        Ok(n) if (1..=count).contains(&n) => Some(n - 1),
-        _ => None,
-    }
+    choices
 }
 
-/// Interactive bind-address picker shown right after the user consents to
-/// enabling external connections: lists this machine's interfaces plus the
-/// explicit all-interfaces option and returns the chosen address. `current`
-/// (the effective `server.bindAddress`) selects the default entry; when it
-/// matches no entry the default is the first (loopback).
-fn prompt_bind_address(current: Option<std::net::IpAddr>) -> anyhow::Result<std::net::IpAddr> {
-    use std::io::{BufRead, Write};
-    let choices = build_bind_choices(&intent_transport::collect_bind_interfaces());
-    let default_index = current
-        .and_then(|cur| choices.iter().position(|c| c.addr == cur))
-        .unwrap_or(0);
-    eprintln!("Which address should the daemon accept connections on?");
-    for (i, choice) in choices.iter().enumerate() {
-        eprintln!("  {}) {}", i + 1, choice.label);
+/// Parse one line of multi-select picker input into 0-based choice indices:
+/// empty (plain Enter) keeps `default_set`; `none` (case-insensitive, alone)
+/// is the explicit empty selection — no additional endpoints, loopback-only
+/// bind; otherwise 1-based numbers separated by commas and/or whitespace,
+/// deduplicated in input order. `Err` carries the re-prompt message (bad
+/// token / out of range / empty selection).
+fn parse_bind_multi_selection(
+    input: &str,
+    count: usize,
+    default_set: &[usize],
+) -> Result<Vec<usize>, String> {
+    let t = input.trim();
+    if t.is_empty() {
+        return Ok(default_set.to_vec());
     }
+    if t.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+    let mut indices = Vec::new();
+    for token in t.split(|c: char| c == ',' || c.is_whitespace()) {
+        if token.is_empty() {
+            continue;
+        }
+        match token.parse::<usize>() {
+            Ok(n) if (1..=count).contains(&n) => {
+                if !indices.contains(&(n - 1)) {
+                    indices.push(n - 1);
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "enter numbers between 1 and {count}, separated by commas, \
+                     or 'none' (got {token:?})"
+                ))
+            }
+        }
+    }
+    if indices.is_empty() {
+        return Err("select at least one number, or 'none' for loopback only".to_string());
+    }
+    Ok(indices)
+}
+
+/// Map selected picker indices to their addresses, enforcing the exclusive
+/// all-interfaces semantics: an unspecified address (`0.0.0.0`) cannot be
+/// combined with specific IPs — matching the `server.bindAddress` validation
+/// (monorepo#3314). `Err` carries the re-prompt message.
+fn resolve_bind_selection(
+    choices: &[BindChoice],
+    indices: &[usize],
+) -> Result<Vec<std::net::IpAddr>, String> {
+    let addrs: Vec<std::net::IpAddr> = indices.iter().map(|&i| choices[i].addr).collect();
+    if addrs.len() > 1 {
+        if let Some(wide) = addrs.iter().find(|a| a.is_unspecified()) {
+            return Err(format!(
+                "{wide} (all interfaces) already covers every address — select it alone"
+            ));
+        }
+    }
+    Ok(addrs)
+}
+
+/// Order-insensitive equality of two address sets (both deduplicated by
+/// construction: picker selections are deduped, persisted sets are validated
+/// duplicate-free).
+fn same_addr_set(a: &[std::net::IpAddr], b: &[std::net::IpAddr]) -> bool {
+    a.len() == b.len() && a.iter().all(|addr| b.contains(addr))
+}
+
+/// The `intentd pair` picker result: the chosen bind address set plus
+/// whether the tailcat tunnel target was selected.
+struct ListenSelection {
+    addresses: Vec<std::net::IpAddr>,
+    tailcat: bool,
+}
+
+/// Label for the tailcat tunnel picker entry (always appended after the
+/// address entries).
+const TAILCAT_CHOICE_LABEL: &str =
+    "Tailcat tunnel — stable tc… address, reachable from other networks (server.tunnel.*)";
+
+/// One-line context printed under the tailcat picker entry: what the tunnel
+/// provides plus the upstream project URL.
+const TAILCAT_CHOICE_NOTE: &str =
+    "Secure, encrypted traffic between your devices — https://github.com/tailscale/tailcat";
+
+/// Map selected picker indices — over the address `choices` plus the
+/// trailing tailcat entry at index `choices.len()` — to a
+/// [`ListenSelection`]. The exclusive all-interfaces rule applies among the
+/// address entries only ([`resolve_bind_selection`]); the tailcat entry
+/// combines with any address set. `Err` carries the re-prompt message.
+fn resolve_listen_selection(
+    choices: &[BindChoice],
+    indices: &[usize],
+) -> Result<ListenSelection, String> {
+    let tailcat = indices.contains(&choices.len());
+    let addr_indices: Vec<usize> = indices
+        .iter()
+        .copied()
+        .filter(|&i| i < choices.len())
+        .collect();
+    let addresses = resolve_bind_selection(choices, &addr_indices)?;
+    Ok(ListenSelection { addresses, tailcat })
+}
+
+/// Map the picker selection to the `settings.update` changes it implies,
+/// diffed against the current state so unchanged values are not rewritten:
+/// - the chosen addresses → `server.bindAddress` (a tailcat-only selection
+///   pins loopback explicitly, so a later `server.tunnel.only = false` never
+///   resurrects a stale wide bind); a persisted `127.0.0.1` — whose picker
+///   row is gone (always bound) — is carried forward into any selection it
+///   can legally join, so Enter on a mixed set never rewrites the setting;
+/// - tailcat selected ⇔ `server.tunnel.enabled`;
+/// - ONLY tailcat selected ⇔ `server.tunnel.only`.
+///
+/// Value keys precede `server.tunnel.enabled` so the daemon-side apply hooks
+/// see them first; the caller ([`enable_wss_listener`]) appends
+/// `server.wsApi.enabled` last. Pure so the mapping is unit-testable.
+fn listen_selection_changes(
+    selection: &ListenSelection,
+    current_addrs: &[std::net::IpAddr],
+    tunnel_enabled: bool,
+    tunnel_only: bool,
+) -> Vec<serde_json::Value> {
+    let mut changes = Vec::new();
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let mut effective_addrs = selection.addresses.clone();
+    // The picker no longer surfaces the unconditionally bound 127.0.0.1, so
+    // a persisted entry (mixed sets like [127.0.0.1, lan] written by older
+    // versions) is carried forward — otherwise Enter would diff non-empty,
+    // rewrite the setting, and restart the listener. Skipped for the
+    // exclusive all-interfaces selection, which cannot combine with specific
+    // IPs (the server.bindAddress validation).
+    if current_addrs.contains(&loopback)
+        && !effective_addrs.contains(&loopback)
+        && !effective_addrs.iter().any(std::net::IpAddr::is_unspecified)
+    {
+        effective_addrs.push(loopback);
+    }
+    // `none` / tunnel-only: no additional endpoints — pin loopback alone.
+    if effective_addrs.is_empty() {
+        effective_addrs.push(loopback);
+    }
+    if !same_addr_set(&effective_addrs, current_addrs) {
+        changes.push(json!({
+            "path": "server.bindAddress",
+            "value": bind_addresses_value(&effective_addrs),
+        }));
+    }
+    // With the loopback row gone, an empty-addresses + tailcat selection is
+    // ambiguous: it is the tunnel-only posture, but ALSO the picker default
+    // for a "127.0.0.1 bind + tunnel enabled" state (whose loopback address
+    // pre-checks nothing). When the selection merely re-states the current
+    // state — same effective addresses, same tunnel switch — keep the
+    // current flag, so Enter never silently flips server.tunnel.only; an
+    // actual change of addresses or tunnel still infers it.
+    let unchanged =
+        same_addr_set(&effective_addrs, current_addrs) && selection.tailcat == tunnel_enabled;
+    let only_new = if unchanged {
+        tunnel_only
+    } else {
+        selection.tailcat && selection.addresses.is_empty()
+    };
+    if only_new != tunnel_only {
+        changes.push(json!({ "path": "server.tunnel.only", "value": only_new }));
+    }
+    if selection.tailcat != tunnel_enabled {
+        changes.push(json!({ "path": "server.tunnel.enabled", "value": selection.tailcat }));
+    }
+    changes
+}
+
+/// Read a boolean setting's effective value over UDS, propagating RPC
+/// failures so a failed read never masquerades as `false` — a wrong `false`
+/// baseline would corrupt the picker's diff (e.g. a persisted
+/// `server.tunnel.only = true` misread as `false` makes the CLI report state
+/// changes the daemon never applies).
+async fn current_bool_setting(socket: &Path, path: &str) -> anyhow::Result<bool> {
+    let response = rpc_call(socket, "settings.get", json!({ "path": path })).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("settings.get {path} failed: {}", rpc_error_text(error));
+    }
+    Ok(response["result"]["value"].as_bool().unwrap_or(false))
+}
+
+/// Default (pre-checked) picker indices for [`prompt_listen_targets`]. In
+/// tunnel-only mode ONLY the tailcat entry is pre-checked — the loopback
+/// bind is an implementation detail of that posture, and pre-checking it
+/// too would make Enter ("keep current selection") resolve to
+/// loopback+tailcat, silently writing `server.tunnel.only = false` and
+/// restarting the listener. Otherwise: the current non-loopback addresses,
+/// plus the tailcat entry when the tunnel is enabled. A persisted
+/// `127.0.0.1` matches no choice (its row is gone — always bound), so an
+/// empty or `127.0.0.1`-only persisted set pre-checks nothing and Enter
+/// round-trips to the unchanged loopback bind; other persisted loopback
+/// addresses (`::1`) keep merged rows and pre-check normally. Pure so the
+/// round-trip is unit-testable.
+fn listen_default_indices(
+    choices: &[BindChoice],
+    current: &[std::net::IpAddr],
+    tunnel_enabled: bool,
+    tunnel_only: bool,
+) -> Vec<usize> {
+    if tunnel_only {
+        return vec![choices.len()];
+    }
+    // Every current non-loopback entry has a choice (merged above); collect
+    // in display order so the default echo reads naturally.
+    let mut default_set: Vec<usize> = (0..choices.len())
+        .filter(|&i| current.contains(&choices[i].addr))
+        .collect();
+    if tunnel_enabled {
+        default_set.push(choices.len());
+    }
+    default_set
+}
+
+/// Interactive multi-select listen-target picker: this machine's
+/// non-loopback interfaces plus the explicit all-interfaces option (and any
+/// persisted non-loopback addresses matching no enumerated entry), then the
+/// tailcat tunnel entry — pre-checked per [`listen_default_indices`] (the
+/// effective `server.bindAddress` set and tunnel state; tunnel-only
+/// pre-checks the tailcat entry alone so Enter round-trips to an empty
+/// changeset). Loopback is not offered — it is always bound
+/// ([`ensure_loopback_bind`]) and the header says so; `none` selects no
+/// additional endpoint (loopback-only bind). Selecting ONLY the tunnel
+/// turns on tunnel-only mode; an all-interfaces address stays exclusive
+/// among the addresses. Reads one selection line from stdin, so a piped run
+/// works without a TTY.
+fn prompt_listen_targets(
+    current: &[std::net::IpAddr],
+    tunnel_enabled: bool,
+    tunnel_only: bool,
+) -> anyhow::Result<ListenSelection> {
+    use std::io::{BufRead, Write};
+    let choices = merge_current_into_bind_choices(
+        build_bind_choices(&intent_transport::collect_bind_interfaces()),
+        current,
+    );
+    let count = choices.len() + 1;
+    let default_set = listen_default_indices(&choices, current, tunnel_enabled, tunnel_only);
+    eprintln!("Where should the daemon accept connections?");
+    eprintln!(
+        "Loopback (127.0.0.1) is always enabled — clients on this machine reach the \
+         daemon regardless of this selection."
+    );
+    for (i, choice) in choices.iter().enumerate() {
+        let mark = if default_set.contains(&i) { "x" } else { " " };
+        eprintln!("  {}) [{mark}] {}", i + 1, choice.label);
+    }
+    let mark = if default_set.contains(&choices.len()) {
+        "x"
+    } else {
+        " "
+    };
+    eprintln!("  {count}) [{mark}] {TAILCAT_CHOICE_LABEL}");
+    eprintln!("         {TAILCAT_CHOICE_NOTE}");
+    eprintln!(
+        "Enter numbers separated by commas (e.g. 1,3), 'none' for loopback only, or \
+         press Enter to keep the current selection; an all-interfaces address \
+         (0.0.0.0 / ::) must be selected alone. Selecting only the tunnel accepts \
+         tunnel traffic only."
+    );
+    let default_display = if default_set.is_empty() {
+        "none".to_string()
+    } else {
+        default_set
+            .iter()
+            .map(|i| (i + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     loop {
-        eprint!("Choice [{}]: ", default_index + 1);
+        eprint!("Selection [{default_display}]: ");
         std::io::stderr().flush()?;
         let mut line = String::new();
         if std::io::stdin().lock().read_line(&mut line)? == 0 {
-            anyhow::bail!("no bind address selected (EOF before a choice was made)");
+            anyhow::bail!("no listen target selected (EOF before a choice was made)");
         }
-        match parse_bind_choice(&line, choices.len(), default_index) {
-            Some(i) => return Ok(choices[i].addr),
-            None => eprintln!("enter a number between 1 and {}", choices.len()),
+        let selection = parse_bind_multi_selection(&line, count, &default_set)
+            .and_then(|indices| resolve_listen_selection(&choices, &indices));
+        match selection {
+            Ok(sel) => return Ok(sel),
+            Err(msg) => eprintln!("{msg}"),
         }
     }
 }
@@ -526,6 +968,39 @@ async fn rotate_pairing_token(socket: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `intentd pair --select-endpoints`: re-run ONLY the listen-target
+/// multi-select — pre-checked from the persisted `server.bindAddress` and
+/// `server.tunnel.enabled` — and persist the changed values via
+/// `settings.update`, without re-pairing (no token mint or rotation, no QR).
+/// Also persists `server.wsApi.enabled = true` (idempotent when already
+/// enabled; [`enable_wss_listener`] batch), so the listener (re-)binds onto
+/// the chosen set immediately — an unchanged selection with the listener
+/// already enabled writes nothing and says so, while an unchanged selection
+/// with it disabled still enables (keeping the stored values untouched).
+/// Requires a running daemon; reads the selection from stdin (one line), so
+/// a piped run works without a TTY.
+async fn cmd_pair_select_endpoints() -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    // Fail early (daemon down / socket missing) before showing the picker.
+    let response = rpc_call(&config.socket_path, "system.status", json!({})).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("cannot reach the daemon: {}", rpc_error_text(error));
+    }
+    let listener_enabled =
+        current_bool_setting(&config.socket_path, "server.wsApi.enabled").await?;
+    let tunnel_enabled = current_bool_setting(&config.socket_path, "server.tunnel.enabled").await?;
+    let tunnel_only = current_bool_setting(&config.socket_path, "server.tunnel.only").await?;
+    let current = current_bind_addresses(&config.socket_path).await;
+    let selection = prompt_listen_targets(&current, tunnel_enabled, tunnel_only)?;
+    let changes = listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only);
+    if changes.is_empty() && listener_enabled {
+        eprintln!("Selection unchanged — settings not modified.");
+        return Ok(());
+    }
+    enable_wss_listener(&config.socket_path, &changes).await?;
+    Ok(())
+}
+
 /// Print the full pairing credentials (§5.2/§5.3): the LAN pairing QR code,
 /// then labeled URL / Token / Fingerprint lines, each with a one-line usage
 /// note. Queries `pairing.getInfo` over UDS — so every value comes from the
@@ -534,10 +1009,11 @@ async fn rotate_pairing_token(socket: &Path) -> anyhow::Result<()> {
 /// QR code in half-height unicode blocks. When external connections (the WSS
 /// listener) are disabled, offers to enable them (prompt, or unattended via
 /// `yes`) through `settings.update` and retries the query — the interactive
-/// path also asks WHICH address to bind ([`prompt_bind_address`]: interfaces
-/// plus an explicit all-interfaces 0.0.0.0 entry, persisted to
-/// `server.bindAddress` in the same batch), while `--yes`/unattended keeps
-/// the persisted value (default: loopback). `rotate` mints a
+/// path also asks WHERE to listen ([`prompt_listen_targets`]: a multi-select
+/// over interfaces plus an exclusive all-interfaces 0.0.0.0 entry and the
+/// tailcat tunnel, persisted to `server.bindAddress` / `server.tunnel.*` in
+/// the same batch), while `--yes`/unattended keeps the persisted values
+/// (default: loopback, tunnel off). `rotate` mints a
 /// new token via [`rotate_pairing_token`] — only AFTER the listener is
 /// confirmed up (pairing info is obtainable), so a declined enable prompt (or
 /// a non-TTY run without `--yes`) never invalidates existing clients' tokens
@@ -552,11 +1028,12 @@ async fn cmd_pair(
     let config = resolve_config()?;
     let mut response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
     if response.get("error").is_some_and(is_listener_down_error) {
-        // Interactive path: consent prompt, then the bind-address picker.
+        // Interactive path: consent prompt, then the listen-target picker.
         // `--yes` (or an unattended run) skips both and keeps the persisted
-        // server.bindAddress (default: loopback).
-        let bind_address = if yes {
-            None
+        // server.bindAddress / server.tunnel.* (default: loopback, tunnel
+        // off).
+        let changes = if yes {
+            Vec::new()
         } else {
             if !confirm_enable_wss()? {
                 anyhow::bail!(
@@ -565,10 +1042,18 @@ async fn cmd_pair(
                      config.toml"
                 );
             }
-            let current = current_bind_address(&config.socket_path).await;
-            Some(prompt_bind_address(current)?)
+            // Multi-select pre-checked from the persisted state; an
+            // unchanged selection writes nothing so the stored shapes stay
+            // untouched.
+            let tunnel_enabled =
+                current_bool_setting(&config.socket_path, "server.tunnel.enabled").await?;
+            let tunnel_only =
+                current_bool_setting(&config.socket_path, "server.tunnel.only").await?;
+            let current = current_bind_addresses(&config.socket_path).await;
+            let selection = prompt_listen_targets(&current, tunnel_enabled, tunnel_only)?;
+            listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only)
         };
-        enable_wss_listener(&config.socket_path, bind_address).await?;
+        enable_wss_listener(&config.socket_path, &changes).await?;
         response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
     }
     if let Some(error) = response.get("error") {
@@ -609,6 +1094,10 @@ async fn cmd_pair(
     println!("             Bearer token — enter it (with host + port) in the desktop app's remote-connection dialog.");
     println!("Fingerprint: {fingerprint}");
     println!("             TLS certificate fingerprint — confirm the client shows this exact value before trusting the connection.");
+    if let Some(tc) = result["tcAddress"].as_str() {
+        println!("Tunnel:      {tc}");
+        println!("             Tailcat tunnel address — reachable from other networks; embedded in the QR payload as tc=.");
+    }
 
     if let Some(path) = png {
         let img = code.render::<image::Luma<u8>>().build();
@@ -641,27 +1130,27 @@ async fn cmd_git_credential(operation: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Write an exported pairing image with owner-only (0600) permissions: the QR
-/// code embeds the bearer token, so it deserves the same treatment as the
-/// secrets file. The file is created/truncated with restrictive permissions
-/// BEFORE the sensitive bytes are written — never exposed under the umask.
+/// Write an exported pairing image with owner-only permissions (0600 on unix,
+/// owner-only DACL on Windows) via [`intent_core::write_private`]: the QR code
+/// embeds the bearer token, so it deserves the same treatment as the secrets
+/// file. The helper creates the file fresh (`create_new`) so the restrictive
+/// permissions apply BEFORE the sensitive bytes are written — never exposed
+/// under the umask. Any pre-existing file (or symlink) is removed first —
+/// deliberately replacing a symlink with a regular file rather than writing
+/// through it — so overwriting an existing export still works. Two deliberate
+/// deltas from the old truncate flow: a planted symlink can no longer
+/// redirect the token-bearing bytes, and removal needs parent-dir write
+/// permission, so an existing writable file in a read-only directory now
+/// fails instead of being truncated in place (fail-closed in exactly the
+/// shared-directory case the hardening targets). The exported image stays
+/// visible on Windows (no hidden attribute) — the user asked for it by path.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
-    let mut file = options.open(path)?;
-    // If the file pre-existed, `mode` above does not apply; enforce it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(bytes)
+    intent_core::write_private(path, bytes)
 }
 
 /// Migrate a legacy Intent `userData` dir into intentd's `SQLite` store (§9.7).
@@ -887,6 +1376,17 @@ fn init_tracing() {
 /// invocations only (monorepo#1827).
 static ONE_SHOT_CLI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Env var the sitter sets on the child when a respawn is update-triggered
+/// (see `intentd_sitter::supervisor::UPDATE_RESTART_ENV`). Captured into
+/// [`UPDATE_RESTART`] and scrubbed from the environment in `main()` so it
+/// never leaks into subprocesses the daemon spawns.
+const UPDATE_RESTART_ENV: &str = "INTENTD_UPDATE_RESTART";
+
+/// Whether this start is an update-triggered respawn: the value of
+/// [`UPDATE_RESTART_ENV`] captured in `main()` before the env var is
+/// scrubbed. Read by `cmd_serve` for the startup resume decision.
+static UPDATE_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Exit status mirroring a default-disposition SIGPIPE death (128 + 13), the
 /// code shells report for standard Unix tools whose output pipe closes early.
 const SIGPIPE_EXIT_CODE: i32 = 141;
@@ -949,7 +1449,23 @@ fn resolve_config() -> anyhow::Result<Config> {
     Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
+/// Build-commit value for the serve startup banner (monorepo#3649): the
+/// embedded commit when present, "unknown" for builds without one — the same
+/// `Option` `system.info` maps into its `build_commit` field.
+fn banner_build_commit(build_commit: Option<&str>) -> &str {
+    build_commit.unwrap_or("unknown")
+}
+
 async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyhow::Result<()> {
+    // Build-identity banner as the first serve log line so every log file
+    // opens with which build produced it (monorepo#3649). Same identity
+    // values `system.info` and the hello handshake expose.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build_commit = banner_build_commit(intent_transport::BUILD_COMMIT),
+        protocol = intent_transport::PROTOCOL_VERSION,
+        "intentd starting"
+    );
     // Insecure dev mode: `--insecure` OR `INTENTD_INSECURE=1` disables TLS and
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
     // provisioning entirely. Dev-only; loudly warned at startup.
@@ -1110,6 +1626,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // already-set ones are left alone.
     intent_services::migrate_quick_action_settings(&settings_registry)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // One-time removal of the deprecated `providers.active` from config.toml
+    // (comment-preserving rewrite; runs only when the key exists). Its value
+    // is carried over into `model.defaultProvider` (which superseded it)
+    // first; an already-set target is never clobbered.
+    intent_services::migrate_active_provider_setting(&settings_registry)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // One-time legacy handling: retired keys still present in config.toml
     // (e.g. the `[ai]` table, `model.workspaceOverrides`) were tolerated +
     // captured by the load above; import any that still have a catalog entry
@@ -1251,6 +1773,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         // STAB-53: capture each spawned child's stderr under
         // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
         .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
+        .with_antigravity_state_root(config.data_dir.join("antigravity"))
         // Per-agent generated config files (`--mcp-config`, `--rules`,
         // pi-extension delivery) are written under the daemon-owned
         // `<data_dir>/agent-configs` instead of the global OS temp dir
@@ -1479,6 +2002,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
     // event bus. Aborted on clean shutdown.
     let auto_commit_loop = services.spawn_auto_commit_loop();
+    // Agent-locks recompute worker (§5.19/§6.5): watch agent lifecycle, task
+    // status, auto-commit policy, and tracked-change events and publish the
+    // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
+    // without an event bus. Aborted on clean shutdown.
+    let agent_locks_loop = services.spawn_agent_locks_loop();
     // CRDT session sweeper (A5, §5.2 CRDT): every hour, drop cached yrs docs
     // for `(workspace, note)` pairs whose last access is older than 24h so
     // long-lived daemons do not accumulate per-note session state. Aborted on
@@ -1542,8 +2070,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         let services = services.clone();
         tokio::spawn(async move { services.start_enabled_mcp_servers().await })
     };
-    let watcher_init_task =
-        spawn_watcher_registry_init(bus.clone(), api.clone(), Arc::clone(&git_status_refresher));
+    // Watch-health handle created BEFORE the backgrounded registry start so
+    // DaemonControl can hold it now; it snapshots `None` (fileWatch absent
+    // from system.status) until the registry attaches the shared hub.
+    let watch_health = intent_services::WatchHealth::default();
+    let watcher_init_task = spawn_watcher_registry_init(
+        bus.clone(),
+        api.clone(),
+        Arc::clone(&git_status_refresher),
+        watch_health.clone(),
+    );
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
@@ -1556,22 +2092,46 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let mut ws_options = ws_options_from_env();
     ws_options.locality_override = locality_override;
     // Apply the effective server.bindAddress (default 127.0.0.1 — loopback;
-    // monorepo#2900). An unparseable persisted value falls back to loopback
-    // with a warning rather than silently widening the bind (defense in
-    // depth — SettingsFile::validate rejects non-IP values at load time).
-    if let Ok(addr) = boot_settings.effective.server.bind_address.parse() {
-        ws_options.bind_address = addr;
-    } else {
-        tracing::warn!(
+    // monorepo#2900). A single IP or a list of IPs (one listener per address,
+    // same port; monorepo#3314). An invalid persisted set falls back to
+    // loopback with a warning rather than silently widening the bind (defense
+    // in depth — SettingsFile::validate rejects invalid sets at load time).
+    match boot_settings.effective.server.bind_address.resolve() {
+        Ok(addrs) => ws_options.bind_addresses = addrs,
+        Err(msg) => tracing::warn!(
             value = %boot_settings.effective.server.bind_address,
-            "server.bindAddress is not a valid IP address; binding loopback (127.0.0.1)"
-        );
+            "server.bindAddress is invalid ({msg}); binding loopback (127.0.0.1)"
+        ),
     }
+    // Tunnel-only mode (server.tunnel.only): the listener accepts
+    // tunnel-forwarded traffic only, so bind loopback regardless of
+    // server.bindAddress. The runtime start path (`start_ws_listener`)
+    // applies the same override from the persisted setting.
+    if boot_settings.effective.server.tunnel.only {
+        let loopback = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+        if ws_options.bind_addresses != loopback {
+            tracing::info!(
+                "server.tunnel.only=true: WSS listener binding loopback only \
+                 (server.bindAddress ignored while tunnel-only is on)"
+            );
+            ws_options.bind_addresses = loopback;
+        }
+    }
+    // The loopback guarantee ([`ensure_loopback_bind`]): 127.0.0.1 is always
+    // bound alongside the configured set — local clients and the tailcat
+    // sidecar must reach the daemon whatever endpoints were selected. The
+    // runtime start path (`start_ws_listener`) applies the same guarantee.
+    ensure_loopback_bind(&mut ws_options.bind_addresses);
     // Loud upgrade-path warning (monorepo#2900): the old config template wrote
     // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
     // file-origin wide bind that predates the loopback default. When that wide
     // bind will actually be served (listener enabled), say so prominently.
-    if ws_options.bind_address.is_unspecified()
+    // Fires only when the effective set contains an unspecified address —
+    // which the settings validation constrains to being the sole entry.
+    if ws_options
+        .bind_addresses
+        .iter()
+        .any(std::net::IpAddr::is_unspecified)
         && boot_settings.effective.server.ws_api.enabled
         && !insecure
     {
@@ -1602,7 +2162,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let (tls_cert, token_store) = if insecure {
         tracing::warn!(
             "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
-            ws_options.bind_address,
+            ws_options
+                .bind_addresses
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
             ws_options.base_port
         );
         (None, None)
@@ -1619,6 +2184,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Build runtime control struct (always, regardless of boot listener state)
     let runtime = Arc::new(WsRuntimeControl {
         api: api.clone(),
+        settings_registry: settings_registry.clone(),
         bus: bus.clone(),
         tls_cert: tls_cert.clone(),
         token_store: token_store.clone(),
@@ -1628,7 +2194,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         state: tokio::sync::Mutex::new(WsRuntimeState {
             ws_server: None,
             port: None,
-            bind_address: None,
+            bind_addresses: None,
         }),
         control: std::sync::OnceLock::new(),
     });
@@ -1667,6 +2233,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         None => Arc::new(WorkspacesDiskUsage::default()),
     };
 
+    // Hoisted out of DaemonControl so the pairing provider below can share
+    // the same supervisor (pairing surfaces advertise the live tc address).
+    let tunnel_supervisor = Arc::new(tunnel::TunnelSupervisor::new(
+        tunnel::resolve_tailcat_bin(),
+        &config.data_dir.join("tunnel"),
+    ));
+
     let control = Arc::new(DaemonControl {
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
@@ -1674,13 +2247,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         start_time: std::time::Instant::now(),
         proc_usage,
         child_usage,
-        route_info,
+        route_info: route_info.clone(),
         workspaces_disk,
+        watch_health,
         legacy_import_store,
         legacy_import_assets_root: assets_root,
         legacy_import_lock: legacy_import_lock.clone(),
         legacy_import_bus: bus.clone(),
         settings_registry: settings_registry.clone(),
+        sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
+        tunnel: tunnel_supervisor.clone(),
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -1692,8 +2268,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     );
 
     // Auto-resume interrupted agents at startup. `--resume-all` forces the
-    // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
-    // (`auto` = headless hosts only, `on` = always, `off` = never). Awaited to
+    // sweep, as does an update-triggered restart (the sitter sets
+    // `INTENTD_UPDATE_RESTART=1` when it respawns a different version than
+    // the one that just ran; captured into [`UPDATE_RESTART`] and scrubbed
+    // from the environment in `main()` so it never leaks to subprocesses);
+    // otherwise the `agents.resumeInterruptedOnStart`
+    // setting decides (`auto` = headless hosts only, `on` = always, `off` =
+    // never). Awaited to
     // completion BEFORE any listener starts (WS/WSS below, UDS further down)
     // so the first `agent.listInterrupted` a client issues on connect never
     // sees rows the sweep is about to claim (no interrupted-agents modal
@@ -1702,9 +2283,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // sweep only logs, so a bad sweep never wedges startup.
     let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
     let has_display = detect_has_display();
-    let resume_on_start = should_resume_on_start(resume_all, resume_setting, has_display);
+    // Captured in `main()` before the env var was scrubbed from the
+    // environment (so it never leaks into daemon-spawned subprocesses).
+    let update_restart = UPDATE_RESTART.load(std::sync::atomic::Ordering::Relaxed);
+    let resume_on_start =
+        should_resume_on_start(resume_all, update_restart, resume_setting, has_display);
     tracing::info!(
         resume_all,
+        update_restart,
         setting = resume_setting.as_str(),
         has_display,
         resume = resume_on_start,
@@ -1741,7 +2327,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             let mut state = runtime.state.lock().await;
             state.ws_server = Some(server);
             state.port = Some(port);
-            state.bind_address = Some(ws_options.bind_address);
+            state.bind_addresses = Some(ws_options.bind_addresses.clone());
         }
     }
 
@@ -1783,6 +2369,28 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         }
     }
 
+    // Boot-time tailcat tunnel auto-start when the effective
+    // server.tunnel.enabled is true. Requires the WSS listener up (checked by
+    // start_tunnel); a start failure at boot is non-fatal — setting stays
+    // true, warning logged, toggle OFF→ON to retry.
+    if boot_settings.effective.server.tunnel.enabled {
+        match intent_core::ServerControl::start_tunnel(control.as_ref()).await {
+            Ok(address) => {
+                tracing::info!(
+                    address = %address,
+                    "tailcat tunnel auto-started at boot (persisted server.tunnel.enabled=true)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to auto-start tailcat tunnel at boot (persisted enabled=true); \
+                     setting remains true, toggle OFF→ON to retry"
+                );
+            }
+        }
+    }
+
     // Build pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
     // Only built when there's a token store (secure mode); `None` in insecure mode.
     // Available to UDS clients even when TCP is disabled (they can still call the RPCs).
@@ -1794,6 +2402,8 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                 data_dir: config.data_dir.clone(),
                 token_store: ts.clone(),
                 ws_runtime: runtime.clone(),
+                tunnel: tunnel_supervisor.clone(),
+                route_info: route_info.clone(),
             }))
         } else {
             None
@@ -1879,17 +2489,20 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     )
     .await?;
 
-    // Clean shutdown: stop the WSS listener (graceful close + port release),
-    // stop the PR refresh loop, then kill every spawned agent child and clear
-    // the registry (§6.8 teardown). Idle reaping during the run is the M5
-    // `reap_idle` hook. Stop via ServerControl so we stop the runtime listener
+    // Clean shutdown: stop the tailcat tunnel sidecar (kill the child), stop
+    // the WSS listener (graceful close + port release), stop the PR refresh
+    // loop, then kill every spawned agent child and clear the registry (§6.8
+    // teardown). Idle reaping during the run is the M5 `reap_idle` hook. Stop
+    // via ServerControl so we stop the runtime listener
     // (ws_runtime.state.ws_server), not the stale boot-time ws_server variable.
+    intent_core::ServerControl::stop_tunnel(control.as_ref()).await;
     control.stop_ws_listener().await;
     pr_refresh.abort();
     pr_monitor_loop.abort();
     token_usage_scan.abort();
     completion_delivery.abort();
     auto_commit_loop.abort();
+    agent_locks_loop.abort();
     crdt_session_sweep.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
@@ -1978,12 +2591,16 @@ struct DaemonControl {
     /// Latest descendant-tree memory sample (agent child processes and
     /// everything they spawn) from the background sampler.
     child_usage: Arc<ChildTreeUsage>,
-    /// Cached route-discovery snapshot (`localIps` + `hostname`) from the
-    /// background sampler, so `status()` never enumerates interfaces inline.
+    /// Cached route-discovery snapshot (`localIps` + `hostname` +
+    /// `prettyHostname`) from the background sampler, so `status()` never
+    /// enumerates interfaces inline.
     route_info: Arc<RouteInfo>,
     /// Latest workspaces-root disk sample (available/total bytes) from the
     /// background sampler, so `status()` never calls `statfs(2)` inline.
     workspaces_disk: Arc<WorkspacesDiskUsage>,
+    /// Watch-coverage handle for `system.status` (intent-hq/intent#3708);
+    /// snapshots `None` until the backgrounded watcher registry attaches.
+    watch_health: intent_services::WatchHealth,
     /// Live store and asset destination shared with Services for legacy import.
     legacy_import_store: Store,
     legacy_import_assets_root: PathBuf,
@@ -1997,6 +2614,12 @@ struct DaemonControl {
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
+    /// `<data_dir>/sitter/sitter.pid` — the supervising sitter's pidfile,
+    /// read by `system.requestUpdate` to find the process to SIGUSR1.
+    sitter_pid_path: PathBuf,
+    /// Tailcat tunnel sidecar supervisor (`server.tunnel.*`). Always present
+    /// so the runtime toggle works whether or not the tunnel was boot-started.
+    tunnel: Arc<tunnel::TunnelSupervisor>,
 }
 
 /// Latest own-process resource sample for `system.status`, written by the
@@ -2027,17 +2650,22 @@ impl ProcUsage {
     }
 }
 
-/// Cached route-discovery snapshot (`localIps` + `hostname`) for
-/// `system.status` (§5.7), written by the background sampler task and read
-/// from `status()` without touching the OS. `localIps` is invalidated by
-/// external network activity, so per the derived-field ladder it is refreshed
-/// off the read path (TTL cache) rather than computed inline on read.
+/// Cached route-discovery snapshot (raw local IPv4/IPv6 enumerations +
+/// `hostname` + `prettyHostname`) for `system.status` (§5.7), written by the
+/// background sampler task and read from `status()` without touching the OS.
+/// The enumerations are invalidated by external network activity, so per the
+/// derived-field ladder they are refreshed off the read path (TTL cache)
+/// rather than computed inline on read. `status()` filters the cached lists
+/// through [`advertised_hosts`] against the live listener bind set, so
+/// `localIps` only names addresses the daemon actually listens on (same
+/// semantics as `server.pairingInfo`) and follows a runtime bind change
+/// immediately.
 struct RouteInfo {
-    inner: std::sync::RwLock<(Vec<String>, String)>,
+    inner: std::sync::RwLock<(Vec<String>, Vec<String>, HostEnvironment)>,
 }
 
 impl RouteInfo {
-    fn load(&self) -> (Vec<String>, String) {
+    fn load(&self) -> (Vec<String>, Vec<String>, HostEnvironment) {
         self.inner.read().expect("route info lock poisoned").clone()
     }
 }
@@ -2048,8 +2676,15 @@ impl RouteInfo {
 /// changes with external network state, so a short-TTL cache keeps the status
 /// read path free of `getifaddrs(3)`/hostname syscalls.
 fn spawn_route_info_sampler() -> Arc<RouteInfo> {
+    let detected = detect_host_environment();
+    let sample = move || {
+        let mut host = detected.clone();
+        host.hostname = local_hostname();
+        host.pretty_hostname = pretty_hostname();
+        (collect_local_ips(), collect_local_ipv6s(), host)
+    };
     let info = Arc::new(RouteInfo {
-        inner: std::sync::RwLock::new((collect_local_ips(), local_hostname())),
+        inner: std::sync::RwLock::new(sample()),
     });
     let task_info = info.clone();
     tokio::spawn(async move {
@@ -2058,8 +2693,7 @@ fn spawn_route_info_sampler() -> Arc<RouteInfo> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let sample = (collect_local_ips(), local_hostname());
-            *task_info.inner.write().expect("route info lock poisoned") = sample;
+            *task_info.inner.write().expect("route info lock poisoned") = sample();
         }
     });
     info
@@ -2584,6 +3218,11 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
 /// state guarded by a Mutex so settings.update can start/stop the listener.
 struct WsRuntimeControl {
     api: Arc<dyn WorkspaceApi>,
+    /// Direct access to daemon-local effective settings for listener startup.
+    /// Runtime hooks execute while `settings.update` holds the settings revision
+    /// write gate, so calling back through `WorkspaceApi::settings_get` here
+    /// would deadlock trying to acquire that gate for a read.
+    settings_registry: Arc<intent_services::SettingsRegistry>,
     bus: EventBus,
     tls_cert: Option<intent_transport::TlsCertificate>,
     token_store: Option<Arc<AsyncTokenStore>>,
@@ -2602,9 +3241,10 @@ struct WsRuntimeState {
     ws_server: Option<WsApiServer>,
     /// Cached port for sync system.status access
     port: Option<u16>,
-    /// Address the running listener is bound to (`server.bindAddress`) so
-    /// pairing surfaces advertise the reachable host(s), not all local IPs.
-    bind_address: Option<std::net::IpAddr>,
+    /// Address set the running listener is bound to (`server.bindAddress`;
+    /// one listener per address) so pairing surfaces advertise the reachable
+    /// host(s), not all local IPs.
+    bind_addresses: Option<Vec<std::net::IpAddr>>,
 }
 
 /// Pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
@@ -2617,6 +3257,11 @@ struct DaemonPairingInfo {
     /// only when server.wsApi.enabled is true, but can be started at runtime
     /// via settings regardless).
     ws_runtime: Arc<WsRuntimeControl>,
+    /// Tunnel supervisor reference so pairing surfaces advertise the live
+    /// `tc...` address (`tcAddress` / the URI's `tc=` param) while it runs.
+    tunnel: Arc<tunnel::TunnelSupervisor>,
+    /// Background-refreshed host identity shared with `system.status`.
+    route_info: Arc<RouteInfo>,
 }
 
 impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
@@ -2626,12 +3271,18 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
         Box<dyn std::future::Future<Output = intent_transport::PairingSnapshot> + Send + '_>,
     > {
         Box::pin(async move {
+            let tc_address = self.tunnel.address().await;
             let state = self.ws_runtime.state.lock().await;
             intent_transport::PairingSnapshot {
                 port: state.port,
-                bind_address: state.bind_address,
+                bind_addresses: state.bind_addresses.clone(),
+                tc_address,
             }
         })
+    }
+
+    fn host_environment(&self) -> HostEnvironment {
+        self.route_info.load().2
     }
 
     fn data_dir(&self) -> &std::path::Path {
@@ -2645,31 +3296,48 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
 
 impl SystemControl for DaemonControl {
     fn status(&self) -> SystemStatus {
-        // Read live port/fingerprint/client count from runtime state (§5.12 fix).
-        // Use try_lock to avoid blocking; if locked, report as unavailable.
-        let (port, fingerprint, clients) = if let Ok(state) = self.ws_runtime.state.try_lock() {
-            let port = state.port;
-            let fingerprint = state
-                .ws_server
-                .as_ref()
-                .and_then(|s| s.fingerprint().map(str::to_string));
-            let clients = state
-                .ws_server
-                .as_ref()
-                .map_or(0, intent_transport::WsApiServer::client_count);
-            (port, fingerprint, clients)
-        } else {
-            (None, None, 0)
-        };
+        // Read live port/fingerprint/client count/bind set from runtime state
+        // (§5.12 fix). Use try_lock to avoid blocking; if locked, report as
+        // unavailable.
+        let (port, fingerprint, clients, bind_addresses) =
+            if let Ok(state) = self.ws_runtime.state.try_lock() {
+                let port = state.port;
+                let fingerprint = state
+                    .ws_server
+                    .as_ref()
+                    .and_then(|s| s.fingerprint().map(str::to_string));
+                let clients = state
+                    .ws_server
+                    .as_ref()
+                    .map_or(0, intent_transport::WsApiServer::client_count);
+                (port, fingerprint, clients, state.bind_addresses.clone())
+            } else {
+                (None, None, 0, None)
+            };
 
         let (cpu_percent, memory_bytes) = self.proc_usage.load();
         // `None` until the slower descendant-tree sampler lands its first walk.
         let child_tree = self.child_usage.load();
-        // Alternative routes for remote clients: same sources as
-        // `server.pairingInfo`, so a remote caller can refresh its stored
-        // host list from `system.status` alone. Served from the background
-        // sampler's TTL cache — never enumerated inline on the read path.
-        let (local_ips, hostname) = self.route_info.load();
+        // Alternative routes for remote clients: same sources and bind-set
+        // semantics as `server.pairingInfo`, so a remote caller can refresh
+        // its stored host list from `system.status` alone — and only learns
+        // addresses the listener is actually bound to. Enumerations come from
+        // the background sampler's TTL cache — never collected inline on the
+        // read path; only the cheap bind-set filter runs here. With no live
+        // TCP listener (UDS-only daemon, failed/stopped WSS — or the
+        // try_lock contention above, matching its transient `uds` posture)
+        // there are no dialable TCP routes at all, so `localIps` is empty
+        // rather than the historical full enumeration.
+        let (local_v4, local_v6, host_environment) = self.route_info.load();
+        let local_ips = if port.is_some() {
+            advertised_hosts(bind_addresses.as_deref(), &local_v4, &local_v6)
+        } else {
+            Vec::new()
+        };
+        // Live tunnel route, same availability semantics as pairing surfaces:
+        // present while the sidecar runs, absent otherwise. try_lock like the
+        // port/fingerprint reads above — never blocks the status path.
+        let tc_address = self.tunnel.address_now();
         // Derived transport surface: UDS always serves; `tcp`/`listenMode`
         // reflect the live TCP listener state (runtime toggles included), so
         // `listenMode` is `both` while the listener is up and `uds` otherwise.
@@ -2698,9 +3366,14 @@ impl SystemControl for DaemonControl {
             has_display: detect_has_display(),
             max_agents: self.manager.registry().cap(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build_commit: intent_transport::BUILD_COMMIT.map(str::to_string),
             uptime_seconds: self.start_time.elapsed().as_secs(),
             local_ips,
-            hostname,
+            tc_address,
+            hostname: host_environment.hostname,
+            pretty_hostname: host_environment.pretty_hostname,
+            device_kind: host_environment.device_kind,
+            hardware_model: host_environment.hardware_model,
             cpu_percent,
             memory_bytes,
             child_processes: child_tree.as_ref().map(|s| s.count),
@@ -2711,13 +3384,36 @@ impl SystemControl for DaemonControl {
             queued_spawns: budget.map(|(_, _, queued)| queued),
             workspaces_disk_available_bytes: workspaces_disk.map(|(avail, _)| avail),
             workspaces_disk_total_bytes: workspaces_disk.map(|(_, total)| total),
+            // Snapshot cost is O(watched roots) under one in-process mutex —
+            // no filesystem or OS calls — and `None` (field absent) until the
+            // backgrounded watcher registry has attached the hub.
+            file_watch: self
+                .watch_health
+                .snapshot()
+                .map(|s| intent_transport::FileWatchStatus {
+                    active_streams: s.active_streams,
+                    total_roots: s.total_roots,
+                    failed_roots: s.failed_roots,
+                }),
+            // Signal-free supervision probe (intent-hq/intent#3875): one
+            // pidfile read + one single-process sysinfo refresh, never a
+            // signal, so status stays cheap and side-effect free.
+            update_supported: sitter_update_supported(&self.sitter_pid_path),
         }
+    }
+
+    fn host_environment(&self) -> HostEnvironment {
+        self.route_info.load().2
     }
 
     fn request_shutdown(&self) {
         // `notify_one` stores a permit if the serve loop is not yet awaiting, so
         // the shutdown is never lost to a race with a freshly-arrived RPC.
         self.shutdown.notify_one();
+    }
+
+    fn request_update(&self) -> Result<(), String> {
+        signal_sitter_update(&self.sitter_pid_path)
     }
 
     fn import_legacy(
@@ -2831,55 +3527,80 @@ impl intent_core::ServerControl for DaemonControl {
 
             // Read the persisted port from settings, then resolve against the
             // env seam (see `resolve_ws_listener_port` for the precedence).
-            let settings_port = match runtime
-                .api
-                .settings_get("server.wsApi.port".to_string())
-                .await
-            {
-                Ok(result) => result
-                    .get("value")
-                    .and_then(serde_json::Value::as_f64)
-                    // Settings schema bounds the port to u16 range; the
-                    // float→int cast saturates anyway.
-                    .map(|p| {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let p = p as u16;
-                        p
-                    }),
-                Err(_) => None,
-            };
+            let settings = runtime.settings_registry.snapshot();
+            let settings_port = settings
+                .get("server.wsApi.port")
+                .and_then(|value| value.as_f64())
+                // Settings schema bounds the port to u16 range; the
+                // float→int cast saturates anyway.
+                .map(|p| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let p = p as u16;
+                    p
+                });
             let desired_port = resolve_ws_listener_port(
                 std::env::var("INTENTD_TCP_PORT").ok().as_deref(),
                 settings_port,
                 runtime.ws_options.base_port,
             );
 
-            // Read the persisted bind address (server.bindAddress) so a value
-            // changed since boot applies on the next listener start. An invalid
-            // value is a hard error naming the setting — never silently bind a
-            // different address than the user configured.
-            let bind_address = match runtime
-                .api
-                .settings_get("server.bindAddress".to_string())
-                .await
-            {
-                Ok(result) => match result.get("value").and_then(|v| v.as_str()) {
-                    Some(raw) => Some(raw.parse::<std::net::IpAddr>().map_err(|_| {
+            // Read the persisted bind address set (server.bindAddress — a
+            // single IP string or a list of IP strings; monorepo#3314) so a
+            // value changed since boot applies on the next listener start. An
+            // invalid value is a hard error naming the setting — never
+            // silently bind a different address set than the user configured.
+            let bind_addresses = match settings.get("server.bindAddress") {
+                Some(raw @ (serde_json::Value::String(_) | serde_json::Value::Array(_))) => {
+                    let parsed: intent_core::settings_file::BindAddress =
+                        serde_json::from_value(raw.clone()).map_err(|_| {
+                            intent_core::Error::InvalidParams(format!(
+                                "server.bindAddress {raw} is not an IP string or an array of \
+                                     IP strings — fix it in config.toml ([server] bindAddress) \
+                                     or via settings"
+                            ))
+                        })?;
+                    Some(parsed.resolve().map_err(|msg| {
                         intent_core::Error::InvalidParams(format!(
-                            "server.bindAddress {raw:?} is not a valid IP address — fix it in \
-                             config.toml ([server] bindAddress) or via settings"
+                            "server.bindAddress {raw}: {msg} — fix it in config.toml \
+                                 ([server] bindAddress) or via settings"
                         ))
-                    })?),
-                    None => None,
-                },
-                Err(_) => None,
+                    })?)
+                }
+                _ => None,
             }
-            .unwrap_or(runtime.ws_options.bind_address);
+            .unwrap_or_else(|| runtime.ws_options.bind_addresses.clone());
 
-            // Clone ws_options and override the port + bind address
+            // Tunnel-only mode (server.tunnel.only): accept tunnel-forwarded
+            // traffic only — bind loopback regardless of server.bindAddress,
+            // so direct LAN connects are refused while tailcat (a local
+            // process) still reaches the listener. The registry snapshot is
+            // infallible and includes the schema default when the key is unset.
+            let tunnel_only = settings
+                .get("server.tunnel.only")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let mut bind_addresses = if tunnel_only {
+                let loopback = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+                if bind_addresses != loopback {
+                    tracing::info!(
+                        "server.tunnel.only=true: WSS listener binding loopback only \
+                         (server.bindAddress ignored while tunnel-only is on)"
+                    );
+                }
+                loopback
+            } else {
+                bind_addresses
+            };
+            // The loopback guarantee ([`ensure_loopback_bind`]), mirroring
+            // the boot path: 127.0.0.1 is always bound alongside the
+            // configured set.
+            ensure_loopback_bind(&mut bind_addresses);
+            let bind_addresses = bind_addresses;
+
+            // Clone ws_options and override the port + bind address set
             let mut ws_options = runtime.ws_options.clone();
             ws_options.base_port = desired_port;
-            ws_options.bind_address = bind_address;
+            ws_options.bind_addresses = bind_addresses.clone();
 
             // Build a fresh WsApiServer and start it. The control is populated via
             // OnceLock after DaemonControl construction (breaking the circular Arc).
@@ -2922,24 +3643,28 @@ impl intent_core::ServerControl for DaemonControl {
                     data_dir: runtime.data_dir.clone(),
                     token_store: ts.clone(),
                     ws_runtime: self.ws_runtime.clone(),
+                    tunnel: self.tunnel.clone(),
+                    route_info: self.route_info.clone(),
                 })
                     as Arc<dyn intent_transport::ServerPairingInfo>;
                 server.install_pairing_info(pairing_provider);
             }
 
             let port = server.start().await.map_err(|e| {
-                // Map bind failures to friendly, actionable error messages
-                let error_kind = e.kind();
-                let error_msg = if error_kind == std::io::ErrorKind::AddrInUse {
+                // Map bind failures to friendly, actionable error messages.
+                // The bind is all-or-nothing across the configured set, and
+                // the transport error names the failing address:port — keep
+                // it so a partial multi-bind failure (or a port-0 run) stays
+                // diagnosable, and add the actionable guidance.
+                let error_msg = if e.kind() == std::io::ErrorKind::AddrInUse {
                     format!(
-                        "Port {desired_port} is already in use — choose a different port or stop the process using it"
+                        "Address already in use ({e}) — choose a different port or stop the process using it"
                     )
                 } else {
-                    // Other bind errors: name the address (server.bindAddress)
-                    // + port and include the OS error text
-                    format!(
-                        "failed to bind {bind_address}:{desired_port} (server.bindAddress): {e}"
-                    )
+                    // Other bind errors: name the setting (server.bindAddress)
+                    // and include the OS error text (which carries the
+                    // failing address:port).
+                    format!("failed to bind (server.bindAddress): {e}")
                 };
                 intent_core::Error::Internal(error_msg)
             })?;
@@ -2949,7 +3674,7 @@ impl intent_core::ServerControl for DaemonControl {
                 let mut state = runtime.state.lock().await;
                 state.ws_server = Some(server);
                 state.port = Some(port);
-                state.bind_address = Some(bind_address);
+                state.bind_addresses = Some(bind_addresses);
             }
 
             Ok(port)
@@ -2965,7 +3690,7 @@ impl intent_core::ServerControl for DaemonControl {
             let server = {
                 let mut state = runtime.state.lock().await;
                 state.port = None;
-                state.bind_address = None;
+                state.bind_addresses = None;
                 state.ws_server.take()
             };
 
@@ -2999,6 +3724,39 @@ impl intent_core::ServerControl for DaemonControl {
         // Returns true for TCP (WSS) connections, false for UDS or when called
         // outside a request context.
         intent_transport::is_tcp_connection()
+    }
+
+    fn start_tunnel(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<String>> + Send + '_>>
+    {
+        Box::pin(async move {
+            // The tunnel forwards to the WSS port, so the listener must be up
+            // (clear, actionable error otherwise — the settings hook surfaces it).
+            let Some(port) = self.ws_listener_port().await else {
+                return Err(intent_core::Error::InvalidParams(
+                    "tunnel requires the WSS listener: enable server.wsApi.enabled first"
+                        .to_string(),
+                ));
+            };
+            // Optional self-hosted DERP relay (server.tunnel.derpUrl).
+            let derp_url = self
+                .settings_registry
+                .get("server.tunnel.derpUrl")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .filter(|s| !s.is_empty());
+            self.tunnel.start(port, derp_url).await
+        })
+    }
+
+    fn stop_tunnel(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { self.tunnel.stop().await })
+    }
+
+    fn tunnel_address(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + '_>> {
+        Box::pin(async move { self.tunnel.address().await })
     }
 }
 
@@ -3084,6 +3842,19 @@ fn apply_startup_pins(
             "workspaces.root",
             json!(dir.to_string_lossy()),
             "INTENTD_WORKSPACES_DIR",
+        )?;
+    }
+    // The base-tier replacement directory (also settable via
+    // `--specialists-dir`, which `main()` folds into the env var pre-runtime).
+    // The empty string counts as unset, matching the specialists service's
+    // own read of the var.
+    if let Some(dir) =
+        std::env::var_os("INTENTD_SPECIALISTS_DIR").filter(|d| !d.as_os_str().is_empty())
+    {
+        pin(
+            "specialists.dir",
+            json!(dir.to_string_lossy()),
+            "INTENTD_SPECIALISTS_DIR",
         )?;
     }
     Ok(())
@@ -3238,6 +4009,115 @@ fn pid_is_alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn pid_is_alive(_pid: u32) -> bool {
     true
+}
+
+/// Whether the process at `pid` is the supervising sitter: true exactly when
+/// BOTH signals hold — `pid` equals the daemon's parent pid AND the process
+/// at that pid carries a sitter binary name. SIGUSR1's default disposition
+/// terminates, so an unrelated process must never be a signal target, and
+/// neither signal is safe alone:
+///
+/// - Parent equality alone proves direction, not identity: a daemon launched
+///   without a sitter (shell, service manager) next to a stale pidfile whose
+///   recycled pid happens to equal that parent would signal the unrelated
+///   parent. The serve-mode sitter always spawns the daemon directly (see
+///   intentd-sitter's supervisor), so requiring parenthood is still the
+///   pid-recycling guard — `getppid` always names a live process.
+/// - The name alone identifies nothing: `intentd-sitter` is only the
+///   dev-build name — packaging renames the sitter binary to `intentd` at
+///   release time (see intentd-sitter's crate docs, packaging/homebrew,
+///   scripts/install.sh, scripts/build-deb.sh), the exact basename the
+///   daemon and one-shot sitter commands also run under, so a recycled
+///   pidfile pid pointing at another `intentd` process would pass a pure
+///   name check.
+#[cfg(unix)]
+fn pid_is_sitter(pid: u32, expected_parent: u32) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    if pid != expected_parent {
+        return false;
+    }
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(pid).is_some_and(|p| {
+        p.name() == std::ffi::OsStr::new("intentd-sitter")
+            || p.name() == std::ffi::OsStr::new("intentd")
+    })
+}
+
+/// `system.requestUpdate` (§5.7): find the supervising sitter via its pidfile
+/// (`<data_dir>/sitter/sitter.pid`), verify the recorded pid is the
+/// supervising sitter — the daemon's direct parent AND named
+/// `intentd-sitter` (dev build) or `intentd` (packaged rename; see
+/// `pid_is_sitter`) — and send it SIGUSR1, the sitter's "check for updates
+/// now" signal. `Err` carries the reason when the daemon is not
+/// sitter-supervised (missing/unparsable/stale/recycled pidfile) or the
+/// signal cannot be delivered. The pid range is clamped to `1..=i32::MAX`
+/// like `lock_holder_detail`: 0 probes our own process group and larger
+/// values go negative in the `i32` cast (`4294967295` → `-1`, the
+/// signal-every-process-we-can broadcast target).
+#[cfg(unix)]
+fn signal_sitter_update(pid_path: &Path) -> Result<(), String> {
+    signal_sitter_update_with_parent(pid_path, std::os::unix::process::parent_id())
+}
+
+/// Body of [`signal_sitter_update`] with the daemon's parent pid injected,
+/// so unit tests can exercise the parent-pid acceptance path without the
+/// test harness as the actual parent.
+#[cfg(unix)]
+fn signal_sitter_update_with_parent(pid_path: &Path, expected_parent: u32) -> Result<(), String> {
+    let pid = supervising_sitter_pid(pid_path, expected_parent).ok_or_else(|| {
+        format!(
+            "daemon is not supervised by intentd-sitter (pid in {} is not the daemon's parent)",
+            pid_path.display()
+        )
+    })?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid.cast_signed()),
+        nix::sys::signal::Signal::SIGUSR1,
+    )
+    .map_err(|e| format!("failed to signal intentd-sitter (pid {pid}): {e}"))?;
+    tracing::info!(
+        sitter_pid = pid,
+        "sent SIGUSR1 to intentd-sitter (update check requested)"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn signal_sitter_update(_pid_path: &Path) -> Result<(), String> {
+    Err("system.requestUpdate is not supported on this platform (no unix signals)".to_string())
+}
+
+/// Signal-free core of the supervision check shared by `system.requestUpdate`
+/// and the `system.status` → `updateSupported` probe: the verified sitter pid
+/// from `pid_path` when the daemon is currently sitter-supervised — pidfile
+/// read, range clamp to `1..=i32::MAX` (see [`signal_sitter_update`]), and
+/// [`pid_is_sitter`] parent + name verification — else `None`. Sends no
+/// signals; the only OS work is one single-process sysinfo refresh inside
+/// `pid_is_sitter`.
+#[cfg(unix)]
+fn supervising_sitter_pid(pid_path: &Path, expected_parent: u32) -> Option<u32> {
+    read_pid(pid_path)
+        .filter(|pid| (1..=i32::MAX as u32).contains(pid) && pid_is_sitter(*pid, expected_parent))
+}
+
+/// `system.status` → `updateSupported` (§5.7, intent-hq/intent#3875): whether
+/// `system.requestUpdate` would find a supervising sitter right now.
+#[cfg(unix)]
+fn sitter_update_supported(pid_path: &Path) -> bool {
+    supervising_sitter_pid(pid_path, std::os::unix::process::parent_id()).is_some()
+}
+
+/// Non-unix hosts have no sitter supervision (`system.requestUpdate` is
+/// unsupported there), so `updateSupported` is constantly `false`.
+#[cfg(not(unix))]
+fn sitter_update_supported(_pid_path: &Path) -> bool {
+    false
 }
 
 /// Local-transport liveness probe: a successful connect means a daemon is
@@ -3745,6 +4625,7 @@ fn spawn_watcher_registry_init(
     bus: EventBus,
     api: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
+    watch_health: intent_services::WatchHealth,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // `block_in_place`, not a bare `spawn`: the registrations inside are
@@ -3769,7 +4650,7 @@ fn spawn_watcher_registry_init(
                     // exercise worker starvation at all.
                     std::thread::sleep(delay);
                 }
-                WatcherRegistry::start(bus, api, refresher).await
+                WatcherRegistry::start_with_health(bus, api, refresher, &watch_health).await
             })
         });
         tracing::info!("watcher registry ready");
@@ -3802,10 +4683,14 @@ fn spawn_config_watcher_init(
         // It stays inside the runtime context, so the watcher's own
         // `tokio::spawn` of its debounce loop keeps working.
         let started = tokio::task::block_in_place(|| {
-            intent_services::ConfigWatcher::start(registry, move |notice| {
-                let services = watcher_services.clone();
-                async move { services.apply_external_settings_change(&notice).await }
-            })
+            intent_services::ConfigWatcher::start(
+                registry,
+                watcher_services.settings_revision_gate(),
+                move |notice| {
+                    let services = watcher_services.clone();
+                    async move { services.apply_external_settings_change(&notice).await }
+                },
+            )
         });
         let watcher = match started {
             Ok(watcher) => watcher,
@@ -4371,6 +5256,10 @@ fn print_status(config: &Config, r: &Value) {
         r["cpuPercent"].as_f64().unwrap_or(0.0)
     );
     println!("  memoryBytes: {}", r["memoryBytes"].as_u64().unwrap_or(0));
+    println!(
+        "  updateSupported: {}",
+        r["updateSupported"].as_bool().unwrap_or(false)
+    );
     match r["fingerprint"].as_str() {
         Some(fp) => println!("  fingerprint: {fp}"),
         None => println!("  fingerprint: (none)"),
@@ -4712,17 +5601,20 @@ async fn report_context_engine() {
 }
 
 /// Whether the startup interrupted-agent resume sweep should run. The
-/// `--resume-all` flag forces the sweep; otherwise the
+/// `--resume-all` flag forces the sweep, as does `update_restart` (the
+/// sitter set `INTENTD_UPDATE_RESTART=1` because this start is an
+/// update-triggered respawn); otherwise the
 /// `agents.resumeInterruptedOnStart` setting decides: `on` always resumes,
 /// `off` never resumes, and `auto` (the default) resumes only on headless
 /// hosts (no display detected).
 fn should_resume_on_start(
     resume_all: bool,
+    update_restart: bool,
     setting: intent_core::settings_file::ResumeInterruptedOnStart,
     has_display: bool,
 ) -> bool {
     use intent_core::settings_file::ResumeInterruptedOnStart;
-    if resume_all {
+    if resume_all || update_restart {
         return true;
     }
     match setting {
@@ -4890,7 +5782,24 @@ async fn report_provider_availability(config: &Config) {
         // npx-only providers (claude-code, pi) never resolve a local binary;
         // report npx availability instead (the auth probe would need a package
         // download, so it is skipped — auth is the external `claude` CLI).
+        // A valid `providers.paths` adapter override (claude-code opts in,
+        // monorepo#4352) is exec'd directly, so it is reported in place of
+        // npx — matching discovery's `installed` and the session spawn.
         if let Some(pkg) = provider.npx_only_package {
+            let adapter_override = intent_providers::find_provider(provider.id).and_then(|cfg| {
+                intent_providers::resolve_npx_only_override(
+                    cfg,
+                    provider_paths.get(provider.id).map(String::as_str),
+                )
+            });
+            if let Some(adapter) = adapter_override {
+                println!(
+                    "  [ok] {} via providers.paths override: {}",
+                    provider.id,
+                    adapter.display()
+                );
+                continue;
+            }
             match &provider.resolved_path {
                 Some(npx) => {
                     // pi additionally requires the `pi` CLI (which the pi-acp
@@ -5022,7 +5931,8 @@ fn report_config_status(config: &Config) {
     println!("[ok] config.toml parsed: {}", config.config_path.display());
     // Mirror `apply_startup_pins` exactly: a numeric env var only pins when
     // it parses (and `INTENTD_TCP_PORT=0` is the ephemeral-port seam, never a
-    // pin); the two path overrides pin whenever set.
+    // pin); the data/workspaces path overrides pin whenever set, and the
+    // specialists replacement dir only when non-empty.
     let tcp_port_pins = std::env::var("INTENTD_TCP_PORT")
         .ok()
         .and_then(|v| v.trim().parse::<u16>().ok())
@@ -5054,6 +5964,11 @@ fn report_config_status(config: &Config) {
             "INTENTD_WORKSPACES_DIR",
             "workspaces.root",
             std::env::var_os("INTENTD_WORKSPACES_DIR").is_some(),
+        ),
+        (
+            "INTENTD_SPECIALISTS_DIR",
+            "specialists.dir",
+            std::env::var_os("INTENTD_SPECIALISTS_DIR").is_some_and(|d| !d.is_empty()),
         ),
     ];
     let mut any = false;
@@ -5217,96 +6132,775 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bind_choices_list_interfaces_then_all_interfaces_option() {
+    fn banner_build_commit_passes_through_embedded_commit() {
+        assert_eq!(banner_build_commit(Some("abc1234")), "abc1234");
+    }
+
+    #[test]
+    fn banner_build_commit_falls_back_to_unknown() {
+        assert_eq!(banner_build_commit(None), "unknown");
+    }
+
+    /// Overwrite regression guard: `write_private` uses `create_new`, so
+    /// re-exporting to the same path only works because of the preceding
+    /// `remove_file` — a refactor dropping it would break `pair --png`
+    /// re-runs against an existing file.
+    #[test]
+    fn write_secret_file_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pair.png");
+
+        write_secret_file(&path, b"first").unwrap();
+        write_secret_file(&path, b"second").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "re-exported file should stay 0600");
+        }
+    }
+
+    /// A symlink at the export path is replaced with a regular file — the
+    /// bytes must not be written through to the link target.
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_replaces_symlink_instead_of_writing_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("pair.png");
+        std::fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_secret_file(&link, b"secret").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&link).unwrap(), b"secret");
+    }
+
+    /// A stand-in "sitter": `sleep` COPIED as `name` — the kernel-visible
+    /// process name comes from the executed image itself, so a copy carries
+    /// the name on every platform, whereas a symlink resolves to the
+    /// target's name on macOS (intent-hq/monorepo#4220) — `intentd-sitter`
+    /// for the dev build, `intentd` for the packaged rename. SIGUSR1's
+    /// default disposition is terminate, so the child exiting on signal
+    /// 10/30 proves delivery.
+    #[cfg(unix)]
+    fn spawn_stand_in_sitter(dir: &Path, name: &str) -> std::process::Child {
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .expect("sleep binary");
+        let bin = dir.join(name);
+        std::fs::copy(sleep, &bin).unwrap();
+        // Bounded ETXTBSY retry: a concurrently forked test child can
+        // transiently inherit the copy's write fd (closed only at that
+        // child's own exec), making exec of the fresh copy fail with
+        // "Text file busy".
+        for _ in 0..400 {
+            match std::process::Command::new(&bin).arg("30").spawn() {
+                Ok(child) => return child,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("spawn stand-in sitter: {e}"),
+            }
+        }
+        panic!("stand-in sitter spawn kept failing with ETXTBSY");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_sitter_update_errors_when_not_supervised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+
+        // Missing pidfile ⇒ not supervised.
+        let err = signal_sitter_update(&path).unwrap_err();
+        assert!(err.contains("not supervised"), "missing pidfile: {err}");
+
+        // Garbage / out-of-range contents ⇒ not supervised. u32::MAX would
+        // cast to pid -1 — the signal-everything broadcast target — so the
+        // range clamp must reject it before any kill().
+        for garbage in ["", "not a pid", "-4", "0", "2147483648", "4294967295"] {
+            std::fs::write(&path, garbage).unwrap();
+            let err = signal_sitter_update(&path).unwrap_err();
+            assert!(err.contains("not supervised"), "garbage {garbage:?}: {err}");
+        }
+
+        // A stale pid (spawned and already reaped) ⇒ not supervised.
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        std::fs::write(&path, dead_pid.to_string()).unwrap();
+        let err = signal_sitter_update(&path).unwrap_err();
+        assert!(err.contains("not supervised"), "stale pid: {err}");
+
+        // A live pid that is not the daemon's parent (a recycled stale pid)
+        // ⇒ not supervised — never a signal target.
+        let mut not_sitter = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&path, not_sitter.id().to_string()).unwrap();
+        let err = signal_sitter_update(&path).unwrap_err();
+        assert!(err.contains("not supervised"), "live non-parent pid: {err}");
+        not_sitter.kill().unwrap();
+        not_sitter.wait().unwrap();
+    }
+
+    /// Acceptance requires BOTH signals: a live process named
+    /// `intentd-sitter` (dev) or `intentd` (packaged rename) is rejected
+    /// when it is not the daemon's parent — the daemon and one-shot sitter
+    /// commands run under the same `intentd` basename, so a recycled pid
+    /// could too — and signaled once it is also injected as the expected
+    /// parent.
+    #[cfg(unix)]
+    #[test]
+    fn signal_sitter_update_requires_both_parenthood_and_sitter_name() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for name in ["intentd-sitter", "intentd"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sitter.pid");
+            let mut child = spawn_stand_in_sitter(dir.path(), name);
+            std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+
+            // Sitter name but not the daemon's parent ⇒ rejected.
+            let err = signal_sitter_update(&path).unwrap_err();
+            assert!(err.contains("not supervised"), "{name}: {err}");
+
+            // Sitter name AND expected parent ⇒ signaled.
+            signal_sitter_update_with_parent(&path, child.id())
+                .unwrap_or_else(|e| panic!("{name} as parent is signaled: {e}"));
+
+            let status = child.wait().unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(nix::sys::signal::Signal::SIGUSR1 as i32),
+                "{name} child must be terminated by SIGUSR1"
+            );
+        }
+    }
+
+    /// Parent equality alone is not enough: a pidfile pid that matches the
+    /// daemon's parent but is not a sitter-named process (here a plain
+    /// `sleep`, standing in for a shell/service-manager parent next to a
+    /// stale recycled pidfile) must be rejected, never signaled.
+    #[cfg(unix)]
+    #[test]
+    fn signal_sitter_update_rejects_a_parent_that_is_not_a_sitter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+
+        let err = signal_sitter_update_with_parent(&path, child.id()).unwrap_err();
+        assert!(err.contains("not supervised"), "non-sitter parent: {err}");
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// The `system.status` → `updateSupported` probe (intent-hq/intent#3875)
+    /// mirrors the `signal_sitter_update` gate for every unsupervised shape:
+    /// missing pidfile, garbage / out-of-range contents, and a stale
+    /// (reaped) pid all read `false`.
+    #[cfg(unix)]
+    #[test]
+    fn sitter_update_supported_is_false_when_not_supervised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let ppid = std::os::unix::process::parent_id();
+
+        // Missing pidfile ⇒ unsupervised (also exercises the real-ppid wrapper).
+        assert!(!sitter_update_supported(&path), "missing pidfile");
+
+        // Garbage / out-of-range contents ⇒ unsupervised.
+        for garbage in ["", "not a pid", "-4", "0", "2147483648", "4294967295"] {
+            std::fs::write(&path, garbage).unwrap();
+            assert!(
+                supervising_sitter_pid(&path, ppid).is_none(),
+                "garbage {garbage:?}"
+            );
+        }
+
+        // A stale pid (spawned and already reaped) ⇒ unsupervised.
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        std::fs::write(&path, dead_pid.to_string()).unwrap();
+        assert!(supervising_sitter_pid(&path, ppid).is_none(), "stale pid");
+    }
+
+    /// A verified supervising sitter reads `true` — and the probe is
+    /// signal-free: unlike `signal_sitter_update`, the stand-in sitter must
+    /// still be alive after the probe accepts it.
+    #[cfg(unix)]
+    #[test]
+    fn sitter_update_supported_probe_accepts_without_signaling() {
+        for name in ["intentd-sitter", "intentd"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sitter.pid");
+            let mut child = spawn_stand_in_sitter(dir.path(), name);
+            std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+
+            // Sitter name but not the daemon's parent ⇒ unsupervised.
+            assert!(
+                supervising_sitter_pid(&path, std::os::unix::process::parent_id()).is_none(),
+                "{name}: non-parent pid must be rejected"
+            );
+
+            // Sitter name AND expected parent ⇒ supervised.
+            assert_eq!(
+                supervising_sitter_pid(&path, child.id()),
+                Some(child.id()),
+                "{name}: parent sitter is accepted"
+            );
+
+            // No signal was sent: the stand-in (which dies on SIGUSR1) is
+            // still running.
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "{name}: probe must not signal the sitter"
+            );
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn bind_choices_offer_no_loopback_row() {
+        // Loopback is filtered out of the picker: it is not selectable —
+        // the daemon binds it unconditionally (ensure_loopback_bind) — so
+        // only the additional endpoints are offered.
         let ifaces = vec![
             ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
             ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
         ];
         let choices = build_bind_choices(&ifaces);
-        assert_eq!(choices.len(), 3);
+        assert_eq!(choices.len(), 2);
+        assert!(
+            !choices.iter().any(|c| c.addr.is_loopback()),
+            "no loopback row"
+        );
         assert_eq!(
             choices[0].addr,
-            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert!(
-            choices[0].label.contains("loopback"),
-            "{}",
-            choices[0].label
-        );
-        assert_eq!(
-            choices[1].addr,
             "192.168.1.5".parse::<std::net::IpAddr>().unwrap()
         );
-        assert!(choices[1].label.contains("eth0"), "{}", choices[1].label);
+        assert!(choices[0].label.contains("eth0"), "{}", choices[0].label);
         // The all-interfaces entry is explicit and carries the exposure warning.
         assert_eq!(
-            choices[2].addr,
-            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert!(
-            choices[2].label.contains("ALL interfaces"),
-            "{}",
-            choices[2].label
-        );
-        assert!(
-            choices[2].label.contains("internet"),
-            "{}",
-            choices[2].label
-        );
-    }
-
-    #[test]
-    fn bind_choices_no_interfaces_synthesize_loopback_default() {
-        // Empty enumeration must NOT leave 0.0.0.0 as the first (default)
-        // entry: a loopback choice is synthesized ahead of it.
-        let choices = build_bind_choices(&[]);
-        assert_eq!(choices.len(), 2);
-        assert_eq!(
-            choices[0].addr,
-            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert!(
-            choices[0].label.contains("loopback"),
-            "{}",
-            choices[0].label
-        );
-        assert_eq!(
             choices[1].addr,
             "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
         );
-    }
-
-    #[test]
-    fn bind_choices_non_loopback_only_enumeration_synthesizes_loopback_first() {
-        let ifaces = vec![("eth0".to_string(), std::net::Ipv4Addr::new(10, 0, 0, 7))];
-        let choices = build_bind_choices(&ifaces);
-        assert_eq!(choices.len(), 3);
-        assert_eq!(
-            choices[0].addr,
-            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        assert!(
+            choices[1].label.contains("ALL interfaces"),
+            "{}",
+            choices[1].label
         );
-        assert_eq!(
-            choices[1].addr,
-            "10.0.0.7".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert_eq!(
-            choices[2].addr,
-            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        assert!(
+            choices[1].label.contains("internet"),
+            "{}",
+            choices[1].label
         );
     }
 
     #[test]
-    fn parse_bind_choice_matrix() {
-        // Empty (plain Enter) → the default entry.
-        assert_eq!(parse_bind_choice("", 3, 0), Some(0));
-        assert_eq!(parse_bind_choice("  \n", 3, 2), Some(2));
-        // 1-based in-range numbers map to 0-based indices.
-        assert_eq!(parse_bind_choice("1", 3, 0), Some(0));
-        assert_eq!(parse_bind_choice("3\n", 3, 0), Some(2));
-        // Out-of-range / non-numeric → None (re-prompt).
-        assert_eq!(parse_bind_choice("0", 3, 0), None);
-        assert_eq!(parse_bind_choice("4", 3, 0), None);
-        assert_eq!(parse_bind_choice("eth0", 3, 0), None);
+    fn bind_choices_empty_enumeration_offers_only_the_unchecked_wide_entry() {
+        // Empty (or loopback-only) enumeration leaves just the
+        // all-interfaces entry — and nothing is pre-checked for it
+        // (listen_default_indices), so the default is never the wide bind:
+        // plain Enter resolves to the loopback-only bind.
+        for ifaces in [
+            Vec::new(),
+            vec![("lo".to_string(), std::net::Ipv4Addr::LOCALHOST)],
+        ] {
+            let choices = build_bind_choices(&ifaces);
+            assert_eq!(choices.len(), 1);
+            assert!(choices[0].addr.is_unspecified());
+            assert_eq!(
+                listen_default_indices(&choices, &[], false, false),
+                Vec::<usize>::new()
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_loopback_bind_matrix() {
+        let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: std::net::IpAddr = "192.168.1.5".parse().unwrap();
+        // An IP-only selection gains the loopback bind.
+        let mut set = vec![lan];
+        ensure_loopback_bind(&mut set);
+        assert_eq!(set, vec![lan, lo]);
+        // Loopback already present, or a wide bind that covers it (0.0.0.0;
+        // dual-stack ::): no append, no duplicate.
+        for existing in ["127.0.0.1", "0.0.0.0", "::"] {
+            let mut set = vec![existing.parse::<std::net::IpAddr>().unwrap()];
+            ensure_loopback_bind(&mut set);
+            assert_eq!(set.len(), 1, "{existing} needs no append");
+        }
+        let mut set = vec![lo, lan];
+        ensure_loopback_bind(&mut set);
+        assert_eq!(set, vec![lo, lan]);
+        // IPv6 loopback alone does not cover 127.0.0.1 (tailcat dials the
+        // IPv4 loopback): the v4 loopback is appended.
+        let mut set = vec!["::1".parse::<std::net::IpAddr>().unwrap()];
+        ensure_loopback_bind(&mut set);
+        assert_eq!(set, vec!["::1".parse::<std::net::IpAddr>().unwrap(), lo]);
+        // Defense in depth: an empty set (validation forbids it) still
+        // yields the loopback bind.
+        let mut set = Vec::new();
+        ensure_loopback_bind(&mut set);
+        assert_eq!(set, vec![lo]);
+    }
+
+    #[test]
+    fn parse_bind_multi_selection_matrix() {
+        // Empty (plain Enter) → the pre-checked default set.
+        assert_eq!(parse_bind_multi_selection("", 3, &[0]), Ok(vec![0]));
+        assert_eq!(
+            parse_bind_multi_selection("  \n", 3, &[0, 2]),
+            Ok(vec![0, 2])
+        );
+        // 1-based numbers, commas and/or whitespace, deduped in input order.
+        assert_eq!(parse_bind_multi_selection("1", 3, &[0]), Ok(vec![0]));
+        assert_eq!(parse_bind_multi_selection("1,3\n", 3, &[0]), Ok(vec![0, 2]));
+        assert_eq!(parse_bind_multi_selection("3, 1", 3, &[0]), Ok(vec![2, 0]));
+        assert_eq!(parse_bind_multi_selection("2 3", 3, &[0]), Ok(vec![1, 2]));
+        assert_eq!(parse_bind_multi_selection("1,1,1", 3, &[0]), Ok(vec![0]));
+        // Out-of-range / non-numeric → Err (re-prompt) naming the token.
+        assert!(parse_bind_multi_selection("0", 3, &[0]).is_err());
+        assert!(parse_bind_multi_selection("4", 3, &[0]).is_err());
+        assert!(parse_bind_multi_selection("eth0", 3, &[0]).is_err());
+        assert!(parse_bind_multi_selection("1,4", 3, &[0]).is_err());
+        // Only separators (no numbers) → Err, not an empty selection.
+        assert!(parse_bind_multi_selection(",, ,", 3, &[0]).is_err());
+        // 'none' (case-insensitive, alone) → the explicit empty selection
+        // (no additional endpoints — loopback-only bind).
+        assert_eq!(parse_bind_multi_selection("none", 3, &[0]), Ok(vec![]));
+        assert_eq!(parse_bind_multi_selection(" NONE \n", 3, &[0]), Ok(vec![]));
+        // …but it cannot combine with numbers.
+        assert!(parse_bind_multi_selection("none,1", 3, &[0]).is_err());
+    }
+
+    #[test]
+    fn resolve_bind_selection_enforces_exclusive_all_interfaces() {
+        let choices = build_bind_choices(&[
+            ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
+            ("ts0".to_string(), std::net::Ipv4Addr::new(100, 64, 0, 3)),
+        ]);
+        // Specific IPs combine freely.
+        assert_eq!(
+            resolve_bind_selection(&choices, &[0, 1]).unwrap(),
+            vec![
+                "192.168.1.5".parse::<std::net::IpAddr>().unwrap(),
+                "100.64.0.3".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+        // 0.0.0.0 alone is fine…
+        assert_eq!(
+            resolve_bind_selection(&choices, &[2]).unwrap(),
+            vec!["0.0.0.0".parse::<std::net::IpAddr>().unwrap()]
+        );
+        // …but cannot be mixed with specific IPs (either order), and the
+        // re-prompt names the offending entry.
+        let err = resolve_bind_selection(&choices, &[0, 2]).unwrap_err();
+        assert!(err.contains("0.0.0.0"), "should name the wide entry: {err}");
+        assert!(resolve_bind_selection(&choices, &[2, 1]).is_err());
+
+        // A merged IPv6 unspecified entry (persisted `::`, accepted by the
+        // daemon schema) is equally exclusive, and the message names it
+        // rather than hardcoding 0.0.0.0.
+        let with_v6_wide = merge_current_into_bind_choices(
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]),
+            &["::".parse::<std::net::IpAddr>().unwrap()],
+        );
+        let v6_wide_idx = with_v6_wide
+            .iter()
+            .position(|c| c.addr.is_unspecified() && c.addr.is_ipv6())
+            .expect("merged :: entry");
+        let err = resolve_bind_selection(&with_v6_wide, &[0, v6_wide_idx]).unwrap_err();
+        assert!(err.contains("::"), "should name the v6 wide entry: {err}");
+    }
+
+    #[test]
+    fn canonicalized_v4_mapped_entry_equals_its_ipv4_twin() {
+        // `current_bind_addresses` canonicalizes parsed entries the way the
+        // daemon-side BindAddress::resolve does: a persisted
+        // `::ffff:192.168.1.5` must compare equal to the enumerated IPv4
+        // twin, so the picker neither duplicates the entry nor treats
+        // re-selecting the twin as a change.
+        let mapped: std::net::IpAddr = "::ffff:192.168.1.5".parse().unwrap();
+        let v4: std::net::IpAddr = "192.168.1.5".parse().unwrap();
+        assert_ne!(mapped, v4);
+        assert_eq!(mapped.to_canonical(), v4);
+        assert!(same_addr_set(&[mapped.to_canonical()], &[v4]));
+        // Merging the canonicalized set into choices that already list the
+        // IPv4 twin adds nothing.
+        let base =
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]);
+        let base_len = base.len();
+        let merged = merge_current_into_bind_choices(base, &[mapped.to_canonical()]);
+        assert_eq!(merged.len(), base_len);
+    }
+
+    #[test]
+    fn merge_current_into_bind_choices_adds_unknown_entries_before_all_interfaces() {
+        let base =
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]);
+        let current = vec![
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+            "100.64.0.7".parse::<std::net::IpAddr>().unwrap(),
+        ];
+        let merged = merge_current_into_bind_choices(base, &current);
+        // A persisted 127.0.0.1 entry (older versions offered the row) is
+        // skipped — it is always bound; the unknown tailnet IP is inserted
+        // ahead of the trailing all-interfaces entry.
+        assert_eq!(merged.len(), 3);
+        assert!(
+            !merged
+                .iter()
+                .any(|c| c.addr == "127.0.0.1".parse::<std::net::IpAddr>().unwrap()),
+            "persisted 127.0.0.1 must not resurrect its row"
+        );
+        assert_eq!(
+            merged[0].addr,
+            "192.168.1.5".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            merged[1].addr,
+            "100.64.0.7".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(merged[1].label.contains("currently configured"));
+        assert!(merged[2].addr.is_unspecified());
+    }
+
+    #[test]
+    fn merge_current_into_bind_choices_keeps_other_loopback_addresses() {
+        // Only 127.0.0.1 is covered by the unconditional-bind guarantee;
+        // other persisted loopback addresses (::1) keep their
+        // currently-configured rows so the picker never silently drops
+        // their listeners on save.
+        let v6_lo: std::net::IpAddr = "::1".parse().unwrap();
+        let base =
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]);
+        let merged = merge_current_into_bind_choices(base, &[v6_lo]);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].addr, v6_lo);
+        assert!(merged[1].label.contains("currently configured"));
+        assert!(merged[2].addr.is_unspecified());
+
+        // And it pre-checks + round-trips like any configured address.
+        let defaults = listen_default_indices(&merged, &[v6_lo], false, false);
+        assert_eq!(defaults, vec![1]);
+        let sel = resolve_listen_selection(&merged, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[v6_lo], false, false).is_empty());
+    }
+
+    #[test]
+    fn same_addr_set_is_order_insensitive() {
+        let a: Vec<std::net::IpAddr> =
+            vec!["127.0.0.1".parse().unwrap(), "10.0.0.7".parse().unwrap()];
+        let b: Vec<std::net::IpAddr> =
+            vec!["10.0.0.7".parse().unwrap(), "127.0.0.1".parse().unwrap()];
+        assert!(same_addr_set(&a, &b));
+        assert!(!same_addr_set(&a, &a[..1]));
+        assert!(!same_addr_set(&a[..1], &b[..1]));
+        assert!(same_addr_set(&[], &[]));
+    }
+
+    #[test]
+    fn bind_addresses_value_string_or_array_shape() {
+        let one: Vec<std::net::IpAddr> = vec!["192.168.1.5".parse().unwrap()];
+        assert_eq!(bind_addresses_value(&one), json!("192.168.1.5"));
+        let two: Vec<std::net::IpAddr> =
+            vec!["127.0.0.1".parse().unwrap(), "192.168.1.5".parse().unwrap()];
+        assert_eq!(
+            bind_addresses_value(&two),
+            json!(["127.0.0.1", "192.168.1.5"])
+        );
+    }
+
+    #[test]
+    fn listen_default_indices_round_trip() {
+        let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: std::net::IpAddr = "192.168.1.5".parse().unwrap();
+        let choices = build_bind_choices(&[
+            ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
+            ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
+        ]);
+        let tc_idx = choices.len();
+
+        // Tunnel-only mode: ONLY the tailcat entry is pre-checked, so
+        // accepting the default round-trips to an empty changeset instead
+        // of writing server.tunnel.only = false.
+        let defaults = listen_default_indices(&choices, &[lo], true, true);
+        assert_eq!(defaults, vec![tc_idx]);
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lo], true, true).is_empty());
+
+        // Tunnel enabled alongside a LAN bind: addresses + tailcat entry;
+        // the default still diffs to no changes.
+        let lan_pos = (0..choices.len())
+            .find(|&i| choices[i].addr == lan)
+            .unwrap();
+        let defaults = listen_default_indices(&choices, &[lan], true, false);
+        assert_eq!(defaults, vec![lan_pos, tc_idx]);
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lan], true, false).is_empty());
+
+        // No persisted addresses, tunnel off: nothing pre-checked (loopback
+        // is not selectable — always bound). Enter (the empty default)
+        // round-trips to the unchanged loopback bind.
+        let defaults = listen_default_indices(&choices, &[], false, false);
+        assert_eq!(defaults, Vec::<usize>::new());
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lo], false, false).is_empty());
+
+        // A loopback-only persisted set (older versions offered the row)
+        // matches no choice: same empty default, same clean round-trip.
+        let defaults = listen_default_indices(&choices, &[lo], false, false);
+        assert_eq!(defaults, Vec::<usize>::new());
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lo], false, false).is_empty());
+
+        // Mixed persisted set the previous selector could write
+        // ([127.0.0.1, lan]): only the LAN row pre-checks, and Enter still
+        // round-trips clean — the hidden 127.0.0.1 is carried forward by
+        // listen_selection_changes instead of being diffed away.
+        let defaults = listen_default_indices(&choices, &[lo, lan], false, false);
+        assert_eq!(defaults, vec![lan_pos]);
+        let sel = resolve_listen_selection(&choices, &defaults).unwrap();
+        assert!(listen_selection_changes(&sel, &[lo, lan], false, false).is_empty());
+
+        // A persisted ::1 (alone or mixed) keeps a merged currently-configured
+        // row, pre-checks it, and round-trips clean.
+        let v6_lo: std::net::IpAddr = "::1".parse().unwrap();
+        let merged = merge_current_into_bind_choices(
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]),
+            &[v6_lo, lan],
+        );
+        for current in [vec![v6_lo], vec![v6_lo, lan]] {
+            let defaults = listen_default_indices(&merged, &current, false, false);
+            assert_eq!(defaults.len(), current.len());
+            let sel = resolve_listen_selection(&merged, &defaults).unwrap();
+            assert!(listen_selection_changes(&sel, &current, false, false).is_empty());
+        }
+    }
+
+    #[test]
+    fn resolve_listen_selection_maps_tailcat_entry() {
+        let choices = build_bind_choices(&[
+            ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
+            ("ts0".to_string(), std::net::Ipv4Addr::new(100, 64, 0, 3)),
+        ]);
+        // Tailcat entry is the index just past the address choices.
+        let tc_idx = choices.len();
+
+        // Address-only selection: tunnel off.
+        let sel = resolve_listen_selection(&choices, &[0]).unwrap();
+        assert_eq!(
+            sel.addresses,
+            vec!["192.168.1.5".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert!(!sel.tailcat);
+
+        // Tunnel combines with any address set.
+        let sel = resolve_listen_selection(&choices, &[0, 1, tc_idx]).unwrap();
+        assert_eq!(sel.addresses.len(), 2);
+        assert!(sel.tailcat);
+
+        // Tunnel-only: empty address set, tailcat on.
+        let sel = resolve_listen_selection(&choices, &[tc_idx]).unwrap();
+        assert!(sel.addresses.is_empty());
+        assert!(sel.tailcat);
+
+        // All-interfaces stays exclusive among the addresses even with the
+        // tunnel selected.
+        assert!(resolve_listen_selection(&choices, &[0, 2, tc_idx]).is_err());
+        // …but all-interfaces + tunnel alone is fine.
+        let sel = resolve_listen_selection(&choices, &[2, tc_idx]).unwrap();
+        assert!(sel.addresses[0].is_unspecified());
+        assert!(sel.tailcat);
+    }
+
+    #[test]
+    fn listen_selection_changes_diffs_against_current_state() {
+        let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: std::net::IpAddr = "192.168.1.5".parse().unwrap();
+
+        // Unchanged selection (same addresses, tunnel state matches): no writes.
+        let sel = ListenSelection {
+            addresses: vec![lan],
+            tailcat: false,
+        };
+        assert!(listen_selection_changes(&sel, &[lan], false, false).is_empty());
+
+        // New address set: bindAddress only — the persisted 127.0.0.1 (whose
+        // picker row is gone) is carried forward, not silently dropped.
+        let changes = listen_selection_changes(&sel, &[lo], false, false);
+        assert_eq!(
+            changes,
+            vec![json!({
+                "path": "server.bindAddress",
+                "value": ["192.168.1.5", "127.0.0.1"],
+            })]
+        );
+
+        // `none` on a mixed persisted set still narrows to the loopback pin:
+        // an explicit empty selection means "no additional endpoints".
+        let none_sel = ListenSelection {
+            addresses: Vec::new(),
+            tailcat: false,
+        };
+        let changes = listen_selection_changes(&none_sel, &[lo, lan], false, false);
+        assert_eq!(
+            changes,
+            vec![json!({ "path": "server.bindAddress", "value": "127.0.0.1" })]
+        );
+
+        // Tunnel newly selected alongside an unchanged address: value key
+        // (tunnel.only would be unchanged false) then the enable.
+        let sel = ListenSelection {
+            addresses: vec![lan],
+            tailcat: true,
+        };
+        let changes = listen_selection_changes(&sel, &[lan], false, false);
+        assert_eq!(
+            changes,
+            vec![json!({ "path": "server.tunnel.enabled", "value": true })]
+        );
+
+        // Tunnel-only selection: pins loopback explicitly, sets only + enabled,
+        // and orders the value keys before the enable.
+        let sel = ListenSelection {
+            addresses: Vec::new(),
+            tailcat: true,
+        };
+        let changes = listen_selection_changes(&sel, &[lan], false, false);
+        assert_eq!(
+            changes,
+            vec![
+                json!({ "path": "server.bindAddress", "value": "127.0.0.1" }),
+                json!({ "path": "server.tunnel.only", "value": true }),
+                json!({ "path": "server.tunnel.enabled", "value": true }),
+            ]
+        );
+        // Same tunnel-only selection already in effect: nothing to write.
+        assert!(listen_selection_changes(&sel, &[lo], true, true).is_empty());
+
+        // The ambiguous empty-addresses + tailcat selection is ALSO the
+        // picker default for a "127.0.0.1 bind + tunnel enabled (not only)"
+        // state — a plain Enter re-states the current state and must not
+        // silently flip server.tunnel.only.
+        assert!(listen_selection_changes(&sel, &[lo], true, false).is_empty());
+
+        // Deselecting the tunnel from tunnel-only mode: both flags drop, the
+        // loopback bind persists unchanged.
+        let sel = ListenSelection {
+            addresses: vec![lo],
+            tailcat: false,
+        };
+        let changes = listen_selection_changes(&sel, &[lo], true, true);
+        assert_eq!(
+            changes,
+            vec![
+                json!({ "path": "server.tunnel.only", "value": false }),
+                json!({ "path": "server.tunnel.enabled", "value": false }),
+            ]
+        );
+
+        // Adding a LAN address while the tunnel stays on: tunnel.only drops,
+        // and the persisted loopback pin rides along.
+        let sel = ListenSelection {
+            addresses: vec![lan],
+            tailcat: true,
+        };
+        let changes = listen_selection_changes(&sel, &[lo], true, true);
+        assert_eq!(
+            changes,
+            vec![
+                json!({
+                    "path": "server.bindAddress",
+                    "value": ["192.168.1.5", "127.0.0.1"],
+                }),
+                json!({ "path": "server.tunnel.only", "value": false }),
+            ]
+        );
+
+        // The exclusive all-interfaces selection cannot legally carry the
+        // persisted loopback (bindAddress validation): 0.0.0.0 replaces it.
+        let sel = ListenSelection {
+            addresses: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)],
+            tailcat: false,
+        };
+        let changes = listen_selection_changes(&sel, &[lo, lan], false, false);
+        assert_eq!(
+            changes,
+            vec![json!({ "path": "server.bindAddress", "value": "0.0.0.0" })]
+        );
+    }
+
+    #[test]
+    fn bind_value_display_handles_string_and_array_shapes() {
+        assert_eq!(
+            bind_value_display(&json!("192.168.1.5")).as_deref(),
+            Some("192.168.1.5")
+        );
+        assert_eq!(
+            bind_value_display(&json!(["127.0.0.1", "192.168.1.5"])).as_deref(),
+            Some("127.0.0.1, 192.168.1.5")
+        );
+        assert_eq!(bind_value_display(&json!([])), None);
+        assert_eq!(bind_value_display(&json!(true)), None);
+    }
+
+    #[test]
+    fn antigravity_login_cli_is_explicit_and_personal_only() {
+        let cli = Cli::try_parse_from([
+            "intentd",
+            "provider",
+            "login",
+            "antigravity",
+            "--path",
+            "/custom/antigravity-acp",
+        ])
+        .unwrap();
+        let Command::Provider { command } = cli.command else {
+            panic!("provider command")
+        };
+        assert!(!command.is_internal_helper());
+        let provider::ProviderCommand::Login { provider, path } = command else {
+            panic!("login command")
+        };
+        assert_eq!(provider, "antigravity");
+        assert_eq!(path, Some(PathBuf::from("/custom/antigravity-acp")));
+        assert!(Cli::try_parse_from(["intentd", "provider", "login", "oauth-business"]).is_err());
+        assert!(Cli::try_parse_from(["intentd", "provider", "login"]).is_err());
+    }
+
+    #[test]
+    fn antigravity_internal_helpers_skip_daemon_logging() {
+        for helper in ["antigravity-browser-guard", "antigravity-login-url"] {
+            let cli = Cli::try_parse_from([
+                "intentd",
+                "provider",
+                helper,
+                "https://accounts.google.com/o/oauth2/v2/auth?state=fixture",
+            ])
+            .unwrap();
+            let Command::Provider { command } = cli.command else {
+                panic!("provider command")
+            };
+            assert!(command.is_internal_helper());
+        }
     }
 
     #[test]
@@ -5517,10 +7111,29 @@ mod tests {
     #[test]
     fn resume_on_start_flag_forces_resume() {
         use intent_core::settings_file::ResumeInterruptedOnStart as R;
-        // --resume-all wins regardless of setting or display.
+        // --resume-all wins regardless of update-restart, setting, or display.
+        for update_restart in [true, false] {
+            for setting in [R::Auto, R::On, R::Off] {
+                for has_display in [true, false] {
+                    assert!(should_resume_on_start(
+                        true,
+                        update_restart,
+                        setting,
+                        has_display
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resume_on_start_update_restart_forces_resume() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        // An update-triggered restart wins regardless of setting or display,
+        // same as --resume-all.
         for setting in [R::Auto, R::On, R::Off] {
             for has_display in [true, false] {
-                assert!(should_resume_on_start(true, setting, has_display));
+                assert!(should_resume_on_start(false, true, setting, has_display));
             }
         }
     }
@@ -5529,16 +7142,16 @@ mod tests {
     fn resume_on_start_setting_on_and_off_ignore_display() {
         use intent_core::settings_file::ResumeInterruptedOnStart as R;
         for has_display in [true, false] {
-            assert!(should_resume_on_start(false, R::On, has_display));
-            assert!(!should_resume_on_start(false, R::Off, has_display));
+            assert!(should_resume_on_start(false, false, R::On, has_display));
+            assert!(!should_resume_on_start(false, false, R::Off, has_display));
         }
     }
 
     #[test]
     fn resume_on_start_auto_resumes_only_headless() {
         use intent_core::settings_file::ResumeInterruptedOnStart as R;
-        assert!(should_resume_on_start(false, R::Auto, false));
-        assert!(!should_resume_on_start(false, R::Auto, true));
+        assert!(should_resume_on_start(false, false, R::Auto, false));
+        assert!(!should_resume_on_start(false, false, R::Auto, true));
     }
 
     #[test]
