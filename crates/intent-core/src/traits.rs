@@ -3948,6 +3948,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.issues.get`: `GET /repos/{owner}/{repo}/issues/{number}` → `{ issue }`.
+    fn github_issues_get(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_issues_get not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.issues.list`: `GET /repos/{owner}/{repo}/issues` (PRs filtered
     /// out) → `{ issues, nextToken }`.
     #[allow(clippy::too_many_arguments)]

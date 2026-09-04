@@ -2588,6 +2588,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.issues.get" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let number = require_u64(params, "number")?;
+            let r = api
+                .github_issues_get(owner, repo, number)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "github.branches.list" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;

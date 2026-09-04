@@ -3,6 +3,8 @@
 //! engine as `PrQuery.search` / `IssueQuery.search` (trimmed, blanks dropped),
 //! the `nextToken` cursor must round-trip onto the engine cursor, and the
 //! no-query call must keep the pre-existing listing behavior (`search: None`).
+//! Also covers the single-issue `github.issues.get` read and its `GithubIssue`
+//! author/timestamp fields.
 //! Drives a real [`WsApiServer`] over TLS with bearer-token auth and a pinned
 //! self-signed fingerprint (the production transport path) with a recording
 //! stub forge injected via `with_source_control`.
@@ -167,6 +169,9 @@ fn sample_issue() -> Issue {
         body: None,
         state: "open".into(),
         url: "https://github.com/o/r/issues/11".into(),
+        author: "reporter".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-02T00:00:00Z".into(),
     }
 }
 
@@ -181,6 +186,7 @@ fn sample_issue() -> Issue {
 struct RecordingForge {
     pr_queries: Mutex<Vec<PrQuery>>,
     issue_queries: Mutex<Vec<IssueQuery>>,
+    issue_gets: Mutex<Vec<(RepoRef, u64)>>,
     branch_queries: Mutex<Vec<(Option<String>, Option<String>)>>,
 }
 
@@ -340,8 +346,12 @@ impl SourceControl for RecordingForge {
     async fn create_issue(&self, _: &RepoRef, _: &str, _: Option<&str>) -> ScResult<Issue> {
         unimplemented!()
     }
-    async fn get_issue(&self, _: &RepoRef, _: u64) -> ScResult<Issue> {
-        unimplemented!()
+    async fn get_issue(&self, repo: &RepoRef, number: u64) -> ScResult<Issue> {
+        self.issue_gets.lock().unwrap().push((repo.clone(), number));
+        Ok(Issue {
+            number,
+            ..sample_issue()
+        })
     }
     async fn list_issues(&self, _: &RepoRef, query: IssueQuery) -> ScResult<Page<Issue>> {
         self.issue_queries.lock().unwrap().push(query);
@@ -550,6 +560,49 @@ async fn search_without_query_leaves_listing_unchanged() {
     assert_eq!(pr_queries.len(), 1);
     assert_eq!(pr_queries[0].search, None);
     assert_eq!(pr_queries[0].involvement, None);
+}
+
+/// `github.issues.get` resolves a single issue by `{owner, repo, number}`:
+/// the addressing reaches the engine verbatim and the `{ issue }` result is
+/// the `GithubIssue` DTO with `user.login` / `createdAt` / `updatedAt`
+/// populated from the engine model, while a missing `number` is rejected in
+/// the router with `-32602` before the engine is touched.
+#[tokio::test]
+async fn issues_get_returns_issue_with_author_and_timestamps() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let r = wss_rpc(
+        &mut ws,
+        1,
+        "github.issues.get",
+        json!({ "owner": "o", "repo": "r", "number": 7 }),
+    )
+    .await;
+    let issue = &r["issue"];
+    assert_eq!(issue["number"], 7);
+    assert_eq!(issue["title"], "Login bug");
+    assert_eq!(issue["state"], "open");
+    assert_eq!(issue["htmlUrl"], "https://github.com/o/r/issues/11");
+    assert_eq!(issue["user"]["login"], "reporter");
+    assert_eq!(issue["createdAt"], "2026-01-01T00:00:00Z");
+    assert_eq!(issue["updatedAt"], "2026-01-02T00:00:00Z");
+    assert_eq!(issue["owner"], "o");
+    assert_eq!(issue["repo"], "r");
+    assert_eq!(issue["labels"], json!([]));
+    assert_eq!(issue["comments"], 0);
+
+    let env = wss_rpc_envelope(
+        &mut ws,
+        2,
+        "github.issues.get",
+        json!({ "owner": "o", "repo": "r" }),
+    )
+    .await;
+    assert_eq!(env["error"]["code"], json!(-32602), "envelope: {env}");
+
+    let gets = fx.forge.issue_gets.lock().unwrap();
+    assert_eq!(*gets, vec![(RepoRef::new("o", "r"), 7)]);
 }
 
 /// `github.issues.search` rejects the PR-only `review-requested` filter with
