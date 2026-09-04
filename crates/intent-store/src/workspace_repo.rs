@@ -2,8 +2,8 @@
 
 use intent_core::{
     now_iso, CheckoutMode, ContextLink, Error, PullRequestInfo, Result, SetupResult, SetupScript,
-    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    CHIEF_WORKSPACE_ID,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceDraftId, WorkspaceId,
+    WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -131,6 +131,107 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
         Ok(())
+    }
+
+    /// Insert a workspace and durably correlate it to a promoting draft in one
+    /// transaction. A restart can therefore recover the original workspace
+    /// even if the process exits before promotion finalization/idempotency.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` when the draft is no longer promoting, or
+    /// `Error::Internal` when serialization or the transaction fails.
+    pub async fn insert_workspace_for_draft_with_auto_commit(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+        draft_id: &WorkspaceDraftId,
+    ) -> Result<()> {
+        let status = enum_to_db(&ws.status)?;
+        let attention = enum_to_db(&ws.attention)?;
+        let pr_status = pr_status_to_db(ws)?;
+        let active_pr = active_pr_to_db(ws)?;
+        let pull_requests = pull_requests_to_db(ws)?;
+        let context_links = context_links_to_db(ws)?;
+        let tags = tags_to_db(&ws.tags)?;
+        let token_usage = token_usage_to_db(ws)?;
+        let setup_script = setup_script_to_db(ws)?;
+        let setup_result = setup_result_to_db(ws)?;
+        let checkout_mode = checkout_mode_to_db(ws)?;
+        let mut conn =
+            self.write_pool().acquire().await.map_err(|e| {
+                Error::Internal(format!("acquire workspace insert connection: {e}"))
+            })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("begin workspace draft insert: {e}")))?;
+        let sql = format!(
+            "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        );
+        let inserted = sqlx::query(&sql)
+            .bind(&ws.id.0)
+            .bind(&ws.title)
+            .bind(&ws.branch)
+            .bind(&ws.base_ref)
+            .bind(&ws.base_commit_sha)
+            .bind(status)
+            .bind(&ws.status_message)
+            .bind(&ws.status_image_asset_id)
+            .bind(attention)
+            .bind(&ws.path)
+            .bind(&ws.repository_path)
+            .bind(&ws.repository_owner)
+            .bind(&ws.repository_name)
+            .bind(&ws.worktree_path)
+            .bind(&ws.scope)
+            .bind(i64::from(ws.skip_worktree))
+            .bind(i64::from(ws.is_remote))
+            .bind(&ws.default_model)
+            .bind(ws.pr_number.map(u64::cast_signed))
+            .bind(&ws.pr_url)
+            .bind(pr_status)
+            .bind(active_pr)
+            .bind(pull_requests)
+            .bind(context_links)
+            .bind(i64::from(ws.archived))
+            .bind(&ws.archived_at)
+            .bind(tags)
+            .bind(&ws.created_at)
+            .bind(&ws.updated_at)
+            .bind(&ws.last_activity)
+            .bind(token_usage)
+            .bind(setup_script)
+            .bind(setup_result)
+            .bind(checkout_mode)
+            .bind(auto_commit.map(i64::from))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")));
+        let body = match inserted {
+            Ok(_) => sqlx::query(
+                "UPDATE workspace_draft SET promoted_workspace_id=?, updated_at=? \
+                 WHERE id=? AND phase='promoting'",
+            )
+            .bind(&ws.id.0)
+            .bind(now_iso())
+            .bind(&draft_id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("map workspace draft promotion failed: {e}")))
+            .and_then(|result| {
+                if result.rows_affected() == 1 {
+                    Ok(())
+                } else {
+                    Err(Error::NotFound(format!(
+                        "promoting workspace draft {draft_id}"
+                    )))
+                }
+            }),
+            Err(error) => Err(error),
+        };
+        crate::commit_with_rollback_guard(conn, body, "commit workspace draft insert").await
     }
 
     /// Fetch a single workspace by id, or `NotFound`.

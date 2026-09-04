@@ -52,6 +52,9 @@ use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
+/// Integration-test callback for interrupting workspace draft promotion.
+pub type WorkspaceDraftPromotionFailpoint = Arc<dyn Fn(&WorkspaceDraftId) -> bool + Send + Sync>;
+
 mod acp_adapter;
 mod agent_locks;
 mod agent_manager;
@@ -341,6 +344,9 @@ pub struct Services {
     /// Per-draft single-flight gates for idempotent promotion. Shared by clones.
     workspace_draft_promotion_locks:
         Arc<Mutex<HashMap<WorkspaceDraftId, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Integration-test seam after `workspace.create` has durably completed
+    /// but before the draft is finalized. Production wiring keeps this unset.
+    workspace_draft_promotion_failpoint: Option<WorkspaceDraftPromotionFailpoint>,
     /// Per-agent in-memory send queues backing `agent.queueMessage` /
     /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
@@ -1087,6 +1093,7 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
             workspace_draft_promotion_locks: Arc::new(Mutex::new(HashMap::new())),
+            workspace_draft_promotion_failpoint: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
@@ -1196,6 +1203,17 @@ impl Services {
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
+    }
+
+    /// Install an integration-test promotion failpoint. Returning `true` after
+    /// `workspace.create` simulates process loss before the RPC result is acknowledged.
+    #[must_use]
+    pub fn with_workspace_draft_promotion_failpoint(
+        mut self,
+        failpoint: WorkspaceDraftPromotionFailpoint,
+    ) -> Self {
+        self.workspace_draft_promotion_failpoint = Some(failpoint);
+        self
     }
 
     /// Pin the PR-monitor poll cadence, bypassing the live
@@ -12356,6 +12374,7 @@ pub(crate) async fn with_idempotency<T, F, Fut>(
     workspace_id: &str,
     key: Option<String>,
     method: &str,
+    after_op: Option<Box<dyn FnOnce() -> Result<()> + Send>>,
     op: F,
 ) -> Result<T>
 where
@@ -12376,6 +12395,9 @@ where
         return Ok(value);
     }
     let result = op().await?;
+    if let Some(after_op) = after_op {
+        after_op()?;
+    }
     let result_json = serde_json::to_string(&result)
         .map_err(|e| Error::Internal(format!("encode idempotent result failed: {e}")))?;
     store
@@ -16359,11 +16381,28 @@ impl WorkspaceApi for Services {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let wrapper_bus = bus.clone();
+            let promotion_failpoint = input.workspace_draft_id.clone().and_then(|draft_id| {
+                services
+                    .workspace_draft_promotion_failpoint
+                    .clone()
+                    .map(|failpoint| {
+                        Box::new(move || {
+                            if failpoint(&draft_id) {
+                                Err(Error::Internal(
+                                    "injected workspace draft promotion crash after create".into(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        }) as Box<dyn FnOnce() -> Result<()> + Send>
+                    })
+            });
             let result = with_idempotency(
                 &store,
                 "",
                 idempotency_key,
                 "workspace.create",
+                promotion_failpoint,
                 move || async move {
                     let store = op_store;
                     let now = now_iso();
@@ -17815,9 +17854,19 @@ impl WorkspaceApi for Services {
                     // in the same INSERT so later global changes don't
                     // retroactively flip existing workspaces — atomic, so the
                     // row can never exist without its seed.
-                    store
-                        .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
-                        .await?;
+                    if let Some(draft_id) = input.workspace_draft_id.as_ref() {
+                        store
+                            .insert_workspace_for_draft_with_auto_commit(
+                                &ws,
+                                Some(global_auto_commit),
+                                draft_id,
+                            )
+                            .await?;
+                    } else {
+                        store
+                            .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
+                            .await?;
+                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -20730,6 +20779,7 @@ impl WorkspaceApi for Services {
                 &ws_scope,
                 idempotency_key,
                 "note.create",
+                None,
                 move || async move {
                     let store = op_store;
                     let now = now_iso();
@@ -22567,6 +22617,7 @@ impl WorkspaceApi for Services {
                 &ws_scope,
                 idempotency_key,
                 "comment.add",
+                None,
                 move || async move {
                     let store = op_store;
                     if comment.trim().is_empty() {
@@ -24544,6 +24595,7 @@ impl WorkspaceApi for Services {
                 &ws_scope,
                 idempotency_key,
                 "git.commit",
+                None,
                 move || async move {
                     let store = op_store;
                     git_ops::assert_agent_commit_allowed(auto_commit_enabled, false)?;
@@ -25592,6 +25644,7 @@ impl WorkspaceApi for Services {
                 &ws_scope,
                 idempotency_key,
                 "agent.create",
+                None,
                 move || async move {
                     self.agent_create_op(
                         workspace_id,

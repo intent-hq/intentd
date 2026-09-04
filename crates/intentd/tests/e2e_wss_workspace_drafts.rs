@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{Result as CoreResult, WorkspaceApi};
-use intent_services::{EventBus, Services};
+use intent_services::{EventBus, Services, WorkspaceDraftPromotionFailpoint};
 use intent_store::Store;
 use intent_transport::{
     ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
@@ -139,11 +139,21 @@ impl Drop for TempDir {
 }
 
 async fn boot(root: &Path) -> (WsApiServer, u16, Arc<ClientConfig>) {
+    boot_with_failpoint(root, None).await
+}
+
+async fn boot_with_failpoint(
+    root: &Path,
+    failpoint: Option<WorkspaceDraftPromotionFailpoint>,
+) -> (WsApiServer, u16, Arc<ClientConfig>) {
     let store = Store::open(&root.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store)
+    let mut services = Services::new(store)
         .with_workspaces_root(root.join("workspaces"))
         .with_event_bus(bus.clone());
+    if let Some(failpoint) = failpoint {
+        services = services.with_workspace_draft_promotion_failpoint(failpoint);
+    }
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let tls = ensure_tls_certificate(root).expect("certificate");
     let token_store_inner = Arc::new(MemTokenStore::default());
@@ -165,6 +175,109 @@ async fn boot(root: &Path) -> (WsApiServer, u16, Arc<ClientConfig>) {
     let config = client_config(&tls.fingerprint256);
     let port = server.start().await.expect("start");
     (server, port, config)
+}
+
+#[tokio::test]
+async fn promotion_restart_after_create_recovers_one_workspace_agent_and_turn() {
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let fail_draft = Arc::new(Mutex::new(None::<String>));
+    let fail_draft_probe = fail_draft.clone();
+    let failpoint: WorkspaceDraftPromotionFailpoint = Arc::new(move |draft_id| {
+        fail_draft_probe.lock().unwrap().as_deref() == Some(draft_id.as_str())
+    });
+    let (server, port, config) = boot_with_failpoint(&root.0, Some(failpoint)).await;
+    let mut ws = connect(port, config).await;
+    let draft = rpc(
+        &mut ws,
+        1,
+        "workspaceDraft.create",
+        json!({
+            "intentText":"crash-safe",
+            "source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}
+        }),
+    )
+    .await;
+    let draft_id = draft["id"].as_str().unwrap().to_string();
+    *fail_draft.lock().unwrap() = Some(draft_id.clone());
+    let interrupted = rpc_raw(
+        &mut ws,
+        2,
+        "workspaceDraft.promote",
+        json!({
+            "id":draft_id,
+            "expectedRevision":0,
+            "initialAgent":{"name":"Coordinator","provider":"codex","prompt":"first turn"}
+        }),
+    )
+    .await;
+    assert_eq!(interrupted["error"]["code"], -32603);
+    let interrupted_draft = rpc(&mut ws, 3, "workspaceDraft.get", json!({"id":draft_id})).await;
+    assert_eq!(interrupted_draft["phase"], "failed");
+    let operation_key = interrupted_draft["operationKey"].as_str().unwrap();
+    let probe_store = Store::open(&root.0.join("intentd.db"))
+        .await
+        .expect("probe store");
+    assert_eq!(
+        probe_store
+            .get_idempotent("", operation_key)
+            .await
+            .expect("read idempotency row"),
+        None,
+        "interruption must occur before the workspace.create result is cached"
+    );
+    let workspace_id = interrupted_draft["promotedWorkspaceId"]
+        .as_str()
+        .expect("workspace mapping committed before interruption")
+        .to_string();
+    drop(ws);
+    drop(server);
+
+    let (_restarted, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let recovered = rpc(
+        &mut ws,
+        4,
+        "workspaceDraft.promote",
+        json!({
+            "id":draft_id,
+            "expectedRevision":0,
+            "initialAgent":{"name":"Coordinator","provider":"codex","prompt":"first turn"}
+        }),
+    )
+    .await;
+    assert_eq!(recovered["workspace"]["id"], workspace_id);
+    assert_eq!(recovered["draft"]["phase"], "promoted");
+    let agent_id = recovered["initialAgent"]["id"]
+        .as_str()
+        .expect("original initial agent recovered")
+        .to_string();
+
+    let workspaces = rpc(&mut ws, 5, "workspace.list", json!({})).await;
+    assert_eq!(workspaces["workspaces"].as_array().unwrap().len(), 1);
+    let agents = rpc(
+        &mut ws,
+        6,
+        "agent.list",
+        json!({"workspaceId":workspace_id}),
+    )
+    .await;
+    assert_eq!(agents["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(agents["agents"][0]["id"], agent_id);
+    let conversation = rpc(
+        &mut ws,
+        7,
+        "agent.getConversation",
+        json!({"workspaceId":workspace_id,"agentId":agent_id}),
+    )
+    .await;
+    let first_turns = conversation["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .count();
+    assert_eq!(first_turns, 1, "restart must not duplicate the first turn");
 }
 
 async fn connect(port: u16, config: Arc<ClientConfig>) -> Ws {

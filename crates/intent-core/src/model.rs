@@ -1050,6 +1050,11 @@ pub struct WorkspaceCreate {
     pub context_links: Option<Vec<ContextLink>>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
+    /// Internal draft correlation used to atomically persist the
+    /// draft-to-workspace mapping with the workspace row. Never accepted from
+    /// the wire; ordinary `workspace.create` callers leave it unset.
+    #[serde(skip)]
+    pub workspace_draft_id: Option<WorkspaceDraftId>,
 }
 
 /// The `initialAgent` sub-object of `workspace.create` (PROTOCOL §5.1). Full
