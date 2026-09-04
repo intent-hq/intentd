@@ -55,7 +55,10 @@ pub struct TransferAttachment {
 /// e.g. `sub/inner`); `branch` is the submodule's attached HEAD branch when
 /// there is one. `carried: true` means the objects ride in the archive as a
 /// submodule bundle (a workspace-worktree finding); `carried: false` marks a
-/// sandbox-only finding that is reported but not bundled.
+/// sandbox-only finding that is reported but not bundled. `published: true`
+/// marks a commit that IS on a remote but is listed (and bundled) anyway
+/// because a nested submodule below it is unpublished and cannot be checked
+/// out without its containing repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferSubmoduleSummary {
@@ -65,6 +68,8 @@ pub struct TransferSubmoduleSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     pub carried: bool,
+    #[serde(default)]
+    pub published: bool,
 }
 
 /// Git state summary for the manifest: the checked-out branch, dirty paths

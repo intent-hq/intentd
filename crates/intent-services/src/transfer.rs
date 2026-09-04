@@ -313,9 +313,11 @@ fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
 }
 
 /// Detect submodules pointing at unpublished commits in the worktree
-/// (`carried: true`, bundled) and in each live sandbox checkout
-/// (`carried: false`, reported only), deduped by `(path, commit_sha)` with
-/// worktree findings taking precedence. Returns the summaries plus the
+/// (`carried: true`, bundled — together with the published ancestors a
+/// nested finding needs, `published: true`) and in each live sandbox
+/// checkout (`carried: false`, reported only; published ancestors are
+/// skipped there since nothing is bundled), deduped by `(path, commit_sha)`
+/// with worktree findings taking precedence. Returns the summaries plus the
 /// estimated bundle bytes of the carried ones. Detection failures degrade to
 /// an empty result — the plan must never fail on a submodule scan.
 fn scan_unpublished_submodules(
@@ -331,6 +333,7 @@ fn scan_unpublished_submodules(
         commit_sha: s.commit_sha.clone(),
         branch: s.branch.clone(),
         carried,
+        published: s.published,
     };
     for sub in find_unpublished_submodules(root).unwrap_or_default() {
         if seen.insert((sub.path.clone(), sub.commit_sha.clone())) {
@@ -343,7 +346,7 @@ fn scan_unpublished_submodules(
             continue;
         }
         for sub in find_unpublished_submodules(sandbox).unwrap_or_default() {
-            if seen.insert((sub.path.clone(), sub.commit_sha.clone())) {
+            if !sub.published && seen.insert((sub.path.clone(), sub.commit_sha.clone())) {
                 out.push(summarize(&sub, false));
             }
         }
@@ -352,11 +355,14 @@ fn scan_unpublished_submodules(
 }
 
 /// The single `submodule-unpublished-commits` warning message, or `None`
-/// when no submodule points at an unpublished commit.
+/// when no submodule points at an unpublished commit. Published ancestors
+/// bundled for a nested finding are named in a trailing clause, not counted
+/// as unpublished.
 fn submodule_warning(
     submodules: &[TransferSubmoduleSummary],
     carried_bytes: u64,
 ) -> Option<String> {
+    use std::fmt::Write as _;
     if submodules.is_empty() {
         return None;
     }
@@ -369,7 +375,12 @@ fn submodule_warning(
     };
     let carried: Vec<String> = submodules
         .iter()
-        .filter(|s| s.carried)
+        .filter(|s| s.carried && !s.published)
+        .map(describe)
+        .collect();
+    let carried_parents: Vec<String> = submodules
+        .iter()
+        .filter(|s| s.carried && s.published)
         .map(describe)
         .collect();
     let sandbox_only: Vec<String> = submodules
@@ -380,7 +391,7 @@ fn submodule_warning(
     let mut message = if carried.is_empty() {
         format!(
             "{} submodule(s) point at commits not on any remote.",
-            submodules.len()
+            sandbox_only.len()
         )
     } else {
         format!(
@@ -391,8 +402,14 @@ fn submodule_warning(
             carried.join(", ")
         )
     };
+    if !carried_parents.is_empty() {
+        let _ = write!(
+            message,
+            " Also bundled so the nested submodule(s) can be checked out: {}.",
+            carried_parents.join(", ")
+        );
+    }
     if !sandbox_only.is_empty() {
-        use std::fmt::Write as _;
         let _ = write!(
             message,
             " Not carried (sandbox only): {}.",
@@ -814,6 +831,68 @@ mod tests {
         );
     }
 
+    /// A nested unpublished submodule under a PUBLISHED parent: exactly one
+    /// warning counts only the nested finding as unpublished and names the
+    /// parent in the "Also bundled" clause; the manifest lists the parent
+    /// first (`carried: true, published: true`) then the child
+    /// (`published: false`), and the estimate includes both bundles.
+    #[tokio::test]
+    async fn transfer_plan_carries_published_parent_of_nested_submodule() {
+        use crate::transfer_submodules::test_fixture::{
+            nested_unpublished_under_published_parent, NestedFixture,
+        };
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+
+        let root = TempDir::new("intentd-transfer-submodule-nested");
+        let NestedFixture {
+            sup,
+            sub_sha,
+            inner_sha,
+            ..
+        } = nested_unpublished_under_published_parent(&root.0);
+
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(sup.to_string_lossy().to_string());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = Services::new(store);
+        let plan = svc.workspace_transfer_plan_op(ws).await.expect("plan");
+
+        let warns: Vec<_> = plan
+            .warnings
+            .iter()
+            .filter(|w| w.code == "submodule-unpublished-commits")
+            .collect();
+        assert_eq!(warns.len(), 1, "{:?}", plan.warnings);
+        let msg = &warns[0].message;
+        assert!(msg.contains("1 submodule(s) point at commits"), "{msg}");
+        assert!(msg.contains("will ride in the archive (~"), "{msg}");
+        assert!(
+            msg.contains(&format!("): sub/inner @ {} (feat/x).", &inner_sha[..7])),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "Also bundled so the nested submodule(s) can be checked out: sub @ {} (main).",
+                &sub_sha[..7]
+            )),
+            "{msg}"
+        );
+        assert!(!msg.contains("Not carried"), "{msg}");
+
+        let subs = &plan.manifest.git.submodules;
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert_eq!(subs[0].path, "sub");
+        assert_eq!(subs[0].commit_sha, sub_sha);
+        assert!(subs[0].carried && subs[0].published, "{subs:?}");
+        assert_eq!(subs[1].path, "sub/inner");
+        assert_eq!(subs[1].commit_sha, inner_sha);
+        assert!(subs[1].carried && !subs[1].published, "{subs:?}");
+        assert!(plan.estimated_git_bundle_bytes > 0);
+    }
+
     /// An unpublished submodule commit found only in a live sandbox checkout
     /// is reported `carried: false` under "Not carried (sandbox only)" and
     /// adds nothing to the bundle estimate; a sandbox finding that matches
@@ -918,19 +997,20 @@ mod tests {
         assert!(!msg.contains("Not carried"), "{msg}");
     }
 
-    /// Message formatting: carried and sandbox-only findings, short sha,
-    /// optional branch, approximate size.
+    /// Message formatting: carried, carried-published-parent and sandbox-only
+    /// findings, short sha, optional branch, approximate size.
     #[test]
     fn submodule_warning_message_shape() {
         use intent_core::transfer::TransferSubmoduleSummary;
         assert_eq!(super::submodule_warning(&[], 0), None);
-        let subs = vec![
+        let mut subs = vec![
             TransferSubmoduleSummary {
                 name: "intentd".to_string(),
                 path: "packages/intentd".to_string(),
                 commit_sha: "6b079e7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 branch: Some("feat/x".to_string()),
                 carried: true,
+                published: false,
             },
             TransferSubmoduleSummary {
                 name: "fe".to_string(),
@@ -938,6 +1018,7 @@ mod tests {
                 commit_sha: "a1b2c3dbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
                 branch: None,
                 carried: false,
+                published: false,
             },
         ];
         let msg = super::submodule_warning(&subs, 41 * 1024 * 1024).expect("message");
@@ -946,6 +1027,26 @@ mod tests {
             "1 submodule(s) point at commits not on any remote and will ride in the archive \
              (~41 MB): packages/intentd @ 6b079e7 (feat/x). Transfer will not push them; \
              publish the branches yourself when ready. \
+             Not carried (sandbox only): packages/cloudlands-fe @ a1b2c3d."
+        );
+        subs.insert(
+            0,
+            TransferSubmoduleSummary {
+                name: "packages".to_string(),
+                path: "packages".to_string(),
+                commit_sha: "0f0f0f0ccccccccccccccccccccccccccccccccc".to_string(),
+                branch: Some("main".to_string()),
+                carried: true,
+                published: true,
+            },
+        );
+        let msg = super::submodule_warning(&subs, 41 * 1024 * 1024).expect("message");
+        assert_eq!(
+            msg,
+            "1 submodule(s) point at commits not on any remote and will ride in the archive \
+             (~41 MB): packages/intentd @ 6b079e7 (feat/x). Transfer will not push them; \
+             publish the branches yourself when ready. \
+             Also bundled so the nested submodule(s) can be checked out: packages @ 0f0f0f0 (main). \
              Not carried (sandbox only): packages/cloudlands-fe @ a1b2c3d."
         );
         assert_eq!(super::human_bytes(0), "0 B");
@@ -1052,6 +1153,7 @@ mod tests {
                         commit_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
                         branch: None,
                         carried: true,
+                        published: false,
                     }],
                 },
             },

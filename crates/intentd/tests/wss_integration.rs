@@ -12449,7 +12449,8 @@ async fn wss_workspace_transfer_plan_round_trip() {
 /// locally: the plan carries exactly one `submodule-unpublished-commits`
 /// warning naming the submodule path, short sha and branch, and
 /// `manifest.git.submodules` lists the finding as
-/// `{ name, path, commitSha, branch, carried: true }`. After the commit is
+/// `{ name, path, commitSha, branch, carried: true, published: false }`.
+/// After the commit is
 /// pushed to the submodule's origin the warning and the entry are gone.
 #[tokio::test]
 async fn wss_workspace_transfer_plan_reports_unpublished_submodule_commits() {
@@ -12567,7 +12568,8 @@ async fn wss_workspace_transfer_plan_reports_unpublished_submodule_commits() {
             "path": "sub",
             "commitSha": sha,
             "branch": "main",
-            "carried": true
+            "carried": true,
+            "published": false
         }]),
         "manifest lists the unpublished submodule: {resp}"
     );
@@ -14090,7 +14092,8 @@ async fn wss_transfer_round_trip_hydrates_unpublished_submodule() {
     assert_eq!(
         manifest["git"]["submodules"],
         serde_json::json!([{
-            "name": "sub", "path": "sub", "commitSha": sha, "branch": "main", "carried": true
+            "name": "sub", "path": "sub", "commitSha": sha, "branch": "main", "carried": true,
+            "published": false
         }]),
         "ready manifest lists the carried submodule commit: {ready}"
     );

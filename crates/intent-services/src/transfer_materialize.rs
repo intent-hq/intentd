@@ -363,9 +363,10 @@ fn materialize_inner(
 /// the checkout keeps its gitlinks uninitialized, as before.
 ///
 /// A submodule whose containing repository is not checked out — a nested
-/// entry under a published (so not bundled) parent — is an error: the
-/// commit cannot be placed, and silently dropping it would contradict the
-/// export's "rides in the archive" promise.
+/// entry whose published parent an older daemon did not bundle — is an
+/// error: the commit cannot be placed, and silently dropping it would
+/// contradict the export's "rides in the archive" promise. Current exports
+/// bundle such parents (`published: true`) ahead of the nested entry.
 fn hydrate_submodules(
     checkout_dir: &Path,
     bundle_dir: &Path,
@@ -377,6 +378,7 @@ fn hydrate_submodules(
         tracing::info!(
             path = %sub.path,
             commit = %sub.commit_sha,
+            published = sub.published,
             "materialize: hydrated submodule from archive bundle"
         );
     }
@@ -415,7 +417,7 @@ fn hydrate_submodule(
     };
     if !parent_dir.join(".git").exists() {
         return Err(format!(
-            "containing repository {} is not checked out (its own submodule commit was published, so the archive did not bundle it)",
+            "containing repository {} is not checked out (the archive did not bundle its published parent submodule; re-export with a current daemon)",
             parent_dir.display()
         ));
     }
@@ -435,6 +437,27 @@ fn hydrate_submodule(
             ))
         }
         _ => return Err("path is not a submodule gitlink at the containing tip".to_string()),
+    }
+
+    // The manifest name must be the `.gitmodules` entry for this path at the
+    // containing tip: `submodule update` resolves the path through that
+    // entry, so a mismatched name would leave the bundle URL unused and
+    // send the clone to the `.gitmodules` URL instead.
+    let gitmodules_path = git_stdout(&parent_dir, |cmd| {
+        cmd.args(["config", "--blob", "HEAD:.gitmodules", "--get"])
+            .arg(format!("submodule.{}.path", sub.name));
+    })
+    .map_err(|e| {
+        format!(
+            "submodule.{}.path missing from .gitmodules at the containing tip: {e}",
+            sub.name
+        )
+    })?;
+    if gitmodules_path != rel {
+        return Err(format!(
+            ".gitmodules names submodule {:?} at path {gitmodules_path:?}, manifest places it at {rel:?}",
+            sub.name
+        ));
     }
 
     // Clone + check out from the bundle. The URL is preset so `init` keeps
@@ -1217,7 +1240,9 @@ mod tests {
     // -- submodule hydration ------------------------------------------------
 
     use crate::transfer_submodules::test_fixture::{
-        git as fgit, init_repo as finit_repo, local_commit, superproject_with_submodule,
+        git as fgit, init_repo as finit_repo, local_commit,
+        nested_unpublished_under_published_parent as nested_fixture, superproject_with_submodule,
+        NestedFixture,
     };
 
     /// Every git config file under `.git` (the repo's own plus each
@@ -1477,42 +1502,88 @@ mod tests {
         );
     }
 
-    /// A nested entry whose containing submodule was published (so not
-    /// bundled, so not checked out on the target) is rejected with an error
-    /// naming the path rather than silently dropped; rollback is complete.
+    /// (b') Nested under a PUBLISHED parent: `sub` (pushed) is carried
+    /// `published: true` ahead of `sub/inner` (unpublished, `feat/x`); both
+    /// hydrate from the archive with no network — the parent at its pushed
+    /// commit on `main`, the child at the local-only commit — and the
+    /// target matches the source's status with no staging path persisted.
     #[test]
-    fn nested_submodule_under_published_parent_is_rejected() {
+    fn roundtrip_hydrates_nested_submodule_under_published_parent() {
         let tmp = tempfile::tempdir().unwrap();
-        let inner_src = tmp.path().join("inner-src");
-        finit_repo(&inner_src);
-        fgit(
-            tmp.path(),
-            &["clone", "-q", "--bare", "inner-src", "inner.git"],
-        );
-        let (sup, _origin) = superproject_with_submodule(tmp.path());
-        let sub = sup.join("sub");
-        fgit(&sub, &["checkout", "-q", "main"]);
-        fgit(
-            &sub,
-            &[
-                "submodule",
-                "add",
-                "-q",
-                tmp.path().join("inner.git").to_str().unwrap(),
-                "inner",
-            ],
-        );
-        fgit(&sub, &["commit", "-q", "-m", "add inner"]);
-        fgit(&sub, &["push", "-q", "origin", "main"]);
-        let inner = sub.join("inner");
-        fgit(&inner, &["checkout", "-q", "-b", "feat/x"]);
-        local_commit(&inner, "deep.txt");
+        let NestedFixture {
+            sup,
+            sub_origin,
+            inner_origin,
+            sub_sha,
+            inner_sha,
+        } = nested_fixture(tmp.path());
+        let src_status = fgit(&sup, &["status", "--porcelain"]);
+        assert_eq!(src_status, "M sub");
 
         let ws = superproject_workspace(&sup);
         let staging = tmp.path().join("staging");
         let TransferBundle {
             bundle_path, refs, ..
         } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        let entries: Vec<(&str, bool)> = refs
+            .submodules
+            .iter()
+            .map(|s| (s.path.as_str(), s.published))
+            .collect();
+        assert_eq!(entries, [("sub", true), ("sub/inner", false)], "{refs:?}");
+
+        // No network: the origins are unreachable while materializing.
+        let sub_origin_hidden = tmp.path().join("sub-origin.hidden");
+        let inner_origin_hidden = tmp.path().join("inner-origin.hidden");
+        fs::rename(&sub_origin, &sub_origin_hidden).unwrap();
+        fs::rename(&inner_origin, &inner_origin_hidden).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+            .unwrap();
+        fs::rename(&sub_origin_hidden, &sub_origin).unwrap();
+        fs::rename(&inner_origin_hidden, &inner_origin).unwrap();
+
+        let dst_sub = out.checkout_dir.join("sub");
+        let dst_inner = dst_sub.join("inner");
+        assert_eq!(repo_head(&dst_sub), sub_sha);
+        assert_eq!(head_branch(&dst_sub), "main");
+        assert_eq!(
+            fgit(&dst_sub, &["remote", "get-url", "origin"]),
+            sub_origin.to_str().unwrap()
+        );
+        assert_eq!(repo_head(&dst_inner), inner_sha);
+        assert_eq!(head_branch(&dst_inner), "feat/x");
+        assert_eq!(
+            fs::read_to_string(dst_inner.join("deep.txt")).unwrap(),
+            "deep.txt\n"
+        );
+        assert_eq!(
+            fgit(&dst_inner, &["remote", "get-url", "origin"]),
+            inner_origin.to_str().unwrap()
+        );
+        assert_eq!(
+            fgit(&out.checkout_dir, &["status", "--porcelain"]),
+            src_status
+        );
+        assert_no_config_mentions(&out.checkout_dir.join(".git"), staging.to_str().unwrap());
+    }
+
+    /// An archive from a daemon that did not carry the published parent
+    /// (only `sub/inner` in `refs.submodules`) is rejected with an error
+    /// naming the path rather than silently dropped; rollback is complete.
+    #[test]
+    fn nested_submodule_under_published_parent_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let NestedFixture { sup, .. } = nested_fixture(tmp.path());
+
+        let ws = superproject_workspace(&sup);
+        let staging = tmp.path().join("staging");
+        let TransferBundle {
+            bundle_path,
+            mut refs,
+            ..
+        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        refs.submodules.retain(|s| !s.published);
         let paths: Vec<&str> = refs.submodules.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(paths, ["sub/inner"], "{refs:?}");
 
@@ -1522,6 +1593,40 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("hydrate submodule sub/inner failed") && msg.contains("not checked out"),
+            "got {msg}"
+        );
+        assert!(!target.path().join(&ws.id.0).exists());
+    }
+
+    /// A manifest entry whose `name` is not the `.gitmodules` entry for its
+    /// `path` at the containing tip is rejected before any clone: the bundle
+    /// URL would otherwise be written under the wrong key and `submodule
+    /// update` would resolve the path to its `.gitmodules` URL instead.
+    #[test]
+    fn submodule_name_must_match_gitmodules_entry_for_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sup, _origin) = superproject_with_submodule(tmp.path());
+        let sub = sup.join("sub");
+        fgit(&sub, &["checkout", "-q", "main"]);
+        local_commit(&sub, "wip.txt");
+
+        let ws = superproject_workspace(&sup);
+        let staging = tmp.path().join("staging");
+        let TransferBundle {
+            bundle_path,
+            mut refs,
+            ..
+        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        assert_eq!(refs.submodules.len(), 1);
+        refs.submodules[0].name = "other".to_string();
+
+        let target = tempfile::tempdir().unwrap();
+        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hydrate submodule sub failed")
+                && msg.contains("submodule.other.path missing from .gitmodules"),
             "got {msg}"
         );
         assert!(!target.path().join(&ws.id.0).exists());

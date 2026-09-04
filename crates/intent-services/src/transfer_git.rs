@@ -107,14 +107,17 @@ pub struct TransferRefsManifest {
     pub sandboxes: Vec<SandboxBundleRef>,
     /// One entry per tracked worktree submodule whose checked-out commit is
     /// unpublished (unreachable from any of its remote-tracking refs) and
-    /// therefore rides the archive as its own bundle. Ordered by path, so a
-    /// parent submodule always precedes its nested children. Absent/empty in
-    /// archives from older daemons and when every submodule is published.
+    /// therefore rides the archive as its own bundle — plus every published
+    /// ancestor such a nested submodule needs checked out first
+    /// (`published: true`). Ordered by path, so a parent submodule always
+    /// precedes its nested children. Absent/empty in archives from older
+    /// daemons and when every submodule is published.
     #[serde(default)]
     pub submodules: Vec<SubmoduleBundleRef>,
 }
 
-/// One unpublished submodule as bundled into the archive.
+/// One submodule as bundled into the archive: unpublished, or the published
+/// parent of a nested unpublished one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmoduleBundleRef {
@@ -140,6 +143,11 @@ pub struct SubmoduleBundleRef {
     /// ([`submodule_bundle_ref`]); the bundle also carries `HEAD` at the same
     /// commit so a plain clone from it checks out.
     pub bundle_ref: String,
+    /// `true` when `commit_sha` is reachable from a remote and the entry is
+    /// bundled only so a nested unpublished submodule below it can be
+    /// checked out. Absent (false) in archives from older daemons.
+    #[serde(default)]
+    pub published: bool,
 }
 
 /// One sandbox branch as recorded in the bundle.
@@ -544,9 +552,10 @@ fn build_bundle(
     })
     .map_err(|e| Error::Internal(format!("git bundle verify failed: {e}")))?;
 
-    // 6. Bundle every unpublished worktree submodule on its own. Runs after
-    //    the WIP snapshot so the gitlinks that travel are final; detection
-    //    order (by path) puts a parent before its nested children.
+    // 6. Bundle every unpublished worktree submodule on its own, along with
+    //    the published parents a nested one needs. Runs after the WIP
+    //    snapshot so the gitlinks that travel are final; detection order (by
+    //    path) puts a parent before its nested children.
     let unpublished = find_unpublished_submodules(worktree)?;
     let mut submodule_refs = Vec::with_capacity(unpublished.len());
     for (index, sub) in unpublished.iter().enumerate() {
@@ -565,7 +574,8 @@ fn build_bundle(
             path = %sub.path,
             commit = %sub.commit_sha,
             entry = %bundle_entry,
-            "transfer bundle: bundled unpublished submodule commit"
+            published = sub.published,
+            "transfer bundle: bundled submodule commit"
         );
         submodule_refs.push(SubmoduleBundleRef {
             name: sub.name.clone(),
@@ -575,6 +585,7 @@ fn build_bundle(
             origin_url: sub.origin_url.clone(),
             bundle_entry,
             bundle_ref,
+            published: sub.published,
         });
     }
 
@@ -1792,6 +1803,7 @@ mod tests {
         );
         assert_eq!(s.bundle_entry, *entry);
         assert_eq!(s.bundle_ref, submodule_bundle_ref(&ws.id.0, 0));
+        assert!(!s.published);
 
         // The bundle carries the anchor ref and is cloneable at the sha.
         let refs = bundle_refs(&sub, sub_bundle);
@@ -1878,6 +1890,7 @@ mod tests {
         assert_eq!(child.commit_sha, inner_sha);
         assert_eq!(child.branch.as_deref(), Some("feat/x"));
         assert_eq!(child.bundle_entry, "git/submodules/1.bundle");
+        assert!(!parent.published && !child.published);
         assert_eq!(bundle.submodule_bundles[0].1, parent.bundle_entry);
         assert_eq!(bundle.submodule_bundles[1].1, child.bundle_entry);
 
@@ -1899,6 +1912,75 @@ mod tests {
                 .all(|r| !r.starts_with(TRANSFER_REF_NS)),
             "temp refs cleaned up in every repo"
         );
+    }
+
+    /// A nested unpublished submodule under a PUBLISHED parent: the parent
+    /// is bundled too (`published: true`, parent-first, cloneable at its
+    /// pushed commit) so the import can check the child out; the archive
+    /// layout is the same as for two unpublished submodules.
+    #[test]
+    fn bundle_carries_published_parent_of_nested_unpublished_submodule() {
+        use crate::transfer_submodules::test_fixture::{
+            git, nested_unpublished_under_published_parent, NestedFixture,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let NestedFixture {
+            sup,
+            sub_origin,
+            inner_origin,
+            sub_sha,
+            inner_sha,
+        } = nested_unpublished_under_published_parent(dir.path());
+        let ws = workspace_for_repo(&sup);
+        let staging = dir.path().join("staging");
+
+        let bundle = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        assert_eq!(bundle.submodule_bundles.len(), 2, "{bundle:?}");
+        assert_eq!(bundle.refs.submodules.len(), 2);
+        let parent = &bundle.refs.submodules[0];
+        let child = &bundle.refs.submodules[1];
+        assert_eq!(parent.path, "sub");
+        assert_eq!(parent.commit_sha, sub_sha);
+        assert_eq!(parent.branch.as_deref(), Some("main"));
+        assert_eq!(
+            parent
+                .origin_url
+                .as_deref()
+                .map(|u| u.trim_end_matches('/')),
+            Some(sub_origin.to_str().unwrap())
+        );
+        assert_eq!(parent.bundle_entry, "git/submodules/0.bundle");
+        assert!(parent.published, "{parent:?}");
+        assert_eq!(child.path, "sub/inner");
+        assert_eq!(child.commit_sha, inner_sha);
+        assert_eq!(
+            child.origin_url.as_deref().map(|u| u.trim_end_matches('/')),
+            Some(inner_origin.to_str().unwrap())
+        );
+        assert_eq!(child.bundle_entry, "git/submodules/1.bundle");
+        assert!(!child.published, "{child:?}");
+
+        for (i, (path, _)) in bundle.submodule_bundles.iter().enumerate() {
+            let dst = dir.path().join(format!("clone-{i}"));
+            git(
+                dir.path(),
+                &["clone", "-q", path.to_str().unwrap(), dst.to_str().unwrap()],
+            );
+            let expected = if i == 0 { &sub_sha } else { &inner_sha };
+            assert_eq!(&git(&dst, &["rev-parse", "HEAD"]), expected);
+        }
+
+        // `published` is additive on the wire: absent reads as false.
+        let json = serde_json::to_value(&bundle.refs).unwrap();
+        assert_eq!(json["submodules"][0]["published"], true);
+        assert_eq!(json["submodules"][1]["published"], false);
+        let mut legacy = json.clone();
+        legacy["submodules"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("published");
+        let back: TransferRefsManifest = serde_json::from_value(legacy).unwrap();
+        assert!(!back.submodules[0].published);
     }
 
     /// A submodule bundle that cannot be written (its output path is a

@@ -11,6 +11,11 @@
 //! it is reachable from (or equal to) any `refs/remotes/**` tip of that
 //! submodule repo. A stale remote-tracking ref only causes an unnecessary but
 //! harmless bundle.
+//!
+//! A nested unpublished submodule can only be hydrated once its containing
+//! submodule is checked out, so every ancestor of an unpublished finding is
+//! reported too — flagged [`UnpublishedSubmodule::published`] when its own
+//! commit is reachable from a remote — and bundled alongside.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -18,7 +23,8 @@ use git2::{Oid, Repository};
 use intent_core::{Error, Result};
 
 /// One tracked submodule whose checkout HEAD is not reachable from any of its
-/// remote-tracking refs.
+/// remote-tracking refs — or a published ancestor carried so that such a
+/// nested submodule can be hydrated (`published: true`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnpublishedSubmodule {
     /// The submodule's registered name (`submodule.<name>.*`) in ITS
@@ -36,13 +42,19 @@ pub(crate) struct UnpublishedSubmodule {
     pub origin_url: Option<String>,
     /// The submodule checkout on disk (its work tree).
     pub repo_dir: PathBuf,
+    /// `true` when this commit IS reachable from a remote and the entry is
+    /// only present because a nested submodule below it is unpublished: the
+    /// destination needs this checkout to place the nested one.
+    pub published: bool,
 }
 
 /// Find every initialized submodule (nested ones included, up to
 /// [`intent_git::submodule::MAX_SUBMODULE_NESTING`]) of the repository at
-/// `repo_path` whose HEAD commit is unpublished. Uninitialized submodules
-/// and unborn checkouts are skipped — there is nothing local to lose.
-/// Results are sorted by `path`.
+/// `repo_path` whose HEAD commit is unpublished, plus every ancestor
+/// submodule of such a finding (flagged `published` when its own commit is
+/// reachable from a remote). Uninitialized submodules and unborn checkouts
+/// are skipped — there is nothing local to lose. Results are sorted by
+/// `path`, so a parent always precedes its nested children.
 ///
 /// # Errors
 ///
@@ -88,16 +100,21 @@ fn collect(
             .filter(|n| !n.is_empty())
             .map_or_else(|| rel.clone(), str::to_string);
 
-        if let Some(found) = inspect_checkout(&sub_repo, &sub_dir, name, &full_path) {
-            out.push(found);
-        }
+        let Some(found) = inspect_checkout(&sub_repo, &sub_dir, name, &full_path) else {
+            continue;
+        };
+        let before = out.len();
         if depth + 1 < intent_git::submodule::MAX_SUBMODULE_NESTING {
             collect(&sub_repo, &sub_dir, &full_path, depth + 1, out);
+        }
+        // Unpublished itself, or a published ancestor of a nested finding.
+        if !found.published || out.len() > before {
+            out.push(found);
         }
     }
 }
 
-/// Inspect one submodule checkout; `Some` when its HEAD is unpublished.
+/// Inspect one submodule checkout; `None` only for an unborn HEAD.
 fn inspect_checkout(
     sub_repo: &Repository,
     sub_dir: &Path,
@@ -106,9 +123,7 @@ fn inspect_checkout(
 ) -> Option<UnpublishedSubmodule> {
     let head = sub_repo.head().ok()?;
     let head_oid = head.target()?;
-    if is_reachable_from_remote(sub_repo, head_oid) {
-        return None;
-    }
+    let published = is_reachable_from_remote(sub_repo, head_oid);
     let branch = if head.is_branch() {
         head.shorthand().ok().map(str::to_string)
     } else {
@@ -125,6 +140,7 @@ fn inspect_checkout(
         branch,
         origin_url,
         repo_dir: sub_dir.to_path_buf(),
+        published,
     })
 }
 
@@ -248,11 +264,65 @@ pub(crate) mod test_fixture {
         git(dir, &["commit", "-q", "-m", &format!("local {file}")]);
         git(dir, &["rev-parse", "HEAD"])
     }
+
+    /// The nested-under-published-parent scenario (monorepo#4219 follow-up).
+    pub(crate) struct NestedFixture {
+        pub sup: PathBuf,
+        pub sub_origin: PathBuf,
+        pub inner_origin: PathBuf,
+        /// `sub`'s HEAD: records `inner` at `inner_sha`, pushed to its origin.
+        pub sub_sha: String,
+        /// `sub/inner`'s HEAD on `feat/x`: never pushed.
+        pub inner_sha: String,
+    }
+
+    /// Superproject `super/` → submodule `sub` (PUBLISHED: its `main`,
+    /// bumping the nested `inner` gitlink to a local-only commit, is pushed
+    /// to `origin.git`) → nested `sub/inner` on `feat/x` at an UNPUBLISHED
+    /// commit (`deep.txt`). The superproject's gitlink for `sub` is stale
+    /// (`M sub`), as a WIP snapshot would carry it.
+    pub(crate) fn nested_unpublished_under_published_parent(root: &Path) -> NestedFixture {
+        let inner_src = root.join("inner-src");
+        init_repo(&inner_src);
+        git(root, &["clone", "-q", "--bare", "inner-src", "inner.git"]);
+        let inner_origin = root.join("inner.git");
+        let (sup, sub_origin) = superproject_with_submodule(root);
+        let sub = sup.join("sub");
+        git(&sub, &["checkout", "-q", "main"]);
+        git(
+            &sub,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                inner_origin.to_str().unwrap(),
+                "inner",
+            ],
+        );
+        git(&sub, &["commit", "-q", "-m", "add inner"]);
+        let inner = sub.join("inner");
+        git(&inner, &["checkout", "-q", "-b", "feat/x"]);
+        let inner_sha = local_commit(&inner, "deep.txt");
+        git(&sub, &["add", "inner"]);
+        git(&sub, &["commit", "-q", "-m", "bump inner"]);
+        git(&sub, &["push", "-q", "origin", "main"]);
+        let sub_sha = git(&sub, &["rev-parse", "HEAD"]);
+        NestedFixture {
+            sup,
+            sub_origin,
+            inner_origin,
+            sub_sha,
+            inner_sha,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_fixture::{git, init_repo, local_commit, superproject_with_submodule};
+    use super::test_fixture::{
+        git, init_repo, local_commit, nested_unpublished_under_published_parent,
+        superproject_with_submodule, NestedFixture,
+    };
     use super::*;
 
     /// A commit made inside the submodule checkout and never pushed is
@@ -274,6 +344,7 @@ mod tests {
         assert_eq!(f.path, "sub");
         assert_eq!(f.commit_sha, sha);
         assert_eq!(f.branch.as_deref(), Some("main"));
+        assert!(!f.published);
         assert_eq!(
             f.origin_url.as_deref().map(|u| u.trim_end_matches('/')),
             Some(origin.to_str().unwrap())
@@ -315,7 +386,9 @@ mod tests {
     }
 
     /// A nested submodule (`sub/inner`) with a local-only commit is found
-    /// with the composed path and its own raw name.
+    /// with the composed path and its own raw name; its published parent
+    /// `sub` is carried ahead of it (`published: true`) and flips to an
+    /// ordinary unpublished finding once it records the child locally.
     #[test]
     fn detects_nested_submodule_with_composed_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -347,12 +420,66 @@ mod tests {
         git(&inner, &["checkout", "-q", "-b", "feat/x"]);
         let sha = local_commit(&inner, "deep.txt");
         let found = find_unpublished_submodules(&sup).unwrap();
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].name, "inner");
-        assert_eq!(found[0].path, "sub/inner");
-        assert_eq!(found[0].commit_sha, sha);
-        assert_eq!(found[0].branch.as_deref(), Some("feat/x"));
-        assert_eq!(found[0].repo_dir, inner);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].path, "sub");
+        assert!(found[0].published, "published parent carried");
+        assert_eq!(found[0].commit_sha, git(&sub, &["rev-parse", "HEAD"]));
+        assert_eq!(found[1].name, "inner");
+        assert_eq!(found[1].path, "sub/inner");
+        assert_eq!(found[1].commit_sha, sha);
+        assert_eq!(found[1].branch.as_deref(), Some("feat/x"));
+        assert_eq!(found[1].repo_dir, inner);
+        assert!(!found[1].published);
+
+        git(&sub, &["add", "inner"]);
+        git(&sub, &["commit", "-q", "-m", "bump inner"]);
+        let found = find_unpublished_submodules(&sup).unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].path, "sub");
+        assert!(!found[0].published, "parent is now unpublished itself");
+        assert!(!found[1].published);
+    }
+
+    /// Published ancestors are carried only when a nested descendant is
+    /// unpublished: with the parent published and the child pushed, nothing
+    /// is reported; a published ancestor keeps its own branch/origin/HEAD.
+    #[test]
+    fn carries_published_parent_chain_only_for_nested_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let NestedFixture {
+            sup,
+            sub_origin,
+            inner_origin,
+            sub_sha,
+            inner_sha,
+        } = nested_unpublished_under_published_parent(tmp.path());
+        let found = find_unpublished_submodules(&sup).unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        let parent = &found[0];
+        assert_eq!(parent.name, "sub");
+        assert_eq!(parent.path, "sub");
+        assert_eq!(parent.commit_sha, sub_sha);
+        assert_eq!(parent.branch.as_deref(), Some("main"));
+        assert_eq!(
+            parent
+                .origin_url
+                .as_deref()
+                .map(|u| u.trim_end_matches('/')),
+            Some(sub_origin.to_str().unwrap())
+        );
+        assert!(parent.published);
+        assert!(estimate_submodule_bundle_bytes(parent) > 0);
+        let child = &found[1];
+        assert_eq!(child.path, "sub/inner");
+        assert_eq!(child.commit_sha, inner_sha);
+        assert_eq!(
+            child.origin_url.as_deref().map(|u| u.trim_end_matches('/')),
+            Some(inner_origin.to_str().unwrap())
+        );
+        assert!(!child.published);
+
+        git(&sup.join("sub/inner"), &["push", "-q", "origin", "feat/x"]);
+        assert!(find_unpublished_submodules(&sup).unwrap().is_empty());
     }
 
     /// A submodule with no remote-tracking refs at all is unpublished.
