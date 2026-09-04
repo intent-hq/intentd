@@ -353,13 +353,19 @@
 //! (set/clear, `agent.dismissQuestions` + its system notice, the
 //! `needs_attention` derivation and `agent:updated` projections) is
 //! unchanged. No method-catalog change — 298 router methods, 39 fast-path,
-//! 339 total.
+//! 339 total. Version 9.6 adds the single-issue read `github.issues.get`
+//! (`{ owner, repo, number }` → `{ issue: GithubIssue }`; §5.27) and enriches
+//! the `GithubIssue` DTO: `user.login`, `createdAt` and `updatedAt` are now
+//! populated from the forge payload (additive — the keys already existed as
+//! placeholders) on `github.issues.get` / `.list` / `.search`. Method
+//! catalog grows by one router method — 299 router methods, 39 fast-path,
+//! 340 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.5";
+pub const PROTOCOL_VERSION: &str = "9.6";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
