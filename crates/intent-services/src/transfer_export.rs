@@ -26,7 +26,8 @@
 //! exist in the canonical `.intent/attachments/` store — a registry row whose
 //! file was deleted rides the rows payload with NO file entry), and — when
 //! the workspace has a repository — `git/repo.bundle` + `git/refs.json` (the
-//! [`TransferRefsManifest`]).
+//! [`TransferRefsManifest`]) plus one `git/submodules/<n>.bundle` per
+//! unpublished worktree submodule listed in `refs.submodules`.
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, Write as _};
@@ -44,7 +45,7 @@ use intent_core::{
 use intent_store::NewEvent;
 use sha2::Digest as _;
 
-use crate::transfer_git::{create_transfer_bundle, unwind_wip};
+use crate::transfer_git::{create_transfer_bundle, unwind_wip, TransferBundle};
 use crate::{git_ops, publish_event, system_actor, Services};
 
 /// Maximum bytes per `workspace.export.read` chunk BEFORE base64 encoding.
@@ -389,19 +390,19 @@ impl Services {
                 .collect();
             let ws_for_bundle = ws.clone();
             let bundle_staging = staging_dir.clone();
-            let (bundle_path, refs) = tokio::task::spawn_blocking(move || {
+            let bundle = tokio::task::spawn_blocking(move || {
                 create_transfer_bundle(&ws_for_bundle, &live, &bundle_staging)
             })
             .await
             .map_err(|e| Error::Internal(format!("export bundle task failed: {e}")))??;
             // Record the repos holding WIP snapshots for the settle unwind.
             let mut wip_paths = Vec::new();
-            if refs.workspace_wip_commit_sha.is_some() {
+            if bundle.refs.workspace_wip_commit_sha.is_some() {
                 if let Some(worktree) = git_ops::worktree_path(&ws) {
                     wip_paths.push(worktree);
                 }
             }
-            for sb in &refs.sandboxes {
+            for sb in &bundle.refs.sandboxes {
                 if sb.wip_commit_sha.is_some() {
                     // Sandbox paths were validated to exist by the bundler.
                     if let Some(path) = sandbox_path_for(&self.store, &id, &sb.agent_id).await {
@@ -418,7 +419,7 @@ impl Services {
                     session.wip_paths = wip_paths;
                 }
             }
-            Some((bundle_path, refs))
+            Some(bundle)
         } else {
             None
         };
@@ -441,7 +442,7 @@ impl Services {
                 &rows,
                 assets_dir.as_deref(),
                 &attachment_sources,
-                git_payload.as_ref().map(|(p, r)| (p.as_path(), r)),
+                git_payload.as_ref(),
             )
         })
         .await
@@ -753,17 +754,17 @@ fn transfer_event(
 
 /// Write the transfer zip (`archive.zip` in the staging dir): manifest,
 /// `rows/<table>.jsonl`, `assets/<assetId>`, `attachments/<attachmentId>`,
-/// and the optional `git/repo.bundle` + `git/refs.json`. Returns the path,
-/// size, and SHA-256 (hashed from the sealed file, the exact bytes `read`
-/// serves). Blocking (sync file I/O + zip deflation) — callers run it via
-/// `spawn_blocking`.
+/// and the optional `git/repo.bundle` + `git/submodules/<n>.bundle` +
+/// `git/refs.json`. Returns the path, size, and SHA-256 (hashed from the
+/// sealed file, the exact bytes `read` serves). Blocking (sync file I/O + zip
+/// deflation) — callers run it via `spawn_blocking`.
 fn write_archive(
     staging_dir: &Path,
     manifest: &TransferManifest,
     rows: &[(String, Vec<serde_json::Value>)],
     assets_dir: Option<&Path>,
     attachments: &[(String, PathBuf)],
-    git: Option<(&Path, &crate::transfer_git::TransferRefsManifest)>,
+    git: Option<&TransferBundle>,
 ) -> Result<(PathBuf, u64, String)> {
     let archive_path = staging_dir.join("archive.zip");
     let file = std::fs::File::create(&archive_path)
@@ -840,15 +841,23 @@ fn write_archive(
         std::io::copy(&mut file, &mut zip).map_err(|e| werr("attachment write", e))?;
     }
 
-    if let Some((bundle_path, refs)) = git {
+    if let Some(bundle) = git {
         zip.start_file("git/repo.bundle", options)
             .map_err(|e| zerr("bundle entry", e))?;
-        let mut bundle = std::fs::File::open(bundle_path)
+        let mut file = std::fs::File::open(&bundle.bundle_path)
             .map_err(|e| Error::Internal(format!("open git bundle failed: {e}")))?;
-        std::io::copy(&mut bundle, &mut zip).map_err(|e| werr("bundle write", e))?;
+        std::io::copy(&mut file, &mut zip).map_err(|e| werr("bundle write", e))?;
+        for (path, entry) in &bundle.submodule_bundles {
+            zip.start_file(entry, options)
+                .map_err(|e| zerr("submodule bundle entry", e))?;
+            let mut file = std::fs::File::open(path).map_err(|e| {
+                Error::Internal(format!("open submodule bundle {entry} failed: {e}"))
+            })?;
+            std::io::copy(&mut file, &mut zip).map_err(|e| werr("submodule bundle write", e))?;
+        }
         zip.start_file("git/refs.json", options)
             .map_err(|e| zerr("refs entry", e))?;
-        let refs_bytes = serde_json::to_vec(refs)
+        let refs_bytes = serde_json::to_vec(&bundle.refs)
             .map_err(|e| Error::Internal(format!("serialize refs manifest failed: {e}")))?;
         zip.write_all(&refs_bytes)
             .map_err(|e| werr("refs write", e))?;
@@ -857,10 +866,20 @@ fn write_archive(
     let file = zip.finish().map_err(|e| zerr("finish", e))?;
     file.sync_all().map_err(|e| werr("sync", e))?;
     drop(file);
-    // The bundle's bytes now live inside the zip; the loose copy is dead
+    // The bundles' bytes now live inside the zip; the loose copies are dead
     // weight in staging.
-    if let Some((bundle_path, _)) = git {
-        let _ = std::fs::remove_file(bundle_path);
+    if let Some(bundle) = git {
+        let _ = std::fs::remove_file(&bundle.bundle_path);
+        for (path, _) in &bundle.submodule_bundles {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(dir) = bundle
+            .submodule_bundles
+            .first()
+            .and_then(|(p, _)| p.parent())
+        {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 
     // Hash the sealed file — the exact bytes `read` serves.

@@ -13804,9 +13804,10 @@ async fn wss_workspace_import_commit_materializes_git() {
     src_ws.repository_path = Some(repo.to_string_lossy().into_owned());
     src_ws.repository_name = Some("test-repo".to_string());
     let staging = src.path().join("staging");
-    let (bundle_path, refs) =
-        intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
-            .expect("bundle");
+    let intent_services::transfer_git::TransferBundle {
+        bundle_path, refs, ..
+    } = intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+        .expect("bundle");
     assert!(
         refs.workspace_wip_commit_sha.is_some(),
         "source was dirty: {refs:?}"

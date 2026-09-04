@@ -472,7 +472,7 @@ fn head_sha(repo_path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transfer_git::create_transfer_bundle;
+    use crate::transfer_git::{create_transfer_bundle, TransferBundle};
     use intent_core::{AgentId, WorkspaceId, WorkspaceStatus};
     use intent_store::SandboxStatus;
     use std::fs;
@@ -701,8 +701,9 @@ mod tests {
         let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
 
         let staging = src.path().join("staging");
-        let (bundle_path, refs) =
-            create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
 
         // Materialize into a fresh target root.
         let target = tempfile::TempDir::new().unwrap();
@@ -808,8 +809,9 @@ mod tests {
         let tip = repo_head(&repo);
         let ws = workspace_for_repo(&repo);
 
-        let (bundle_path, refs) =
-            create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
         assert_eq!(refs.workspace_wip_commit_sha, None);
 
         let target = tempfile::TempDir::new().unwrap();
@@ -827,8 +829,9 @@ mod tests {
         let ws = workspace_for_repo(&repo);
 
         // Bundle carries no sandbox branches...
-        let (bundle_path, refs) =
-            create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
 
         // ...but a sandbox row rides in the import anyway.
         let agent = AgentId::new();
@@ -860,8 +863,11 @@ mod tests {
         init_repo(&repo);
         let ws = workspace_for_repo(&repo);
 
-        let (bundle_path, mut refs) =
-            create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        let TransferBundle {
+            bundle_path,
+            mut refs,
+            ..
+        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
         // Corrupt the manifest so the post-clone tip check fails AFTER the
         // checkout directory has been created.
         refs.workspace_head_sha = "0".repeat(40);
@@ -881,8 +887,9 @@ mod tests {
         let repo = src.path().join("source-repo");
         init_repo(&repo);
         let ws = workspace_for_repo(&repo);
-        let (bundle_path, refs) =
-            create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
         fs::remove_file(&bundle_path).unwrap();
 
         let target = tempfile::TempDir::new().unwrap();
@@ -897,8 +904,9 @@ mod tests {
         let repo = src.path().join("source-repo");
         init_repo(&repo);
         let ws = workspace_for_repo(&repo);
-        let (bundle_path, refs) =
-            create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
 
         let target = tempfile::TempDir::new().unwrap();
         let existing = target.path().join(&ws.id.0).join("test-repo");
@@ -932,8 +940,11 @@ mod tests {
         let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
 
         let staging = src.path().join("staging");
-        let (bundle_path, mut refs) =
-            create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
+        let TransferBundle {
+            bundle_path,
+            mut refs,
+            ..
+        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
 
         // Pre-existing agent dir with unrelated content on the target.
         let target = tempfile::TempDir::new().unwrap();
@@ -1001,8 +1012,9 @@ mod tests {
         let repo = src.path().join("source-repo");
         init_repo(&repo);
         let ws = workspace_for_repo(&repo);
-        let (bundle_path, refs) =
-            create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
 
         let target = tempfile::TempDir::new().unwrap();
         let out = materialize_workspace_git(

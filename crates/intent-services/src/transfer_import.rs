@@ -2291,7 +2291,9 @@ mod tests {
             updated_at: t.to_string(),
         };
         let staging = src.0.join("staging");
-        let (bundle_path, refs) = crate::transfer_git::create_transfer_bundle(
+        let crate::transfer_git::TransferBundle {
+            bundle_path, refs, ..
+        } = crate::transfer_git::create_transfer_bundle(
             &src_ws,
             std::slice::from_ref(&src_sb),
             &staging,
@@ -2475,8 +2477,9 @@ mod tests {
             w
         };
         let staging = src.0.join("staging");
-        let (bundle_path, refs) =
-            crate::transfer_git::create_transfer_bundle(&src_ws, &[], &staging).expect("bundle");
+        let crate::transfer_git::TransferBundle {
+            bundle_path, refs, ..
+        } = crate::transfer_git::create_transfer_bundle(&src_ws, &[], &staging).expect("bundle");
 
         let m = manifest(&ws);
         let rows: Vec<(&str, Vec<serde_json::Value>)> =
