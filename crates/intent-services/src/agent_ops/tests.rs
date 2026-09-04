@@ -38236,6 +38236,7 @@ mod resume_tail_recap {
     use crate::agent_ops::{
         build_resume_tail_recap, LEGACY_RESUME_CONTINUATION_TEXT,
         RESUME_CONTINUATION_FALLBACK_TEXT, RESUME_CONTINUATION_METADATA_TYPE,
+        RESUME_RECAP_TRUNCATION_HINT,
     };
     use intent_core::{AgentId, AgentMessage};
     use serde_json::{json, Value};
@@ -38375,7 +38376,10 @@ mod resume_tail_recap {
     }
 
     /// Oversized tail segments are middle-truncated so a pathological
-    /// message cannot blow up the continuation prompt.
+    /// message cannot blow up the continuation prompt. The recap then carries
+    /// the truncation hint (intent#3696) in its preamble and marks each
+    /// truncated element with `truncated="true" original_chars="N"`, the
+    /// same convention the session-recreate history replay uses.
     #[test]
     fn recap_truncates_oversized_segments() {
         let big = "x".repeat(50_000);
@@ -38387,6 +38391,68 @@ mod resume_tail_recap {
             recap.text.len()
         );
         assert!(recap.text.contains("characters truncated"));
+        assert!(
+            recap.text.contains(RESUME_RECAP_TRUNCATION_HINT),
+            "truncated recap must carry the hint: {}",
+            recap.text
+        );
+        // The hint precedes the replayed segments.
+        assert!(
+            recap.text.find(RESUME_RECAP_TRUNCATION_HINT).unwrap()
+                < recap.text.find("<interrupted_user_message").unwrap()
+        );
+        assert!(recap
+            .text
+            .contains("<interrupted_user_message truncated=\"true\" original_chars=\"50000\">"));
+        assert!(recap.text.contains(
+            "<interrupted_partial_response truncated=\"true\" original_chars=\"50000\">"
+        ));
+    }
+
+    /// Only an over-cap segment is marked: a mixed recap marks the oversized
+    /// element and leaves the under-cap one bare, and the hint is present
+    /// because at least one segment was abbreviated.
+    #[test]
+    fn recap_marks_only_truncated_segments() {
+        let big = "y".repeat(9_000);
+        let messages = vec![user("short request"), interrupted_assistant(&big)];
+        let recap = build_resume_tail_recap(&messages).expect("recap");
+        assert!(recap.text.contains(RESUME_RECAP_TRUNCATION_HINT));
+        assert!(recap
+            .text
+            .contains("<interrupted_user_message>\nshort request\n"));
+        assert!(recap
+            .text
+            .contains("<interrupted_partial_response truncated=\"true\" original_chars=\"9000\">"));
+    }
+
+    /// Under-cap segments with no elision render exactly as before the hint
+    /// existed: no hint sentence, no truncation attribute, byte-identical
+    /// recap text.
+    #[test]
+    fn recap_omits_hint_when_nothing_truncated_or_elided() {
+        let messages = vec![
+            user("build a simple local webapp"),
+            interrupted_assistant("Delegating board webapp..."),
+        ];
+        let recap = build_resume_tail_recap(&messages).expect("recap");
+        assert!(!recap.text.contains(RESUME_RECAP_TRUNCATION_HINT));
+        assert!(!recap.text.contains("truncated="));
+        assert!(!recap.text.contains("cut by this recap"));
+        assert!(!recap.text.contains("elided"));
+        assert_eq!(
+            recap.text,
+            "<supervisor>\nRestart recovery: the harness restarted while you were \
+             responding, and your restored session may predate the exchange below \
+             — it is repeated here (parts of it may or may not already be in your \
+             context).\n\n\
+             The user's message, delivered before the interruption:\n\
+             <interrupted_user_message>\nbuild a simple local webapp\n</interrupted_user_message>\n\n\
+             Your partial response before the cut-off (it did NOT complete; anything \
+             after this point was lost):\n\
+             <interrupted_partial_response>\nDelegating board webapp...\n</interrupted_partial_response>\n\n\
+             </supervisor>"
+        );
     }
 
     /// A SECOND restart mid-continuation: the tail now holds the original
@@ -38551,6 +38617,26 @@ mod resume_tail_recap {
         assert!(recap.text.contains("partial-final"));
         assert!(recap.text.contains("elided"));
         assert!(!recap.text.contains("partial-0"), "oldest partials elided");
+        // Elision alone (no segment over the char cap) still earns the hint —
+        // the omitted partials are a recap artefact the model must not
+        // mistake for lost work — while the surviving under-cap elements
+        // stay unmarked.
+        assert!(
+            recap.text.contains(RESUME_RECAP_TRUNCATION_HINT),
+            "elided recap must carry the hint: {}",
+            recap.text
+        );
+        assert!(!recap.text.contains("<interrupted_user_message truncated="));
+        assert!(!recap
+            .text
+            .contains("<interrupted_partial_response truncated="));
+        assert!(
+            recap.text.find(RESUME_RECAP_TRUNCATION_HINT).unwrap()
+                < recap
+                    .text
+                    .find("older interrupted segment(s) elided")
+                    .unwrap()
+        );
     }
 }
 

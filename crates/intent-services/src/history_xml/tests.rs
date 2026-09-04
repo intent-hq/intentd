@@ -149,6 +149,113 @@ fn truncates_oversized_tool_content_in_the_middle() {
     assert!(xml.len() < 10_000);
 }
 
+/// intent#3696: the preamble tells the model that abbreviated tool blocks are
+/// a replay artefact (not failed/empty tools) and how to recover one output.
+#[test]
+fn preamble_carries_truncation_hint_paragraph() {
+    let messages = vec![msg("user", json!([{ "type": "text", "text": "hello" }]))];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let (preamble, _) = xml
+        .split_once("<exchange>")
+        .expect("preamble before exchanges");
+    assert!(preamble.contains("The previous ACP session was lost."));
+    assert!(preamble.contains(
+        "some tool inputs and tool outputs below are abbreviated by the recovery replay"
+    ));
+    assert!(preamble.contains("longer than 4000 characters is middle-truncated"));
+    assert!(preamble.contains("blocks without that attribute are complete"));
+    assert!(preamble.contains("Older exchanges may be omitted"));
+    assert!(preamble.contains("does NOT mean the tool failed or returned empty output"));
+    assert!(preamble.contains("re-run that ONE call once"));
+    assert!(preamble.contains("Do not re-fetch the same inputs repeatedly"));
+}
+
+/// intent#3696: an over-cap `tool_result` is marked at the element level
+/// (`truncated="true" original_chars="N"`) in addition to the inline marker.
+#[test]
+fn oversized_tool_result_carries_truncated_attribute_and_marker() {
+    let big = "x".repeat(10_000);
+    let messages = vec![msg(
+        "user",
+        json!([{ "type": "tool_result", "tool_use_id": "t", "output": big }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(xml.contains(
+        "<tool_result tool_use_id=\"t\" is_error=\"false\" truncated=\"true\" original_chars=\"10000\">"
+    ));
+    assert!(xml.contains("\n... [6060 characters truncated] ...\n"));
+}
+
+/// intent#3696: `original_chars` and the inline marker count chars, not bytes
+/// (a 2-byte `é` repeated 5000 times is 10000 bytes but 5000 chars).
+#[test]
+fn truncated_attribute_and_marker_count_chars_not_bytes() {
+    let multibyte = "é".repeat(5_000);
+    assert_eq!(multibyte.len(), 10_000);
+    let messages = vec![msg(
+        "user",
+        json!([{ "type": "tool_result", "tool_use_id": "t", "output": multibyte }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(xml.contains(
+        "<tool_result tool_use_id=\"t\" is_error=\"false\" truncated=\"true\" original_chars=\"5000\">"
+    ));
+    // 5000 - 2 * 1970 kept chars.
+    assert!(xml.contains("\n... [1060 characters truncated] ...\n"));
+}
+
+/// intent#3696: an under-cap `tool_result` renders exactly as before — no
+/// `truncated` attribute, no marker.
+#[test]
+fn under_cap_tool_result_has_no_truncated_attribute() {
+    let exact = "x".repeat(4_000);
+    let messages = vec![msg(
+        "user",
+        json!([{ "type": "tool_result", "tool_use_id": "t", "output": exact }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    // The preamble mentions the attribute/marker by name; only the exchange
+    // body must be free of them.
+    let (_, body) = xml.split_once("<exchange>").expect("exchange body");
+    assert!(body.contains("<tool_result tool_use_id=\"t\" is_error=\"false\">"));
+    assert!(!body.contains("truncated="));
+    assert!(!body.contains("original_chars="));
+    assert!(!body.contains("characters truncated] ..."));
+}
+
+/// intent#3696: same element-level marking for an over-cap `tool_use` input,
+/// and none for an under-cap one.
+#[test]
+fn tool_use_input_truncated_attribute_tracks_cap() {
+    let big_input = json!({ "path": "x".repeat(10_000) });
+    let small_input = json!({ "path": "y".repeat(100) });
+    let messages = vec![
+        msg(
+            "assistant",
+            json!([
+                { "type": "tool_use", "name": "view", "tool_use_id": "big", "input": big_input },
+                { "type": "tool_use", "name": "view", "tool_use_id": "small", "input": small_input },
+            ]),
+        ),
+        msg(
+            "user",
+            json!([
+                { "type": "tool_result", "tool_use_id": "big", "output": "ok" },
+                { "type": "tool_result", "tool_use_id": "small", "output": "ok" },
+            ]),
+        ),
+    ];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let (_, body) = xml.split_once("<exchange>").expect("exchange body");
+    // `{"path":"` + 10000 + `"}` = 10011 chars of stringified JSON input.
+    assert!(body.contains(
+        "<tool_use name=\"view\" tool_use_id=\"big\" truncated=\"true\" original_chars=\"10011\">"
+    ));
+    assert!(body.contains("<tool_use name=\"view\" tool_use_id=\"small\">"));
+    assert_eq!(body.matches("truncated=\"true\"").count(), 1);
+    assert_eq!(body.matches("characters truncated] ...").count(), 1);
+}
+
 #[test]
 fn budget_omits_older_exchanges_newest_first() {
     let messages = vec![
@@ -217,9 +324,10 @@ fn assistant_whose_blocks_all_get_sanitized_is_dropped() {
     )];
     let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
     // The supervisor wrapper still appears, but the (now-empty) exchange list
-    // contains no assistant tag and no tool_result.
+    // contains no assistant tag and no tool_result element (the preamble's
+    // prose mentions `tool_result` by name, so match the element form).
     assert!(xml.starts_with("<supervisor>\n"));
-    assert!(!xml.contains("tool_result"));
+    assert!(!xml.contains("<tool_result"));
     assert!(!xml.contains("agent_response_or_tool_uses"));
 }
 
