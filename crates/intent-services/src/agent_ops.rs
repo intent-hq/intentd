@@ -6137,6 +6137,30 @@ impl Services {
         true
     }
 
+    /// Turn-start materialization of the pre-upgrade fallback in
+    /// [`Services::questions_pending`]: for a session whose pending-questions
+    /// marker key was never written, derive pendingness from the transcript
+    /// tail and persist it as the marker BEFORE the starting turn appends its
+    /// user row (the tail walk stops seeing the question once any later
+    /// non-system row lands). Called from the runtime turn-slot claim
+    /// (`AgentManager::try_begin_outcome`), which every delivery path —
+    /// user or automatic, direct, drained, or wake — passes through ahead of
+    /// its user row INSERT. A session with a written marker (the
+    /// post-upgrade norm) costs one session-row read and returns; store
+    /// errors fail open.
+    pub(crate) async fn materialize_legacy_pending_questions_marker(&self, agent_id: &AgentId) {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return;
+        };
+        if session.pending_questions_marker_written() {
+            return;
+        }
+        if let Some(pending) = self.pending_questions_from_tail(agent_id).await {
+            self.record_pending_questions_marker(&session.workspace_id, agent_id, &pending)
+                .await;
+        }
+    }
+
     /// The number of question resource blocks still pending on the marked
     /// question message — the counting form of the pending-questions
     /// derivation ([`Services::questions_pending`] is `true` exactly when this

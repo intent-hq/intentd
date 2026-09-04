@@ -32258,6 +32258,61 @@ async fn question_hold_tail_fallback_materializes_marker_and_survives_user_row()
     assert!(!svc.questions_pending(&id).await);
 }
 
+/// The turn-start materialization hook: on a marker-less (pre-upgrade)
+/// session whose tail is an un-dismissed question it persists the marker
+/// without going through `questions_pending`; it is a no-op on an empty
+/// transcript, on a question-free tail, and once the marker key exists
+/// (including the authoritative empty marker, which it must not resurrect).
+#[tokio::test]
+async fn materialize_legacy_pending_questions_marker_writes_marker_from_tail() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    svc.materialize_legacy_pending_questions_marker(&id).await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(
+        !session.pending_questions_marker_written(),
+        "empty transcript: nothing to materialize"
+    );
+
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+    svc.materialize_legacy_pending_questions_marker(&id).await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked.id.as_str()),
+        "tail question materialized as the marker"
+    );
+
+    // The marker outlives the user row the starting turn appends next.
+    svc.store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "auto wake" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user");
+    assert!(svc.questions_pending(&id).await, "marker survives the row");
+
+    // Once the marker key exists the hook is a no-op: dismissal resolves the
+    // pending set, and re-running the hook must not disturb that state.
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+    assert!(!svc.questions_pending(&id).await);
+    svc.materialize_legacy_pending_questions_marker(&id).await;
+    assert!(
+        !svc.questions_pending(&id).await,
+        "a written marker is authoritative; the hook never overrides it"
+    );
+}
+
 /// Regression: a trailing `system` row (e.g. the resume-interruption marker
 /// `resume_interrupted_agent` appends before its `Automatic` continuation)
 /// must not defeat the hold — the derivation walks back past it to the

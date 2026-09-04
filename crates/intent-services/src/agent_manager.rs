@@ -5035,6 +5035,19 @@ impl AgentManager {
                     .await;
                 self.arm_auto_unarchive_flag_if_slot_held(agent_id);
             }
+            // Pre-upgrade pending-questions marker (PROTOCOL §5.5): a session
+            // whose marker key was never written derives pendingness from the
+            // transcript tail, and this turn's user row is about to become
+            // that tail. Materialize the marker HERE — the single choke point
+            // every runtime delivery (user or automatic, direct, drained, or
+            // wake) claims through before its user row INSERT — so a pending
+            // set live across the upgrade stays sticky instead of vanishing
+            // under the first delivery. One session-row read on the
+            // post-upgrade norm (marker written); best-effort, never blocks
+            // the turn.
+            self.services
+                .materialize_legacy_pending_questions_marker(agent_id)
+                .await;
             // A real turn is starting: this agent's monitoring-idle waiting
             // period (if any) is over, so clear its once-per-period advisory
             // markers — the NEXT hook-/PR-monitor-waiting idle opens a NEW

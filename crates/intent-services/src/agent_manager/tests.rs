@@ -16726,6 +16726,80 @@ mod pending_questions_no_gate {
         assert!(!mgr.services.questions_pending(&id).await, "marker cleared");
     }
 
+    /// Pre-upgrade regression: a session whose marker key was NEVER written
+    /// (only the legacy transcript tail says a question is pending) must not
+    /// lose that pending set to an automatic delivery. The turn-slot claim
+    /// materializes the marker BEFORE the wake's user row becomes the tail,
+    /// so `questions_pending` still reports it after the turn — independent
+    /// of the workspace displayStatus recompute, which only probes legacy
+    /// sessions on the workspace's own `Idle → AgentRunning` edge.
+    #[tokio::test]
+    async fn automatic_send_materializes_legacy_marker_before_user_row() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, _bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = mock_agent(&mgr, "ws-pq-legacy", "a-pq-legacy").await;
+        // Another agent already in flight in this workspace: the claim below
+        // is not the workspace's Idle → AgentRunning edge, so no displayStatus
+        // recompute runs ahead of it to materialize the marker incidentally.
+        mgr.services.agent_activity_begin(&ws).await;
+        // Question row only — no marker (the pre-marker daemon shape).
+        let asked = mgr
+            .services
+            .store
+            .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+            .await
+            .expect("append question");
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&id)
+            .await
+            .expect("session");
+        assert!(!session.pending_questions_marker_written(), "legacy shape");
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("automatic send");
+        assert_eq!(r["queued"], json!(false), "delivered directly");
+        settle(&mgr, &id).await;
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert!(
+            user_row_idx(&messages, "auto wake").is_some(),
+            "wake row landed after the question"
+        );
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&id)
+            .await
+            .expect("session");
+        assert_eq!(
+            session.pending_questions_message_id(),
+            Some(asked.id.as_str()),
+            "marker materialized from the tail before the wake row landed"
+        );
+        assert!(
+            mgr.services.questions_pending(&id).await,
+            "legacy pending set stays sticky across the automatic delivery"
+        );
+    }
+
     /// `try_drain_queue` drains a parked automatic entry while questions are
     /// pending, and the marker survives both the drain and a later
     /// question-free assistant turn until dismissed.
