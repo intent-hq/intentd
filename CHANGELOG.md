@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.23] - 2026-09-04
+
+### 🐛 Bug Fixes
+
+- *(services)* Register the idle debouncer atomically with the count drop ([#1736](https://github.com/intent-hq/intentd/pull/1736))
+- *(settings)* Keep stored secrets when settings.update echoes the redaction placeholder ([#1738](https://github.com/intent-hq/intentd/pull/1738))
+
+### 🧪 Testing
+
+- *(agent-manager)* Spawn the agent_root_pids fixture child as a group leader ([#1734](https://github.com/intent-hq/intentd/pull/1734))
+- *(tunnel)* Unset INTENTD_TAILCAT_BIN in the missing-binary test ([#1732](https://github.com/intent-hq/intentd/pull/1732))
+- *(e2e)* Detach stdio in the DaemonGuard drop test so nextest sees no leak ([#1733](https://github.com/intent-hq/intentd/pull/1733))
+
+
 ## [0.9.22] - 2026-09-04
 
 ### 🐛 Bug Fixes
