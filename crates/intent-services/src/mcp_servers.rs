@@ -2346,6 +2346,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_transport_switch_with_placeholder_stays_section_scoped() {
+        // stdio → http while echoing the redacted env: the env placeholder
+        // resolves against the stored env only, and a headers placeholder with
+        // no stored headers counterpart is dropped rather than borrowing the
+        // env secret.
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(json!({
+            "id": "sw1", "transport": "stdio", "command": "srv",
+            "env": { "TOKEN": "real-env" },
+        }))
+        .await
+        .unwrap();
+
+        let listed = s.list(None).await.unwrap();
+        let mut echoed = listed["servers"][0].clone();
+        assert_eq!(echoed["env"]["TOKEN"], json!(REDACTED_PLACEHOLDER));
+        let obj = echoed.as_object_mut().unwrap();
+        obj.remove("command");
+        obj.insert("transport".into(), json!("http"));
+        obj.insert("url".into(), json!("http://y"));
+        obj.insert(
+            "headers".into(),
+            json!({ "Authorization": REDACTED_PLACEHOLDER }),
+        );
+
+        let out = s.update("sw1", echoed).await.unwrap();
+        assert_eq!(out["server"]["transport"], json!("http"));
+        assert_eq!(out["server"]["env"]["TOKEN"], json!(REDACTED_PLACEHOLDER));
+
+        let stored = read_configs(&secrets).await;
+        assert_eq!(stored["sw1"]["transport"], json!("http"));
+        assert_eq!(stored["sw1"]["url"], json!("http://y"));
+        assert_eq!(stored["sw1"]["env"], json!({ "TOKEN": "real-env" }));
+        assert_eq!(stored["sw1"]["headers"], json!({}));
+        assert!(stored["sw1"].get("command").is_none());
+    }
+
+    #[tokio::test]
     async fn update_placeholder_for_unknown_key_is_dropped() {
         let secrets = mem_async();
         let h = McpHub::new();
