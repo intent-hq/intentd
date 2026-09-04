@@ -1333,6 +1333,102 @@ mod tests {
         assert_eq!(remote_names(&out.checkout_dir), Vec::<String>::new());
     }
 
+    /// A submodule whose removal is staged (`git rm --cached sub`, checkout
+    /// left on disk) with an unpublished local commit is NOT bundled: the WIP
+    /// tip carries the removal and has no gitlink to hydrate against, so
+    /// bundling it would make the import roll back. The archive round-trips
+    /// exactly as before submodule bundling existed.
+    #[test]
+    fn staged_submodule_removal_is_not_bundled_and_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sup, _origin) = superproject_with_submodule(tmp.path());
+        let sub = sup.join("sub");
+        fgit(&sub, &["checkout", "-q", "main"]);
+        local_commit(&sub, "wip.txt");
+        fgit(&sup, &["rm", "-q", "--cached", "sub"]);
+        let src_status = fgit(&sup, &["status", "--porcelain"]);
+        assert_eq!(src_status, "D  sub\n?? sub/");
+
+        let ws = superproject_workspace(&sup);
+        let staging = tmp.path().join("staging");
+        let TransferBundle {
+            bundle_path,
+            refs,
+            submodule_bundles,
+        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        assert!(refs.submodules.is_empty(), "{refs:?}");
+        assert!(submodule_bundles.is_empty());
+
+        let target = tempfile::tempdir().unwrap();
+        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+            .unwrap();
+        assert_eq!(
+            fgit(&out.checkout_dir, &["status", "--porcelain"]),
+            "D  sub",
+            "staged removal travels; the on-disk checkout does not"
+        );
+        assert!(!out.checkout_dir.join("sub").exists());
+    }
+
+    /// A nested submodule whose checkout HEAD is NOT the gitlink its parent's
+    /// HEAD records (committed in `sub/inner`, not yet committed in `sub`)
+    /// cannot be placed by hydration — `sub` is bundled as-is, never
+    /// snapshotted — so it is skipped rather than bundled at a commit the
+    /// containing tip does not record; the import succeeds with `sub`
+    /// hydrated at the tip it records.
+    #[test]
+    fn nested_submodule_unrecorded_by_parent_head_is_not_bundled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner_src = tmp.path().join("inner-src");
+        finit_repo(&inner_src);
+        fgit(
+            tmp.path(),
+            &["clone", "-q", "--bare", "inner-src", "inner.git"],
+        );
+        let inner_origin = tmp.path().join("inner.git");
+        let (sup, _sub_origin) = superproject_with_submodule(tmp.path());
+        let sub = sup.join("sub");
+        fgit(&sub, &["checkout", "-q", "main"]);
+        fgit(
+            &sub,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                inner_origin.to_str().unwrap(),
+                "inner",
+            ],
+        );
+        fgit(&sub, &["commit", "-q", "-m", "add inner"]);
+        let sub_sha = fgit(&sub, &["rev-parse", "HEAD"]);
+        let inner = sub.join("inner");
+        let recorded_inner = fgit(&inner, &["rev-parse", "HEAD"]);
+        fgit(&inner, &["checkout", "-q", "-b", "feat/x"]);
+        local_commit(&inner, "deep.txt");
+
+        let ws = superproject_workspace(&sup);
+        let staging = tmp.path().join("staging");
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        let paths: Vec<&str> = refs.submodules.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, ["sub"], "{refs:?}");
+
+        let target = tempfile::tempdir().unwrap();
+        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+            .unwrap();
+        let dst_sub = out.checkout_dir.join("sub");
+        assert_eq!(repo_head(&dst_sub), sub_sha);
+        assert_eq!(
+            fgit(&dst_sub, &["ls-tree", "HEAD", "--", "inner"]),
+            format!("160000 commit {recorded_inner}\tinner")
+        );
+        assert!(
+            !dst_sub.join("inner/.git").exists(),
+            "inner stays an uninitialized gitlink"
+        );
+    }
+
     /// (b) Nested: `sub` (unpublished — it records a bumped `inner`
     /// gitlink locally) and `sub/inner` (unpublished, on `feat/x`) both
     /// hydrate, parent first, each at its bundled commit and branch.

@@ -88,7 +88,7 @@ fn collect(
         let Ok(sub_repo) = sm.open() else {
             continue;
         };
-        let sub_dir = workdir.join(rel_path);
+        let sub_dir = workdir.join(&rel_path);
         let full_path = if prefix.is_empty() {
             rel.clone()
         } else {
@@ -103,6 +103,22 @@ fn collect(
         let Some(found) = inspect_checkout(&sub_repo, &sub_dir, name, &full_path) else {
             continue;
         };
+        // Only a submodule the containing tip records as a gitlink can be
+        // placed on import (hydration checks out that gitlink): skip one
+        // whose removal is staged (`git rm --cached`, checkout left on disk)
+        // and a nested one whose parent HEAD records a different commit —
+        // its subtree with it.
+        match recorded_gitlink(repo, &rel_path, depth) {
+            Some(recorded) if depth == 0 || recorded.to_string() == found.commit_sha => {}
+            _ => {
+                tracing::debug!(
+                    path = %full_path,
+                    commit = %found.commit_sha,
+                    "transfer submodule scan: containing tip does not record this checkout; skipped"
+                );
+                continue;
+            }
+        }
         let before = out.len();
         if depth + 1 < intent_git::submodule::MAX_SUBMODULE_NESTING {
             collect(&sub_repo, &sub_dir, &full_path, depth + 1, out);
@@ -132,7 +148,7 @@ fn inspect_checkout(
     let origin_url = sub_repo
         .find_remote("origin")
         .ok()
-        .and_then(|r| r.url().ok().map(str::to_string));
+        .and_then(|r| r.url().ok().map(strip_url_credentials));
     Some(UnpublishedSubmodule {
         name,
         path: full_path.to_string(),
@@ -142,6 +158,49 @@ fn inspect_checkout(
         repo_dir: sub_dir.to_path_buf(),
         published,
     })
+}
+
+/// A remote URL fit to persist in a transfer archive and restore on another
+/// machine: the source's credentials must not travel. For `http(s)://` the
+/// whole userinfo goes (tokens ride there as the username); for any other
+/// `scheme://` URL only a `:password` goes, since the user part (`git@`)
+/// is what ssh needs. Scp-like `git@host:path` has no scheme and is kept.
+fn strip_url_credentials(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let (scheme, rest) = url.split_at(scheme_end + 3);
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    let userinfo = &authority[..at];
+    let host = &authority[at + 1..];
+    let is_http = scheme.eq_ignore_ascii_case("http://") || scheme.eq_ignore_ascii_case("https://");
+    if is_http {
+        format!("{scheme}{host}{tail}")
+    } else {
+        let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
+        format!("{scheme}{user}@{host}{tail}")
+    }
+}
+
+/// The gitlink the containing repository's tip records at `rel`, if any.
+/// The top-level tip is the index — the WIP snapshot commits it, and it
+/// already reflects a staged removal or addition — while a nested
+/// submodule's containing tip is its parent's HEAD tree, since the parent
+/// checkout is bundled as-is and never snapshotted.
+fn recorded_gitlink(repo: &Repository, rel: &Path, depth: u32) -> Option<Oid> {
+    if depth == 0 {
+        let index = repo.index().ok()?;
+        let entry = index.get_path(rel, 0)?;
+        (entry.mode == 0o16_0000).then_some(entry.id)
+    } else {
+        let tree = repo.head().ok()?.peel_to_tree().ok()?;
+        let entry = tree.get_path(rel).ok()?;
+        (entry.filemode() == 0o16_0000).then_some(entry.id())
+    }
 }
 
 /// Whether `oid` equals or is an ancestor of any `refs/remotes/**` tip.
@@ -386,9 +445,12 @@ mod tests {
     }
 
     /// A nested submodule (`sub/inner`) with a local-only commit is found
-    /// with the composed path and its own raw name; its published parent
-    /// `sub` is carried ahead of it (`published: true`) and flips to an
-    /// ordinary unpublished finding once it records the child locally.
+    /// with the composed path and its own raw name once its parent `sub`
+    /// records that commit — hydration checks out the gitlink the parent's
+    /// HEAD records, so an unrecorded commit is not reported. With the
+    /// recording commit pushed, `sub` is carried ahead of it
+    /// (`published: true`); it flips to an ordinary unpublished finding once
+    /// the recording commit is local only.
     #[test]
     fn detects_nested_submodule_with_composed_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -420,6 +482,15 @@ mod tests {
         git(&inner, &["checkout", "-q", "-b", "feat/x"]);
         let sha = local_commit(&inner, "deep.txt");
         let found = find_unpublished_submodules(&sup).unwrap();
+        assert!(
+            found.is_empty(),
+            "parent HEAD does not record the inner commit yet: {found:?}"
+        );
+
+        git(&sub, &["add", "inner"]);
+        git(&sub, &["commit", "-q", "-m", "bump inner"]);
+        git(&sub, &["push", "-q", "origin", "main"]);
+        let found = find_unpublished_submodules(&sup).unwrap();
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].path, "sub");
         assert!(found[0].published, "published parent carried");
@@ -431,13 +502,34 @@ mod tests {
         assert_eq!(found[1].repo_dir, inner);
         assert!(!found[1].published);
 
+        local_commit(&inner, "deeper.txt");
         git(&sub, &["add", "inner"]);
-        git(&sub, &["commit", "-q", "-m", "bump inner"]);
+        git(&sub, &["commit", "-q", "-m", "bump inner again"]);
         let found = find_unpublished_submodules(&sup).unwrap();
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].path, "sub");
         assert!(!found[0].published, "parent is now unpublished itself");
         assert!(!found[1].published);
+    }
+
+    /// A submodule whose removal is staged (`git rm --cached`, checkout left
+    /// on disk) is not reported: the tip the export snapshots has no gitlink
+    /// to hydrate against, so its local commits cannot ride along.
+    #[test]
+    fn skips_submodule_with_staged_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sup, _origin) = superproject_with_submodule(tmp.path());
+        let sub = sup.join("sub");
+        git(&sub, &["checkout", "-q", "main"]);
+        local_commit(&sub, "wip.txt");
+        assert_eq!(find_unpublished_submodules(&sup).unwrap().len(), 1);
+
+        git(&sup, &["rm", "-q", "--cached", "sub"]);
+        assert!(sub.join(".git").exists(), "checkout left on disk");
+        assert!(find_unpublished_submodules(&sup).unwrap().is_empty());
+
+        git(&sup, &["reset", "-q", "--", "sub"]);
+        assert_eq!(find_unpublished_submodules(&sup).unwrap().len(), 1);
     }
 
     /// Published ancestors are carried only when a nested descendant is
@@ -509,5 +601,62 @@ mod tests {
         let _ = find_unpublished_submodules(&sup).unwrap();
         assert_eq!(git(&sup, &["status", "--porcelain"]), before);
         assert_eq!(git(&sub, &["status", "--porcelain"]), sub_before);
+    }
+
+    /// Credentials embedded in the submodule's `remote.origin.url` never
+    /// reach the manifest: http(s) userinfo is dropped entirely, an ssh
+    /// password is dropped but its user kept, and URLs without a scheme or
+    /// without userinfo pass through unchanged.
+    #[test]
+    fn origin_url_credentials_are_stripped() {
+        assert_eq!(
+            strip_url_credentials("https://user:token@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            strip_url_credentials("https://ghp_token@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            strip_url_credentials("HTTP://u:p@host:8080/r"),
+            "HTTP://host:8080/r"
+        );
+        assert_eq!(
+            strip_url_credentials("ssh://git:secret@host:2222/o/r.git"),
+            "ssh://git@host:2222/o/r.git"
+        );
+        assert_eq!(
+            strip_url_credentials("ssh://git@host/o/r.git"),
+            "ssh://git@host/o/r.git"
+        );
+        assert_eq!(
+            strip_url_credentials("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+        assert_eq!(strip_url_credentials("/tmp/origin.git"), "/tmp/origin.git");
+        assert_eq!(
+            strip_url_credentials("https://host/o/r"),
+            "https://host/o/r"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (sup, _origin) = superproject_with_submodule(tmp.path());
+        let sub = sup.join("sub");
+        git(
+            &sub,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://user:s3cret@example.com/o/r.git",
+            ],
+        );
+        local_commit(&sub, "wip.txt");
+        let found = find_unpublished_submodules(&sup).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].origin_url.as_deref(),
+            Some("https://example.com/o/r.git")
+        );
     }
 }

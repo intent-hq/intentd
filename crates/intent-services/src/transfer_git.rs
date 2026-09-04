@@ -1870,10 +1870,14 @@ mod tests {
             ],
         );
         git(&sub, &["commit", "-q", "-m", "add inner"]);
-        let sub_sha = git(&sub, &["rev-parse", "HEAD"]);
         let inner = sub.join("inner");
         git(&inner, &["checkout", "-q", "-b", "feat/x"]);
         let inner_sha = local_commit(&inner, "deep.txt");
+        // `sub` records the new inner gitlink in a commit that is never
+        // pushed — only a gitlink its HEAD records can be hydrated on import.
+        git(&sub, &["add", "inner"]);
+        git(&sub, &["commit", "-q", "-m", "bump inner"]);
+        let sub_sha = git(&sub, &["rev-parse", "HEAD"]);
         let ws = workspace_for_repo(&sup);
         let staging = dir.path().join("staging");
 
