@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.16] - 2026-09-04
+
+### 🚀 Features
+
+- Report detected device kind ([#1706](https://github.com/intent-hq/intentd/pull/1706))
+- *(agent)* Stop parking automatic deliveries behind pending questions ([#1710](https://github.com/intent-hq/intentd/pull/1710))
+
+
 ## [0.9.15] - 2026-09-03
 
 ### 🚀 Features
