@@ -82,7 +82,7 @@ intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.22" }
 nix = { workspace = true, features = ["signal", "process", "fs"] }
 # No-echo terminal input for `intentd settings <sensitive>` prompts
 # (termios); already in the workspace dependency tree via intent-core.
-libc = "0.2"
+libc = { workspace = true }
 
 # Static musl release targets have no system OpenSSL; macOS has no system OpenSSL
 # headers/dylibs we can rely on either (Homebrew paths break on machines without it).

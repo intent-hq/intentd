@@ -28,7 +28,7 @@ use intent_services::EventBus;
 use sha2::{Digest, Sha256};
 
 #[cfg(any(unix, windows))]
-use crate::accept_backoff::{AcceptBackoff, AcceptFailure};
+use crate::accept_backoff::{sleep_unless_shutdown, AcceptBackoff, AcceptFailure};
 use crate::control::SystemControl;
 use crate::reverse::PrimaryReverseRegistry;
 use crate::rpc_limit::RpcLimiter;
@@ -195,9 +195,8 @@ where
                                     "uds accept failed: out of descriptors, backing off"
                                 );
                             }
-                            tokio::select! {
-                                () = tokio::time::sleep(delay) => {}
-                                () = &mut shutdown => break,
+                            if sleep_unless_shutdown(delay, &mut shutdown).await {
+                                break;
                             }
                         }
                         AcceptFailure::Other => tracing::warn!(error = %e, "uds accept failed"),
@@ -478,9 +477,8 @@ where
                                     "named-pipe connect failed: out of resources, backing off"
                                 );
                             }
-                            tokio::select! {
-                                () = tokio::time::sleep(delay) => {}
-                                _ = &mut shutdown => break,
+                            if sleep_unless_shutdown(delay, &mut shutdown).await {
+                                break;
                             }
                         }
                         AcceptFailure::Other => tracing::warn!(error = %e, "named-pipe connect failed"),

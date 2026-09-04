@@ -6,8 +6,11 @@
 //! attempt. [`AcceptBackoff`] classifies each accept error: transient resource
 //! exhaustion yields a jittered exponential delay (50 ms doubling to a 500 ms
 //! cap, reset by the next successful accept) plus a rate-limited WARN, while any
-//! other error keeps today's immediate retry.
+//! other error keeps today's immediate retry. The WARN clock spans streaks, so
+//! a listener flapping at the limit (fail → sleep → one accept → fail …) logs
+//! at most one WARN/recovery pair per interval instead of one per cycle.
 
+use std::future::Future;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -39,7 +42,12 @@ pub(crate) enum AcceptFailure {
 pub(crate) struct AcceptBackoff {
     streak: u32,
     base: Duration,
+    /// Last WARN instant; deliberately kept across streaks so the rate limit
+    /// bounds the log rate under flapping, not just within one streak.
     last_warn: Option<Instant>,
+    /// Whether the current streak has logged a WARN (so recovery logs only
+    /// when there is a WARN to pair it with).
+    warned: bool,
 }
 
 impl AcceptBackoff {
@@ -65,6 +73,7 @@ impl AcceptBackoff {
         };
         if warn {
             self.last_warn = Some(now);
+            self.warned = true;
         }
         AcceptFailure::Backoff {
             delay: jitter(self.base),
@@ -75,13 +84,24 @@ impl AcceptBackoff {
 
     /// Record a successful accept. Returns the length of the streak that just
     /// ended so the caller can log recovery once, or `None` when no streak was
-    /// in progress.
+    /// in progress or the streak never warned (a silent streak gets a silent
+    /// recovery, so flapping cannot emit an INFO per cycle). The WARN clock is
+    /// left running across streaks.
     pub(crate) fn on_success(&mut self) -> Option<u32> {
-        let ended = (self.streak > 0).then_some(self.streak);
+        let ended = (self.streak > 0 && self.warned).then_some(self.streak);
         self.streak = 0;
         self.base = Duration::ZERO;
-        self.last_warn = None;
+        self.warned = false;
         ended
+    }
+}
+
+/// Sleep for `delay` unless `shutdown` resolves first. Returns `true` when
+/// shutdown won, so an accept loop exits without waiting out the backoff.
+pub(crate) async fn sleep_unless_shutdown(delay: Duration, shutdown: impl Future) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => false,
+        _ = shutdown => true,
     }
 }
 
@@ -110,11 +130,15 @@ fn is_resource_exhaustion(err: &io::Error) -> bool {
     )
 }
 
-/// Windows equivalents: `WSAEMFILE` (10024) and `WSAENOBUFS` (10055) from
-/// Winsock, plus the portable out-of-memory kind.
+/// Windows equivalents. The WSS `TcpListener` reports Winsock codes —
+/// `WSAEMFILE` (10024) and `WSAENOBUFS` (10055) — while the named-pipe
+/// `connect()` loop reports Win32 codes: `ERROR_TOO_MANY_OPEN_FILES` (4) and
+/// `ERROR_NO_SYSTEM_RESOURCES` (1450). `ERROR_NOT_ENOUGH_MEMORY` (8) maps to
+/// the portable out-of-memory kind.
 #[cfg(windows)]
 fn is_resource_exhaustion(err: &io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(10024 | 10055)) || err.kind() == io::ErrorKind::OutOfMemory
+    matches!(err.raw_os_error(), Some(4 | 1450 | 10024 | 10055))
+        || err.kind() == io::ErrorKind::OutOfMemory
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -124,7 +148,10 @@ fn is_resource_exhaustion(err: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{jitter, AcceptBackoff, AcceptFailure, INITIAL_DELAY, MAX_DELAY, WARN_INTERVAL};
+    use super::{
+        jitter, sleep_unless_shutdown, AcceptBackoff, AcceptFailure, INITIAL_DELAY, MAX_DELAY,
+        WARN_INTERVAL,
+    };
     use std::io;
     use std::time::{Duration, Instant};
 
@@ -212,17 +239,74 @@ mod tests {
     }
 
     #[test]
-    fn success_resets_the_streak_and_delay() {
+    fn success_resets_the_streak_and_delay_but_not_the_warn_clock() {
         let mut b = AcceptBackoff::default();
+        let t0 = Instant::now();
         for _ in 0..4 {
-            backoff(b.on_error(&emfile()));
+            backoff(b.on_error_at(&emfile(), t0));
         }
         assert_eq!(b.on_success(), Some(4));
         assert_eq!(b.on_success(), None);
-        let (delay, streak, warn) = backoff(b.on_error(&emfile()));
+        let (delay, streak, warn) = backoff(b.on_error_at(&emfile(), t0 + Duration::from_secs(1)));
         assert_eq!(streak, 1);
-        assert!(warn, "first failure after recovery warns again");
+        assert!(!warn, "WARN rate limit spans streaks");
         assert!(delay <= INITIAL_DELAY, "delay {delay:?} did not reset");
+        let (_, _, warn) = backoff(b.on_error_at(&emfile(), t0 + WARN_INTERVAL));
+        assert!(warn, "WARN is due again once the interval elapses");
+    }
+
+    /// A listener sitting exactly at the limit alternates one EMFILE with one
+    /// successful accept every few tens of milliseconds. That must not emit a
+    /// WARN + "recovered" INFO pair per cycle: one WARN per interval, and a
+    /// recovery line only for the streak that warned.
+    #[test]
+    fn flapping_at_the_limit_is_bounded_to_one_warn_and_recovery_per_interval() {
+        let mut b = AcceptBackoff::default();
+        let t0 = Instant::now();
+        let mut warns = 0;
+        let mut recoveries = 0;
+        // 10 s of 40 ms cycles.
+        for cycle in 0..250u32 {
+            let now = t0 + Duration::from_millis(40) * cycle;
+            let (_, streak, warn) = backoff(b.on_error_at(&emfile(), now));
+            assert_eq!(streak, 1);
+            warns += u32::from(warn);
+            recoveries += u32::from(b.on_success().is_some());
+        }
+        // t = 0 s, 5 s, 10 s would be three; 250 × 40 ms stops just short of 10 s.
+        assert_eq!(warns, 2, "one WARN per {WARN_INTERVAL:?}");
+        assert_eq!(
+            recoveries, warns,
+            "recovery is logged once per warned streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_wins_while_asleep() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(());
+        });
+        let started = Instant::now();
+        let mut shutdown = std::pin::pin!(rx);
+        assert!(
+            sleep_unless_shutdown(MAX_DELAY, &mut shutdown).await,
+            "shutdown should win"
+        );
+        assert!(
+            started.elapsed() < MAX_DELAY / 2,
+            "returned after {:?}, expected well under {MAX_DELAY:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_completes_when_shutdown_stays_pending() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut shutdown = std::pin::pin!(rx);
+        assert!(!sleep_unless_shutdown(Duration::from_millis(10), &mut shutdown).await);
+        drop(tx);
     }
 
     #[test]

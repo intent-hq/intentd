@@ -38,7 +38,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role, WebSoc
 use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::accept_backoff::{AcceptBackoff, AcceptFailure};
+use crate::accept_backoff::{sleep_unless_shutdown, AcceptBackoff, AcceptFailure};
 use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore};
 use crate::conn::{self, ConnSubs};
 use crate::forward::ForwardRegistry;
@@ -420,9 +420,8 @@ impl WsInner {
                                     "ws accept failed: out of descriptors, backing off"
                                 );
                             }
-                            tokio::select! {
-                                _ = &mut shutdown => break,
-                                () = tokio::time::sleep(delay) => {}
+                            if sleep_unless_shutdown(delay, &mut shutdown).await {
+                                break;
                             }
                         }
                         AcceptFailure::Other => tracing::warn!(error = %e, "ws accept failed"),

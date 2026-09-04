@@ -2660,17 +2660,47 @@ impl ProcUsage {
 
 /// Count the daemon's own open file descriptors: entries of the per-process
 /// fd table (`/proc/self/fd` on Linux, `/dev/fd` on macOS), minus the handle
-/// the read itself holds. `None` where no such table exists.
-fn count_open_fds() -> Option<u64> {
+/// the read itself holds. `Unsupported` where no such table exists; note the
+/// read needs a descriptor of its own, so at exhaustion it fails with EMFILE.
+fn count_open_fds() -> std::io::Result<u64> {
     let table = if cfg!(target_os = "linux") {
         "/proc/self/fd"
     } else if cfg!(target_os = "macos") {
         "/dev/fd"
     } else {
-        return None;
+        return Err(std::io::ErrorKind::Unsupported.into());
     };
-    let entries = std::fs::read_dir(table).ok()?.count() as u64;
-    Some(entries.saturating_sub(1))
+    let entries = std::fs::read_dir(table)?.count() as u64;
+    Ok(entries.saturating_sub(1))
+}
+
+/// Whether a failed fd-table read means the table itself is full.
+#[cfg(unix)]
+fn is_fd_exhaustion(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+#[cfg(not(unix))]
+fn is_fd_exhaustion(_err: &std::io::Error) -> bool {
+    false
+}
+
+/// Resolve one fd-table read into the count to publish and feed to the
+/// pressure gate. The gauge must not go blind exactly at exhaustion: when the
+/// read itself fails with EMFILE/ENFILE the table is saturated, so the count
+/// is the soft `limit` itself (the WARN fires). Any other failure yields
+/// `None` — logged at debug, except the expected `Unsupported` off Linux/macOS.
+fn resolve_fd_count(read: std::io::Result<u64>, limit: Option<u64>) -> Option<u64> {
+    match read {
+        Ok(count) => Some(count),
+        Err(e) if is_fd_exhaustion(&e) => limit,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                tracing::debug!(error = %e, "cannot read the open fd table");
+            }
+            None
+        }
+    }
 }
 
 /// Descriptor-pressure log gate (intent-hq/intent#4390): WARN once the open
@@ -2707,6 +2737,10 @@ impl FdPressure {
         limit: u64,
         now: std::time::Instant,
     ) -> Option<FdPressureEvent> {
+        // No usable limit: never warn (`above` would be trivially true).
+        if limit == 0 {
+            return None;
+        }
         // Integer arithmetic: `count * 100 >= limit * 80` ⇔ count ≥ 80 % of limit.
         let above = |percent: u64| count.saturating_mul(100) >= limit.saturating_mul(percent);
         if above(Self::ENTER_PERCENT) {
@@ -2789,11 +2823,12 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
     let usage = Arc::new(ProcUsage::default());
     let mut pressure = FdPressure::new();
     let mut sample_fds = move |usage: &ProcUsage| {
-        let Some(count) = count_open_fds() else {
+        let limit = fd_limit::soft_limit();
+        let Some(count) = resolve_fd_count(count_open_fds(), limit) else {
             return;
         };
         usage.store_fd_count(count);
-        let Some(limit) = fd_limit::soft_limit() else {
+        let Some(limit) = limit else {
             return;
         };
         match pressure.observe(count, limit, std::time::Instant::now()) {
@@ -2812,19 +2847,30 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
     };
     sample_fds(&usage);
 
-    let Ok(pid) = sysinfo::get_current_pid() else {
-        tracing::warn!("cannot resolve own pid; cpu/memory sampling disabled");
-        return usage;
-    };
-    let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
-    let mut sys = System::new();
-    let sample = move |sys: &mut System, usage: &ProcUsage| {
-        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh_kind);
-        if let Some(proc) = sys.process(pid) {
-            usage.store(proc.cpu_usage(), proc.memory());
+    // Descriptor sampling does not need the pid, so a pid lookup failure only
+    // disables the cpu/memory half of the tick.
+    let mut cpu_mem = match sysinfo::get_current_pid() {
+        Ok(pid) => {
+            let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
+            let mut sys = System::new();
+            let sample = move |sys: &mut System, usage: &ProcUsage| {
+                sys.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    refresh_kind,
+                );
+                if let Some(proc) = sys.process(pid) {
+                    usage.store(proc.cpu_usage(), proc.memory());
+                }
+            };
+            sample(&mut sys, &usage);
+            Some((sys, sample))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot resolve own pid; cpu/memory sampling disabled");
+            None
         }
     };
-    sample(&mut sys, &usage);
 
     let task_usage = usage.clone();
     tokio::spawn(async move {
@@ -2836,7 +2882,9 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            sample(&mut sys, &task_usage);
+            if let Some((sys, sample)) = cpu_mem.as_mut() {
+                sample(sys, &task_usage);
+            }
             sample_fds(&task_usage);
         }
     });
@@ -2876,6 +2924,11 @@ mod fd_limit {
     /// to set, or `None` to leave the limit untouched. The target is the hard
     /// limit bounded by the cap; an unlimited hard limit with no cap has no
     /// finite target. The soft limit is never lowered.
+    ///
+    /// `(hard = None, cap = None)` is effectively unreachable on Linux: the
+    /// kernel refuses `RLIM_INFINITY` for `RLIMIT_NOFILE` (EPERM above
+    /// `fs.nr_open`), so the hard limit is always finite there. That branch
+    /// is macOS-without-cap territory only, and macOS always has a cap.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64> {
         let target = match (hard, cap) {
@@ -6448,6 +6501,46 @@ mod tests {
         assert!(during > before, "{during} > {before}");
         drop(held);
         assert!(count_open_fds().unwrap() < during);
+    }
+
+    /// At exhaustion the table read itself fails with EMFILE/ENFILE; that must
+    /// read as "saturated" (count = limit) so the pressure WARN still fires,
+    /// while any other failure leaves the gauge alone.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_fd_count_saturates_to_the_limit_on_exhaustion() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(resolve_fd_count(Ok(42), Some(1024)), Some(42));
+        assert_eq!(resolve_fd_count(Ok(42), None), Some(42));
+        for code in [libc::EMFILE, libc::ENFILE] {
+            assert_eq!(
+                resolve_fd_count(Err(Error::from_raw_os_error(code)), Some(1024)),
+                Some(1024),
+                "errno {code} saturates"
+            );
+            assert_eq!(
+                resolve_fd_count(Err(Error::from_raw_os_error(code)), None),
+                None,
+                "errno {code} without a known limit has no count to report"
+            );
+        }
+        assert_eq!(
+            resolve_fd_count(Err(Error::from_raw_os_error(libc::EACCES)), Some(1024)),
+            None
+        );
+        assert_eq!(
+            resolve_fd_count(Err(ErrorKind::Unsupported.into()), Some(1024)),
+            None
+        );
+    }
+
+    #[test]
+    fn fd_pressure_never_warns_without_a_usable_limit() {
+        use std::time::Instant;
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.observe(0, 0, t0), None);
+        assert_eq!(p.observe(500, 0, t0), None);
     }
 
     #[test]
