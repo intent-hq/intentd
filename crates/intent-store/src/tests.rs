@@ -1,6 +1,7 @@
 //! Unit tests: open a temp `SQLite` DB, run migrations, and round-trip
 //! workspaces and notes including the `include_archived` filter.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use intent_core::{
@@ -843,6 +844,95 @@ async fn note_round_trip() {
 
     let fetched = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(fetched.id, note.id);
+}
+
+/// `count_tasks_by_status`: one GROUP BY aggregate over
+/// `json_extract(task_json, '$.status')` keyed by the wire status string —
+/// every task note in the workspace regardless of parent/archive state
+/// except the spec itself (`task.list` population parity), non-task notes
+/// ignored, absent statuses absent, an unknown stored status folded into
+/// `not_started`, and scoped per workspace.
+#[tokio::test]
+async fn count_tasks_by_status_groups_by_wire_status() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let ts = now_iso();
+    let mk_note = |id: &str, status: Option<TaskStatus>, archived: bool| Note {
+        id: NoteId::from(id),
+        workspace_id: ws_id.clone(),
+        title: id.to_string(),
+        content: "body".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: archived,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata {
+            task: status.map(|status| TaskMetadata {
+                status,
+                ..Default::default()
+            }),
+        },
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts.clone(),
+    };
+    for (id, status, archived) in [
+        ("t-review", Some(TaskStatus::ReviewRequired), false),
+        ("t-prog-1", Some(TaskStatus::InProgress), false),
+        ("t-prog-2", Some(TaskStatus::InProgress), true),
+        ("t-done", Some(TaskStatus::Complete), false),
+        ("t-cancel", Some(TaskStatus::Cancelled), false),
+        ("n-plain", None, false),
+        // A spec carrying task metadata is excluded, like `task.list`.
+        ("spec", Some(TaskStatus::Blocked), false),
+    ] {
+        store
+            .insert_note(&mk_note(id, status, archived))
+            .await
+            .expect("insert");
+    }
+    // An unrecognised stored status folds into `not_started`.
+    sqlx::query("UPDATE note SET task_json = '{\"status\":\"bogus\"}' WHERE id = 't-done'")
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt status");
+
+    let counts = store.count_tasks_by_status(&ws_id).await.expect("counts");
+    let expected: BTreeMap<String, u64> = [
+        ("cancelled".to_string(), 1),
+        ("in_progress".to_string(), 2),
+        ("not_started".to_string(), 1),
+        ("review_required".to_string(), 1),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(counts, expected);
+    assert!(
+        !counts.contains_key("blocked"),
+        "spec row with task metadata must not be counted: {counts:?}"
+    );
+
+    // Scoped per workspace: another workspace reads empty.
+    let other = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&other, "Other", false))
+        .await
+        .expect("insert other ws");
+    assert!(store
+        .count_tasks_by_status(&other)
+        .await
+        .expect("other counts")
+        .is_empty());
 }
 
 /// `max_note_updated_at` (monorepo#3058): the newest note `updated_at` per

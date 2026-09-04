@@ -1,10 +1,10 @@
 //! Note repository: insert + list, mapping rows ↔ [`Note`] (§9.2).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use intent_core::{
     ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, Result, TaskMetadata,
-    WorkspaceId, WorkspaceTaskStats,
+    TaskStatus, WorkspaceId, WorkspaceTaskStats,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -376,6 +376,52 @@ impl Store {
             }
         }
         Ok(stats)
+    }
+
+    /// Per-workspace task-note count per status as a single aggregate
+    /// statement over `json_extract(task_json, '$.status')` — every task
+    /// note in the workspace except the spec itself (any parent, archived
+    /// included; the same population as `task.list`), never the note bodies.
+    /// Keys are the wire `snake_case` [`TaskStatus`] strings. A NULL or
+    /// unrecognised stored status is counted under `not_started` (the
+    /// [`TaskStatus`] default) as a best-effort fold for this count only —
+    /// such a row does NOT deserialize that way (`map_note_row` fails on it),
+    /// so the fold keeps the aggregate total honest without hiding the row.
+    /// Statuses with no rows are absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_tasks_by_status(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<BTreeMap<String, u64>> {
+        let rows = sqlx::query(
+            "SELECT json_extract(task_json, '$.status') AS status, COUNT(*) AS n FROM note \
+             WHERE workspace_id = ? AND task_json IS NOT NULL AND id != 'spec' \
+             GROUP BY status",
+        )
+        .bind(&workspace_id.0)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("task status counts failed: {e}")))?;
+
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for row in &rows {
+            let status: Option<String> = col(row, "status")?;
+            let n: i64 = col(row, "n")?;
+            let status = status
+                .and_then(|s| {
+                    serde_json::from_value::<TaskStatus>(serde_json::Value::String(s)).ok()
+                })
+                .unwrap_or_default();
+            let key = serde_json::to_value(status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or_else(|| Error::Internal("task status key encode failed".into()))?;
+            *counts.entry(key).or_insert(0) += u64::try_from(n).unwrap_or(0);
+        }
+        Ok(counts)
     }
 
     /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
