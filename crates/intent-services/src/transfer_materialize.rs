@@ -421,6 +421,10 @@ fn hydrate_submodule(
             parent_dir.display()
         ));
     }
+    // `check_relative_components` rejects `..`, but the superproject tree is
+    // user-supplied too: a committed symlink at any component of the path
+    // would otherwise send the git calls below outside the checkout.
+    let parent_dir = confined_to_checkout(checkout_dir, &parent_dir)?;
 
     // The gitlink at the containing tip must be the bundled commit: that is
     // what `submodule update` checks out, and what the export recorded.
@@ -464,6 +468,10 @@ fn hydrate_submodule(
     // it instead of copying `.gitmodules`; protocol.file.allow because the
     // bundle is a local path; GIT_LFS_SKIP_SMUDGE for the same reason as the
     // superproject clone.
+    let module_dir = parent_dir.join(rel);
+    if module_dir.symlink_metadata().is_ok() {
+        confined_to_checkout(checkout_dir, &module_dir)?;
+    }
     let url_key = format!("submodule.{}.url", sub.name);
     run_git(&parent_dir, |cmd| {
         cmd.args(["config", &url_key, bundle]);
@@ -476,7 +484,6 @@ fn hydrate_submodule(
     })
     .map_err(|e| format!("submodule update from bundle failed: {e}"))?;
 
-    let module_dir = parent_dir.join(rel);
     let module_head = head_sha(&module_dir).map_err(|e| e.to_string())?;
     if module_head != sub.commit_sha {
         return Err(format!(
@@ -516,6 +523,26 @@ fn hydrate_submodule(
         .map_err(|e| format!("remove bundle origin failed: {e}"))?;
     }
     Ok(())
+}
+
+/// Canonicalize `path` and require it to stay under the canonicalized
+/// `checkout_dir` — the materialized tree may commit symlinks anywhere.
+fn confined_to_checkout(checkout_dir: &Path, path: &Path) -> std::result::Result<PathBuf, String> {
+    let root = checkout_dir
+        .canonicalize()
+        .map_err(|e| format!("canonicalize checkout {}: {e}", checkout_dir.display()))?;
+    let resolved = path
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {}: {e}", path.display()))?;
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "{} resolves to {} outside the checkout {}",
+            path.display(),
+            resolved.display(),
+            root.display()
+        ));
+    }
+    Ok(resolved)
 }
 
 /// Resolve an archive entry (`git/submodules/<n>.bundle`) to the file next
@@ -1692,6 +1719,58 @@ mod tests {
             "got {msg}"
         );
         assert!(!target.path().join(&ws.id.0).exists());
+    }
+
+    /// A superproject tree that commits a symlink pointing outside the
+    /// workspace dir, with a manifest entry nested under it, is rejected
+    /// before any git call runs through the link: the source repository the
+    /// link resolves to is untouched and the rollback is complete.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_escaping_the_checkout_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sup, origin) = superproject_with_submodule(tmp.path());
+        let sub = sup.join("sub");
+        fgit(&sub, &["checkout", "-q", "main"]);
+        local_commit(&sub, "wip.txt");
+        // Committed symlink resolving to the source superproject itself: on
+        // the target it points outside the materialized checkout, at a
+        // repository whose tip records `sub` at the bundled commit.
+        std::os::unix::fs::symlink(&sup, sup.join("evil")).unwrap();
+        fgit(&sup, &["add", "evil"]);
+        fgit(&sup, &["commit", "-q", "-m", "add symlink"]);
+
+        let ws = superproject_workspace(&sup);
+        let staging = tmp.path().join("staging");
+        let TransferBundle {
+            bundle_path,
+            mut refs,
+            ..
+        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        assert_eq!(refs.submodules.len(), 1, "{refs:?}");
+        refs.submodules[0].path = "evil/sub".to_string();
+        let src_url_before = fgit(&sup, &["config", "submodule.sub.url"]);
+        assert_eq!(src_url_before, origin.to_str().unwrap());
+
+        let target = tempfile::tempdir().unwrap();
+        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hydrate submodule evil/sub failed")
+                && msg.contains("outside the checkout"),
+            "got {msg}"
+        );
+        assert!(
+            !target.path().join(&ws.id.0).exists(),
+            "rollback removed the workspace dir"
+        );
+        assert_eq!(
+            fgit(&sup, &["config", "submodule.sub.url"]),
+            src_url_before,
+            "nothing was written through the symlink"
+        );
+        assert_no_config_mentions(&sup.join(".git"), staging.to_str().unwrap());
     }
 
     /// A manifest entry whose `name` is not the `.gitmodules` entry for its
