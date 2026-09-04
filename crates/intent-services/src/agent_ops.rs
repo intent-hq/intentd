@@ -14141,6 +14141,19 @@ const RESUME_RECAP_SEGMENT_MAX_CHARS: usize = 8_000;
 /// whole recap exists to preserve; the freshest partials matter most).
 const RESUME_RECAP_MAX_SEGMENTS: usize = 8;
 
+/// Recap truncation hint (intent#3696), emitted only when a segment was
+/// middle-truncated or segments were elided: tells the model the abbreviation
+/// is a replay artefact (not lost/broken tool output) and that one targeted
+/// re-read — not repeated re-fetching — is the right recovery. Mirrors the
+/// history replay's `SUPERVISOR_PREAMBLE` wording and its
+/// `truncated="true" original_chars="N"` marker convention. The literal
+/// `8000` must track [`RESUME_RECAP_SEGMENT_MAX_CHARS`] (asserted below).
+const RESUME_RECAP_TRUNCATION_HINT: &str = "Note on this recap: some replayed text below is abbreviated by the recovery recap. Segments longer than 8000 characters are middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element), and older interrupted segments may be elided entirely. This abbreviation is a replay artefact, NOT lost or broken tool output — the full exchange remains in your persisted transcript, so it is safe to continue without re-fetching anything. If you genuinely need one specific full text, re-read that ONE item once. Do not re-fetch the same inputs repeatedly.\n\n";
+const _: () = assert!(
+    RESUME_RECAP_SEGMENT_MAX_CHARS == 8000,
+    "RESUME_RECAP_TRUNCATION_HINT names the per-segment cap literally; update both together"
+);
+
 /// `metadata.type` stamped on every restart-resume continuation message
 /// (`resume_interrupted_agent`), riding `messageMetadata` onto the persisted
 /// user row. A fresh continuation is re-sent on every resume, so persisted
@@ -14340,15 +14353,12 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     let has_partial = segments
         .iter()
         .any(|s| matches!(s, TailSegment::Partial(_)));
-    let mut recap = String::from(
-        "<supervisor>\nRestart recovery: the harness restarted while you were \
-         responding, and your restored session may predate the exchange below \
-         — it is repeated here (parts of it may or may not already be in your \
-         context).\n\n",
-    );
-    if elided > 0 {
-        let _ = write!(recap, "({elided} older interrupted segment(s) elided.)\n\n");
-    }
+    // Segments render first so the preamble can learn whether any of them
+    // was middle-truncated (the hint is emitted only when something was
+    // actually abbreviated; untruncated, unelided recaps are byte-identical
+    // to before).
+    let mut body = String::new();
+    let mut truncated_any = false;
     for segment in &segments {
         let (label, tag, text) = match segment {
             TailSegment::User(text) => (
@@ -14363,15 +14373,28 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                 text,
             ),
         };
+        let (text, truncated_attrs) =
+            crate::history_xml::truncate_marked(text, RESUME_RECAP_SEGMENT_MAX_CHARS);
+        truncated_any |= !truncated_attrs.is_empty();
         let _ = write!(
-            recap,
-            "{label}\n<{tag}>\n{}\n</{tag}>\n\n",
-            crate::history_xml::escape_xml(&crate::history_xml::truncate_middle_content(
-                text,
-                RESUME_RECAP_SEGMENT_MAX_CHARS,
-            ))
+            body,
+            "{label}\n<{tag}{truncated_attrs}>\n{}\n</{tag}>\n\n",
+            crate::history_xml::escape_xml(&text)
         );
     }
+    let mut recap = String::from(
+        "<supervisor>\nRestart recovery: the harness restarted while you were \
+         responding, and your restored session may predate the exchange below \
+         — it is repeated here (parts of it may or may not already be in your \
+         context).\n\n",
+    );
+    if truncated_any || elided > 0 {
+        recap.push_str(RESUME_RECAP_TRUNCATION_HINT);
+    }
+    if elided > 0 {
+        let _ = write!(recap, "({elided} older interrupted segment(s) elided.)\n\n");
+    }
+    recap.push_str(&body);
     if !has_partial {
         recap.push_str(
             "Your response was cut off before any output was produced — \

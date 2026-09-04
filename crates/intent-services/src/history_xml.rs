@@ -64,18 +64,26 @@ pub(crate) fn truncate_middle_content(text: &str, max_chars: usize) -> String {
     format!("{start}\n... [{omitted} characters truncated] ...\n{end}")
 }
 
-/// Middle-truncate a tool input/output to `MAX_TOOL_CONTENT_CHARS` and return
-/// the element attribute suffix (` truncated="true" original_chars="N"`) that
-/// marks the block as abbreviated (intent#3696), or `""` when it fit whole.
-fn truncate_tool_content(text: &str) -> (String, String) {
+/// Middle-truncate `text` to `max_chars` and return the element attribute
+/// suffix (` truncated="true" original_chars="N"`) that marks the block as
+/// abbreviated (intent#3696), or `""` when it fit whole. Shared by the
+/// history replay's tool blocks and the restart-resume tail recap's
+/// segments so both recovery prompts carry the same marker convention.
+pub(crate) fn truncate_marked(text: &str, max_chars: usize) -> (String, String) {
     let original_chars = text.chars().count();
-    if original_chars <= MAX_TOOL_CONTENT_CHARS {
+    if original_chars <= max_chars {
         return (text.to_string(), String::new());
     }
     (
-        truncate_middle_content(text, MAX_TOOL_CONTENT_CHARS),
+        truncate_middle_content(text, max_chars),
         format!(" truncated=\"true\" original_chars=\"{original_chars}\""),
     )
+}
+
+/// Middle-truncate a tool input/output to `MAX_TOOL_CONTENT_CHARS` and return
+/// the truncation attribute suffix (see [`truncate_marked`]).
+fn truncate_tool_content(text: &str) -> (String, String) {
+    truncate_marked(text, MAX_TOOL_CONTENT_CHARS)
 }
 
 /// Stringify a value (TS `safeStringify`): strings pass through; everything else
