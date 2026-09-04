@@ -454,7 +454,8 @@ pub(crate) fn read_output(
     )))
 }
 
-/// Decode and ANSI-strip only the raw lines copied by `scrollback_lines`.
+/// Decode and ANSI-strip the raw lines copied by `scrollback_lines`, including
+/// any leading unmatched OSC context needed to make the window sequence-safe.
 /// The ring includes the newline after a window that ends before the live tail;
 /// `take(line_count)` excludes the synthetic split item after that delimiter.
 fn decoded_snapshot_lines(snapshot: &LineSnapshot) -> Vec<String> {
@@ -1079,6 +1080,18 @@ mod tests {
             retained_has_non_whitespace: true,
         };
         assert_eq!(decoded_snapshot_lines(&snapshot), ["�prefixred"]);
+    }
+
+    #[test]
+    fn bounded_line_decode_strips_osc_sequence_straddling_window_start() {
+        let snapshot = LineSnapshot {
+            bytes: b"\x1b]0;hidden\nhidden-tail\x07visible-after\nlast".to_vec(),
+            total_lines: 4,
+            start_line: 2,
+            end_line: 4,
+            retained_has_non_whitespace: true,
+        };
+        assert_eq!(decoded_snapshot_lines(&snapshot), ["visible-after", "last"]);
     }
 
     // ---- credential injection helpers (no spawn) ----

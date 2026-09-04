@@ -17,9 +17,10 @@ use std::collections::VecDeque;
 pub(crate) const DEFAULT_SCROLLBACK_BYTES: usize = 512 * 1024;
 
 /// A contiguous snapshot of an oldest-indexed line window in the retained
-/// scrollback. `bytes` contains exactly `start_line..end_line`, preserving the
-/// raw newline separators between those lines; text decoding and ANSI handling
-/// remain the caller's responsibility.
+/// scrollback. `bytes` contains `start_line..end_line`, preserving the raw
+/// newline separators between those lines. When the window starts inside an
+/// OSC escape sequence, it also includes that sequence's opener and hidden
+/// prefix so callers can strip it without leaking control payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineSnapshot {
     /// Raw bytes for the selected lines, in chronological order.
@@ -163,8 +164,9 @@ impl Scrollback {
             self.stream_offset - u64::try_from(self.buf.len()).expect("buffer length fits in u64");
         let byte_start = self.line_start(start_line, retained_start);
         let byte_end = self.line_start(end_line, retained_start);
+        let context_start = self.open_osc_start(byte_start).unwrap_or(byte_start);
         LineSnapshot {
-            bytes: self.copy_range(byte_start, byte_end),
+            bytes: self.copy_range(context_start, byte_end),
             total_lines,
             start_line,
             end_line,
@@ -181,6 +183,20 @@ impl Scrollback {
         }
         usize::try_from(self.newlines[line - 1] + 1 - retained_start)
             .expect("retained offset fits in usize")
+    }
+
+    /// Return the unmatched OSC opener before a window boundary, if any. OSC
+    /// payload may contain newlines, so slicing at a raw line boundary must
+    /// retain this prefix for the caller's ANSI stripper. Only bytes since the
+    /// last BEL terminator can participate.
+    fn open_osc_start(&self, byte_start: usize) -> Option<usize> {
+        let search_start = (0..byte_start)
+            .rev()
+            .find(|index| self.buf[*index] == 0x07)
+            .map_or(0, |index| index + 1);
+        (search_start..byte_start.saturating_sub(1))
+            .rev()
+            .find(|index| self.buf[*index] == 0x1b && self.buf[*index + 1] == b']')
     }
 
     fn copy_range(&self, start: usize, end: usize) -> Vec<u8> {
@@ -322,5 +338,18 @@ mod tests {
         assert_eq!(lines.bytes, b"line-147\nline-148\nline-149\n");
         assert_eq!(sb.last_snapshot_copied_bytes(), lines.bytes.len());
         assert!(sb.last_snapshot_copied_bytes() < sb.len());
+    }
+
+    #[test]
+    fn line_window_includes_unterminated_osc_prefix_for_safe_decoding() {
+        let mut sb = Scrollback::new(128);
+        sb.push(b"visible-before\n\x1b]0;hidden\nhidden-tail\x07visible-after\nlast");
+
+        let lines = sb.snapshot_lines(2, None);
+        assert_eq!((lines.start_line, lines.end_line), (2, 4));
+        assert_eq!(
+            lines.bytes,
+            b"\x1b]0;hidden\nhidden-tail\x07visible-after\nlast"
+        );
     }
 }
