@@ -11,7 +11,7 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 300 canonical methods routed through the main dispatch match in
+/// These are the 307 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -318,6 +318,13 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.update",
     "workspace.updateContext",
     "workspace.updateUiContext",
+    "workspaceDraft.create",
+    "workspaceDraft.delete",
+    "workspaceDraft.get",
+    "workspaceDraft.list",
+    "workspaceDraft.markDelivery",
+    "workspaceDraft.promote",
+    "workspaceDraft.update",
 ];
 
 /// Method aliases (wire-accepted → canonical).

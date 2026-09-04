@@ -36,6 +36,33 @@ pub(crate) fn clear_workspace_unread_if_all_seen_sql() -> String {
 }
 
 impl Store {
+    /// Persist only the setup outcome column, avoiding a stale full-row write
+    /// from the background setup task.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when encoding or persistence fails, and
+    /// `Error::NotFound` when the workspace no longer exists.
+    pub async fn update_workspace_setup_result(
+        &self,
+        id: &WorkspaceId,
+        result: &SetupResult,
+    ) -> Result<()> {
+        let encoded = serde_json::to_string(result)
+            .map_err(|e| Error::Internal(format!("encode setup_result failed: {e}")))?;
+        let res = sqlx::query("UPDATE workspace SET setup_result = ?, updated_at = ? WHERE id = ?")
+            .bind(encoded)
+            .bind(now_iso())
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("update workspace setup_result failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     ///
     /// # Errors

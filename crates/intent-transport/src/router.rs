@@ -10,7 +10,8 @@ use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate, NoteEditInput,
     NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
-    WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
+    WorkspaceApi, WorkspaceCreate, WorkspaceDraftId, WorkspaceGitRootId, WorkspaceId,
+    WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 use tracing::Instrument;
@@ -378,6 +379,57 @@ async fn dispatch(
             }
             Ok(result)
         }
+        "workspaceDraft.create" => api
+            .workspace_draft_create(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+        "workspaceDraft.get" => api
+            .workspace_draft_get(require_workspace_draft_id(params)?)
+            .await
+            .map_err(domain_to_rpc),
+        "workspaceDraft.list" => api.workspace_draft_list().await.map_err(domain_to_rpc),
+        "workspaceDraft.update" => {
+            let id = require_workspace_draft_id(params)?;
+            let revision = require_u64_param(params, "expectedRevision")?;
+            let patch = params
+                .get("patch")
+                .filter(|value| value.is_object())
+                .cloned()
+                .ok_or_else(|| invalid_params("Missing required parameter: patch"))?;
+            api.workspace_draft_update(id, revision, patch)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "workspaceDraft.promote" => {
+            let id = require_workspace_draft_id(params)?;
+            let revision = require_u64_param(params, "expectedRevision")?;
+            if params
+                .get("initialAgent")
+                .and_then(|agent| agent.get("agentId"))
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(invalid_params(
+                    "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted",
+                ));
+            }
+            api.workspace_draft_promote(id, revision, opt_value(params, "initialAgent"))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "workspaceDraft.markDelivery" => {
+            let delivery = params
+                .get("delivery")
+                .filter(|value| value.is_object())
+                .cloned()
+                .ok_or_else(|| invalid_params("Missing required parameter: delivery"))?;
+            api.workspace_draft_mark_delivery(require_workspace_draft_id(params)?, delivery)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "workspaceDraft.delete" => api
+            .workspace_draft_delete(require_workspace_draft_id(params)?)
+            .await
+            .map_err(domain_to_rpc),
         "workspace.update" => {
             let id = require_workspace_id(params)?;
             let mut rest = params.clone();
@@ -4341,6 +4393,17 @@ fn require_workspace_id(params: &Map<String, Value>) -> Result<WorkspaceId, RpcE
         Some(s) if !s.is_empty() => Ok(WorkspaceId::from(s)),
         _ => Err(invalid_params("Missing required parameter: workspaceId")),
     }
+}
+
+fn require_workspace_draft_id(params: &Map<String, Value>) -> Result<WorkspaceDraftId, RpcErr> {
+    require_str_param(params, "id").map(|id| WorkspaceDraftId::from(id.as_str()))
+}
+
+fn require_u64_param(params: &Map<String, Value>, name: &str) -> Result<u64, RpcErr> {
+    params
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_params(format!("Missing required parameter: {name}")))
 }
 
 /// Map a domain [`Error`] for `workspace.*` methods: a missing workspace surfaces

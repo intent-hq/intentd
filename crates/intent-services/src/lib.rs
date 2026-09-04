@@ -39,14 +39,14 @@ use intent_core::{
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     ProjectType, PullRequestInfo, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
-    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRoot,
-    WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
-    WorkspaceUpdate,
+    SessionStats, SetupResult, SetupResultState, SetupScript, TaskAgentLink, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary,
+    WorkspaceAttention, WorkspaceCreate, WorkspaceCreateResult, WorkspaceDraftId,
+    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceId, WorkspaceStatus,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -137,6 +137,7 @@ mod transfer_submodules;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
+mod workspace_draft;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
@@ -337,6 +338,9 @@ pub struct Services {
     /// `None` until wired by the composition root; when unset, mutations persist
     /// as before but emit no events (keeps read-only/test wiring unchanged).
     event_bus: Option<EventBus>,
+    /// Per-draft single-flight gates for idempotent promotion. Shared by clones.
+    workspace_draft_promotion_locks:
+        Arc<Mutex<HashMap<WorkspaceDraftId, Arc<tokio::sync::Mutex<()>>>>>,
     /// Per-agent in-memory send queues backing `agent.queueMessage` /
     /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
@@ -1082,6 +1086,7 @@ impl Services {
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
+            workspace_draft_promotion_locks: Arc::new(Mutex::new(HashMap::new())),
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
@@ -14068,6 +14073,63 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn workspace_draft_create(
+        &self,
+        input: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_create_op(input).await })
+    }
+
+    fn workspace_draft_get(
+        &self,
+        id: WorkspaceDraftId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_get_op(id).await })
+    }
+
+    fn workspace_draft_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_list_op().await })
+    }
+
+    fn workspace_draft_update(
+        &self,
+        id: WorkspaceDraftId,
+        expected_revision: u64,
+        patch: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_draft_update_op(id, expected_revision, patch)
+                .await
+        })
+    }
+
+    fn workspace_draft_promote(
+        &self,
+        id: WorkspaceDraftId,
+        expected_revision: u64,
+        initial_agent: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_draft_promote_op(id, expected_revision, initial_agent)
+                .await
+        })
+    }
+
+    fn workspace_draft_mark_delivery(
+        &self,
+        id: WorkspaceDraftId,
+        delivery: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_mark_delivery_op(id, delivery).await })
+    }
+
+    fn workspace_draft_delete(
+        &self,
+        id: WorkspaceDraftId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_delete_op(id).await })
+    }
+
     fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let _revision_guard = self.settings_revision_gate.read().await;
@@ -18017,6 +18079,7 @@ impl WorkspaceApi for Services {
                     // publish nothing (same as `workspace:created`).
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
+                    let store_for_setup = self.store.clone();
                     let setup_worktree = if ws.skip_worktree {
                         None
                     } else {
@@ -18074,6 +18137,18 @@ impl WorkspaceApi for Services {
                                 worktree = %worktree_path,
                                 "executing setup script in background"
                             );
+                            let started_at = now_iso();
+                            let running = SetupResult {
+                                state: SetupResultState::Running,
+                                started_at: Some(started_at.clone()),
+                                ..SetupResult::default()
+                            };
+                            if let Err(e) = store_for_setup
+                                .update_workspace_setup_result(&workspace_id, &running)
+                                .await
+                            {
+                                tracing::warn!(error = %e, "failed to persist running setup result");
+                            }
                             // A script was resolved and a spawn will be attempted.
                             publish_event(
                                 bus_for_setup.as_ref(),
@@ -18082,7 +18157,7 @@ impl WorkspaceApi for Services {
                             .await;
                             // Every terminal path below funnels into exactly one
                             // `workspace:setup:completed` publish after this block.
-                            let (ran_script, exit_code): (bool, Option<u32>) = 'setup: {
+                            let (ran_script, exit_code, error): (bool, Option<u32>, Option<String>) = 'setup: {
                             // Write script to a private file under worktree .intent/ directory
                             // (mode 0600 on Unix, safe from other users, isolated from /tmp races).
                             let script_id = uuid::Uuid::new_v4();
@@ -18095,7 +18170,7 @@ impl WorkspaceApi for Services {
                                         workspace = %workspace_id.as_str(),
                                         "setup script execution skipped: .intent is not a real directory (symlink or file)"
                                     );
-                                    break 'setup (false, None);
+                                    break 'setup (false, None, Some(".intent is not a directory".into()));
                                 }
                             } else {
                                 // .intent doesn't exist, create it with restrictive permissions
@@ -18105,7 +18180,7 @@ impl WorkspaceApi for Services {
                                         error = %e,
                                         "failed to create .intent directory for setup script"
                                     );
-                                    break 'setup (false, None);
+                                    break 'setup (false, None, Some(e.to_string()));
                                 }
                                 #[cfg(unix)]
                                 {
@@ -18150,7 +18225,7 @@ impl WorkspaceApi for Services {
                                     error = %e,
                                     "failed to write setup script to private file"
                                 );
-                                break 'setup (false, None);
+                                break 'setup (false, None, Some(e.to_string()));
                             }
                             // cmd.exe fallback only: the timing wrapper is a
                             // sibling .cmd file rather than an inline `-c`
@@ -18168,7 +18243,7 @@ impl WorkspaceApi for Services {
                                         "failed to write setup script cmd wrapper"
                                     );
                                     let _ = tokio::fs::remove_file(&script_path).await;
-                                    break 'setup (false, None);
+                                    break 'setup (false, None, Some(e.to_string()));
                                 }
                                 Some(p)
                             } else {
@@ -18217,7 +18292,10 @@ impl WorkspaceApi for Services {
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
-                                    (true, exit.ok().map(|e| e.exit_code))
+                                    match exit {
+                                        Ok(exit) => (true, Some(exit.exit_code), None),
+                                        Err(e) => (true, None, Some(e.to_string())),
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -18230,10 +18308,31 @@ impl WorkspaceApi for Services {
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
-                                    (false, None)
+                                    (false, None, Some(e.to_string()))
                                 }
                             }
                             };
+                            let failed = error.is_some() || exit_code.is_some_and(|code| code != 0);
+                            let setup_result = SetupResult {
+                                state: if failed {
+                                    SetupResultState::Failed
+                                } else {
+                                    SetupResultState::Succeeded
+                                },
+                                exit_code: exit_code.map(|code| i32::try_from(code).unwrap_or(i32::MAX)),
+                                started_at: Some(started_at),
+                                finished_at: Some(now_iso()),
+                                error: error.or_else(|| {
+                                    exit_code.filter(|code| *code != 0)
+                                        .map(|code| format!("setup script exited with code {code}"))
+                                }),
+                            };
+                            if let Err(e) = store_for_setup
+                                .update_workspace_setup_result(&workspace_id, &setup_result)
+                                .await
+                            {
+                                tracing::warn!(error = %e, "failed to persist terminal setup result");
+                            }
                             publish_event(
                                 bus_for_setup.as_ref(),
                                 workspace_setup_completed_event(
