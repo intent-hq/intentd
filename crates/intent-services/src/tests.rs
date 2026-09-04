@@ -36655,3 +36655,221 @@ mod derived_workspace_unread {
         assert!(!set.contains(h.ws.as_str()), "seen workspace drained");
     }
 }
+
+/// `workspace.localChanges` (§5.1): per-root aggregation over the primary
+/// worktree and every registered secondary git root. The per-repository
+/// signal math is covered in `intent_git::local_changes`; these assert row
+/// composition, ordering, remote-workspace skipping, and fail-soft rows.
+mod local_changes {
+    use std::path::{Path, PathBuf};
+
+    use intent_core::{now_iso, Error, WorkspaceId};
+    use intent_store::Store;
+
+    use super::{workspace, TempDb};
+    use crate::Services;
+
+    /// Self-cleaning temp directory.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("intentd-lc-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Init a repo at `dir` with one commit (no remotes → the commit is
+    /// unpushed) and one untracked file (→ one uncommitted path).
+    fn dirty_repo(dir: &Path) {
+        let repo = git2::Repository::init(dir).unwrap();
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+        std::fs::write(dir.join("untracked.txt"), "hi\n").unwrap();
+    }
+
+    /// Init an empty repo at `dir` (unborn HEAD, clean worktree → 0/0).
+    fn empty_repo(dir: &Path) {
+        git2::Repository::init(dir).unwrap();
+    }
+
+    fn git_root(ws_id: &WorkspaceId, path: &Path) -> intent_core::WorkspaceGitRoot {
+        let ts = now_iso();
+        intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws_id.clone(),
+            path: path.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    /// Store + service + a seeded workspace whose worktree is `worktree`
+    /// (when given) and whose `is_remote` flag is `remote`.
+    async fn setup(
+        worktree: Option<&Path>,
+        remote: bool,
+    ) -> (TempDb, Services, intent_core::Workspace) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = worktree.map(|p| p.to_string_lossy().into_owned());
+        ws.is_remote = remote;
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+        (tmp, svc, ws)
+    }
+
+    #[tokio::test]
+    async fn primary_only_workspace_reports_one_primary_row() {
+        let wt = TempDir::new();
+        dirty_repo(&wt.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "{v}");
+        assert_eq!(roots[0]["kind"], "primary");
+        assert!(roots[0].get("gitRootId").is_none(), "{v}");
+        assert_eq!(roots[0]["path"], wt.0.to_string_lossy().as_ref());
+        assert_eq!(roots[0]["hasRemoteRefs"], false);
+        assert_eq!(roots[0]["unpushedCount"], 1);
+        assert_eq!(roots[0]["uncommittedCount"], 1);
+        assert!(roots[0].get("error").is_none(), "{v}");
+        assert_eq!(v["hasUnpushedCommits"], true);
+        assert_eq!(v["hasUncommittedChanges"], true);
+    }
+
+    #[tokio::test]
+    async fn secondary_root_row_follows_primary() {
+        let wt = TempDir::new();
+        empty_repo(&wt.0);
+        let sub = TempDir::new();
+        dirty_repo(&sub.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+        let root = git_root(&ws.id, &sub.0);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 2, "{v}");
+        assert_eq!(roots[0]["kind"], "primary");
+        assert_eq!(roots[0]["path"], wt.0.to_string_lossy().as_ref());
+        assert_eq!(roots[0]["unpushedCount"], 0);
+        assert_eq!(roots[0]["uncommittedCount"], 0);
+        assert_eq!(roots[1]["kind"], "secondary");
+        assert_eq!(roots[1]["gitRootId"], root.id.as_str());
+        assert_eq!(roots[1]["path"], root.path);
+        assert_eq!(roots[1]["unpushedCount"], 1);
+        assert_eq!(roots[1]["uncommittedCount"], 1);
+        // The aggregate flags OR over rows: only the secondary root is dirty.
+        assert_eq!(v["hasUnpushedCommits"], true);
+        assert_eq!(v["hasUncommittedChanges"], true);
+    }
+
+    #[tokio::test]
+    async fn deleted_root_path_yields_error_row_without_failing() {
+        let wt = TempDir::new();
+        empty_repo(&wt.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+        let gone = std::env::temp_dir().join(format!("intentd-lc-gone-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&gone).unwrap();
+        let root = git_root(&ws.id, &gone);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 2, "{v}");
+        assert_eq!(roots[1]["kind"], "secondary");
+        assert_eq!(roots[1]["gitRootId"], root.id.as_str());
+        assert_eq!(roots[1]["path"], root.path);
+        assert!(
+            roots[1]["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{v}"
+        );
+        assert_eq!(roots[1]["hasRemoteRefs"], false);
+        assert_eq!(roots[1]["unpushedCount"], 0);
+        assert_eq!(roots[1]["uncommittedCount"], 0);
+        assert!(roots[1].get("branch").is_none(), "{v}");
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+    }
+
+    #[tokio::test]
+    async fn non_git_primary_worktree_is_skipped() {
+        let wt = TempDir::new();
+        let (_t, svc, ws) = setup(Some(&wt.0), false).await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        assert_eq!(v["roots"], serde_json::json!([]));
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_without_roots_is_empty() {
+        let wt = TempDir::new();
+        dirty_repo(&wt.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), true).await;
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        assert_eq!(v["roots"], serde_json::json!([]));
+        assert_eq!(v["hasUnpushedCommits"], false);
+        assert_eq!(v["hasUncommittedChanges"], false);
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_still_evaluates_secondary_roots() {
+        let wt = TempDir::new();
+        dirty_repo(&wt.0);
+        let sub = TempDir::new();
+        dirty_repo(&sub.0);
+        let (_t, svc, ws) = setup(Some(&wt.0), true).await;
+        let root = git_root(&ws.id, &sub.0);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let v = svc.workspace_local_changes_op(ws.id.clone()).await.unwrap();
+        let roots = v["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "{v}");
+        assert_eq!(roots[0]["kind"], "secondary");
+        assert_eq!(roots[0]["gitRootId"], root.id.as_str());
+        assert_eq!(roots[0]["path"], root.path);
+        assert_eq!(roots[0]["unpushedCount"], 1);
+        assert_eq!(v["hasUnpushedCommits"], true);
+        assert_eq!(v["hasUncommittedChanges"], true);
+    }
+
+    #[tokio::test]
+    async fn unknown_workspace_is_not_found() {
+        let (_t, svc, _ws) = setup(None, false).await;
+        let err = svc
+            .workspace_local_changes_op(WorkspaceId::from("missing"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+}

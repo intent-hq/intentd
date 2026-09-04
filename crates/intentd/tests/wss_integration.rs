@@ -8093,6 +8093,129 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `workspace.localChanges` over WSS (§5.1): a workspace whose primary
+/// worktree has a never-pushed commit and an untracked file, plus a registered
+/// secondary root, answers `{ roots, hasUnpushedCommits, hasUncommittedChanges }`
+/// with the primary row first and the secondary row carrying its `gitRootId`;
+/// a missing `workspaceId` and an unknown workspace are both `-32602`.
+#[tokio::test]
+async fn wss_workspace_local_changes_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    let repo_dir = test_tempdir("intentd-wsslocalchanges-");
+    let repo = repo_dir.path().to_path_buf();
+    let nested = repo.join("vendor/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let git = |dir: &std::path::PathBuf, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    for dir in [&repo, &nested] {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git(dir, &["add", "seed.txt"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    }
+    // Primary: one untracked file. Nested: clean worktree.
+    std::fs::write(repo.join("scratch.txt"), "wip\n").unwrap();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS localChanges WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+    let primary_path = created["result"]["workspace"]["worktreePath"]
+        .as_str()
+        .expect("worktreePath")
+        .to_string();
+
+    let ts = now_iso();
+    let root = intent_core::WorkspaceGitRoot {
+        id: intent_core::WorkspaceGitRootId::new(),
+        workspace_id: WorkspaceId::from(ws_id.as_str()),
+        path: nested.to_string_lossy().into_owned(),
+        source: intent_core::WorkspaceGitRootSource::Agent,
+        repo_owner: None,
+        repo_name: None,
+        registered_by_agent_ids: vec![intent_core::AgentId::from("agent-1")],
+        registered_commit_sha: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        pull_requests: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    srv.store
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("register root");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.localChanges","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 2);
+    let result = &resp["result"];
+    assert_eq!(result["hasUnpushedCommits"], true, "{resp}");
+    assert_eq!(result["hasUncommittedChanges"], true, "{resp}");
+    let roots = result["roots"].as_array().expect("roots");
+    assert_eq!(roots.len(), 2, "{resp}");
+
+    assert_eq!(roots[0]["kind"], "primary");
+    assert!(roots[0].get("gitRootId").is_none(), "{resp}");
+    assert_eq!(roots[0]["path"], primary_path);
+    assert!(roots[0]["branch"].as_str().is_some_and(|b| !b.is_empty()));
+    assert_eq!(roots[0]["hasRemoteRefs"], false);
+    assert_eq!(roots[0]["unpushedCount"], 1);
+    assert_eq!(roots[0]["uncommittedCount"], 1);
+    assert!(roots[0].get("error").is_none(), "{resp}");
+
+    assert_eq!(roots[1]["kind"], "secondary");
+    assert_eq!(roots[1]["gitRootId"], root.id.as_str());
+    assert_eq!(roots[1]["path"], root.path);
+    assert_eq!(roots[1]["hasRemoteRefs"], false);
+    assert_eq!(roots[1]["unpushedCount"], 1);
+    assert_eq!(roots[1]["uncommittedCount"], 0);
+    assert!(roots[1].get("error").is_none(), "{resp}");
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.localChanges","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"workspace.localChanges","params":{"workspaceId":"nope"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
 /// `git.agentCommit` targeted at a registered secondary git root over WSS
 /// (monorepo#2053 follow-up): with `gitRootId` + an explicit `files` list the
 /// commit lands in the nested repo (its HEAD advances, the primary repo is

@@ -359,13 +359,27 @@
 //! populated from the forge payload (additive — the keys already existed as
 //! placeholders) on `github.issues.get` / `.list` / `.search`. Method
 //! catalog grows by one router method — 299 router methods, 39 fast-path,
-//! 340 total.
+//! 340 total. Version 9.7 is an additive minor bump over 9.6 that adds the
+//! `workspace.localChanges` method (§5.1): the local git work archiving or
+//! deleting a workspace would lose —
+//! `{ roots: [...], hasUnpushedCommits, hasUncommittedChanges }`
+//! with one row per evaluated root (the primary worktree first, skipped when
+//! the workspace is remote or not a git repository; then every registered
+//! secondary root in `gitRoot.list` order, always evaluated), each carrying
+//! `kind`, `gitRootId` (secondary only), `path`, `branch?`, `hasRemoteRefs`,
+//! `unpushedCount` (commits no `refs/remotes/*` ref reaches, saturating at
+//! 1000 — exact for never-pushed branches, unlike the upstream-relative
+//! `git.status.ahead`), `uncommittedCount` (distinct paths in the
+//! `git.status.files` entry set), and `error` only when the root could not
+//! be read (counts then 0). Unknown workspace → `-32602`. Method catalog
+//! grows by one router method — 300 router methods, 39 fast-path, 341
+//! total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.6";
+pub const PROTOCOL_VERSION: &str = "9.7";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
