@@ -149,6 +149,8 @@ mod v1_goldens;
 mod v2_1_goldens;
 #[cfg(test)]
 mod v2_2_goldens;
+#[cfg(test)]
+mod v2_3_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;

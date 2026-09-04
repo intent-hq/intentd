@@ -60,13 +60,11 @@ fn v2_2_registry_selects_rewritten_workspace_bodies() {
     );
 }
 
+/// v2.2 stays a resolvable registry row even though a newer version is
+/// current, so sessions stamped "2.2" keep their doctrine.
 #[test]
-fn current_harness_version_is_v2_2() {
-    assert_eq!(intent_core::model::CURRENT_HARNESS_VERSION, "2.2");
-    assert_eq!(
-        crate::harness::resolve_entry(intent_core::model::CURRENT_HARNESS_VERSION).version,
-        "2.2"
-    );
+fn v2_2_remains_resolvable_after_bump() {
+    assert_eq!(crate::harness::resolve_entry("2.2").version, "2.2");
 }
 
 #[test]
