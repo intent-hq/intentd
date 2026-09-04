@@ -38,7 +38,9 @@ needs. Fields that matter most:
   (`Node`/`Electron`) gets `NODE_OPTIONS=--max-old-space-size=<MB>` injected by
   `build_provider_env` (`crates/intent-providers/src/args.rs`) to raise the ~1.7 GB V8
   default old-space cap that OOM-killed long coordinator sessions (STAB-50). The cap
-  resolves as `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var > `agents.acpNodeMaxOldSpaceMb`
+  resolves as an inherited `NODE_OPTIONS` that already contains `--max-old-space-size`
+  (left untouched — the daemon never clobbers a parent cap) >
+  `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var > `agents.acpNodeMaxOldSpaceMb`
   daemon setting (1024–65536, threaded in via `SpawnOptions::node_max_old_space_mb`) >
   8192 MB default (`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB` in intent-core); it is read live
   per spawn, so a settings change applies to the next spawned provider process.
