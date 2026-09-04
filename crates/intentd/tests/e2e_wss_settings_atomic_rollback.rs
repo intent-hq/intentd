@@ -10,7 +10,11 @@
 //!   provider (cached catalog default, else cleared);
 //! - `tokenImpact` annotations: every `agentFeatures.*` definition in
 //!   `settings.list` carries its approximate token-impact string, and
-//!   unannotated definitions omit the optional key.
+//!   unannotated definitions omit the optional key;
+//! - redaction placeholder on sensitive paths (intent#4383): echoing the
+//!   `settings.list` placeholder back through `settings.update` keeps the
+//!   stored secret, and the placeholder without a stored secret rejects the
+//!   whole batch with `-32602`.
 
 #![cfg(unix)]
 
@@ -1220,6 +1224,212 @@ async fn agent_memory_knobs_over_wss() {
     assert_success_envelope(&resp, 10);
     assert_eq!(resp["result"]["value"], Value::Null, "{resp}");
     assert_eq!(resp["result"]["origin"], json!("default"), "{resp}");
+}
+
+/// Read one account straight from the daemon's secrets file, bypassing the
+/// (redacting) wire — the only way to prove the stored secret is intact.
+fn stored_secret(secrets_file: &Path, account: &str) -> Option<String> {
+    let bytes = std::fs::read(secrets_file).ok()?;
+    let map: serde_json::Map<String, Value> = serde_json::from_slice(&bytes).ok()?;
+    map.get(account)?.as_str().map(str::to_string)
+}
+
+/// Redaction placeholder round trip over WSS (intent#4383): store a secret,
+/// read it back redacted via `settings.list`, echo that redacted value into
+/// `settings.update` (what a client submitting the whole form does), and the
+/// stored secret is still the original — the response and the
+/// `settings:changed` notification carry the placeholder, never the secret.
+#[tokio::test]
+async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
+    const PLACEHOLDER: &str = "********";
+    const SECRET: &str = "lin_api_original_0123456789";
+    let data_dir = temp_data_dir();
+    let secrets_file = data_dir.join("secrets.json");
+    let secrets_file_str = secrets_file.to_string_lossy().into_owned();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SECRETS_FILE", &secrets_file_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let resp = wss_rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({ "eventTypes": ["settings:changed"] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 100);
+
+    // Store the secret; the wire only ever shows the placeholder.
+    let resp = wss_rpc(
+        &mut ws,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "linear.token", "value": SECRET }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 1);
+    assert_eq!(resp["result"]["applied"][0]["value"], json!(PLACEHOLDER));
+    let _ = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        stored_secret(&secrets_file, "linear.token").as_deref(),
+        Some(SECRET)
+    );
+
+    // settings.list → redacted.
+    let list = wss_rpc(&mut ws, 2, "settings.list", json!({})).await;
+    assert_success_envelope(&list, 2);
+    let listed = list["result"]["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|e| e["path"] == json!("linear.token"))
+        .expect("linear.token in settings.list")
+        .clone();
+    assert_eq!(listed["sensitive"], json!(true));
+    assert_eq!(listed["value"], json!(PLACEHOLDER));
+
+    // Echo the redacted value back (plus a real sibling change): the secret
+    // must survive, the response/notification echo the placeholder.
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "linear.token", "value": listed["value"] },
+            { "path": "git.autoCommit", "value": false }
+        ] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 3);
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    let echoed = applied
+        .iter()
+        .find(|e| e["path"] == json!("linear.token"))
+        .expect("linear.token echoed in applied");
+    assert_eq!(echoed["value"], json!(PLACEHOLDER), "{resp}");
+    assert!(
+        applied
+            .iter()
+            .any(|e| e["path"] == json!("git.autoCommit") && e["value"] == json!(false)),
+        "{resp}"
+    );
+    let changes = next_settings_changed(&mut sub).await;
+    assert!(
+        !changes.to_string().contains(SECRET),
+        "secret leaked in settings:changed: {changes}"
+    );
+    assert_eq!(
+        stored_secret(&secrets_file, "linear.token").as_deref(),
+        Some(SECRET),
+        "echoing the placeholder must not clobber the stored secret"
+    );
+
+    // A literal value still replaces.
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.update",
+        json!({ "changes": [{ "path": "linear.token", "value": "lin_api_rotated" }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 4);
+    assert_eq!(
+        stored_secret(&secrets_file, "linear.token").as_deref(),
+        Some("lin_api_rotated")
+    );
+}
+
+/// Redaction placeholder without a stored secret over WSS (intent#4383):
+/// `-32602`, and the batch is atomic — the sibling non-sensitive change is
+/// not applied and no secret is written.
+#[tokio::test]
+async fn redaction_placeholder_without_secret_rejects_batch_over_wss() {
+    let data_dir = temp_data_dir();
+    let secrets_file = data_dir.join("secrets.json");
+    let secrets_file_str = secrets_file.to_string_lossy().into_owned();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SECRETS_FILE", &secrets_file_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let resp = wss_rpc(&mut ws, 1, "settings.get", json!({ "path": "linear.token" })).await;
+    assert_success_envelope(&resp, 1);
+    assert_eq!(resp["result"]["value"], Value::Null, "no secret stored yet");
+
+    let resp = wss_rpc(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "git.autoCommit", "value": false },
+            { "path": "linear.token", "value": "********" }
+        ] }),
+    )
+    .await;
+    assert_error_envelope(&resp, 2, -32602);
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("linear.token")),
+        "error must name the offending path: {resp}"
+    );
+
+    assert_eq!(stored_secret(&secrets_file, "linear.token"), None);
+    let resp = wss_rpc(&mut ws, 3, "settings.get", json!({ "path": "linear.token" })).await;
+    assert_success_envelope(&resp, 3);
+    assert_eq!(resp["result"]["value"], Value::Null);
+    let resp = wss_rpc(&mut ws, 4, "settings.get", json!({ "path": "git.autoCommit" })).await;
+    assert_success_envelope(&resp, 4);
+    assert_eq!(
+        resp["result"]["value"],
+        json!(true),
+        "sibling change must not apply when the batch is rejected: {resp}"
+    );
 }
 
 /// Assert the JSON-RPC 2.0 error envelope (PROTOCOL §1/§9): `jsonrpc: "2.0"`,
