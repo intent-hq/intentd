@@ -13271,10 +13271,20 @@ mod dead_child_respawn_tests {
     async fn agent_root_pids_maps_child_pids_and_skips_pidless_handles() {
         let (mgr, _seeded, _db) = manager_with(None, None).await;
 
-        // A live child whose pid is known: it must appear in the map.
+        // A live child whose pid is known: it must appear in the map. Spawn
+        // it the way production does (`process_group(0)` + `kill_on_drop`):
+        // `mgr.stop` tears down by `killpg` on the child's own group, so a
+        // child left in the test's group survives the kill and outlives the
+        // test holding the harness stdio pipes (nextest LEAK, intent#4221).
+        // Null stdio so nothing can hold those pipes even if teardown fails.
         let with_pid = AgentId::from("agent-root-pid");
         let child = tokio::process::Command::new("sleep")
             .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn sleeping child");
         let pid = child.id().expect("live child has a pid");
