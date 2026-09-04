@@ -20137,6 +20137,100 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
     assert_eq!(parent_message_count(&svc, &a).await, 2);
 }
 
+/// Split-snapshot regression (intent-hq/intent#4367 review): with two
+/// ungrouped parents on one child, two concurrent passes can each claim one
+/// watch (pass 1 claims A's, pass 2 claims C's). The flipped-completion take
+/// is destructive, so a per-pass memo would stamp the child's flips on only
+/// the first taker's wake and lose them on the other parent's ONLY terminal
+/// wake. The taken set is shared across overlapping passes per child: both
+/// wakes carry the flipped task.
+#[tokio::test]
+async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let park = Arc::new(crate::CompletionClassifyPark::default());
+    let svc = Services::new(store).with_completion_claim_park(park.clone());
+    let a = create_agent(&svc, &ws, "A").await;
+    let c = create_agent(&svc, &ws, "C").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let flipped = seed_task(&svc, &ws, "Flipped task").await;
+    svc.task_update_note_status(
+        ws.clone(),
+        flipped.clone(),
+        "complete".into(),
+        None,
+        Some(b.clone()),
+    )
+    .await
+    .expect("B flips other task");
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), b.clone(), None)
+        .expect("C watches B");
+
+    // Pass 1 claims the first watch and parks before taking the flips.
+    let first = tokio::spawn({
+        let svc = svc.clone();
+        let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
+        async move { svc.handle_completion_event(&event).await }
+    });
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("first pass parked on its claimed watch");
+    // Pass 2 skips the claimed watch, claims the other one, and parks too:
+    // the snapshot is now split between the two passes.
+    let second = tokio::spawn({
+        let svc = svc.clone();
+        let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
+        async move { svc.handle_completion_event(&event).await }
+    });
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("second pass parked on the other claimed watch");
+
+    park.release.notify_one();
+    park.release.notify_one();
+    timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first pass completes")
+        .expect("first pass task");
+    timeout(Duration::from_secs(5), second)
+        .await
+        .expect("second pass completes")
+        .expect("second pass task");
+
+    for parent in [&a, &c] {
+        let session = svc
+            .store()
+            .get_agent_session(parent)
+            .await
+            .expect("parent session");
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "exactly one terminal wake for {}",
+            parent.0
+        );
+        let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata[UNBLOCKED_TRIGGER_TASKS_KEY],
+            json!([{ "workspaceId": ws.0, "taskNoteId": flipped.0 }]),
+            "flipped task stamped on {}'s wake",
+            parent.0
+        );
+    }
+    assert!(svc.find_watches_for_child(&b).is_empty());
+    assert!(svc
+        .store()
+        .list_agent_flipped_completions(&b)
+        .await
+        .expect("list flips")
+        .is_empty());
+}
+
 /// 2-cycle deadlock guard: A⇄B watch each other and both are idle. B's idle
 /// must NOT defer (the mutual-idle pair would deadlock otherwise) — A's watch
 /// on B fires as before.
