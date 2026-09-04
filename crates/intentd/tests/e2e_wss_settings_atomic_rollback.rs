@@ -1341,6 +1341,30 @@ async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
         !changes.to_string().contains(SECRET),
         "secret leaked in settings:changed: {changes}"
     );
+    let notified: Vec<&Value> = changes
+        .as_array()
+        .expect("data.changes array")
+        .iter()
+        .filter(|e| e["path"] == json!("linear.token"))
+        .collect();
+    assert_eq!(
+        notified.len(),
+        1,
+        "linear.token must ride settings:changed exactly once: {changes}"
+    );
+    assert_eq!(
+        notified[0]["value"],
+        json!(PLACEHOLDER),
+        "settings:changed must echo the placeholder for the untouched secret: {changes}"
+    );
+    assert!(
+        changes
+            .as_array()
+            .expect("data.changes array")
+            .iter()
+            .any(|e| e["path"] == json!("git.autoCommit") && e["value"] == json!(false)),
+        "sibling change must ride settings:changed: {changes}"
+    );
     assert_eq!(
         stored_secret(&secrets_file, "linear.token").as_deref(),
         Some(SECRET),
