@@ -581,10 +581,12 @@ impl Services {
     }
 
     /// Materialize the imported git payload (`git/repo.bundle` +
-    /// `git/refs.json` under `extracted_dir`) via
+    /// `git/refs.json`, plus any `git/submodules/<n>.bundle` the refs list,
+    /// under `extracted_dir`) via
     /// [`crate::transfer_materialize::materialize_workspace_git`]: clone the
-    /// bundle into `<workspaces_root>/<wsId>/<repo-slug>`, fetch the base
-    /// ref, re-provision sandboxes, and unwind WIP snapshots. The checkout
+    /// bundle into `<workspaces_root>/<wsId>/<repo-slug>`, hydrate the
+    /// bundled submodules, fetch the base ref, re-provision sandboxes, and
+    /// unwind WIP snapshots. The checkout
     /// is workspace-owned storage and is NOT registered in `known_repo`
     /// (intent-hq/monorepo#2227). Runs BEFORE the store insert with the
     /// transformed rows passed mutably: the [`MaterializedGit::apply`] row
@@ -1835,6 +1837,7 @@ mod tests {
                 branch: None,
                 dirty_files: vec![],
                 sandbox_branches: vec![],
+                submodules: vec![],
             },
         }
     }
@@ -2290,7 +2293,9 @@ mod tests {
             updated_at: t.to_string(),
         };
         let staging = src.0.join("staging");
-        let (bundle_path, refs) = crate::transfer_git::create_transfer_bundle(
+        let crate::transfer_git::TransferBundle {
+            bundle_path, refs, ..
+        } = crate::transfer_git::create_transfer_bundle(
             &src_ws,
             std::slice::from_ref(&src_sb),
             &staging,
@@ -2474,8 +2479,9 @@ mod tests {
             w
         };
         let staging = src.0.join("staging");
-        let (bundle_path, refs) =
-            crate::transfer_git::create_transfer_bundle(&src_ws, &[], &staging).expect("bundle");
+        let crate::transfer_git::TransferBundle {
+            bundle_path, refs, ..
+        } = crate::transfer_git::create_transfer_bundle(&src_ws, &[], &staging).expect("bundle");
 
         let m = manifest(&ws);
         let rows: Vec<(&str, Vec<serde_json::Value>)> =

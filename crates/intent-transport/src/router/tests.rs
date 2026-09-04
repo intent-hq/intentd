@@ -206,6 +206,7 @@ impl WorkspaceApi for FakeApi {
                         branch: None,
                         dirty_files: vec![],
                         sandbox_branches: vec![],
+                        submodules: vec![],
                     },
                 },
                 total_size_bytes: 100,

@@ -131,6 +131,7 @@ mod transfer_import;
 pub(crate) mod transfer_materialize;
 #[cfg(test)]
 mod transfer_roundtrip;
+mod transfer_submodules;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
