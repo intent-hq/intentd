@@ -444,15 +444,42 @@ where
 
     tokio::pin!(shutdown);
     let mut backoff = AcceptBackoff::default();
-    loop {
+    'accept: loop {
         tokio::select! {
             connected = server.connect() => {
                 match connected {
                     Ok(()) => {
+                        // The replacement instance needs a handle of its own,
+                        // so at exhaustion `create` fails with
+                        // ERROR_TOO_MANY_OPEN_FILES: back off like a failed
+                        // connect instead of tearing the listener down. The
+                        // connected client waits out the bounded delay and is
+                        // served once an instance exists. Other create errors
+                        // stay fatal, as before.
+                        let next = loop {
+                            match ServerOptions::new().create(&pipe_name) {
+                                Ok(next) => break next,
+                                Err(e) => match backoff.on_error(&e) {
+                                    AcceptFailure::Backoff { delay, streak, warn } => {
+                                        if warn {
+                                            tracing::warn!(
+                                                error = %e,
+                                                streak,
+                                                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                                "named-pipe instance create failed: out of resources, backing off"
+                                            );
+                                        }
+                                        if sleep_unless_shutdown(delay, &mut shutdown).await {
+                                            break 'accept;
+                                        }
+                                    }
+                                    AcceptFailure::Other => return Err(e),
+                                },
+                            }
+                        };
                         if let Some(failures) = backoff.on_success() {
                             tracing::info!(failures, "named-pipe connect recovered");
                         }
-                        let next = ServerOptions::new().create(&pipe_name)?;
                         let stream = std::mem::replace(&mut server, next);
                         let api = api.clone();
                         let bus = bus.clone();
