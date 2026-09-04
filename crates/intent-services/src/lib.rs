@@ -795,6 +795,10 @@ pub struct Services {
     /// To prevent race conditions where an old task removes a newer handle, each
     /// entry stores a generation counter alongside the abort handle. Tasks only
     /// remove their own entry if the generation still matches.
+    ///
+    /// Lock order when nested with `agent_activity`: `agent_activity` →
+    /// `idle_debouncers` (`workspace_activity`, `agent_activity_end`). Never
+    /// take `agent_activity` while holding this lock.
     idle_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
     /// Generation counter for idle debounce tasks (incremented on each schedule).
     idle_debounce_gen: Arc<Mutex<u64>>,
@@ -2942,21 +2946,28 @@ impl Services {
     /// window (~3s default, env-overridable for tests). A new `agent_activity_begin`
     /// within the window cancels the idle flip. A decrement with no tracked session
     /// is a no-op.
+    ///
+    /// The `agent_activity` lock is held across the debouncer registration
+    /// (intent#4283): [`Self::workspace_activity`] reads the count and then
+    /// the `idle_debouncers` map, so releasing the count before the debouncer
+    /// is inserted opened a window where a reader saw count `0` with no
+    /// pending debouncer and derived a transient `Idle` inside the grace
+    /// window — `workspace.get` serving `idle` while the immediately following
+    /// `workspace.list` served `agent_running` / `in_progress`. Lock order
+    /// `agent_activity → idle_debouncers` matches `workspace_activity`.
     pub(crate) fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
-        let transitioned = {
-            let mut map = self.agent_activity.lock().unwrap();
-            match map.get_mut(workspace_id) {
-                Some(count) if *count > 0 => {
-                    *count -= 1;
-                    if *count == 0 {
-                        map.remove(workspace_id);
-                        true
-                    } else {
-                        false
-                    }
+        let mut map = self.agent_activity.lock().unwrap();
+        let transitioned = match map.get_mut(workspace_id) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(workspace_id);
+                    true
+                } else {
+                    false
                 }
-                _ => false,
             }
+            _ => false,
         };
         if transitioned {
             self.schedule_idle_debounce(workspace_id.clone());
@@ -2967,6 +2978,11 @@ impl Services {
     /// for the workspace. The event is emitted only after the workspace stays idle
     /// for the full debounce window (~3s default, env-overridable for tests). A new
     /// `agent_activity_begin` within the window cancels the pending flip.
+    ///
+    /// Called with the `agent_activity` guard held (intent#4283): must stay
+    /// synchronous, must not lock `agent_activity` (non-reentrant `std::sync::Mutex`),
+    /// and may only take `idle_debounce_gen` / `idle_debouncers` (lock order
+    /// `agent_activity → idle_debouncers`).
     fn schedule_idle_debounce(&self, workspace_id: WorkspaceId) {
         // Increment generation counter and cancel any existing debouncer.
         let gen = if let Ok(mut gen_lock) = self.idle_debounce_gen.lock() {
