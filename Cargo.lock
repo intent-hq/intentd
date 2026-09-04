@@ -2421,6 +2421,7 @@ dependencies = [
  "if-addrs",
  "intent-core",
  "intent-services",
+ "libc",
  "rcgen",
  "rustls",
  "rustls-pemfile",

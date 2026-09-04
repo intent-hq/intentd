@@ -38,6 +38,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role, WebSoc
 use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::accept_backoff::{AcceptBackoff, AcceptFailure};
 use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore};
 use crate::conn::{self, ConnSubs};
 use crate::forward::ForwardRegistry;
@@ -377,18 +378,23 @@ impl WsInner {
     /// configured the raw TCP stream is first wrapped in TLS (production posture,
     /// `wss://`); in insecure dev mode the plain TCP stream drives the HTTP
     /// upgrade directly (`ws://`). A failed accept is logged, never fatal
-    /// (post-bind durable error handler). Dropping the listener on exit frees
-    /// the port before `stop()` returns.
+    /// (post-bind durable error handler); descriptor exhaustion backs off with
+    /// jitter instead of spinning (intent-hq/intent#4390). Dropping the
+    /// listener on exit frees the port before `stop()` returns.
     pub(crate) async fn accept_loop(
         self: Arc<Self>,
         listener: TcpListener,
         mut shutdown: oneshot::Receiver<()>,
     ) {
+        let mut backoff = AcceptBackoff::default();
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
                 accepted = listener.accept() => match accepted {
                     Ok((tcp, _peer)) => {
+                        if let Some(failures) = backoff.on_success() {
+                            tracing::info!(failures, "ws accept recovered");
+                        }
                         let me = self.clone();
                         tokio::spawn(async move {
                             let _ = tcp.set_nodelay(true);
@@ -404,7 +410,23 @@ impl WsInner {
                             }
                         });
                     }
-                    Err(e) => tracing::warn!(error = %e, "ws accept failed"),
+                    Err(e) => match backoff.on_error(&e) {
+                        AcceptFailure::Backoff { delay, streak, warn } => {
+                            if warn {
+                                tracing::warn!(
+                                    error = %e,
+                                    streak,
+                                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                    "ws accept failed: out of descriptors, backing off"
+                                );
+                            }
+                            tokio::select! {
+                                _ = &mut shutdown => break,
+                                () = tokio::time::sleep(delay) => {}
+                            }
+                        }
+                        AcceptFailure::Other => tracing::warn!(error = %e, "ws accept failed"),
+                    },
                 }
             }
         }

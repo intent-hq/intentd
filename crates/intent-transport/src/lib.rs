@@ -42,6 +42,7 @@ fn disable_node_compile_cache() {
     std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
 }
 
+mod accept_backoff;
 pub mod auth;
 pub(crate) mod browser;
 pub mod catalog;
