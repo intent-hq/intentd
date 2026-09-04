@@ -8,8 +8,8 @@ use intent_core::{
     events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
     CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, EventActor,
     Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility,
-    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    SetupResult, SetupResultState, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -66,6 +66,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         scope: None,
         skip_worktree: false,
         setup_script: None,
+        setup_result: None,
         is_remote: false,
         default_model: Some("opus".to_string()),
         pr_number: Some(42),
@@ -103,7 +104,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114
+            110, 111, 112, 113, 114, 115
         ]
     );
     assert_eq!(
@@ -114,7 +115,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114
+            110, 111, 112, 113, 114, 115
         ]
     );
 }
@@ -319,6 +320,41 @@ async fn workspace_round_trip_and_archive_filter() {
     assert_eq!(got.path, Some("/tmp/ws-meta".to_string()));
     assert_eq!(got.repository_path, Some("/tmp/repo".to_string()));
     assert!(!got.archived);
+}
+
+#[tokio::test]
+async fn workspace_setup_result_round_trips_insert_update_and_select() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let id = WorkspaceId::new();
+    let mut workspace = sample_workspace(&id, "Setup result", false);
+    workspace.setup_result = Some(SetupResult {
+        state: SetupResultState::Running,
+        started_at: Some("2026-09-04T20:00:00Z".to_string()),
+        ..SetupResult::default()
+    });
+    store.insert_workspace(&workspace).await.expect("insert");
+    assert_eq!(
+        store.get_workspace(&id).await.unwrap().setup_result,
+        workspace.setup_result
+    );
+
+    workspace.setup_result = Some(SetupResult {
+        state: SetupResultState::Failed,
+        exit_code: Some(2),
+        started_at: Some("2026-09-04T20:00:00Z".to_string()),
+        finished_at: Some("2026-09-04T20:01:00Z".to_string()),
+        error: Some("setup failed".to_string()),
+    });
+    store.update_workspace(&workspace).await.expect("update");
+    let selected = store
+        .list_workspaces(false)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == id)
+        .expect("workspace in list");
+    assert_eq!(selected.setup_result, workspace.setup_result);
 }
 
 /// `unarchive_workspace_if_archived` is a single atomic flip: the archived
@@ -5402,6 +5438,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     scope: None,
                     skip_worktree: false,
                     setup_script: None,
+                    setup_result: None,
                     is_remote: false,
                     default_model: None,
                     pr_number: None,

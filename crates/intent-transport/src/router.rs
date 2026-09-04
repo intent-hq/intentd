@@ -80,10 +80,10 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: "Internal error".to_string(),
             data: Some(Value::String(msg)),
         },
-        // Optimistic-concurrency conflict: -32005 carrying the current entity
+        // Optimistic-concurrency conflict: -32009 carrying the current entity
         // under `data.current` so the client can reconcile (PROTOCOL §4, §5.6).
         Error::Conflict { current } => RpcErr {
-            code: -32005,
+            code: -32009,
             message: "Conflict".to_string(),
             data: Some(json!({ "code": "conflict", "current": current })),
         },

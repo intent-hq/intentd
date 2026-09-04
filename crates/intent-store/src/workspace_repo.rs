@@ -1,8 +1,8 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    now_iso, CheckoutMode, ContextLink, Error, PullRequestInfo, Result, SetupScript, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, CheckoutMode, ContextLink, Error, PullRequestInfo, Result, SetupResult, SetupScript,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
     CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
@@ -17,7 +17,8 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     status_message, status_image_asset_id, attention, path, repository_path, repository_owner, \
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
-    tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode";
+    tags, created_at, updated_at, last_activity, token_usage, setup_script, setup_result, \
+    checkout_mode";
 
 /// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
 /// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
@@ -61,7 +62,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -96,6 +97,7 @@ impl Store {
             .bind(&ws.last_activity)
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
+            .bind(setup_result_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
             .bind(auto_commit.map(i64::from))
             .execute(self.write_pool())
@@ -148,7 +150,7 @@ impl Store {
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, checkout_mode=? WHERE id=?",
+             token_usage=?, setup_script=?, setup_result=?, checkout_mode=? WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -183,6 +185,7 @@ impl Store {
         .bind(&ws.last_activity)
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
+        .bind(setup_result_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
         .bind(&ws.id.0)
         .execute(self.write_pool())
@@ -812,6 +815,26 @@ fn setup_script_from_db(s: Option<String>) -> Result<Option<SetupScript>> {
     .transpose()
 }
 
+/// Encode the optional durable setup outcome to a JSON column.
+fn setup_result_to_db(ws: &Workspace) -> Result<Option<String>> {
+    ws.setup_result
+        .as_ref()
+        .map(|result| {
+            serde_json::to_string(result)
+                .map_err(|e| Error::Internal(format!("encode setup_result failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the optional durable setup outcome JSON column.
+fn setup_result_from_db(s: Option<String>) -> Result<Option<SetupResult>> {
+    s.map(|json| {
+        serde_json::from_str::<SetupResult>(&json)
+            .map_err(|e| Error::Internal(format!("decode setup_result failed: {e}")))
+    })
+    .transpose()
+}
+
 /// Encode the optional `checkout_mode` enum to a TEXT column (§5.1).
 fn checkout_mode_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.checkout_mode.as_ref().map(enum_to_db).transpose()
@@ -828,6 +851,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
     let context_links = context_links_from_db(col::<Option<String>>(row, "context_links")?)?;
     let token_usage = token_usage_from_db(col::<Option<String>>(row, "token_usage")?)?;
     let setup_script = setup_script_from_db(col::<Option<String>>(row, "setup_script")?)?;
+    let setup_result = setup_result_from_db(col::<Option<String>>(row, "setup_result")?)?;
     let checkout_mode = col::<Option<String>>(row, "checkout_mode")?
         .map(|s| enum_from_db::<CheckoutMode>(&s))
         .transpose()?;
@@ -855,6 +879,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         scope: col(row, "scope")?,
         skip_worktree: col::<i64>(row, "skip_worktree")? != 0,
         setup_script,
+        setup_result,
         is_remote: col::<i64>(row, "is_remote")? != 0,
         default_model: col(row, "default_model")?,
         pr_number: pr_number.map(i64::cast_unsigned),

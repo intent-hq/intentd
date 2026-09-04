@@ -276,6 +276,7 @@ async fn seed_vocab_workspace(fx: &Fixture, readme: &str) -> WorkspaceId {
         scope: None,
         skip_worktree: false,
         setup_script: None,
+        setup_result: None,
         is_remote: false,
         default_model: None,
         pr_number: None,

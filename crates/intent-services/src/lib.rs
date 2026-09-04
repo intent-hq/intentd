@@ -17065,6 +17065,7 @@ impl WorkspaceApi for Services {
                         scope: input.scope,
                         skip_worktree: input.skip_isolation.unwrap_or(false),
                         setup_script: None,
+                        setup_result: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
                         // PR linkage from a pr-kind contextLink: number/url
@@ -19418,6 +19419,7 @@ impl WorkspaceApi for Services {
                 scope: source.scope.clone(),
                 skip_worktree: source.skip_worktree,
                 setup_script: None,
+                setup_result: None,
                 is_remote: source.is_remote,
                 default_model: source.default_model.clone(),
                 pr_number: None,
