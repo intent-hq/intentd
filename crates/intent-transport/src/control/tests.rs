@@ -57,6 +57,8 @@ impl FakeControl {
                     total_roots: 5,
                     failed_roots: 0,
                 }),
+                fd_count: Some(312),
+                fd_limit: Some(10240),
                 update_supported: true,
             },
             shutdown_called: AtomicBool::new(false),
@@ -229,6 +231,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         workspaces_disk_available_bytes: None,
         workspaces_disk_total_bytes: None,
         file_watch: None,
+        fd_count: None,
+        fd_limit: None,
         update_supported: false,
     };
     let v = status_json(&status, true);
@@ -259,6 +263,9 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert!(!obj.contains_key("workspacesDiskTotalBytes"));
     // Watcher registry not started yet ⇒ fileWatch is ABSENT, not null.
     assert!(!obj.contains_key("fileWatch"));
+    // No descriptor sample / unreadable limit ⇒ fd fields are ABSENT, not null.
+    assert!(!obj.contains_key("fdCount"));
+    assert!(!obj.contains_key("fdLimit"));
     // Tunnel disabled/down ⇒ tcAddress is ABSENT (presence-detected), not null.
     assert!(!obj.contains_key("tcAddress"));
     // Unsupervised daemon ⇒ updateSupported is PRESENT and false — a plain
@@ -340,6 +347,24 @@ fn status_json_carries_the_file_watch_coverage_when_available() {
     });
     let v = status_json(&status, true);
     assert_eq!(v["fileWatch"]["failedRoots"], 3);
+}
+
+/// The descriptor gauge rides `system.status` (intent-hq/intent#4390) so a
+/// debug bundle can attribute EMFILE symptoms to descriptor pressure: the
+/// daemon's open count next to the soft limit it runs under.
+#[test]
+fn status_json_carries_the_fd_count_and_limit_when_sampled() {
+    let v = status_json(&FakeControl::new().status, true);
+    assert_eq!(v["fdCount"], 312);
+    assert_eq!(v["fdLimit"], 10240);
+
+    // The two are independent: a readable limit with no count sample yet (or
+    // a platform without a countable fd table) still serves the limit alone.
+    let mut status = FakeControl::new().status;
+    status.fd_count = None;
+    let v = status_json(&status, true);
+    assert!(!v.as_object().unwrap().contains_key("fdCount"));
+    assert_eq!(v["fdLimit"], 10240);
 }
 
 #[tokio::test]

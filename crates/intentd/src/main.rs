@@ -2618,12 +2618,15 @@ struct DaemonControl {
 /// Latest own-process resource sample for `system.status`, written by the
 /// background sampler task (~1s tick) and read lock-free from `status()`.
 /// `cpu_percent` follows the raw `sysinfo` convention (100 = one full core,
-/// may exceed 100 on multi-core hosts); `memory_bytes` is resident memory.
+/// may exceed 100 on multi-core hosts); `memory_bytes` is resident memory;
+/// `fd_count` is the open-descriptor count (intent-hq/intent#4390), `0` while
+/// unsampled/unavailable — a live process always holds at least its stdio.
 #[derive(Default)]
 struct ProcUsage {
     /// `f32` CPU percent stored as raw bits (`f32::to_bits`).
     cpu_bits: std::sync::atomic::AtomicU32,
     memory_bytes: std::sync::atomic::AtomicU64,
+    fd_count: std::sync::atomic::AtomicU64,
 }
 
 impl ProcUsage {
@@ -2640,6 +2643,87 @@ impl ProcUsage {
             f32::from_bits(self.cpu_bits.load(Ordering::Relaxed)),
             self.memory_bytes.load(Ordering::Relaxed),
         )
+    }
+
+    fn store_fd_count(&self, count: u64) {
+        self.fd_count
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `None` until the first descriptor sample lands or where counting is
+    /// unsupported, so the wire field stays presence-detected.
+    fn fd_count(&self) -> Option<u64> {
+        let n = self.fd_count.load(std::sync::atomic::Ordering::Relaxed);
+        (n > 0).then_some(n)
+    }
+}
+
+/// Count the daemon's own open file descriptors: entries of the per-process
+/// fd table (`/proc/self/fd` on Linux, `/dev/fd` on macOS), minus the handle
+/// the read itself holds. `None` where no such table exists.
+fn count_open_fds() -> Option<u64> {
+    let table = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        return None;
+    };
+    let entries = std::fs::read_dir(table).ok()?.count() as u64;
+    Some(entries.saturating_sub(1))
+}
+
+/// Descriptor-pressure log gate (intent-hq/intent#4390): WARN once the open
+/// count reaches 80 % of the soft limit, re-warn at most once a minute while
+/// it stays there, and INFO once when it recovers below 60 %. The band in
+/// between is hysteresis — no log either way — so a count hovering around the
+/// threshold cannot flap. Pure state machine; the sampler feeds it.
+struct FdPressure {
+    high: bool,
+    last_warn: Option<std::time::Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FdPressureEvent {
+    Warn,
+    Recovered,
+}
+
+impl FdPressure {
+    const ENTER_PERCENT: u64 = 80;
+    const EXIT_PERCENT: u64 = 60;
+    const WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+    const fn new() -> Self {
+        Self {
+            high: false,
+            last_warn: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        count: u64,
+        limit: u64,
+        now: std::time::Instant,
+    ) -> Option<FdPressureEvent> {
+        // Integer arithmetic: `count * 100 >= limit * 80` ⇔ count ≥ 80 % of limit.
+        let above = |percent: u64| count.saturating_mul(100) >= limit.saturating_mul(percent);
+        if above(Self::ENTER_PERCENT) {
+            let due = self
+                .last_warn
+                .is_none_or(|t| now.duration_since(t) >= Self::WARN_INTERVAL);
+            self.high = true;
+            if due {
+                self.last_warn = Some(now);
+                return Some(FdPressureEvent::Warn);
+            }
+        } else if self.high && !above(Self::EXIT_PERCENT) {
+            self.high = false;
+            self.last_warn = None;
+            return Some(FdPressureEvent::Recovered);
+        }
+        None
     }
 }
 
@@ -2692,15 +2776,42 @@ fn spawn_route_info_sampler() -> Arc<RouteInfo> {
     info
 }
 
-/// Spawn the own-process CPU/memory sampler backing `system.status` (§5.7).
-/// Takes one synchronous sample first so `memoryBytes` is populated before the
-/// listeners come up (the first CPU reading may legitimately be 0 — sysinfo
-/// needs two refreshes to compute a delta), then refreshes on a ~1s tick.
-/// Refreshes are scoped to the daemon's own PID — never a full-system scan.
+/// Spawn the own-process CPU/memory/descriptor sampler backing `system.status`
+/// (§5.7). Takes one synchronous sample first so `memoryBytes` is populated
+/// before the listeners come up (the first CPU reading may legitimately be 0 —
+/// sysinfo needs two refreshes to compute a delta), then refreshes on a ~1s
+/// tick. Refreshes are scoped to the daemon's own PID — never a full-system
+/// scan. Each tick also counts the daemon's open descriptors and feeds the
+/// [`FdPressure`] gate against the startup-sampled soft limit.
 fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     let usage = Arc::new(ProcUsage::default());
+    let mut pressure = FdPressure::new();
+    let mut sample_fds = move |usage: &ProcUsage| {
+        let Some(count) = count_open_fds() else {
+            return;
+        };
+        usage.store_fd_count(count);
+        let Some(limit) = fd_limit::soft_limit() else {
+            return;
+        };
+        match pressure.observe(count, limit, std::time::Instant::now()) {
+            Some(FdPressureEvent::Warn) => tracing::warn!(
+                fd_count = count,
+                fd_limit = limit,
+                "open file descriptors near the soft limit"
+            ),
+            Some(FdPressureEvent::Recovered) => tracing::info!(
+                fd_count = count,
+                fd_limit = limit,
+                "open file descriptors back below the pressure threshold"
+            ),
+            None => {}
+        }
+    };
+    sample_fds(&usage);
+
     let Ok(pid) = sysinfo::get_current_pid() else {
         tracing::warn!("cannot resolve own pid; cpu/memory sampling disabled");
         return usage;
@@ -2726,6 +2837,7 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
         loop {
             tick.tick().await;
             sample(&mut sys, &task_usage);
+            sample_fds(&task_usage);
         }
     });
     usage
@@ -2745,6 +2857,7 @@ mod fd_limit {
     #[cfg(target_os = "macos")]
     pub(crate) const PLATFORM_CAP: Option<u64> = Some(10240);
     #[cfg(not(target_os = "macos"))]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) const PLATFORM_CAP: Option<u64> = None;
 
     /// Soft limit in effect after the startup raise (or the untouched value
@@ -2754,7 +2867,6 @@ mod fd_limit {
     /// The soft `RLIMIT_NOFILE` sampled at startup, for `system.status`
     /// reporting. `None` before `raise_at_startup` ran or when the limit
     /// could not be read (non-Unix, `getrlimit` failure).
-    #[allow(dead_code)]
     pub(crate) fn soft_limit() -> Option<u64> {
         SOFT_LIMIT.get().copied()
     }
@@ -2764,6 +2876,7 @@ mod fd_limit {
     /// to set, or `None` to leave the limit untouched. The target is the hard
     /// limit bounded by the cap; an unlimited hard limit with no cap has no
     /// finite target. The soft limit is never lowered.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64> {
         let target = match (hard, cap) {
             (Some(hard), Some(cap)) => hard.min(cap),
@@ -3515,6 +3628,11 @@ impl SystemControl for DaemonControl {
                     total_roots: s.total_roots,
                     failed_roots: s.failed_roots,
                 }),
+            // Descriptor gauge (intent-hq/intent#4390): count from the ~1s
+            // own-process sampler, limit sampled once at startup — both
+            // atomic/OnceLock reads, nothing touches the OS here.
+            fd_count: self.proc_usage.fd_count(),
+            fd_limit: fd_limit::soft_limit(),
             // Signal-free supervision probe (intent-hq/intent#3875): one
             // pidfile read + one single-process sysinfo refresh, never a
             // signal, so status stays cheap and side-effect free.
@@ -5371,6 +5489,12 @@ fn print_status(config: &Config, r: &Value) {
         r["cpuPercent"].as_f64().unwrap_or(0.0)
     );
     println!("  memoryBytes: {}", r["memoryBytes"].as_u64().unwrap_or(0));
+    if let Some(count) = r["fdCount"].as_u64() {
+        match r["fdLimit"].as_u64() {
+            Some(limit) => println!("  fds: {count} / {limit}"),
+            None => println!("  fds: {count}"),
+        }
+    }
     println!(
         "  updateSupported: {}",
         r["updateSupported"].as_bool().unwrap_or(false)
@@ -6310,6 +6434,78 @@ mod tests {
         assert_eq!(fd_limit::soft_limit(), Some(after_soft));
         fd_limit::raise_at_startup();
         assert_eq!(fd_limit::read().unwrap().0, after_soft);
+    }
+
+    /// The sampler's own directory handle is excluded, and a live test
+    /// process always holds at least stdio plus the file it opens here.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn count_open_fds_counts_the_live_table() {
+        let before = count_open_fds().expect("fd table readable");
+        assert!(before >= 3, "at least stdio: {before}");
+        let held = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let during = count_open_fds().unwrap();
+        assert!(during > before, "{during} > {before}");
+        drop(held);
+        assert!(count_open_fds().unwrap() < during);
+    }
+
+    #[test]
+    fn fd_pressure_warns_at_80_percent_and_recovers_below_60() {
+        use std::time::{Duration, Instant};
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.observe(700, 1000, t0), None);
+        assert_eq!(p.observe(800, 1000, t0), Some(FdPressureEvent::Warn));
+        // Hysteresis band: no log either way while it drains.
+        assert_eq!(p.observe(700, 1000, t0 + Duration::from_secs(1)), None);
+        assert_eq!(p.observe(600, 1000, t0 + Duration::from_secs(2)), None);
+        assert_eq!(
+            p.observe(599, 1000, t0 + Duration::from_secs(3)),
+            Some(FdPressureEvent::Recovered)
+        );
+        // Recovery is logged once; staying low is silent.
+        assert_eq!(p.observe(100, 1000, t0 + Duration::from_secs(4)), None);
+        // Re-entry warns immediately: the rate limit reset on recovery.
+        assert_eq!(
+            p.observe(950, 1000, t0 + Duration::from_secs(5)),
+            Some(FdPressureEvent::Warn)
+        );
+    }
+
+    #[test]
+    fn fd_pressure_rate_limits_repeat_warnings_to_once_a_minute() {
+        use std::time::{Duration, Instant};
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.observe(900, 1000, t0), Some(FdPressureEvent::Warn));
+        assert_eq!(p.observe(950, 1000, t0 + Duration::from_secs(1)), None);
+        assert_eq!(p.observe(999, 1000, t0 + Duration::from_secs(59)), None);
+        assert_eq!(
+            p.observe(999, 1000, t0 + Duration::from_secs(60)),
+            Some(FdPressureEvent::Warn)
+        );
+        assert_eq!(p.observe(999, 1000, t0 + Duration::from_secs(61)), None);
+        // A dip into the hysteresis band does not restart the clock.
+        assert_eq!(p.observe(700, 1000, t0 + Duration::from_secs(90)), None);
+        assert_eq!(p.observe(900, 1000, t0 + Duration::from_secs(91)), None);
+        assert_eq!(
+            p.observe(900, 1000, t0 + Duration::from_secs(120)),
+            Some(FdPressureEvent::Warn)
+        );
+    }
+
+    /// Thresholds compare exactly in integer arithmetic — no float rounding
+    /// at the boundaries, no division by the limit.
+    #[test]
+    fn fd_pressure_uses_exact_integer_thresholds() {
+        use std::time::Instant;
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        // 4/5 = 80 % exactly ⇒ warn; 3/5 = 60 % is not below 60 % ⇒ no recovery.
+        assert_eq!(p.observe(4, 5, t0), Some(FdPressureEvent::Warn));
+        assert_eq!(p.observe(3, 5, t0), None);
+        assert_eq!(p.observe(2, 5, t0), Some(FdPressureEvent::Recovered));
     }
 
     /// Overwrite regression guard: `write_private` uses `create_new`, so

@@ -137,6 +137,21 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     // Supervision probe (intent-hq/intent#3875): always present, and false
     // here — the daemon was spawned by the test harness, not a sitter.
     assert_eq!(r["updateSupported"], false, "updateSupported: {resp}");
+    // Descriptor gauge (intent-hq/intent#4390): the startup sample lands
+    // before the socket binds, so both fields are live on Linux/macOS and a
+    // running daemon can never hold zero descriptors or exceed its soft limit.
+    if matches!(std::env::consts::OS, "linux" | "macos") {
+        let fd_count = r["fdCount"].as_u64().expect("fdCount is u64");
+        let fd_limit = r["fdLimit"].as_u64().expect("fdLimit is u64");
+        assert!(fd_count > 0, "fdCount > 0: {resp}");
+        assert!(fd_limit >= fd_count, "fdLimit ≥ fdCount: {resp}");
+    }
+    for key in ["fdCount", "fdLimit"] {
+        assert!(
+            r.get(key).is_none_or(Value::is_u64),
+            "{key} is omitted, never null: {resp}"
+        );
+    }
 
     // host.status is the §5.14 capability probe, answered on the same UDS
     // connection with the resolved locality (UDS ⇒ local) and host fields.
