@@ -6774,7 +6774,13 @@ async fn interrupt_after_worker_persisted_full_row_emits_normal_completion_end()
         "stream:end names the completed row (got {:?})",
         end.data
     );
-    for field in ["stopReason", "interruptReason", "interruptedBy"] {
+    for field in [
+        "stopReason",
+        "interruptReason",
+        "interruptedBy",
+        "trailingBlocks",
+        "finishReason",
+    ] {
         assert!(
             end.data.get(field).is_none(),
             "a completed turn's stream:end carries no `{field}` (got {:?})",
