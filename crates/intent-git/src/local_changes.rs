@@ -75,7 +75,9 @@ pub fn local_changes(worktree_path: &Path) -> Result<LocalChanges> {
 /// Every `refs/remotes/*` ref: whether any exists, plus the commit OIDs they
 /// resolve to. A ref that cannot be resolved (a dangling `origin/HEAD` symref
 /// after its target branch was deleted) still counts as existing but hides
-/// nothing.
+/// nothing. An error yielded by the ref iterator itself is propagated rather
+/// than skipped: swallowing it would drop tips and count history as unpushed,
+/// whereas the caller turns an `Err` into an explicit per-root `error` row.
 fn remote_tips(repo: &Repository) -> Result<(bool, Vec<Oid>)> {
     let mut any = false;
     let mut tips = Vec::new();
@@ -83,7 +85,7 @@ fn remote_tips(repo: &Repository) -> Result<(bool, Vec<Oid>)> {
         .references_glob("refs/remotes/*")
         .map_err(map_git_err)?
     {
-        let Ok(reference) = reference else { continue };
+        let reference = reference.map_err(map_git_err)?;
         any = true;
         if let Some(oid) = reference.resolve().ok().and_then(|r| r.target()) {
             tips.push(oid);
@@ -287,6 +289,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
         assert!(result.is_err());
         assert!(local_changes(&outside.join("missing")).is_err());
+    }
+
+    /// A remote-ref read failure surfaces as `Err` (the service turns it into
+    /// the row's `error`) instead of a wrong count. A corrupt `packed-refs`
+    /// is the failure libgit2 reports deterministically: it rejects the file
+    /// when the `refs/remotes/*` iterator is created. Malformed loose ref
+    /// files, by contrast, are skipped silently inside libgit2's iteration
+    /// and never reach the iterator's `Err` arm.
+    #[test]
+    fn corrupt_packed_refs_is_an_error_not_a_count() {
+        let dir = init_repo("local-changes-corrupt-packed");
+        commit_file(dir.path(), "a.txt", "x\n");
+        set_origin_ref(dir.path(), &head_branch(dir.path()));
+        assert!(local_changes(dir.path()).unwrap().has_remote_refs);
+        std::fs::write(
+            dir.path().join(".git/packed-refs"),
+            "# pack-refs with: peeled fully-peeled sorted \nnot-an-oid refs/remotes/origin/main\n",
+        )
+        .unwrap();
+        let err = local_changes(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("packed references"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Wire shape: camelCase keys, `branch` omitted when absent.
