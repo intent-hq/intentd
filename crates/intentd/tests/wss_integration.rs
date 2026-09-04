@@ -14629,6 +14629,8 @@ impl SystemControl for WatchHealthControl {
                 total_roots: s.total_roots,
                 failed_roots: s.failed_roots,
             }),
+            fd_count: None,
+            fd_limit: None,
             update_supported: false,
         }
     }

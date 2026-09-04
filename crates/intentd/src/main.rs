@@ -1466,6 +1466,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         protocol = intent_transport::PROTOCOL_VERSION,
         "intentd starting"
     );
+    // Raise the soft descriptor limit before anything opens fds in earnest
+    // (store pool, listeners, agent subprocesses): the macOS default soft limit
+    // is 256, which the daemon exhausts under load (intent-hq/intent#4390).
+    // Never fatal — a failed raise leaves the limit untouched and is logged.
+    fd_limit::raise_at_startup();
     // Insecure dev mode: `--insecure` OR `INTENTD_INSECURE=1` disables TLS and
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
     // provisioning entirely. Dev-only; loudly warned at startup.
@@ -2613,12 +2618,15 @@ struct DaemonControl {
 /// Latest own-process resource sample for `system.status`, written by the
 /// background sampler task (~1s tick) and read lock-free from `status()`.
 /// `cpu_percent` follows the raw `sysinfo` convention (100 = one full core,
-/// may exceed 100 on multi-core hosts); `memory_bytes` is resident memory.
+/// may exceed 100 on multi-core hosts); `memory_bytes` is resident memory;
+/// `fd_count` is the open-descriptor count (intent-hq/intent#4390), `0` while
+/// unsampled/unavailable — a live process always holds at least its stdio.
 #[derive(Default)]
 struct ProcUsage {
     /// `f32` CPU percent stored as raw bits (`f32::to_bits`).
     cpu_bits: std::sync::atomic::AtomicU32,
     memory_bytes: std::sync::atomic::AtomicU64,
+    fd_count: std::sync::atomic::AtomicU64,
 }
 
 impl ProcUsage {
@@ -2635,6 +2643,121 @@ impl ProcUsage {
             f32::from_bits(self.cpu_bits.load(Ordering::Relaxed)),
             self.memory_bytes.load(Ordering::Relaxed),
         )
+    }
+
+    fn store_fd_count(&self, count: u64) {
+        self.fd_count
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `None` until the first descriptor sample lands or where counting is
+    /// unsupported, so the wire field stays presence-detected.
+    fn fd_count(&self) -> Option<u64> {
+        let n = self.fd_count.load(std::sync::atomic::Ordering::Relaxed);
+        (n > 0).then_some(n)
+    }
+}
+
+/// Count the daemon's own open file descriptors: entries of the per-process
+/// fd table (`/proc/self/fd` on Linux, `/dev/fd` on macOS), minus the handle
+/// the read itself holds. `Unsupported` where no such table exists; note the
+/// read needs a descriptor of its own, so at exhaustion it fails with EMFILE.
+fn count_open_fds() -> std::io::Result<u64> {
+    let table = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    };
+    let entries = std::fs::read_dir(table)?.count() as u64;
+    Ok(entries.saturating_sub(1))
+}
+
+/// Whether a failed fd-table read means the table itself is full.
+#[cfg(unix)]
+fn is_fd_exhaustion(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+#[cfg(not(unix))]
+fn is_fd_exhaustion(_err: &std::io::Error) -> bool {
+    false
+}
+
+/// Resolve one fd-table read into the count to publish and feed to the
+/// pressure gate. The gauge must not go blind exactly at exhaustion: when the
+/// read itself fails with EMFILE/ENFILE the table is saturated, so the count
+/// is the soft `limit` itself (the WARN fires). Any other failure yields
+/// `None` — logged at debug, except the expected `Unsupported` off Linux/macOS.
+fn resolve_fd_count(read: std::io::Result<u64>, limit: Option<u64>) -> Option<u64> {
+    match read {
+        Ok(count) => Some(count),
+        Err(e) if is_fd_exhaustion(&e) => limit,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                tracing::debug!(error = %e, "cannot read the open fd table");
+            }
+            None
+        }
+    }
+}
+
+/// Descriptor-pressure log gate (intent-hq/intent#4390): WARN once the open
+/// count reaches 80 % of the soft limit, re-warn at most once a minute while
+/// it stays there, and INFO once when it recovers below 60 %. The band in
+/// between is hysteresis — no log either way — so a count hovering around the
+/// threshold cannot flap. Pure state machine; the sampler feeds it.
+struct FdPressure {
+    high: bool,
+    last_warn: Option<std::time::Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FdPressureEvent {
+    Warn,
+    Recovered,
+}
+
+impl FdPressure {
+    const ENTER_PERCENT: u64 = 80;
+    const EXIT_PERCENT: u64 = 60;
+    const WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+    const fn new() -> Self {
+        Self {
+            high: false,
+            last_warn: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        count: u64,
+        limit: u64,
+        now: std::time::Instant,
+    ) -> Option<FdPressureEvent> {
+        // No usable limit: never warn (`above` would be trivially true).
+        if limit == 0 {
+            return None;
+        }
+        // Integer arithmetic: `count * 100 >= limit * 80` ⇔ count ≥ 80 % of limit.
+        let above = |percent: u64| count.saturating_mul(100) >= limit.saturating_mul(percent);
+        if above(Self::ENTER_PERCENT) {
+            let due = self
+                .last_warn
+                .is_none_or(|t| now.duration_since(t) >= Self::WARN_INTERVAL);
+            self.high = true;
+            if due {
+                self.last_warn = Some(now);
+                return Some(FdPressureEvent::Warn);
+            }
+        } else if self.high && !above(Self::EXIT_PERCENT) {
+            self.high = false;
+            self.last_warn = None;
+            return Some(FdPressureEvent::Recovered);
+        }
+        None
     }
 }
 
@@ -2687,28 +2810,67 @@ fn spawn_route_info_sampler() -> Arc<RouteInfo> {
     info
 }
 
-/// Spawn the own-process CPU/memory sampler backing `system.status` (§5.7).
-/// Takes one synchronous sample first so `memoryBytes` is populated before the
-/// listeners come up (the first CPU reading may legitimately be 0 — sysinfo
-/// needs two refreshes to compute a delta), then refreshes on a ~1s tick.
-/// Refreshes are scoped to the daemon's own PID — never a full-system scan.
+/// Spawn the own-process CPU/memory/descriptor sampler backing `system.status`
+/// (§5.7). Takes one synchronous sample first so `memoryBytes` is populated
+/// before the listeners come up (the first CPU reading may legitimately be 0 —
+/// sysinfo needs two refreshes to compute a delta), then refreshes on a ~1s
+/// tick. Refreshes are scoped to the daemon's own PID — never a full-system
+/// scan. Each tick also counts the daemon's open descriptors and feeds the
+/// [`FdPressure`] gate against the startup-sampled soft limit.
 fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     let usage = Arc::new(ProcUsage::default());
-    let Ok(pid) = sysinfo::get_current_pid() else {
-        tracing::warn!("cannot resolve own pid; cpu/memory sampling disabled");
-        return usage;
-    };
-    let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
-    let mut sys = System::new();
-    let sample = move |sys: &mut System, usage: &ProcUsage| {
-        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh_kind);
-        if let Some(proc) = sys.process(pid) {
-            usage.store(proc.cpu_usage(), proc.memory());
+    let mut pressure = FdPressure::new();
+    let mut sample_fds = move |usage: &ProcUsage| {
+        let limit = fd_limit::soft_limit();
+        let Some(count) = resolve_fd_count(count_open_fds(), limit) else {
+            return;
+        };
+        usage.store_fd_count(count);
+        let Some(limit) = limit else {
+            return;
+        };
+        match pressure.observe(count, limit, std::time::Instant::now()) {
+            Some(FdPressureEvent::Warn) => tracing::warn!(
+                fd_count = count,
+                fd_limit = limit,
+                "open file descriptors near the soft limit"
+            ),
+            Some(FdPressureEvent::Recovered) => tracing::info!(
+                fd_count = count,
+                fd_limit = limit,
+                "open file descriptors back below the pressure threshold"
+            ),
+            None => {}
         }
     };
-    sample(&mut sys, &usage);
+    sample_fds(&usage);
+
+    // Descriptor sampling does not need the pid, so a pid lookup failure only
+    // disables the cpu/memory half of the tick.
+    let mut cpu_mem = match sysinfo::get_current_pid() {
+        Ok(pid) => {
+            let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
+            let mut sys = System::new();
+            let sample = move |sys: &mut System, usage: &ProcUsage| {
+                sys.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    refresh_kind,
+                );
+                if let Some(proc) = sys.process(pid) {
+                    usage.store(proc.cpu_usage(), proc.memory());
+                }
+            };
+            sample(&mut sys, &usage);
+            Some((sys, sample))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot resolve own pid; cpu/memory sampling disabled");
+            None
+        }
+    };
 
     let task_usage = usage.clone();
     tokio::spawn(async move {
@@ -2720,10 +2882,146 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            sample(&mut sys, &task_usage);
+            if let Some((sys, sample)) = cpu_mem.as_mut() {
+                sample(sys, &task_usage);
+            }
+            sample_fds(&task_usage);
         }
     });
     usage
+}
+
+/// Process descriptor limit (`RLIMIT_NOFILE`) policy for `serve`
+/// (intent-hq/intent#4390): raise the soft limit as far as the OS allows at
+/// startup, log the result, and keep the sampled soft limit readable for
+/// `system.status`. Unix only; every entry point is a no-op elsewhere.
+mod fd_limit {
+    use std::sync::OnceLock;
+
+    /// macOS `setrlimit` rejects a soft `RLIMIT_NOFILE` above
+    /// `kern.maxfilesperproc` even when the hard limit is `RLIM_INFINITY`;
+    /// `OPEN_MAX` (10240) is the portable ceiling that always succeeds there.
+    /// Linux enforces the finite hard limit itself, so no extra cap applies.
+    #[cfg(target_os = "macos")]
+    pub(crate) const PLATFORM_CAP: Option<u64> = Some(10240);
+    #[cfg(not(target_os = "macos"))]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) const PLATFORM_CAP: Option<u64> = None;
+
+    /// Soft limit in effect after the startup raise (or the untouched value
+    /// when no raise was needed/possible). Set once by `raise_at_startup`.
+    static SOFT_LIMIT: OnceLock<u64> = OnceLock::new();
+
+    /// The soft `RLIMIT_NOFILE` sampled at startup, for `system.status`
+    /// reporting. `None` before `raise_at_startup` ran or when the limit
+    /// could not be read (non-Unix, `getrlimit` failure).
+    pub(crate) fn soft_limit() -> Option<u64> {
+        SOFT_LIMIT.get().copied()
+    }
+
+    /// Pure raise decision: given the current `soft` limit, the `hard` limit
+    /// (`None` = `RLIM_INFINITY`) and the platform cap, return the soft value
+    /// to set, or `None` to leave the limit untouched. The target is the hard
+    /// limit bounded by the cap; an unlimited hard limit with no cap has no
+    /// finite target. The soft limit is never lowered.
+    ///
+    /// `(hard = None, cap = None)` is effectively unreachable on Linux: the
+    /// kernel refuses `RLIM_INFINITY` for `RLIMIT_NOFILE` (EPERM above
+    /// `fs.nr_open`), so the hard limit is always finite there. That branch
+    /// is macOS-without-cap territory only, and macOS always has a cap.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64> {
+        let target = match (hard, cap) {
+            (Some(hard), Some(cap)) => hard.min(cap),
+            (Some(hard), None) => hard,
+            (None, Some(cap)) => cap,
+            (None, None) => return None,
+        };
+        (target > soft).then_some(target)
+    }
+
+    /// Current `(soft, hard)` `RLIMIT_NOFILE`; `hard == None` means unlimited.
+    #[cfg(unix)]
+    pub(crate) fn read() -> std::io::Result<(u64, Option<u64>)> {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `lim` is a valid, writable `rlimit` for the call's duration.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((to_u64(lim.rlim_cur), finite(lim.rlim_max)))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn read() -> std::io::Result<(u64, Option<u64>)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "RLIMIT_NOFILE is not available on this platform",
+        ))
+    }
+
+    /// Render a hard limit for logs/doctor output.
+    pub(crate) fn fmt_hard(hard: Option<u64>) -> String {
+        hard.map_or_else(|| "unlimited".to_string(), |h| h.to_string())
+    }
+
+    /// Raise the soft limit per `target_soft` and log one INFO line with the
+    /// resulting limits. Failures are WARN-only; the limit is left untouched.
+    #[cfg(unix)]
+    pub(crate) fn raise_at_startup() {
+        let (soft, hard) = match read() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read fd limit (getrlimit)");
+                return;
+            }
+        };
+        let mut raised_from = None;
+        if let Some(target) = target_soft(soft, hard, PLATFORM_CAP) {
+            let lim = libc::rlimit {
+                rlim_cur: target as libc::rlim_t,
+                rlim_max: hard.map_or(libc::RLIM_INFINITY, |h| h as libc::rlim_t),
+            };
+            // SAFETY: `lim` is a valid, initialized `rlimit` for the call's duration.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim) } == 0 {
+                raised_from = Some(soft);
+            } else {
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    soft,
+                    target,
+                    hard = %fmt_hard(hard),
+                    "cannot raise fd limit (setrlimit); leaving it unchanged"
+                );
+            }
+        }
+        // Re-read so the logged/stored value is what the kernel actually applied.
+        let (soft, hard) = read().unwrap_or((soft, hard));
+        let _ = SOFT_LIMIT.set(soft);
+        tracing::info!(
+            soft,
+            hard = %fmt_hard(hard),
+            raised_from = %raised_from.map_or_else(|| "none".to_string(), |s| s.to_string()),
+            "fd limit"
+        );
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn raise_at_startup() {}
+
+    #[cfg(unix)]
+    fn finite(v: libc::rlim_t) -> Option<u64> {
+        (v != libc::RLIM_INFINITY).then(|| to_u64(v))
+    }
+
+    /// `rlim_t` is `u64` on the tier-1 Unix targets but not universally.
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)]
+    fn to_u64(v: libc::rlim_t) -> u64 {
+        v as u64
+    }
 }
 
 /// Latest workspaces-root disk sample (`available`, `total` bytes of the
@@ -3383,6 +3681,11 @@ impl SystemControl for DaemonControl {
                     total_roots: s.total_roots,
                     failed_roots: s.failed_roots,
                 }),
+            // Descriptor gauge (intent-hq/intent#4390): count from the ~1s
+            // own-process sampler, limit sampled once at startup — both
+            // atomic/OnceLock reads, nothing touches the OS here.
+            fd_count: self.proc_usage.fd_count(),
+            fd_limit: fd_limit::soft_limit(),
             // Signal-free supervision probe (intent-hq/intent#3875): one
             // pidfile read + one single-process sysinfo refresh, never a
             // signal, so status stays cheap and side-effect free.
@@ -5239,6 +5542,12 @@ fn print_status(config: &Config, r: &Value) {
         r["cpuPercent"].as_f64().unwrap_or(0.0)
     );
     println!("  memoryBytes: {}", r["memoryBytes"].as_u64().unwrap_or(0));
+    if let Some(count) = r["fdCount"].as_u64() {
+        match r["fdLimit"].as_u64() {
+            Some(limit) => println!("  fds: {count} / {limit}"),
+            None => println!("  fds: {count}"),
+        }
+    }
     println!(
         "  updateSupported: {}",
         r["updateSupported"].as_bool().unwrap_or(false)
@@ -5489,12 +5798,26 @@ async fn cmd_doctor() -> ExitCode {
     report_github_token();
     report_context_engine().await;
     report_host_capabilities();
+    report_fd_limit();
     report_cow_support(&config);
 
     if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Process descriptor limit (`RLIMIT_NOFILE`), informational only: `serve`
+/// raises the soft limit at startup (intent-hq/intent#4390), so this reports
+/// the limit `doctor` itself inherited, never a failure.
+fn report_fd_limit() {
+    match fd_limit::read() {
+        Ok((soft, hard)) => println!(
+            "[ok] fd limit: soft={soft} hard={}",
+            fd_limit::fmt_hard(hard)
+        ),
+        Err(e) => println!("[--] fd limit: unavailable ({e})"),
     }
 }
 
@@ -6111,6 +6434,171 @@ mod tests {
     #[test]
     fn banner_build_commit_falls_back_to_unknown() {
         assert_eq!(banner_build_commit(None), "unknown");
+    }
+
+    #[test]
+    fn fd_limit_target_raises_soft_to_finite_hard() {
+        assert_eq!(fd_limit::target_soft(256, Some(65536), None), Some(65536));
+    }
+
+    #[test]
+    fn fd_limit_target_uses_platform_cap_when_hard_unlimited() {
+        assert_eq!(fd_limit::target_soft(256, None, Some(10240)), Some(10240));
+    }
+
+    #[test]
+    fn fd_limit_target_is_none_when_hard_unlimited_and_uncapped() {
+        assert_eq!(fd_limit::target_soft(256, None, None), None);
+    }
+
+    #[test]
+    fn fd_limit_target_never_lowers_soft() {
+        // Already at the target.
+        assert_eq!(fd_limit::target_soft(65536, Some(65536), None), None);
+        // Above the target (soft can legitimately exceed the cap).
+        assert_eq!(fd_limit::target_soft(20000, None, Some(10240)), None);
+        assert_eq!(fd_limit::target_soft(20000, Some(65536), Some(10240)), None);
+    }
+
+    #[test]
+    fn fd_limit_target_cap_never_exceeds_hard() {
+        assert_eq!(
+            fd_limit::target_soft(256, Some(4096), Some(10240)),
+            Some(4096)
+        );
+        assert_eq!(
+            fd_limit::target_soft(256, Some(65536), Some(10240)),
+            Some(10240)
+        );
+    }
+
+    /// Raising the real limit is idempotent and never lowers it: a second
+    /// call finds nothing to raise and the recorded soft value is stable.
+    #[cfg(unix)]
+    #[test]
+    fn fd_limit_raise_at_startup_never_lowers_and_records_soft() {
+        let (before_soft, _) = fd_limit::read().unwrap();
+        fd_limit::raise_at_startup();
+        let (after_soft, after_hard) = fd_limit::read().unwrap();
+        assert!(after_soft >= before_soft);
+        if let Some(hard) = after_hard {
+            assert!(after_soft <= hard);
+        }
+        assert_eq!(fd_limit::soft_limit(), Some(after_soft));
+        fd_limit::raise_at_startup();
+        assert_eq!(fd_limit::read().unwrap().0, after_soft);
+    }
+
+    /// The sampler's own directory handle is excluded, and a live test
+    /// process always holds at least stdio plus the file it opens here.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn count_open_fds_counts_the_live_table() {
+        let before = count_open_fds().expect("fd table readable");
+        assert!(before >= 3, "at least stdio: {before}");
+        let held = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let during = count_open_fds().unwrap();
+        assert!(during > before, "{during} > {before}");
+        drop(held);
+        assert!(count_open_fds().unwrap() < during);
+    }
+
+    /// At exhaustion the table read itself fails with EMFILE/ENFILE; that must
+    /// read as "saturated" (count = limit) so the pressure WARN still fires,
+    /// while any other failure leaves the gauge alone.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_fd_count_saturates_to_the_limit_on_exhaustion() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(resolve_fd_count(Ok(42), Some(1024)), Some(42));
+        assert_eq!(resolve_fd_count(Ok(42), None), Some(42));
+        for code in [libc::EMFILE, libc::ENFILE] {
+            assert_eq!(
+                resolve_fd_count(Err(Error::from_raw_os_error(code)), Some(1024)),
+                Some(1024),
+                "errno {code} saturates"
+            );
+            assert_eq!(
+                resolve_fd_count(Err(Error::from_raw_os_error(code)), None),
+                None,
+                "errno {code} without a known limit has no count to report"
+            );
+        }
+        assert_eq!(
+            resolve_fd_count(Err(Error::from_raw_os_error(libc::EACCES)), Some(1024)),
+            None
+        );
+        assert_eq!(
+            resolve_fd_count(Err(ErrorKind::Unsupported.into()), Some(1024)),
+            None
+        );
+    }
+
+    #[test]
+    fn fd_pressure_never_warns_without_a_usable_limit() {
+        use std::time::Instant;
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.observe(0, 0, t0), None);
+        assert_eq!(p.observe(500, 0, t0), None);
+    }
+
+    #[test]
+    fn fd_pressure_warns_at_80_percent_and_recovers_below_60() {
+        use std::time::{Duration, Instant};
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.observe(700, 1000, t0), None);
+        assert_eq!(p.observe(800, 1000, t0), Some(FdPressureEvent::Warn));
+        // Hysteresis band: no log either way while it drains.
+        assert_eq!(p.observe(700, 1000, t0 + Duration::from_secs(1)), None);
+        assert_eq!(p.observe(600, 1000, t0 + Duration::from_secs(2)), None);
+        assert_eq!(
+            p.observe(599, 1000, t0 + Duration::from_secs(3)),
+            Some(FdPressureEvent::Recovered)
+        );
+        // Recovery is logged once; staying low is silent.
+        assert_eq!(p.observe(100, 1000, t0 + Duration::from_secs(4)), None);
+        // Re-entry warns immediately: the rate limit reset on recovery.
+        assert_eq!(
+            p.observe(950, 1000, t0 + Duration::from_secs(5)),
+            Some(FdPressureEvent::Warn)
+        );
+    }
+
+    #[test]
+    fn fd_pressure_rate_limits_repeat_warnings_to_once_a_minute() {
+        use std::time::{Duration, Instant};
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.observe(900, 1000, t0), Some(FdPressureEvent::Warn));
+        assert_eq!(p.observe(950, 1000, t0 + Duration::from_secs(1)), None);
+        assert_eq!(p.observe(999, 1000, t0 + Duration::from_secs(59)), None);
+        assert_eq!(
+            p.observe(999, 1000, t0 + Duration::from_secs(60)),
+            Some(FdPressureEvent::Warn)
+        );
+        assert_eq!(p.observe(999, 1000, t0 + Duration::from_secs(61)), None);
+        // A dip into the hysteresis band does not restart the clock.
+        assert_eq!(p.observe(700, 1000, t0 + Duration::from_secs(90)), None);
+        assert_eq!(p.observe(900, 1000, t0 + Duration::from_secs(91)), None);
+        assert_eq!(
+            p.observe(900, 1000, t0 + Duration::from_secs(120)),
+            Some(FdPressureEvent::Warn)
+        );
+    }
+
+    /// Thresholds compare exactly in integer arithmetic — no float rounding
+    /// at the boundaries, no division by the limit.
+    #[test]
+    fn fd_pressure_uses_exact_integer_thresholds() {
+        use std::time::Instant;
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        // 4/5 = 80 % exactly ⇒ warn; 3/5 = 60 % is not below 60 % ⇒ no recovery.
+        assert_eq!(p.observe(4, 5, t0), Some(FdPressureEvent::Warn));
+        assert_eq!(p.observe(3, 5, t0), None);
+        assert_eq!(p.observe(2, 5, t0), Some(FdPressureEvent::Recovered));
     }
 
     /// Overwrite regression guard: `write_private` uses `create_new`, so

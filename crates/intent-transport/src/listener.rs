@@ -27,6 +27,8 @@ use intent_services::EventBus;
 #[cfg(any(windows, test))]
 use sha2::{Digest, Sha256};
 
+#[cfg(any(unix, windows))]
+use crate::accept_backoff::{sleep_unless_shutdown, AcceptBackoff, AcceptFailure};
 use crate::control::SystemControl;
 use crate::reverse::PrimaryReverseRegistry;
 use crate::rpc_limit::RpcLimiter;
@@ -158,11 +160,15 @@ where
     tracing::info!(path = %socket_path.display(), "intentd listening on UDS");
 
     tokio::pin!(shutdown);
+    let mut backoff = AcceptBackoff::default();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
+                        if let Some(failures) = backoff.on_success() {
+                            tracing::info!(failures, "uds accept recovered");
+                        }
                         let api = api.clone();
                         let bus = bus.clone();
                         let control = control.clone();
@@ -176,7 +182,25 @@ where
                             }
                         });
                     }
-                    Err(e) => tracing::warn!(error = %e, "uds accept failed"),
+                    // Descriptor exhaustion (intent-hq/intent#4390): sleep
+                    // with jittered backoff instead of spinning, and keep the
+                    // shutdown branch winning while asleep.
+                    Err(e) => match backoff.on_error(&e) {
+                        AcceptFailure::Backoff { delay, streak, warn } => {
+                            if warn {
+                                tracing::warn!(
+                                    error = %e,
+                                    streak,
+                                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                    "uds accept failed: out of descriptors, backing off"
+                                );
+                            }
+                            if sleep_unless_shutdown(delay, &mut shutdown).await {
+                                break;
+                            }
+                        }
+                        AcceptFailure::Other => tracing::warn!(error = %e, "uds accept failed"),
+                    },
                 }
             }
             () = &mut shutdown => break,
@@ -419,12 +443,43 @@ where
     tracing::info!(pipe = %pipe_name, path = %socket_path.display(), "intentd listening on named pipe");
 
     tokio::pin!(shutdown);
-    loop {
+    let mut backoff = AcceptBackoff::default();
+    'accept: loop {
         tokio::select! {
             connected = server.connect() => {
                 match connected {
                     Ok(()) => {
-                        let next = ServerOptions::new().create(&pipe_name)?;
+                        // The replacement instance needs a handle of its own,
+                        // so at exhaustion `create` fails with
+                        // ERROR_TOO_MANY_OPEN_FILES: back off like a failed
+                        // connect instead of tearing the listener down. The
+                        // connected client waits out the bounded delay and is
+                        // served once an instance exists. Other create errors
+                        // stay fatal, as before.
+                        let next = loop {
+                            match ServerOptions::new().create(&pipe_name) {
+                                Ok(next) => break next,
+                                Err(e) => match backoff.on_error(&e) {
+                                    AcceptFailure::Backoff { delay, streak, warn } => {
+                                        if warn {
+                                            tracing::warn!(
+                                                error = %e,
+                                                streak,
+                                                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                                "named-pipe instance create failed: out of resources, backing off"
+                                            );
+                                        }
+                                        if sleep_unless_shutdown(delay, &mut shutdown).await {
+                                            break 'accept;
+                                        }
+                                    }
+                                    AcceptFailure::Other => return Err(e),
+                                },
+                            }
+                        };
+                        if let Some(failures) = backoff.on_success() {
+                            tracing::info!(failures, "named-pipe connect recovered");
+                        }
                         let stream = std::mem::replace(&mut server, next);
                         let api = api.clone();
                         let bus = bus.clone();
@@ -439,7 +494,22 @@ where
                             }
                         });
                     }
-                    Err(e) => tracing::warn!(error = %e, "named-pipe connect failed"),
+                    Err(e) => match backoff.on_error(&e) {
+                        AcceptFailure::Backoff { delay, streak, warn } => {
+                            if warn {
+                                tracing::warn!(
+                                    error = %e,
+                                    streak,
+                                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                    "named-pipe connect failed: out of resources, backing off"
+                                );
+                            }
+                            if sleep_unless_shutdown(delay, &mut shutdown).await {
+                                break;
+                            }
+                        }
+                        AcceptFailure::Other => tracing::warn!(error = %e, "named-pipe connect failed"),
+                    },
                 }
             }
             _ = &mut shutdown => break,
