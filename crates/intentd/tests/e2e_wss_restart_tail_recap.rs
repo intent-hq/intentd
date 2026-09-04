@@ -538,9 +538,9 @@ async fn resume_via_session_load_replays_interrupted_tail() {
     );
     // The replayed segments are far under the per-segment cap and nothing was
     // elided, so the truncation hint (intent#3696) must NOT ride the recap —
-    // it is reserved for recaps that actually abbreviated something.
+    // it is reserved for recaps that actually cut something.
     assert!(
-        !text.contains("abbreviated by the recovery recap") && !text.contains("truncated=\""),
+        !text.contains("cut by this recap") && !text.contains("truncated=\""),
         "an untruncated recap must not carry the truncation hint; got: {text}"
     );
 

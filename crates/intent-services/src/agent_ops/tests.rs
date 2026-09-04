@@ -38438,7 +38438,7 @@ mod resume_tail_recap {
         let recap = build_resume_tail_recap(&messages).expect("recap");
         assert!(!recap.text.contains(RESUME_RECAP_TRUNCATION_HINT));
         assert!(!recap.text.contains("truncated="));
-        assert!(!recap.text.contains("abbreviated"));
+        assert!(!recap.text.contains("cut by this recap"));
         assert!(!recap.text.contains("elided"));
         assert_eq!(
             recap.text,

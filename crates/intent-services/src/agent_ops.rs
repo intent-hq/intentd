@@ -14142,13 +14142,15 @@ const RESUME_RECAP_SEGMENT_MAX_CHARS: usize = 8_000;
 const RESUME_RECAP_MAX_SEGMENTS: usize = 8;
 
 /// Recap truncation hint (intent#3696), emitted only when a segment was
-/// middle-truncated or segments were elided: tells the model the abbreviation
-/// is a replay artefact (not lost/broken tool output) and that one targeted
-/// re-read — not repeated re-fetching — is the right recovery. Mirrors the
-/// history replay's `SUPERVISOR_PREAMBLE` wording and its
-/// `truncated="true" original_chars="N"` marker convention. The literal
-/// `8000` must track [`RESUME_RECAP_SEGMENT_MAX_CHARS`] (asserted below).
-const RESUME_RECAP_TRUNCATION_HINT: &str = "Note on this recap: some replayed text below is abbreviated by the recovery recap. Segments longer than 8000 characters are middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element), and older interrupted segments may be elided entirely. This abbreviation is a replay artefact, NOT lost or broken tool output — the full exchange remains in your persisted transcript, so it is safe to continue without re-fetching anything. If you genuinely need one specific full text, re-read that ONE item once. Do not re-fetch the same inputs repeatedly.\n\n";
+/// middle-truncated or segments were elided. The segments are the user's
+/// message and the model's own partial response — never tool output — so the
+/// hint says the cut parts were trimmed by this recap for size (not lost by a
+/// failing tool), to continue without re-fetching anything, and to ask the
+/// user once if a truncated user message is genuinely needed in full. Uses
+/// the history replay's `truncated="true" original_chars="N"` marker
+/// convention. The literal `8000` must track
+/// [`RESUME_RECAP_SEGMENT_MAX_CHARS`] (asserted below).
+const RESUME_RECAP_TRUNCATION_HINT: &str = "Note on this recap: parts of the replayed exchange below were cut by this recap for size — segments longer than 8000 characters are middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element), and older interrupted segments may be elided entirely. Nothing was lost by a failing tool; the cut text is only the user's message and your own earlier partial response. Continue without re-fetching anything. If you genuinely need the full text of a truncated user message, ask the user for it once.\n\n";
 const _: () = assert!(
     RESUME_RECAP_SEGMENT_MAX_CHARS == 8000,
     "RESUME_RECAP_TRUNCATION_HINT names the per-segment cap literally; update both together"
