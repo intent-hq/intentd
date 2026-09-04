@@ -40,7 +40,8 @@ needs. Fields that matter most:
   default old-space cap that OOM-killed long coordinator sessions (STAB-50). The cap
   resolves as an inherited `NODE_OPTIONS` that already contains `--max-old-space-size`
   (left untouched — the daemon never clobbers a parent cap) >
-  `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var > `agents.acpNodeMaxOldSpaceMb`
+  `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var (only when it parses as a `u32`; a
+  malformed value is WARN-logged and skipped) > `agents.acpNodeMaxOldSpaceMb`
   daemon setting (1024–65536, threaded in via `SpawnOptions::node_max_old_space_mb`) >
   8192 MB default (`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB` in intent-core); it is read live
   per spawn, so a settings change applies to the next spawned provider process.
