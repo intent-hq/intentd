@@ -461,6 +461,13 @@ mod tests {
         std::ptr::from_ref::<dyn Harness>(h).cast::<()>()
     }
 
+    /// The harness types are unit structs, so pointer identity between two
+    /// of them is vacuous (zero-sized statics may share an address). Tell
+    /// versions apart by the one surface that differs between them.
+    fn next_steps(h: &dyn Harness) -> String {
+        h.suggested_next_steps_block(false)
+    }
+
     /// The registry keys on the exact version string sessions are stamped
     /// with (intent-core's `CURRENT_HARNESS_VERSION`): the stamp and
     /// the resolved harness can never drift.
@@ -468,10 +475,9 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert!(std::ptr::eq(
-            data_ptr(resolve_entry(intent_core::CURRENT_HARNESS_VERSION).harness),
-            data_ptr(&v2_3::V2_3)
-        ));
+        assert_eq!(entry.version, "2.3");
+        assert_eq!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
+        assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));
     }
 
     /// A "1.0"-stamped session keeps resolving the v1 row (its original
@@ -544,7 +550,8 @@ mod tests {
     fn latest_is_current_harness_version() {
         assert_eq!(LATEST_VERSION, intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(latest_entry().version, LATEST_VERSION);
-        assert!(std::ptr::eq(data_ptr(latest()), data_ptr(&v2_3::V2_3)));
+        assert_eq!(next_steps(latest()), next_steps(&v2_3::V2_3));
+        assert_ne!(next_steps(latest()), next_steps(&v1::V1));
     }
 
     /// Every registry row is coherent: unique version keys, a doctrine whose
@@ -639,8 +646,8 @@ mod tests {
             v2_2.doctrine.instructions,
             v2_3.doctrine.instructions
         ));
-        assert!(std::ptr::eq(data_ptr(v2_2.harness), data_ptr(&v1::V1)));
-        assert!(std::ptr::eq(data_ptr(v2_3.harness), data_ptr(&v2_3::V2_3)));
+        assert_eq!(next_steps(v2_2.harness), next_steps(&v1::V1));
+        assert_eq!(next_steps(v2_3.harness), next_steps(&v2_3::V2_3));
         for auto_commit in [false, true] {
             assert_ne!(
                 v2_2.harness.suggested_next_steps_block(auto_commit),
