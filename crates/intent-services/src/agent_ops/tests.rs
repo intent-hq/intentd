@@ -36382,7 +36382,8 @@ async fn seed_task_note(svc: &Services, ws: &WorkspaceId, title: &str, status: &
 }
 
 /// `tasks` counts the workspace's task notes per non-terminal status keyed
-/// by the wire `snake_case` string: `complete` / `cancelled` are dropped,
+/// by the wire `snake_case` string: every non-terminal status is listed
+/// (`blocked` / `waiting` included), `complete` / `cancelled` are dropped,
 /// keys are in `BTreeMap` order, and the field alone forces the injection
 /// line.
 #[tokio::test]
@@ -36391,6 +36392,8 @@ async fn agent_snapshot_counts_open_task_statuses_and_forces_injection() {
     let agent = create_agent(&svc, &ws, "Coordinator").await;
     seed_task_note(&svc, &ws, "Reviewing", "review_required").await;
     seed_task_note(&svc, &ws, "Working", "in_progress").await;
+    seed_task_note(&svc, &ws, "Stuck", "blocked").await;
+    seed_task_note(&svc, &ws, "Parked", "waiting").await;
     seed_task_note(&svc, &ws, "Done", "complete").await;
     seed_task_note(&svc, &ws, "Dropped", "cancelled").await;
 
@@ -36400,12 +36403,12 @@ async fn agent_snapshot_counts_open_task_statuses_and_forces_injection() {
         .expect("snapshot");
     assert_eq!(
         v["tasks"],
-        json!({"in_progress": 1, "review_required": 1}),
+        json!({"blocked": 1, "in_progress": 1, "review_required": 1, "waiting": 1}),
         "non-terminal counts only: {v}"
     );
     assert_eq!(
         serde_json::to_string(&v["tasks"]).unwrap(),
-        "{\"in_progress\":1,\"review_required\":1}",
+        "{\"blocked\":1,\"in_progress\":1,\"review_required\":1,\"waiting\":1}",
         "deterministic key order"
     );
 
@@ -36419,6 +36422,8 @@ async fn agent_snapshot_counts_open_task_statuses_and_forces_injection() {
     let parsed: serde_json::Value = serde_json::from_str(json_part).expect("valid JSON");
     assert_eq!(parsed["tasks"]["review_required"], json!(1));
     assert_eq!(parsed["tasks"]["in_progress"], json!(1));
+    assert_eq!(parsed["tasks"]["blocked"], json!(1));
+    assert_eq!(parsed["tasks"]["waiting"], json!(1));
     assert!(
         parsed["tasks"].get("complete").is_none() && parsed["tasks"].get("cancelled").is_none(),
         "terminal statuses never listed: {line}"

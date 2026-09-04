@@ -846,13 +846,14 @@ async fn note_round_trip() {
     assert_eq!(fetched.id, note.id);
 }
 
-/// `count_task_status_counts`: one GROUP BY aggregate over
+/// `count_tasks_by_status`: one GROUP BY aggregate over
 /// `json_extract(task_json, '$.status')` keyed by the wire status string —
-/// every task note in the workspace regardless of parent/archive state,
-/// non-task notes ignored, absent statuses absent, an unknown stored
-/// status folded into `not_started`, and scoped per workspace.
+/// every task note in the workspace regardless of parent/archive state
+/// except the spec itself (`task.list` population parity), non-task notes
+/// ignored, absent statuses absent, an unknown stored status folded into
+/// `not_started`, and scoped per workspace.
 #[tokio::test]
-async fn count_task_status_counts_groups_by_wire_status() {
+async fn count_tasks_by_status_groups_by_wire_status() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
 
@@ -892,6 +893,8 @@ async fn count_task_status_counts_groups_by_wire_status() {
         ("t-done", Some(TaskStatus::Complete), false),
         ("t-cancel", Some(TaskStatus::Cancelled), false),
         ("n-plain", None, false),
+        // A spec carrying task metadata is excluded, like `task.list`.
+        ("spec", Some(TaskStatus::Blocked), false),
     ] {
         store
             .insert_note(&mk_note(id, status, archived))
@@ -904,10 +907,7 @@ async fn count_task_status_counts_groups_by_wire_status() {
         .await
         .expect("corrupt status");
 
-    let counts = store
-        .count_task_status_counts(&ws_id)
-        .await
-        .expect("counts");
+    let counts = store.count_tasks_by_status(&ws_id).await.expect("counts");
     let expected: BTreeMap<String, u64> = [
         ("cancelled".to_string(), 1),
         ("in_progress".to_string(), 2),
@@ -917,6 +917,10 @@ async fn count_task_status_counts_groups_by_wire_status() {
     .into_iter()
     .collect();
     assert_eq!(counts, expected);
+    assert!(
+        !counts.contains_key("blocked"),
+        "spec row with task metadata must not be counted: {counts:?}"
+    );
 
     // Scoped per workspace: another workspace reads empty.
     let other = WorkspaceId::new();
@@ -925,7 +929,7 @@ async fn count_task_status_counts_groups_by_wire_status() {
         .await
         .expect("insert other ws");
     assert!(store
-        .count_task_status_counts(&other)
+        .count_tasks_by_status(&other)
         .await
         .expect("other counts")
         .is_empty());

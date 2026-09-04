@@ -380,22 +380,25 @@ impl Store {
 
     /// Per-workspace task-note count per status as a single aggregate
     /// statement over `json_extract(task_json, '$.status')` — every task
-    /// note in the workspace (any parent, archived included), never the note
-    /// bodies. Keys are the wire `snake_case` [`TaskStatus`] strings; a NULL
-    /// or unrecognised stored status folds into `not_started` (the
-    /// [`TaskStatus`] default, which is also how the row deserializes).
+    /// note in the workspace except the spec itself (any parent, archived
+    /// included; the same population as `task.list`), never the note bodies.
+    /// Keys are the wire `snake_case` [`TaskStatus`] strings. A NULL or
+    /// unrecognised stored status is counted under `not_started` (the
+    /// [`TaskStatus`] default) as a best-effort fold for this count only —
+    /// such a row does NOT deserialize that way (`map_note_row` fails on it),
+    /// so the fold keeps the aggregate total honest without hiding the row.
     /// Statuses with no rows are absent.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn count_task_status_counts(
+    pub async fn count_tasks_by_status(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<BTreeMap<String, u64>> {
         let rows = sqlx::query(
             "SELECT json_extract(task_json, '$.status') AS status, COUNT(*) AS n FROM note \
-             WHERE workspace_id = ? AND task_json IS NOT NULL \
+             WHERE workspace_id = ? AND task_json IS NOT NULL AND id != 'spec' \
              GROUP BY status",
         )
         .bind(&workspace_id.0)

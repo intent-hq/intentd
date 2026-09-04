@@ -10473,13 +10473,15 @@ impl Services {
 
     /// Build [`AgentSnapshot`] for `agent_id` — the cheap per-turn digest
     /// behind `ws.agent.snapshot()` and the turn-prompt injection line
-    /// (`ws.agent.diagnostics` stays the deep-dive tool). O(this agent):
-    /// every field reads a per-agent registry length or a bounded per-agent
-    /// count statement — no workspace-wide scans, no transcript or blob
-    /// hydration (`prs` adds the workspace row plus the workspace's
-    /// registered git roots, both single bounded statements). `session` is
-    /// the caller's already-fetched summary row so the op path stays at one
-    /// session read.
+    /// (`ws.agent.diagnostics` stays the deep-dive tool). O(this agent) for
+    /// the per-agent fields: each reads a per-agent registry length or a
+    /// bounded per-agent count statement — no transcript or blob hydration.
+    /// Two fields are workspace-wide bounded aggregates instead: `prs` adds
+    /// the workspace row plus the workspace's registered git roots (both
+    /// single bounded statements), and `tasks` adds one indexed GROUP BY over
+    /// the workspace's task rows' status column (`idx_note_task`; no note
+    /// bodies). `session` is the caller's already-fetched summary row so the
+    /// op path stays at one session read.
     pub(crate) async fn build_agent_snapshot(
         &self,
         session: &AgentSession,
@@ -10562,12 +10564,12 @@ impl Services {
     }
 
     /// The snapshot's `tasks` field: the workspace's task-note counts per
-    /// non-terminal status from [`Store::count_task_status_counts`] (one
+    /// non-terminal status from [`Store::count_tasks_by_status`] (one
     /// aggregate statement, no content hydration), with `complete` and
     /// `cancelled` removed. Best-effort — a store failure reads as empty so
     /// a snapshot build never fails on it.
     async fn open_task_status_counts(&self, workspace_id: &WorkspaceId) -> BTreeMap<String, usize> {
-        let counts = match self.store.count_task_status_counts(workspace_id).await {
+        let counts = match self.store.count_tasks_by_status(workspace_id).await {
             Ok(counts) => counts,
             Err(e) => {
                 tracing::warn!(
