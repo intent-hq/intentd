@@ -423,3 +423,89 @@ async fn failed_promotion_retains_and_restart_restores_draft() {
     assert_eq!(restored["phase"], "failed");
     assert_eq!(restored["intentText"], "retain");
 }
+
+#[tokio::test]
+async fn new_folder_promotion_initializes_main_and_rejects_non_empty_target() {
+    let root = TempDir::new();
+    let (_server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+
+    let fresh_name = "fresh-project";
+    let fresh_path = root.0.join(fresh_name);
+    let fresh = rpc(
+        &mut ws,
+        1,
+        "workspaceDraft.create",
+        json!({
+            "intentText":"start fresh",
+            "source":{"kind":"newFolder","parentPath":root.0,"name":fresh_name}
+        }),
+    )
+    .await;
+    let promoted = rpc(
+        &mut ws,
+        2,
+        "workspaceDraft.promote",
+        json!({"id":fresh["id"],"expectedRevision":0}),
+    )
+    .await;
+    assert_eq!(
+        promoted["workspace"]["repositoryPath"],
+        fresh_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(promoted["workspace"]["skipWorktree"], true);
+    let head = std::process::Command::new("git")
+        .args(["symbolic-ref", "HEAD"])
+        .current_dir(&fresh_path)
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "refs/heads/main"
+    );
+
+    let occupied_name = "occupied-project";
+    let occupied_path = root.0.join(occupied_name);
+    std::fs::create_dir_all(&occupied_path).unwrap();
+    std::fs::write(occupied_path.join("keep.txt"), "keep\n").unwrap();
+    let occupied = rpc(
+        &mut ws,
+        3,
+        "workspaceDraft.create",
+        json!({
+            "intentText":"retain me",
+            "source":{"kind":"newFolder","parentPath":root.0,"name":occupied_name}
+        }),
+    )
+    .await;
+    let rejected = rpc_raw(
+        &mut ws,
+        4,
+        "workspaceDraft.promote",
+        json!({"id":occupied["id"],"expectedRevision":0}),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602);
+    let retained = rpc(
+        &mut ws,
+        5,
+        "workspaceDraft.get",
+        json!({"id":occupied["id"]}),
+    )
+    .await;
+    assert_eq!(retained["phase"], "failed");
+    assert_eq!(retained["intentText"], "retain me");
+    assert_eq!(
+        retained["lastError"],
+        format!(
+            "invalid params: new project directory already exists and is not empty: {}",
+            occupied_path.display()
+        )
+    );
+    assert!(!occupied_path.join(".git").exists());
+    assert_eq!(
+        std::fs::read_to_string(occupied_path.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+}

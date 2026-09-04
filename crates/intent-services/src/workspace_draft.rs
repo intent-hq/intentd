@@ -112,11 +112,10 @@ impl Services {
         };
         self.publish_workspace_draft_updated(&promoting).await;
 
-        let created = match WorkspaceApi::create_workspace(
-            self,
-            input,
-            Some(promoting.operation_key.clone()),
-        )
+        let created = match async {
+            validate_new_folder_target(&promoting).await?;
+            WorkspaceApi::create_workspace(self, input, Some(promoting.operation_key.clone())).await
+        }
         .await
         {
             Ok(created) => created,
@@ -270,6 +269,52 @@ fn promotion_input(
         None => {}
     }
     input
+}
+
+async fn validate_new_folder_target(draft: &WorkspaceDraft) -> Result<()> {
+    let Some(DraftSource::NewFolder { parent_path, name }) = &draft.source else {
+        return Ok(());
+    };
+    let path = PathBuf::from(parent_path).join(name);
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::Internal(format!(
+                "workspaceDraft.promote: inspect new project path {} failed: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(Error::InvalidParams(format!(
+            "new project path already exists and is not a directory: {}",
+            path.display()
+        )));
+    }
+    let mut entries = tokio::fs::read_dir(&path).await.map_err(|error| {
+        Error::Internal(format!(
+            "workspaceDraft.promote: read new project directory {} failed: {error}",
+            path.display()
+        ))
+    })?;
+    if entries
+        .next_entry()
+        .await
+        .map_err(|error| {
+            Error::Internal(format!(
+                "workspaceDraft.promote: read new project directory {} failed: {error}",
+                path.display()
+            ))
+        })?
+        .is_some()
+    {
+        return Err(Error::InvalidParams(format!(
+            "new project directory already exists and is not empty: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn parse_patch(mut patch: Map<String, Value>) -> Result<WorkspaceDraftPatch> {
