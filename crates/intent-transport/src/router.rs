@@ -160,6 +160,29 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
         e @ (Error::InvalidParams(_) | Error::InvalidInput(_)) => invalid_params(e.to_string()),
+        // Execution-environment selection failures (§5.1): machine-readable
+        // `data.code` plus the offending environment so clients key off the
+        // structured payload instead of prose.
+        ref e @ Error::ExecutionEnvironmentUnavailable {
+            ref environment,
+            ref reason,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "execution-environment-unavailable",
+                "environment": environment,
+                "reason": reason,
+            })),
+        },
+        ref e @ Error::ExecutionEnvironmentNotImplemented { ref environment } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "execution-environment-not-implemented",
+                "environment": environment,
+            })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -2115,6 +2138,50 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
+        }
+        "sandbox.profiles.list" => {
+            // Global namespace (no workspaceId): the configured execution
+            // environment profiles (PROTOCOL §5.5b).
+            let r = api.sandbox_profiles_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sandbox.profiles.update" => {
+            match api
+                .sandbox_profiles_update(Value::Object(params.clone()))
+                .await
+            {
+                Ok(v) => Ok(v),
+                // Unknown type/field or failed validation → -32602.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "sandbox.options" => {
+            // Global namespace (no workspaceId): the capability-resolved
+            // execution environment availability matrix (PROTOCOL §5.5b).
+            let r = api.sandbox_options().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sandbox.image.check" => {
+            // Global namespace (no workspaceId): dry-run guest-image validity
+            // check (PROTOCOL §5.5b). Fetch/validation failures are results
+            // (`valid: false`), not RPC errors.
+            let manifest_url = params
+                .get("manifestUrl")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| rpc(INVALID_PARAMS, "manifestUrl is required"))?
+                .to_string();
+            let sha256 = params
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let r = api
+                .sandbox_image_check(manifest_url, sha256)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
         }
         "git.status" => {
             let ws = require_ws_note(params)?;

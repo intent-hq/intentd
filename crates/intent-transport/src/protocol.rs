@@ -373,13 +373,20 @@
 //! `git.status.files` entry set), and `error` only when the root could not
 //! be read (counts then 0). Unknown workspace → `-32602`. Method catalog
 //! grows by one router method — 300 router methods, 39 fast-path, 341
-//! total.
+//! total. Version 9.8 adds the execution-environment surface (additive;
+//! §5.35, §5.1, §5.5b): the `sandbox.profiles.list` /
+//! `sandbox.profiles.update` / `sandbox.options` / `sandbox.image.check`
+//! router methods, the `system.capabilities.microvmSupported` field (§5.7),
+//! the `workspace.create` `executionEnvironment` param with the persisted
+//! `Workspace.executionEnvironment` field, and the structured
+//! `execution-environment-unavailable` / `execution-environment-not-implemented`
+//! error payloads (§9) — 304 router methods, 39 fast-path, 345 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.7";
+pub const PROTOCOL_VERSION: &str = "9.8";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

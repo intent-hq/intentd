@@ -875,7 +875,7 @@ mod tests {
     /// `transferred_table_columns_match_snapshot` after deciding what the
     /// column change means for transfer (see that test's message).
     const TRANSFERRED_COLUMNS: &str = "\
-workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links
+workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, execution_environment
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
 note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
@@ -894,7 +894,7 @@ hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, 
 pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot
 script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running
 task_agent_link: workspace_id, note_id, task_key, task_text, agent_id, created_at
-sandbox: id, workspace_id, agent_id, path, branch, base_commit_sha, snapshot_commit_sha, status, created_at, updated_at, retry_count
+sandbox: id, workspace_id, agent_id, path, branch, base_commit_sha, snapshot_commit_sha, status, created_at, updated_at, retry_count, last_merged_commit_sha, merge_on_turn_end, conflicting_paths
 tracked_changes: id, workspace_id, path, stage, status, agent_id, session_id, turn, commit_hash, old_blob_sha, new_blob_sha, additions, deletions, created_at, updated_at
 diffs: id, workspace_id, file_path, staged, old_content, new_content, hunks_json, created_at, updated_at
 workspace_metrics: workspace_id, additions, deletions, files_changed, updated_at

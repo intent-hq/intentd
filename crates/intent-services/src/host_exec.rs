@@ -70,7 +70,10 @@ impl ExecPolicy for AllowAllPolicy {
 
 /// Parsed `host.exec` params. `command` is required; `args`/`env` default empty;
 /// `cwd` requires `workspace_id` so the containment guard has a root to check
-/// against. `timeout_ms` capped by [`MAX_TIMEOUT_MS`].
+/// against. `timeout_ms` capped by [`MAX_TIMEOUT_MS`]. `caller_agent_id` is
+/// server-injected (never client-supplied): the `ws.host.exec` binding stamps
+/// the calling agent so cwd resolution roots at that agent's sandbox when it
+/// has one.
 #[derive(Debug)]
 pub struct HostExecArgs {
     pub command: String,
@@ -79,6 +82,7 @@ pub struct HostExecArgs {
     pub env: BTreeMap<String, String>,
     pub timeout_ms: Option<u64>,
     pub workspace_id: Option<String>,
+    pub caller_agent_id: Option<intent_core::AgentId>,
 }
 
 /// Upper bound on `timeoutMs` to keep a runaway request from wedging the daemon
@@ -177,6 +181,11 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecArgs, HostExecE
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|s| !s.is_empty());
+    let caller_agent_id = params
+        .get("callerAgentId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(intent_core::AgentId::from);
     let timeout_ms = match params.get("timeoutMs") {
         None | Some(Value::Null) => None,
         Some(v) => {
@@ -198,6 +207,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecArgs, HostExecE
         env,
         timeout_ms,
         workspace_id,
+        caller_agent_id,
     })
 }
 
@@ -354,6 +364,19 @@ pub(crate) async fn default_cwd_for_workspace(
     }
 }
 
+/// The calling agent's sandbox root, when the caller is a sandboxed agent:
+/// the default `cwd` for its execs, so a sandboxed agent's `ws.host.exec`
+/// runs inside its sandbox rather than the canonical checkout. `None` for
+/// non-agent callers, unknown sessions, and unsandboxed agents.
+async fn sandbox_root_for(
+    api: &dyn WorkspaceApi,
+    caller_agent_id: Option<&intent_core::AgentId>,
+) -> Option<PathBuf> {
+    let agent_id = caller_agent_id?;
+    let session = api.agent_get_session(agent_id.clone(), None).await.ok()?;
+    session.sandbox_path.map(PathBuf::from)
+}
+
 /// Assemble the tokio `Command` for a validated exec request. Pipes stdio,
 /// sets `kill_on_drop`, puts the child in its own process group (unix), and
 /// assembles the child env per the precedence contract in the module doc
@@ -451,12 +474,18 @@ pub async fn run(
         .map_err(HostExecError::internal)?;
 
     let cwd_resolved = match (args.cwd.as_deref(), args.workspace_id.as_deref()) {
-        (Some(cwd), Some(ws_id)) => {
-            Some(resolve_cwd_within_workspace(api, ws_id, cwd, None).await?)
-        }
-        // No explicit `cwd` but a workspace caller: default to the workspace
-        // root (monorepo#3231) instead of inheriting the daemon's cwd.
-        (None, Some(ws_id)) => default_cwd_for_workspace(api, ws_id).await,
+        (Some(cwd), Some(ws_id)) => Some(
+            resolve_cwd_within_workspace(api, ws_id, cwd, args.caller_agent_id.as_ref()).await?,
+        ),
+        // No explicit `cwd` but a workspace caller: a sandboxed agent's
+        // default cwd is its sandbox root; everyone else defaults to the
+        // workspace root (monorepo#3231) instead of inheriting the daemon's
+        // cwd — a functional default that degrades to `None` for rootless
+        // workspaces, not a containment guard.
+        (None, Some(ws_id)) => match sandbox_root_for(api, args.caller_agent_id.as_ref()).await {
+            Some(sandbox_root) => Some(sandbox_root),
+            None => default_cwd_for_workspace(api, ws_id).await,
+        },
         _ => None,
     };
 
@@ -746,6 +775,7 @@ mod tests {
             env: btree(&[("INTENT_TEST_OVERRIDDEN", "caller-wins")]),
             timeout_ms: None,
             workspace_id: None,
+            caller_agent_id: None,
         };
         let captured = btree(&[
             ("INTENT_TEST_CAPTURED", "from-shell"),
@@ -796,6 +826,7 @@ mod tests {
             env: btree(&[("GIT_AUTHOR_NAME", "caller-wins")]),
             timeout_ms: None,
             workspace_id: None,
+            caller_agent_id: None,
         };
         let cmd = build_command_with_captured(&args, Some(&dir), &BTreeMap::new());
         let envs = cmd_envs(&cmd);
@@ -834,6 +865,7 @@ mod tests {
             env: BTreeMap::new(),
             timeout_ms: None,
             workspace_id: None,
+            caller_agent_id: None,
         };
         let captured = btree(&[("PATH", "/captured/only")]);
         let cmd = build_command_with_captured(&args, None, &captured);

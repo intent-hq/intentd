@@ -220,10 +220,14 @@ API:
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create a sub-agent, or with `topLevel: true` an INDEPENDENT top-level agent. Sub-agent creation starts immediately and auto-subscribes you to its completion events — you are woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model` (a bare model id — compound `provider:model` ids are rejected; pass `provider` separately), `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
+    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
+    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
     With `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) the created agent is a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started. A child idling with active background hooks or PR monitors is not complete: the watch delivers ONE advisory wake per continuous waiting period instead (`watchStillArmed: true`, informational only — advisories never consume a watch) and stays armed for the genuine settlement; an `"after_all"` group likewise stays open until genuine completions. See `ws.agent.watch`.
     `model` must be a bare model id — compound `provider:model` ids are rejected with `-32602`. `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
+    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
+    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
     Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, delivery?, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy; the third argument also takes an options object `{ priority?, replacePending? }`.
     `ok: true` does not always mean delivered NOW — read the `delivery` outcome: `"delivered"` (driving a turn now) or `"queued"` (parked in the target's queue, drained when its turn ends; raw flag `queued: true`).
@@ -233,10 +237,11 @@ API:
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: true`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that does NOT consume the watch: it stays armed, silent through further monitoring idles in the SAME waiting period, and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. Cancel with `ws.agent.unwatch` if you no longer want the wake. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
-  ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
+  ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`). Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.
   ws.agent.listSpecialists() → [specialists]  // Specialist catalog with model dispatch hints; prompt bodies omitted. The live counterpart to the session-start specialist hints; each row is `{ id, name, description, hidden?, aliases?, defaultModel?, modelOptions }`.
     `defaultModel` is `{ provider, model, reasoningEffort? }` with bare `model` (what a no-`model` delegate would pin, including the effort it would apply; omitted when resolution yields the provider default); `modelOptions` is `[{ provider?, model, hint?, reasoningEffort? }]` with bare `model` (pass `provider` when the option pins one).
-  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars).
+  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars). Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
+  ws.agent.mergeSandbox(agentId) → { ok, agentId, status, reason? }  // Start a sandbox merge-back into the workspace repo — the follow-up to `mergeOnTurnEnd: false` (inspect the sandbox, then merge when ready). ASYNC: returns immediately with `status: "started"` (merge runs in the background; large repos take minutes) or `"in_progress"` (a merge already owns the sandbox). Poll `ws.agent.status(agentId).sandboxStatus` for the outcome — `merged`, `conflict` (terminal; work preserved on an `sb/…` branch in the workspace repo), `merge_pending` (blocked/failed; retried automatically), or unchanged on a dirty bounce (uncommitted sandbox changes with workspace auto-commit off). Errors if the agent has no sandbox.
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries. Check it for an entry with your `fromAgentId` before sending again — the single-pending-message rule on `ws.agent.send` refuses a second send while one is pending.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected. This is the remediation when `ws.agent.send` / `ws.agent.sendToTask` refuse a second send under the single-pending-message rule: remove the pending entry, then re-send ONE combined message.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
@@ -469,10 +474,14 @@ API:
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create a sub-agent, or with `topLevel: true` an INDEPENDENT top-level agent. Sub-agent creation starts immediately and auto-subscribes you to its completion events — you are woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model` (a bare model id — compound `provider:model` ids are rejected; pass `provider` separately), `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
+    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
+    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
     With `topLevel: true` (foreground top-level callers only; gated by `agentFeatures.peerAgents`) the created agent is a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only; the result carries `sponsorAgentId` and no `subscriptionId`) and a sponsor preamble telling it of its independent standing is prepended to your message. Top-level agents are FOREGROUND by default (`isBackground: false`); `taskNoteId` is rejected, and the call is refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Watch it explicitly with `watch` if you care about its completion.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started. A child idling with active background hooks or PR monitors is not complete: the watch delivers ONE advisory wake per continuous waiting period instead (`watchStillArmed: true`, informational only — advisories never consume a watch) and stays armed for the genuine settlement; an `"after_all"` group likewise stays open until genuine completions. See `ws.agent.watch`.
     `model` must be a bare model id — compound `provider:model` ids are rejected with `-32602`. `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
+    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
+    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
     Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, delivery?, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy; the third argument also takes an options object `{ priority?, replacePending? }`.
     `ok: true` does not always mean delivered NOW — read the `delivery` outcome: `"delivered"` (driving a turn now) or `"queued"` (parked in the target's queue, drained when its turn ends; raw flag `queued: true`).
@@ -482,10 +491,11 @@ API:
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: true`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that does NOT consume the watch: it stays armed, silent through further monitoring idles in the SAME waiting period, and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. Cancel with `ws.agent.unwatch` if you no longer want the wake. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
-  ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`).
+  ws.agent.list(optsOrIncludeCompleted?) → [agents]  // Lists agents in this workspace. Terminal-status rows (completed/error/deleted) are omitted unless `includeCompleted` is true. A bare boolean is the legacy `includeCompleted`; the object form takes `{ includeCompleted?, scope?, parentAgentId? }` — `scope: "top-level"` keeps only agents with no parent, `scope: "subagents"` only agents with a parent, and `parentAgentId` only that agent's direct sub-agents (cannot be combined with `scope: "top-level"`). Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.
   ws.agent.listSpecialists() → [specialists]  // Specialist catalog with model dispatch hints; prompt bodies omitted. The live counterpart to the session-start specialist hints; each row is `{ id, name, description, hidden?, aliases?, defaultModel?, modelOptions }`.
     `defaultModel` is `{ provider, model, reasoningEffort? }` with bare `model` (what a no-`model` delegate would pin, including the effort it would apply; omitted when resolution yields the provider default); `modelOptions` is `[{ provider?, model, hint?, reasoningEffort? }]` with bare `model` (pass `provider` when the option pins one).
-  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
+  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps. Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
+  ws.agent.mergeSandbox(agentId) → { ok, agentId, status, reason? }  // Start a sandbox merge-back into the workspace repo — the follow-up to `mergeOnTurnEnd: false` (inspect the sandbox, then merge when ready). ASYNC: returns immediately with `status: "started"` (merge runs in the background; large repos take minutes) or `"in_progress"` (a merge already owns the sandbox). Poll `ws.agent.status(agentId).sandboxStatus` for the outcome — `merged`, `conflict` (terminal; work preserved on an `sb/…` branch in the workspace repo), `merge_pending` (blocked/failed; retried automatically), or unchanged on a dirty bounce (uncommitted sandbox changes with workspace auto-commit off). Errors if the agent has no sandbox.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
   ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, tasks?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). `tasks` counts the workspace's task notes per non-terminal status (`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`, e.g. `{"in_progress":2,"review_required":1}`; `complete`/`cancelled` never listed). Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
@@ -670,6 +680,26 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
 /// clause still matches both description variants verbatim).
 const REPORT_TO_PARENT_ATTENTION_XREF: &str = " — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead";
 
+/// Sandbox doc clauses scrubbed from the assembled description when the
+/// workspace is NOT CoW-capable (no `CoW` filesystem support and not a microVM
+/// workspace): the `mergeOnTurnEnd` continuation line under
+/// `ws.agent.create`/`ws.agent.delegate` (whole line, scrubbed twice per
+/// variant), the `mergeOnTurnEnd?` arg in the delegate signature, and the
+/// sandbox-field cross-references on the `ws.agent.list`/`ws.agent.status`
+/// doc lines. Description-only — dispatch accepts and ignores
+/// `mergeOnTurnEnd` regardless (advisory; no sandbox exists to honor it).
+/// Unit tests guard that each clause matches both description variants
+/// verbatim so the `replacen` scrubs cannot silently become no-ops.
+const SANDBOX_MERGE_ON_TURN_END_DOC_LINE: &str = "    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.\n";
+const SANDBOX_DELEGATE_MERGE_ARG: &str = ", mergeOnTurnEnd?";
+const SANDBOX_VM_RESOURCES_DOC_LINE: &str = "    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.\n";
+const SANDBOX_DELEGATE_VM_RESOURCES_ARG: &str = ", vmResources?";
+const SANDBOX_LIST_FIELDS_XREF: &str =
+    " Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.";
+const SANDBOX_STATUS_FIELDS_XREF: &str =
+    " Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).";
+const SANDBOX_MERGE_SANDBOX_DOC_LINE: &str = "  ws.agent.mergeSandbox(agentId) → { ok, agentId, status, reason? }  // Start a sandbox merge-back into the workspace repo — the follow-up to `mergeOnTurnEnd: false` (inspect the sandbox, then merge when ready). ASYNC: returns immediately with `status: \"started\"` (merge runs in the background; large repos take minutes) or `\"in_progress\"` (a merge already owns the sandbox). Poll `ws.agent.status(agentId).sandboxStatus` for the outcome — `merged`, `conflict` (terminal; work preserved on an `sb/…` branch in the workspace repo), `merge_pending` (blocked/failed; retried automatically), or unchanged on a dirty bounce (uncommitted sandbox changes with workspace auto-commit off). Errors if the agent has no sandbox.\n";
+
 /// The base variant's cross-references to `ws.host.exec` inside the
 /// `ws.hook.*` docs (the Namespaces index hint and the `ws.hook.schedule`
 /// continuation line), scrubbed from the assembled description when
@@ -702,8 +732,8 @@ const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
 /// whole "Batch form:" continuation line, the `@@@task` fence-attribute
 /// clause of `ws.note.setContent`, and the fence-attribute grammar of
 /// `ws.task.convertBlocks` (rewritten to name only the result shape).
-const TASK_GRAPH_DELEGATE_PARAMS: &str = " skipAutoCommit?, tasks? })";
-const TASK_GRAPH_DELEGATE_PARAMS_OFF: &str = " skipAutoCommit? })";
+const TASK_GRAPH_DELEGATE_PARAMS: &str = ", tasks? })";
+const TASK_GRAPH_DELEGATE_PARAMS_OFF: &str = " })";
 const TASK_GRAPH_UNBLOCKED_WAKE_XREF: &str = " Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.";
 const TASK_GRAPH_BATCH_FORM_LINE: &str = "    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.\n";
 const TASK_GRAPH_SETCONTENT_XREF: &str = "; the fence line takes optional `key=` / `dependsOn=` / `conflictsWith=` / `effort=` attributes (see `ws.task.convertBlocks`), and every content-write result (`add` / `edit` / `editLines` / `setContent`) carries the conversion's `createdTasks` + `warnings`";
@@ -742,12 +772,15 @@ pub(super) fn denied_feature(
 /// variants, pruning the doc lines of every feature disabled in
 /// `[agentFeatures]` (a method line and its indented continuation lines drop
 /// together; doubled blank lines left by a removed namespace paragraph
-/// collapse to one). With every toggle on (the defaults) this returns the
-/// static const unchanged, so the every-gate-open description is
-/// byte-identical to today's by construction.
+/// collapse to one), then scrubbing the sandbox doc clauses when the
+/// workspace is not `CoW`-capable. With every toggle on — including the
+/// opt-in `taskGraph` — and `cow_capable`, this returns the static const
+/// unchanged, so the every-gate-open description is byte-identical to
+/// today's by construction.
 pub fn workspace_api_description(
     is_chief: bool,
     features: &AgentFeaturesSettings,
+    cow_capable: bool,
 ) -> Cow<'static, str> {
     let base = if is_chief {
         WORKSPACE_API_DESCRIPTION_CHIEF
@@ -755,7 +788,7 @@ pub fn workspace_api_description(
         WORKSPACE_API_DESCRIPTION
     };
     let gated = gated_prefixes(features);
-    if gated.is_empty() && features.task_graph {
+    if gated.is_empty() && cow_capable && features.task_graph {
         return Cow::Borrowed(base);
     }
     // Method doc lines sit at exactly two spaces of indentation
@@ -794,6 +827,19 @@ pub fn workspace_api_description(
     // methods, so drop that clause too.
     if !features.attention_requests {
         out = out.replacen(REPORT_TO_PARENT_ATTENTION_XREF, "", 1);
+    }
+    // Clause-level scrub for non-CoW-capable workspaces: the sandbox doc
+    // clauses on `agent.create`/`agent.delegate`/`agent.list`/`agent.status`
+    // advertise behavior that needs a sandbox to exist. Dispatch is NOT
+    // gated — `mergeOnTurnEnd` stays accepted-and-ignored (advisory).
+    if !cow_capable {
+        out = out.replacen(SANDBOX_MERGE_ON_TURN_END_DOC_LINE, "", 2);
+        out = out.replacen(SANDBOX_DELEGATE_MERGE_ARG, "", 1);
+        out = out.replacen(SANDBOX_LIST_FIELDS_XREF, "", 1);
+        out = out.replacen(SANDBOX_STATUS_FIELDS_XREF, "", 1);
+        out = out.replacen(SANDBOX_MERGE_SANDBOX_DOC_LINE, "", 1);
+        out = out.replacen(SANDBOX_VM_RESOURCES_DOC_LINE, "", 2);
+        out = out.replacen(SANDBOX_DELEGATE_VM_RESOURCES_ARG, "", 1);
     }
     // Cross-reference scrub for `hostExec`: the surviving `ws.hook.*` index
     // hint and `ws.hook.schedule` doc line name `ws.host.exec` as callable
@@ -844,9 +890,10 @@ pub fn workspace_api_description(
 fn workspace_api_description_for_bridge(
     is_chief: bool,
     features: &AgentFeaturesSettings,
+    cow_capable: bool,
     is_sub_agent: bool,
 ) -> Cow<'static, str> {
-    let base = workspace_api_description(is_chief, features);
+    let base = workspace_api_description(is_chief, features, cow_capable);
     if !is_sub_agent {
         return base;
     }
@@ -896,8 +943,9 @@ pub const WORKSPACE_API_SYSTEM_PROMPT_HEADING: &str = "# Workspace API Reference
 pub fn compact_workspace_api_description(
     is_chief: bool,
     features: &AgentFeaturesSettings,
+    cow_capable: bool,
 ) -> String {
-    let full = workspace_api_description(is_chief, features);
+    let full = workspace_api_description(is_chief, features, cow_capable);
     let Some(header_start) = full.find(NAMESPACE_INDEX_HEADER) else {
         // Unreachable while the drift test pins the header into both static
         // variants; degrade to the full text rather than panic.
@@ -931,9 +979,11 @@ pub fn compact_workspace_api_description(
 pub fn condensed_workspace_api_description(
     is_chief: bool,
     features: &AgentFeaturesSettings,
+    cow_capable: bool,
     model_options: &[SpecialistModelOptions],
+    microvm_hints: Option<&MicrovmSpawnHints>,
 ) -> String {
-    let full = workspace_api_description(is_chief, features);
+    let full = workspace_api_description(is_chief, features, cow_capable);
     let mut out = String::with_capacity(full.len() / 2);
     let mut in_api = false;
     for line in full.lines() {
@@ -958,7 +1008,7 @@ pub fn condensed_workspace_api_description(
         out.push_str(condensed_method_line(line));
         out.push('\n');
     }
-    inject_model_options(&out, model_options).unwrap_or(out)
+    inject_model_options(&out, model_options, microvm_hints).unwrap_or(out)
 }
 
 /// One `API:` section line of the condensed rendering: a method doc line has
@@ -1008,7 +1058,11 @@ fn first_sentence_end(comment: &str) -> Option<usize> {
 /// `[agentFeatures]` gating apply exactly as they do to the advertised tool
 /// description, plus a hint on how to fetch one namespace's full docs.
 pub(super) fn help_index(is_chief: bool, features: &AgentFeaturesSettings) -> String {
-    let desc = workspace_api_description(is_chief, features);
+    // `ws.help` renders the capable (full) docs: the CoW-capability gate is
+    // an advisory description-only scrub and the host dispatch path does not
+    // carry the per-bridge capability; dispatch accepts and ignores
+    // `mergeOnTurnEnd` either way.
+    let desc = workspace_api_description(is_chief, features, true);
     let block: Vec<&str> = desc
         .lines()
         .skip_while(|l| !l.starts_with("Namespaces"))
@@ -1039,7 +1093,11 @@ pub(super) fn help_namespace(
         .trim_start_matches("ws.")
         .trim_end_matches('*')
         .trim_end_matches('.');
-    let desc = workspace_api_description_for_bridge(is_chief, features, is_sub_agent);
+    // `ws.help` renders the capable (full) docs: the CoW-capability gate is
+    // an advisory description-only scrub and the host dispatch path does not
+    // carry the per-bridge capability; dispatch accepts and ignores
+    // `mergeOnTurnEnd` either way.
+    let desc = workspace_api_description_for_bridge(is_chief, features, true, is_sub_agent);
     if !ns.is_empty() {
         // Direct calls like `ws.help(...)` are documented without a trailing
         // dot, so match both the `ws.<ns>.` and `ws.<ns>(` spellings.
@@ -1102,38 +1160,69 @@ pub(super) fn help_namespace(
     ))
 }
 
+/// Live microVM spawn facts injected into the `workspace_api` description of
+/// microVM-workspace bridges (alongside the `vmResources`/`mergeOnTurnEnd`
+/// clauses): the guest image spawns will use and the settings-resolved
+/// default VM size. Built at bridge creation from already-loaded settings and
+/// the statically-known image resolution — never from a manifest fetch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MicrovmSpawnHints {
+    /// Human-readable label of the resolved guest image: the built-in pin's
+    /// version when no override applies, else the override's manifest URL
+    /// (the id/version live inside the manifest, which must not be fetched
+    /// at description-build time).
+    pub image_label: String,
+    /// Settings-resolved default vCPU count (`sandbox.microvm.vcpus`).
+    pub vcpus: u8,
+    /// Settings-resolved default guest memory MiB (`sandbox.microvm.memMib`).
+    pub mem_mib: u32,
+}
+
 /// [`workspace_api_description`] plus the per-specialist delegation model
-/// options (PROTOCOL §5.11 `modelOptions`), injected as continuation lines of
-/// the `ws.agent.delegate` doc entry so delegating agents see which models a
-/// specialist's author suggests. `model_options` lists only specialists that
-/// carry options; when it is empty — the all-defaults case — the assembled
-/// text is returned unchanged, so the default description stays
-/// byte-identical by construction.
+/// options (PROTOCOL §5.11 `modelOptions`) and the microVM spawn hints, both
+/// injected as continuation lines of the `ws.agent.delegate` doc entry so
+/// delegating agents see which models a specialist's author suggests and
+/// what a spawned agent gets (guest image, default VM size). `model_options`
+/// lists only specialists that carry options and `microvm_hints` is `Some`
+/// only for microVM-capable workspaces; with neither — the all-defaults case
+/// — the assembled text is returned unchanged, so the default description
+/// stays byte-identical by construction.
 pub(crate) fn workspace_api_description_with_model_options(
     is_chief: bool,
     features: &AgentFeaturesSettings,
+    cow_capable: bool,
     model_options: &[SpecialistModelOptions],
+    microvm_hints: Option<&MicrovmSpawnHints>,
     is_sub_agent: bool,
 ) -> Cow<'static, str> {
-    let base = workspace_api_description_for_bridge(is_chief, features, is_sub_agent);
-    if model_options.is_empty() {
-        return base;
-    }
-    match inject_model_options(&base, model_options) {
+    let base = workspace_api_description_for_bridge(is_chief, features, cow_capable, is_sub_agent);
+    match inject_model_options(&base, model_options, microvm_hints) {
         Some(out) => Cow::Owned(out),
         None => base,
     }
 }
 
-/// Splice the [`model_options_block`] into `base`: anchor on the
-/// `ws.agent.delegate` doc line (indent 2) and append the options block after
-/// its indented continuation lines, so the injected text reads as part of the
-/// delegate/create docs. Returns `None` when `model_options` is empty or the
-/// anchor line is absent (it can never be feature-pruned today, but stay
-/// safe) — callers keep `base` unchanged. Shared by the full and condensed
-/// renderings so the two splices cannot drift.
-fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) -> Option<String> {
-    if model_options.is_empty() {
+/// Splice the [`model_options_block`] (and the [`microvm_hints_block`] when
+/// hints are present) into `base`: anchor on the `ws.agent.delegate` doc line
+/// (indent 2) and append the block after its indented continuation lines, so
+/// the injected text reads as part of the delegate/create docs. Returns
+/// `None` when the block is empty or the anchor line is absent (it can never
+/// be feature-pruned today, but stay safe) — callers keep `base` unchanged.
+/// Shared by the full and condensed renderings so the two splices cannot
+/// drift.
+fn inject_model_options(
+    base: &str,
+    model_options: &[SpecialistModelOptions],
+    microvm_hints: Option<&MicrovmSpawnHints>,
+) -> Option<String> {
+    let mut block = String::new();
+    if let Some(hints) = microvm_hints {
+        block.push_str(&microvm_hints_block(hints));
+    }
+    if !model_options.is_empty() {
+        block.push_str(&model_options_block(model_options));
+    }
+    if block.is_empty() {
         return None;
     }
     let mut out = String::with_capacity(base.len() + 256);
@@ -1144,7 +1233,7 @@ fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) ->
         let indent = line.len() - trimmed.len();
         let is_continuation = indent >= 4 && !trimmed.is_empty();
         if in_delegate && !is_continuation && !inserted {
-            out.push_str(&model_options_block(model_options));
+            out.push_str(&block);
             inserted = true;
         }
         if indent == 2 && trimmed.starts_with("ws.") {
@@ -1154,7 +1243,7 @@ fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) ->
         out.push('\n');
     }
     if in_delegate && !inserted {
-        out.push_str(&model_options_block(model_options));
+        out.push_str(&block);
         inserted = true;
     }
     if !inserted {
@@ -1164,6 +1253,20 @@ fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) ->
         out.pop();
     }
     Some(out)
+}
+
+/// Render the microVM spawn-hints continuation line (indent ≥4 so the
+/// `[agentFeatures]` pruning treats it as part of the `ws.agent.delegate`
+/// entry). Values are flattened onto one line so a pathological image URL
+/// cannot break the description's line structure.
+fn microvm_hints_block(hints: &MicrovmSpawnHints) -> String {
+    let flat = |s: &str| s.replace(['\n', '\r'], " ");
+    format!(
+        "    microVM spawns here get guest image {} and a default VM size of {} vCPUs / {} MiB unless `vmResources` overrides.\n",
+        flat(&hints.image_label),
+        hints.vcpus,
+        hints.mem_mib,
+    )
 }
 
 /// Render the injected continuation block: one header line plus one line per
@@ -1227,7 +1330,7 @@ mod tests {
         compact_workspace_api_description, condensed_workspace_api_description, denied_feature,
         first_sentence_end, help_index, help_namespace, workspace_api_description,
         workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
-        SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
+        MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
         HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT,
         PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF,
         PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
@@ -1607,7 +1710,7 @@ mod tests {
         ));
         for is_chief in [false, true] {
             for (label, features) in &feature_sets {
-                let desc = workspace_api_description(is_chief, features);
+                let desc = workspace_api_description(is_chief, features, true);
                 let start = desc
                     .find("Namespaces")
                     .unwrap_or_else(|| panic!("chief={is_chief} {label}: no Namespaces index"));
@@ -1662,7 +1765,8 @@ mod tests {
             ..AgentFeaturesSettings::default()
         };
         for is_chief in [false, true] {
-            let condensed = condensed_workspace_api_description(is_chief, &features, &[]);
+            let condensed =
+                condensed_workspace_api_description(is_chief, &features, true, &[], None);
             let create_line = condensed
                 .lines()
                 .find(|l| l.trim_start().starts_with("ws.agent.create("))
@@ -1727,8 +1831,8 @@ mod tests {
         }
         for is_chief in [false, true] {
             for features in &feature_sets {
-                let full = workspace_api_description(is_chief, features);
-                let compact = compact_workspace_api_description(is_chief, features);
+                let full = workspace_api_description(is_chief, features, true);
+                let compact = compact_workspace_api_description(is_chief, features, true);
                 let header_start = full.find(NAMESPACE_INDEX_HEADER).unwrap();
                 let index_end = full[header_start..]
                     .find("\n\n")
@@ -1795,7 +1899,7 @@ mod tests {
         }
         for is_chief in [false, true] {
             for (label, features) in &feature_sets {
-                let compact = compact_workspace_api_description(is_chief, features);
+                let compact = compact_workspace_api_description(is_chief, features, true);
                 assert!(
                     compact.len() <= BUDGET,
                     "chief={is_chief} {label}: compact description is {} bytes, over the \
@@ -1872,8 +1976,9 @@ mod tests {
         });
         for is_chief in [false, true] {
             for features in &feature_sets {
-                let full = workspace_api_description(is_chief, features);
-                let condensed = condensed_workspace_api_description(is_chief, features, &[]);
+                let full = workspace_api_description(is_chief, features, true);
+                let condensed =
+                    condensed_workspace_api_description(is_chief, features, true, &[], None);
                 let (full_pre, full_api, full_examples) = split_sections(&full);
                 let (cond_pre, cond_api, cond_examples) = split_sections(&condensed);
                 assert_eq!(cond_pre, full_pre, "chief={is_chief}: preamble drifted");
@@ -1979,15 +2084,21 @@ mod tests {
     }
 
     // Size budget for the system-prompt copy: the all-defaults non-chief
-    // rendering (the common case for truncating providers) stays under 21.5k
-    // chars — roughly half the ~40k full text.
+    // rendering (the common case for truncating providers) stays under 22k
+    // chars — roughly half the ~40k full text (budget includes the execution
+    // environment doc lines).
     #[test]
     fn condensed_description_size_budget() {
-        let condensed =
-            condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
+        let condensed = condensed_workspace_api_description(
+            false,
+            &AgentFeaturesSettings::default(),
+            true,
+            &[],
+            None,
+        );
         assert!(
-            condensed.len() < 21_500,
-            "condensed all-on description is {} bytes, over the 21.5k budget",
+            condensed.len() < 22_000,
+            "condensed all-on description is {} bytes, over the 22k budget",
             condensed.len()
         );
     }
@@ -1999,7 +2110,7 @@ mod tests {
         for (prefixes, disable) in feature_cases() {
             let mut features = AgentFeaturesSettings::default();
             disable(&mut features);
-            let condensed = condensed_workspace_api_description(false, &features, &[]);
+            let condensed = condensed_workspace_api_description(false, &features, true, &[], None);
             for prefix in prefixes {
                 assert!(
                     !condensed.contains(prefix),
@@ -2024,8 +2135,13 @@ mod tests {
                 reasoning_effort: String::new(),
             }],
         }];
-        let condensed =
-            condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &options);
+        let condensed = condensed_workspace_api_description(
+            false,
+            &AgentFeaturesSettings::default(),
+            true,
+            &options,
+            None,
+        );
         assert!(
             condensed
                 .contains("implementor: default `claude-opus-5`, `kimi-k3` on opencode (cheap)"),
@@ -2281,13 +2397,13 @@ mod tests {
     #[test]
     fn all_gates_open_description_is_byte_identical() {
         let features = all_gates_open();
-        let base = workspace_api_description(false, &features);
+        let base = workspace_api_description(false, &features, true);
         assert!(
             matches!(base, Cow::Borrowed(_)),
             "all-on must not reassemble"
         );
         assert_eq!(&*base, WORKSPACE_API_DESCRIPTION);
-        let chief = workspace_api_description(true, &features);
+        let chief = workspace_api_description(true, &features, true);
         assert!(
             matches!(chief, Cow::Borrowed(_)),
             "all-on must not reassemble"
@@ -2348,7 +2464,7 @@ mod tests {
             ..AgentFeaturesSettings::default()
         };
         for is_chief in [false, true] {
-            let pruned = workspace_api_description(is_chief, &features);
+            let pruned = workspace_api_description(is_chief, &features, true);
             for gone in [
                 " skipAutoCommit?, tasks? })",
                 "Batch form:",
@@ -2370,7 +2486,7 @@ mod tests {
             // included (non-goal: older relation APIs stay documented) —
             // survives untouched.
             for kept in [
-                "ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit? })",
+                "ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? })",
                 "ws.task.convertBlocks(noteId)",
                 "ws.task.setRelations(noteId, { dependsOn?, conflictsWith? })",
                 "ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? })",
@@ -2415,12 +2531,12 @@ mod tests {
     #[test]
     fn disabling_one_feature_prunes_only_its_lines() {
         for is_chief in [false, true] {
-            let full = workspace_api_description(is_chief, &all_gates_open());
+            let full = workspace_api_description(is_chief, &all_gates_open(), true);
             let full_methods = extract_ws_methods(&full);
             for (prefixes, disable) in feature_cases() {
                 let mut features = all_gates_open();
                 disable(&mut features);
-                let pruned = workspace_api_description(is_chief, &features);
+                let pruned = workspace_api_description(is_chief, &features, true);
                 for prefix in prefixes {
                     assert!(
                         !pruned
@@ -2473,7 +2589,7 @@ mod tests {
             mcp_tools: false,
         };
         for is_chief in [false, true] {
-            let pruned = workspace_api_description(is_chief, &features);
+            let pruned = workspace_api_description(is_chief, &features, true);
             for (prefixes, _) in feature_cases() {
                 for prefix in prefixes {
                     assert!(
@@ -2510,11 +2626,11 @@ mod tests {
             ..all_gates_open()
         };
         assert_eq!(
-            &*workspace_api_description(false, &features),
+            &*workspace_api_description(false, &features, true),
             WORKSPACE_API_DESCRIPTION
         );
         assert_eq!(
-            &*workspace_api_description(true, &features),
+            &*workspace_api_description(true, &features, true),
             WORKSPACE_API_DESCRIPTION_CHIEF
         );
     }
@@ -2527,7 +2643,7 @@ mod tests {
             structured_questions: false,
             ..AgentFeaturesSettings::default()
         };
-        let pruned = workspace_api_description(true, &features);
+        let pruned = workspace_api_description(true, &features, true);
         assert!(!pruned.contains("ws.app.question."));
         for kept in [
             "ws.app.agents.list(",
@@ -2545,6 +2661,74 @@ mod tests {
     fn attention_xref_clause_is_present_in_both_variants() {
         assert!(WORKSPACE_API_DESCRIPTION.contains(REPORT_TO_PARENT_ATTENTION_XREF));
         assert!(WORKSPACE_API_DESCRIPTION_CHIEF.contains(REPORT_TO_PARENT_ATTENTION_XREF));
+    }
+
+    // Guard: each sandbox doc clause scrubbed by the CoW-capability gate
+    // matches both description variants verbatim (the mergeOnTurnEnd doc
+    // line appears twice per variant — under create and delegate), so the
+    // `replacen` scrubs cannot silently become no-ops.
+    #[test]
+    fn sandbox_doc_clauses_are_present_in_both_variants() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert_eq!(
+                desc.matches(super::SANDBOX_MERGE_ON_TURN_END_DOC_LINE)
+                    .count(),
+                2,
+                "mergeOnTurnEnd doc line must appear under both create and delegate"
+            );
+            assert!(desc.contains(super::SANDBOX_DELEGATE_MERGE_ARG));
+            assert!(desc.contains(super::SANDBOX_LIST_FIELDS_XREF));
+            assert!(desc.contains(super::SANDBOX_STATUS_FIELDS_XREF));
+            assert!(desc.contains(super::SANDBOX_MERGE_SANDBOX_DOC_LINE));
+            assert_eq!(
+                desc.matches(super::SANDBOX_VM_RESOURCES_DOC_LINE).count(),
+                2,
+                "vmResources doc line must appear under both create and delegate"
+            );
+            assert!(desc.contains(super::SANDBOX_DELEGATE_VM_RESOURCES_ARG));
+        }
+    }
+
+    // CoW-capable (the default): the sandbox clauses are present and the
+    // all-defaults description is byte-identical to the static const.
+    // Not capable: every sandbox clause is scrubbed while the method lines
+    // themselves survive.
+    #[test]
+    fn cow_capability_gates_sandbox_doc_clauses() {
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let capable = workspace_api_description(is_chief, &features, true);
+            assert!(capable.contains("mergeOnTurnEnd"));
+
+            let pruned = workspace_api_description(is_chief, &features, false);
+            assert!(
+                !pruned.contains("mergeOnTurnEnd"),
+                "chief={is_chief}: mergeOnTurnEnd must be scrubbed when not CoW-capable"
+            );
+            assert!(
+                !pruned.contains("sandboxStatus") && !pruned.contains("sandboxId"),
+                "chief={is_chief}: sandbox field docs must be scrubbed when not CoW-capable"
+            );
+            assert!(
+                !pruned.contains("ws.agent.mergeSandbox"),
+                "chief={is_chief}: mergeSandbox doc line must be scrubbed when not CoW-capable"
+            );
+            assert!(
+                !pruned.contains("vmResources"),
+                "chief={is_chief}: vmResources clauses must be scrubbed when not CoW-capable"
+            );
+            for kept in [
+                "ws.agent.create(",
+                "ws.agent.delegate(",
+                "ws.agent.list(",
+                "ws.agent.status(",
+            ] {
+                assert!(
+                    pruned.contains(kept),
+                    "chief={is_chief}: `{kept}` was wrongly pruned"
+                );
+            }
+        }
     }
 
     // Guard: the hook-docs cross-references to `ws.host.exec` scrubbed by the
@@ -2568,7 +2752,7 @@ mod tests {
             ..AgentFeaturesSettings::default()
         };
         for is_chief in [false, true] {
-            let pruned = workspace_api_description(is_chief, &features);
+            let pruned = workspace_api_description(is_chief, &features, true);
             assert!(
                 !pruned.contains("host.exec"),
                 "chief={is_chief}: a `host.exec` mention survived disabling hostExec"
@@ -2615,7 +2799,7 @@ mod tests {
             ..AgentFeaturesSettings::default()
         };
         for is_chief in [false, true] {
-            let pruned = workspace_api_description(is_chief, &features);
+            let pruned = workspace_api_description(is_chief, &features, true);
             assert!(
                 !pruned.contains("pr.monitor"),
                 "chief={is_chief}: a `pr.monitor` mention survived disabling prMonitor"
@@ -2644,7 +2828,7 @@ mod tests {
             ..AgentFeaturesSettings::default()
         };
         for is_chief in [false, true] {
-            let pruned = workspace_api_description(is_chief, &features);
+            let pruned = workspace_api_description(is_chief, &features, true);
             assert!(!pruned.contains("ws.agent.requestDiscussion"));
             assert!(!pruned.contains("ws.agent.reportBlocker"));
             for kept in [
@@ -2865,14 +3049,21 @@ mod tests {
     fn no_model_options_keeps_description_byte_identical() {
         let features = all_gates_open();
         for is_chief in [false, true] {
-            let got = workspace_api_description_with_model_options(is_chief, &features, &[], false);
+            let got = workspace_api_description_with_model_options(
+                is_chief,
+                &features,
+                true,
+                &[],
+                None,
+                false,
+            );
             assert!(
                 matches!(got, Cow::Borrowed(_)),
                 "no options must not reassemble"
             );
             assert_eq!(
                 &*got,
-                &*workspace_api_description(is_chief, &features),
+                &*workspace_api_description(is_chief, &features, true),
                 "chief={is_chief}: empty options changed the description"
             );
         }
@@ -2890,7 +3081,9 @@ mod tests {
             let got = workspace_api_description_with_model_options(
                 is_chief,
                 &features,
+                true,
                 &sample_options(),
+                None,
                 false,
             );
             assert!(
@@ -2966,7 +3159,9 @@ mod tests {
         let got = workspace_api_description_with_model_options(
             false,
             &AgentFeaturesSettings::default(),
+            true,
             &options,
+            None,
             false,
         );
         assert!(
@@ -2990,7 +3185,9 @@ mod tests {
         let got = workspace_api_description_with_model_options(
             false,
             &features,
+            true,
             &sample_options(),
+            None,
             false,
         );
         assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
@@ -3017,12 +3214,135 @@ mod tests {
         let got = workspace_api_description_with_model_options(
             false,
             &AgentFeaturesSettings::default(),
+            true,
             &options,
+            None,
             false,
         );
         assert!(
             got.contains("`kimi-k3` on opencode (line one line two)"),
             "multi-line hint not flattened:\n{got}"
+        );
+    }
+
+    // ---- microVM spawn hints injection --------------------------------------
+
+    fn sample_hints() -> MicrovmSpawnHints {
+        MicrovmSpawnHints {
+            image_label: "`intentd-guest-base` v0.1.0 (built-in pin)".to_string(),
+            vcpus: 4,
+            mem_mib: 4096,
+        }
+    }
+
+    // `None` hints (non-microVM bridges — the default) keep the description
+    // byte-identical to the plain assembly.
+    #[test]
+    fn no_microvm_hints_keeps_description_byte_identical() {
+        let features = all_gates_open();
+        for is_chief in [false, true] {
+            let got = workspace_api_description_with_model_options(
+                is_chief,
+                &features,
+                true,
+                &[],
+                None,
+                false,
+            );
+            assert!(
+                matches!(got, Cow::Borrowed(_)),
+                "no hints must not reassemble"
+            );
+        }
+    }
+
+    // `Some` hints inject a continuation line under the delegate docs naming
+    // the live guest image and the settings-resolved default VM size.
+    #[test]
+    fn microvm_hints_injected_into_delegate_docs() {
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let hints = sample_hints();
+            let got = workspace_api_description_with_model_options(
+                is_chief,
+                &features,
+                true,
+                &[],
+                Some(&hints),
+                false,
+            );
+            assert!(
+                got.contains(
+                    "microVM spawns here get guest image `intentd-guest-base` v0.1.0 \
+                     (built-in pin) and a default VM size of 4 vCPUs / 4096 MiB unless \
+                     `vmResources` overrides."
+                ),
+                "chief={is_chief}: hint line missing/miswritten:\n{got}"
+            );
+            // Inside the delegate docs, before the next method line.
+            let delegate_idx = got.find("ws.agent.delegate(").expect("delegate line");
+            let hint_idx = got.find("microVM spawns here").expect("hint line");
+            let send_idx = got[delegate_idx..]
+                .find("ws.agent.send(")
+                .map(|i| i + delegate_idx)
+                .expect("send line after delegate");
+            assert!(
+                delegate_idx < hint_idx && hint_idx < send_idx,
+                "chief={is_chief}: hint not inside the delegate docs"
+            );
+            // Continuation-indented so feature pruning keeps it attached.
+            let line = got
+                .lines()
+                .find(|l| l.contains("microVM spawns here"))
+                .unwrap();
+            assert!(
+                line.starts_with("    "),
+                "hint line not continuation-indented: {line:?}"
+            );
+        }
+    }
+
+    // Hints and model options compose: both blocks land under the delegate
+    // docs, hints first.
+    #[test]
+    fn microvm_hints_compose_with_model_options() {
+        let hints = sample_hints();
+        let got = workspace_api_description_with_model_options(
+            false,
+            &AgentFeaturesSettings::default(),
+            true,
+            &sample_options(),
+            Some(&hints),
+            false,
+        );
+        let hint_idx = got.find("microVM spawns here").expect("hint line");
+        let options_idx = got.find("Specialist model options").expect("options block");
+        assert!(
+            hint_idx < options_idx,
+            "hints must precede the model options block"
+        );
+    }
+
+    // A pathological image label cannot break the description's line
+    // structure: newlines are flattened to spaces.
+    #[test]
+    fn microvm_hints_flatten_multiline_image_label() {
+        let hints = MicrovmSpawnHints {
+            image_label: "`https://example.com/a`\n(repo-config)".to_string(),
+            vcpus: 2,
+            mem_mib: 2048,
+        };
+        let got = workspace_api_description_with_model_options(
+            false,
+            &AgentFeaturesSettings::default(),
+            true,
+            &[],
+            Some(&hints),
+            false,
+        );
+        assert!(
+            got.contains("guest image `https://example.com/a` (repo-config) and"),
+            "multi-line image label not flattened:\n{got}"
         );
     }
 }

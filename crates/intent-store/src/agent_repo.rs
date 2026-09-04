@@ -1582,6 +1582,33 @@ impl Store {
         Ok(())
     }
 
+    /// Clear one session's sandbox linkage (`sandbox_id`, `sandbox_path`,
+    /// `sandbox_branch`) — called when the sandbox is discarded so no later
+    /// spawn observes a pointer to a deleted directory. Scoped `UPDATE`, no
+    /// read-modify-write of the whole session row. Scoped to `workspace_id`
+    /// (defense-in-depth); an absent row is a no-op (the sandbox can outlive
+    /// its agent — GC path).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the write fails.
+    pub async fn clear_agent_session_sandbox(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE agent_session SET sandbox_id=NULL, sandbox_path=NULL, sandbox_branch=NULL \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("clear agent session sandbox failed: {e}")))?;
+        Ok(())
+    }
+
     /// Read one session's `model`, `resolved_model` (D14 display identity of
     /// an explicit pick, if any), `provider`, and its persisted cumulative
     /// end-of-turn `token_usage` snapshot (§5.23) in a single row read. This
@@ -4818,6 +4845,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -4939,6 +4967,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -5098,6 +5127,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         }
@@ -7829,6 +7859,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -7960,6 +7991,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -8043,6 +8075,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -8239,6 +8272,7 @@ mod tests {
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
+                execution_environment: None,
                 disk_usage: None,
                 pending_delete_at: None,
             };
@@ -8532,6 +8566,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -12703,6 +12738,7 @@ mod tests {
         };
         let ts = now_iso();
         let workspace = Workspace {
+            execution_environment: None,
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),

@@ -1,14 +1,14 @@
 //! Sandbox provisioning and lifecycle for `CoW` agent isolation (direct-mode and
 //! CoW-checkout workspaces).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use intent_core::{AgentId, CheckoutMode, Error, Result, Workspace, WorkspaceId};
 use intent_git::{cow_clone, cow_probe, CowSupport};
 use intent_store::{Sandbox, SandboxStatus, Store};
 
-use crate::nested_repos::{is_dirty, stage_all_skipping_nested};
+use crate::nested_repos::{is_dirty_excluding_submodules as is_dirty, stage_all_skipping_nested};
 use crate::now_iso;
 
 /// Test hook: artificial delay (milliseconds) at the top of
@@ -69,10 +69,14 @@ pub enum ProvisionOutcome {
 /// Outcome of a merge-back attempt.
 #[derive(Debug, Clone)]
 pub enum MergeOutcome {
-    /// Clean merge; sandbox commits applied to canonical.
+    /// Clean merge; sandbox commits applied to canonical. `sandbox_head_sha`
+    /// is the sandbox branch tip of the applied range — persisted as
+    /// `last_merged_commit_sha` so the next merge of the (persistent)
+    /// sandbox starts after it.
     Merged {
         commit_range: String,
         canonical_head: String,
+        sandbox_head_sha: String,
     },
     /// Conflicts detected; user's repo left pristine.
     Conflict {
@@ -87,12 +91,114 @@ pub enum MergeOutcome {
         reason: String,
         overlapping_paths: Vec<String>,
     },
+    /// The sandbox worktree has uncommitted changes and the caller's policy
+    /// forbids auto-committing them ([`DirtyHandling::Bounce`] — workspace
+    /// auto-commit is off on an automatic merge path): nothing was committed
+    /// or merged, and the sandbox is untouched.
+    Dirty { dirty_paths: Vec<String> },
+}
+
+/// How [`merge_sandbox`] treats uncommitted changes in the sandbox worktree.
+/// Callers resolve this against the workspace's effective auto-commit policy
+/// (see `Services::sandbox_dirty_handling`).
+#[derive(Debug, Clone)]
+pub enum DirtyHandling {
+    /// Commit the dirty state before merging, using the given message when
+    /// present (LLM-assisted) or the deterministic
+    /// `Auto-commit dirty state for <agentId>` default.
+    Commit(Option<String>),
+    /// Refuse to merge a dirty sandbox: return [`MergeOutcome::Dirty`]
+    /// without committing or merging anything.
+    Bounce,
 }
 
 /// Configuration for sandbox provisioning.
 pub(crate) struct ProvisionConfig {
     /// Workspaces root directory (from `config.workspaces_root`).
     pub workspaces_root: PathBuf,
+}
+
+/// Crash-safe scope guard for a claimed sandbox merge (`… → merging`).
+///
+/// Every merge path claims the row via CAS before doing git work; if the
+/// owning future is dropped mid-flight (caller cancellation — e.g. the
+/// `workspace_api` eval timeout that stranded a row `merging` in the
+/// isolation-lab incident — or a panic between claim and finalize), nothing
+/// used to reset the status, leaving the sandbox stranded: invisible to the
+/// retry sweep and unclaimable by the RPC until a daemon restart.
+///
+/// Arm the guard right after a successful claim; call [`disarm`] once the
+/// merge's terminal status has been persisted. On drop while still armed,
+/// the guard schedules a compare-and-swap `merging → merge_pending` on a
+/// detached task (Drop cannot await), so a misfire after some OTHER terminal
+/// status landed is a harmless CAS miss.
+///
+/// [`disarm`]: MergeClaimGuard::disarm
+pub(crate) struct MergeClaimGuard {
+    store: Option<Store>,
+    workspace_id: WorkspaceId,
+    agent_id: AgentId,
+}
+
+impl MergeClaimGuard {
+    /// Arm a guard for the given claimed sandbox.
+    pub(crate) fn armed(store: Store, workspace_id: WorkspaceId, agent_id: AgentId) -> Self {
+        Self {
+            store: Some(store),
+            workspace_id,
+            agent_id,
+        }
+    }
+
+    /// Disarm: the merge path has persisted its intended terminal status.
+    pub(crate) fn disarm(&mut self) {
+        self.store = None;
+    }
+}
+
+impl Drop for MergeClaimGuard {
+    fn drop(&mut self) {
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let workspace_id = self.workspace_id.clone();
+        let agent_id = self.agent_id.clone();
+        // Drop cannot await; hand the reset to the runtime when one exists
+        // (always true in the daemon). CAS from `merging` only — if the merge
+        // actually finished and this is a late misfire, the swap is a no-op.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                match store
+                    .try_transition_sandbox_status(
+                        &workspace_id,
+                        &agent_id,
+                        SandboxStatus::Merging,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::warn!(
+                            agent = %agent_id.0,
+                            workspace = %workspace_id.0,
+                            "sandbox merge abandoned mid-flight (cancelled or panicked); \
+                             claim guard reset merging → merge_pending"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %agent_id.0,
+                            workspace = %workspace_id.0,
+                            error = %e,
+                            "sandbox merge claim guard failed to reset stranded merging row"
+                        );
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// Provision a sandbox for an agent in a sandbox-eligible (direct-mode or
@@ -120,6 +226,35 @@ pub async fn provision_sandbox(
     // Load workspace
     let workspace = store.get_workspace(workspace_id).await?;
 
+    // Sandboxes are persistent for the agent's lifetime: a respawn (new turn,
+    // daemon restart) must reuse the existing sandbox instead of re-cloning.
+    // A record whose directory vanished (manual cleanup) is stale — drop it
+    // and re-provision below.
+    if let Some(existing) = store.get_sandbox(workspace_id, agent_id).await? {
+        let existing_path = PathBuf::from(&existing.path);
+        if existing_path.exists() {
+            tracing::debug!(
+                workspace = %workspace_id.0,
+                agent = %agent_id.0,
+                sandbox_path = %existing.path,
+                "provision_sandbox: reusing existing persistent sandbox"
+            );
+            return Ok(ProvisionOutcome::Supported {
+                path: existing_path,
+                branch: existing.branch,
+                base_commit_sha: existing.base_commit_sha,
+                snapshot_commit_sha: existing.snapshot_commit_sha,
+            });
+        }
+        tracing::warn!(
+            workspace = %workspace_id.0,
+            agent = %agent_id.0,
+            sandbox_path = %existing.path,
+            "provision_sandbox: sandbox record exists but directory is missing; re-provisioning"
+        );
+        store.delete_sandbox(workspace_id, agent_id).await?;
+    }
+
     // The CoW probe/clone + git2 setup are synchronous and can run for tens
     // of seconds on large checkouts; run them on the blocking pool so they
     // never occupy a core runtime worker (monorepo#954).
@@ -144,7 +279,23 @@ pub async fn provision_sandbox(
         return Ok(ProvisionOutcome::Unsupported);
     };
 
-    // Persist the sandbox record
+    // Persist the sandbox record. `merge_on_turn_end` comes from the child's
+    // session metadata (stamped by delegate/create from the `mergeOnTurnEnd`
+    // input) so both provisioning paths — the background delegate task and
+    // the synchronous microVM first-spawn — pick it up uniformly, and the
+    // flag survives respawn/daemon restart. Default `true` = today's
+    // merge-on-completion behavior.
+    let merge_on_turn_end = store
+        .get_agent_session_summary(agent_id)
+        .await
+        .ok()
+        .and_then(|s| {
+            s.metadata
+                .as_ref()
+                .and_then(|m| m.get("mergeOnTurnEnd"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(true);
     let now = now_iso();
     let sandbox = Sandbox {
         id: uuid::Uuid::new_v4().to_string(),
@@ -154,8 +305,11 @@ pub async fn provision_sandbox(
         branch: branch_name.clone(),
         base_commit_sha: base_commit_sha.clone(),
         snapshot_commit_sha: snapshot_commit_sha.clone(),
+        last_merged_commit_sha: None,
         status: SandboxStatus::Created,
         retry_count: 0,
+        merge_on_turn_end,
+        conflicting_paths: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -165,7 +319,13 @@ pub async fn provision_sandbox(
         // strand the just-cloned directory when the record insert fails.
         // Best-effort, but log failures so a leaked clone is observable.
         let cleanup_path = sandbox_path.clone();
-        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cleanup_path)).await {
+        match tokio::task::spawn_blocking(move || {
+            std::fs::remove_dir_all(&cleanup_path)?;
+            remove_empty_sandbox_parents(&cleanup_path);
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(remove_err)) => tracing::warn!(
                 sandbox_path = %sandbox_path.display(),
@@ -223,6 +383,12 @@ fn provision_sandbox_blocking(
         return Ok(ProvisionOutcome::Unsupported);
     }
 
+    // CoW sandboxes are temporarily locked to macOS — mirror the
+    // workspace_aggregates choke point (report unsupported without probing).
+    if cfg!(not(target_os = "macos")) {
+        return Ok(ProvisionOutcome::Unsupported);
+    }
+
     // Ensure sandbox parent exists (needed for cow_probe)
     std::fs::create_dir_all(&sandbox_parent)
         .map_err(|e| Error::Internal(format!("create sandbox parent dir failed: {e}")))?;
@@ -237,8 +403,12 @@ fn provision_sandbox_blocking(
     // itself is still unsupported (e.g. a nested cross-volume mount inside the
     // tree); degrade to shared mode instead of failing the agent start.
     if let Err(e) = cow_clone(&user_dir, &sandbox_path) {
-        if let Err(remove_err) = std::fs::remove_dir_all(&sandbox_path) {
-            if remove_err.kind() != std::io::ErrorKind::NotFound {
+        match std::fs::remove_dir_all(&sandbox_path) {
+            Ok(()) => remove_empty_sandbox_parents(&sandbox_path),
+            Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {
+                remove_empty_sandbox_parents(&sandbox_path);
+            }
+            Err(remove_err) => {
                 tracing::warn!(
                     sandbox_path = %sandbox_path.display(),
                     error = %remove_err,
@@ -309,7 +479,29 @@ fn provision_sandbox_blocking(
     })
 }
 
-/// Discard a sandbox: remove the directory and the database record.
+/// Best-effort removal of the now-empty per-agent parent directories after a
+/// sandbox removal: `…/sandboxes/<agentId>/` and, when it too becomes empty,
+/// `…/sandboxes/`. `std::fs::remove_dir` only deletes EMPTY directories, so a
+/// sibling sandbox (or any unrelated entry) makes this a silent no-op; the
+/// walk never climbs past those two levels, so the workspace directory itself
+/// is untouched.
+fn remove_empty_sandbox_parents(sandbox_path: &std::path::Path) {
+    let mut dir = sandbox_path.parent();
+    for _ in 0..2 {
+        let Some(d) = dir else { break };
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
+/// Discard a sandbox: remove the directory (plus any now-empty parent
+/// directories), the database record, and the agent session's sandbox
+/// linkage (`sandbox_id`/`sandbox_path`/`sandbox_branch`) — a discarded
+/// sandbox must never be observable through a stale session pointer
+/// (a respawned microVM agent would otherwise skip re-provisioning and
+/// fall back to mounting the canonical directory).
 pub(crate) async fn discard_sandbox(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -324,12 +516,81 @@ pub(crate) async fn discard_sandbox(
             std::fs::remove_dir_all(&path)
                 .map_err(|e| Error::Internal(format!("remove sandbox directory failed: {e}")))?;
         }
+        remove_empty_sandbox_parents(&path);
     }
 
     // Delete the record (whether or not the directory existed)
     store.delete_sandbox(workspace_id, agent_id).await?;
 
+    // Clear the session's sandbox fields so no later spawn reuses the deleted
+    // path. Best-effort: the session row may already be gone (agent.delete).
+    if let Err(e) = store
+        .clear_agent_session_sandbox(workspace_id, agent_id)
+        .await
+    {
+        tracing::warn!(
+            agent = %agent_id.0,
+            error = %e,
+            "failed to clear agent session sandbox fields after discard"
+        );
+    }
+
     Ok(())
+}
+
+/// Preserve a conflicted sandbox's commits in the canonical repo: fetch the
+/// sandbox branch into canonical as a local
+/// `sb/<agentId>-recovery-<timestamp>` branch so the agent's entire output —
+/// including its non-conflicting files — stays recoverable with normal git
+/// tooling even if the sandbox directory is later lost. The unique suffix
+/// keeps each conflict's snapshot (a later bounce-and-reconcile cycle never
+/// clobbers an earlier one) and never collides with the sandbox's own
+/// `sb/<agentId>` merge branch. Ref-only (no checkout, canonical worktree
+/// untouched). Returns the recovery branch name.
+pub async fn push_conflict_recovery_branch(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<String> {
+    let sandbox = store
+        .get_sandbox(workspace_id, agent_id)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("sandbox not found for agent {}", agent_id.0)))?;
+    let workspace = store.get_workspace(workspace_id).await?;
+    let canonical_path = resolve_user_directory(&workspace)?;
+    let sandbox_path = sandbox.path.clone();
+    let branch = sandbox.branch.clone();
+    // Ref-safe timestamp: now_iso's digits only (colons are illegal in refs).
+    let timestamp: String = now_iso()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(14)
+        .collect();
+    let recovery_branch = format!("{branch}-recovery-{timestamp}");
+
+    tokio::task::spawn_blocking(move || {
+        let refspec = format!("+refs/heads/{branch}:refs/heads/{recovery_branch}");
+        let out = std::process::Command::new("git")
+            .arg("fetch")
+            .arg("--no-tags")
+            .arg("--quiet")
+            .arg(&sandbox_path)
+            .arg(&refspec)
+            .current_dir(&canonical_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| Error::Internal(format!("push recovery branch failed: {e}")))?;
+        if !out.status.success() {
+            return Err(Error::Internal(format!(
+                "push recovery branch failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(recovery_branch)
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("recovery branch task failed: {e}")))?
 }
 
 /// Garbage-collect orphaned sandboxes: remove sandboxes whose agent no longer exists
@@ -358,19 +619,41 @@ pub(crate) async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
             if path.exists() {
                 let _ = std::fs::remove_dir_all(&path);
             }
+            remove_empty_sandbox_parents(&path);
             // Delete the record
             store
                 .delete_sandbox(&sandbox.workspace_id, &sandbox.agent_id)
                 .await?;
+            // Best-effort: the agent session (when it still exists — the
+            // dir-missing arm) must not keep pointing at the removed sandbox.
+            let _ = store
+                .clear_agent_session_sandbox(&sandbox.workspace_id, &sandbox.agent_id)
+                .await;
         }
     }
 
     Ok(())
 }
 
+/// Merge sandbox commits back to the canonical repository, auto-committing
+/// any dirty sandbox state with the deterministic default message. See
+/// [`merge_sandbox_with`] for the policy-aware variant (all production
+/// callers thread the workspace's auto-commit policy through it; this
+/// shorthand serves the unit tests).
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn merge_sandbox(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<MergeOutcome> {
+    merge_sandbox_with(store, workspace_id, agent_id, DirtyHandling::Commit(None)).await
+}
+
 /// Merge sandbox commits back to the canonical repository.
 ///
-/// 1. Auto-commit any dirty sandbox state (if present).
+/// 1. Handle dirty sandbox state per `dirty_handling`: commit it (with the
+///    provided message or the deterministic default), or return
+///    [`MergeOutcome::Dirty`] without touching anything (`Bounce`).
 /// 2. Check canonical repository for dirty state overlapping with sandbox changes.
 /// 3. Fetch sandbox branch into canonical.
 /// 4. Apply commits after the snapshot (or base if no snapshot) via cherry-pick.
@@ -379,10 +662,19 @@ pub(crate) async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
 /// 7. On success: return Merged with the applied range.
 ///
 /// The canonical repository is never left mid-merge/cherry-pick (always abort on failure).
-pub(crate) async fn merge_sandbox(
+///
+/// The git work (libgit2 commit/cherry-pick plus the `git fetch` subprocess)
+/// runs on the blocking pool via [`tokio::task::spawn_blocking`], for two
+/// reasons: it must not pin an async runtime worker for the duration of a
+/// large fetch/cherry-pick, and a blocking task runs to completion even if
+/// the awaiting future is dropped — so a cancelled caller (e.g. the 30s
+/// `workspace_api` eval timeout, monorepo stranded-`merging` incident) can
+/// never abandon the canonical repo mid-mutation.
+pub(crate) async fn merge_sandbox_with(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,
+    dirty_handling: DirtyHandling,
 ) -> Result<MergeOutcome> {
     // Load sandbox record
     let sandbox = store
@@ -395,184 +687,377 @@ pub(crate) async fn merge_sandbox(
     let canonical_path = resolve_user_directory(&workspace)?;
     let sandbox_path = PathBuf::from(&sandbox.path);
 
-    // Open both repositories
-    let canonical_repo = git2::Repository::open(&canonical_path)
-        .map_err(|e| Error::Internal(format!("open canonical repo failed: {e}")))?;
-    let sandbox_repo = git2::Repository::open(&sandbox_path)
-        .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
+    let outcome = {
+        let sandbox = sandbox.clone();
+        let agent_id = agent_id.clone();
+        let canonical_path = canonical_path.clone();
+        let sandbox_path = sandbox_path.clone();
+        tokio::task::spawn_blocking(move || {
+            merge_sandbox_git(
+                &canonical_path,
+                &sandbox_path,
+                &sandbox,
+                &agent_id,
+                &dirty_handling,
+            )
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("sandbox merge git task failed: {e}")))?
+    };
 
-    // Auto-commit any dirty sandbox state (preserving agent attribution)
-    if is_dirty(&sandbox_repo)? {
-        let sig = resolve_signature(&sandbox_repo)?;
-        let mut index = sandbox_repo
-            .index()
-            .map_err(|e| Error::Internal(format!("get sandbox index failed: {e}")))?;
-        // Untracked nested repos/worktrees cannot be staged: libgit2's
-        // add_all rejects their paths (`invalid path`), and `git add` skips
-        // embedded repos too.
-        let skipped = stage_all_skipping_nested(&sandbox_repo, &mut index)?;
-        if !skipped.is_empty() {
+    // Persistent sandboxes merge repeatedly: record the merged range's tip so
+    // the next merge only picks up commits after it. Best-effort — the merge
+    // itself already landed; a lost update only re-applies an already-merged
+    // (now empty) range next time.
+    if let Ok(MergeOutcome::Merged {
+        sandbox_head_sha, ..
+    }) = &outcome
+    {
+        if let Err(e) = store
+            .set_sandbox_last_merged_commit(workspace_id, agent_id, sandbox_head_sha, &now_iso())
+            .await
+        {
             tracing::warn!(
-                sandbox = %sandbox_path.display(),
-                skipped = ?skipped,
-                "sandbox auto-commit: skipping untracked nested git repos/worktrees"
+                agent = %agent_id.0,
+                error = %e,
+                "failed to record sandbox last merged commit"
             );
         }
-        index
-            .write()
-            .map_err(|e| Error::Internal(format!("write sandbox index failed: {e}")))?;
-        let tree_oid = index
-            .write_tree()
-            .map_err(|e| Error::Internal(format!("write sandbox tree failed: {e}")))?;
-        let tree = sandbox_repo
-            .find_tree(tree_oid)
-            .map_err(|e| Error::Internal(format!("find sandbox tree failed: {e}")))?;
-        let head = sandbox_repo
-            .head()
-            .map_err(|e| Error::Internal(format!("get sandbox HEAD failed: {e}")))?;
-        let parent = head
-            .peel_to_commit()
-            .map_err(|e| Error::Internal(format!("peel sandbox HEAD failed: {e}")))?;
-        sandbox_repo
-            .commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                &format!("Auto-commit dirty state for {}", agent_id.0),
-                &tree,
-                &[&parent],
-            )
-            .map_err(|e| Error::Internal(format!("auto-commit sandbox failed: {e}")))?;
-    }
-
-    // Get canonical HEAD
-    let canonical_head_ref = canonical_repo
-        .head()
-        .map_err(|e| Error::Internal(format!("get canonical HEAD failed: {e}")))?;
-    let canonical_head_commit = canonical_head_ref
-        .peel_to_commit()
-        .map_err(|e| Error::Internal(format!("peel canonical HEAD failed: {e}")))?;
-
-    // Check for dirty state in canonical
-    let canonical_dirty = is_dirty(&canonical_repo)?;
-    if canonical_dirty {
-        // Get the list of changed files in canonical
-        let canonical_changed = get_changed_files(&canonical_repo)?;
-
-        // Get the list of files changed by the sandbox (from base to HEAD)
-        let base_sha = sandbox
-            .snapshot_commit_sha
-            .as_ref()
-            .unwrap_or(&sandbox.base_commit_sha);
-        let sandbox_changed = get_files_in_range(&sandbox_repo, base_sha, "HEAD")?;
-
-        // Check for overlap
-        let overlap: Vec<String> = canonical_changed
-            .iter()
-            .filter(|f| sandbox_changed.contains(f))
-            .cloned()
-            .collect();
-
-        if !overlap.is_empty() {
-            return Ok(MergeOutcome::Blocked {
-                reason:
-                    "Canonical repository has uncommitted changes overlapping with sandbox changes"
-                        .to_string(),
-                overlapping_paths: overlap,
-            });
-        }
-    }
-
-    // A missing or unborn sandbox branch is not an internal error: the agent
-    // never committed anything on it. Surface a typed Blocked outcome so
-    // callers keep the sandbox retryable.
-    let branch_ref_name = format!("refs/heads/{}", sandbox.branch);
-    let branch_is_committish = sandbox_repo
-        .find_reference(&branch_ref_name)
-        .and_then(|r| r.peel_to_commit())
-        .is_ok();
-    if !branch_is_committish {
-        tracing::warn!(
-            agent = %agent_id.0,
-            branch = %sandbox.branch,
-            sandbox_path = %sandbox.path,
-            "sandbox merge skipped: branch is missing or unborn in the sandbox repo"
-        );
-        return Ok(MergeOutcome::Blocked {
-            reason: format!(
-                "sandbox branch '{}' is missing or unborn in the sandbox repository",
-                sandbox.branch
-            ),
-            overlapping_paths: Vec::new(),
-        });
-    }
-
-    // Defensive audit: today only sb/<agentId> ever diverges from the
-    // workspace repo; warn if any OTHER local sandbox branch has a tip the
-    // workspace repo cannot reach.
-    let diverged = audit_diverged_sandbox_branches(&sandbox_repo, &canonical_repo, &sandbox.branch);
-    if !diverged.is_empty() {
-        tracing::warn!(
-            agent = %agent_id.0,
-            branches = ?diverged,
-            sandbox_path = %sandbox.path,
-            "sandbox has local branches (other than the merge branch) not reachable in the workspace repo"
-        );
-    }
-
-    // Fetch sandbox branch into canonical (no checkout, just fetch).
-    // Shell out to git with an explicit full refspec into a temporary ref and
-    // tag auto-follow disabled: CoW repos carry non-commit refs
-    // (refs/intent/blobs/*, refs/stash) that libgit2's local transport trips
-    // over ("object is not a committish", InvalidSpec) — its pack negotiation
-    // revwalk-hides every local ref and rejects blob targets.
-    let sandbox_path_str = sandbox_path
-        .to_str()
-        .ok_or_else(|| Error::Internal("sandbox path not UTF-8".to_string()))?;
-    let temp_ref = format!("refs/intent/sandbox-merge/{}", agent_id.0);
-    let refspec = format!("+{branch_ref_name}:{temp_ref}");
-
-    // Sandbox paths are intentd-controlled absolute paths under
-    // workspaces_root, so the positional <repository> argument cannot be
-    // mistaken for an option or a remote-helper URL. GIT_TERMINAL_PROMPT=0 and
-    // a null stdin force fail-fast instead of a hidden credential prompt
-    // (parity with intent-git/src/fetch.rs); the transport is local-only.
-    let fetch_out = std::process::Command::new("git")
-        .arg("fetch")
-        .arg("--no-tags")
-        .arg("--quiet")
-        .arg(sandbox_path_str)
-        .arg(&refspec)
-        .current_dir(&canonical_path)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| Error::Internal(format!("fetch sandbox branch failed: {e}")))?;
-    if !fetch_out.status.success() {
-        return Err(Error::Internal(format!(
-            "fetch sandbox branch failed: {}",
-            String::from_utf8_lossy(&fetch_out.stderr).trim()
-        )));
-    }
-
-    let outcome = apply_sandbox_commits(
-        &canonical_repo,
-        &sandbox_repo,
-        &sandbox,
-        &canonical_head_commit,
-    );
-
-    // The temp ref only anchors the fetch; drop it regardless of outcome.
-    if let Ok(mut r) = canonical_repo.find_reference(&temp_ref) {
-        let _ = r.delete();
     }
 
     outcome
 }
 
-/// Cherry-pick the sandbox commits (post-snapshot, or post-base) onto the
-/// canonical HEAD. Assumes the sandbox branch objects are already present in
-/// the canonical ODB (fetched by [`merge_sandbox`]).
+/// How old an abandoned `.git/index.lock` must be before the merge path
+/// breaks it. A legitimate git operation holds the lock for seconds; a lock
+/// this old has no plausible live holder (crashed git process, killed agent
+/// command) and would otherwise fail every merge retry until a human deletes
+/// the file.
+pub const STALE_GIT_LOCK_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// Detect and handle an abandoned `.git/index.lock` in `repo` before a merge
+/// mutates its index. No lock → Ok. A lock older than `max_age` (per mtime)
+/// is broken (removed, WARN) so the merge self-heals. A younger lock
+/// plausibly has a live holder: return an actionable error naming the lock
+/// path so the caller's retry path reports something a human can act on.
+/// `repo_label` names which side is locked (`"canonical"` / `"sandbox"`).
+fn break_stale_git_lock(
+    repo: &git2::Repository,
+    repo_label: &str,
+    max_age: Duration,
+) -> Result<()> {
+    let lock_path = repo.path().join("index.lock");
+    let Ok(meta) = std::fs::metadata(&lock_path) else {
+        return Ok(()); // no lock
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .unwrap_or(Duration::ZERO);
+    if age >= max_age {
+        std::fs::remove_file(&lock_path)
+            .map_err(|e| Error::Internal(format!("break stale git lock failed: {e}")))?;
+        tracing::warn!(
+            lock = %lock_path.display(),
+            age_secs = age.as_secs(),
+            repo = repo_label,
+            "broke stale git index.lock (no plausible live holder)"
+        );
+        return Ok(());
+    }
+    Err(Error::Internal(format!(
+        "{repo_label} repository is locked: {} exists (age {}s) — another git process may be \
+         running; if none is, delete the lock file and retry the merge",
+        lock_path.display(),
+        age.as_secs()
+    )))
+}
+
+/// The synchronous git section of [`merge_sandbox_with`]: dirty-state commit,
+/// canonical-overlap check, fetch, cherry-pick. Runs on the blocking pool.
+/// Logs per-phase wall-clock timings (dirty-commit, fetch, cherry-pick) so a
+/// slow merge names its slow phase.
+fn merge_sandbox_git(
+    canonical_path: &Path,
+    sandbox_path: &Path,
+    sandbox: &Sandbox,
+    agent_id: &AgentId,
+    dirty_handling: &DirtyHandling,
+) -> Result<MergeOutcome> {
+    let mut dirty_commit_ms: u64 = 0;
+    let fetch_ms: u64;
+    let cherrypick_ms: u64;
+    {
+        // Open both repositories
+        let canonical_repo = git2::Repository::open(canonical_path)
+            .map_err(|e| Error::Internal(format!("open canonical repo failed: {e}")))?;
+        let sandbox_repo = git2::Repository::open(sandbox_path)
+            .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
+
+        // Abandoned index locks (crashed git process) would fail every index
+        // write below; break stale ones up front, error actionably on fresh
+        // ones. Both sides mutate their index (sandbox: dirty auto-commit;
+        // canonical: cherry-pick).
+        break_stale_git_lock(&canonical_repo, "canonical", STALE_GIT_LOCK_MAX_AGE)?;
+        break_stale_git_lock(&sandbox_repo, "sandbox", STALE_GIT_LOCK_MAX_AGE)?;
+
+        // Handle dirty sandbox state per the caller's policy: commit it
+        // (preserving agent attribution) or refuse the merge outright.
+        if is_dirty(&sandbox_repo)? {
+            let message = match &dirty_handling {
+                DirtyHandling::Bounce => {
+                    return Ok(MergeOutcome::Dirty {
+                        dirty_paths: get_changed_files(&sandbox_repo)?,
+                    });
+                }
+                DirtyHandling::Commit(Some(msg)) => msg.clone(),
+                DirtyHandling::Commit(None) => {
+                    format!("Auto-commit dirty state for {}", agent_id.0)
+                }
+            };
+            let dirty_started = std::time::Instant::now();
+            let sig = resolve_signature(&sandbox_repo)?;
+            let mut index = sandbox_repo
+                .index()
+                .map_err(|e| Error::Internal(format!("get sandbox index failed: {e}")))?;
+            // Untracked nested repos/worktrees cannot be staged: libgit2's
+            // add_all rejects their paths (`invalid path`), and `git add`
+            // skips embedded repos too.
+            let skipped = stage_all_skipping_nested(&sandbox_repo, &mut index)?;
+            if !skipped.is_empty() {
+                tracing::warn!(
+                    sandbox = %sandbox_path.display(),
+                    skipped = ?skipped,
+                    "sandbox auto-commit: skipping untracked nested git repos/worktrees"
+                );
+            }
+            index
+                .write()
+                .map_err(|e| Error::Internal(format!("write sandbox index failed: {e}")))?;
+            let tree_oid = index
+                .write_tree()
+                .map_err(|e| Error::Internal(format!("write sandbox tree failed: {e}")))?;
+            let tree = sandbox_repo
+                .find_tree(tree_oid)
+                .map_err(|e| Error::Internal(format!("find sandbox tree failed: {e}")))?;
+            let head = sandbox_repo
+                .head()
+                .map_err(|e| Error::Internal(format!("get sandbox HEAD failed: {e}")))?;
+            let parent = head
+                .peel_to_commit()
+                .map_err(|e| Error::Internal(format!("peel sandbox HEAD failed: {e}")))?;
+            sandbox_repo
+                .commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent])
+                .map_err(|e| Error::Internal(format!("auto-commit sandbox failed: {e}")))?;
+            dirty_commit_ms =
+                u64::try_from(dirty_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        }
+
+        // Get canonical HEAD
+        let canonical_head_ref = canonical_repo
+            .head()
+            .map_err(|e| Error::Internal(format!("get canonical HEAD failed: {e}")))?;
+        let canonical_head_commit = canonical_head_ref
+            .peel_to_commit()
+            .map_err(|e| Error::Internal(format!("peel canonical HEAD failed: {e}")))?;
+
+        // Check for dirty state in canonical
+        let canonical_dirty = is_dirty(&canonical_repo)?;
+        if canonical_dirty {
+            // Get the list of changed files in canonical
+            let canonical_changed = get_changed_files(&canonical_repo)?;
+
+            // Get the list of files changed by the sandbox since the last merge
+            // (or from snapshot/base on the first merge)
+            let base_sha = merge_start_sha(sandbox);
+            let sandbox_changed = get_files_in_range(&sandbox_repo, base_sha, "HEAD")?;
+
+            // Check for overlap
+            let overlap: Vec<String> = canonical_changed
+                .iter()
+                .filter(|f| sandbox_changed.contains(f))
+                .cloned()
+                .collect();
+
+            if !overlap.is_empty() {
+                return Ok(MergeOutcome::Blocked {
+                reason:
+                    "Canonical repository has uncommitted changes overlapping with sandbox changes"
+                        .to_string(),
+                overlapping_paths: overlap,
+            });
+            }
+        }
+
+        // A missing or unborn sandbox branch is not an internal error: the agent
+        // never committed anything on it. Surface a typed Blocked outcome so
+        // callers keep the sandbox retryable.
+        let branch_ref_name = format!("refs/heads/{}", sandbox.branch);
+        let branch_is_committish = sandbox_repo
+            .find_reference(&branch_ref_name)
+            .and_then(|r| r.peel_to_commit())
+            .is_ok();
+        if !branch_is_committish {
+            tracing::warn!(
+                agent = %agent_id.0,
+                branch = %sandbox.branch,
+                sandbox_path = %sandbox.path,
+                "sandbox merge skipped: branch is missing or unborn in the sandbox repo"
+            );
+            return Ok(MergeOutcome::Blocked {
+                reason: format!(
+                    "sandbox branch '{}' is missing or unborn in the sandbox repository",
+                    sandbox.branch
+                ),
+                overlapping_paths: Vec::new(),
+            });
+        }
+
+        // Defensive audit: today only sb/<agentId> ever diverges from the
+        // workspace repo; warn if any OTHER local sandbox branch has a tip the
+        // workspace repo cannot reach.
+        let diverged =
+            audit_diverged_sandbox_branches(&sandbox_repo, &canonical_repo, &sandbox.branch);
+        if !diverged.is_empty() {
+            tracing::warn!(
+                agent = %agent_id.0,
+                branches = ?diverged,
+                sandbox_path = %sandbox.path,
+                "sandbox has local branches (other than the merge branch) not reachable in the workspace repo"
+            );
+        }
+
+        // Fetch sandbox branch into canonical (no checkout, just fetch).
+        // Shell out to git with an explicit full refspec into a temporary ref and
+        // tag auto-follow disabled: CoW repos carry non-commit refs
+        // (refs/intent/blobs/*, refs/stash) that libgit2's local transport trips
+        // over ("object is not a committish", InvalidSpec) — its pack negotiation
+        // revwalk-hides every local ref and rejects blob targets.
+        let sandbox_path_str = sandbox_path
+            .to_str()
+            .ok_or_else(|| Error::Internal("sandbox path not UTF-8".to_string()))?;
+        let temp_ref = format!("refs/intent/sandbox-merge/{}", agent_id.0);
+        let refspec = format!("+{branch_ref_name}:{temp_ref}");
+
+        // Sandbox paths are intentd-controlled absolute paths under
+        // workspaces_root, so the positional <repository> argument cannot be
+        // mistaken for an option or a remote-helper URL. GIT_TERMINAL_PROMPT=0 and
+        // a null stdin force fail-fast instead of a hidden credential prompt
+        // (parity with intent-git/src/fetch.rs); the transport is local-only.
+        let fetch_started = std::time::Instant::now();
+        let fetch_out = std::process::Command::new("git")
+            .arg("fetch")
+            .arg("--no-tags")
+            .arg("--quiet")
+            .arg(sandbox_path_str)
+            .arg(&refspec)
+            .current_dir(canonical_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| Error::Internal(format!("fetch sandbox branch failed: {e}")))?;
+        if !fetch_out.status.success() {
+            return Err(Error::Internal(format!(
+                "fetch sandbox branch failed: {}",
+                String::from_utf8_lossy(&fetch_out.stderr).trim()
+            )));
+        }
+        fetch_ms = u64::try_from(fetch_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        let cherrypick_started = std::time::Instant::now();
+        let outcome = apply_sandbox_commits(
+            &canonical_repo,
+            &sandbox_repo,
+            sandbox,
+            &canonical_head_commit,
+        );
+        cherrypick_ms = u64::try_from(cherrypick_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        // The temp ref only anchors the fetch; drop it regardless of outcome.
+        if let Ok(mut r) = canonical_repo.find_reference(&temp_ref) {
+            let _ = r.delete();
+        }
+
+        tracing::info!(
+            agent = %agent_id.0,
+            dirty_commit_ms,
+            fetch_ms,
+            cherrypick_ms,
+            "sandbox merge git phases completed"
+        );
+
+        outcome
+    }
+}
+
+/// The start of the next merge range: the last successfully merged tip when
+/// present (repeat merge on a persistent sandbox), else the dirty-state
+/// snapshot, else the provision-time base.
+fn merge_start_sha(sandbox: &Sandbox) -> &String {
+    sandbox
+        .last_merged_commit_sha
+        .as_ref()
+        .or(sandbox.snapshot_commit_sha.as_ref())
+        .unwrap_or(&sandbox.base_commit_sha)
+}
+
+/// Stable patch-id of a commit's change (parent→commit diff), the same
+/// semantic-identity notion as `git patch-id --stable`: identical patches
+/// committed as different SHAs (different author/date/message/parent) share
+/// an id. `None` when the diff cannot be computed (e.g. missing objects) —
+/// callers treat that as "unknown", never as a match.
+fn patch_id_of(repo: &git2::Repository, oid: git2::Oid) -> Option<git2::Oid> {
+    let commit = repo.find_commit(oid).ok()?;
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let tree = commit.tree().ok()?;
+    let diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .ok()?;
+    diff.patchid(None).ok()
+}
+
+/// Patch-ids of the canonical commits the sandbox range will be applied on
+/// top of (start..canonical HEAD when `start` is a canonical ancestor, else
+/// a bounded walk from HEAD). Used to skip sandbox commits whose change
+/// already landed in canonical — see [`apply_sandbox_commits`].
+fn canonical_patch_ids(
+    canonical_repo: &git2::Repository,
+    start_sha: &str,
+    canonical_head: git2::Oid,
+) -> std::collections::HashSet<git2::Oid> {
+    // Bound the fallback walk: already-merged detection is best-effort and
+    // recent history is where a duplicated change plausibly lives.
+    const FALLBACK_WALK_LIMIT: usize = 200;
+
+    let mut ids = std::collections::HashSet::new();
+    let Ok(mut revwalk) = canonical_repo.revwalk() else {
+        return ids;
+    };
+    if revwalk.push(canonical_head).is_err() {
+        return ids;
+    }
+    let hidden = git2::Oid::from_str(start_sha)
+        .ok()
+        .is_some_and(|start| revwalk.hide(start).is_ok());
+    for (i, oid) in revwalk.flatten().enumerate() {
+        if !hidden && i >= FALLBACK_WALK_LIMIT {
+            break;
+        }
+        if let Some(id) = patch_id_of(canonical_repo, oid) {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+
+/// Cherry-pick the sandbox commits (post-last-merge, post-snapshot, or
+/// post-base) onto the canonical HEAD. Assumes the sandbox branch objects are
+/// already present in the canonical ODB (fetched by [`merge_sandbox`]).
+/// Commits whose patch-id already exists in canonical (the same change landed
+/// independently, or a previous merge was only partially recorded) are
+/// skipped — reported inside the Merged range, with no duplicate/empty commit
+/// and no false conflict.
 fn apply_sandbox_commits(
     canonical_repo: &git2::Repository,
     sandbox_repo: &git2::Repository,
@@ -581,15 +1066,13 @@ fn apply_sandbox_commits(
 ) -> Result<MergeOutcome> {
     let canonical_head_sha = canonical_head_commit.id().to_string();
 
-    // Get the range of commits to cherry-pick: from snapshot (or base) to the
-    // sandbox branch tip. Resolve the branch ref rather than HEAD — the fetch
+    // Get the range of commits to cherry-pick: from the last merged tip
+    // (persistent sandbox, repeat merge) or snapshot/base to the sandbox
+    // branch tip. Resolve the branch ref rather than HEAD — the fetch
     // in `merge_sandbox` only brought over `refs/heads/<branch>` objects, so a
     // detached or re-pointed HEAD would yield a range whose commits are absent
     // from the canonical ODB.
-    let start_sha = sandbox
-        .snapshot_commit_sha
-        .as_ref()
-        .unwrap_or(&sandbox.base_commit_sha);
+    let start_sha = merge_start_sha(sandbox);
     let sandbox_head = sandbox_repo
         .find_reference(&format!("refs/heads/{}", sandbox.branch))
         .map_err(|e| Error::Internal(format!("get sandbox branch failed: {e}")))?
@@ -601,12 +1084,18 @@ fn apply_sandbox_commits(
     let commits_to_apply = get_commits_after(sandbox_repo, start_sha, &sandbox_head_sha)?;
 
     if commits_to_apply.is_empty() {
-        // No commits to apply (only the snapshot, or base == HEAD)
+        // No commits to apply (only the snapshot, base == HEAD, or nothing
+        // new since the last merge)
         return Ok(MergeOutcome::Merged {
             commit_range: format!("{start_sha}..{sandbox_head_sha} (empty)"),
             canonical_head: canonical_head_sha,
+            sandbox_head_sha,
         });
     }
+
+    // Already-merged detection: patch-ids of the canonical commits since the
+    // range start. A sandbox commit whose patch-id matches is skipped below.
+    let canonical_ids = canonical_patch_ids(canonical_repo, start_sha, canonical_head_commit.id());
 
     // Cherry-pick each commit onto canonical
     let canonical_oid = canonical_head_commit.id();
@@ -618,6 +1107,19 @@ fn apply_sandbox_commits(
         let commit = canonical_repo
             .find_commit(commit_oid)
             .map_err(|e| Error::Internal(format!("find commit failed: {e}")))?;
+
+        // Skip commits whose exact change already landed in canonical
+        // (identical patch-id): re-applying is at best an empty commit and
+        // at worst a false conflict.
+        if let Some(id) = patch_id_of(canonical_repo, commit_oid) {
+            if canonical_ids.contains(&id) {
+                tracing::info!(
+                    commit = %commit_sha,
+                    "sandbox merge: commit already applied in canonical (patch-id match); skipping"
+                );
+                continue;
+            }
+        }
 
         let current_commit = canonical_repo
             .find_commit(current_oid)
@@ -693,6 +1195,7 @@ fn apply_sandbox_commits(
     Ok(MergeOutcome::Merged {
         commit_range: format!("{start_sha}..{sandbox_head_sha}"),
         canonical_head: current_oid.to_string(),
+        sandbox_head_sha,
     })
 }
 
@@ -756,7 +1259,7 @@ fn audit_diverged_sandbox_branches(
 ///   returns an error.
 /// - Otherwise (`skip_worktree` = true OR no worktree provisioned): the user's
 ///   repository folder (`repository_path`).
-fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
+pub(crate) fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
     let repo_path = match workspace.checkout_mode {
         Some(CheckoutMode::Cow) => workspace.worktree_path.as_ref().ok_or_else(|| {
             Error::InvalidParams("CoW workspace has no worktree_path".to_string())
@@ -865,6 +1368,15 @@ fn restore_missing_tracked_files(
     Ok(())
 }
 
+/// Check if the repository at `path` has uncommitted changes (staged,
+/// unstaged, or untracked). Path-based wrapper over [`is_dirty`] for callers
+/// outside this module (the completion path's dirty-state pre-check).
+pub fn worktree_is_dirty(path: &Path) -> Result<bool> {
+    let repo = git2::Repository::open(path)
+        .map_err(|e| Error::Internal(format!("open repo failed: {e}")))?;
+    is_dirty(&repo)
+}
+
 /// Resolve a git signature for authoring commits, falling back to a stable
 /// default identity when the user has no `user.name`/`user.email` configured.
 ///
@@ -947,12 +1459,14 @@ fn create_snapshot_commit(repo: &git2::Repository, agent_id: &AgentId) -> Result
     Ok(oid.to_string())
 }
 
-/// Get the list of changed files in a repository (dirty state).
+/// Get the list of changed files in a repository (dirty state). Submodules
+/// are excluded for the same reason as [`is_dirty`] — keep both in sync.
 fn get_changed_files(repo: &git2::Repository) -> Result<Vec<String>> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(false);
+        .include_ignored(false)
+        .exclude_submodules(true);
     let statuses = repo
         .statuses(Some(&mut opts))
         .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
@@ -1273,6 +1787,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         }
@@ -1289,7 +1804,8 @@ mod tests {
         // Early probe check - skip test if CoW not available (e.g., non-CoW filesystem)
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
                 "Skipping test: CoW not supported between {repo_path:?} and {workspaces_root:?}"
             );
@@ -1440,7 +1956,8 @@ mod tests {
         // Early probe check - skip test if CoW not available
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
                 "Skipping test: CoW not supported between {repo_path:?} and {workspaces_root:?}"
             );
@@ -1607,7 +2124,8 @@ mod tests {
         // Early probe check - skip test if CoW not available
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
                 "Skipping test: CoW not supported between {repo_path:?} and {workspaces_root:?}"
             );
@@ -1710,8 +2228,86 @@ mod tests {
             "Sandbox record must be deleted from DB after discard"
         );
 
+        // Verify the now-empty <agentId>/ parent (and sandboxes/) were removed
+        let agent_parent = path.parent().unwrap();
+        assert!(
+            !agent_parent.exists(),
+            "Empty <agentId>/ parent must be removed after discard"
+        );
+        assert!(
+            !agent_parent.parent().unwrap().exists(),
+            "Empty sandboxes/ dir must be removed after discard"
+        );
+
         // Clean up
         let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn discard_sandbox_clears_session_fields_and_keeps_sibling_parents() {
+        // No CoW required: insert the sandbox record by hand over a plain
+        // directory tree. Covers (a) session sandbox fields cleared on
+        // discard, (b) empty parent cleanup stops at a non-empty sandboxes/
+        // dir (sibling agent's sandbox survives).
+        let (store, _db) = temp_store().await;
+        let root = tempfile::TempDir::new().unwrap();
+
+        let ws = workspace_for_repo(&root.path().join("fake-repo"));
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId::new();
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let sandboxes_dir = root.path().join(ws.id.0.as_str()).join("sandboxes");
+        let sandbox_path = sandboxes_dir.join(agent_id.0.as_str()).join("repo");
+        fs::create_dir_all(&sandbox_path).unwrap();
+        let sibling = sandboxes_dir.join("agent-other").join("repo");
+        fs::create_dir_all(&sibling).unwrap();
+
+        let sandbox = intent_store::Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: format!("sb/{}", agent_id.0),
+            base_commit_sha: "abc123".to_string(),
+            snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        // Point the session at the sandbox (as the delegate/microVM paths do)
+        let mut session = store.get_agent_session(&agent_id).await.unwrap();
+        session.sandbox_id = Some(sandbox.id.clone());
+        session.sandbox_path = Some(sandbox.path.clone());
+        session.sandbox_branch = Some(sandbox.branch.clone());
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        discard_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+
+        assert!(!sandbox_path.exists(), "sandbox dir removed");
+        assert!(
+            !sandboxes_dir.join(agent_id.0.as_str()).exists(),
+            "empty <agentId>/ parent removed"
+        );
+        assert!(
+            sandboxes_dir.exists() && sibling.exists(),
+            "non-empty sandboxes/ dir and sibling sandbox must survive"
+        );
+
+        let session = store.get_agent_session(&agent_id).await.unwrap();
+        assert!(
+            session.sandbox_id.is_none()
+                && session.sandbox_path.is_none()
+                && session.sandbox_branch.is_none(),
+            "session sandbox fields must be cleared after discard"
+        );
     }
 
     #[tokio::test]
@@ -1788,8 +2384,11 @@ mod tests {
             branch: "sb/test".to_string(),
             base_commit_sha: "abc123".to_string(),
             snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
             status: intent_store::SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -1976,7 +2575,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2017,7 +2617,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2112,7 +2713,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2178,7 +2780,211 @@ mod tests {
             _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
+        // Persistent lifecycle: the merged tip is recorded on the record so
+        // the next merge is incremental.
+        let record = store
+            .get_sandbox(&ws.id, &agent_id)
+            .await
+            .unwrap()
+            .expect("sandbox record persists after merge");
+        assert!(
+            record.last_merged_commit_sha.is_some(),
+            "last merged commit must be recorded"
+        );
+
         // Clean up
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_repeat_merge_is_incremental() {
+        // Persistent sandbox lifecycle: turn 1 commits + merges, turn 2
+        // commits + merges in the SAME sandbox. Canonical gets both changes;
+        // the second merge only applies the new range (no duplicate or
+        // conflicting re-application of turn 1's commit).
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("repeat-merge");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&canonical_path, &workspaces_root).unwrap();
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::from("agent-repeat-merge");
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
+            panic!("Expected Supported outcome");
+        };
+
+        // Turn 1: commit + merge.
+        let turn1_sha = commit_file(&sandbox_path, "turn1.txt", "turn 1", "Turn 1 work");
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+        let MergeOutcome::Merged {
+            sandbox_head_sha, ..
+        } = outcome
+        else {
+            panic!("Expected Merged outcome for turn 1, got {outcome:?}");
+        };
+        assert_eq!(sandbox_head_sha, turn1_sha);
+        assert!(canonical_path.join("turn1.txt").exists());
+
+        let record = store
+            .get_sandbox(&ws.id, &agent_id)
+            .await
+            .unwrap()
+            .expect("sandbox record persists after turn 1 merge");
+        assert_eq!(
+            record.last_merged_commit_sha.as_deref(),
+            Some(turn1_sha.as_str()),
+            "turn 1 tip recorded as last merged"
+        );
+        assert!(
+            sandbox_path.exists(),
+            "sandbox directory persists after turn 1 merge"
+        );
+
+        // Turn 2: another commit in the SAME sandbox, then merge again.
+        let turn2_sha = commit_file(&sandbox_path, "turn2.txt", "turn 2", "Turn 2 work");
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+        let MergeOutcome::Merged {
+            commit_range,
+            sandbox_head_sha,
+            ..
+        } = outcome
+        else {
+            panic!("Expected Merged outcome for turn 2, got {outcome:?}");
+        };
+        assert_eq!(sandbox_head_sha, turn2_sha);
+        assert!(
+            commit_range.starts_with(&turn1_sha),
+            "turn 2 range must start at turn 1's merged tip, got {commit_range}"
+        );
+
+        // Canonical has both files, and exactly one commit per turn landed
+        // (no duplicate application of turn 1's commit).
+        assert!(canonical_path.join("turn1.txt").exists());
+        assert!(canonical_path.join("turn2.txt").exists());
+        let canonical_repo = git2::Repository::open(&canonical_path).unwrap();
+        let mut walk = canonical_repo.revwalk().unwrap();
+        walk.push_head().unwrap();
+        let messages: Vec<String> = walk
+            .map(|oid| {
+                canonical_repo
+                    .find_commit(oid.unwrap())
+                    .unwrap()
+                    .message()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.contains("Turn 1 work"))
+                .count(),
+            1,
+            "turn 1 commit applied exactly once: {messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.contains("Turn 2 work"))
+                .count(),
+            1,
+            "turn 2 commit applied exactly once: {messages:?}"
+        );
+
+        let record = store
+            .get_sandbox(&ws.id, &agent_id)
+            .await
+            .unwrap()
+            .expect("sandbox record persists after turn 2 merge");
+        assert_eq!(
+            record.last_merged_commit_sha.as_deref(),
+            Some(turn2_sha.as_str()),
+            "turn 2 tip recorded as last merged"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn provision_reuses_existing_persistent_sandbox() {
+        // Re-provisioning for an agent whose sandbox already exists (respawn,
+        // daemon restart) must return the existing sandbox instead of failing
+        // on the existing destination or re-cloning.
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("provision-reuse");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::from("agent-reuse");
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let first = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: first_path,
+            branch: first_branch,
+            ..
+        } = first
+        else {
+            panic!("Expected Supported outcome");
+        };
+
+        // Leave a marker only present in the existing sandbox: a re-clone
+        // would lose it.
+        fs::write(first_path.join("marker.txt"), "existing sandbox").unwrap();
+
+        let second = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: second_path,
+            branch: second_branch,
+            ..
+        } = second
+        else {
+            panic!("Expected Supported outcome on re-provision");
+        };
+        assert_eq!(second_path, first_path, "same sandbox path reused");
+        assert_eq!(second_branch, first_branch, "same sandbox branch reused");
+        assert!(
+            second_path.join("marker.txt").exists(),
+            "existing sandbox contents preserved (no re-clone)"
+        );
+
         let _ = fs::remove_dir_all(&test_root);
     }
 
@@ -2235,8 +3041,11 @@ mod tests {
             branch: "sb/test".to_string(),
             base_commit_sha: base_sha,
             snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -2271,7 +3080,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2384,7 +3194,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2478,7 +3289,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2569,8 +3381,11 @@ mod tests {
             branch: "sb/test".to_string(),
             base_commit_sha: "abc123".to_string(),
             snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -2660,7 +3475,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&source_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2737,7 +3553,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&source_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2927,8 +3744,11 @@ mod tests {
             branch: branch_name,
             base_commit_sha: base_sha,
             snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3010,8 +3830,11 @@ mod tests {
             branch: branch_name,
             base_commit_sha: base_sha,
             snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3025,6 +3848,341 @@ mod tests {
                 assert!(canonical_path.join("agent.txt").exists());
             }
             _ => panic!("Expected Merged outcome, got {outcome:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_already_applied_commit_is_skipped_not_duplicated() {
+        // Regression (dev-seat merge-verification round): a sandbox commit
+        // whose change ALREADY landed in canonical (e.g. the user applied the
+        // same fix, or a previous partially-recorded merge) must be detected
+        // as already-merged — outcome Merged with NO new (empty) commit on
+        // canonical — instead of duplicating an empty commit or bouncing a
+        // false conflict.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("already-applied");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .branch(&branch_name, &head_commit, false)
+                .unwrap();
+            sandbox_repo
+                .set_head(&format!("refs/heads/{branch_name}"))
+                .unwrap();
+        }
+
+        // The SAME change lands independently on both sides (different SHAs,
+        // identical patch).
+        commit_file(&sandbox_path, "shared.txt", "same fix", "Sandbox fix");
+        commit_file(&canonical_path, "shared.txt", "same fix", "Canonical fix");
+
+        let canonical_head_before = {
+            let repo = git2::Repository::open(&canonical_path).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            head.to_string()
+        };
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("already-applied commit must not be an internal error");
+        match outcome {
+            MergeOutcome::Merged { .. } => {}
+            other => panic!("already-applied change must report Merged, got {other:?}"),
+        }
+
+        // No duplicate/empty commit: canonical HEAD is unchanged.
+        let canonical_head_after = {
+            let repo = git2::Repository::open(&canonical_path).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            head.to_string()
+        };
+        assert_eq!(
+            canonical_head_before, canonical_head_after,
+            "already-applied commit must be skipped, not duplicated as an empty commit"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn patch_id_matches_identical_change_across_commits() {
+        // Same patch committed twice (different SHAs, different messages)
+        // yields the same patch-id; a different patch yields a different id.
+        let (_dir, repo_path) = temp_repo("patch-id");
+        commit_file(&repo_path, "f.txt", "one", "add f");
+        let a = commit_file(&repo_path, "g.txt", "same content", "first copy");
+        // Revert g.txt then re-add it identically as a new commit.
+        {
+            let repo = git2::Repository::open(&repo_path).unwrap();
+            fs::remove_file(repo_path.join("g.txt")).unwrap();
+            let mut index = repo.index().unwrap();
+            index.remove_path(Path::new("g.txt")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "remove g", &tree, &[&parent])
+                .unwrap();
+        }
+        let b = commit_file(&repo_path, "g.txt", "same content", "second copy");
+        let c = commit_file(&repo_path, "h.txt", "different", "unrelated");
+
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let id_a = patch_id_of(&repo, git2::Oid::from_str(&a).unwrap()).expect("patch id for a");
+        let id_b = patch_id_of(&repo, git2::Oid::from_str(&b).unwrap()).expect("patch id for b");
+        let id_c = patch_id_of(&repo, git2::Oid::from_str(&c).unwrap()).expect("patch id for c");
+        assert_eq!(id_a, id_b, "identical patches must share a patch-id");
+        assert_ne!(id_a, id_c, "different patches must differ");
+    }
+
+    #[test]
+    fn stale_index_lock_is_broken() {
+        // Regression (dev-seat merge-verification round): an abandoned
+        // .git/index.lock (crashed git process) must be broken when it is
+        // older than the threshold, so merges self-heal instead of failing
+        // every retry until a human deletes the file.
+        let (_dir, repo_path) = temp_repo("stale-lock");
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let lock_path = repo.path().join("index.lock");
+        fs::write(&lock_path, "").unwrap();
+
+        // Age zero => everything is stale: the lock must be removed.
+        break_stale_git_lock(&repo, "canonical", Duration::ZERO)
+            .expect("stale lock must be broken, not error");
+        assert!(!lock_path.exists(), "stale index.lock must be removed");
+    }
+
+    #[test]
+    fn fresh_index_lock_yields_actionable_error() {
+        // A fresh lock plausibly has a live holder: do NOT break it; fail
+        // with an error that names the lock file and what to do.
+        let (_dir, repo_path) = temp_repo("fresh-lock");
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let lock_path = repo.path().join("index.lock");
+        fs::write(&lock_path, "").unwrap();
+
+        let err = break_stale_git_lock(&repo, "canonical", Duration::from_secs(3600))
+            .expect_err("fresh lock must not be broken");
+        let msg = err.to_string();
+        assert!(msg.contains("index.lock"), "must name the lock: {msg}");
+        assert!(
+            msg.contains("canonical"),
+            "must name which repo is locked: {msg}"
+        );
+        assert!(lock_path.exists(), "fresh lock must be left in place");
+    }
+
+    #[tokio::test]
+    async fn test_merge_breaks_stale_canonical_index_lock() {
+        // End-to-end: a stale index.lock in the canonical repo must not fail
+        // the merge — the lock is broken and the merge lands.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("merge-stale-lock");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .branch(&branch_name, &head_commit, false)
+                .unwrap();
+            sandbox_repo
+                .set_head(&format!("refs/heads/{branch_name}"))
+                .unwrap();
+        }
+        commit_file(&sandbox_path, "agent.txt", "agent work", "Agent work");
+
+        // Abandoned lock, backdated past the staleness threshold (touch -t
+        // avoids a filetime dev-dependency; any timestamp older than the
+        // threshold works).
+        let lock_path = canonical_path.join(".git").join("index.lock");
+        fs::write(&lock_path, "").unwrap();
+        let touch = std::process::Command::new("touch")
+            .arg("-m")
+            .arg("-t")
+            .arg("202001010000")
+            .arg(&lock_path)
+            .output()
+            .unwrap();
+        assert!(touch.status.success(), "backdating the lock must succeed");
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("stale lock must be broken, not fail the merge");
+        match outcome {
+            MergeOutcome::Merged { .. } => {
+                assert!(canonical_path.join("agent.txt").exists());
+            }
+            other => panic!("Expected Merged outcome, got {other:?}"),
+        }
+        assert!(!lock_path.exists(), "stale lock must be gone after merge");
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_identical_submodule_pointer_is_not_a_conflict() {
+        // Regression (dev-seat merge-verification round): a sandbox commit
+        // that bumps a submodule gitlink to the SAME sha the canonical repo
+        // already has must merge cleanly (empty pick), not bounce the agent
+        // with a false conflict on the submodule path. The submodule worktree
+        // is deliberately absent (gitlink committed, directory never
+        // materialized — the drifted state cache-hydrated checkouts exhibit):
+        // submodule worktree state does not participate in the cherry-pick
+        // tree merge, so it must not trip the dirty/overlap checks either.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("submodule-identical");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        // Fabricate a gitlink entry (mode 160000) at `mysub` pointing at an
+        // arbitrary commit sha — submodule pointers are plain shas, no object
+        // required in the superproject ODB. Commit it as the shared base.
+        let sub_old = git2::Oid::from_str(&base_sha).unwrap();
+        let add_gitlink = |repo_path: &Path, target: git2::Oid, message: &str| -> String {
+            let repo = git2::Repository::open(repo_path).unwrap();
+            let mut index = repo.index().unwrap();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160_000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: target,
+                flags: 0,
+                flags_extended: 0,
+                path: b"mysub".to_vec(),
+            };
+            index.add(&entry).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+                .unwrap()
+                .to_string()
+        };
+        let base_with_sub = add_gitlink(&canonical_path, sub_old, "Add submodule at old sha");
+
+        // Sandbox = clone of canonical at the shared base.
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .branch(&branch_name, &head_commit, false)
+                .unwrap();
+            sandbox_repo
+                .set_head(&format!("refs/heads/{branch_name}"))
+                .unwrap();
+        }
+
+        // BOTH sides bump the gitlink to the SAME new sha.
+        let sub_new = git2::Oid::from_str(&base_with_sub).unwrap();
+        add_gitlink(&canonical_path, sub_new, "canonical: bump submodule");
+        add_gitlink(&sandbox_path, sub_new, "sandbox: bump submodule");
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_with_sub,
+            snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("identical submodule bump must not be an internal error");
+        match outcome {
+            MergeOutcome::Merged { .. } => {}
+            other => panic!("identical submodule pointer must merge cleanly, got {other:?}"),
         }
 
         let _ = fs::remove_dir_all(&test_root);
@@ -3058,8 +4216,11 @@ mod tests {
             branch: format!("sb/{}", agent_id.0),
             base_commit_sha: base_sha,
             snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3331,6 +4492,9 @@ mod tests {
         fs::write(sandbox_path.join("wip.txt"), "wip").unwrap();
 
         let sandbox = Sandbox {
+            last_merged_commit_sha: None,
+            merge_on_turn_end: true,
+            conflicting_paths: vec![],
             id: uuid::Uuid::new_v4().to_string(),
             workspace_id: ws.id.clone(),
             agent_id: agent_id.clone(),

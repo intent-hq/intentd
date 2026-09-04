@@ -18,7 +18,7 @@
 //!   `sandbox:cow:created` event and session sandbox fields report the settled
 //!   outcome), and completion merges the sandbox back into the workspace
 //!   checkout (`sandbox:cow:merged` event, filesystem changes land, sandbox dir
-//!   discarded).
+//!   persists for the agent's next turn).
 //! - SLOW sandbox provisioning (test seam) never blocks `agent.delegate` —
 //!   the RPC returns promptly with `effectiveIsolation: "pending"` and the
 //!   gated child still spawns in the settled sandbox (monorepo#871).
@@ -28,6 +28,9 @@
 //!   leaves the source repository untouched.
 //! - `workspace.duplicate` of a `CoW` workspace provisions a fresh standalone
 //!   `CoW` clone for the duplicate (same decision matrix as create).
+//! - Uniform per-agent isolation (`executionEnvironment: "cow"`): a TOP-LEVEL
+//!   `agent.create` agent provisions a per-agent sandbox at first spawn, runs
+//!   with the sandbox as its cwd, and merges back on turn end like a delegate.
 //!
 //! Gated on `git` on PATH plus a CoW-capable filesystem via
 //! `intent_git::cow_probe` (APFS/Btrfs/XFS-reflink); skips cleanly
@@ -221,6 +224,36 @@ where
     }
 }
 
+/// Send one JSON-RPC frame and return the `error` member; panics on success.
+async fn wss_rpc_err<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(Duration::from_secs(20), ws.next())
+            .await
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    assert!(v.get("error").is_some(), "rpc {method} succeeded: {v}");
+                    return v["error"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 /// Read one `events.event` notification from a subscriber connection (bounded).
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
@@ -264,7 +297,12 @@ fn git_gate(test: &str) -> bool {
 
 /// Whether the filesystem hosting `/tmp` scratch dirs can CoW-clone
 /// (`intent_git::cow_probe` — the same capability check the daemon runs).
+/// `CoW` is temporarily locked to macOS, so every other OS reports false
+/// (mirroring the daemon's choke point).
 fn cow_supported() -> bool {
+    if cfg!(not(target_os = "macos")) {
+        return false;
+    }
     let probe = scratch_dir("probe");
     let src = probe.join("src");
     let dst = probe.join("dst");
@@ -669,8 +707,8 @@ async fn workspace_create_routes_linked_worktree_source_to_worktree_mode() {
 /// reports the settled outcome), and when the
 /// child completes its turn the daemon auto-merges the sandbox back into the
 /// workspace checkout (`sandbox:cow:merged` event, the file written inside the
-/// sandbox lands in the checkout as a commit, and the sandbox directory is
-/// discarded).
+/// sandbox lands in the checkout as a commit, and the sandbox directory
+/// persists for the agent's next turn).
 #[tokio::test]
 async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
     const TEST: &str = "agent.delegate CoW sandbox WSS e2e";
@@ -830,16 +868,11 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
         "merge advanced the canonical HEAD past the base"
     );
 
-    // Clean merge discards the sandbox directory.
-    for _ in 0..50 {
-        if !sandbox_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // Persistent lifecycle: a clean merge keeps the sandbox directory for
+    // the agent's next turn (discard happens on agent/workspace deletion).
     assert!(
-        !sandbox_path.exists(),
-        "sandbox directory discarded after a clean merge"
+        sandbox_path.exists(),
+        "sandbox directory persists after a clean merge"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -987,11 +1020,9 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
     );
 
     // The child's first spawn was gated on settlement: its actual working
-    // directory is the fully-provisioned sandbox (mock `echoCwd` stamp). The
-    // sandbox dir may already be merged + discarded by the time the stamp is
-    // read (the mock turn completes fast), so compare against the
-    // symlink-resolved root (`/tmp` → `/private/tmp` on macOS) rather than
-    // canonicalizing the sandbox path itself.
+    // directory is the fully-provisioned sandbox (mock `echoCwd` stamp).
+    // Compare against the symlink-resolved root (`/tmp` → `/private/tmp` on
+    // macOS) rather than canonicalizing the sandbox path itself.
     let echoed = poll_echoed_cwd(&mut rpc, 100, &agent_id).await;
     let expected = std::fs::canonicalize(&root)
         .expect("scratch root exists")
@@ -1448,6 +1479,490 @@ async fn workspace_duplicate_falls_back_to_worktree_when_clone_fails_midflight()
         "duplicate fallback is a linked worktree (gitfile .git)"
     );
     assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Flip a `sandbox.*` setting over the wire and assert the change applied.
+async fn set_sandbox_setting<S>(ws: &mut WebSocketStream<S>, id: i64, path: &str, value: Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let resp = wss_rpc(
+        ws,
+        id,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": value }] }),
+    )
+    .await;
+    assert_eq!(resp["applied"][0]["path"], json!(path), "applied: {resp}");
+}
+
+/// Scenario H — execution-environment selection matrix over WSS (§5.1 v4.2):
+/// explicit `worktree` overrides `workspace.cowIsolation` ON; explicit
+/// `direct` provisions nothing and persists the selection; a disabled type
+/// (`cow` is disabled by default) fails `-32602` with the structured
+/// `execution-environment-unavailable` payload; `microvm` disabled fails the
+/// same way; the flow rules reject `worktree` for `githubUrl` and `isNewRepo`
+/// creates. Runs on any filesystem (no `CoW` dependency in these arms).
+#[tokio::test]
+async fn workspace_create_execution_environment_selection_over_wss() {
+    const TEST: &str = "workspace.create executionEnvironment WSS e2e";
+    if !git_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("eesel");
+    let (daemon, port, cfg) = boot(&root, &[]).await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_cow_isolation(&mut ws, 1, true).await;
+
+    // Explicit worktree wins over cowIsolation ON.
+    let result = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "EE Worktree E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "worktree",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let workspace = &result["workspace"];
+    assert_eq!(
+        workspace["checkoutMode"],
+        json!("worktree"),
+        "explicit worktree overrides cowIsolation: {workspace}"
+    );
+    assert_eq!(
+        workspace["executionEnvironment"],
+        json!("worktree"),
+        "selection persisted on the row: {workspace}"
+    );
+    let wt_path = PathBuf::from(workspace["worktreePath"].as_str().expect("worktreePath"));
+    assert!(wt_path.join(".git").is_file(), "linked worktree gitfile");
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+
+    // Explicit direct: nothing provisioned, selection persisted.
+    let result = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.create",
+        json!({
+            "title": "EE Direct E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "direct",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let workspace = &result["workspace"];
+    assert!(
+        workspace["worktreePath"].is_null(),
+        "direct: no checkout provisioned: {workspace}"
+    );
+    assert!(workspace["checkoutMode"].is_null());
+    assert_eq!(workspace["executionEnvironment"], json!("direct"));
+    assert_eq!(workspace["skipWorktree"], json!(true));
+
+    // Round-trip through workspace.get (store persistence on the wire).
+    let got = wss_rpc(
+        &mut ws,
+        4,
+        "workspace.get",
+        json!({ "workspaceId": workspace["id"] }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["executionEnvironment"], json!("direct"));
+
+    // Disabled type (`sandbox.cow.enabled` defaults to false): structured
+    // -32602 with the machine-readable payload.
+    let err = wss_rpc_err(
+        &mut ws,
+        5,
+        "workspace.create",
+        json!({
+            "title": "EE Disabled CoW E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "cow",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "disabled cow: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable"),
+        "structured payload: {err}"
+    );
+    assert_eq!(err["data"]["environment"], json!("cow"));
+    assert!(err["data"]["reason"].is_string(), "reason present: {err}");
+
+    // Disabled microvm: same structured unavailability.
+    let err = wss_rpc_err(
+        &mut ws,
+        6,
+        "workspace.create",
+        json!({
+            "title": "EE Disabled MicroVM E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "microvm",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "disabled microvm: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable")
+    );
+    assert_eq!(err["data"]["environment"], json!("microvm"));
+
+    // Contradictory skipIsolation + non-direct environment: plain -32602.
+    let err = wss_rpc_err(
+        &mut ws,
+        7,
+        "workspace.create",
+        json!({
+            "title": "EE Conflict E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "skipIsolation": true,
+            "executionEnvironment": "worktree",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "conflicting params: {err}");
+
+    // Flow rule: worktree + githubUrl ("pick a repo") is rejected up front
+    // with the structured payload — validation fires before any clone, so no
+    // network is touched.
+    let err = wss_rpc_err(
+        &mut ws,
+        8,
+        "workspace.create",
+        json!({
+            "title": "EE Worktree GitHub E2E",
+            "githubUrl": "https://github.com/intent-hq/example",
+            "executionEnvironment": "worktree",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "worktree + githubUrl: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable"),
+        "structured payload: {err}"
+    );
+    assert_eq!(err["data"]["environment"], json!("worktree"));
+    assert!(
+        err["data"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("local repository copy")),
+        "reason names the flow rule: {err}"
+    );
+
+    // Flow rule: worktree + isNewRepo ("new repo") — same structured
+    // rejection.
+    let err = wss_rpc_err(
+        &mut ws,
+        9,
+        "workspace.create",
+        json!({
+            "title": "EE Worktree NewRepo E2E",
+            "repositoryPath": daemon.scratch.join("fresh-repo").to_string_lossy(),
+            "isNewRepo": true,
+            "executionEnvironment": "worktree",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "worktree + isNewRepo: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable")
+    );
+    assert_eq!(err["data"]["environment"], json!("worktree"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Scenario H2 — explicit `executionEnvironment: "cow"` over WSS on a
+/// CoW-capable filesystem: enabling `sandbox.cow.enabled` makes the selection
+/// pass validation and provision a standalone `CoW` clone with the selection
+/// persisted. Gated on `CoW` support.
+#[tokio::test]
+async fn workspace_create_explicit_cow_environment_over_wss() {
+    const TEST: &str = "workspace.create explicit-cow WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("eecow");
+    let (daemon, port, cfg) = boot(&root, &[]).await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_sandbox_setting(&mut ws, 1, "sandbox.cow.enabled", json!(true)).await;
+    // cowIsolation stays OFF: the explicit selection alone drives CoW.
+    set_cow_isolation(&mut ws, 2, false).await;
+
+    let result = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.create",
+        json!({
+            "title": "EE Explicit CoW E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "cow",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let workspace = &result["workspace"];
+    assert_eq!(
+        workspace["checkoutMode"],
+        json!("cow"),
+        "explicit cow provisions a CoW clone with cowIsolation off: {workspace}"
+    );
+    assert_eq!(workspace["executionEnvironment"], json!("cow"));
+    let wt_path = PathBuf::from(workspace["worktreePath"].as_str().expect("worktreePath"));
+    assert!(
+        wt_path.join(".git").is_dir(),
+        "standalone clone (not a worktree gitfile)"
+    );
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Scenario H3 — explicit `executionEnvironment: "cow"` with the clone forced
+/// to fail as unsupported mid-flight (same daemon seam as Scenario B2): the
+/// explicit selection must NOT silently fall back to a worktree — the create
+/// fails `-32602` with the structured `execution-environment-unavailable`
+/// payload. Gated on `CoW` support (the probe must pass for the mid-flight arm
+/// to be reachable).
+#[tokio::test]
+async fn workspace_create_explicit_cow_never_falls_back_over_wss() {
+    const TEST: &str = "workspace.create explicit-cow no-fallback WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("eecownf");
+    let (daemon, port, cfg) = boot(
+        &root,
+        &[("INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH", "source-repo")],
+    )
+    .await;
+    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_sandbox_setting(&mut ws, 1, "sandbox.cow.enabled", json!(true)).await;
+
+    let err = wss_rpc_err(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "EE CoW No-Fallback E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "cow",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "explicit cow fails: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable"),
+        "structured payload instead of a silent worktree fallback: {err}"
+    );
+    assert_eq!(err["data"]["environment"], json!("cow"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Scenario I — uniform per-agent isolation in `executionEnvironment: "cow"`
+/// workspaces: a TOP-LEVEL `agent.create` agent (not a delegate) provisions a
+/// per-agent `CoW` sandbox synchronously at first spawn, runs with the sandbox
+/// as its cwd (mock `echoCwd`), and its work merges back into the workspace
+/// checkout on turn end (`sandbox:cow:merged`) exactly like a delegate's.
+/// Gated on git + `CoW` + node/mock fixture.
+#[tokio::test]
+async fn top_level_agent_in_cow_workspace_gets_sandbox_and_merges_over_wss() {
+    const TEST: &str = "agent.create cow-workspace per-agent sandbox WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let Some(script) = mock_gate(TEST) else {
+        return;
+    };
+    let root = scratch_dir("sbtop");
+    // Delay the turn so the test can write a file into the sandbox while the
+    // turn is still in flight (before agent:idle triggers the auto-merge).
+    let behavior =
+        json!({ "delayMs": 8000, "response": "top-level done", "echoCwd": true }).to_string();
+    let extra: [(&str, &str); 2] = [
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let (daemon, port, cfg) = boot(&root, &extra).await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    set_sandbox_setting(&mut rpc, 1, "sandbox.cow.enabled", json!(true)).await;
+
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Uniform Isolation E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "cow",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let workspace = &created["workspace"];
+    let ws_id = workspace["id"].as_str().expect("workspace id").to_string();
+    assert_eq!(workspace["executionEnvironment"], json!("cow"));
+    let checkout = PathBuf::from(workspace["worktreePath"].as_str().expect("worktreePath"));
+
+    // SUBSCRIBER conn — sandbox:* BEFORE the turn starts.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["sandbox:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // TOP-LEVEL create (no delegation, no isolation param anywhere).
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Top Level", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "do isolated work" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // ensure_started provisions synchronously at spawn, so the sandbox
+    // directory appears at the deterministic per-agent layout well before the
+    // (delayed) turn ends.
+    let sandbox_path = root
+        .join(&ws_id)
+        .join("sandboxes")
+        .join(&agent_id)
+        .join("source-repo");
+    let mut provisioned = false;
+    for _ in 0..120 {
+        if sandbox_path.join(".git").is_dir() {
+            provisioned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        provisioned,
+        "top-level agent's per-agent sandbox provisioned at {}",
+        sandbox_path.display()
+    );
+
+    // Write a change INTO the sandbox while the delayed turn is in flight —
+    // the turn-end auto-merge must carry it back to the workspace checkout.
+    std::fs::write(
+        sandbox_path.join("top-level-work.txt"),
+        "from the sandbox\n",
+    )
+    .expect("write into sandbox");
+
+    // sandbox:cow:merged — turn-end merge-back applies to top-level agents.
+    let mut canonical_head = None;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 60).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "sandbox:cow:merged" {
+            assert_eq!(ev["data"]["workspaceId"], json!(ws_id));
+            assert_eq!(ev["data"]["agentId"], json!(agent_id));
+            canonical_head = Some(
+                ev["data"]["canonicalHead"]
+                    .as_str()
+                    .expect("canonicalHead")
+                    .to_string(),
+            );
+            break;
+        }
+    }
+    let canonical_head = canonical_head.expect("sandbox:cow:merged event delivered");
+
+    assert!(
+        checkout.join("top-level-work.txt").exists(),
+        "top-level agent's sandbox work merged into the workspace checkout"
+    );
+    assert_eq!(
+        run_git(&["rev-parse", "HEAD"], &checkout),
+        canonical_head,
+        "checkout HEAD is the post-merge canonicalHead"
+    );
+    assert_ne!(
+        canonical_head, head_sha,
+        "merge advanced the canonical HEAD past the base"
+    );
+
+    // The agent actually RAN in the sandbox: the mock child echoed its cwd.
+    let echoed = poll_echoed_cwd(&mut rpc, 100, &agent_id).await;
+    let expected = std::fs::canonicalize(&sandbox_path).expect("sandbox exists");
+    let actual = std::fs::canonicalize(&echoed).unwrap_or_else(|_| PathBuf::from(&echoed));
+    assert_eq!(
+        actual, expected,
+        "top-level agent spawned with the sandbox as cwd, got {echoed}"
+    );
+
+    // Persistent lifecycle: the sandbox survives the clean merge.
+    assert!(
+        sandbox_path.exists(),
+        "sandbox directory persists after a clean merge"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);

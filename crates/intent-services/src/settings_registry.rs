@@ -63,6 +63,14 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "workspace.defaultShell",
     "workspace.cowIsolation",
     "git.autoCommit",
+    "sandbox.defaultType",
+    "sandbox.direct.enabled",
+    "sandbox.worktree.enabled",
+    "sandbox.cow.enabled",
+    "sandbox.microvm.enabled",
+    "sandbox.microvm.image",
+    "sandbox.microvm.vcpus",
+    "sandbox.microvm.memMib",
     "mcp.enableUserServers",
     "mcp.disabledServers",
     "notifications.enabled",
@@ -358,7 +366,6 @@ impl SettingsRegistry {
     }
 
     /// All dotted wire paths the registry manages.
-    #[cfg(test)]
     pub(crate) fn known_paths() -> &'static [&'static str] {
         KNOWN_PATHS
     }

@@ -319,12 +319,27 @@ pub(crate) struct SpecialistPromptInjection {
 /// not just the workspace cowIsolation setting, so it reflects what the agent is
 /// actually running under.
 ///
-/// Hint matrix (per spec line 104-110):
-/// - Sandboxed implementor (`session.sandbox_path` present + specialist="implementor"):
-///   isolation context block with sandbox path, branch, base commit, caches-warm
-///   notice, branch-switching warning, and conflict-bounce resolution instructions.
-/// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
-///   direct-mode + `cow_supported=true`): parallel delegation safety guidance.
+/// Hint matrix (per spec line 104-110; microVM per monorepo#1120, EE-5):
+/// - microVM workspace (`workspace.execution_environment=microvm`): every agent
+///   runs inside its own VM with a `CoW` workspace clone mounted at the guest
+///   workspace dir, so all agents get a microVM isolation block. Checked first:
+///   the session's sandbox fields hold host-side paths that are meaningless
+///   inside the guest.
+/// - Sandboxed agent (`session.sandbox_path` present, any specialist): isolation
+///   context block with sandbox path, branch, base commit, caches-warm notice,
+///   branch-switching warning, and conflict-bounce resolution instructions. Keyed
+///   off `sandbox_path` alone — every sandboxed agent must know about the no-branch-
+///   switch constraint and the bounce protocol, not just implementors.
+/// - Coordinator in a sandbox-eligible workspace (specialist
+///   "coordinator"/"spec-writer"): parallel delegation safety guidance.
+///   Eligibility keys off the persisted `execution_environment` where set —
+///   the same authority the delegate path resolves isolation from — so prompt
+///   and provisioning cannot disagree: `cow` fires (uniform per-agent
+///   isolation; the hint states EVERY agent runs in its own sandbox and the
+///   param/setting are ignored), `direct`/`worktree` suppress. Legacy rows
+///   (unset environment) keep the derived predicate (`cow_supported=true` +
+///   direct mode or a standalone Cow/Direct checkout) and the delegate-scoped,
+///   param/setting-driven wording.
 /// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
 pub(crate) fn build_isolation_hint(
     workspace: Option<&intent_core::Workspace>,
@@ -344,31 +359,72 @@ pub(crate) fn build_isolation_hint(
     // calls resolve to the latest.
     let harness = session_harness_entry(agent_session).harness;
 
-    // Case 1: Sandboxed implementor — inject isolation context
-    if is_sandboxed && specialist_name.eq_ignore_ascii_case("implementor") {
+    // Case 1: microVM workspace — every agent runs isolated in its own VM
+    if workspace
+        .is_some_and(|ws| ws.execution_environment == Some(intent_core::SandboxType::Microvm))
+    {
+        return Some(harness.microvm_isolation_hint(crate::microvm::GUEST_WORKSPACE_DIR));
+    }
+
+    // Case 2: Sandboxed agent — inject isolation context. Keyed off
+    // session.sandbox_path presence alone: any sandboxed agent (implementor or
+    // not, specialist absent or not) must know it is in a sandbox, must not
+    // switch branches, and must understand the conflict-bounce protocol.
+    if is_sandboxed {
         let session = agent_session?;
         let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
         let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");
         return Some(harness.sandboxed_implementor_hint(sandbox_path, sandbox_branch));
     }
 
-    // Case 2: Coordinator in CoW-enabled direct-mode workspace
-    // "spec-writer" is the coordinator specialist (per SPECIALISTS constant in FE)
+    // Case 3: Coordinator in a sandbox-eligible CoW-capable workspace.
+    // "spec-writer" is the coordinator specialist (per SPECIALISTS constant in FE).
+    // Eligibility keys off the workspace's persisted `execution_environment`
+    // where available — the same authority the delegate path in agent_ops.rs
+    // resolves isolation from — so prompt and provisioning cannot disagree:
+    // `cow` fires the hint (every agent is sandboxed there; `microvm` never
+    // reaches Case 3 — Case 1 returns first), `direct`/`worktree` suppress it
+    // (no delegate sandboxes regardless of param or setting). Legacy rows
+    // (`execution_environment` unset, pre-v3.3) keep the derived predicate:
+    // direct-mode workspaces (no worktree or skip_worktree=true, with a
+    // repository path) AND standalone-checkout workspaces (checkoutMode ==
+    // cow|direct with a worktree_path) provision delegate sandboxes there.
     if specialist_name.eq_ignore_ascii_case("coordinator")
         || specialist_name.eq_ignore_ascii_case("spec-writer")
     {
         if let Some(ws) = workspace {
-            // Direct mode: skip_worktree=true OR worktree_path=None
-            let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
+            let is_direct_mode =
+                (ws.skip_worktree || ws.worktree_path.is_none()) && ws.repository_path.is_some();
+            let is_standalone_checkout = matches!(
+                ws.checkout_mode,
+                Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
+            ) && ws.worktree_path.is_some();
             let cow_supported = ws.cow_supported.unwrap_or(false);
+            let eligible = match ws.execution_environment {
+                Some(intent_core::SandboxType::Cow) => true,
+                Some(_) => false,
+                None => (is_direct_mode || is_standalone_checkout) && cow_supported,
+            };
 
-            if is_direct_mode && cow_supported {
-                return Some(harness.coordinator_cow_hint());
+            if eligible {
+                // `executionEnvironment: cow` workspaces provision a per-agent
+                // sandbox for EVERY agent at spawn (`ensure_started`), not
+                // just delegates — the clarification must say so. A legacy
+                // CoW checkout without the persisted `cow` environment keeps
+                // the delegate-scoped wording (only delegates are sandboxed
+                // there). Wording is harness-owned (H2); gating stays here.
+                let uniform_isolation =
+                    ws.execution_environment == Some(intent_core::SandboxType::Cow);
+                let standalone_cow_checkout =
+                    ws.checkout_mode == Some(intent_core::CheckoutMode::Cow);
+                return Some(
+                    harness.coordinator_cow_hint(uniform_isolation, standalone_cow_checkout),
+                );
             }
         }
     }
 
-    // Case 3: Worktree mode or shared-mode direct — no hint (behavior unchanged)
+    // Case 4: Worktree mode or shared-mode direct — no hint (behavior unchanged)
     None
 }
 
@@ -795,6 +851,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         }

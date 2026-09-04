@@ -316,6 +316,7 @@ async fn seed_workspace_and_task_note(data_dir: &Path) -> String {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            execution_environment: None,
         })
         .await
         .expect("insert ws");

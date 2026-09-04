@@ -38,8 +38,9 @@ async-recursion = "1.1"
 toml_edit = "0.25.5"
 tempfile = "3"
 reqwest.workspace = true
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 sha2 = "0.11"
+thiserror = { workspace = true }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 croner = "3.0.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

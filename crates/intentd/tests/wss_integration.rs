@@ -187,6 +187,9 @@ async fn make_services(
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    // Wire a settings registry over a hermetic config.toml (matching the
+    // production composition root), so TOML-backed `settings.*` /
+    // `sandbox.profiles.*` writes persist and are served back.
     let registry = Arc::new(
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
@@ -4501,6 +4504,194 @@ async fn wss_system_capabilities_reports_cow_supported() {
         result.get("cowSupported").is_some_and(Value::is_boolean),
         "cowSupported present as a boolean when the probe ran (hermetic root exists): {resp}"
     );
+    // `microvmSupported` (§5.7, v4.1): platform check AND cowSupported. On an
+    // incapable platform it is always false; on a capable one it mirrors
+    // cowSupported — either way it is a boolean here (probe ran).
+    assert!(
+        result
+            .get("microvmSupported")
+            .is_some_and(Value::is_boolean),
+        "microvmSupported present as a boolean when the probe ran: {resp}"
+    );
+    srv.ws.stop().await;
+}
+
+/// `sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options`
+/// (PROTOCOL §5.5b, v4.1): daemon-global (no workspaceId) execution
+/// environment profile surface. Asserts the documented result shapes, the
+/// update round-trip through the settings registry, and -32602 on a bad
+/// update.
+#[tokio::test]
+async fn wss_sandbox_profiles_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Defaults: worktree preselected, direct/worktree enabled, cow/microvm off.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"sandbox.profiles.list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 1);
+    assert_eq!(resp["result"]["defaultType"], "worktree", "{resp}");
+    let profiles = resp["result"]["profiles"].as_array().expect("profiles");
+    assert_eq!(profiles.len(), 4, "{resp}");
+    assert_eq!(profiles[0]["type"], "direct");
+    assert_eq!(profiles[3]["type"], "microvm");
+    assert_eq!(profiles[3]["image"], Value::Null, "{resp}");
+
+    // Update: enable cow and make it the default in one batch.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"sandbox.profiles.update","params":{"defaultType":"cow","profiles":{"cow":{"enabled":true}}}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["defaultType"], "cow", "{resp}");
+    assert_eq!(resp["result"]["profiles"][2]["enabled"], true, "{resp}");
+
+    // Options: capability-resolved matrix; reason present exactly when
+    // unavailable, and the moved default is reflected.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"sandbox.options","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["defaultType"], "cow", "{resp}");
+    let options = resp["result"]["options"].as_array().expect("options");
+    assert_eq!(options.len(), 4, "{resp}");
+    for opt in options {
+        let available = opt["available"].as_bool().expect("available");
+        assert_eq!(
+            opt.get("reason").is_some(),
+            !available,
+            "reason present exactly when unavailable: {opt}"
+        );
+    }
+    assert_eq!(options[0]["available"], true, "direct always available");
+    assert_eq!(options[1]["available"], true, "worktree always available");
+
+    // Bad update (unknown type) → -32602, nothing applied.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"sandbox.profiles.update","params":{"profiles":{"vm":{"enabled":true}}}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+
+    srv.ws.stop().await;
+}
+
+/// `sandbox.image.check` (PROTOCOL §5.5b, v4.8): dry-run guest-image validity
+/// check — daemon-global, no workspaceId. Asserts the documented result shape
+/// on both outcomes (`valid: true` with manifest metadata; `valid: false`
+/// with a structured error — fetch failures are results, not RPC errors) and
+/// `-32602` on a missing `manifestUrl`.
+#[tokio::test]
+async fn wss_sandbox_image_check() {
+    use std::io::{Read, Write};
+
+    // Minimal fixture HTTP server: a conforming manifest at /manifest.json.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let manifest_body = serde_json::json!({
+        "schema": 1,
+        "id": "intent-guest-base",
+        "version": "9.9.9",
+        "arch": "aarch64",
+        "rootfs": {
+            "url": format!("{base}/rootfs.tar.xz"),
+            "format": "tar.xz",
+            "sha256": "a".repeat(64),
+        },
+        "vsockExec": {
+            "init": "/usr/local/bin/intent-init",
+            "port": 4088,
+            "protocol": "intent-exec/1",
+        },
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                manifest_body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(manifest_body.as_bytes());
+        }
+    });
+
+    let srv = start(WsOptions::default()).await;
+
+    // Valid manifest → { valid: true, imageId, version, arch }.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sandbox.image.check","params":{{"manifestUrl":"{base}/manifest.json"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["valid"], true, "{resp}");
+    assert_eq!(resp["result"]["imageId"], "intent-guest-base", "{resp}");
+    assert_eq!(resp["result"]["version"], "9.9.9", "{resp}");
+    assert_eq!(resp["result"]["arch"], "aarch64", "{resp}");
+    // manifestSha256: hex sha of the fetched document — the pin to save.
+    assert!(
+        resp["result"]["manifestSha256"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())),
+        "{resp}"
+    );
+
+    // Unreachable URL → { valid: false, error } (a result, not an RPC error).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"sandbox.image.check","params":{"manifestUrl":"http://127.0.0.1:1/manifest.json"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["valid"], false, "{resp}");
+    assert!(
+        resp["result"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("failed to fetch image manifest")),
+        "{resp}"
+    );
+
+    // Pin mismatch → { valid: false, error } naming the sha mismatch.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"sandbox.image.check","params":{{"manifestUrl":"{base}/manifest.json","sha256":"{}"}}}}"#,
+            "b".repeat(64)
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["valid"], false, "{resp}");
+    assert!(
+        resp["result"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("sha256 mismatch")),
+        "{resp}"
+    );
+
+    // Missing manifestUrl → -32602.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"sandbox.image.check","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+
     srv.ws.stop().await;
 }
 
@@ -7250,6 +7441,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     }

@@ -295,6 +295,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             active_pull_request: None,
             pull_requests: None,
             context_links: None,
+            execution_environment: None,
             archived: false,
             archived_at: None,
             task_stats: None,

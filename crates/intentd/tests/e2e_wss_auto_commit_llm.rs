@@ -346,6 +346,7 @@ async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) ->
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     };

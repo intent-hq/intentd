@@ -412,6 +412,7 @@ mod tests {
 
     fn test_workspace(ws_id: &WorkspaceId, ts: &str) -> Workspace {
         Workspace {
+            execution_environment: None,
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),

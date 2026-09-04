@@ -29,6 +29,7 @@ use super::{
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
+use crate::microvm::{MicrovmVm, GUEST_WORKSPACE_DIR};
 use crate::Services;
 
 /// `SQLite` db inside an RAII temp dir: the dir sweep (on drop, including on
@@ -1092,6 +1093,7 @@ async fn process_cap_events_queued_resumed_evicted() {
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     };
@@ -1463,6 +1465,7 @@ fn mock_handle() -> AgentHandle {
         notifications: Arc::new(TokioMutex::new(note_rx)),
         serve_task: tokio::spawn(async {}),
         child: None,
+        vm: None,
         child_pid: None,
         _mcp_bridge: None,
         _mcp_config: None,
@@ -3413,6 +3416,47 @@ async fn stop_many_fence_blocks_lazy_respawn_until_dropped() {
     );
 }
 
+/// Isolation-bypass regression: a store ERROR on the workspace read in
+/// `ensure_started` must FAIL the spawn — never read as "no workspace",
+/// which would skip sandbox provisioning and spawn a microvm-workspace
+/// agent as an unsandboxed host child. Only a genuine `NotFound` proceeds
+/// without a workspace.
+#[tokio::test]
+async fn ensure_started_store_error_on_workspace_read_fails_spawn() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-store-err");
+    let agent_id = AgentId::from("a-store-err");
+    let mut workspace = super::role_reminder_tests::workspace(&ws);
+    workspace.execution_environment = Some(intent_core::SandboxType::Microvm);
+    mgr.services
+        .store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+    mgr.services
+        .store
+        .insert_agent_session(&super::role_reminder_tests::session(&agent_id, &ws, None))
+        .await
+        .expect("insert session");
+    // Break every `workspace` read while keeping the rows (SQLite rewrites
+    // FK references on rename) — the session read still succeeds, so the
+    // failure is pinned to the workspace lookup.
+    sqlx::query("ALTER TABLE workspace RENAME TO workspace_gone")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("rename workspace table");
+
+    let err = mgr
+        .ensure_started(&agent_id, &ws)
+        .await
+        .expect_err("a store error must fail the spawn, not skip provisioning");
+    assert!(
+        matches!(&err, Error::Internal(m) if m.contains("get workspace failed")),
+        "the workspace read's store error propagates, got: {err:?}"
+    );
+    assert!(mgr.is_empty(), "no handle installed for the failed spawn");
+}
+
 /// Signal-0 liveness probe used by the process-group teardown test.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
@@ -3519,6 +3563,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     };
@@ -3747,6 +3792,7 @@ fn track_mock_agent_inner(
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
             child: None,
+            vm: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -3869,6 +3915,7 @@ fn track_mock_agent_prompt_rpc_error(
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            vm: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -4141,6 +4188,7 @@ async fn seed_agent_with_task_graph(
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     };
@@ -4631,6 +4679,109 @@ async fn start_session_carries_session_mcp_servers_on_session_load() {
     let servers = params["mcpServers"].as_array().expect("mcpServers array");
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0]["name"], json!("workspace-mcp"));
+}
+
+/// Mark an already-tracked handle as a microVM agent by stashing a stub
+/// [`crate::microvm::MicrovmVm`] on it (no helper child, nonexistent state
+/// paths — the Drop scrub tolerates missing paths). `start_session` keys the
+/// guest-cwd translation on `_vm.is_some()`, which is all these tests need.
+fn mark_handle_microvm(mgr: &AgentManager, id: &AgentId) {
+    let stub_root =
+        std::env::temp_dir().join(format!("intentd-test-vmstub-{}", uuid::Uuid::new_v4()));
+    let vm = MicrovmVm {
+        vm_dir: stub_root.join("vm"),
+        rootfs: stub_root.join("vm/rootfs"),
+        exec_sock: stub_root.join("exec.sock"),
+        child: None,
+        rotation_watcher: None,
+        boot_ms: 0,
+        stop_event: None,
+    };
+    mgr.handles.lock().unwrap().get_mut(id).unwrap().vm = Some(vm);
+}
+
+/// microVM agents run the provider INSIDE the guest, where the `CoW` sandbox is
+/// virtio-fs-mounted at [`GUEST_WORKSPACE_DIR`] — the host sandbox path does
+/// not exist there, and providers that validate the session cwd (auggie's
+/// workspace root) die before producing any output. `session/new` must carry
+/// the guest path, never the host sandbox path.
+#[tokio::test]
+async fn microvm_start_session_carries_guest_cwd_on_session_new() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-vm-new"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mark_handle_microvm(&mgr, &id);
+
+    mgr.start_session(&id, PathBuf::from("/tmp/host-sandbox"), &test_provider())
+        .await
+        .expect("first session");
+
+    let log = log.lock().unwrap();
+    let (_, params) = log
+        .iter()
+        .find(|(m, _)| m == "session/new")
+        .expect("session/new sent");
+    assert_eq!(
+        params["cwd"],
+        json!(GUEST_WORKSPACE_DIR),
+        "microVM session/new must carry the guest workspace path"
+    );
+}
+
+/// The same guest-cwd translation applies to the `session/load` resume path.
+#[tokio::test]
+async fn microvm_start_session_carries_guest_cwd_on_session_load() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-vm-load"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "existing-id")
+        .await
+        .unwrap();
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, true);
+    mark_handle_microvm(&mgr, &id);
+
+    mgr.start_session(&id, PathBuf::from("/tmp/host-sandbox"), &test_provider())
+        .await
+        .expect("resume");
+
+    let log = log.lock().unwrap();
+    let (_, params) = log
+        .iter()
+        .find(|(m, _)| m == "session/load")
+        .expect("session/load sent");
+    assert_eq!(
+        params["cwd"],
+        json!(GUEST_WORKSPACE_DIR),
+        "microVM session/load must carry the guest workspace path"
+    );
+}
+
+/// Host-exec agents (no VM on the handle) are untouched by the translation:
+/// their session params keep the host cwd.
+#[tokio::test]
+async fn host_start_session_keeps_host_cwd() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-host-cwd"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+
+    mgr.start_session(&id, PathBuf::from("/tmp/host-sandbox"), &test_provider())
+        .await
+        .expect("first session");
+
+    let log = log.lock().unwrap();
+    let (_, params) = log
+        .iter()
+        .find(|(m, _)| m == "session/new")
+        .expect("session/new sent");
+    assert_eq!(
+        params["cwd"],
+        json!("/tmp/host-sandbox"),
+        "host agents keep the host cwd in session params"
+    );
 }
 
 /// Under the shipped `AllowAll` default, `start_session` best-effort asks the
@@ -6279,6 +6430,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
             child: None,
+            vm: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -9120,6 +9272,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     };
@@ -12902,6 +13055,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     };
@@ -13019,6 +13173,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
         display_status: None,
         waiting: false,
         checkout_mode: Some(intent_core::CheckoutMode::Direct),
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     };
@@ -13407,6 +13562,7 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         active_pull_request: None,
         pull_requests: None,
         context_links: None,
+        execution_environment: None,
         archived: false,
         archived_at: None,
         task_stats: None,
@@ -13786,6 +13942,7 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     };
@@ -15701,6 +15858,7 @@ mod harness_wake_tests {
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
             child: None,
+            vm: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,

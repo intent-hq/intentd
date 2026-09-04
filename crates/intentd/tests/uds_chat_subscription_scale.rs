@@ -178,6 +178,7 @@ fn seed_workspace(idx: usize) -> Workspace {
         active_pull_request: None,
         pull_requests: None,
         context_links: None,
+        execution_environment: None,
         archived: false,
         archived_at: None,
         task_stats: None,

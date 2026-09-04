@@ -58,6 +58,7 @@ pub(crate) const PRELUDE: &str = r"
         },
         listSpecialists: () => host({ method: 'agent.listSpecialists', args: {} }),
         status: (agentId) => host({ method: 'agent.status', args: { agentId } }),
+        mergeSandbox: (agentId) => host({ method: 'agent.mergeSandbox', args: { agentId } }),
         getQueue: (agentId) => host({ method: 'agent.getQueue', args: { agentId } }),
         removeQueuedMessage: (agentId, messageId) =>
             host({ method: 'agent.removeQueuedMessage', args: { agentId, messageId } }),
@@ -134,6 +135,7 @@ pub(crate) async fn dispatch(
         "list" => list(api, ws, args).await,
         "listSpecialists" => list_specialists(api, ws).await,
         "status" => status(api, ws, args).await,
+        "mergeSandbox" => merge_sandbox(api, ws, args).await,
         "getQueue" => get_queue(api, ws, args).await,
         "removeQueuedMessage" => remove_queued_message(api, ws, caller, args).await,
         "diagnostics" => diagnostics(api, ws, args).await,
@@ -195,6 +197,21 @@ async fn create(
     }
     if let Some(tn) = &task_note_id {
         metadata.insert("taskNoteId".to_string(), Value::String(tn.clone()));
+    }
+    // Advisory when the workspace is not CoW-capable: the flag is persisted
+    // onto the child's metadata but no sandbox ever exists to honor it, so
+    // passing it never errors (accept-and-ignore).
+    if let Some(m) = opt_bool(args, "mergeOnTurnEnd") {
+        metadata.insert("mergeOnTurnEnd".to_string(), Value::Bool(m));
+    }
+    // Per-agent microVM sizing (advisory on non-microVM workspaces, like
+    // mergeOnTurnEnd): validated here so invalid input errors at create
+    // time, then persisted on metadata for the spawn path to resolve.
+    if let Some(vm) = parse_vm_resources(args)? {
+        metadata.insert(
+            "vmResources".to_string(),
+            serde_json::to_value(vm).unwrap_or(Value::Null),
+        );
     }
     let extra = AgentCreateExtra {
         metadata: Some(Value::Object(metadata)),
@@ -542,6 +559,12 @@ async fn delegate(
         wait_mode: opt_str(args, "waitMode"),
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
         isolation: opt_str(args, "isolation"),
+        // Advisory when the workspace is not CoW-capable: accepted and
+        // ignored (no sandbox exists to honor it), never an error.
+        merge_on_turn_end: opt_bool(args, "mergeOnTurnEnd"),
+        // Per-agent microVM sizing (advisory on non-microVM workspaces);
+        // parse errors surface here, bounds are validated by the op.
+        vm_resources: parse_vm_resources(args)?,
         force: opt_bool(args, "force"),
         tasks,
         // Presence-sensitive: `greedy` is REMOVED and any supplied value
@@ -553,6 +576,21 @@ async fn delegate(
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))
+}
+
+/// Parse and bounds-validate the optional `vmResources: { vcpus?, memMib? }`
+/// arg shared by `ws.agent.create` and `ws.agent.delegate`. `None` when the
+/// key is absent or null; a malformed shape or out-of-range value errors at
+/// call time (never at VM boot).
+fn parse_vm_resources(args: &Value) -> Result<Option<intent_core::VmResources>, String> {
+    let raw = match args.get("vmResources") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let vm: intent_core::VmResources = serde_json::from_value(raw.clone())
+        .map_err(|e| format!("vmResources: expected {{ vcpus?, memMib? }}: {e}"))?;
+    vm.validate().map_err(|e| e.to_string())?;
+    Ok(Some(vm))
 }
 
 /// Resolve the effective delivery priority for `ws.agent.send` /
@@ -1055,6 +1093,9 @@ async fn require_active_target(
 /// by `agent.get`/`agent.list` is untouched. Queue entries use the
 /// `getQueue` presentation (drain order, lifted attribution) with `content`
 /// truncated to [`STATUS_QUEUE_PREVIEW_MAX_CHARS`] chars (`…` appended).
+/// For sandboxed agents (`metadata.sandboxPath` set) the sandbox record's
+/// merge state is merged in too (`sandboxStatus` + `mergeOnTurnEnd`) — one
+/// cheap store lookup, best-effort (a lookup failure never fails status).
 async fn status(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -1063,12 +1104,67 @@ async fn status(
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
     let agent = require_active_target(api, ws, &agent_id).await?;
+    let sandboxed = agent.metadata.sandbox_path.is_some();
     let mut out = serde_json::to_value(agent).map_err(|e| e.to_string())?;
     let queue = fetch_presented_queue(api, ws, &agent_id).await?;
     let queue: Vec<Value> = queue.into_iter().map(truncate_entry_content).collect();
     if let Some(obj) = out.as_object_mut() {
         obj.insert("queueLength".to_string(), json!(queue.len()));
         obj.insert("queue".to_string(), Value::Array(queue));
+    }
+    if sandboxed {
+        if let Ok(sandbox) = api.sandbox_get(ws.clone(), agent_id).await {
+            if let (Some(obj), Some(sb)) = (out.as_object_mut(), sandbox.as_object()) {
+                if let Some(status) = sb.get("status") {
+                    obj.insert("sandboxStatus".to_string(), status.clone());
+                }
+                if let Some(merge) = sb.get("mergeOnTurnEnd") {
+                    obj.insert("mergeOnTurnEnd".to_string(), merge.clone());
+                }
+                // Terminal-conflict context: present only while the row is
+                // in the terminal `conflict` status.
+                if let Some(paths) = sb.get("conflictingPaths") {
+                    obj.insert("sandboxConflictingPaths".to_string(), paths.clone());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `ws.agent.mergeSandbox(agentId)`: start a sandbox merge-back for a
+/// sandboxed agent — the MCP face of the `sandbox.cow.merge` RPC. The
+/// primary consumer is a parent that delegated with `mergeOnTurnEnd: false`
+/// and now wants the child's work in the workspace repo. ASYNC contract: a
+/// merge can take minutes on a large repo (far beyond the 30s eval budget),
+/// so the call acknowledges immediately with `status: "started"` (merge runs
+/// on a detached daemon task) or `"in_progress"` (another merge path already
+/// owns the sandbox). The outcome is observable via
+/// `ws.agent.status(agentId).sandboxStatus` (`merged` / `conflict` /
+/// `merge_pending` / unchanged on a dirty bounce) and the
+/// `sandbox:cow:merged` / `sandbox:cow:conflict` events. Errors surface for
+/// a missing sandbox.
+async fn merge_sandbox(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    // Workspace scoping: the target must resolve inside the caller's
+    // workspace before any merge is attempted (same defense-in-depth as
+    // getQueue/removeQueuedMessage).
+    let _ = api
+        .agent_get(agent_id.clone(), Some(ws.clone()))
+        .await
+        .map_err(map_err)?;
+    let v = api
+        .sandbox_merge(ws.clone(), agent_id)
+        .await
+        .map_err(map_err)?;
+    let mut out = merge_ok(v);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("agentId".to_string(), json!(agent_id_str));
     }
     Ok(out)
 }
@@ -2059,6 +2155,7 @@ mod tests {
                         active_pull_request: None,
                         pull_requests: None,
                         context_links: None,
+                        execution_environment: None,
                         archived: false,
                         archived_at: None,
                         task_stats: None,

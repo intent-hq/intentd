@@ -197,6 +197,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     }
@@ -22293,6 +22294,7 @@ mod rules {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -22439,6 +22441,7 @@ mod rules {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -22576,6 +22579,7 @@ mod rules {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -22708,6 +22712,7 @@ mod rules {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -22839,6 +22844,7 @@ mod rules {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -22975,6 +22981,7 @@ mod rules {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -23054,6 +23061,596 @@ mod rules {
         assert!(
             prompt.contains("/test/sandboxes/agent-1/test-repo"),
             "sandbox path included"
+        );
+    }
+
+    /// Round 3 addendum 9b: the sandbox hint keys off `session.sandbox_path`
+    /// presence alone — a sandboxed agent with a non-implementor (or absent)
+    /// specialist must still learn it is in a sandbox, the no-branch-switch
+    /// constraint, and the conflict-bounce protocol.
+    #[tokio::test]
+    async fn assembly_injects_sandbox_hint_for_non_implementor_sandboxed_agent() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Verify the work.".into()),
+            specialist_name: Some("Verifier".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+
+        let workspace = intent_core::Workspace {
+            pending_delete_at: None,
+            context_links: None,
+            waiting: false,
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/path".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: None,
+            scope: None,
+            skip_worktree: true,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(true),
+            display_status: None,
+            checkout_mode: None,
+            execution_environment: None,
+            disk_usage: None,
+        };
+
+        let agent_session = intent_core::AgentSession {
+            file_blocks: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            pending_delete_at: None,
+            id: intent_core::AgentId::from("agent-1"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("verifier".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            retired_at: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: Some("sandbox-1".into()),
+            sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
+            sandbox_branch: Some("sb/agent-1".into()),
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        // With a non-implementor specialist injection
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace),
+            Some(&agent_session),
+            None,
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("## Workspace Isolation"),
+            "sandbox hint for non-implementor sandboxed agent"
+        );
+        assert!(prompt.contains("Do NOT switch branches"), "branch warning");
+        assert!(
+            prompt.contains("woken with the conflicting paths"),
+            "conflict bounce protocol"
+        );
+
+        // With no specialist injection at all
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            None,
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace),
+            Some(&agent_session),
+            None,
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("## Workspace Isolation"),
+            "sandbox hint for sandboxed agent with no specialist"
+        );
+    }
+
+    /// Round 3 addendum 9a: Case 3's eligibility predicate matches the delegate
+    /// sandbox path — a coordinator in a standalone CoW-checkout workspace
+    /// (`checkoutMode=cow`, `worktree_path` set, `skip_worktree=false`) gets the
+    /// delegation-safety hint plus the checkout-level-isolation clarification.
+    #[tokio::test]
+    async fn assembly_injects_delegation_hint_for_coordinator_in_cow_checkout() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Plan and delegate.".into()),
+            specialist_name: Some("Coordinator".into()),
+            role_reminder: Some("Delegate to implementors.".into()),
+        };
+
+        // Standalone CoW-checkout workspace: worktree_path set, skip_worktree
+        // false — the old direct-mode-only predicate never fired here even
+        // though delegates ARE sandboxed (agent_ops is_standalone_checkout).
+        let workspace = intent_core::Workspace {
+            pending_delete_at: None,
+            context_links: None,
+            waiting: false,
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/checkout".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: Some("/test/checkout".into()),
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(true),
+            display_status: None,
+            checkout_mode: Some(intent_core::CheckoutMode::Cow),
+            execution_environment: None,
+            disk_usage: None,
+        };
+
+        let agent_session = intent_core::AgentSession {
+            file_blocks: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            pending_delete_at: None,
+            id: intent_core::AgentId::from("agent-coordinator"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Coordinator Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("spec-writer".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            retired_at: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace),
+            Some(&agent_session),
+            None,
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("## Agent Delegation & Isolation"),
+            "delegation header in CoW-checkout workspace"
+        );
+        assert!(prompt.contains("isolated CoW sandboxes"), "sandbox mention");
+        assert!(
+            prompt.contains("standalone CoW clone"),
+            "checkout-level isolation clarification for cow checkoutMode"
+        );
+        assert!(
+            prompt.contains("apply to your delegated agents"),
+            "legacy CoW checkout (no persisted cow environment): delegate-scoped wording"
+        );
+
+        // Uniform per-agent isolation variant: executionEnvironment=cow means
+        // EVERY agent (top-level included) is sandboxed at spawn — the
+        // clarification must say so instead of the delegate-scoped wording.
+        let workspace_uniform = intent_core::Workspace {
+            execution_environment: Some(intent_core::SandboxType::Cow),
+            ..workspace.clone()
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace_uniform),
+            Some(&agent_session),
+            None,
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("**Every agent** in this"),
+            "cow execution environment: uniform per-agent isolation wording"
+        );
+        assert!(
+            !prompt.contains("apply to your delegated agents"),
+            "delegate-scoped wording replaced under uniform isolation"
+        );
+        assert!(
+            prompt.contains("per-agent isolation is"),
+            "cow execution environment: lead states isolation is unconditional"
+        );
+        assert!(
+            !prompt.contains("`cowIsolation` setting defaults it"),
+            "cow execution environment: param/setting-driven lead wording replaced"
+        );
+
+        // Execution-environment authority: a persisted `direct` environment
+        // suppresses the hint even though the derived predicate (direct mode
+        // + cow_supported) would fire — the param/setting cannot sandbox
+        // delegates in such a workspace, so the prompt must not claim it.
+        let workspace_direct_env = intent_core::Workspace {
+            execution_environment: Some(intent_core::SandboxType::Direct),
+            ..workspace.clone()
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace_direct_env),
+            Some(&agent_session),
+            None,
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            !prompt.contains("## Agent Delegation & Isolation"),
+            "no delegation hint when execution environment is direct"
+        );
+
+        // Direct-checkout variant (checkoutMode=direct) also fires, but
+        // without the CoW-checkout clarification line.
+        let workspace_direct = intent_core::Workspace {
+            checkout_mode: Some(intent_core::CheckoutMode::Direct),
+            ..workspace.clone()
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace_direct),
+            Some(&agent_session),
+            None,
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("## Agent Delegation & Isolation"),
+            "delegation header in direct-checkout workspace"
+        );
+        assert!(
+            !prompt.contains("standalone CoW clone"),
+            "no checkout clarification for direct checkoutMode"
+        );
+
+        // Worktree-mode variant (checkoutMode=worktree) must NOT fire.
+        let workspace_worktree = intent_core::Workspace {
+            checkout_mode: Some(intent_core::CheckoutMode::Worktree),
+            ..workspace.clone()
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace_worktree),
+            Some(&agent_session),
+            None,
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            !prompt.contains("## Agent Delegation & Isolation"),
+            "no delegation hint in worktree-checkout workspace"
+        );
+    }
+
+    /// EE-5 (monorepo#1120): a microVM workspace injects the microVM isolation
+    /// hint for every agent — keyed off `workspace.execution_environment`, and it
+    /// wins over the `CoW` implementor hint (the session's sandbox fields hold
+    /// host-side paths that are meaningless inside the guest).
+    #[tokio::test]
+    async fn assembly_injects_microvm_hint_for_microvm_workspace() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Implement your task.".into()),
+            specialist_name: Some("Implementor".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+
+        // microVM workspace
+        let workspace = intent_core::Workspace {
+            pending_delete_at: None,
+            context_links: None,
+            waiting: false,
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/path".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: None,
+            scope: None,
+            skip_worktree: true,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(true),
+            display_status: None,
+            checkout_mode: None,
+            execution_environment: Some(intent_core::SandboxType::Microvm),
+            disk_usage: None,
+        };
+
+        // microVM agents also carry sandbox fields (host-side CoW clone the VM
+        // mounts); the microVM hint must still win over the CoW implementor hint.
+        let agent_session = intent_core::AgentSession {
+            file_blocks: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            pending_delete_at: None,
+            id: intent_core::AgentId::from("agent-1"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("implementor".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            retired_at: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: Some("sandbox-123".into()),
+            sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
+            sandbox_branch: Some("sb/agent-1".into()),
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace),
+            Some(&agent_session),
+            None,
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("## Workspace Isolation"),
+            "isolation header"
+        );
+        assert!(
+            prompt.contains("isolated sandbox (microVM)"),
+            "microVM mention"
+        );
+        assert!(
+            prompt.contains("`/workspace`"),
+            "guest workspace mountpoint"
+        );
+        assert!(
+            prompt.contains("copy-on-write clone of the canonical checkout"),
+            "CoW clone mention"
+        );
+        assert!(
+            prompt.contains("automatic merging of your changes back"),
+            "merge-back mention"
+        );
+        assert!(
+            prompt.contains("isolated at the filesystem level from other agents"),
+            "filesystem isolation mention"
+        );
+        assert!(
+            prompt.contains("host filesystem outside your workspace is not accessible"),
+            "host FS inaccessible"
+        );
+        // The CoW implementor hint must NOT fire (its host-side paths are
+        // meaningless inside the guest).
+        assert!(
+            !prompt.contains("isolated CoW (copy-on-write) sandbox"),
+            "no CoW implementor hint"
+        );
+        assert!(
+            !prompt.contains("/test/sandboxes/agent-1/test-repo"),
+            "no host sandbox path"
         );
     }
 }
@@ -23851,6 +24448,7 @@ mod known_repo {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         };
@@ -23971,6 +24569,24 @@ mod worktree_provisioning {
         let parents: Vec<&git2::Commit> = parent.iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
             .unwrap()
+    }
+
+    /// `INTENTD_WORKSPACES_DIR` mutation is process-global; tests that set it
+    /// serialize on this lock and restore via [`WsDirEnvGuard`].
+    static ENV_WS_DIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Restores (or removes) `INTENTD_WORKSPACES_DIR` on drop so a panic
+    /// mid-test cannot leak the override into other in-process tests.
+    struct WsDirEnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+    impl Drop for WsDirEnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("INTENTD_WORKSPACES_DIR", v),
+                None => std::env::remove_var("INTENTD_WORKSPACES_DIR"),
+            }
+        }
     }
 
     /// Init a git repo with one commit; returns (guard, head sha, head branch).
@@ -24513,20 +25129,6 @@ mod worktree_provisioning {
     /// process-global, hence the lock + drop-guard restore).
     #[tokio::test]
     async fn cow_supported_probes_default_root_when_none_injected() {
-        static ENV_WS_DIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        /// Restores (or removes) `INTENTD_WORKSPACES_DIR` on drop so a panic
-        /// mid-test cannot leak the override into other in-process tests.
-        struct WsDirEnvGuard {
-            prior: Option<std::ffi::OsString>,
-        }
-        impl Drop for WsDirEnvGuard {
-            fn drop(&mut self) {
-                match self.prior.take() {
-                    Some(v) => std::env::set_var("INTENTD_WORKSPACES_DIR", v),
-                    None => std::env::remove_var("INTENTD_WORKSPACES_DIR"),
-                }
-            }
-        }
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-cowcap-root");
@@ -24544,6 +25146,91 @@ mod worktree_provisioning {
             result.is_some(),
             "capability reported (true or false) even without an injected root"
         );
+    }
+
+    /// Regression (microVM agent spawn): `Services::provision_sandbox` must
+    /// resolve the workspaces root like its sibling consumers — injected
+    /// root, else `default_workspaces_root()` — instead of hard-erroring
+    /// with "`workspaces_root` not configured". Production daemons never call
+    /// `.with_workspaces_root()` (only tests do), so the hard error failed
+    /// every microVM agent spawn, the first real-daemon path through this
+    /// method. Guarded by `INTENTD_WORKSPACES_DIR` (env-var mutation is
+    /// process-global, hence the lock + drop-guard restore).
+    #[tokio::test]
+    async fn provision_sandbox_falls_back_to_default_root_when_none_injected() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _sha, _branch) = seed_repo("intentd-sbxroot-repo");
+        let root = unique_dir("intentd-sbxroot-root");
+
+        // Direct-mode workspace over the seeded repo (sandbox-eligible:
+        // repository_path set, no provisioned worktree).
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.repository_path = Some(repo_dir.0.to_string_lossy().to_string());
+        ws.repository_name = Some("Sbx Repo".to_string());
+        store.insert_workspace(&ws).await.expect("insert workspace");
+
+        let agent_id = AgentId::new();
+        let session = AgentSession {
+            file_blocks: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            pending_delete_at: None,
+            id: agent_id.clone(),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Sandbox Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            retired_at: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        };
+        store.insert_agent_session(&session).await.expect("session");
+
+        let svc = Services::new(store); // no .with_workspaces_root()
+        let outcome = {
+            let _lock = ENV_WS_DIR_LOCK.lock().await;
+            let _env = WsDirEnvGuard {
+                prior: std::env::var_os("INTENTD_WORKSPACES_DIR"),
+            };
+            std::env::set_var("INTENTD_WORKSPACES_DIR", &root.0);
+            svc.provision_sandbox(&ws_id, &agent_id).await
+        };
+        // Supported vs Unsupported depends on the temp filesystem's CoW
+        // capability; the regression is the hard error on a missing root.
+        outcome.expect("provision_sandbox resolves the default workspaces root");
     }
 
     /// `system.capabilities` (PROTOCOL §5.7): the trait method returns a plain
@@ -24568,6 +25255,240 @@ mod worktree_provisioning {
             obj.get("cowSupported").and_then(serde_json::Value::as_bool),
             svc.compute_cow_supported().await,
             "capability mirrors the shared workspaces-root probe"
+        );
+    }
+
+    /// `system.capabilities.microvmSupported` (§5.7): platform check `ANDed`
+    /// with the `CoW` probe. On a capable platform (macOS arm64 / Linux with
+    /// /dev/kvm) it mirrors `cowSupported`; on an incapable platform it is
+    /// `false` regardless.
+    #[tokio::test]
+    async fn system_capabilities_reports_microvm_supported() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-syscap-mvm-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let caps = svc.system_capabilities().await.expect("capabilities");
+        let obj = caps.as_object().expect("result is an object");
+        let cow = obj.get("cowSupported").and_then(serde_json::Value::as_bool);
+        let microvm = obj
+            .get("microvmSupported")
+            .and_then(serde_json::Value::as_bool);
+        // microVM is temporarily locked to macOS (Apple Silicon only); the
+        // Linux/KVM arm is disabled.
+        let platform_capable = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        if platform_capable {
+            assert_eq!(microvm, cow, "capable platform mirrors cowSupported");
+        } else {
+            assert_eq!(microvm, Some(false), "incapable platform is always false");
+        }
+    }
+
+    /// `sandbox.profiles.list` (§5.35): the default settings yield one row
+    /// per type in catalog order — direct/worktree enabled, cow/microvm
+    /// disabled, `defaultType: "worktree"`, a `null` microvm image, and the
+    /// default microvm VM sizing. Registry-less wiring serves schema
+    /// defaults (no error).
+    #[tokio::test]
+    async fn sandbox_profiles_list_serves_defaults() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store);
+
+        let result = svc.sandbox_profiles_list().await.expect("list");
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "defaultType": "worktree",
+                "profiles": [
+                    { "type": "direct", "enabled": true },
+                    { "type": "worktree", "enabled": true },
+                    { "type": "cow", "enabled": false },
+                    { "type": "microvm", "enabled": false, "image": null,
+                      "vcpus": 2, "memMib": 2048 },
+                ],
+            })
+        );
+    }
+
+    /// `sandbox.profiles.update` (§5.35): a batch update persists through the
+    /// settings registry and returns the updated list shape; an explicit
+    /// `image: null` clears the override; unknown types/fields → `InvalidParams`
+    /// with nothing applied.
+    #[tokio::test]
+    async fn sandbox_profiles_update_persists_and_validates() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        let svc = Services::new(store).with_settings_registry(registry.clone());
+
+        let result = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "defaultType": "cow",
+                "profiles": {
+                    "cow": { "enabled": true },
+                    "microvm": {
+                        "enabled": true,
+                        "image": { "manifestUrl": "https://example.com/m.json", "sha256": "abc" },
+                    },
+                },
+            }))
+            .await
+            .expect("update");
+        assert_eq!(result["defaultType"], "cow");
+        assert_eq!(result["profiles"][2]["enabled"], true);
+        assert_eq!(result["profiles"][3]["enabled"], true);
+        assert_eq!(
+            result["profiles"][3]["image"],
+            serde_json::json!({ "manifestUrl": "https://example.com/m.json", "sha256": "abc" })
+        );
+        // Persisted, not just echoed.
+        assert_eq!(
+            registry.get("sandbox.defaultType"),
+            Some(serde_json::json!("cow"))
+        );
+
+        // Explicit null clears the image override.
+        let result = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "microvm": { "image": null } },
+            }))
+            .await
+            .expect("clear image");
+        assert_eq!(result["profiles"][3]["image"], serde_json::Value::Null);
+
+        // Unknown type → InvalidParams, nothing applied.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "vm": { "enabled": true } },
+            }))
+            .await
+            .expect_err("unknown type rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+
+        // Unknown field → InvalidParams.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "cow": { "bogus": true } },
+            }))
+            .await
+            .expect_err("unknown field rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+
+        // image on a non-microvm type → InvalidParams.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "cow": { "image": { "manifestUrl": "u", "sha256": "s" } } },
+            }))
+            .await
+            .expect_err("image on cow rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+
+        // Schema invariant holds: disabling the current default fails.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "cow": { "enabled": false } },
+            }))
+            .await
+            .expect_err("disabling the default type rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("sandbox.defaultType"), "{msg}");
+
+        // VM sizing rides the microvm row: persisted and echoed.
+        let result = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "microvm": { "vcpus": 4, "memMib": 4096 } },
+            }))
+            .await
+            .expect("update sizing");
+        assert_eq!(result["profiles"][3]["vcpus"], 4);
+        assert_eq!(result["profiles"][3]["memMib"], 4096);
+        assert_eq!(
+            registry.get("sandbox.microvm.vcpus"),
+            Some(serde_json::json!(4))
+        );
+        assert_eq!(
+            registry.get("sandbox.microvm.memMib"),
+            Some(serde_json::json!(4096))
+        );
+
+        // Out-of-range sizing → InvalidParams (catalog min/max).
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "microvm": { "vcpus": 17 } },
+            }))
+            .await
+            .expect_err("out-of-range vcpus rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "microvm": { "memMib": 64 } },
+            }))
+            .await
+            .expect_err("out-of-range memMib rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+
+        // Sizing on a non-microvm type → InvalidParams.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "cow": { "vcpus": 4 } },
+            }))
+            .await
+            .expect_err("vcpus on cow rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+    }
+
+    /// `sandbox.options` (§5.35): joins the settings intent with host
+    /// capability — direct/worktree always available, `cow` gated on the `CoW`
+    /// probe, `microvm` on platform AND `CoW`; `reason` present exactly when
+    /// unavailable.
+    #[tokio::test]
+    async fn sandbox_options_resolves_availability() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-sbopt-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let cow_supported = svc.compute_cow_supported().await;
+        let result = svc.sandbox_options().await.expect("options");
+        assert_eq!(result["defaultType"], "worktree");
+        let options = result["options"].as_array().expect("options array");
+        assert_eq!(options.len(), 4);
+        for (i, ty) in ["direct", "worktree", "cow", "microvm"].iter().enumerate() {
+            assert_eq!(options[i]["type"], *ty);
+            assert_eq!(options[i]["default"], (*ty == "worktree"));
+            let available = options[i]["available"].as_bool().expect("available bool");
+            assert_eq!(
+                options[i].get("reason").is_some(),
+                !available,
+                "reason present exactly when unavailable: {}",
+                options[i]
+            );
+        }
+        // direct/worktree are unconditionally available.
+        assert_eq!(options[0]["available"], true);
+        assert_eq!(options[1]["available"], true);
+        // cow availability mirrors the probe.
+        assert_eq!(
+            options[2]["available"].as_bool(),
+            Some(cow_supported == Some(true))
+        );
+        // microvm is available only on a capable platform with CoW.
+        // microVM is temporarily locked to macOS (Apple Silicon only); the
+        // Linux/KVM arm is disabled.
+        let platform_capable = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        assert_eq!(
+            options[3]["available"].as_bool(),
+            Some(platform_capable && cow_supported == Some(true))
         );
     }
 
@@ -24612,9 +25533,11 @@ mod worktree_provisioning {
         // Untracked build artifact in the source repo — CoW carries it over.
         std::fs::write(repo_dir.0.join("untracked.log"), "artifact\n").unwrap();
         let root = unique_dir("intentd-cowprov-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
         {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
@@ -24752,6 +25675,438 @@ mod worktree_provisioning {
         );
     }
 
+    /// Build [`Services`] with a live settings registry seeded with the given
+    /// setting changes (execution-environment selection tests, §5.1 v4.2).
+    fn services_with_settings(
+        store: Store,
+        root: PathBuf,
+        changes: &[(&str, serde_json::Value)],
+    ) -> (Services, tempfile::TempDir) {
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        let changes: Vec<(String, serde_json::Value)> = changes
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        registry.apply(&changes).expect("apply settings");
+        let svc = Services::new(store)
+            .with_workspaces_root(root)
+            .with_settings_registry(registry);
+        (svc, config_dir)
+    }
+
+    /// `executionEnvironment: "direct"` (§5.1 v4.2) behaves like
+    /// `skipIsolation: true`: no checkout is provisioned, `skipWorktree` is
+    /// set, and the selection persists as `executionEnvironment: "direct"`.
+    #[tokio::test]
+    async fn create_with_execution_environment_direct_skips_provisioning() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eedirect-repo");
+        let root = unique_dir("intentd-eedirect-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Direct),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert!(ws.skip_worktree, "direct selection implies skipWorktree");
+        assert!(ws.worktree_path.is_none(), "no checkout provisioned");
+        assert!(ws.checkout_mode.is_none());
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Direct)
+        );
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment,
+            Some(intent_core::SandboxType::Direct),
+            "selection round-trips through the store"
+        );
+    }
+
+    /// `executionEnvironment: "worktree"` (§5.1 v4.2) forces the
+    /// linked-worktree path even with `workspace.cowIsolation` on.
+    #[tokio::test]
+    async fn create_with_execution_environment_worktree_overrides_cow_setting() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eewt-repo");
+        let root = unique_dir("intentd-eewt-root");
+        let (svc, _config) = services_with_settings(
+            store.clone(),
+            root.0.clone(),
+            &[("workspace.cowIsolation", serde_json::json!(true))],
+        );
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Worktree),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree),
+            "explicit worktree wins over cowIsolation on"
+        );
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Worktree)
+        );
+        let wt_repo =
+            git2::Repository::open(ws.worktree_path.as_deref().unwrap()).expect("worktree opens");
+        assert!(wt_repo.is_worktree());
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment,
+            Some(intent_core::SandboxType::Worktree)
+        );
+    }
+
+    /// Legacy derivation (§5.1 v4.2): when `executionEnvironment` is omitted,
+    /// the provisioning outcome fills the persisted field (`worktree` here).
+    #[tokio::test]
+    async fn create_without_execution_environment_derives_from_provisioning() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eederive-repo");
+        let root = unique_dir("intentd-eederive-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Worktree),
+            "omitted param derives the environment from the provisioning outcome"
+        );
+    }
+
+    /// A disabled type (§5.1 v4.2): `sandbox.cow.enabled` defaults to false,
+    /// so `executionEnvironment: "cow"` fails structured (`-32602`,
+    /// `execution-environment-unavailable`) before any provisioning.
+    #[tokio::test]
+    async fn create_with_disabled_execution_environment_fails_structured() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eedis-repo");
+        let root = unique_dir("intentd-eedis-root");
+        let (svc, _config) = services_with_settings(store.clone(), root.0.clone(), &[]);
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Cow),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("disabled cow must be rejected");
+        assert!(
+            matches!(&err, Error::ExecutionEnvironmentUnavailable { environment, .. }
+                if environment == "cow"),
+            "got: {err}"
+        );
+        assert_eq!(err.code(), -32602);
+    }
+
+    /// `skipIsolation: true` combined with a non-direct
+    /// `executionEnvironment` (§5.1 v4.2) is contradictory → `InvalidParams`.
+    #[tokio::test]
+    async fn create_with_skip_isolation_conflicting_environment_is_rejected() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-eeconf-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    skip_isolation: Some(true),
+                    execution_environment: Some(intent_core::SandboxType::Worktree),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("conflicting selection rejected");
+        assert!(matches!(&err, Error::InvalidParams(_)), "got: {err}");
+    }
+
+    /// Flow rule (§5.1): `executionEnvironment: "worktree"` requires a local
+    /// repository copy — a `githubUrl` create is rejected structured
+    /// (`-32602`, `execution-environment-unavailable`) before any
+    /// provisioning.
+    #[tokio::test]
+    async fn create_with_worktree_environment_and_github_url_is_rejected() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-eewtgh-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some("https://github.com/intent-hq/example".to_string()),
+                    execution_environment: Some(intent_core::SandboxType::Worktree),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("worktree + githubUrl rejected");
+        assert!(
+            matches!(&err, Error::ExecutionEnvironmentUnavailable { environment, reason }
+                if environment == "worktree" && reason.contains("local repository copy")),
+            "got: {err}"
+        );
+        assert_eq!(err.code(), -32602);
+    }
+
+    /// Flow rule (§5.1): `executionEnvironment: "worktree"` with
+    /// `isNewRepo: true` is rejected structured — the new-repo flow works
+    /// directly in the initialized repository.
+    #[tokio::test]
+    async fn create_with_worktree_environment_and_is_new_repo_is_rejected() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-eewtnew-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let repo_parent = unique_dir("intentd-eewtnew-repo");
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(
+                        repo_parent.0.join("fresh").to_string_lossy().to_string(),
+                    ),
+                    is_new_repo: Some(true),
+                    execution_environment: Some(intent_core::SandboxType::Worktree),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("worktree + isNewRepo rejected");
+        assert!(
+            matches!(&err, Error::ExecutionEnvironmentUnavailable { environment, reason }
+                if environment == "worktree" && reason.contains("local repository copy")),
+            "got: {err}"
+        );
+        assert_eq!(err.code(), -32602);
+    }
+
+    /// `isNewRepo` + omitted `executionEnvironment` (§5.1): the initialized
+    /// repository is worked in directly, and the derived `direct` environment
+    /// persists on the row.
+    #[tokio::test]
+    async fn create_new_repo_derives_direct_execution_environment() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-eenewderive-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let repo_parent = unique_dir("intentd-eenewderive-repo");
+        let repo_path = repo_parent.0.join("fresh");
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_path.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Direct),
+            "isNewRepo derives and persists direct"
+        );
+        assert!(
+            !ws.skip_worktree,
+            "direct here still provisions the checkout"
+        );
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(repo_path.to_string_lossy().as_ref()),
+            "the initialized repository is the checkout"
+        );
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment,
+            Some(intent_core::SandboxType::Direct)
+        );
+    }
+
+    /// `executionEnvironment: "microvm"` (§5.1 v4.2 + EE-5): disabled by
+    /// default → structured unavailable; enabled on a capable host → the
+    /// workspace provisions a `CoW` checkout and persists the microvm
+    /// selection (agents then spawn in per-agent VMs at `ensure_started`).
+    #[tokio::test]
+    async fn create_with_microvm_environment_is_structured() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eemvm-repo");
+        let root = unique_dir("intentd-eemvm-root");
+
+        // Disabled (default) → unavailable.
+        let (svc, _config) = services_with_settings(store.clone(), root.0.clone(), &[]);
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch.clone()),
+                    execution_environment: Some(intent_core::SandboxType::Microvm),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("disabled microvm must be rejected");
+        assert!(
+            matches!(&err, Error::ExecutionEnvironmentUnavailable { environment, .. }
+                if environment == "microvm"),
+            "got: {err}"
+        );
+
+        // Enabled on a capable host → creates the workspace with a CoW
+        // checkout and the persisted microvm selection (EE-5). Gated on the
+        // same platform + CoW conjunction the daemon validates.
+        let (platform_ok, _) = crate::microvm_platform_supported();
+        if !platform_ok
+            || intent_git::cow_probe(&root.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping live arm: microVM prerequisites absent on this host");
+            return;
+        }
+        let (svc, _config) = services_with_settings(
+            store.clone(),
+            root.0.clone(),
+            &[("sandbox.microvm.enabled", serde_json::json!(true))],
+        );
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Microvm),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("enabled microvm create must succeed")
+            .workspace;
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Microvm),
+            "explicit microvm selection must persist"
+        );
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Cow),
+            "microvm workspaces provision a CoW checkout"
+        );
+        assert!(
+            ws.worktree_path.is_some(),
+            "microvm workspaces get a real checkout"
+        );
+    }
+
+    /// `executionEnvironment: "cow"` on a CoW-capable filesystem (§5.1 v4.2):
+    /// provisions the `CoW` clone and persists the selection — no
+    /// `workspace.cowIsolation` involvement. Gated on filesystem support.
+    #[tokio::test]
+    async fn create_with_explicit_cow_environment_provisions_cow() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eecow-repo");
+        let root = unique_dir("intentd-eecow-root");
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_settings(
+            store.clone(),
+            root.0.clone(),
+            &[("sandbox.cow.enabled", serde_json::json!(true))],
+        );
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Cow),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Cow));
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Cow)
+        );
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment,
+            Some(intent_core::SandboxType::Cow)
+        );
+    }
+
     /// `workspace.delete` of a `CoW` workspace removes the checkout directory
     /// and its `<root>/<workspaceId>` parent but never touches the source
     /// repository: no registration prune and — critically — no branch delete,
@@ -24852,9 +26207,11 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-cowdup-repo");
         let root = unique_dir("intentd-cowdup-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
         {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
@@ -24964,9 +26321,11 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowfail-repo");
         let root = unique_dir("intentd-cowfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
         {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
@@ -25016,9 +26375,11 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowdupfail-repo");
         let root = unique_dir("intentd-cowdupfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
         {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
@@ -26906,10 +28267,11 @@ mod file_ops_service {
         repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
             .unwrap();
 
-        // Early probe check - skip test if CoW not available
+        // Early probe check - skip test if CoW not available (temporarily
+        // locked to macOS).
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("SKIP test (CoW not supported): {user_dir:?} → {workspaces_root:?}");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -27121,7 +28483,9 @@ mod file_ops_service {
         // session's sandbox fields; the delegate result itself is "pending").
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
-        let expect_sandbox = matches!(probe, CowSupport::Supported);
+        // CoW is temporarily locked to macOS, so the settled outcome is the
+        // shared-mode fallback everywhere else regardless of the probe.
+        let expect_sandbox = cfg!(target_os = "macos") && matches!(probe, CowSupport::Supported);
 
         // Create services with workspaces_root configured
         let mut svc = Services::new(store.clone())
@@ -28702,6 +30066,17 @@ mod clone_orchestration {
             "hydration persists cow or direct: {:?}",
             ws.checkout_mode
         );
+        // The derived executionEnvironment (§5.1 v4.2) follows the checkout
+        // mode: CoW copy → `cow`, plain local clone → `direct`.
+        let expected_env = match ws.checkout_mode {
+            Some(intent_core::CheckoutMode::Cow) => intent_core::SandboxType::Cow,
+            _ => intent_core::SandboxType::Direct,
+        };
+        assert_eq!(
+            ws.execution_environment,
+            Some(expected_env),
+            "hydration derives executionEnvironment from the checkout mode"
+        );
         assert_eq!(
             repo.head().unwrap().shorthand().expect("branch name"),
             ws.branch.as_str(),
@@ -28728,7 +30103,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new(store.clone())
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -28753,6 +30128,12 @@ mod clone_orchestration {
             "base commit SHA recorded from the checkout"
         );
         drop(repo);
+        // The derived environment round-trips through the store.
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment, ws.execution_environment,
+            "derived executionEnvironment round-trips through the store"
+        );
         // Owner/name derived from the URL (file:// → last two segments).
         assert!(ws.repository_owner.is_some(), "owner derived from URL");
         assert_eq!(

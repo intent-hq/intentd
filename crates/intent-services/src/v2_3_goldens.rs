@@ -108,7 +108,14 @@ fn v2_3_forwards_other_prompt_surfaces_to_v1() {
         v1.first_turn_prepend_block("go"),
         v2_3.first_turn_prepend_block("go")
     );
-    assert_eq!(v1.coordinator_cow_hint(), v2_3.coordinator_cow_hint());
+    for uniform in [false, true] {
+        for standalone in [false, true] {
+            assert_eq!(
+                v1.coordinator_cow_hint(uniform, standalone),
+                v2_3.coordinator_cow_hint(uniform, standalone)
+            );
+        }
+    }
     assert_eq!(
         v1.sandboxed_implementor_hint("/sb", "sb/x"),
         v2_3.sandboxed_implementor_hint("/sb", "sb/x")

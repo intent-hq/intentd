@@ -2802,6 +2802,95 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Sandbox record lookup for one agent: `{ id, status, path, branch,
+    /// mergeOnTurnEnd, ... }` (the serialized store record) or `null` when
+    /// the agent has no sandbox. Backs the `ws.agent.status` sandbox
+    /// enrichment — one cheap store lookup, MCP-side only (no wire RPC).
+    fn sandbox_get(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sandbox_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sandbox.profiles.list`: the configured execution-environment profiles
+    /// (global, no `workspaceId`) — `{ defaultType, profiles: [{ type,
+    /// enabled, image? }] }`, one row per type in catalog order (`direct`,
+    /// `worktree`, `cow`, `microvm`); `image` appears on the `microvm` row
+    /// only (`null` when unset). Settings intent only — availability is
+    /// resolved by `sandbox.options`.
+    fn sandbox_profiles_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sandbox_profiles_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sandbox.profiles.update`: batch-update the execution-environment
+    /// profile settings — params `{ defaultType?, profiles?: { <type>: {
+    /// enabled?, image? } } }` (`image` on `microvm` only; explicit `null`
+    /// clears the override). Validation failures (unknown type, disabled
+    /// `defaultType`, malformed image) → `-32602` with nothing applied.
+    /// Persists through the `settings.*` machinery (emitting
+    /// `settings:changed`) and returns the updated `sandbox.profiles.list`
+    /// shape.
+    fn sandbox_profiles_update(
+        &self,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = changes;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sandbox_profiles_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sandbox.options`: the capability-resolved execution-environment
+    /// availability matrix (global, no `workspaceId`) — `{ defaultType,
+    /// options: [{ type, enabled, available, default, reason? }] }`. A type
+    /// is `available` when the host can actually run it (`cow` requires `CoW`
+    /// filesystem support on the workspaces root; `microvm` additionally
+    /// requires microVM host capability — see
+    /// `system.capabilities.microvmSupported`); `reason` is a structured
+    /// human-readable explanation present exactly when `available` is false.
+    fn sandbox_options(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sandbox_options not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sandbox.image.check`: dry-run validity check of a microVM guest-image
+    /// reference (global, no `workspaceId`) — params `{ manifestUrl,
+    /// sha256? }`. Fetches the manifest, verifies the optional outer pin, and
+    /// contract-checks it **without** downloading the rootfs or touching the
+    /// image cache. Returns `{ valid: true, imageId, version, arch }` on
+    /// success or `{ valid: false, error }` (a structured human-readable
+    /// failure) — fetch/validation failures are results, not RPC errors, so
+    /// clients can check-before-save. A malformed `manifestUrl` param
+    /// (missing/empty) → `-32602`.
+    fn sandbox_image_check(
+        &self,
+        manifest_url: String,
+        sha256: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (manifest_url, sha256);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sandbox_image_check not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `comment.add`: text-anchored comment via searchContext + commentTarget (§5.3).
     ///
     /// `author_type` is the optional wire `authorType` (`"user"` | `"agent"`);
@@ -4720,13 +4809,20 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `system.capabilities`: machine-level capabilities independent of any
-    /// workspace — `{ cowSupported?: boolean }` (PROTOCOL §5.7). `cowSupported`
-    /// reports the `CoW` probe of the workspaces root (`true`/`false` for a
-    /// supported/unsupported filesystem, omitted when the probe cannot run) —
-    /// the same cached probe that fills `Workspace.cowSupported` (§5.1).
-    /// Unlike the `system.status`/`system.shutdown` control fast-path, this is
-    /// a router method: it needs the service layer's workspaces-root
-    /// resolution and aggregate cache, not composition-root daemon state.
+    /// workspace — `{ cowSupported?: boolean, microvmSupported?: boolean }`
+    /// (PROTOCOL §5.7). `cowSupported` reports the `CoW` probe of the
+    /// workspaces root (`true`/`false` for a supported/unsupported
+    /// filesystem, omitted when the probe cannot run) — the same cached probe
+    /// that fills `Workspace.cowSupported` (§5.1). `microvmSupported` reports
+    /// whether the host can run microVM agent sandboxes: a platform check
+    /// (macOS: ARM64 only; Linux: `/dev/kvm` present; other OSes: false)
+    /// `ANDed` with `cowSupported` (microVM requires `CoW` — each agent VM
+    /// mounts its own reflink clone). It is `false` on an incapable platform
+    /// regardless of the `CoW` probe; on a capable platform it mirrors
+    /// `cowSupported` and is omitted when that probe cannot run. Unlike the
+    /// `system.status`/`system.shutdown` control fast-path, this is a router
+    /// method: it needs the service layer's workspaces-root resolution and
+    /// aggregate cache, not composition-root daemon state.
     fn system_capabilities(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(

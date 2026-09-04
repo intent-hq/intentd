@@ -128,9 +128,21 @@ pub(crate) trait Harness: Send + Sync {
     fn rtk_instruction_line(&self, subcommands: &[String]) -> String;
     /// `## Workspace Isolation` hint for a sandboxed implementor.
     fn sandboxed_implementor_hint(&self, sandbox_path: &str, sandbox_branch: &str) -> String;
+    /// `## Workspace Isolation` hint for an agent in a microVM workspace
+    /// (`executionEnvironment: microvm`); `guest_dir` is the in-VM workspace
+    /// mount point.
+    fn microvm_isolation_hint(&self, guest_dir: &str) -> String;
     /// `## Agent Delegation & Isolation` hint for a coordinator in a
-    /// CoW-enabled direct-mode workspace.
-    fn coordinator_cow_hint(&self) -> String;
+    /// sandbox-eligible CoW-capable workspace. `uniform_isolation` is true
+    /// for `executionEnvironment: cow` workspaces (EVERY agent is sandboxed,
+    /// param/setting ignored); `standalone_cow_checkout` is true when the
+    /// workspace checkout is itself a standalone `CoW` clone (`checkoutMode:
+    /// cow`), adding the checkout-level-isolation note for legacy rows.
+    fn coordinator_cow_hint(
+        &self,
+        uniform_isolation: bool,
+        standalone_cow_checkout: bool,
+    ) -> String;
     /// `# Your Specialist Role` section wrapping the behavior prompt.
     fn specialist_role_section(&self, behavior_prompt: &str) -> String;
     /// The status-neutral `## Commit Policy` clause (every agent).

@@ -448,6 +448,9 @@ mod tests {
             .expect("message");
         store
             .insert_sandbox(&Sandbox {
+                last_merged_commit_sha: None,
+                merge_on_turn_end: true,
+                conflicting_paths: vec![],
                 id: "sb-1".to_string(),
                 workspace_id: ws.clone(),
                 agent_id: agent.clone(),

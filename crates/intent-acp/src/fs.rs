@@ -49,6 +49,10 @@ pub struct FileChange {
 pub struct FileService {
     root: PathBuf,
     scope: Option<PathBuf>,
+    /// Absolute path prefix that aliases `root` (microVM guests send guest
+    /// paths like `/workspace/...`; the alias rebases them onto the host
+    /// root before the containment check).
+    alias: Option<PathBuf>,
 }
 
 impl FileService {
@@ -57,7 +61,17 @@ impl FileService {
         Self {
             root: root.into(),
             scope: None,
+            alias: None,
         }
+    }
+
+    /// Alias an absolute prefix onto the root: requests under `alias` are
+    /// rebased onto `root` (e.g. guest `/workspace/src/x.rs` → host
+    /// `<sandbox>/src/x.rs` for microVM sessions, monorepo#1120 EE-5).
+    #[must_use]
+    pub fn with_alias(mut self, alias: impl Into<PathBuf>) -> Self {
+        self.alias = Some(alias.into());
+        self
     }
 
     /// The effective sandbox base (`root`, optionally narrowed by `scope`).
@@ -78,6 +92,14 @@ impl FileService {
     /// Returns [`AcpError::Fs`] if the resolved path escapes the sandbox base.
     pub fn resolve(&self, requested: &Path) -> AcpResult<PathBuf> {
         let base = normalize_lexical(&self.base());
+        let requested = match &self.alias {
+            Some(alias) => match requested.strip_prefix(alias) {
+                Ok(rel) => self.root.join(rel),
+                Err(_) => requested.to_path_buf(),
+            },
+            None => requested.to_path_buf(),
+        };
+        let requested = requested.as_path();
         let joined = if requested.is_absolute() {
             requested.to_path_buf()
         } else {

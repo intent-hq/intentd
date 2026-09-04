@@ -122,6 +122,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         display_status: None,
         waiting: false,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
     }
@@ -11774,6 +11775,174 @@ async fn delegate_explicit_isolation_overrides_setting() {
     assert!(
         out.get("effectiveIsolation").is_none(),
         "explicit shared isolation should skip provisioning"
+    );
+}
+
+/// Execution-environment authority, direction 1: a workspace persisted with
+/// `execution_environment: direct` stays shared even after the global
+/// `workspace.cowIsolation` setting is flipped ON — the setting cannot turn
+/// per-agent sandboxing on inside an existing workspace.
+#[tokio::test]
+async fn delegate_setting_flip_on_does_not_sandbox_direct_environment_workspace() {
+    let (_t, svc, _ws) = setup().await;
+    // Sandbox-eligible by the legacy predicate (direct mode: repo path +
+    // skip_worktree) so only the persisted environment can be what gates it.
+    let ws = WorkspaceId::new();
+    let mut w = workspace(&ws);
+    w.repository_path = Some("/test/repo".into());
+    w.skip_worktree = true;
+    w.cow_supported = Some(true);
+    w.execution_environment = Some(intent_core::SandboxType::Direct);
+    svc.store().insert_workspace(&w).await.expect("ws");
+
+    svc.settings_update(json!([{
+        "path": "workspace.cowIsolation",
+        "value": true
+    }]))
+    .await
+    .expect("enable cowIsolation");
+
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+
+    assert!(
+        out.get("effectiveIsolation").is_none(),
+        "direct execution environment must ignore the flipped-on cowIsolation setting"
+    );
+}
+
+/// Execution-environment authority, direction 2: a workspace persisted with
+/// `execution_environment: cow` keeps provisioning per-agent sandboxes with
+/// the global setting OFF (its default), and an explicit `isolation:
+/// "shared"` param cannot turn sandboxing off either.
+#[tokio::test]
+async fn delegate_setting_off_does_not_unsandbox_cow_environment_workspace() {
+    let (tmp, svc, _ws) = setup().await;
+    // The cow path reaches real (background) provisioning — pin a hermetic
+    // workspaces root so the test never touches $HOME/intent/workspaces.
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
+    // workspace.cowIsolation defaults to false — deliberately left OFF.
+    let ws = WorkspaceId::new();
+    let mut w = workspace(&ws);
+    w.repository_path = Some("/test/repo".into());
+    w.skip_worktree = true;
+    w.cow_supported = Some(true);
+    w.execution_environment = Some(intent_core::SandboxType::Cow);
+    svc.store().insert_workspace(&w).await.expect("ws");
+
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+
+    // Provisioning runs in the background (monorepo#871), so the delegate
+    // reports "pending" — the point is that it provisions at all with the
+    // global setting off.
+    assert_eq!(
+        out.get("effectiveIsolation").and_then(|v| v.as_str()),
+        Some("pending"),
+        "cow execution environment must sandbox with the global setting off"
+    );
+
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                isolation: Some("shared".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+
+    assert_eq!(
+        out.get("effectiveIsolation").and_then(|v| v.as_str()),
+        Some("pending"),
+        "isolation:\"shared\" param cannot turn sandboxing off in a cow environment"
+    );
+}
+
+/// Execution-environment authority: an explicit `isolation: "cow"` param on a
+/// workspace persisted with `execution_environment: direct` does NOT sandbox
+/// — there is no turning `CoW` on on the fly within a workspace.
+#[tokio::test]
+async fn delegate_cow_param_does_not_sandbox_direct_environment_workspace() {
+    let (_t, svc, _ws) = setup().await;
+    let ws = WorkspaceId::new();
+    let mut w = workspace(&ws);
+    w.repository_path = Some("/test/repo".into());
+    w.skip_worktree = true;
+    w.cow_supported = Some(true);
+    w.execution_environment = Some(intent_core::SandboxType::Direct);
+    svc.store().insert_workspace(&w).await.expect("ws");
+
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                isolation: Some("cow".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+
+    assert!(
+        out.get("effectiveIsolation").is_none(),
+        "isolation:\"cow\" param must not sandbox a direct execution environment workspace"
+    );
+}
+
+/// Execution-environment authority, fault path: a store ERROR on the
+/// workspace read must FAIL the delegate — never resolve as "no workspace"
+/// and fall through to the legacy param-then-setting path, which would
+/// delegate an agent into a sandboxed (cow/microvm) workspace without a
+/// sandbox. Only a genuine `NotFound` may take the legacy path.
+#[tokio::test]
+async fn delegate_store_error_on_workspace_read_fails_instead_of_unsandboxing() {
+    let (_t, svc, ws) = setup().await;
+    // Break every `workspace` read while keeping the rows (SQLite rewrites
+    // FK references on rename, so the child session insert still succeeds
+    // and the failure is pinned to the isolation resolution's read).
+    sqlx::query("ALTER TABLE workspace RENAME TO workspace_gone")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("rename workspace table");
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("a store error must fail the delegate, not skip isolation");
+    assert!(
+        matches!(&err, Error::Internal(m) if m.contains("get workspace failed")),
+        "the isolation resolution's store error propagates, got: {err:?}"
     );
 }
 
@@ -29997,8 +30166,11 @@ async fn fake_provisioned_sandbox(
         branch: format!("sb/{}", aid.0),
         base_commit_sha: "abc123".to_string(),
         snapshot_commit_sha: None,
+        last_merged_commit_sha: None,
         status: intent_store::SandboxStatus::Created,
         retry_count: 0,
+        merge_on_turn_end: true,
+        conflicting_paths: Vec::new(),
         created_at: now_iso(),
         updated_at: now_iso(),
     };
@@ -30100,6 +30272,34 @@ async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
     assert!(
         session.sandbox_id.is_none() && session.sandbox_path.is_none(),
         "soft-deleted session must not gain sandbox fields"
+    );
+}
+
+#[tokio::test]
+async fn agent_delete_discards_persistent_sandbox() {
+    // Sandboxes persist across merges for the agent's lifetime; that lifetime
+    // ends at agent.delete — the directory and record must both go, before
+    // the FK cascade makes the path unreachable.
+    let (_t, svc, ws) = setup().await;
+    let aid = create_agent(&svc, &ws, "Sandboxed").await;
+    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    assert!(dir.exists(), "sandbox directory exists before delete");
+
+    svc.agent_delete_op(aid.clone(), None)
+        .await
+        .expect("agent delete");
+
+    assert!(
+        !dir.exists(),
+        "sandbox directory must be removed on agent delete"
+    );
+    assert!(
+        svc.store()
+            .get_sandbox(&ws, &aid)
+            .await
+            .expect("get sandbox")
+            .is_none(),
+        "sandbox record must be removed on agent delete"
     );
 }
 
@@ -34186,6 +34386,127 @@ async fn delegate_unoccupied_task_succeeds_without_force() {
         .await
         .expect("first delegate must pass the guard");
     assert_eq!(resp["ok"], true);
+}
+
+/// `mergeOnTurnEnd` is stamped onto the child's persisted metadata (the
+/// hand-off point `provision_sandbox` reads at provision time), and omitted
+/// when not supplied.
+#[tokio::test]
+async fn delegate_stamps_merge_on_turn_end_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "NoMerge").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                merge_on_turn_end: Some(false),
+                ..delegate_input(&note_id, None)
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc.store.get_agent_session(&child).await.expect("session");
+    assert_eq!(
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("mergeOnTurnEnd"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "child metadata must persist mergeOnTurnEnd=false"
+    );
+
+    let note_id2 = seed_task(&svc, &ws, "DefaultMerge").await;
+    let resp = svc
+        .agent_delegate_op(ws.clone(), delegate_input(&note_id2, None), None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc.store.get_agent_session(&child).await.expect("session");
+    assert!(
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("mergeOnTurnEnd"))
+            .is_none(),
+        "metadata omits mergeOnTurnEnd when not supplied (default = merge)"
+    );
+}
+
+/// `vmResources` is bounds-validated at delegate time (errors immediately,
+/// never at VM boot) and stamped onto the child's persisted metadata (the
+/// hand-off point the microVM spawn path reads at boot/respawn); omitted
+/// when not supplied.
+#[tokio::test]
+async fn delegate_validates_and_stamps_vm_resources_metadata() {
+    let (_t, svc, ws) = setup().await;
+
+    // Out-of-range → InvalidParams naming the field, no agent created.
+    let note_id = seed_task(&svc, &ws, "BadVm").await;
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                vm_resources: Some(intent_core::VmResources {
+                    vcpus: Some(17),
+                    mem_mib: None,
+                }),
+                ..delegate_input(&note_id, None)
+            },
+            None,
+        )
+        .await
+        .expect_err("out-of-range vcpus must be rejected at delegate time");
+    assert!(
+        err.to_string().contains("vmResources.vcpus"),
+        "error names the field: {err}"
+    );
+
+    // Valid partial override → persisted verbatim on metadata.
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                vm_resources: Some(intent_core::VmResources {
+                    vcpus: None,
+                    mem_mib: Some(4096),
+                }),
+                ..delegate_input(&note_id, None)
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc.store.get_agent_session(&child).await.expect("session");
+    assert_eq!(
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("vmResources"))
+            .cloned(),
+        Some(serde_json::json!({ "memMib": 4096 })),
+        "child metadata must persist the partial vmResources override"
+    );
+
+    // Not supplied → omitted.
+    let note_id2 = seed_task(&svc, &ws, "DefaultVm").await;
+    let resp = svc
+        .agent_delegate_op(ws.clone(), delegate_input(&note_id2, None), None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc.store.get_agent_session(&child).await.expect("session");
+    assert!(
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("vmResources"))
+            .is_none(),
+        "metadata omits vmResources when not supplied"
+    );
 }
 
 /// Occupied task (live assigned agent) → second delegate is rejected with

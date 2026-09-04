@@ -7,22 +7,32 @@ use sqlx::Row;
 
 use crate::Store;
 
-/// Sandbox status lifecycle.
+/// Sandbox status lifecycle. Wire values are the `snake_case` names — the same
+/// strings `to_db` writes — so clients never see undocumented spellings like
+/// `mergepending` (the old `lowercase` rename collapsed the separator).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SandboxStatus {
     /// Initial state after provisioning
     Created,
     /// Merge-back is in progress
     Merging,
-    /// Successfully merged to canonical and discarded
+    /// Successfully merged to canonical (sandbox persists for the agent's
+    /// lifetime; `last_merged_commit_sha` marks the merged tip)
     Merged,
     /// Discarded without merging
     Discarded,
-    /// Conflict detected, agent bounced with instructions
+    /// Conflict detected, agent bounced with instructions (live retry loop)
     ConflictBounced,
-    /// Merge pending manual resolution (blocked or retry exhausted)
+    /// Merge pending manual resolution (blocked or transient failure)
     MergePending,
+    /// TERMINAL: deterministic merge conflict with no live agent turn to
+    /// bounce (retry cap exhausted, sweep conflict, or manual merge
+    /// conflict). `conflicting_paths` names the clash; the sandbox's commits
+    /// are pushed to a recovery branch in the canonical repo. Resolved only
+    /// by a manual `sandbox.cow.merge` (after canonical changes) or
+    /// `sandbox.cow.discard`.
+    Conflict,
 }
 
 impl SandboxStatus {
@@ -34,6 +44,7 @@ impl SandboxStatus {
             SandboxStatus::Discarded => "discarded",
             SandboxStatus::ConflictBounced => "conflict_bounced",
             SandboxStatus::MergePending => "merge_pending",
+            SandboxStatus::Conflict => "conflict",
         }
     }
 
@@ -43,9 +54,10 @@ impl SandboxStatus {
             "merging" => Ok(SandboxStatus::Merging),
             "merged" => Ok(SandboxStatus::Merged),
             "discarded" => Ok(SandboxStatus::Discarded),
-            "conflict_bounced" | "conflict" => Ok(SandboxStatus::ConflictBounced),
+            "conflict_bounced" => Ok(SandboxStatus::ConflictBounced),
             "merge_pending" => Ok(SandboxStatus::MergePending),
-            // Handle legacy "conflict" status from migration 0038
+            // Terminal conflict; also absorbs the legacy migration-0038 value.
+            "conflict" => Ok(SandboxStatus::Conflict),
             _ => Err(intent_core::Error::Internal(format!(
                 "invalid sandbox status: {s}"
             ))),
@@ -64,14 +76,30 @@ pub struct Sandbox {
     pub branch: String,
     pub base_commit_sha: String,
     pub snapshot_commit_sha: Option<String>,
+    /// Tip of the last successfully merged range. Sandboxes persist across
+    /// turns (merge-on-completion no longer discards them), so repeat merges
+    /// start the next cherry-pick range here instead of base/snapshot.
+    pub last_merged_commit_sha: Option<String>,
     pub status: SandboxStatus,
     pub retry_count: i64,
+    /// Whether the completion path auto-merges this sandbox when the agent's
+    /// turn ends. `false` (parent opted out via `mergeOnTurnEnd: false`) keeps
+    /// the sandbox live at turn end; merging happens only via the manual
+    /// `sandbox.cow.merge` RPC. The retry sweep also skips such sandboxes.
+    pub merge_on_turn_end: bool,
+    /// Conflicting paths persisted whenever a merge attempt conflicts: on
+    /// `conflict_bounced` (agent reconciling, next attempt overwrites them)
+    /// and on the terminal `conflict` status; empty otherwise. Serialized on
+    /// the wire so clients see what conflicted without re-running the merge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicting_paths: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const COLUMNS: &str = "id, workspace_id, agent_id, path, branch, base_commit_sha, \
-    snapshot_commit_sha, status, retry_count, created_at, updated_at";
+    snapshot_commit_sha, last_merged_commit_sha, status, retry_count, merge_on_turn_end, \
+    conflicting_paths, created_at, updated_at";
 
 impl Store {
     /// Insert a new sandbox record.
@@ -80,8 +108,14 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
-        let sql =
-            format!("INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = format!(
+            "INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        );
+        let conflicting_paths = if s.conflicting_paths.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&s.conflicting_paths).unwrap_or_default())
+        };
         sqlx::query(&sql)
             .bind(&s.id)
             .bind(&s.workspace_id.0)
@@ -90,8 +124,11 @@ impl Store {
             .bind(&s.branch)
             .bind(&s.base_commit_sha)
             .bind(&s.snapshot_commit_sha)
+            .bind(&s.last_merged_commit_sha)
             .bind(s.status.to_db())
             .bind(s.retry_count)
+            .bind(s.merge_on_turn_end)
+            .bind(conflicting_paths)
             .bind(&s.created_at)
             .bind(&s.updated_at)
             .execute(self.write_pool())
@@ -142,6 +179,73 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| intent_core::Error::Internal(format!("update sandbox status failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Persist a status together with the conflicting paths in one write, so
+    /// the status row and its explanation can never disagree. Used for
+    /// `conflict` (terminal) and `conflict_bounced` (agent reconciling) with
+    /// the clash's paths, and for `merged` with an empty slice — which
+    /// stores NULL, clearing any stale paths from an earlier bounce.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the write fails.
+    pub async fn set_sandbox_status_with_conflicts(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        status: SandboxStatus,
+        conflicting_paths: &[String],
+        updated_at: &str,
+    ) -> Result<()> {
+        let paths_json = if conflicting_paths.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(conflicting_paths).unwrap_or_default())
+        };
+        sqlx::query(
+            "UPDATE sandbox SET status = ?, conflicting_paths = ?, updated_at = ? \
+             WHERE workspace_id = ? AND agent_id = ?",
+        )
+        .bind(status.to_db())
+        .bind(paths_json)
+        .bind(updated_at)
+        .bind(&workspace_id.0)
+        .bind(&agent_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| intent_core::Error::Internal(format!("set sandbox conflict failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Record the tip of the last successfully merged range for a sandbox.
+    /// Persistent sandboxes merge repeatedly; the next merge cherry-picks
+    /// only commits after this SHA.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the write fails.
+    pub async fn set_sandbox_last_merged_commit(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        last_merged_commit_sha: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sandbox SET last_merged_commit_sha = ?, updated_at = ? \
+             WHERE workspace_id = ? AND agent_id = ?",
+        )
+        .bind(last_merged_commit_sha)
+        .bind(updated_at)
+        .bind(&workspace_id.0)
+        .bind(&agent_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("set sandbox last merged commit failed: {e}"))
+        })?;
         Ok(())
     }
 
@@ -341,10 +445,24 @@ fn sandbox_from_row(row: &SqliteRow) -> Result<Sandbox> {
             .ok()
             .flatten()
             .filter(|s| !s.is_empty()),
+        last_merged_commit_sha: row
+            .try_get::<Option<String>, _>("last_merged_commit_sha")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty()),
         status: SandboxStatus::from_db(&status_str)?,
         retry_count: row
             .try_get("retry_count")
             .map_err(|e| intent_core::Error::Internal(format!("get retry_count failed: {e}")))?,
+        merge_on_turn_end: row.try_get("merge_on_turn_end").map_err(|e| {
+            intent_core::Error::Internal(format!("get merge_on_turn_end failed: {e}"))
+        })?,
+        conflicting_paths: row
+            .try_get::<Option<String>, _>("conflicting_paths")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
         created_at: row
             .try_get("created_at")
             .map_err(|e| intent_core::Error::Internal(format!("get created_at failed: {e}")))?,

@@ -22,7 +22,8 @@ mod tools;
 
 pub(crate) use tools::ToolDef;
 pub use tools::{
-    SpecialistModelOption, SpecialistModelOptions, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+    MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions,
+    WORKSPACE_API_SYSTEM_PROMPT_HEADING,
 };
 
 // Static description const, exposed for the segment-assembly parity tests
@@ -54,6 +55,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The agent→BE MCP server: a fixed workspace context, the shared service
 /// surface, and the set of tool names denied for this agent's type.
+#[allow(clippy::struct_excessive_bools)]
 pub struct WorkspaceMcpServer {
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -84,12 +86,25 @@ pub struct WorkspaceMcpServer {
     /// Disabled features are pruned from the tool description and JS prelude
     /// and denied at dispatch. Defaults to all-on (FE front door, tests).
     agent_features: AgentFeaturesSettings,
+    /// Whether the workspace can run `CoW` sandboxes (`CoW` probe supported OR a
+    /// microVM execution environment). Gates the sandbox-related doc clauses
+    /// (`mergeOnTurnEnd`, sandbox fields) in the `workspace_api` description
+    /// — description-only: dispatch accepts and ignores `mergeOnTurnEnd`
+    /// regardless (advisory; no sandbox exists to honor it when not
+    /// capable). Defaults to `true` (FE front door, tests) so the
+    /// all-defaults description stays byte-identical to the static const.
+    cow_capable: bool,
     /// Per-specialist delegation model options (PROTOCOL §5.11
     /// `modelOptions`), captured at bridge creation like `agent_features` and
     /// injected into the `workspace_api` description's `ws.agent.delegate`
     /// docs. Only specialists that carry options appear; empty — the default
     /// — leaves the description byte-identical.
     specialist_model_options: Vec<tools::SpecialistModelOptions>,
+    /// Live microVM spawn facts (guest image, settings-resolved default VM
+    /// size) injected into the delegate/create docs — `Some` only for
+    /// microVM-workspace bridges, captured at bridge creation like
+    /// `agent_features` (a settings change applies to new sessions only).
+    microvm_hints: Option<tools::MicrovmSpawnHints>,
     /// Whether this server front-doors a sub-agent (a session with a
     /// `parent_agent_id` or `is_background`), captured once at bridge
     /// creation like `agent_features`. Sub-agents don't own a user-facing
@@ -122,7 +137,9 @@ impl WorkspaceMcpServer {
             workspace_api_timeout: dispatch::default_workspace_api_timeout(),
             turn_attachments: None,
             agent_features: AgentFeaturesSettings::default(),
+            cow_capable: true,
             specialist_model_options: Vec::new(),
+            microvm_hints: None,
             is_sub_agent: false,
             compact_tool_descriptions: false,
         }
@@ -183,6 +200,17 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Capture whether this bridge's workspace can run `CoW` sandboxes (the
+    /// spawn-time wiring point, like `with_agent_features`). When `false`
+    /// the sandbox doc clauses (`mergeOnTurnEnd`, sandbox status fields) are
+    /// scrubbed from the `workspace_api` description — description-only,
+    /// dispatch is unaffected.
+    #[must_use]
+    pub fn with_cow_capable(mut self, cow_capable: bool) -> Self {
+        self.cow_capable = cow_capable;
+        self
+    }
+
     /// Set the per-specialist delegation model options advertised in the
     /// `workspace_api` description (the spawn-time wiring point — resolved
     /// once at bridge creation, like `agent_features`). Pass only specialists
@@ -193,6 +221,17 @@ impl WorkspaceMcpServer {
         options: Vec<tools::SpecialistModelOptions>,
     ) -> Self {
         self.specialist_model_options = options;
+        self
+    }
+
+    /// Set the live microVM spawn hints (guest image, default VM size)
+    /// advertised in the `workspace_api` description — the spawn-time wiring
+    /// point, like `with_cow_capable`. Pass `Some` only for
+    /// microVM-workspace bridges; `None` (the default) keeps the description
+    /// unchanged.
+    #[must_use]
+    pub fn with_microvm_hints(mut self, hints: Option<tools::MicrovmSpawnHints>) -> Self {
+        self.microvm_hints = hints;
         self
     }
 
@@ -227,7 +266,9 @@ impl WorkspaceMcpServer {
         tools::workspace_api_description_with_model_options(
             self.is_chief,
             &self.effective_agent_features(),
+            self.cow_capable,
             &self.specialist_model_options,
+            self.microvm_hints.as_ref(),
             self.is_sub_agent,
         )
         .into_owned()
@@ -245,7 +286,9 @@ impl WorkspaceMcpServer {
         tools::condensed_workspace_api_description(
             self.is_chief,
             &self.effective_agent_features(),
+            self.cow_capable,
             &self.specialist_model_options,
+            self.microvm_hints.as_ref(),
         )
     }
 
@@ -351,6 +394,7 @@ impl WorkspaceMcpServer {
                         tools::compact_workspace_api_description(
                             self.is_chief,
                             &self.effective_agent_features(),
+                            self.cow_capable,
                         )
                     } else {
                         self.full_workspace_api_description()

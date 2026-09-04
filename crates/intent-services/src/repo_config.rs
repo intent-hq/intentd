@@ -542,6 +542,7 @@ mod tests {
                 },
             ]),
             cow_clone_exclude: Some(vec!["node_modules".to_string()]),
+            execution_environment: None,
             extra: BTreeMap::new(),
         };
 

@@ -165,6 +165,7 @@ fn workspace(id: &WorkspaceId, title: &str) -> Workspace {
         skip_worktree: false,
         setup_script: None,
         is_remote: false,
+        execution_environment: None,
         default_model: None,
         pr_number: None,
         pr_url: None,

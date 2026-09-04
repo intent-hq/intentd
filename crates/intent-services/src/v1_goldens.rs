@@ -41,6 +41,7 @@ fn sha256_hex(s: &str) -> String {
 fn workspace(id: &WorkspaceId) -> Workspace {
     let ts = now_iso();
     Workspace {
+        execution_environment: None,
         id: id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
@@ -2059,7 +2060,10 @@ fn golden_isolation_hints() {
         hint,
         "## Workspace Isolation\n\n\
          You are working in an **isolated CoW (copy-on-write) sandbox** at `/sandboxes/sb-1` \
-         on branch `sb/one` (base commit tracked in sandbox metadata). Your dependency caches (node_modules, \
+         on branch `sb/one` (base commit tracked in sandbox metadata). Your workspace is **isolated at the \
+         filesystem level from other agents**: each agent works in its own copy-on-write \
+         clone, so your file reads and writes cannot see or affect other agents' concurrent \
+         changes (or the canonical checkout) until merge-back. Your dependency caches (node_modules, \
          target/, .venv, etc.) are warm — you inherited them from the canonical workspace.\n\n\
          **Critical constraints:**\n\
          - Do NOT switch branches or checkout other refs in your sandbox.\n\
@@ -2070,10 +2074,13 @@ fn golden_isolation_hints() {
          retry the merge. Do NOT attempt to touch other checkouts or the canonical workspace directly.\n\
          - You have up to 2 conflict-resolution attempts before the merge is deferred to manual intervention."
     );
-    // Coordinator variant: direct-mode CoW-supported workspace.
+    // Coordinator variant: direct-mode CoW-supported workspace. Direct-mode
+    // eligibility additionally requires a repository path (the same predicate
+    // the delegate provisioning path resolves isolation from).
     session.sandbox_path = None;
     let mut ws = workspace(&WorkspaceId::from("ws-1"));
     ws.skip_worktree = true;
+    ws.repository_path = Some("/repo".to_string());
     ws.cow_supported = Some(true);
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,

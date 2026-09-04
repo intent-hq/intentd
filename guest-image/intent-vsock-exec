@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Intent vsock exec agent — protocol `intent-exec/1` (monorepo#1120, EE-3).
+
+Listens on AF_VSOCK port 4088 (override: INTENT_EXEC_PORT). One connection =
+one command execution:
+
+  1. Client sends ONE newline-terminated JSON header:
+       { "argv": ["cmd", ...],        # required, non-empty
+         "env":  {"K": "V", ...},     # optional, merged over agent env
+         "cwd":  "/workspace",        # optional
+         "stderr": "merge"|"discard" }# optional (default "merge")
+  2. Agent replies with ONE newline-terminated JSON status line:
+       { "ok": true,  "protocol": "intent-exec/1", "pid": 123 }
+     or
+       { "ok": false, "protocol": "intent-exec/1", "error": "..." }
+  3. On ok, the agent relays the socket to the child's REAL PIPE stdio:
+     socket -> stdin pipe, stdout pipe -> socket (stderr merged into the
+     stdout pipe or discarded per header). The child never sees the vsock
+     fd: Node/libuv silently reads/writes nothing on an AF_VSOCK stdio fd
+     (Wave 2 verifier repro, monorepo#1120), and the spec's hard constraint
+     is that provider stdin is a pipe, never a TTY.
+  4. The connection closes when the child exits (EE-5 observes EOF): the
+     child's exit closes the last write end of its stdout pipe, the relay
+     drains, and the handler closes the socket.
+
+The daemon-side orchestrator (EE-5) speaks this protocol to bridge ACP.
+"""
+
+import json
+import os
+import select
+import signal
+import socket
+import sys
+
+PROTOCOL = "intent-exec/1"
+DEFAULT_PORT = 4088
+
+
+def log(msg):
+    try:
+        with open("/dev/console", "w") as f:
+            f.write(f"[intent-vsock-exec] {msg}\n")
+    except OSError:
+        print(f"[intent-vsock-exec] {msg}", file=sys.stderr)
+
+
+def read_header_line(conn, limit=1024 * 1024):
+    """Read up to and including the first newline (bounded)."""
+    chunks = []
+    total = 0
+    while total < limit:
+        b = conn.recv(4096)
+        if not b:
+            break
+        chunks.append(b)
+        total += len(b)
+        if b"\n" in b:
+            break
+    data = b"".join(chunks)
+    nl = data.find(b"\n")
+    if nl == -1:
+        raise ValueError("no newline-terminated JSON header received")
+    if data[nl + 1:]:
+        raise ValueError("unexpected bytes after header before status reply")
+    return data[:nl]
+
+
+def send_status(conn, obj):
+    conn.sendall((json.dumps(obj) + "\n").encode())
+
+
+def handle(conn):
+    try:
+        header = json.loads(read_header_line(conn))
+        argv = header.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+            raise ValueError("header.argv must be a non-empty list of strings")
+        env = dict(os.environ)
+        env.update(header.get("env") or {})
+        cwd = header.get("cwd") or "/workspace"
+        stderr_mode = header.get("stderr", "merge")
+        if stderr_mode not in ("merge", "discard"):
+            raise ValueError(f"unsupported stderr mode: {stderr_mode!r}")
+    except (ValueError, json.JSONDecodeError) as e:
+        send_status(conn, {"ok": False, "protocol": PROTOCOL, "error": str(e)})
+        return
+
+    # Real pipes for the child's stdio; the vsock fd stays in the handler.
+    stdin_r, stdin_w = os.pipe()
+    stdout_r, stdout_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        # Child: pipe ends become stdin/stdout; drop the socket and the
+        # handler-side pipe ends so EOFs propagate correctly.
+        conn.close()
+        os.close(stdin_w)
+        os.close(stdout_r)
+        os.dup2(stdin_r, 0)
+        os.dup2(stdout_w, 1)
+        if stderr_mode == "merge":
+            os.dup2(stdout_w, 2)
+        else:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 2)
+        os.close(stdin_r)
+        os.close(stdout_w)
+        try:
+            os.chdir(cwd)
+        except OSError:
+            os.chdir("/")
+        try:
+            os.execvpe(argv[0], argv, env)
+        except OSError as e:
+            os.write(2, f"[intent-vsock-exec] exec failed: {e}\n".encode())
+            os._exit(127)
+    else:
+        os.close(stdin_r)
+        os.close(stdout_w)
+        send_status(conn, {"ok": True, "protocol": PROTOCOL, "pid": pid})
+        try:
+            relay(conn, stdin_w, stdout_r)
+        finally:
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+
+
+def relay(conn, stdin_w, stdout_r):
+    """Pump socket -> child stdin pipe and child stdout pipe -> socket.
+
+    Non-blocking select loop with bounded buffers so a slow reader on either
+    side cannot deadlock the other direction. Socket EOF propagates to the
+    child as a stdin close (after the pending buffer drains); the loop ends
+    when the child's stdout hits EOF (child exited) and its output has been
+    flushed to the socket.
+    """
+    buf_limit = 65536
+    sock_fd = conn.fileno()
+    for fd in (sock_fd, stdin_w, stdout_r):
+        os.set_blocking(fd, False)
+    to_child = bytearray()
+    to_sock = bytearray()
+    sock_eof = False
+    child_eof = False
+    while True:
+        if sock_eof and not to_child and stdin_w is not None:
+            try:
+                os.close(stdin_w)
+            except OSError:
+                pass
+            stdin_w = None
+        if child_eof and not to_sock:
+            break
+        rlist, wlist = [], []
+        if not sock_eof and len(to_child) < buf_limit:
+            rlist.append(sock_fd)
+        if not child_eof and len(to_sock) < buf_limit:
+            rlist.append(stdout_r)
+        if to_child and stdin_w is not None:
+            wlist.append(stdin_w)
+        if to_sock:
+            wlist.append(sock_fd)
+        if not rlist and not wlist:
+            break
+        try:
+            readable, writable, _ = select.select(rlist, wlist, [])
+        except InterruptedError:
+            continue
+        if sock_fd in readable:
+            try:
+                b = os.read(sock_fd, buf_limit)
+                if b:
+                    to_child += b
+                else:
+                    sock_eof = True
+            except (BlockingIOError, InterruptedError):
+                pass
+            except OSError:
+                sock_eof = True
+        if stdout_r in readable:
+            try:
+                b = os.read(stdout_r, buf_limit)
+                if b:
+                    to_sock += b
+                else:
+                    child_eof = True
+            except (BlockingIOError, InterruptedError):
+                pass
+            except OSError:
+                child_eof = True
+        if stdin_w is not None and stdin_w in writable:
+            try:
+                n = os.write(stdin_w, to_child)
+                del to_child[:n]
+            except (BlockingIOError, InterruptedError):
+                pass
+            except OSError:
+                # Child closed its stdin; drop pending input.
+                to_child.clear()
+                try:
+                    os.close(stdin_w)
+                except OSError:
+                    pass
+                stdin_w = None
+        if sock_fd in writable and to_sock:
+            try:
+                n = os.write(sock_fd, to_sock)
+                del to_sock[:n]
+            except (BlockingIOError, InterruptedError):
+                pass
+            except OSError:
+                # Peer gone: no destination left for child output.
+                break
+    if stdin_w is not None:
+        try:
+            os.close(stdin_w)
+        except OSError:
+            pass
+    try:
+        os.close(stdout_r)
+    except OSError:
+        pass
+
+
+def main():
+    port = int(os.environ.get("INTENT_EXEC_PORT", DEFAULT_PORT))
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    srv = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    srv.bind((socket.VMADDR_CID_ANY, port))
+    srv.listen(16)
+    log(f"listening on vsock port {port} ({PROTOCOL})")
+    while True:
+        conn, _addr = srv.accept()
+        child = os.fork()
+        if child == 0:
+            srv.close()
+            try:
+                handle(conn)
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                os._exit(0)
+        else:
+            conn.close()
+            # Reap any finished connection handlers without blocking.
+            try:
+                while os.waitpid(-1, os.WNOHANG) != (0, 0):
+                    pass
+            except ChildProcessError:
+                pass
+
+
+if __name__ == "__main__":
+    main()

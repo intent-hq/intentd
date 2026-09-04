@@ -968,6 +968,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "providers",
             Some(json!({})),
         ),
+        secret(
+            "providers.claudeCodeOauthToken",
+            "Claude Code OAuth token",
+            "Long-lived token minted via `claude setup-token`, injected as \
+             CLAUDE_CODE_OAUTH_TOKEN into microVM-sandboxed claude-code agents \
+             (host spawns keep using the Keychain)",
+            "providers",
+        ),
         string(
             "model.default",
             "Default model",
@@ -1067,6 +1075,68 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "CoW workspaces + per-agent sandboxes (requires CoW filesystem support on the workspaces root)",
             "workspace",
             false,
+        ),
+        // --- Group B: execution environments (sandbox.*) ---------------------
+        enumerated(
+            "sandbox.defaultType",
+            "Default execution environment",
+            "Execution environment preselected at workspace creation (must name an enabled type)",
+            "sandbox",
+            &["direct", "worktree", "cow", "microvm"],
+            "worktree",
+        ),
+        boolean(
+            "sandbox.direct.enabled",
+            "Direct enabled",
+            "The direct (in-repo, no isolation) execution environment is always enabled; disabling it is rejected",
+            "sandbox",
+            true,
+        ),
+        boolean(
+            "sandbox.worktree.enabled",
+            "Worktree enabled",
+            "Offer the linked-worktree execution environment",
+            "sandbox",
+            true,
+        ),
+        boolean(
+            "sandbox.cow.enabled",
+            "CoW enabled",
+            "Offer CoW-clone workspaces + per-agent sandboxes (requires CoW filesystem support on the workspaces root)",
+            "sandbox",
+            false,
+        ),
+        boolean(
+            "sandbox.microvm.enabled",
+            "microVM enabled",
+            "Offer microVM (libkrun) agent sandboxes (requires microVM host capability and CoW filesystem support)",
+            "sandbox",
+            false,
+        ),
+        object(
+            "sandbox.microvm.image",
+            "microVM image override",
+            "Optional default guest-image override ({ manifestUrl, sha256 }); unset uses the built-in image pin",
+            "sandbox",
+            None,
+        ),
+        number(
+            "sandbox.microvm.vcpus",
+            "microVM vCPUs",
+            "Default vCPU count for spawned agent VMs (per-agent vmResources overrides beat this)",
+            "sandbox",
+            Some(1.0),
+            Some(16.0), // MAX_VCPUS in intentd-microvm-helper
+            2.0,
+        ),
+        number(
+            "sandbox.microvm.memMib",
+            "microVM memory (MiB)",
+            "Default guest memory in MiB for spawned agent VMs (per-agent vmResources overrides beat this)",
+            "sandbox",
+            Some(128.0), // MIN_MEM_MIB in intentd-microvm-helper
+            None,
+            2048.0,
         ),
         // --- Group A: MCP ----------------------------------------------------
         boolean(
@@ -1999,6 +2069,42 @@ pub async fn cleanup_retired_settings(store: &Store) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// One-time boot migration of `workspace.cowIsolation` into the execution
+/// environment (`sandbox.*`) settings group: when the legacy toggle is
+/// effectively **true** and the user has never touched the sandbox group (no
+/// `sandbox.*` key explicitly in `config.toml`), seed `sandbox.cow.enabled =
+/// true` and `sandbox.defaultType = "cow"` so the `CoW` opt-in carries over.
+/// The write lands in `config.toml`, which makes the migration durable and
+/// self-guarding: afterwards the seeded keys have `file` origin, so later
+/// boots (and a user who turns `cowIsolation` back off) never re-run it. The
+/// legacy toggle itself is left untouched — it still drives the
+/// `agent.delegate` isolation default. Returns whether the seed was applied.
+///
+/// # Errors
+///
+/// Returns an error when persisting the seeded settings fails.
+pub fn migrate_cow_isolation_to_sandbox(registry: &SettingsRegistry) -> Result<bool> {
+    let snapshot = registry.snapshot();
+    if !snapshot.effective.workspace.cow_isolation {
+        return Ok(false);
+    }
+    let sandbox_touched = SettingsRegistry::known_paths()
+        .iter()
+        .filter(|p| p.starts_with("sandbox."))
+        .any(|p| snapshot.origin(p) == Some(SettingOrigin::File));
+    if sandbox_touched {
+        return Ok(false);
+    }
+    registry.apply(&[
+        ("sandbox.cow.enabled".to_string(), json!(true)),
+        ("sandbox.defaultType".to_string(), json!("cow")),
+    ])?;
+    tracing::info!(
+        "migrated workspace.cowIsolation=true to sandbox.cow.enabled=true + sandbox.defaultType=cow"
+    );
+    Ok(true)
 }
 
 /// One-time boot migration for the `voice.vocabulary` default trim: a stored
@@ -3340,6 +3446,109 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// The `sandbox.*` execution-environment group: every key is a
+    /// non-secret TOML-backed catalog entry in the `sandbox` category, with
+    /// the worktree default enabled + preselected and CoW/microVM disabled.
+    #[test]
+    fn sandbox_catalog_entries_are_toml_backed() {
+        let def = find_definition("sandbox.defaultType").expect("sandbox.defaultType missing");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "sandbox");
+        assert!(matches!(
+            def.ty,
+            SettingType::Enum(&["direct", "worktree", "cow", "microvm"])
+        ));
+        assert_eq!(def.default_value, Some(json!("worktree")));
+
+        for (path, default) in [
+            ("sandbox.direct.enabled", true),
+            ("sandbox.worktree.enabled", true),
+            ("sandbox.cow.enabled", false),
+            ("sandbox.microvm.enabled", false),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path}");
+            assert!(!def.read_only, "{path}");
+            assert_eq!(def.category, "sandbox", "{path}");
+            assert!(matches!(def.ty, SettingType::Boolean), "{path}");
+            assert_eq!(def.default_value, Some(json!(default)), "{path}");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+
+        let def = find_definition("sandbox.microvm.image").expect("sandbox.microvm.image missing");
+        assert!(!def.sensitive);
+        assert!(matches!(def.ty, SettingType::Object));
+        assert!(def.default_value.is_none());
+        assert!(KNOWN_PATHS.contains(&"sandbox.defaultType"));
+        assert!(KNOWN_PATHS.contains(&"sandbox.microvm.image"));
+    }
+
+    /// The cowIsolation → sandbox migration seeds `sandbox.cow.enabled=true`
+    /// plus `sandbox.defaultType="cow"` exactly once: only when the legacy
+    /// toggle is effectively true AND no `sandbox.*` key is explicitly in the
+    /// file; the seeded keys then have `file` origin, so re-runs (and later
+    /// user changes) are never overwritten.
+    #[test]
+    fn cow_isolation_migration_seeds_sandbox_group() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-mig-cow-{tag}.toml"));
+        std::fs::write(&config_path, "[workspace]\ncowIsolation = true\n").expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        assert!(migrate_cow_isolation_to_sandbox(&registry).expect("migrate"));
+        assert_eq!(registry.get("sandbox.cow.enabled"), Some(json!(true)));
+        assert_eq!(registry.get("sandbox.defaultType"), Some(json!("cow")));
+        assert_eq!(
+            registry.origin("sandbox.defaultType"),
+            Some(SettingOrigin::File)
+        );
+        // The legacy toggle stays untouched.
+        assert_eq!(registry.get("workspace.cowIsolation"), Some(json!(true)));
+
+        // Idempotent: the seeded keys now have file origin, so a second boot
+        // does not re-apply.
+        assert!(!migrate_cow_isolation_to_sandbox(&registry).expect("re-run"));
+
+        // A user who later changes the group is never overwritten.
+        registry
+            .apply(&[("sandbox.defaultType".to_string(), json!("worktree"))])
+            .expect("user change");
+        assert!(!migrate_cow_isolation_to_sandbox(&registry).expect("re-run after user change"));
+        assert_eq!(registry.get("sandbox.defaultType"), Some(json!("worktree")));
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// The migration is a no-op when cowIsolation is off (default or
+    /// explicit) or when the sandbox group was already configured.
+    #[test]
+    fn cow_isolation_migration_no_ops() {
+        // cowIsolation off (schema default).
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-mig-off-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        assert!(!migrate_cow_isolation_to_sandbox(&registry).expect("migrate"));
+        assert_eq!(registry.get("sandbox.cow.enabled"), Some(json!(false)));
+        let _ = std::fs::remove_file(&config_path);
+
+        // cowIsolation on but the sandbox group already touched: user intent
+        // wins, nothing is seeded.
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-mig-touched-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[workspace]\ncowIsolation = true\n\n[sandbox.cow]\nenabled = false\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        assert!(!migrate_cow_isolation_to_sandbox(&registry).expect("migrate"));
+        assert_eq!(registry.get("sandbox.cow.enabled"), Some(json!(false)));
+        assert_eq!(registry.get("sandbox.defaultType"), Some(json!("worktree")));
+        let _ = std::fs::remove_file(&config_path);
     }
 
     /// `agents.flushQueuedMessages` is a TOML-backed enum (`all` / `systemOnly`

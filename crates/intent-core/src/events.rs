@@ -447,6 +447,34 @@ pub const APP_UI_NAVIGATE: &str = "app:ui-navigate";
 pub const APP_UI_HIGHLIGHT: &str = "app:ui-highlight";
 pub const APP_WORKSPACE_OPEN: &str = "app:workspace-open";
 
+// Sandbox guest-image events (new in intentd; monorepo#1120). Emitted by the
+// guest-image download/verify/cache pipeline (`intent-services::sandbox_image`)
+// during first-use image resolution for microVM-sandboxed workspaces.
+// `sandbox:image:pulling` → `{ workspaceId?, manifestUrl, imageId?, version? }`
+// when a download starts (cache miss); `sandbox:image:downloaded` →
+// `{ workspaceId?, manifestUrl, imageId, version, sha256, cachePath }` on a
+// verified download landing in the cache; `sandbox:image:error` →
+// `{ workspaceId?, manifestUrl, configSource, error }` on any manifest /
+// download / verification failure (`configSource` names where the image
+// reference came from: repo config, profile default, or built-in pin).
+pub const SANDBOX_IMAGE_PULLING: &str = "sandbox:image:pulling";
+pub const SANDBOX_IMAGE_DOWNLOADED: &str = "sandbox:image:downloaded";
+pub const SANDBOX_IMAGE_ERROR: &str = "sandbox:image:error";
+
+// Sandbox microVM lifecycle events (new in intentd; monorepo#1120, EE-5).
+// Emitted by the microVM orchestrator (`intent-services::microvm`) around the
+// per-agent VM lifecycle. `sandbox:vm:starting` →
+// `{ workspaceId, agentId, imageId, imageVersion }` when a VM boot begins;
+// `sandbox:vm:started` → `{ workspaceId, agentId, imageId, imageVersion,
+// bootMs }` once the guest exec agent answers; `sandbox:vm:stopped` →
+// `{ workspaceId, agentId }` after teardown (helper reaped, staged
+// credentials scrubbed); `sandbox:vm:error` →
+// `{ workspaceId, agentId, error }` on any boot/bridge failure.
+pub const SANDBOX_VM_STARTING: &str = "sandbox:vm:starting";
+pub const SANDBOX_VM_STARTED: &str = "sandbox:vm:started";
+pub const SANDBOX_VM_STOPPED: &str = "sandbox:vm:stopped";
+pub const SANDBOX_VM_ERROR: &str = "sandbox:vm:error";
+
 // Skills events (new in intentd; PROTOCOL §5.33/§6.5). Emitted when the
 // discovered skill set changes for a workspace (file-watch on skill roots).
 // Payload: `{ workspaceId }`.
@@ -596,6 +624,13 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,
+    SANDBOX_IMAGE_PULLING,
+    SANDBOX_IMAGE_DOWNLOADED,
+    SANDBOX_IMAGE_ERROR,
+    SANDBOX_VM_STARTING,
+    SANDBOX_VM_STARTED,
+    SANDBOX_VM_STOPPED,
+    SANDBOX_VM_ERROR,
     SKILLS_CHANGED,
     SPECIALISTS_CHANGED,
 ];

@@ -97,6 +97,7 @@ mod history_xml;
 mod hook_manager;
 mod line_attribution;
 mod linear_ops;
+pub mod microvm;
 mod model_catalog;
 mod nested_repos;
 pub mod note_ops;
@@ -113,6 +114,7 @@ pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
 mod rtk;
+pub mod sandbox_image;
 mod sandbox_ops;
 mod script_ops;
 mod search_ops;
@@ -158,8 +160,8 @@ pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
     max_concurrent_adapters, max_concurrent_agents, migrate_active_provider_setting,
-    migrate_default_vocabulary, migrate_quick_action_settings, report_to_parent_debounce_seconds,
-    InMemorySecretStore, SecretStore,
+    migrate_cow_isolation_to_sandbox, migrate_default_vocabulary, migrate_quick_action_settings,
+    report_to_parent_debounce_seconds, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
@@ -731,6 +733,11 @@ pub struct Services {
     /// reads through it; this set is empty there. Shared across clones so a
     /// `set_test_busy` on one handle is visible to every other handle.
     test_busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Test-only per-agent delay injected into the sweep's merge attempt
+    /// (after the claim), standing in for a wedged merge (hung fetch). Lets
+    /// unit tests prove the sweep's time budget aborts a stuck lane without
+    /// stalling the pass. Empty in production. Shared across clones.
+    test_sweep_delays: Arc<Mutex<HashMap<AgentId, std::time::Duration>>>,
     /// Attention requests (`ws.agent.requestDiscussion` /
     /// `ws.agent.reportBlocker`) raised MID-TURN, whose user-facing
     /// surfacing (`agent:attention-requested`, the `agent:updated` attention
@@ -1140,6 +1147,7 @@ impl Services {
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
+            test_sweep_delays: Arc::new(Mutex::new(HashMap::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
@@ -2741,6 +2749,42 @@ impl Services {
             .await
     }
 
+    /// Whether the host can run microVM agent sandboxes
+    /// (`system.capabilities.microvmSupported`, §5.7): the platform check
+    /// (macOS ARM64 / Linux with `/dev/kvm`) `ANDed` with the `CoW` probe —
+    /// microVM requires `CoW` because each agent VM virtio-fs-mounts its own
+    /// reflink clone. `Some(false)` on an incapable platform regardless of
+    /// the `CoW` probe; on a capable platform this mirrors
+    /// [`Self::compute_cow_supported`] (`None` when the probe cannot run).
+    async fn compute_microvm_supported(&self) -> Option<bool> {
+        let (platform_ok, _) = microvm_platform_supported();
+        if !platform_ok {
+            return Some(false);
+        }
+        self.compute_cow_supported().await
+    }
+
+    /// Non-panicking CoW-capability hint for per-bridge description gating
+    /// (`WorkspaceMcpServer::with_cow_capable`). Unlike
+    /// [`Self::compute_cow_supported`] this never falls through to
+    /// `default_workspaces_root()`'s hermetic-test guard: with no injected
+    /// root and no `$INTENTD_WORKSPACES_DIR` it reports `false` — under
+    /// `cfg(test)` and in daemons spawned with
+    /// `INTENTD_ASSERT_HERMETIC_ROOT` — instead of panicking.
+    /// Description-only consumers tolerate the conservative answer.
+    pub(crate) async fn cow_capable_hint(&self) -> bool {
+        let root = match self.workspaces_root.clone() {
+            Some(r) => r,
+            None if std::env::var_os("INTENTD_WORKSPACES_DIR").is_none()
+                && (cfg!(test) || std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some()) =>
+            {
+                return false;
+            }
+            None => default_workspaces_root(),
+        };
+        self.workspace_aggregates.cow_supported(root).await == Some(true)
+    }
+
     /// The daemon-managed directory whose footprint `workspace.diskUsage`
     /// reports, or `None` for rows without one (remote / skip-isolation rows
     /// and the virtual chief workspace). The directory is the provisioned
@@ -3294,6 +3338,17 @@ impl Services {
             } else {
                 set.remove(agent_id);
             }
+        }
+    }
+
+    /// Test-only seam: inject a delay into the sweep's merge attempt for
+    /// `agent_id`'s sandbox (after the claim), simulating a wedged merge so
+    /// tests can prove the sweep budget aborts stuck lanes. No production
+    /// caller.
+    #[doc(hidden)]
+    pub fn set_test_sweep_delay(&self, agent_id: &AgentId, delay: std::time::Duration) {
+        if let Ok(mut map) = self.test_sweep_delays.lock() {
+            map.insert(agent_id.clone(), delay);
         }
     }
 
@@ -4784,7 +4839,16 @@ impl Services {
             let mut sub = bus.subscribe(filter);
             while let Some(events) = sub.recv().await {
                 for event in events {
-                    services.handle_completion_event(&event).await;
+                    // Detach per event: a completion that triggers a sandbox
+                    // merge-back does git work (dirty commit + LLM message,
+                    // fetch, cherry-pick) and must not head-of-line-block the
+                    // subscriber loop — while one merge ran inline here, every
+                    // other agent's completion wake sat undelivered (and the
+                    // subscriber queue could lag out entirely).
+                    let services = services.clone();
+                    tokio::spawn(async move {
+                        services.handle_completion_event(&event).await;
+                    });
                 }
             }
         })
@@ -4804,23 +4868,49 @@ impl Services {
         let child = AgentId::from(child_id.as_str());
 
         // BEFORE waking the coordinator: if this is a sandboxed agent completion,
-        // attempt the merge-back. On clean merge, proceed normally. On conflict,
-        // suppress completion propagation and bounce the agent. On blocked or
-        // retry-exhausted, propagate with merge-pending status.
+        // attempt the merge-back. On clean merge, proceed normally. On conflict
+        // (or an uncommitted sandbox with auto-commit off), suppress completion
+        // propagation and bounce the agent. On blocked or retry-exhausted,
+        // propagate with merge-pending status. Propagated completions carry the
+        // merge outcome on the event data (`sandboxMergeStatus` + `sandboxPath`
+        // + `sandboxCommitRange`) so the parent's wake names where the work is.
+        let mut sandbox_annotated: Option<Event> = None;
         if event.event_type == AGENT_IDLE {
             if let Ok(session) = self.store.get_agent_session(&child).await {
                 if session.sandbox_path.is_some() {
-                    let should_propagate = self
+                    let disposition = self
                         .handle_sandbox_merge_on_completion(&event.workspace_id, &child, &session)
                         .await;
-                    if !should_propagate {
-                        // Conflict bounce: agent was woken with instructions; do NOT
+                    if !disposition.propagate {
+                        // Bounce: agent was woken with instructions; do NOT
                         // wake coordinator yet. The agent's next completion will retry.
                         return;
+                    }
+                    if disposition.merge_status.is_some() {
+                        let mut e = event.clone();
+                        if let Some(obj) = e.data.as_object_mut() {
+                            if let Some(status) = disposition.merge_status {
+                                obj.insert(
+                                    "sandboxMergeStatus".to_string(),
+                                    serde_json::json!(status),
+                                );
+                            }
+                            if let Some(path) = &session.sandbox_path {
+                                obj.insert("sandboxPath".to_string(), serde_json::json!(path));
+                            }
+                            if let Some(range) = &disposition.commit_range {
+                                obj.insert(
+                                    "sandboxCommitRange".to_string(),
+                                    serde_json::json!(range),
+                                );
+                            }
+                        }
+                        sandbox_annotated = Some(e);
                     }
                 }
             }
         }
+        let event = sandbox_annotated.as_ref().unwrap_or(event);
 
         let classification = self.deliver_completion_to_watches(&child, event).await;
         // An agent going idle ends its delegating turn, so seal that parent's
@@ -7386,19 +7476,27 @@ impl Services {
         Box::pin(self.redeliver_completion_after_queue_mutation(&group.parent_agent_id)).await;
     }
 
-    /// Handle sandbox merge-back on agent completion.
-    /// Returns `true` if completion should propagate normally (clean merge or blocked/retry-exhausted).
-    /// Returns `false` if completion was suppressed (conflict bounce).
+    /// Handle sandbox merge-back on agent completion (see
+    /// [`SandboxMergeDisposition`]). The returned
+    /// disposition says whether the completion should propagate
+    /// (`propagate: false` = the agent was bounced — conflict, or an
+    /// uncommitted sandbox with auto-commit off) and, when it does, which
+    /// merge outcome to annotate onto the completion event
+    /// (`sandboxMergeStatus`: `"merged"` / `"merge_pending"` / `"unmerged"`,
+    /// plus `sandboxCommitRange` on a clean merge).
     async fn handle_sandbox_merge_on_completion(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         session: &AgentSession,
-    ) -> bool {
-        // Check retry count (cap at 2 bounces)
-        const MAX_RETRIES: i64 = 2;
-        use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+    ) -> SandboxMergeDisposition {
+        use crate::sandbox_ops::{
+            merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
+        };
         use intent_store::SandboxStatus;
+
+        // Retry count cap (2 bounces).
+        const MAX_RETRIES: i64 = 2;
 
         // Load sandbox record
         let sandbox = match self.store.get_sandbox(workspace_id, agent_id).await {
@@ -7408,7 +7506,7 @@ impl Services {
                     agent = %agent_id.0,
                     "agent has sandbox_path but no sandbox record; skipping merge"
                 );
-                return true;
+                return SandboxMergeDisposition::propagate_silent();
             }
             Err(e) => {
                 tracing::error!(
@@ -7416,10 +7514,27 @@ impl Services {
                     error = %e,
                     "failed to load sandbox record; propagating completion"
                 );
-                return true;
+                return SandboxMergeDisposition::propagate_silent();
             }
         };
 
+        // Parent opted out of turn-end merges (`mergeOnTurnEnd: false`):
+        // skip the merge entirely — no status transition, no bounce — and
+        // propagate completion normally. The sandbox stays live in its
+        // current status; `ws.agent.mergeSandbox` / the `sandbox.cow.merge`
+        // RPC is the way to merge later, and the retry sweep skips these
+        // sandboxes too. The parent still learns the work is unmerged from
+        // the completion annotation.
+        if !sandbox.merge_on_turn_end {
+            tracing::info!(
+                agent = %agent_id.0,
+                sandbox = %sandbox.id,
+                "sandbox has mergeOnTurnEnd=false; skipping turn-end merge"
+            );
+            return SandboxMergeDisposition::propagate_with("unmerged");
+        }
+
+        // Check retry count (cap at MAX_RETRIES bounces)
         let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id).await;
 
         // Claim the merge atomically (current status → merging) so this path
@@ -7432,8 +7547,9 @@ impl Services {
                 agent = %agent_id.0,
                 "sandbox merge already in progress; propagating completion without merging"
             );
-            return true;
+            return SandboxMergeDisposition::propagate_silent();
         }
+        let claim_started = std::time::Instant::now();
         match self
             .store
             .try_transition_sandbox_status(
@@ -7451,7 +7567,7 @@ impl Services {
                     agent = %agent_id.0,
                     "sandbox claimed by another merge path; propagating completion without merging"
                 );
-                return true;
+                return SandboxMergeDisposition::propagate_silent();
             }
             Err(e) => {
                 tracing::error!(
@@ -7461,55 +7577,41 @@ impl Services {
                 );
             }
         }
+        let claim_ms = u64::try_from(claim_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Crash-safe claim scope: if this future is dropped or panics before a
+        // terminal status is persisted, the guard resets `merging →
+        // merge_pending` so the row is never stranded (the mechanism behind
+        // the isolation-lab stranded-`merging` incident).
+        let mut claim_guard =
+            MergeClaimGuard::armed(self.store.clone(), workspace_id.clone(), agent_id.clone());
+
+        // Turn-end dirty-state policy: with the workspace's effective
+        // auto-commit ON, generate an LLM-assisted commit message for the
+        // uncommitted sandbox state (deterministic fallback inside); with it
+        // OFF, refuse to commit — `DirtyHandling::Bounce` makes the merge
+        // return `Dirty` without snapshotting or merging anything.
+        let auto_commit = self.effective_auto_commit(workspace_id).await;
+        let commit_msg_started = std::time::Instant::now();
+        let dirty_handling = if auto_commit {
+            let message = self.sandbox_dirty_commit_message(agent_id, session).await;
+            DirtyHandling::Commit(message)
+        } else {
+            DirtyHandling::Bounce
+        };
+        let commit_msg_ms =
+            u64::try_from(commit_msg_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         // Attempt merge
-        let outcome = match merge_sandbox(&self.store, workspace_id, agent_id).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                tracing::error!(
-                    agent = %agent_id.0,
-                    error = %e,
-                    "sandbox merge failed with error; marking merge-pending"
-                );
-                let _ = self
-                    .store
-                    .update_sandbox_status(
-                        workspace_id,
-                        agent_id,
-                        SandboxStatus::MergePending,
-                        &now_iso(),
-                    )
-                    .await;
-                // Propagate completion with error status
-                return true;
-            }
-        };
-
-        match outcome {
-            MergeOutcome::Merged {
-                commit_range,
-                canonical_head,
-            } => {
-                // Success! Shared bookkeeping: mark merged, discard sandbox,
-                // emit sandbox:cow:merged, clear retry count.
-                self.finalize_sandbox_merged(
-                    workspace_id,
-                    agent_id,
-                    &commit_range,
-                    &canonical_head,
-                )
-                .await;
-
-                // Propagate completion normally
-                true
-            }
-            MergeOutcome::Conflict {
-                conflicting_paths,
-                canonical_head,
-            } => {
-                // Conflict: check retry limit
-                if retry_count >= MAX_RETRIES {
-                    // Exhausted retries; mark merge-pending and propagate
+        let merge_started = std::time::Instant::now();
+        let outcome =
+            match merge_sandbox_with(&self.store, workspace_id, agent_id, dirty_handling).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::error!(
+                        agent = %agent_id.0,
+                        error = %e,
+                        "sandbox merge failed with error; marking merge-pending"
+                    );
                     let _ = self
                         .store
                         .update_sandbox_status(
@@ -7519,33 +7621,98 @@ impl Services {
                             &now_iso(),
                         )
                         .await;
+                    claim_guard.disarm();
+                    // Propagate completion with error status
+                    return SandboxMergeDisposition::propagate_with("merge_pending");
+                }
+            };
+        let merge_ms = u64::try_from(merge_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        match outcome {
+            MergeOutcome::Merged {
+                commit_range,
+                canonical_head,
+                ..
+            } => {
+                // Success! Shared bookkeeping: mark merged, emit
+                // sandbox:cow:merged, clear retry count. The sandbox
+                // persists for the agent's next turn.
+                let finalize_started = std::time::Instant::now();
+                self.finalize_sandbox_merged(
+                    workspace_id,
+                    agent_id,
+                    &commit_range,
+                    &canonical_head,
+                )
+                .await;
+                claim_guard.disarm();
+                tracing::info!(
+                    agent = %agent_id.0,
+                    claim_ms,
+                    commit_msg_ms,
+                    merge_ms,
+                    finalize_ms = u64::try_from(finalize_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "sandbox turn-end merge phase timings"
+                );
+
+                // Propagate completion normally
+                SandboxMergeDisposition {
+                    propagate: true,
+                    merge_status: Some("merged"),
+                    commit_range: Some(commit_range),
+                }
+            }
+            MergeOutcome::Conflict {
+                conflicting_paths,
+                canonical_head,
+            } => {
+                // Conflict: check retry limit
+                if retry_count >= MAX_RETRIES {
+                    // Bounce retries exhausted: conflicts are deterministic —
+                    // more automatic retries are useless. Land the TERMINAL
+                    // `conflict` status (paths persisted, work pushed to the
+                    // sb/<agentId> recovery branch in canonical, attention
+                    // raised) and propagate so the coordinator learns.
+                    self.finalize_sandbox_conflict(
+                        workspace_id,
+                        agent_id,
+                        &conflicting_paths,
+                        &canonical_head,
+                    )
+                    .await;
+                    claim_guard.disarm();
 
                     tracing::warn!(
                         agent = %agent_id.0,
                         retries = retry_count,
-                        "conflict retry limit exhausted; marking merge-pending"
+                        "conflict retry limit exhausted; sandbox is in terminal conflict status"
                     );
 
                     self.clear_sandbox_retry_count(workspace_id, agent_id).await;
-                    return true;
+                    return SandboxMergeDisposition::propagate_with("conflict");
                 }
 
-                // Bounce: update status, increment retry, fetch canonical, wake agent
+                // Bounce: update status (persisting the conflicting paths on
+                // the row so pollers see WHY it bounced), increment retry,
+                // fetch canonical, wake agent
                 let _ = self
                     .store
-                    .update_sandbox_status(
+                    .set_sandbox_status_with_conflicts(
                         workspace_id,
                         agent_id,
                         SandboxStatus::ConflictBounced,
+                        &conflicting_paths,
                         &now_iso(),
                     )
                     .await;
+                claim_guard.disarm();
 
                 self.increment_sandbox_retry_count(workspace_id, agent_id)
                     .await;
 
-                // Fetch canonical state into sandbox
-                if let Err(e) = self
+                // Fetch the CURRENT canonical tip into the sandbox (forced
+                // refspec — every bounce refreshes `canonical/HEAD`).
+                let fetched_tip = match self
                     .fetch_canonical_to_sandbox(
                         workspace_id,
                         agent_id,
@@ -7554,29 +7721,32 @@ impl Services {
                     )
                     .await
                 {
-                    tracing::error!(
-                        agent = %agent_id.0,
-                        error = %e,
-                        "failed to fetch canonical to sandbox; marking merge-pending"
-                    );
-                    let _ = self
-                        .store
-                        .update_sandbox_status(
-                            workspace_id,
-                            agent_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    return true;
-                }
+                    Ok(tip) => tip,
+                    Err(e) => {
+                        tracing::error!(
+                            agent = %agent_id.0,
+                            error = %e,
+                            "failed to fetch canonical to sandbox; marking merge-pending"
+                        );
+                        let _ = self
+                            .store
+                            .update_sandbox_status(
+                                workspace_id,
+                                agent_id,
+                                SandboxStatus::MergePending,
+                                &now_iso(),
+                            )
+                            .await;
+                        return SandboxMergeDisposition::propagate_with("merge_pending");
+                    }
+                };
 
                 // Wake agent with conflict instructions
                 let message = format!(
                     "⚠️ Merge conflict detected. Your sandbox branch has conflicts with the canonical repository.\n\n\
                     **Conflicting files:**\n{}\n\n\
                     **Instructions:**\n\
-                    1. The canonical state has been fetched to your sandbox as `refs/remotes/canonical/HEAD`\n\
+                    1. The canonical state has been fetched to your sandbox as `refs/remotes/canonical/HEAD` (commit {})\n\
                     2. Resolve conflicts by rebasing or merging: `git rebase canonical/HEAD` or `git merge canonical/HEAD`\n\
                     3. Fix conflicts in the listed files\n\
                     4. Commit the resolution: `git add <files> && git commit`\n\
@@ -7585,20 +7755,20 @@ impl Services {
                     You are working in an isolated sandbox at: `{}`\n\
                     Retry {}/{} - fix conflicts in your sandbox only.",
                     conflicting_paths.join("\n- "),
+                    fetched_tip,
                     session.sandbox_path.as_ref().unwrap(),
                     retry_count + 1,
                     MAX_RETRIES
                 );
 
+                // Deliver as a REAL turn via the runtime AgentManager
+                // (`deliver_wake_message`): the agent just went idle, so a
+                // store-only append would sit unread forever — the bounce
+                // must resume the agent so it actually reconciles. A dead
+                // ACP child is tolerated (the turn worker respawns it), and
+                // a busy agent gets the bounce queued for its drain loop.
                 if let Err(e) = self
-                    .agent_send_message_op(
-                        agent_id.clone(),
-                        message,
-                        None, // messageId
-                        None, // imageBlocks
-                        None, // fileBlocks
-                        None, // messageMetadata
-                    )
+                    .deliver_wake_message(workspace_id, agent_id, &message, None)
                     .await
                 {
                     tracing::error!(
@@ -7616,7 +7786,7 @@ impl Services {
                 );
 
                 // Suppress completion propagation
-                false
+                SandboxMergeDisposition::bounce()
             }
             MergeOutcome::Blocked {
                 reason,
@@ -7632,6 +7802,7 @@ impl Services {
                         &now_iso(),
                     )
                     .await;
+                claim_guard.disarm();
 
                 tracing::warn!(
                     agent = %agent_id.0,
@@ -7643,51 +7814,154 @@ impl Services {
                 self.clear_sandbox_retry_count(workspace_id, agent_id).await;
 
                 // Propagate completion (coordinator/user will see merge-pending status)
-                true
+                SandboxMergeDisposition::propagate_with("merge_pending")
+            }
+            MergeOutcome::Dirty { dirty_paths } => {
+                // Auto-commit is OFF and the sandbox worktree has uncommitted
+                // changes: nothing was committed or merged. Return the
+                // sandbox to its pre-claim status and bounce the agent — the
+                // turn must NOT complete while the work is neither committed
+                // nor merged. The bounce does not consume a conflict retry
+                // (nothing conflicted); the agent commits and re-completes.
+                let _ = self
+                    .store
+                    .update_sandbox_status(workspace_id, agent_id, sandbox.status, &now_iso())
+                    .await;
+                claim_guard.disarm();
+
+                let message = format!(
+                    "⚠️ Your sandbox has uncommitted changes and this workspace has auto-commit \
+                     disabled, so your work cannot be merged back automatically.\n\n\
+                     **Uncommitted paths:**\n- {}\n\n\
+                     **Instructions:**\n\
+                     1. Commit your work in the sandbox: `git add <files> && git commit`\n\
+                     2. Use scoped, meaningful commits — auto-commit is off because commits are curated here\n\
+                     3. End your turn when done - the system will retry the merge\n\n\
+                     You are working in an isolated sandbox at: `{}`",
+                    dirty_paths.join("\n- "),
+                    session.sandbox_path.as_deref().unwrap_or("<unknown>"),
+                );
+
+                // Same runtime delivery as the conflict bounce above: resume
+                // the agent so it commits, instead of leaving the row unread.
+                if let Err(e) = self
+                    .deliver_wake_message(workspace_id, agent_id, &message, None)
+                    .await
+                {
+                    tracing::error!(
+                        agent = %agent_id.0,
+                        error = %e,
+                        "failed to send dirty-sandbox bounce message to agent"
+                    );
+                }
+
+                tracing::info!(
+                    agent = %agent_id.0,
+                    paths = ?dirty_paths,
+                    "dirty sandbox with auto-commit off; agent bounced to commit its work"
+                );
+
+                SandboxMergeDisposition::bounce()
             }
         }
     }
 
+    /// Best-effort LLM-assisted commit message for a dirty sandbox worktree
+    /// at turn-end merge time (auto-commit ON). Reuses the LNI-1 generation
+    /// pipeline pointed at the SANDBOX path (diff, recent subjects, AGENTS.md,
+    /// task/agent hints). `None` falls through to `merge_sandbox_with`'s
+    /// deterministic default message.
+    async fn sandbox_dirty_commit_message(
+        &self,
+        agent_id: &AgentId,
+        session: &AgentSession,
+    ) -> Option<String> {
+        let sandbox_path = std::path::PathBuf::from(session.sandbox_path.as_deref()?);
+        // Cheap pre-check: skip generation (an LLM round-trip) when clean.
+        match crate::sandbox_ops::worktree_is_dirty(&sandbox_path) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => {
+                tracing::debug!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "sandbox dirty pre-check failed; skipping message generation"
+                );
+                return None;
+            }
+        }
+        let linked_note_id = session.task_note_id.clone();
+        match self
+            .generate_auto_commit_message(&sandbox_path, session, linked_note_id.as_ref())
+            .await
+        {
+            Some(msg) => Some(msg),
+            None => Some(
+                self.build_auto_commit_subject(session, linked_note_id.as_ref())
+                    .await,
+            ),
+        }
+    }
+
     /// Fetch canonical repository state into sandbox for conflict resolution.
+    /// The source is the merge-target repository ([`resolve_user_directory`]
+    /// — the workspace checkout for CoW/Direct checkout modes, NOT the raw
+    /// `repository_path`, which is a stale clone source there). Returns the
+    /// fetched canonical tip SHA (`refs/remotes/canonical/HEAD` after the
+    /// fetch) so bounce messages can name the exact commit to reconcile
+    /// against.
     async fn fetch_canonical_to_sandbox(
         &self,
         workspace_id: &WorkspaceId,
         _agent_id: &AgentId,
         sandbox_path: &str,
         _canonical_head: &str,
-    ) -> Result<()> {
-        // Load workspace to get canonical repo path
+    ) -> Result<String> {
+        // Resolve the canonical repo exactly like the merge path does, so
+        // the bounced agent reconciles against the tip it conflicted with.
         let workspace = self.store.get_workspace(workspace_id).await?;
-        let canonical_path = workspace
-            .repository_path
-            .as_ref()
-            .ok_or_else(|| Error::InvalidParams("workspace has no repository_path".to_string()))?;
+        let canonical_path = crate::sandbox_ops::resolve_user_directory(&workspace)?;
 
         // Fetch canonical HEAD into sandbox as canonical/HEAD. Shell out to
         // git with an explicit refspec and tag auto-follow disabled: the
         // canonical repo carries non-commit refs (refs/intent/blobs/*,
         // refs/stash) that libgit2's local transport trips over ("object is
         // not a committish", InvalidSpec) — same failure class fixed for the
-        // merge-back fetch in sandbox_ops::merge_sandbox.
-        let fetch_out = std::process::Command::new("git")
-            .arg("fetch")
-            .arg("--no-tags")
-            .arg("--quiet")
-            .arg(canonical_path)
-            .arg("+HEAD:refs/remotes/canonical/HEAD")
-            .current_dir(sandbox_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| Error::Internal(format!("fetch canonical to sandbox failed: {e}")))?;
-        if !fetch_out.status.success() {
-            return Err(Error::Internal(format!(
-                "fetch canonical to sandbox failed: {}",
-                String::from_utf8_lossy(&fetch_out.stderr).trim()
-            )));
-        }
-
-        Ok(())
+        // merge-back fetch in sandbox_ops::merge_sandbox. The `+` refspec
+        // forces the update so every bounce refreshes the ref to the CURRENT
+        // tip. Runs on the blocking pool: a large local fetch must not pin
+        // an async runtime worker.
+        let sandbox_path = sandbox_path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let fetch_out = std::process::Command::new("git")
+                .arg("fetch")
+                .arg("--no-tags")
+                .arg("--quiet")
+                .arg(&canonical_path)
+                .arg("+HEAD:refs/remotes/canonical/HEAD")
+                .current_dir(&sandbox_path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| Error::Internal(format!("fetch canonical to sandbox failed: {e}")))?;
+            if !fetch_out.status.success() {
+                return Err(Error::Internal(format!(
+                    "fetch canonical to sandbox failed: {}",
+                    String::from_utf8_lossy(&fetch_out.stderr).trim()
+                )));
+            }
+            let repo = git2::Repository::open(&sandbox_path)
+                .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
+            let tip = repo
+                .find_reference("refs/remotes/canonical/HEAD")
+                .and_then(|r| r.peel_to_commit())
+                .map_err(|e| {
+                    Error::Internal(format!("resolve fetched canonical tip failed: {e}"))
+                })?;
+            Ok(tip.id().to_string())
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("fetch canonical task failed: {e}")))?
     }
 
     async fn get_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) -> i64 {
@@ -7713,10 +7987,12 @@ impl Services {
 
     /// Shared success bookkeeping for a merged sandbox, used by every
     /// merge-back caller (completion interception, the `sandbox.cow.merge` RPC,
-    /// and the background retry sweep): mark the record `merged`, discard
-    /// the sandbox directory + record, emit `sandbox:cow:merged`, and clear the
-    /// retry count. All store failures are logged and swallowed — the merge
-    /// itself already landed in canonical.
+    /// and the background retry sweep): mark the record `merged`, emit
+    /// `sandbox:cow:merged`, and clear the retry count. The sandbox directory
+    /// and record are NOT discarded — sandboxes are persistent for the agent's
+    /// lifetime (the agent keeps working in the same sandbox across turns;
+    /// cleanup happens on agent/workspace deletion). All store failures are
+    /// logged and swallowed — the merge itself already landed in canonical.
     pub(crate) async fn finalize_sandbox_merged(
         &self,
         workspace_id: &WorkspaceId,
@@ -7726,20 +8002,18 @@ impl Services {
     ) {
         use intent_store::SandboxStatus;
 
+        // Single write clears any stale conflicting_paths left by an earlier
+        // bounce along with landing the merged status.
         let _ = self
             .store
-            .update_sandbox_status(workspace_id, agent_id, SandboxStatus::Merged, &now_iso())
+            .set_sandbox_status_with_conflicts(
+                workspace_id,
+                agent_id,
+                SandboxStatus::Merged,
+                &[],
+                &now_iso(),
+            )
             .await;
-
-        if let Err(e) =
-            crate::sandbox_ops::discard_sandbox(&self.store, workspace_id, agent_id).await
-        {
-            tracing::warn!(
-                agent = %agent_id.0,
-                error = %e,
-                "failed to discard sandbox after successful merge"
-            );
-        }
 
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
@@ -7771,6 +8045,247 @@ impl Services {
         );
 
         self.clear_sandbox_retry_count(workspace_id, agent_id).await;
+    }
+
+    /// Shared terminal-conflict bookkeeping for a merge that hit deterministic
+    /// conflicts with no productive retry left (completion retry cap
+    /// exhausted, any sweep conflict, or a manual merge conflict): persist the
+    /// terminal `conflict` status WITH the conflicting paths in one write,
+    /// push the sandbox's commits to its `sb/<agentId>` branch in the
+    /// canonical repo so the work — including its non-conflicting files — is
+    /// recoverable with normal git tooling, emit `sandbox:cow:conflict`, and
+    /// raise workspace attention so the user is told. Conflicts are
+    /// deterministic (retrying without canonical changing is useless), so the
+    /// row leaves the retry queue entirely; resolution is a later manual
+    /// `sandbox.cow.merge` or `sandbox.cow.discard`. All failures inside are
+    /// logged and swallowed — the terminal status write is the anchor.
+    pub(crate) async fn finalize_sandbox_conflict(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        conflicting_paths: &[String],
+        canonical_head: &str,
+    ) {
+        use intent_store::SandboxStatus;
+
+        // Recovery branch FIRST: fetch the sandbox branch into canonical as a
+        // local sb/<agentId> branch (ref-only, worktree untouched) so the
+        // agent's output survives even if the sandbox directory is later lost.
+        let recovery_branch = match crate::sandbox_ops::push_conflict_recovery_branch(
+            &self.store,
+            workspace_id,
+            agent_id,
+        )
+        .await
+        {
+            Ok(branch) => Some(branch),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "failed to push conflict recovery branch; sandbox work only lives in the sandbox directory"
+                );
+                None
+            }
+        };
+
+        if let Err(e) = self
+            .store
+            .set_sandbox_status_with_conflicts(
+                workspace_id,
+                agent_id,
+                SandboxStatus::Conflict,
+                conflicting_paths,
+                &now_iso(),
+            )
+            .await
+        {
+            tracing::error!(
+                agent = %agent_id.0,
+                workspace = %workspace_id.0,
+                error = %e,
+                "failed to persist terminal conflict status"
+            );
+        }
+
+        let event = NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: now_iso(),
+            event_type: "sandbox:cow:conflict".to_string(),
+            actor: intent_core::EventActor {
+                actor_type: ActorType::System,
+                id: Some("intentd".to_string()),
+                name: Some("intentd".to_string()),
+                ..Default::default()
+            },
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({
+                "workspaceId": workspace_id.0,
+                "agentId": agent_id.0,
+                "conflictingPaths": conflicting_paths,
+                "canonicalHead": canonical_head,
+                "recoveryBranch": recovery_branch,
+            }),
+        };
+        crate::publish_event(self.event_bus.as_ref(), event).await;
+
+        // Attention: a terminal conflict needs a human/coordinator decision.
+        if let Err(e) = self
+            .raise_attention(workspace_id, WorkspaceAttention::ReviewRequired)
+            .await
+        {
+            tracing::warn!(
+                workspace = %workspace_id.0,
+                error = %e,
+                "failed to raise attention for sandbox conflict"
+            );
+        }
+
+        tracing::warn!(
+            agent = %agent_id.0,
+            workspace = %workspace_id.0,
+            paths = ?conflicting_paths,
+            recovery_branch = ?recovery_branch,
+            "sandbox merge conflict is terminal; work preserved on recovery branch — resolve via sandbox.cow.merge (after updating canonical) or sandbox.cow.discard"
+        );
+    }
+
+    /// The body of a manual `sandbox.cow.merge` after the RPC handler has
+    /// already claimed the row (`… → merging`) and acknowledged the caller
+    /// (`status: "started"`). Runs on a detached task: attempts the merge and
+    /// persists the terminal outcome — `merged` (shared bookkeeping),
+    /// `conflict` (TERMINAL: paths persisted, recovery branch, attention),
+    /// `merge_pending` (blocked / hard error), or the pre-claim status on a
+    /// dirty bounce with auto-commit off. The claim guard covers task panics.
+    pub(crate) async fn run_claimed_sandbox_merge(
+        &self,
+        workspace_id: &WorkspaceId,
+        sandbox_id: &AgentId,
+        pre_claim_status: intent_store::SandboxStatus,
+    ) {
+        use crate::sandbox_ops::{
+            merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
+        };
+        use intent_store::SandboxStatus;
+
+        let store = &self.store;
+        let mut claim_guard =
+            MergeClaimGuard::armed(store.clone(), workspace_id.clone(), sandbox_id.clone());
+
+        // Same dirty-state policy as the automatic paths: with the
+        // workspace's auto-commit ON, commit uncommitted sandbox state
+        // (LLM-assisted message when generatable); OFF, refuse — the sandbox
+        // returns to its pre-claim status and the agent must commit its own
+        // work first.
+        let dirty_handling = if self.effective_auto_commit(workspace_id).await {
+            let message = match store.get_agent_session(sandbox_id).await {
+                Ok(session) => {
+                    self.sandbox_dirty_commit_message(sandbox_id, &session)
+                        .await
+                }
+                Err(_) => None,
+            };
+            DirtyHandling::Commit(message)
+        } else {
+            DirtyHandling::Bounce
+        };
+
+        let outcome =
+            match merge_sandbox_with(store, workspace_id, sandbox_id, dirty_handling).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // Hard error: return the sandbox to merge_pending so it
+                    // stays visible to the retry sweep and retryable via the
+                    // RPC rather than stranded `merging`.
+                    tracing::error!(
+                        agent = %sandbox_id.0,
+                        workspace = %workspace_id.0,
+                        error = %e,
+                        "manual sandbox merge failed; marking merge-pending"
+                    );
+                    let _ = store
+                        .update_sandbox_status(
+                            workspace_id,
+                            sandbox_id,
+                            SandboxStatus::MergePending,
+                            &now_iso(),
+                        )
+                        .await;
+                    claim_guard.disarm();
+                    return;
+                }
+            };
+
+        match outcome {
+            MergeOutcome::Merged {
+                commit_range,
+                canonical_head,
+                ..
+            } => {
+                self.finalize_sandbox_merged(
+                    workspace_id,
+                    sandbox_id,
+                    &commit_range,
+                    &canonical_head,
+                )
+                .await;
+                claim_guard.disarm();
+            }
+            MergeOutcome::Conflict {
+                conflicting_paths,
+                canonical_head,
+            } => {
+                // Manual merges have no live agent turn to bounce: a conflict
+                // is deterministic, so it lands terminally right away.
+                self.finalize_sandbox_conflict(
+                    workspace_id,
+                    sandbox_id,
+                    &conflicting_paths,
+                    &canonical_head,
+                )
+                .await;
+                claim_guard.disarm();
+            }
+            MergeOutcome::Blocked {
+                reason,
+                overlapping_paths,
+            } => {
+                let _ = store
+                    .update_sandbox_status(
+                        workspace_id,
+                        sandbox_id,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await;
+                claim_guard.disarm();
+                tracing::warn!(
+                    agent = %sandbox_id.0,
+                    workspace = %workspace_id.0,
+                    reason = %reason,
+                    paths = ?overlapping_paths,
+                    "manual sandbox merge blocked; sandbox back to merge_pending"
+                );
+            }
+            MergeOutcome::Dirty { dirty_paths } => {
+                // Nothing was committed or merged; restore the pre-claim
+                // status so the sandbox stays where it was.
+                let _ = store
+                    .update_sandbox_status(workspace_id, sandbox_id, pre_claim_status, &now_iso())
+                    .await;
+                claim_guard.disarm();
+                tracing::info!(
+                    agent = %sandbox_id.0,
+                    workspace = %workspace_id.0,
+                    paths = ?dirty_paths,
+                    "manual sandbox merge refused: dirty sandbox with auto-commit off"
+                );
+            }
+        }
     }
 
     /// Crash-recovery for sandboxes stranded `merging`: every merge path
@@ -7854,13 +8369,50 @@ impl Services {
     ///   consuming the retry cap: blocked-ness (dirty canonical overlap,
     ///   missing/unborn branch) resolves externally, and one attempt per
     ///   sweep period is not hammering;
-    /// - `Conflict` / hard errors → `retry_count` incremented, sandbox
-    ///   returned to `merge_pending`.
+    /// - `Conflict` → TERMINAL `conflict` status right away
+    ///   ([`Services::finalize_sandbox_conflict`]): conflicts are
+    ///   deterministic — canonical did not change between sweeps, so
+    ///   retrying is useless. The row leaves the retry queue entirely
+    ///   (only `merge_pending` rows are swept), so a wedged conflict can
+    ///   never starve later sandboxes;
+    /// - hard errors → `retry_count` incremented, sandbox returned to
+    ///   `merge_pending`.
+    ///
+    /// **Merge-lane independence:** sandboxes are grouped by workspace and
+    /// each workspace's queue runs on its own concurrent task — merges into
+    /// one canonical repo must serialize (they mutate its index/worktree),
+    /// but a slow or wedged merge in one workspace must not delay another
+    /// workspace's landings.
     pub async fn sweep_merge_pending_sandboxes(&self) -> MergeSweepSummary {
-        use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+        self.sweep_merge_pending_sandboxes_with_budget(SANDBOX_MERGE_SWEEP_BUDGET)
+            .await
+    }
+
+    /// [`Services::sweep_merge_pending_sandboxes`] with an explicit time
+    /// budget. The budget bounds the whole pass: when it expires, the
+    /// still-running workspace lanes are aborted (each in-flight claim's
+    /// [`MergeClaimGuard`] resets its row `merging → merge_pending`, and the
+    /// git mutation itself is on the blocking pool, so the canonical repo is
+    /// never abandoned mid-mutation) and the sweep returns with
+    /// `timed_out_lanes > 0`. Without the bound, one wedged merge (e.g. a
+    /// hung `git fetch` subprocess) blocked the summary forever, the
+    /// daemon's sweep ticker never re-armed, and every other sandbox stopped
+    /// being swept — the dev-seat stall.
+    pub async fn sweep_merge_pending_sandboxes_with_budget(
+        &self,
+        budget: std::time::Duration,
+    ) -> MergeSweepSummary {
         use intent_store::SandboxStatus;
 
-        let mut summary = MergeSweepSummary::default();
+        // Live watchdog for stranded `merging` rows: every merge path holds
+        // the claim only for the duration of one merge attempt (well under a
+        // sweep interval), so a row still `merging` after
+        // [`SANDBOX_MERGING_STALE_AFTER`] lost its owner without the claim
+        // guard firing (e.g. a pre-guard daemon, or a guard reset that itself
+        // failed). Reset it to `merge_pending` so the sweep/RPC can reclaim
+        // it without a daemon restart.
+        self.reset_stale_merging_sandboxes().await;
+
         let pending = match self
             .store
             .list_sandboxes_by_status(SandboxStatus::MergePending)
@@ -7869,132 +8421,355 @@ impl Services {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "merge retry sweep: listing merge_pending sandboxes failed");
-                return summary;
+                return MergeSweepSummary::default();
             }
         };
 
+        // One lane per workspace: in-workspace order is preserved (same
+        // canonical repo), cross-workspace lanes run concurrently.
+        let mut lanes: HashMap<WorkspaceId, Vec<intent_store::Sandbox>> = HashMap::new();
         for sandbox in pending {
-            let workspace_id = sandbox.workspace_id.clone();
-            let agent_id = sandbox.agent_id.clone();
+            lanes
+                .entry(sandbox.workspace_id.clone())
+                .or_default()
+                .push(sandbox);
+        }
 
-            if sandbox.retry_count >= SANDBOX_MERGE_SWEEP_RETRY_CAP {
-                summary.skipped_capped += 1;
-                tracing::debug!(
-                    sandbox = %sandbox.id,
-                    agent = %agent_id.0,
-                    workspace = %workspace_id.0,
-                    retries = sandbox.retry_count,
-                    "merge retry sweep: retry cap reached; sandbox stays merge_pending for manual handling"
-                );
-                continue;
-            }
-
-            // Best-effort politeness check; not a correctness guard. If the
-            // agent starts a turn right after this check, the turn's own
-            // completion-path merge still cannot collide with the sweep: it
-            // goes through the same CAS claim below and loses to the sweep's
-            // `merging` claim.
-            if self.agent_is_busy(agent_id.clone()) {
-                summary.skipped_busy += 1;
-                tracing::debug!(
-                    sandbox = %sandbox.id,
-                    agent = %agent_id.0,
-                    workspace = %workspace_id.0,
-                    "merge retry sweep: agent is mid-turn; skipping"
-                );
-                continue;
-            }
-
-            // Atomic claim: only one merge path may own the transition out of
-            // merge_pending. Losing the race means another merge is in flight.
-            match self
-                .store
-                .try_transition_sandbox_status(
-                    &workspace_id,
-                    &agent_id,
-                    SandboxStatus::MergePending,
-                    SandboxStatus::Merging,
-                    &now_iso(),
-                )
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    summary.skipped_raced += 1;
-                    tracing::debug!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        "merge retry sweep: sandbox claimed by another merge path; skipping"
-                    );
-                    continue;
+        let mut join = tokio::task::JoinSet::new();
+        for (_, lane) in lanes {
+            let services = self.clone();
+            join.spawn(async move {
+                let mut summary = MergeSweepSummary::default();
+                for sandbox in lane {
+                    services.sweep_one_sandbox(sandbox, &mut summary).await;
                 }
-                Err(e) => {
-                    summary.errors += 1;
+                summary
+            });
+        }
+        let mut summary = MergeSweepSummary::default();
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let res = tokio::select! {
+                res = join.join_next() => match res {
+                    Some(res) => res,
+                    None => break,
+                },
+                () = tokio::time::sleep_until(deadline) => {
+                    // Budget exhausted: abort the stragglers. Each aborted
+                    // lane's in-flight claim guard resets its row, and the
+                    // blocking-pool git task runs to completion — safe to
+                    // abandon the awaiting future.
+                    summary.timed_out_lanes = join.len();
+                    join.abort_all();
                     tracing::warn!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        error = %e,
-                        "merge retry sweep: claiming sandbox failed; skipping"
+                        timed_out_lanes = summary.timed_out_lanes,
+                        budget_secs = budget.as_secs(),
+                        "merge retry sweep: budget exhausted; aborting slow workspace lanes so the sweep keeps ticking"
                     );
-                    continue;
+                    break;
+                }
+            };
+            match res {
+                Ok(lane_summary) => summary.absorb(&lane_summary),
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    summary.errors += 1;
+                    tracing::warn!(error = %e, "merge retry sweep: workspace lane task failed");
                 }
             }
-
-            match merge_sandbox(&self.store, &workspace_id, &agent_id).await {
-                Ok(MergeOutcome::Merged {
-                    commit_range,
-                    canonical_head,
-                }) => {
-                    self.finalize_sandbox_merged(
-                        &workspace_id,
-                        &agent_id,
-                        &commit_range,
-                        &canonical_head,
-                    )
-                    .await;
-                    summary.merged += 1;
-                }
-                Ok(MergeOutcome::Blocked {
-                    reason,
-                    overlapping_paths,
-                }) => {
-                    let _ = self
-                        .store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &agent_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    summary.blocked += 1;
-                    tracing::info!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        reason = %reason,
-                        paths = ?overlapping_paths,
-                        "merge retry sweep: merge blocked; will retry next sweep (retry cap not consumed)"
-                    );
-                }
-                Ok(MergeOutcome::Conflict {
-                    conflicting_paths, ..
-                }) => {
-                    let last_error = format!("merge conflict on: {}", conflicting_paths.join(", "));
-                    self.record_sweep_merge_failure(&sandbox, &last_error).await;
-                    summary.conflicts += 1;
-                }
+        }
+        // Drain whatever the abort left behind (already-finished lanes may
+        // still yield results; cancelled ones are skipped).
+        while let Some(res) = join.join_next().await {
+            match res {
+                Ok(lane_summary) => summary.absorb(&lane_summary),
+                Err(e) if e.is_cancelled() => {}
                 Err(e) => {
-                    self.record_sweep_merge_failure(&sandbox, &e.to_string())
-                        .await;
                     summary.errors += 1;
+                    tracing::warn!(error = %e, "merge retry sweep: workspace lane task failed");
                 }
             }
         }
 
         summary
+    }
+
+    /// One sweep attempt for one `merge_pending` sandbox (the per-sandbox
+    /// body of [`Services::sweep_merge_pending_sandboxes`]), tallied into
+    /// `summary`. See the sweep's doc comment for the per-outcome contract.
+    async fn sweep_one_sandbox(
+        &self,
+        sandbox: intent_store::Sandbox,
+        summary: &mut MergeSweepSummary,
+    ) {
+        use crate::sandbox_ops::{
+            merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
+        };
+        use intent_store::SandboxStatus;
+
+        let workspace_id = sandbox.workspace_id.clone();
+        let agent_id = sandbox.agent_id.clone();
+
+        // `mergeOnTurnEnd: false` sandboxes only reach `merge_pending`
+        // via a failed manual `sandbox.cow.merge`; auto-retrying would
+        // undermine the parent's control over when merging happens, so
+        // leave them for another explicit merge (or discard).
+        if !sandbox.merge_on_turn_end {
+            summary.skipped_manual_merge += 1;
+            tracing::debug!(
+                sandbox = %sandbox.id,
+                agent = %agent_id.0,
+                workspace = %workspace_id.0,
+                "merge retry sweep: sandbox has mergeOnTurnEnd=false; skipping (manual merge only)"
+            );
+            return;
+        }
+
+        if sandbox.retry_count >= SANDBOX_MERGE_SWEEP_RETRY_CAP {
+            summary.skipped_capped += 1;
+            tracing::debug!(
+                sandbox = %sandbox.id,
+                agent = %agent_id.0,
+                workspace = %workspace_id.0,
+                retries = sandbox.retry_count,
+                "merge retry sweep: retry cap reached; sandbox stays merge_pending for manual handling"
+            );
+            return;
+        }
+
+        // Best-effort politeness check; not a correctness guard. If the
+        // agent starts a turn right after this check, the turn's own
+        // completion-path merge still cannot collide with the sweep: it
+        // goes through the same CAS claim below and loses to the sweep's
+        // `merging` claim.
+        if self.agent_is_busy(agent_id.clone()) {
+            summary.skipped_busy += 1;
+            tracing::debug!(
+                sandbox = %sandbox.id,
+                agent = %agent_id.0,
+                workspace = %workspace_id.0,
+                "merge retry sweep: agent is mid-turn; skipping"
+            );
+            return;
+        }
+
+        // Atomic claim: only one merge path may own the transition out of
+        // merge_pending. Losing the race means another merge is in flight.
+        match self
+            .store
+            .try_transition_sandbox_status(
+                &workspace_id,
+                &agent_id,
+                SandboxStatus::MergePending,
+                SandboxStatus::Merging,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                summary.skipped_raced += 1;
+                tracing::debug!(
+                    sandbox = %sandbox.id,
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    "merge retry sweep: sandbox claimed by another merge path; skipping"
+                );
+                return;
+            }
+            Err(e) => {
+                summary.errors += 1;
+                tracing::warn!(
+                    sandbox = %sandbox.id,
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "merge retry sweep: claiming sandbox failed; skipping"
+                );
+                return;
+            }
+        }
+
+        // Crash-safe claim scope: reset `merging → merge_pending` if the
+        // sweep task is aborted (daemon shutdown, sweep budget expiry) or
+        // panics mid-merge.
+        let mut claim_guard =
+            MergeClaimGuard::armed(self.store.clone(), workspace_id.clone(), agent_id.clone());
+
+        // Test seam: simulate a wedged merge (see `set_test_sweep_delay`).
+        let test_delay = self
+            .test_sweep_delays
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&agent_id).copied());
+        if let Some(delay) = test_delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        // Same dirty-state policy as the completion path: with the
+        // workspace's auto-commit OFF the sweep must not commit the
+        // agent's uncommitted work — `Dirty` is handled like `Blocked`
+        // below (back to merge_pending, no retry consumed; the state
+        // resolves externally when the agent commits).
+        let dirty_handling = if self.effective_auto_commit(&workspace_id).await {
+            DirtyHandling::Commit(None)
+        } else {
+            DirtyHandling::Bounce
+        };
+        match merge_sandbox_with(&self.store, &workspace_id, &agent_id, dirty_handling).await {
+            Ok(MergeOutcome::Merged {
+                commit_range,
+                canonical_head,
+                ..
+            }) => {
+                self.finalize_sandbox_merged(
+                    &workspace_id,
+                    &agent_id,
+                    &commit_range,
+                    &canonical_head,
+                )
+                .await;
+                claim_guard.disarm();
+                summary.merged += 1;
+            }
+            Ok(MergeOutcome::Blocked {
+                reason,
+                overlapping_paths,
+            }) => {
+                let _ = self
+                    .store
+                    .update_sandbox_status(
+                        &workspace_id,
+                        &agent_id,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await;
+                claim_guard.disarm();
+                summary.blocked += 1;
+                tracing::info!(
+                    sandbox = %sandbox.id,
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    reason = %reason,
+                    paths = ?overlapping_paths,
+                    "merge retry sweep: merge blocked; will retry next sweep (retry cap not consumed)"
+                );
+            }
+            Ok(MergeOutcome::Dirty { dirty_paths }) => {
+                let _ = self
+                    .store
+                    .update_sandbox_status(
+                        &workspace_id,
+                        &agent_id,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await;
+                claim_guard.disarm();
+                summary.blocked += 1;
+                tracing::info!(
+                    sandbox = %sandbox.id,
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    paths = ?dirty_paths,
+                    "merge retry sweep: sandbox dirty with auto-commit off; will retry next sweep (retry cap not consumed)"
+                );
+            }
+            Ok(MergeOutcome::Conflict {
+                conflicting_paths,
+                canonical_head,
+            }) => {
+                // Conflicts are deterministic: canonical did not change
+                // between sweeps, so retrying is useless. Land the
+                // terminal `conflict` status immediately (paths
+                // persisted, recovery branch pushed, attention raised)
+                // instead of burning retries cycling merge_pending.
+                self.finalize_sandbox_conflict(
+                    &workspace_id,
+                    &agent_id,
+                    &conflicting_paths,
+                    &canonical_head,
+                )
+                .await;
+                claim_guard.disarm();
+                summary.conflicts += 1;
+            }
+            Err(e) => {
+                self.record_sweep_merge_failure(&sandbox, &e.to_string())
+                    .await;
+                claim_guard.disarm();
+                summary.errors += 1;
+            }
+        }
+    }
+
+    /// Watchdog for rows stranded `merging` in a LIVE daemon: any sandbox
+    /// whose `updated_at` (stamped by the claim CAS) is older than
+    /// [`SANDBOX_MERGING_STALE_AFTER`] no longer has a plausible in-flight
+    /// owner — every merge path settles or resets its claim within one
+    /// attempt. CAS-reset it to `merge_pending` (WARN) so the sweep and the
+    /// manual RPC can pick it up again. Complements
+    /// [`Services::recover_stranded_merging_sandboxes`], which handles the
+    /// daemon-restart case unconditionally.
+    async fn reset_stale_merging_sandboxes(&self) {
+        use intent_store::SandboxStatus;
+
+        let merging = match self
+            .store
+            .list_sandboxes_by_status(SandboxStatus::Merging)
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "merging watchdog: listing merging sandboxes failed");
+                return;
+            }
+        };
+        if merging.is_empty() {
+            return;
+        }
+        let cutoff = time::OffsetDateTime::now_utc() - SANDBOX_MERGING_STALE_AFTER;
+        for sandbox in merging {
+            // Unparseable timestamp: treat as stale rather than let the
+            // row hide from recovery forever.
+            let stale =
+                intent_core::parse_iso(&sandbox.updated_at).is_none_or(|updated| updated < cutoff);
+            if !stale {
+                continue;
+            }
+            match self
+                .store
+                .try_transition_sandbox_status(
+                    &sandbox.workspace_id,
+                    &sandbox.agent_id,
+                    SandboxStatus::Merging,
+                    SandboxStatus::MergePending,
+                    &now_iso(),
+                )
+                .await
+            {
+                Ok(true) => {
+                    tracing::warn!(
+                        sandbox = %sandbox.id,
+                        agent = %sandbox.agent_id.0,
+                        workspace = %sandbox.workspace_id.0,
+                        claimed_at = %sandbox.updated_at,
+                        "sandbox stuck merging past the stale threshold; watchdog reset to merge_pending"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        sandbox = %sandbox.id,
+                        agent = %sandbox.agent_id.0,
+                        workspace = %sandbox.workspace_id.0,
+                        error = %e,
+                        "merging watchdog: reset failed"
+                    );
+                }
+            }
+        }
     }
 
     /// Bookkeeping for a failed sweep merge attempt: return the sandbox to
@@ -9753,6 +10528,94 @@ fn workspace_dir_candidates(
     }
     dirs.dedup();
     dirs
+}
+
+/// The execution-environment types in wire/catalog order (`sandbox.profiles.*`
+/// / `sandbox.options` row order, PROTOCOL §5.5b).
+const SANDBOX_TYPES: &[&str] = &["direct", "worktree", "cow", "microvm"];
+
+/// Whether `ty` is enabled in the sandbox settings group. `direct` is always
+/// enabled — the schema clamps `sandbox.direct.enabled = false` at
+/// validation, and this belt-and-braces arm keeps `sandbox.options` /
+/// `sandbox.profiles.list` reporting it enabled even if a legacy persisted
+/// value slipped past.
+fn sandbox_type_enabled(sandbox: &intent_core::settings_file::SandboxSettings, ty: &str) -> bool {
+    match ty {
+        "direct" => true,
+        "worktree" => sandbox.worktree.enabled,
+        "cow" => sandbox.cow.enabled,
+        "microvm" => sandbox.microvm.enabled,
+        _ => false,
+    }
+}
+
+/// The `sandbox.profiles.list` result shape (§5.5b): `{ defaultType,
+/// profiles: [{ type, enabled, image? }] }` — one row per type in
+/// [`SANDBOX_TYPES`] order; `image` only on the `microvm` row (`null` when
+/// unset).
+fn sandbox_profiles_json(
+    sandbox: &intent_core::settings_file::SandboxSettings,
+) -> serde_json::Value {
+    let profiles: Vec<serde_json::Value> = SANDBOX_TYPES
+        .iter()
+        .map(|&ty| {
+            let mut row = serde_json::json!({
+                "type": ty,
+                "enabled": sandbox_type_enabled(sandbox, ty),
+            });
+            if ty == "microvm" {
+                row["image"] = sandbox
+                    .microvm
+                    .image
+                    .as_ref()
+                    .and_then(|i| serde_json::to_value(i).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                row["vcpus"] = serde_json::json!(sandbox.microvm.vcpus);
+                row["memMib"] = serde_json::json!(sandbox.microvm.mem_mib);
+            }
+            row
+        })
+        .collect();
+    serde_json::json!({
+        "defaultType": sandbox.default_type.as_str(),
+        "profiles": profiles,
+    })
+}
+
+/// Whether the host **platform** can run microVM agent sandboxes, plus a
+/// structured reason when it cannot. macOS: Apple Silicon only (libkrun via
+/// Hypervisor.framework is arm64-only upstream); every other OS — including
+/// Linux, whose KVM path is temporarily locked out to reduce surface area —
+/// is unsupported. Purely the platform half of `microvmSupported` — the `CoW`
+/// requirement is `ANDed` in by the caller.
+fn microvm_platform_supported() -> (bool, Option<&'static str>) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        (true, None)
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    {
+        (
+            false,
+            Some("microVM sandboxes require Apple Silicon on macOS"),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Temporarily locked to macOS (the Linux/KVM arm used to gate on
+        // /dev/kvm here).
+        (
+            false,
+            Some("microVM sandboxes are temporarily locked to macOS"),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (
+            false,
+            Some("microVM sandboxes are not supported on this operating system"),
+        )
+    }
 }
 
 /// Default root for daemon-provisioned worktrees: `$INTENTD_WORKSPACES_DIR`
@@ -12249,13 +13112,72 @@ fn search_done_event(
 /// `sandbox.cow.discard`). `Blocked` outcomes do not consume attempts.
 pub(crate) const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
 
+/// How long a sandbox may sit `merging` (per its claim-time `updated_at`)
+/// before the sweep's watchdog treats the claim as orphaned and resets the
+/// row to `merge_pending`. One merge attempt completes in seconds; 10 minutes
+/// (one sweep interval) is far past any legitimate in-flight merge.
+pub const SANDBOX_MERGING_STALE_AFTER: time::Duration = time::Duration::minutes(10);
+
+/// Time budget for one [`Services::sweep_merge_pending_sandboxes`] pass.
+/// Bounds the whole sweep so one wedged merge (hung fetch, giant cherry-pick)
+/// cannot pin the sweep loop past its own interval and starve every other
+/// sandbox of retries. Kept under the daemon's sweep interval (10 min) so a
+/// fresh tick always follows a timed-out pass.
+pub const SANDBOX_MERGE_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(480);
+
+/// What [`Services::handle_sandbox_merge_on_completion`] decided about a
+/// sandboxed agent's completion: whether it propagates to the coordinator
+/// (`false` = the agent was bounced and will re-complete) and, when it does,
+/// the merge outcome annotated onto the completion event so the parent's
+/// wake names where the child's work landed.
+struct SandboxMergeDisposition {
+    /// Whether the completion should propagate to watches/groups.
+    propagate: bool,
+    /// The `sandboxMergeStatus` value stamped onto the event data
+    /// (`"merged"` / `"merge_pending"` / `"unmerged"`); `None` propagates
+    /// without annotation (no-record / claim-race / lookup-failure paths).
+    merge_status: Option<&'static str>,
+    /// The applied commit range on a clean merge (`sandboxCommitRange`).
+    commit_range: Option<String>,
+}
+
+impl SandboxMergeDisposition {
+    /// Propagate without annotating the event (degenerate paths where no
+    /// merge decision was made: missing record, claim race, store errors).
+    fn propagate_silent() -> Self {
+        Self {
+            propagate: true,
+            merge_status: None,
+            commit_range: None,
+        }
+    }
+
+    /// Propagate with the given `sandboxMergeStatus` annotation.
+    fn propagate_with(status: &'static str) -> Self {
+        Self {
+            propagate: true,
+            merge_status: Some(status),
+            commit_range: None,
+        }
+    }
+
+    /// Suppress propagation (the agent was bounced with instructions).
+    fn bounce() -> Self {
+        Self {
+            propagate: false,
+            merge_status: None,
+            commit_range: None,
+        }
+    }
+}
+
 /// Outcome tally for one [`Services::sweep_merge_pending_sandboxes`] pass,
 /// used by the daemon's periodic loop for logging and by unit tests.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MergeSweepSummary {
     /// Sandboxes merged back into canonical and discarded.
     pub merged: usize,
-    /// Merge attempts that hit conflicts (retry consumed, back to `merge_pending`).
+    /// Merge attempts that hit conflicts (terminal `conflict` status landed).
     pub conflicts: usize,
     /// Merge attempts blocked externally (no retry consumed, back to `merge_pending`).
     pub blocked: usize,
@@ -12265,8 +13187,14 @@ pub struct MergeSweepSummary {
     pub skipped_busy: usize,
     /// Sandboxes skipped because another merge path claimed them first.
     pub skipped_raced: usize,
+    /// Sandboxes skipped because `merge_on_turn_end=false` (manual merge only).
+    pub skipped_manual_merge: usize,
     /// Hard errors (claim failures or merge errors; retry consumed on merge errors).
     pub errors: usize,
+    /// Workspace lanes aborted because the sweep's time budget expired
+    /// (their in-flight claims were reset by the claim guard; remaining
+    /// rows stay `merge_pending` for the next tick).
+    pub timed_out_lanes: usize,
 }
 
 impl MergeSweepSummary {
@@ -12274,6 +13202,19 @@ impl MergeSweepSummary {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Fold another summary (one workspace lane's tally) into this one.
+    pub fn absorb(&mut self, other: &Self) {
+        self.merged += other.merged;
+        self.conflicts += other.conflicts;
+        self.blocked += other.blocked;
+        self.skipped_capped += other.skipped_capped;
+        self.skipped_busy += other.skipped_busy;
+        self.skipped_raced += other.skipped_raced;
+        self.skipped_manual_merge += other.skipped_manual_merge;
+        self.errors += other.errors;
+        self.timed_out_lanes += other.timed_out_lanes;
     }
 }
 
@@ -12625,7 +13566,14 @@ pub(crate) fn format_completion_wake(
 ) -> String {
     let mut params = child_settlement_params(child_id, event, None, stall, child_of_recipient);
     params.report_already_delivered = report_already_delivered;
-    harness::latest().completion_wake(&params, watch_retired)
+    let mut msg = harness::latest().completion_wake(&params, watch_retired);
+    // Sandboxed children: append the turn-end merge outcome (merged /
+    // conflict / blocked) stamped onto the event by the completion
+    // interception path, so the parent's wake names it.
+    if let Some(sandbox) = format_sandbox_outcome_suffix(&event.data) {
+        msg.push_str(&sandbox);
+    }
+    msg
 }
 
 /// The advisory wake for a hook-/PR-monitor-deferred idle: the child is idle
@@ -12764,6 +13712,49 @@ fn child_settlement_params<'a>(
     }
 }
 
+/// The wake-text suffix describing a sandboxed child's turn-end merge
+/// outcome, rendered from the `sandboxMergeStatus` / `sandboxPath` /
+/// `sandboxCommitRange` fields the completion-interception path stamped onto
+/// the `agent:idle` event data. `None` for non-sandboxed completions (no
+/// `sandboxMergeStatus` on the event).
+fn format_sandbox_outcome_suffix(data: &serde_json::Value) -> Option<String> {
+    let status = data
+        .get("sandboxMergeStatus")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let path = data
+        .get("sandboxPath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
+    Some(match status {
+        "merged" => {
+            let range = data
+                .get("sandboxCommitRange")
+                .and_then(|v| v.as_str())
+                .filter(|r| !r.is_empty())
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default();
+            format!(" Sandbox merged into the workspace repo{range}.")
+        }
+        "merge_pending" => format!(
+            " Sandbox merge is PENDING — the work is NOT in the workspace repo yet; it lives in \
+             the sandbox at `{path}`. Resolve via ws.agent.mergeSandbox(agentId) once the \
+             blocker clears."
+        ),
+        "conflict" => format!(
+            " Sandbox merge hit a TERMINAL CONFLICT — the work is NOT in the workspace repo; \
+             its commits are preserved on the sandbox's `sb/…` branch in the workspace repo and \
+             in the sandbox at `{path}`. Resolve the conflict manually, then \
+             ws.agent.mergeSandbox(agentId) or discard."
+        ),
+        "unmerged" => format!(
+            " Sandbox left unmerged (mergeOnTurnEnd: false) — the work lives in the sandbox at \
+             `{path}`. Merge it with ws.agent.mergeSandbox(agentId) when ready."
+        ),
+        other => format!(" Sandbox merge status: {other} (sandbox at `{path}`)."),
+    })
+}
+
 /// Build one per-child summary line for a delegation group's aggregated wake.
 /// A compact sibling of [`format_completion_wake`] without the standalone
 /// `[WORKSPACE EVENTS]` framing, since the group header carries that. A
@@ -12779,13 +13770,20 @@ pub(crate) fn format_group_child_line(
 ) -> String {
     // Group child lines render no relationship label ("- {name} ({id}) …"),
     // so `child_of_recipient` is inert here — pass `true` unconditionally.
-    harness::latest().group_child_line(&child_settlement_params(
+    let mut line = harness::latest().group_child_line(&child_settlement_params(
         child_id,
         event,
         completion_report,
         stall,
         true,
-    ))
+    ));
+    // Sandboxed children: append the turn-end merge outcome (merged /
+    // conflict / blocked) stamped onto the event by the completion
+    // interception path, so the aggregated line names it.
+    if let Some(sandbox) = format_sandbox_outcome_suffix(&event.data) {
+        line.push_str(&sandbox);
+    }
+    line
 }
 
 /// A suspected-stall completion (monorepo#1016): the child went idle WITHOUT
@@ -14389,11 +15387,232 @@ impl WorkspaceApi for Services {
             // the same cached workspaces-root probe as Workspace.cowSupported
             // (§5.1); it is included as true/false when the probe ran and
             // omitted when it could not run (presence-detected by clients).
+            // `microvmSupported` = platform check AND cowSupported; false on
+            // an incapable platform even when the CoW probe could not run.
             let mut caps = serde_json::Map::new();
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
+            if let Some(microvm_supported) = self.compute_microvm_supported().await {
+                caps.insert(
+                    "microvmSupported".to_string(),
+                    serde_json::json!(microvm_supported),
+                );
+            }
             Ok(serde_json::Value::Object(caps))
+        })
+    }
+
+    fn sandbox_profiles_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { Ok(sandbox_profiles_json(&self.effective_settings().sandbox)) })
+    }
+
+    fn sandbox_profiles_update(
+        &self,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Translate the profile-shaped params into `settings.update`
+            // changes on the `sandbox.*` paths, validating the envelope here
+            // (unknown type / field → -32602 before anything mutates). The
+            // typed registry schema then enforces the deeper invariants
+            // (defaultType must name an enabled type, image shape).
+            let obj = changes
+                .as_object()
+                .ok_or_else(|| Error::InvalidParams("params must be an object".to_string()))?;
+            // The registry validates its batch change-by-change, so order the
+            // translated updates to keep every intermediate state valid:
+            // enables first, then `defaultType`, then disables (e.g. enabling
+            // `cow` + `defaultType: "cow"` + disabling the old default all in
+            // one call). Image changes are order-insensitive.
+            let mut enables: Vec<serde_json::Value> = Vec::new();
+            let mut default_type: Vec<serde_json::Value> = Vec::new();
+            let mut disables: Vec<serde_json::Value> = Vec::new();
+            let mut resets: Vec<&'static str> = Vec::new();
+            for (key, value) in obj {
+                match key.as_str() {
+                    "workspaceId" => {}
+                    "defaultType" => {
+                        default_type.push(
+                            serde_json::json!({ "path": "sandbox.defaultType", "value": value }),
+                        );
+                    }
+                    "profiles" => {
+                        let profiles = value.as_object().ok_or_else(|| {
+                            Error::InvalidParams("profiles must be an object".to_string())
+                        })?;
+                        for (ty, cfg) in profiles {
+                            if !SANDBOX_TYPES.contains(&ty.as_str()) {
+                                return Err(Error::InvalidParams(format!(
+                                    "unknown execution environment type: {ty}"
+                                )));
+                            }
+                            let cfg = cfg.as_object().ok_or_else(|| {
+                                Error::InvalidParams(format!("profiles.{ty} must be an object"))
+                            })?;
+                            for (field, field_value) in cfg {
+                                match field.as_str() {
+                                    "enabled" => {
+                                        let change = serde_json::json!({
+                                            "path": format!("sandbox.{ty}.enabled"),
+                                            "value": field_value,
+                                        });
+                                        if field_value.as_bool() == Some(false) {
+                                            disables.push(change);
+                                        } else {
+                                            enables.push(change);
+                                        }
+                                    }
+                                    "image" if ty == "microvm" => {
+                                        if field_value.is_null() {
+                                            resets.push("sandbox.microvm.image");
+                                        } else {
+                                            enables.push(serde_json::json!({
+                                                "path": "sandbox.microvm.image",
+                                                "value": field_value,
+                                            }));
+                                        }
+                                    }
+                                    "image" => {
+                                        return Err(Error::InvalidParams(format!(
+                                            "profiles.{ty}.image: image override is only \
+                                             supported on the microvm type"
+                                        )))
+                                    }
+                                    "vcpus" if ty == "microvm" => {
+                                        enables.push(serde_json::json!({
+                                            "path": "sandbox.microvm.vcpus",
+                                            "value": field_value,
+                                        }));
+                                    }
+                                    "memMib" if ty == "microvm" => {
+                                        enables.push(serde_json::json!({
+                                            "path": "sandbox.microvm.memMib",
+                                            "value": field_value,
+                                        }));
+                                    }
+                                    "vcpus" | "memMib" => {
+                                        return Err(Error::InvalidParams(format!(
+                                            "profiles.{ty}.{field}: VM sizing is only \
+                                             supported on the microvm type"
+                                        )))
+                                    }
+                                    other => {
+                                        return Err(Error::InvalidParams(format!(
+                                            "profiles.{ty}.{other}: unknown field"
+                                        )))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(Error::InvalidParams(format!("unknown param: {other}")));
+                    }
+                }
+            }
+            let updates: Vec<serde_json::Value> = enables
+                .into_iter()
+                .chain(default_type)
+                .chain(disables)
+                .collect();
+            if !updates.is_empty() {
+                self.settings_update(serde_json::Value::Array(updates))
+                    .await?;
+            }
+            for path in resets {
+                self.settings_reset(path.to_string()).await?;
+            }
+            Ok(sandbox_profiles_json(&self.effective_settings().sandbox))
+        })
+    }
+
+    fn sandbox_options(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Capability-resolved availability matrix (§5.5b): the settings
+            // intent (`enabled`) joined with what the host can actually run.
+            let sandbox = self.effective_settings().sandbox;
+            let cow_supported = self.compute_cow_supported().await;
+            let cow_reason = match cow_supported {
+                Some(true) => None,
+                // Temporarily locked to macOS: on other OSes the choke point
+                // reports Some(false) without probing, so name the lock
+                // instead of blaming the filesystem.
+                Some(false) if cfg!(not(target_os = "macos")) => {
+                    Some("CoW sandboxes are temporarily locked to macOS".to_string())
+                }
+                Some(false) => Some(
+                    "the workspaces root filesystem does not support copy-on-write clones"
+                        .to_string(),
+                ),
+                None => Some("CoW filesystem support could not be determined".to_string()),
+            };
+            let (platform_ok, platform_reason) = microvm_platform_supported();
+            let microvm_reason = if platform_ok {
+                cow_reason.clone()
+            } else {
+                platform_reason.map(str::to_string)
+            };
+            let mut options = Vec::with_capacity(SANDBOX_TYPES.len());
+            for &ty in SANDBOX_TYPES {
+                let enabled = sandbox_type_enabled(&sandbox, ty);
+                let reason = match ty {
+                    "cow" => cow_reason.clone(),
+                    "microvm" => microvm_reason.clone(),
+                    _ => None,
+                };
+                let mut row = serde_json::json!({
+                    "type": ty,
+                    "enabled": enabled,
+                    "available": reason.is_none(),
+                    "default": sandbox.default_type.as_str() == ty,
+                });
+                if let Some(reason) = reason {
+                    row["reason"] = serde_json::json!(reason);
+                }
+                options.push(row);
+            }
+            Ok(serde_json::json!({
+                "defaultType": sandbox.default_type.as_str(),
+                "options": options,
+            }))
+        })
+    }
+
+    fn sandbox_image_check(
+        &self,
+        manifest_url: String,
+        sha256: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Dry-run guest-image validity check (§5.5b): fetch + pin-verify
+            // + contract-check the manifest without downloading the rootfs or
+            // touching the cache. Failures are results (`valid: false`), not
+            // RPC errors, so clients can check-before-save.
+            let image_ref = intent_core::GuestImageRef {
+                manifest_url,
+                sha256,
+            };
+            match sandbox_image::fetch_and_validate_manifest(
+                &image_ref,
+                &sandbox_image::ImageSource::ProfileDefault,
+            )
+            .await
+            {
+                Ok((manifest, bytes)) => Ok(serde_json::json!({
+                    "valid": true,
+                    "imageId": manifest.id,
+                    "version": manifest.version,
+                    "arch": manifest.arch,
+                    // Sha of the fetched manifest document, so clients can
+                    // pin the override they are about to save.
+                    "manifestSha256": sandbox_image::manifest_sha256(&bytes),
+                })),
+                Err(e) => Ok(serde_json::json!({
+                    "valid": false,
+                    "error": e.to_string(),
+                })),
+            }
         })
     }
 
@@ -16249,6 +17468,108 @@ impl WorkspaceApi for Services {
             let log_repo_path = input.repository_path.clone();
             let log_branch = input.branch.clone();
 
+            // Execution-environment selection (§5.1): validate the explicit
+            // choice against enabled profiles + host availability up front,
+            // before the idempotent op body runs. `direct` and `worktree`
+            // need only be enabled; `cow` additionally requires the
+            // workspaces-root CoW probe; `microvm` requires the platform
+            // check AND the CoW probe, and — being not implemented yet —
+            // then returns a structured NOT_IMPLEMENTED error.
+            if let Some(env) = input.execution_environment {
+                if input.skip_isolation == Some(true) && env != intent_core::SandboxType::Direct {
+                    return Err(Error::InvalidParams(format!(
+                        "skipIsolation conflicts with executionEnvironment '{}'; omit one",
+                        env.as_str()
+                    )));
+                }
+                // Flow rule (§5.1): `worktree` is only offerable for local
+                // repository copies — a linked worktree needs an existing
+                // local checkout to link against. "Pick a repo" (`githubUrl`)
+                // and "New repo" (`isNewRepo`) creates provision a standalone
+                // checkout (or none), so they take `direct`, `cow`, or
+                // `microvm` — never `worktree`.
+                if env == intent_core::SandboxType::Worktree {
+                    let has_github_url = input
+                        .github_url
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|s| !s.is_empty());
+                    if has_github_url {
+                        return Err(Error::ExecutionEnvironmentUnavailable {
+                            environment: env.as_str().to_string(),
+                            reason: "worktree checkouts require a local repository copy; \
+                                     GitHub-URL creates provision a standalone checkout — \
+                                     use direct, cow, or microvm"
+                                .to_string(),
+                        });
+                    }
+                    if input.is_new_repo == Some(true) {
+                        return Err(Error::ExecutionEnvironmentUnavailable {
+                            environment: env.as_str().to_string(),
+                            reason: "worktree checkouts require a local repository copy; \
+                                     new-repo creates work directly in the initialized \
+                                     repository — use direct, cow, or microvm"
+                                .to_string(),
+                        });
+                    }
+                }
+                let sandbox = services.effective_settings().sandbox;
+                if !sandbox_type_enabled(&sandbox, env.as_str()) {
+                    return Err(Error::ExecutionEnvironmentUnavailable {
+                        environment: env.as_str().to_string(),
+                        reason: format!(
+                            "the '{}' execution environment is disabled in settings",
+                            env.as_str()
+                        ),
+                    });
+                }
+                match env {
+                    intent_core::SandboxType::Cow => {
+                        if services.compute_cow_supported().await != Some(true) {
+                            // Temporarily locked to macOS: name the platform
+                            // lock on other OSes instead of blaming the
+                            // filesystem (the choke point never probed).
+                            let reason = if cfg!(not(target_os = "macos")) {
+                                "CoW sandboxes are temporarily locked to macOS".to_string()
+                            } else {
+                                "the workspaces root filesystem does not support \
+                                 copy-on-write clones"
+                                    .to_string()
+                            };
+                            return Err(Error::ExecutionEnvironmentUnavailable {
+                                environment: env.as_str().to_string(),
+                                reason,
+                            });
+                        }
+                    }
+                    intent_core::SandboxType::Microvm => {
+                        let (platform_ok, platform_reason) = microvm_platform_supported();
+                        if !platform_ok {
+                            return Err(Error::ExecutionEnvironmentUnavailable {
+                                environment: env.as_str().to_string(),
+                                reason: platform_reason
+                                    .unwrap_or("microVM sandboxes are not supported on this host")
+                                    .to_string(),
+                            });
+                        }
+                        if services.compute_cow_supported().await != Some(true) {
+                            return Err(Error::ExecutionEnvironmentUnavailable {
+                                environment: env.as_str().to_string(),
+                                reason: "microVM sandboxes require copy-on-write clone \
+                                         support, and the workspaces root filesystem does \
+                                         not support copy-on-write clones"
+                                    .to_string(),
+                            });
+                        }
+                        // Enabled and available: the workspace provisions a
+                        // CoW checkout below (same arm as `cow`), and agents
+                        // spawn inside per-agent microVMs (EE-5,
+                        // monorepo#1120).
+                    }
+                    _ => {}
+                }
+            }
+
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
             // Unified provisioning progress (PROTOCOL §5.1): when the request
@@ -16283,6 +17604,30 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    // Explicit execution-environment selection (§5.1),
+                    // validated above. `direct` opts out of isolation (same
+                    // as `skipIsolation`); `worktree`/`cow` force the
+                    // checkout mode below regardless of the legacy
+                    // `workspace.cowIsolation` setting; `microvm` provisions
+                    // a CoW checkout (validated CoW-capable above) that each
+                    // agent VM mounts its own reflink clone of (EE-5).
+                    let requested_env = input.execution_environment;
+                    let explicit_cow = matches!(
+                        requested_env,
+                        Some(intent_core::SandboxType::Cow | intent_core::SandboxType::Microvm)
+                    );
+                    // Structured-error label for the explicit CoW-checkout
+                    // arms below: names the environment the caller actually
+                    // requested (`cow` or `microvm`).
+                    let explicit_env_label = requested_env
+                        .map_or_else(|| "cow".to_string(), |e| e.as_str().to_string());
+                    let want_cow = match requested_env {
+                        Some(intent_core::SandboxType::Cow | intent_core::SandboxType::Microvm) => {
+                            true
+                        }
+                        Some(_) => false,
+                        None => cow_isolation,
+                    };
                     // Attachment-reference validation (PROTOCOL §5.5,
                     // monorepo#3338), hoisted BEFORE any state change so a
                     // bad `initialAgent.imageBlocks` reference rejects
@@ -17040,7 +18385,18 @@ impl WorkspaceApi for Services {
                         repository_name: input.repository_name,
                         worktree_path: input.worktree_path,
                         scope: input.scope,
-                        skip_worktree: input.skip_isolation.unwrap_or(false),
+                        // `executionEnvironment: direct` is the explicit
+                        // spelling of the `skipIsolation` opt-out (§5.1) —
+                        // but only for local-repo creates. In the
+                        // "pick a repo" (cache hydration) and "new repo"
+                        // flows there is no pre-existing local checkout to
+                        // work in, so `direct` still provisions the
+                        // standalone checkout below (CoW is just the copy
+                        // mechanism there) and must not skip provisioning.
+                        skip_worktree: input.skip_isolation.unwrap_or(false)
+                            || (requested_env == Some(intent_core::SandboxType::Direct)
+                                && cache_hydration.is_none()
+                                && !new_repo_direct),
                         setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
@@ -17069,6 +18425,10 @@ impl WorkspaceApi for Services {
                         display_status: None,
                         waiting: false,
                         checkout_mode: None,
+                        // Explicit selection persists as-is; the legacy
+                        // derivation below fills it from the provisioning
+                        // outcome when the param was omitted.
+                        execution_environment: requested_env,
                         disk_usage: None,
                         pending_delete_at: None,
                     };
@@ -17149,9 +18509,29 @@ impl WorkspaceApi for Services {
                                     intent_core::CheckoutMode::Cow
                                 }
                                 Ok(intent_git::CowSupport::Unsupported) => {
+                                    // Explicit `cow`/`microvm` never silently
+                                    // degrades to a plain clone — surface the
+                                    // structured unavailability (the local-arm
+                                    // no-silent-fallback rule, §5.1).
+                                    if explicit_cow {
+                                        remove_workspace_dir_if_empty(&ws_dir);
+                                        return Err(Error::ExecutionEnvironmentUnavailable {
+                                            environment: explicit_env_label.clone(),
+                                            reason: "the workspaces root filesystem does \
+                                                     not support copy-on-write clones"
+                                                .to_string(),
+                                        });
+                                    }
                                     intent_core::CheckoutMode::Direct
                                 }
                                 Err(e) => {
+                                    if explicit_cow {
+                                        remove_workspace_dir_if_empty(&ws_dir);
+                                        return Err(Error::ExecutionEnvironmentUnavailable {
+                                            environment: explicit_env_label.clone(),
+                                            reason: format!("CoW probe failed: {e}"),
+                                        });
+                                    }
                                     tracing::warn!(
                                         cache = %cache_path.display(),
                                         error = %e,
@@ -17290,6 +18670,19 @@ impl WorkspaceApi for Services {
                             let sha = match provision(mode).await {
                                 Ok(sha) => sha,
                                 Err(Error::Unsupported(reason))
+                                    if mode == intent_core::CheckoutMode::Cow
+                                        && explicit_cow =>
+                                {
+                                    // Explicit `cow`/`microvm` never silently
+                                    // degrades — surface the structured
+                                    // unavailability (§5.1).
+                                    remove_workspace_dir_if_empty(&ws_dir);
+                                    return Err(Error::ExecutionEnvironmentUnavailable {
+                                        environment: explicit_env_label.clone(),
+                                        reason,
+                                    });
+                                }
+                                Err(Error::Unsupported(reason))
                                     if mode == intent_core::CheckoutMode::Cow =>
                                 {
                                     // Safety net: the probe passed but the
@@ -17323,6 +18716,19 @@ impl WorkspaceApi for Services {
                             ws.worktree_path =
                                 Some(checkout_path.to_string_lossy().to_string());
                             ws.checkout_mode = Some(mode);
+                            // Persist the environment the hydration actually
+                            // provisioned when the param was omitted (§5.1):
+                            // a CoW copy is `cow`, a plain local clone is
+                            // `direct`. Explicit selections were validated
+                            // against the outcome above and persist as-is.
+                            if ws.execution_environment.is_none() {
+                                ws.execution_environment = Some(match mode {
+                                    intent_core::CheckoutMode::Cow => {
+                                        intent_core::SandboxType::Cow
+                                    }
+                                    _ => intent_core::SandboxType::Direct,
+                                });
+                            }
                             if ws.base_commit_sha.is_none() {
                                 // A PR-derived branch checks out at the PR
                                 // head, not the base — record the merge-base
@@ -17419,6 +18825,18 @@ impl WorkspaceApi for Services {
                                 // user-chosen folder never matches.
                                 ws.worktree_path =
                                     Some(repo_dir.to_string_lossy().into_owned());
+                                // Persist the environment this arm actually
+                                // provisions when the param was omitted: the
+                                // initialized repository is worked in
+                                // directly. (`worktree` was rejected up
+                                // front for `isNewRepo`; explicit
+                                // `cow`/`microvm` persist as-is — their
+                                // per-agent isolation keys off the persisted
+                                // field, sourced from this direct checkout.)
+                                if ws.execution_environment.is_none() {
+                                    ws.execution_environment =
+                                        Some(intent_core::SandboxType::Direct);
+                                }
                                 if ws.base_commit_sha.is_none() {
                                     ws.base_commit_sha = Some(sha);
                                 }
@@ -17447,7 +18865,7 @@ impl WorkspaceApi for Services {
                                         pr_link.as_ref(),
                                     );
                                 }
-                                let mut mode = if cow_isolation
+                                let mut mode = if want_cow
                                     && repo_dir.join(".git").is_file()
                                 {
                                     // A linked worktree's `.git` is a gitfile
@@ -17456,21 +18874,37 @@ impl WorkspaceApi for Services {
                                     // would give the clone a `.git` that still
                                     // points at the ORIGINAL repo, so the
                                     // branch switch + hard reset would rewrite
-                                    // the user's source checkout. Provision a
-                                    // linked worktree instead.
+                                    // the user's source checkout. An explicit
+                                    // `executionEnvironment: cow` fails
+                                    // structured instead of silently changing
+                                    // mode; the settings-derived path
+                                    // provisions a linked worktree.
+                                    if explicit_cow {
+                                        return Err(Error::ExecutionEnvironmentUnavailable {
+                                            environment: explicit_env_label.clone(),
+                                            reason: "repositoryPath has a gitfile .git (linked \
+                                                     worktree or submodule checkout); CoW-cloning \
+                                                     it would corrupt the source checkout"
+                                                .to_string(),
+                                        });
+                                    }
                                     tracing::warn!(
                                         repository_path = %repo_dir.display(),
                                         "workspace.create: repositoryPath has a gitfile .git (linked worktree or submodule checkout); CoW-cloning it would corrupt the source checkout — provisioning a linked worktree instead"
                                     );
                                     intent_core::CheckoutMode::Worktree
-                                } else if cow_isolation {
+                                } else if want_cow {
                                     // CoW probe: repo dir → `<root>/<wsId>` (the
                                     // clone's parent). The repository can live on
                                     // any filesystem and reflinks cannot cross
-                                    // volumes, so Unsupported (or a probe error)
-                                    // falls back to a linked worktree instead of
-                                    // failing the create — `workspace.cowIsolation`
-                                    // is a preference, not a guarantee.
+                                    // volumes. On the settings-derived path an
+                                    // Unsupported (or errored) probe falls back
+                                    // to a linked worktree instead of failing
+                                    // the create — `workspace.cowIsolation` is
+                                    // a preference, not a guarantee. An explicit
+                                    // `executionEnvironment: cow` selection
+                                    // never falls back silently: it fails with
+                                    // a structured error instead.
                                     std::fs::create_dir_all(&ws_dir).map_err(|e| {
                                         Error::Internal(format!(
                                             "cannot create workspace dir for CoW probe: {e}"
@@ -17478,20 +18912,40 @@ impl WorkspaceApi for Services {
                                     })?;
                                     let probe_repo = repo_dir.clone();
                                     let probe_dst = ws_dir.clone();
-                                    let support = tokio::task::spawn_blocking(move || {
-                                        intent_git::cow_probe(&probe_repo, &probe_dst)
-                                    })
-                                    .await
-                                    .map_err(|e| {
-                                        Error::Internal(format!(
-                                            "CoW probe task failed: {e}"
-                                        ))
-                                    })?;
+                                    // Temporarily locked to macOS: skip the
+                                    // live probe elsewhere (same gate as the
+                                    // workspace_aggregates choke point) and
+                                    // take the Unsupported arm below.
+                                    let support = if cfg!(not(target_os = "macos")) {
+                                        Ok(intent_git::CowSupport::Unsupported)
+                                    } else {
+                                        tokio::task::spawn_blocking(move || {
+                                            intent_git::cow_probe(&probe_repo, &probe_dst)
+                                        })
+                                        .await
+                                        .map_err(|e| {
+                                            Error::Internal(format!(
+                                                "CoW probe task failed: {e}"
+                                            ))
+                                        })?
+                                    };
                                     match support {
                                         Ok(intent_git::CowSupport::Supported) => {
                                             intent_core::CheckoutMode::Cow
                                         }
                                         Ok(intent_git::CowSupport::Unsupported) => {
+                                            if explicit_cow {
+                                                remove_workspace_dir_if_empty(&ws_dir);
+                                                return Err(
+                                                    Error::ExecutionEnvironmentUnavailable {
+                                                        environment: explicit_env_label.clone(),
+                                                        reason: "the repository's filesystem \
+                                                                 cannot CoW-clone into the \
+                                                                 workspaces root"
+                                                            .to_string(),
+                                                    },
+                                                );
+                                            }
                                             tracing::warn!(
                                                 repository_path = %repo_dir.display(),
                                                 workspaces_root = %workspaces_root_pathbuf.display(),
@@ -17500,6 +18954,15 @@ impl WorkspaceApi for Services {
                                             intent_core::CheckoutMode::Worktree
                                         }
                                         Err(e) => {
+                                            if explicit_cow {
+                                                remove_workspace_dir_if_empty(&ws_dir);
+                                                return Err(
+                                                    Error::ExecutionEnvironmentUnavailable {
+                                                        environment: explicit_env_label.clone(),
+                                                        reason: format!("CoW probe failed: {e}"),
+                                                    },
+                                                );
+                                            }
                                             tracing::warn!(
                                                 repository_path = %repo_dir.display(),
                                                 error = %e,
@@ -17625,6 +19088,21 @@ impl WorkspaceApi for Services {
                                 let sha = match provision(mode).await {
                                     Ok(sha) => sha,
                                     Err(Error::Unsupported(reason))
+                                        if mode == intent_core::CheckoutMode::Cow
+                                            && explicit_cow =>
+                                    {
+                                        // Explicit `executionEnvironment: cow`
+                                        // never silently degrades to a linked
+                                        // worktree — surface the structured
+                                        // unavailability instead (#774 cleanup
+                                        // still applies).
+                                        remove_workspace_dir_if_empty(&ws_dir);
+                                        return Err(Error::ExecutionEnvironmentUnavailable {
+                                            environment: explicit_env_label.clone(),
+                                            reason,
+                                        });
+                                    }
+                                    Err(Error::Unsupported(reason))
                                         if mode == intent_core::CheckoutMode::Cow =>
                                     {
                                         // Safety net: the pre-provisioning
@@ -17684,7 +19162,7 @@ impl WorkspaceApi for Services {
                                         // is left empty, so a failed create
                                         // leaves the workspaces root clean
                                         // (#774).
-                                        if cow_isolation {
+                                        if want_cow {
                                             remove_workspace_dir_if_empty(&ws_dir);
                                         }
                                         return Err(e);
@@ -17693,6 +19171,22 @@ impl WorkspaceApi for Services {
                                 ws.worktree_path =
                                     Some(wt_path.to_string_lossy().to_string());
                                 ws.checkout_mode = Some(mode);
+                                // Legacy derivation: when `executionEnvironment`
+                                // was omitted, persist the environment the
+                                // settings-driven path actually provisioned.
+                                if ws.execution_environment.is_none() {
+                                    ws.execution_environment = Some(match mode {
+                                        intent_core::CheckoutMode::Cow => {
+                                            intent_core::SandboxType::Cow
+                                        }
+                                        intent_core::CheckoutMode::Worktree => {
+                                            intent_core::SandboxType::Worktree
+                                        }
+                                        intent_core::CheckoutMode::Direct => {
+                                            intent_core::SandboxType::Direct
+                                        }
+                                    });
+                                }
                                 if ws.base_commit_sha.is_none() {
                                     // A PR-derived branch checks out at the
                                     // PR head, not the base — record the
@@ -19413,6 +20907,7 @@ impl WorkspaceApi for Services {
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
+                execution_environment: None,
                 disk_usage: None,
                 pending_delete_at: None,
             };
@@ -19536,11 +21031,18 @@ impl WorkspaceApi for Services {
                         })?;
                         let probe_repo = repo_dir.clone();
                         let probe_dst = ws_dir.clone();
-                        let support = tokio::task::spawn_blocking(move || {
-                            intent_git::cow_probe(&probe_repo, &probe_dst)
-                        })
-                        .await
-                        .map_err(|e| Error::Internal(format!("CoW probe task failed: {e}")))?;
+                        // Temporarily locked to macOS: skip the live probe
+                        // elsewhere (same gate as the workspace_aggregates
+                        // choke point) and take the Unsupported arm below.
+                        let support = if cfg!(not(target_os = "macos")) {
+                            Ok(intent_git::CowSupport::Unsupported)
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                intent_git::cow_probe(&probe_repo, &probe_dst)
+                            })
+                            .await
+                            .map_err(|e| Error::Internal(format!("CoW probe task failed: {e}")))?
+                        };
                         match support {
                             Ok(intent_git::CowSupport::Supported) => intent_core::CheckoutMode::Cow,
                             Ok(intent_git::CowSupport::Unsupported) => {
@@ -26381,28 +27883,47 @@ impl WorkspaceApi for Services {
     // triggering merge-back or discarding a sandbox when auto-merge fails.
     // ========================================================================
 
+    fn sandbox_get(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let sandbox = store.get_sandbox(&workspace_id, &agent_id).await?;
+            serde_json::to_value(sandbox)
+                .map_err(|e| Error::Internal(format!("serialize sandbox failed: {e}")))
+        })
+    }
+
     fn sandbox_merge(
         &self,
         workspace_id: WorkspaceId,
         sandbox_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let services = self.clone();
         Box::pin(async move {
-            use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
             use intent_store::SandboxStatus;
 
             // Claim the merge atomically (current status → merging) so the RPC
             // never merges concurrently with the completion path or the
             // background retry sweep — every merge path goes through the same
-            // compare-and-swap claim protocol.
+            // compare-and-swap claim protocol. A row already claimed is an
+            // EXPECTED state, not an internal error: return a structured
+            // `status: "in_progress"` result so callers (ws.agent.mergeSandbox)
+            // can react without string-matching an error message.
             let sandbox = store
                 .get_sandbox(&workspace_id, &sandbox_id)
                 .await?
                 .ok_or_else(|| Error::Internal("Sandbox not found".to_string()))?;
+            let already_in_progress = serde_json::json!({
+                "ok": true,
+                "status": "in_progress",
+                "reason": "a sandbox merge is already in progress; check sandboxStatus for the outcome",
+            });
             if sandbox.status == SandboxStatus::Merging {
-                return Err(Error::Internal(
-                    "Sandbox merge already in progress".to_string(),
-                ));
+                return Ok(already_in_progress);
             }
             let claimed = store
                 .try_transition_sandbox_status(
@@ -26414,92 +27935,29 @@ impl WorkspaceApi for Services {
                 )
                 .await?;
             if !claimed {
-                return Err(Error::Internal(
-                    "Sandbox merge already in progress".to_string(),
-                ));
+                return Ok(already_in_progress);
             }
 
-            // Attempt merge. On a hard error return the sandbox to
-            // merge_pending so it stays visible to the retry sweep and
-            // retryable via this RPC rather than stranded `merging`.
-            let outcome = match merge_sandbox(&store, &workspace_id, &sandbox_id).await {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    return Err(e);
-                }
-            };
-
-            match outcome {
-                MergeOutcome::Merged {
-                    commit_range,
-                    canonical_head,
-                } => {
-                    // Shared bookkeeping: mark merged, discard sandbox, emit
-                    // sandbox:cow:merged, clear retry count.
-                    self.finalize_sandbox_merged(
-                        &workspace_id,
-                        &sandbox_id,
-                        &commit_range,
-                        &canonical_head,
-                    )
+            // ASYNC CONTRACT: a merge takes minutes on a large repo — longer
+            // than every RPC/MCP caller budget (the 30s `workspace_api` eval
+            // timeout made the old synchronous result unreachable, while an
+            // abandoned call still ran the merge daemon-side). Acknowledge
+            // immediately and run the merge on a DETACHED task; the outcome
+            // is observable via the sandbox row (`agent.status`
+            // `sandboxStatus`, `sandbox.cow.get`) and the settlement events
+            // (`sandbox:cow:merged` / `sandbox:cow:conflict`).
+            let pre_claim_status = sandbox.status;
+            tokio::spawn(async move {
+                services
+                    .run_claimed_sandbox_merge(&workspace_id, &sandbox_id, pre_claim_status)
                     .await;
+            });
 
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "merged",
-                        "commitRange": commit_range,
-                        "canonicalHead": canonical_head,
-                    }))
-                }
-                MergeOutcome::Conflict {
-                    conflicting_paths,
-                    canonical_head,
-                } => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::ConflictBounced,
-                            &now_iso(),
-                        )
-                        .await;
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "conflict",
-                        "conflictingPaths": conflicting_paths,
-                        "canonicalHead": canonical_head,
-                    }))
-                }
-                MergeOutcome::Blocked {
-                    reason,
-                    overlapping_paths,
-                } => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "blocked",
-                        "reason": reason,
-                        "overlappingPaths": overlapping_paths,
-                    }))
-                }
-            }
+            Ok(serde_json::json!({
+                "ok": true,
+                "status": "started",
+                "reason": "merge started in the background; poll sandboxStatus (merged / conflict / merge_pending / pre-merge status on a dirty bounce) or watch sandbox:cow:* events for the outcome",
+            }))
         })
     }
 
@@ -28784,10 +30242,16 @@ impl Services {
 impl Services {
     /// Provision a sandbox for an agent in a direct-mode or CoW-checkout workspace.
     /// Returns `ProvisionOutcome::Supported` if `CoW` is available, or `Unsupported` for fallback.
+    /// Resolves the workspaces root like every other consumer — the injected
+    /// `workspaces_root`, else [`default_workspaces_root`]
+    /// (`$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces`). Production
+    /// daemons never call `.with_workspaces_root()` (only tests do), so a
+    /// hard error on `None` here failed every microVM agent spawn — the
+    /// first real-daemon path through this method.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if `workspaces_root` is not configured or provisioning fails.
+    /// Returns `Error::Internal` if provisioning fails.
     pub async fn provision_sandbox(
         &self,
         workspace_id: &WorkspaceId,
@@ -28797,7 +30261,7 @@ impl Services {
             workspaces_root: self
                 .workspaces_root
                 .clone()
-                .ok_or_else(|| Error::Internal("workspaces_root not configured".to_string()))?,
+                .unwrap_or_else(default_workspaces_root),
         };
         sandbox_ops::provision_sandbox(&self.store, workspace_id, agent_id, &config).await
     }

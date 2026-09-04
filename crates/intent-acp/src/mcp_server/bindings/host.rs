@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 use super::map_err;
@@ -25,11 +25,12 @@ pub(crate) const PRELUDE: &str = r"
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "exec" => exec(api, ws, args).await,
+        "exec" => exec(api, ws, caller_agent_id, args).await,
         other => Err(format!("host: unknown method `host.{other}`")),
     }
 }
@@ -37,11 +38,29 @@ pub(crate) async fn dispatch(
 async fn exec(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
-    api.host_exec(ws.clone(), args.clone())
-        .await
-        .map_err(map_err)
+    // Stamp the calling agent (server-side, authoritative in both
+    // directions: overwrite when known, strip when not) so cwd resolution
+    // roots at the caller's sandbox when it has one — a delegated sandboxed
+    // agent's `cwd` must resolve inside ITS sandbox, not the shared
+    // workspace checkout — and a caller can never impersonate another agent.
+    let mut args = args.clone();
+    if let Some(obj) = args.as_object_mut() {
+        match caller_agent_id {
+            Some(agent_id) => {
+                obj.insert(
+                    "callerAgentId".to_string(),
+                    Value::String(agent_id.0.clone()),
+                );
+            }
+            None => {
+                obj.remove("callerAgentId");
+            }
+        }
+    }
+    api.host_exec(ws.clone(), args).await.map_err(map_err)
 }
 
 #[cfg(test)]
@@ -122,6 +141,7 @@ mod tests {
             display_status: None,
             waiting: false,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
         }
@@ -143,6 +163,7 @@ mod tests {
         let r = dispatch(
             &api,
             &ws,
+            None,
             "exec",
             &json!({ "command": "echo", "args": ["hi"] }),
         )
@@ -166,7 +187,7 @@ mod tests {
             .unwrap()
             .worktree_path
             .unwrap();
-        let r = dispatch(&api, &ws, "exec", &json!({ "command": "pwd" }))
+        let r = dispatch(&api, &ws, None, "exec", &json!({ "command": "pwd" }))
             .await
             .unwrap();
         assert_eq!(r["exitCode"], 0);
@@ -187,6 +208,7 @@ mod tests {
         let r = dispatch(
             &api,
             &ws,
+            None,
             "exec",
             &json!({ "command": "sh", "args": ["-c", "exit 7"] }),
         )
@@ -203,6 +225,7 @@ mod tests {
         let r = dispatch(
             &api,
             &ws,
+            None,
             "exec",
             &json!({ "command": "sleep", "args": ["30"], "timeoutMs": 100 }),
         )
@@ -217,6 +240,7 @@ mod tests {
         let err = dispatch(
             &api,
             &ws,
+            None,
             "exec",
             &json!({ "command": "echo", "cwd": "../../outside" }),
         )
@@ -231,7 +255,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_rejects_unknown_method() {
         let (api, ws) = api("unknown");
-        let err = dispatch(&api, &ws, "nope", &json!({})).await.unwrap_err();
+        let err = dispatch(&api, &ws, None, "nope", &json!({}))
+            .await
+            .unwrap_err();
         assert!(err.contains("unknown method"));
     }
 }

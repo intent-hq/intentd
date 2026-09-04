@@ -4207,6 +4207,20 @@ impl Services {
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
         if let Some(session_ws) = session_workspace_id.as_ref() {
+            // Sandboxes persist for the agent's lifetime; that lifetime ends
+            // here. Discard BEFORE the session delete: the FK cascade removes
+            // the sandbox row with the session, and the directory path is
+            // only reachable through the record. Best-effort — a leaked
+            // directory must not fail the idempotent delete.
+            if let Err(e) =
+                crate::sandbox_ops::discard_sandbox(&self.store, session_ws, &agent_id).await
+            {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "failed to discard sandbox during agent delete"
+                );
+            }
             self.store
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;
@@ -8183,6 +8197,12 @@ impl Services {
                 .await;
         }
         let wait_mode = input.wait_mode.clone();
+        // Per-agent microVM sizing: validate at delegate time so invalid
+        // input errors here, not at VM boot (accepted-and-ignored on
+        // non-microVM workspaces, like mergeOnTurnEnd).
+        if let Some(vm) = &input.vm_resources {
+            vm.validate()?;
+        }
         // Persist the task linkage + skipAutoCommit on the session so the
         // auto-commit-on-idle subscriber (LNI-1) can resolve `Linked-Note-Id:`
         // and honor the opt-out without a reverse lookup on every idle event.
@@ -8430,6 +8450,20 @@ impl Services {
         // Delegated agents are background agents (the TS `DelegateTaskTool`
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
+        // Parent-controlled turn-end merge (advisory without a sandbox):
+        // persisted on the child's metadata so `provision_sandbox` can stamp
+        // it onto the sandbox record — in both the background delegate path
+        // and the synchronous microVM path — surviving respawn/restart.
+        if let Some(merge) = input.merge_on_turn_end {
+            extra_metadata.insert("mergeOnTurnEnd".to_string(), json!(merge));
+        }
+        // Per-agent microVM sizing (advisory on non-microVM workspaces):
+        // persisted on the child's metadata so `ensure_started` — which can
+        // boot the VM long after delegate, and again on respawn — resolves
+        // the same size every time.
+        if let Some(vm) = &input.vm_resources {
+            extra_metadata.insert("vmResources".to_string(), json!(vm));
+        }
         let extra = AgentCreateExtra {
             provider: delegate_provider,
             reasoning_effort,
@@ -8473,26 +8507,53 @@ impl Services {
         // sandbox fields and the `sandbox:cow:created` event.
         let mut effective_isolation: Option<&str> = None;
 
-        // Provision sandbox if isolation=cow is requested (Task 3).
-        // Check if isolation is "cow" (explicit or defaulted from workspace setting).
-        // Default to "cow" if workspace.cowIsolation setting is enabled and no explicit
-        // isolation parameter was provided (Task 5).
-        let mut isolation = input.isolation.clone();
-        if isolation.is_none() {
-            // Check workspace.cowIsolation setting
-            // `settings_get` returns the `{ path, value, definition }`
-            // envelope (§5.9) — read the nested `value`.
-            if let Ok(setting) = self
-                .settings_get("workspace.cowIsolation".to_string())
-                .await
-            {
-                if setting["value"].as_bool().unwrap_or(false) {
-                    isolation = Some("cow".to_string());
-                }
+        // Resolve the delegate's isolation mode. Once a workspace is set up,
+        // its persisted `execution_environment` is THE authority for
+        // isolation — the global `workspace.cowIsolation` setting and the
+        // per-call `isolation` param cannot turn per-agent sandboxing on or
+        // off inside an existing workspace:
+        // - `cow` / `microvm` ⇒ every agent is sandboxed (uniform per-agent
+        //   isolation; the spawn path provisions unconditionally anyway, the
+        //   delegate-time resolution just keeps provisioning off the critical
+        //   path via the background clone below).
+        // - `direct` / `worktree` ⇒ shared checkout, no sandbox — even when
+        //   the caller passes `isolation: "cow"` or the global setting is on.
+        // - Legacy rows (`execution_environment` unset, pre-v3.3): preserve
+        //   the original param-then-setting resolution so pre-existing
+        //   workspaces keep their behavior.
+        // A store error fails the delegate rather than silently resolving as
+        // "no workspace" — that would skip the execution-environment
+        // authority and degrade isolation. Only a genuinely absent workspace
+        // (NotFound) falls through to the legacy param-then-setting path.
+        let workspace = match self.store.get_workspace(&workspace_id).await {
+            Ok(w) => Some(w),
+            Err(Error::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let execution_env = workspace.as_ref().and_then(|w| w.execution_environment);
+        let isolation: Option<String> = match execution_env {
+            Some(intent_core::SandboxType::Cow | intent_core::SandboxType::Microvm) => {
+                Some("cow".to_string())
             }
-        }
+            Some(intent_core::SandboxType::Direct | intent_core::SandboxType::Worktree) => None,
+            None => {
+                let mut isolation = input.isolation.clone();
+                if isolation.is_none() {
+                    // `settings_get` returns the `{ path, value, definition }`
+                    // envelope (§5.9) — read the nested `value`.
+                    if let Ok(setting) = self
+                        .settings_get("workspace.cowIsolation".to_string())
+                        .await
+                    {
+                        if setting["value"].as_bool().unwrap_or(false) {
+                            isolation = Some("cow".to_string());
+                        }
+                    }
+                }
+                isolation
+            }
+        };
         if isolation.as_deref() == Some("cow") {
-            let workspace = self.store.get_workspace(&workspace_id).await.ok();
             if let Some(ws) = workspace {
                 // Sandbox-eligible: direct-mode workspaces (no worktree or
                 // skip_worktree=true; sandbox sourced from the user's repo folder),

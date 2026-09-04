@@ -671,6 +671,7 @@ mod tests {
     fn workspace_for_repo(repo_path: &Path) -> Workspace {
         let now = now_iso();
         Workspace {
+            execution_environment: None,
             id: WorkspaceId::new(),
             title: "Test WS".to_string(),
             branch: "main".to_string(),
@@ -719,6 +720,9 @@ mod tests {
     fn sandbox_row(ws: &Workspace, agent_id: &AgentId, path: &Path, branch: &str) -> Sandbox {
         let now = now_iso();
         Sandbox {
+            last_merged_commit_sha: None,
+            merge_on_turn_end: true,
+            conflicting_paths: vec![],
             id: format!("sb-{}", agent_id.0),
             workspace_id: ws.id.clone(),
             agent_id: agent_id.clone(),

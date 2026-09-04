@@ -1,0 +1,32 @@
+#!/bin/sh
+# Intent guest init (monorepo#1120, EE-3): the manifest's vsockExec.init.
+# Booted as the libkrun guest workload; mounts the pseudo-filesystems the
+# krun init may not have provided, then execs the vsock exec agent.
+# Guest commands are NEVER delivered on the kernel cmdline (ASCII/length
+# limits) — everything arrives over the vsock exec protocol.
+
+# Idempotent mounts: under libkrun most of these are pre-mounted by the
+# built-in init; failures are benign.
+mountpoint -q /proc 2>/dev/null || mount -t proc proc /proc 2>/dev/null
+mountpoint -q /sys 2>/dev/null || mount -t sysfs sys /sys 2>/dev/null
+mkdir -p /dev 2>/dev/null
+mountpoint -q /dev 2>/dev/null || mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mountpoint -q /dev/pts 2>/dev/null || mount -t devpts devpts /dev/pts 2>/dev/null
+mountpoint -q /tmp 2>/dev/null || mount -t tmpfs tmp /tmp 2>/dev/null
+
+hostname intent-guest 2>/dev/null
+ip link set lo up 2>/dev/null
+
+# TSI-compatible resolv.conf: libkrun TSI intercepts the actual socket sends,
+# but glibc/Node DNS paths need non-empty resolvers. Baked into the image by
+# the build script; re-asserted here in case the rootfs was customized.
+[ -s /etc/resolv.conf ] || \
+  printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf 2>/dev/null
+
+export HOME="${HOME:-/root}"
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+echo "[intent-init] up, starting vsock exec agent" > /dev/console 2>/dev/null
+
+exec /usr/local/bin/intent-vsock-exec

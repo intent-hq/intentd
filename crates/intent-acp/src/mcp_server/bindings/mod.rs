@@ -203,7 +203,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("host.") {
-        return host::dispatch(api, workspace_id, rest, args)
+        return host::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }

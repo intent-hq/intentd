@@ -405,6 +405,9 @@ async fn seed_source(
     // Sandbox row for the clone above.
     svc.store
         .insert_sandbox(&Sandbox {
+            last_merged_commit_sha: None,
+            merge_on_turn_end: true,
+            conflicting_paths: vec![],
             id: "sb-rt".to_string(),
             workspace_id: id.clone(),
             agent_id: sb_agent.clone(),

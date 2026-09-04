@@ -42,10 +42,25 @@ fn status_path(bytes: &[u8]) -> PathBuf {
 /// while its checkout remains on disk, `INDEX_DELETED | WT_NEW`) is real dirt
 /// whose staged side must travel.
 pub(crate) fn is_dirty(repo: &git2::Repository) -> Result<bool> {
+    is_dirty_with(repo, false)
+}
+
+/// [`is_dirty`] with submodule status entries excluded. Used by the sandbox
+/// merge-back paths: the merge only moves gitlink POINTERS via tree-level
+/// cherry-pick and never touches a submodule worktree, so submodule worktree
+/// state (uninitialized/absent directory, or a checked-out sha that differs
+/// from the committed gitlink — common in cache-hydrated checkouts) must not
+/// make the repo look dirty and block/bounce a merge.
+pub(crate) fn is_dirty_excluding_submodules(repo: &git2::Repository) -> Result<bool> {
+    is_dirty_with(repo, true)
+}
+
+fn is_dirty_with(repo: &git2::Repository, exclude_submodules: bool) -> Result<bool> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(false);
+        .include_ignored(false)
+        .exclude_submodules(exclude_submodules);
     let statuses = repo
         .statuses(Some(&mut opts))
         .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
