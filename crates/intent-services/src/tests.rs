@@ -8593,6 +8593,67 @@ mod change_event_parity {
         );
     }
 
+    /// Regression (intent#4283): `agent_activity_end` must register the idle
+    /// debouncer atomically with dropping the in-flight count. Before the
+    /// fix the count was released first and the debouncer inserted after, so
+    /// a concurrent `workspace_activity` read landing in the gap saw count 0
+    /// with no pending debouncer and derived a transient `Idle` inside the
+    /// grace window — `workspace.get` served `idle` while the immediately
+    /// following `workspace.list` served `agent_running` / `in_progress`.
+    /// A spinning reader on its own OS thread hammers the derivation across
+    /// many begin/end cycles; with a debounce window far longer than the
+    /// test, `Idle` must never be observed once the first session is in
+    /// flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activity_end_never_exposes_transient_idle_inside_grace_window() {
+        use intent_core::WorkspaceActivity;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let _guard = DebounceEnvGuard::new("30000");
+        let h = harness().await;
+
+        // First session in flight before the reader starts: the pre-begin
+        // `Idle` is legitimate and must not count.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let idle_seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let reader = {
+            let services = h.services.clone();
+            let ws = h.ws.clone();
+            let stop = stop.clone();
+            let idle_seen = idle_seen.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if services.workspace_activity(&ws) == WorkspaceActivity::Idle {
+                        idle_seen.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        // Each `end` is the `1 → 0` edge (debouncer scheduled); each `begin`
+        // re-enters flight and cancels it. The reader must see
+        // `AgentRunning` throughout.
+        for _ in 0..500 {
+            h.services.agent_activity_end(&h.ws);
+            h.services.agent_activity_begin(&h.ws).await;
+        }
+        h.services.agent_activity_end(&h.ws);
+
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("reader thread");
+        assert_eq!(
+            idle_seen.load(Ordering::Relaxed),
+            0,
+            "workspace_activity derived a transient Idle inside the grace window"
+        );
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "grace window still pending after the last end"
+        );
+    }
+
     /// Regression for STAB-N: workspace mutation paths must derive `activity`
     /// from live agent state before returning the `Workspace` on the wire (§9.9).
     /// When a workspace has agents in-flight, mutations that return a `Workspace`

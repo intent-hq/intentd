@@ -2942,25 +2942,33 @@ impl Services {
     /// window (~3s default, env-overridable for tests). A new `agent_activity_begin`
     /// within the window cancels the idle flip. A decrement with no tracked session
     /// is a no-op.
+    ///
+    /// The `agent_activity` lock is held across the debouncer registration
+    /// (intent#4283): [`Self::workspace_activity`] reads the count and then
+    /// the `idle_debouncers` map, so releasing the count before the debouncer
+    /// is inserted opened a window where a reader saw count `0` with no
+    /// pending debouncer and derived a transient `Idle` inside the grace
+    /// window — `workspace.get` serving `idle` while the immediately following
+    /// `workspace.list` served `agent_running` / `in_progress`. Lock order
+    /// `agent_activity → idle_debouncers` matches `workspace_activity`.
     pub(crate) fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
-        let transitioned = {
-            let mut map = self.agent_activity.lock().unwrap();
-            match map.get_mut(workspace_id) {
-                Some(count) if *count > 0 => {
-                    *count -= 1;
-                    if *count == 0 {
-                        map.remove(workspace_id);
-                        true
-                    } else {
-                        false
-                    }
+        let mut map = self.agent_activity.lock().unwrap();
+        let transitioned = match map.get_mut(workspace_id) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(workspace_id);
+                    true
+                } else {
+                    false
                 }
-                _ => false,
             }
+            _ => false,
         };
         if transitioned {
             self.schedule_idle_debounce(workspace_id.clone());
         }
+        drop(map);
     }
 
     /// Schedule a debounced `workspace:activity-changed { idle }` event emission
