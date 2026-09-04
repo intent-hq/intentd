@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.20] - 2026-09-04
+
+### 📚 Documentation
+
+- *(providers)* State inherited NODE_OPTIONS first in heap-cap precedence ([#1724](https://github.com/intent-hq/intentd/pull/1724))
+
+
 ## [0.9.19] - 2026-09-04
 
 ### 🐛 Bug Fixes
