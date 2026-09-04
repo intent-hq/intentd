@@ -1912,9 +1912,20 @@ async fn report_progress_keeps_original_watch_for_terminal_completion_over_wss()
     )
     .await;
     let wakes = wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, "completed.").await;
+    req_id += 1;
     assert_eq!(wakes, 1, "exactly one terminal completion wake");
-    let n = watch_count_on_target(&mut setup.rpc, req_id + 1, &ws_id, &parent, &child).await;
-    assert_eq!(n, 0, "terminal completion retires the original watch");
+    // The wake row is visible before the retire write commits (monorepo#4380):
+    // poll for retirement instead of a one-shot read.
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
 }
 
 /// The child reports during a silent in-turn tail. The report wake is visible
@@ -2047,8 +2058,17 @@ async fn in_turn_progress_is_followed_by_terminal_wake_over_wss() {
         wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, "reported. Report:").await;
     req_id += 1;
     assert_eq!(reports, 1, "exactly one report wake in the cycle");
-    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
-    assert_eq!(n, 0, "terminal completion retires the original watch");
+    // Same retire-after-wake window as monorepo#4380: poll for retirement.
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
 }
 
 /// monorepo#2532 Gap B: arming a watch on a child that REPORTED and idled
