@@ -6,7 +6,7 @@
 //! `agent.list`/`agent.get` post-processing; [`parse_model_list_output`]
 //! ports the auggie CLI model-list parser.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -196,6 +196,14 @@ pub(crate) struct AgentSnapshot {
     /// byte-identical for workspaces without PRs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prs: Option<AgentSnapshotPrs>,
+    /// Workspace task-note counts per non-terminal status, keyed by the wire
+    /// `snake_case` `TaskStatus` string (`not_started`, `waiting`,
+    /// `discussion_needed`, `blocked`, `in_progress`, `review_required`).
+    /// `complete` / `cancelled` are never listed and zero counts are absent;
+    /// omitted entirely when nothing qualifies, so prompts stay
+    /// byte-identical for workspaces without open tasks.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) tasks: BTreeMap<String, usize>,
     /// `"blocker"` / `"discussion"` when this agent has raised an attention
     /// request that is still unresolved.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,6 +328,7 @@ impl AgentSnapshot {
             && self.num_questions_asked == 0
             && self.pr_monitors.is_empty()
             && self.prs.is_none()
+            && self.tasks.is_empty()
             && self.pending_attention.is_none()
     }
 }
@@ -10522,6 +10531,10 @@ impl Services {
         // registered git roots) — no forge calls, no per-PR statements.
         // Fails open to None.
         let prs = self.tracked_open_prs_grouped(&session.workspace_id).await;
+        // One GROUP BY aggregate over the workspace's task rows (status
+        // column only, no note bodies); terminal statuses dropped here.
+        // Fails open to empty.
+        let tasks = self.open_task_status_counts(&session.workspace_id).await;
         // Whole-second UTC timestamp — the snapshot line is injected into
         // every turn prompt, so sub-second precision only spends tokens.
         let time = {
@@ -10543,8 +10556,33 @@ impl Services {
             num_questions_asked,
             pr_monitors,
             prs,
+            tasks,
             pending_attention: session.attention_request_kind.clone(),
         })
+    }
+
+    /// The snapshot's `tasks` field: the workspace's task-note counts per
+    /// non-terminal status from [`Store::count_task_status_counts`] (one
+    /// aggregate statement, no content hydration), with `complete` and
+    /// `cancelled` removed. Best-effort — a store failure reads as empty so
+    /// a snapshot build never fails on it.
+    async fn open_task_status_counts(&self, workspace_id: &WorkspaceId) -> BTreeMap<String, usize> {
+        let counts = match self.store.count_task_status_counts(workspace_id).await {
+            Ok(counts) => counts,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "task status count failed; snapshot tasks omitted"
+                );
+                return BTreeMap::new();
+            }
+        };
+        counts
+            .into_iter()
+            .filter(|(status, n)| *n > 0 && status != "complete" && status != "cancelled")
+            .map(|(status, n)| (status, usize::try_from(n).expect("value fits in usize")))
+            .collect()
     }
 
     /// The snapshot's `prs` field: the workspace's tracked open PRs grouped

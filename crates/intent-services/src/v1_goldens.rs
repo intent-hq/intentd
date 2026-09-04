@@ -2053,6 +2053,12 @@ fn golden_snapshot_full_field_serialization() {
             mergeable: vec!["o/r#3".to_string()],
             unknown: vec!["o/r#4".to_string()],
         }),
+        tasks: [
+            ("in_progress".to_string(), 2),
+            ("review_required".to_string(), 1),
+        ]
+        .into_iter()
+        .collect(),
         pending_attention: Some("blocker".to_string()),
     };
     assert_eq!(
@@ -2064,6 +2070,7 @@ fn golden_snapshot_full_field_serialization() {
          \"intent-hq/monorepo#8 (changes pending)\"],\
          \"prs\":{\"draft\":[\"o/r#1\"],\"blocked\":[\"o/r#2\"],\
          \"mergeable\":[\"o/r#3\"],\"unknown\":[\"o/r#4\"]},\
+         \"tasks\":{\"in_progress\":2,\"review_required\":1},\
          \"pendingAttention\":\"blocker\"}"
     );
 }

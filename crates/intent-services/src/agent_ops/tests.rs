@@ -36350,6 +36350,105 @@ async fn agent_snapshot_omits_prs_when_no_open_tracked_pr() {
     );
 }
 
+/// Create a note and mark it as a task with the given wire status string.
+async fn seed_task_note(svc: &Services, ws: &WorkspaceId, title: &str, status: &str) {
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: title.into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note;
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        status.into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
+}
+
+/// `tasks` counts the workspace's task notes per non-terminal status keyed
+/// by the wire `snake_case` string: `complete` / `cancelled` are dropped,
+/// keys are in `BTreeMap` order, and the field alone forces the injection
+/// line.
+#[tokio::test]
+async fn agent_snapshot_counts_open_task_statuses_and_forces_injection() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Coordinator").await;
+    seed_task_note(&svc, &ws, "Reviewing", "review_required").await;
+    seed_task_note(&svc, &ws, "Working", "in_progress").await;
+    seed_task_note(&svc, &ws, "Done", "complete").await;
+    seed_task_note(&svc, &ws, "Dropped", "cancelled").await;
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["tasks"],
+        json!({"in_progress": 1, "review_required": 1}),
+        "non-terminal counts only: {v}"
+    );
+    assert_eq!(
+        serde_json::to_string(&v["tasks"]).unwrap(),
+        "{\"in_progress\":1,\"review_required\":1}",
+        "deterministic key order"
+    );
+
+    let line = svc
+        .agent_state_snapshot_line(&agent)
+        .await
+        .expect("tasks alone makes the snapshot non-trivial");
+    let json_part = line
+        .strip_prefix("current ws.agent.snapshot() => ")
+        .expect("JSON payload");
+    let parsed: serde_json::Value = serde_json::from_str(json_part).expect("valid JSON");
+    assert_eq!(parsed["tasks"]["review_required"], json!(1));
+    assert_eq!(parsed["tasks"]["in_progress"], json!(1));
+    assert!(
+        parsed["tasks"].get("complete").is_none() && parsed["tasks"].get("cancelled").is_none(),
+        "terminal statuses never listed: {line}"
+    );
+}
+
+/// A workspace whose task notes are all `complete` / `cancelled` omits
+/// `tasks` entirely and stays trivial — no injection line fires.
+#[tokio::test]
+async fn agent_snapshot_omits_tasks_when_only_terminal_statuses() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Coordinator").await;
+    seed_task_note(&svc, &ws, "Done", "complete").await;
+    seed_task_note(&svc, &ws, "Dropped", "cancelled").await;
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("tasks"),
+        "terminal-only tasks omit the field: {v}"
+    );
+    assert_eq!(
+        svc.agent_state_snapshot_line(&agent).await,
+        None,
+        "terminal-only tasks keep the snapshot trivial"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Batch `agent.delegate` (tasks[]): full request→response shape over the
 // service op — classification is unit-tested in `batch.rs`; these lock the
