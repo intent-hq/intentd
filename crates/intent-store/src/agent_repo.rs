@@ -1536,16 +1536,20 @@ impl Store {
                 .as_deref()
                 .and_then(|raw| serde_json::from_str(raw).ok())
                 .unwrap_or_default();
-            let cost_delta = match (previous.cost.as_ref(), snapshot.cost.as_ref()) {
-                (Some(old), Some(new)) if old.currency == new.currency => {
-                    Some((&new.currency, new.amount - old.amount))
+            if let (Some(old), Some(new)) = (previous.cost.as_ref(), snapshot.cost.as_ref()) {
+                if old.currency != new.currency {
+                    let total = costs.entry(old.currency.clone()).or_default();
+                    *total = (*total - old.amount).max(0.0);
                 }
-                (_, Some(new)) => Some((&new.currency, new.amount)),
-                _ => None,
+            }
+            let cost_delta = match (previous.cost.as_ref(), snapshot.cost.as_ref()) {
+                (Some(old), Some(new)) if old.currency == new.currency => new.amount - old.amount,
+                (_, Some(new)) => new.amount,
+                _ => 0.0,
             };
-            if let Some((currency, amount)) = cost_delta.filter(|(_, amount)| *amount != 0.0) {
-                let total = costs.entry(currency.clone()).or_default();
-                *total = (*total + amount).max(0.0);
+            if let Some(new) = snapshot.cost.as_ref().filter(|_| cost_delta != 0.0) {
+                let total = costs.entry(new.currency.clone()).or_default();
+                *total = (*total + cost_delta).max(0.0);
             }
             costs.retain(|_, amount| *amount > 0.0);
             let costs_json = serde_json::to_string(&costs)
@@ -1633,33 +1637,133 @@ impl Store {
              WHEN instr(ltrim(model, ':'), ':') > 0 \
              THEN nullif(substr(ltrim(model, ':'), instr(ltrim(model, ':'), ':') + 1), '') \
              ELSE nullif(ltrim(model, ':'), '') END";
-        let res = match expected_model {
-            Some(expected) => {
-                sqlx::query(&format!(
-                    "UPDATE agent_session SET resolved_model=? \
-                     WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} = ?"
+        let pool = self.write_pool();
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool.begin().await.map_err(|e| {
+                Error::Internal(format!(
+                    "set agent session resolved model begin failed: {e}"
                 ))
-                .bind(resolved)
-                .bind(&id.0)
-                .bind(&workspace_id.0)
-                .bind(expected)
-                .execute(self.write_pool())
-                .await
+            })?;
+            let res = match expected_model {
+                Some(expected) => {
+                    sqlx::query(&format!(
+                        "UPDATE agent_session SET resolved_model=? \
+                         WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} = ?"
+                    ))
+                    .bind(resolved)
+                    .bind(&id.0)
+                    .bind(&workspace_id.0)
+                    .bind(expected)
+                    .execute(&mut *tx)
+                    .await
+                }
+                None => {
+                    sqlx::query(&format!(
+                        "UPDATE agent_session SET resolved_model=? \
+                         WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} IS NULL"
+                    ))
+                    .bind(resolved)
+                    .bind(&id.0)
+                    .bind(&workspace_id.0)
+                    .execute(&mut *tx)
+                    .await
+                }
             }
-            None => {
-                sqlx::query(&format!(
-                    "UPDATE agent_session SET resolved_model=? \
-                     WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} IS NULL"
+            .map_err(|e| {
+                Error::Internal(format!("set agent session resolved model failed: {e}"))
+            })?;
+            let landed = res.rows_affected() > 0;
+
+            // A turn's user row is persisted before lazy session open resolves
+            // the provider's display model. Move only that current last row and
+            // its trusted count, leaving historical model provenance unchanged.
+            if let Some(resolved) = landed
+                .then_some(resolved)
+                .flatten()
+                .filter(|model| !model.is_empty())
+            {
+                let prompt = sqlx::query(
+                    "SELECT m.id, m.usage_model, m.usage_origin FROM agent_message m \
+                     JOIN agent_session s ON s.id=m.agent_id \
+                     WHERE m.agent_id=? AND m.id=s.last_message_id AND m.role='user' \
+                     AND m.usage_origin IN ('human','agent')",
+                )
+                .bind(&id.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("read prompt provenance failed: {e}")))?;
+                if let Some(prompt) = prompt {
+                    let old_model: String = prompt.get("usage_model");
+                    if old_model != resolved {
+                        let origin: String = prompt.get("usage_origin");
+                        let (human, agent) = if origin == "human" {
+                            (1_i64, 0_i64)
+                        } else {
+                            (0_i64, 1_i64)
+                        };
+                        sqlx::query("UPDATE agent_message SET usage_model=? WHERE id=?")
+                            .bind(resolved)
+                            .bind(prompt.get::<String, _>("id"))
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!("update prompt provenance failed: {e}"))
+                            })?;
+                        sqlx::query(
+                            "UPDATE agent_usage_cell SET \
+                             human_messages=MAX(0,human_messages-?), \
+                             agent_messages=MAX(0,agent_messages-?) \
+                             WHERE agent_id=? AND model=?",
+                        )
+                        .bind(human)
+                        .bind(agent)
+                        .bind(&id.0)
+                        .bind(&old_model)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("decrement prompt usage cell failed: {e}"))
+                        })?;
+                        sqlx::query(
+                            "INSERT INTO agent_usage_cell \
+                             (agent_id, model, human_messages, agent_messages) VALUES (?, ?, ?, ?) \
+                             ON CONFLICT(agent_id, model) DO UPDATE SET \
+                             human_messages=human_messages+excluded.human_messages, \
+                             agent_messages=agent_messages+excluded.agent_messages",
+                        )
+                        .bind(&id.0)
+                        .bind(resolved)
+                        .bind(human)
+                        .bind(agent)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("increment prompt usage cell failed: {e}"))
+                        })?;
+                        sqlx::query(
+                            "DELETE FROM agent_usage_cell WHERE agent_id=? AND model=? \
+                             AND input_tokens=0 AND output_tokens=0 AND cache_read_tokens=0 \
+                             AND cache_creation_tokens=0 AND thought_tokens=0 \
+                             AND costs_json='{}' AND human_messages=0 AND agent_messages=0",
+                        )
+                        .bind(&id.0)
+                        .bind(&old_model)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("prune empty prompt usage cell failed: {e}"))
+                        })?;
+                    }
+                }
+            }
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!(
+                    "set agent session resolved model commit failed: {e}"
                 ))
-                .bind(resolved)
-                .bind(&id.0)
-                .bind(&workspace_id.0)
-                .execute(self.write_pool())
-                .await
-            }
-        }
-        .map_err(|e| Error::Internal(format!("set agent session resolved model failed: {e}")))?;
-        Ok(res.rows_affected() > 0)
+            })?;
+            Ok(landed)
+        })
+        .await
     }
 
     /// Clear a session's resolved display model (D14). Called by
@@ -5386,6 +5490,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cumulative_cost_currency_change_replaces_prior_contribution() {
+        use intent_core::{now_iso, UsageCost};
+
+        let tmp = TempDb::new("test-cost-currency-replace");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-cost-currency".to_string());
+        let agent_id = AgentId("agent-cost-currency".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        for (amount, currency) in [(20.0, "USD"), (10.0, "EUR")] {
+            store
+                .set_agent_session_token_usage(
+                    &ws_id,
+                    &agent_id,
+                    &TokenUsageTotals {
+                        cost: Some(UsageCost {
+                            amount,
+                            currency: currency.to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("replace cumulative snapshot");
+        }
+
+        let rows = store.get_workspace_agent_usage_data(&ws_id).await.unwrap();
+        assert_eq!(
+            rows[0].5[0].reported_totals.cost,
+            Some(UsageCost {
+                amount: 10.0,
+                currency: "EUR".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn usage_cells_keep_trusted_origins_and_model_provenance() {
         use intent_core::now_iso;
 
@@ -7904,6 +8053,62 @@ mod tests {
         assert!(
             landed,
             "empty remainder normalizes to NULL and matches None"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_model_reattributes_current_prompt_provenance() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-resolved-prompt-provenance");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-resolved-prompt".to_string());
+        let agent_id = AgentId("agent-resolved-prompt".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.model = Some("default".to_string());
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let body = serde_json::json!([{"type":"text","text":"initial prompt"}]);
+        store
+            .append_agent_message_with_provenance(
+                &agent_id,
+                "initial-prompt",
+                "user",
+                &body,
+                None,
+                &ts,
+                UsageMessageOrigin::Human,
+            )
+            .await
+            .expect("append prompt before session open");
+
+        assert!(store
+            .set_agent_session_resolved_model(
+                &ws_id,
+                &agent_id,
+                Some("default"),
+                Some("Claude 3.5 Sonnet"),
+            )
+            .await
+            .expect("persist resolved model"));
+        store
+            .append_agent_message(&agent_id, "assistant", &body, &ts)
+            .await
+            .expect("append resolved reply");
+
+        let rows = store.get_workspace_agent_usage_data(&ws_id).await.unwrap();
+        assert_eq!(rows[0].5.len(), 1, "raw placeholder cell was pruned");
+        assert_eq!(rows[0].5[0].model, "Claude 3.5 Sonnet");
+        assert_eq!(
+            (rows[0].5[0].human_messages, rows[0].5[0].agent_messages),
+            (1, 1)
         );
     }
 
