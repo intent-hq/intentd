@@ -772,10 +772,8 @@ pub(crate) struct LiveTurn {
 /// interrupt path's downstream decisions agree with the durable row instead of
 /// with a pre-abort clone.
 pub(crate) struct FlushedTurn {
-    /// Id of the interrupted assistant row this flush appended — `None` when
-    /// nothing was appended (the worker's own full row won the `agent_message.id`
-    /// UNIQUE collision, or the store errored).
-    pub(crate) message_id: Option<String>,
+    /// What became of the slot's content — see [`InterruptFlushOutcome`].
+    pub(crate) outcome: InterruptFlushOutcome,
     /// Whether the flushed slot carried any blocks — the zero-output test the
     /// stop-redelivery arm (intent-hq/monorepo#1757) keys off.
     pub(crate) had_output: bool,
@@ -784,6 +782,39 @@ pub(crate) struct FlushedTurn {
     /// The flushed content's `type: "text"` block strings, for the terminal
     /// `agent:stream:end` live-preview fields.
     pub(crate) text_blocks: Vec<String>,
+}
+
+/// Outcome of one
+/// [`flush_partial_turn_on_interruption`](Services::flush_partial_turn_on_interruption)
+/// attempt. The three arms are deliberately kept apart: only `Appended` is an
+/// interruption the flush recorded, `AlreadyPersisted` means the turn was
+/// NOT interrupted at all (the worker's own full row won), and `Failed`
+/// leaves the slot as the only copy of the content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InterruptFlushOutcome {
+    /// This flush appended the interrupted assistant row under the turn's
+    /// minted id (carried here).
+    Appended(String),
+    /// The append hit the `agent_message.id` UNIQUE collision: the worker had
+    /// already persisted the turn's FULL row under this id — the interrupt
+    /// landed in the persist→worker-exit gap of a turn that completed
+    /// normally. Carries that completed row's id so the interrupt path can
+    /// close the stream as the completion it really was, rather than stamp
+    /// `stopReason: "interrupted"` on a turn that was never cut short.
+    AlreadyPersisted(String),
+    /// A genuine store error: nothing was persisted; the slot is kept.
+    Failed,
+}
+
+impl InterruptFlushOutcome {
+    /// Id of the interrupted row this flush appended — `None` for the
+    /// collision and error arms.
+    pub(crate) fn appended_message_id(&self) -> Option<&str> {
+        match self {
+            Self::Appended(id) => Some(id.as_str()),
+            Self::AlreadyPersisted(_) | Self::Failed => None,
+        }
+    }
 }
 
 /// Machine-readable cause of a turn interruption, stamped as
@@ -1894,11 +1925,11 @@ impl Services {
         let had_output = !live.blocks.is_empty();
         let block_count = live.blocks.len();
         let text_blocks = text_block_strings(&live.blocks);
-        let message_id = self
+        let outcome = self
             .flush_partial_turn_on_interruption(agent_id, live, reason, interrupted_by, true)
             .await;
         Some(FlushedTurn {
-            message_id,
+            outcome,
             had_output,
             block_count,
             text_blocks,
@@ -1940,9 +1971,11 @@ impl Services {
     /// combined-delivery re-queue check in `preempt_busy_turn` excludes the
     /// row this flush appends.)
     ///
-    /// Returns the persisted interrupted row's message id (`Some` only when
-    /// this flush appended the row), so the interrupt path can carry
-    /// `messageId` on the terminal `agent:stream:end`.
+    /// Returns an [`InterruptFlushOutcome`]: `Appended` (this flush persisted
+    /// the interrupted row) so the interrupt path can carry `messageId` on the
+    /// terminal `agent:stream:end`; `AlreadyPersisted` (the UNIQUE collision —
+    /// the worker's full row won, so the turn actually completed) so that path
+    /// can close the stream as a normal completion; or `Failed`.
     /// `owns_slot` says whose slot this flush may release: the teardown flush
     /// owns the pin it is flushing and clears unconditionally; the suspend
     /// enrollment flushes caller-held content and must NOT release a pin a
@@ -1956,7 +1989,7 @@ impl Services {
         reason: InterruptReason,
         interrupted_by: Option<&InterruptedBy>,
         owns_slot: bool,
-    ) -> Option<String> {
+    ) -> InterruptFlushOutcome {
         let block_count = live.blocks.len();
         // A partial tail can already carry proposal blocks (the interrupt
         // landed after the propose tool call): capture their ids BEFORE the
@@ -2038,7 +2071,7 @@ impl Services {
                 } else {
                     self.clear_unpinned_live_turn(agent_id);
                 }
-                Some(live.message_id)
+                InterruptFlushOutcome::Appended(live.message_id)
             }
             // Only the `agent_message.id` violation means "the worker already
             // persisted the full turn under this minted id" — a `(agent_id,
@@ -2060,7 +2093,7 @@ impl Services {
                     error = %e,
                     "partial flush skipped: worker already persisted the full turn under this id"
                 );
-                None
+                InterruptFlushOutcome::AlreadyPersisted(live.message_id)
             }
             Err(e) => {
                 tracing::warn!(
@@ -2083,7 +2116,7 @@ impl Services {
                 if owns_slot {
                     self.mark_live_turn_flush_failed(agent_id);
                 }
-                None
+                InterruptFlushOutcome::Failed
             }
         }
     }
@@ -3624,10 +3657,10 @@ impl Services {
         };
         // A failed flush deliberately does NOT reap the turn's mid-turn
         // staged rows (unlike the turn-end/wake failure arms): this path does
-        // not own the slot, so a `None` here can coexist with a concurrent
-        // teardown whose pinned retry flush is still entitled to adopt them —
-        // reaping would delete the only copy of the heavy bodies out from
-        // under it. Truly orphaned rows are bounded and reaped by the
+        // not own the slot, so a non-`Appended` outcome here can coexist with
+        // a concurrent teardown whose pinned retry flush is still entitled to
+        // adopt them — reaping would delete the only copy of the heavy bodies
+        // out from under it. Truly orphaned rows are bounded and reaped by the
         // `Store::open` sweep.
         let interrupted_message_id = self
             .flush_partial_turn_on_interruption(
@@ -3637,7 +3670,9 @@ impl Services {
                 None,
                 false,
             )
-            .await;
+            .await
+            .appended_message_id()
+            .map(str::to_owned);
         // Capture the session's running status for restore-on-resume, serialized
         // to the stored form (e.g. "active", "Waiting") exactly like
         // `heal_stale_agent_sessions`. A lookup failure falls back to "active".
