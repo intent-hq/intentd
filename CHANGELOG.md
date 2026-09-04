@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.17] - 2026-09-04
+
+### 🚀 Features
+
+- *(harness)* Mint v2.3 with a levers-focused Suggested Next Steps hint ([#1713](https://github.com/intent-hq/intentd/pull/1713))
+- *(agent)* Report workspace task status counts in ws.agent.snapshot() ([#1712](https://github.com/intent-hq/intentd/pull/1712))
+
+
 ## [0.9.16] - 2026-09-04
 
 ### 🚀 Features

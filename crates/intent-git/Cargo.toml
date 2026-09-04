@@ -1,6 +1,6 @@
 [package]
 name = "intent-git"
-version = "0.9.16"
+version = "0.9.17"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 description = "Git wrappers: status/stage/commit/branches and worktree create + lock"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.16" }
+intent-core = { path = "../intent-core", version = "0.9.17" }
 git2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
