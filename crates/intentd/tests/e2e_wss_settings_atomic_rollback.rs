@@ -1397,7 +1397,13 @@ async fn redaction_placeholder_without_secret_rejects_batch_over_wss() {
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(port, cfg).await;
 
-    let resp = wss_rpc(&mut ws, 1, "settings.get", json!({ "path": "linear.token" })).await;
+    let resp = wss_rpc(
+        &mut ws,
+        1,
+        "settings.get",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
     assert_success_envelope(&resp, 1);
     assert_eq!(resp["result"]["value"], Value::Null, "no secret stored yet");
 
@@ -1420,10 +1426,22 @@ async fn redaction_placeholder_without_secret_rejects_batch_over_wss() {
     );
 
     assert_eq!(stored_secret(&secrets_file, "linear.token"), None);
-    let resp = wss_rpc(&mut ws, 3, "settings.get", json!({ "path": "linear.token" })).await;
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "settings.get",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
     assert_success_envelope(&resp, 3);
     assert_eq!(resp["result"]["value"], Value::Null);
-    let resp = wss_rpc(&mut ws, 4, "settings.get", json!({ "path": "git.autoCommit" })).await;
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.get",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
     assert_success_envelope(&resp, 4);
     assert_eq!(
         resp["result"]["value"],

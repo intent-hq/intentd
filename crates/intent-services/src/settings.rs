@@ -2212,6 +2212,13 @@ impl<'a> SettingsService<'a> {
     /// a durable file change without a `settings:changed` event. Returns the
     /// **redacted** applied `{ path, value, origin? }` pairs for the response +
     /// `settings:changed` payload.
+    ///
+    /// A sensitive entry whose value is the [`REDACTED_PLACEHOLDER`] is what a
+    /// client echoes back from `settings.list`/`settings.get` for a secret it
+    /// did not touch (intent#4383): with a stored secret it is a no-op for
+    /// that path (the secret is left as is; the entry is still echoed
+    /// redacted), without one it is `-32602` and the whole batch is rejected
+    /// before anything is applied — the placeholder is never stored.
     pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
         let entries = changes
             .as_array()
@@ -2251,6 +2258,15 @@ impl<'a> SettingsService<'a> {
             }
             def.validate(&value)?;
             validate_bare_model_id(path, &value)?;
+            if def.sensitive
+                && value.as_str() == Some(REDACTED_PLACEHOLDER)
+                && self.secrets.load(def.path).await?.is_none()
+            {
+                return Err(Error::InvalidParams(format!(
+                    "{path}: the redaction placeholder cannot be stored as a secret \
+                     (no secret is currently stored for this setting)"
+                )));
+            }
             planned.push((def, value));
         }
 
@@ -2263,11 +2279,17 @@ impl<'a> SettingsService<'a> {
         let mut mutations = Vec::with_capacity(planned.len());
         for (def, value) in planned {
             let unchanged = if def.sensitive {
-                let desired = match &value {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
+                // The placeholder stays in the plan so the entry is echoed
+                // (redacted) even though the secret itself is left untouched.
+                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
+                    false
+                } else {
+                    let desired = match &value {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
+                }
             } else if let Some(reg) = self.registry_for(def.path) {
                 match reg.origin(def.path) {
                     Some(SettingOrigin::File) => reg
@@ -2319,14 +2341,20 @@ impl<'a> SettingsService<'a> {
         let mut applied = Vec::with_capacity(planned.len());
         for (def, value) in planned {
             let persisted = if def.sensitive {
-                let secret_value = match &value {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                self.secrets
-                    .store(def.path, &secret_value)
-                    .await
-                    .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
+                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
+                    // Presence was verified during validation: keep the
+                    // stored secret, echo the redacted entry.
+                    Ok(json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
+                } else {
+                    let secret_value = match &value {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    self.secrets
+                        .store(def.path, &secret_value)
+                        .await
+                        .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
+                }
             } else if self.registry_for(def.path).is_some() {
                 // Already applied via the registry batch above. Normalize the
                 // echoed value so number-typed settings keep the float wire
@@ -2842,7 +2870,8 @@ mod tests {
     #[tokio::test]
     async fn update_with_redaction_placeholder_and_no_secret_rejects_whole_batch() {
         let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-placeholder-reject-{tag}.db"));
+        let tmp =
+            std::env::temp_dir().join(format!("intentd-settings-placeholder-reject-{tag}.db"));
         let store = Store::open(&tmp).await.expect("open store");
         let config_path =
             std::env::temp_dir().join(format!("intentd-settings-placeholder-reject-{tag}.toml"));
