@@ -307,6 +307,11 @@ pub const WORKSPACE_CLOSED: &str = "workspace:closed";
 // no setup. Idempotent replays publish nothing (same as `workspace:created`).
 pub const WORKSPACE_SETUP_STARTED: &str = "workspace:setup:started";
 pub const WORKSPACE_SETUP_COMPLETED: &str = "workspace:setup:completed";
+// Durable pre-workspace draft lifecycle. Draft events are daemon-global and
+// therefore publish under the empty workspace-id sentinel, like settings events.
+pub const WORKSPACE_DRAFT_UPDATED: &str = "workspace-draft:updated";
+pub const WORKSPACE_DRAFT_PROMOTED: &str = "workspace-draft:promoted";
+pub const WORKSPACE_DRAFT_DELETED: &str = "workspace-draft:deleted";
 pub(crate) const WORKSPACE_ACTIVITY: &str = "workspace:activity";
 // Workspace status-change family (new in intentd; PROTOCOL §6.5). Self-sufficient
 // payloads carry the new derived value so the FE flips the green/blue dot with no
@@ -563,6 +568,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_CLOSED,
     WORKSPACE_SETUP_STARTED,
     WORKSPACE_SETUP_COMPLETED,
+    WORKSPACE_DRAFT_UPDATED,
+    WORKSPACE_DRAFT_PROMOTED,
+    WORKSPACE_DRAFT_DELETED,
     WORKSPACE_ACTIVITY,
     WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED,
