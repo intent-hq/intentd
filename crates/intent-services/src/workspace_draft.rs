@@ -86,7 +86,27 @@ impl Services {
         let draft = self.store.get_workspace_draft(&id).await?;
 
         if let Some(workspace_id) = draft.promoted_workspace_id.clone() {
-            return self.promotion_result(draft, workspace_id).await;
+            if draft.phase == DraftPhase::Promoted {
+                return self.promotion_result(draft, workspace_id).await;
+            }
+            match self.store.get_workspace(&workspace_id).await {
+                Ok(workspace) => {
+                    let initial_agent = self.recover_initial_agent(&workspace_id).await?;
+                    let agent_id = initial_agent.as_ref().map(|agent| agent.id.clone());
+                    let promoted = self
+                        .store
+                        .set_workspace_draft_promotion(&id, &workspace_id, agent_id.as_ref())
+                        .await?;
+                    self.publish_workspace_draft_promoted(&promoted).await;
+                    let mut result = json!({ "draft": promoted, "workspace": workspace });
+                    if let Some(agent) = initial_agent {
+                        result["initialAgent"] = encode(agent)?;
+                    }
+                    return Ok(result);
+                }
+                Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         if !matches!(draft.phase, DraftPhase::Promoting) && draft.revision != expected_revision {
             return Err(Error::Conflict {
@@ -190,6 +210,31 @@ impl Services {
         Ok(result)
     }
 
+    async fn recover_initial_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<intent_core::AgentLite>> {
+        let sessions = self
+            .store
+            .list_agent_session_summaries(workspace_id)
+            .await?;
+        let initial = sessions.into_iter().find(|session| {
+            session
+                .metadata
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|metadata| metadata.get("isInitialAgent"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
+        match initial {
+            Some(session) => WorkspaceApi::agent_get(self, session.id, Some(workspace_id.clone()))
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     async fn publish_workspace_draft_updated(&self, draft: &WorkspaceDraft) {
         publish_event(
             self.event_bus.as_ref(),
@@ -233,6 +278,7 @@ fn promotion_input(
             .and_then(Value::as_str)
             .map(str::to_string),
         initial_agent,
+        workspace_draft_id: Some(draft.id.clone()),
         ..WorkspaceCreate::default()
     };
     match &draft.source {
