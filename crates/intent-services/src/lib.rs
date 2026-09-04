@@ -2484,17 +2484,41 @@ impl Services {
             .flat_map(|by_workspace| by_workspace.values().flatten())
             .map(|session| (&session.id, session))
             .collect();
-        let legacy_question_holds = legacy_question_tails
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(agent_id, message_id, role, content)| {
-                let session = sessions_by_agent.get(&agent_id)?;
-                (role == "assistant"
-                    && agent_ops::has_question_blocks(&content)
-                    && session.dismissed_questions_message_id() != Some(message_id.as_str()))
-                .then_some(agent_id)
-            })
-            .collect();
+        let legacy_question_holds = match legacy_question_tails {
+            Ok(tails) => tails
+                .into_iter()
+                .filter_map(|(agent_id, message_id, role, content)| {
+                    let session = sessions_by_agent.get(&agent_id)?;
+                    (role == "assistant"
+                        && agent_ops::has_question_blocks(&content)
+                        && session.dismissed_questions_message_id() != Some(message_id.as_str()))
+                    .then_some(agent_id)
+                })
+                .collect(),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch legacy question tail read failed; falling back to per-session probes"
+                );
+                let legacy_agent_ids: Vec<_> = sessions_by_agent
+                    .values()
+                    .filter(|session| {
+                        session.parent_agent_id.is_none()
+                            && !session.is_background
+                            && session.status != intent_core::AgentStatus::Deleted
+                            && !session.pending_questions_marker_written()
+                    })
+                    .map(|session| session.id.clone())
+                    .collect();
+                let mut holds = HashSet::new();
+                for agent_id in legacy_agent_ids {
+                    if self.questions_pending(&agent_id).await {
+                        holds.insert(agent_id);
+                    }
+                }
+                holds
+            }
+        };
 
         WorkspaceAggregateSnapshot {
             max_note_updated_at: max_note_updated_at.unwrap_or_default(),

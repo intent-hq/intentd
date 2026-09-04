@@ -1706,7 +1706,8 @@ mod display_status {
 #[cfg(test)]
 mod workspace_needs_attention {
     use intent_core::{
-        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceAttention, WorkspaceId,
+        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceApi, WorkspaceAttention,
+        WorkspaceDisplayStatus, WorkspaceId,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -1898,6 +1899,53 @@ mod workspace_needs_attention {
             .await
             .unwrap();
         assert!(signals(&svc, &ws).await.needs_attention);
+    }
+
+    #[tokio::test]
+    async fn batch_tail_failure_falls_back_without_hiding_pending_questions() {
+        let (svc, ws, _tmp) = setup().await;
+        let pending = mk_session(&ws, "agent-pending-batch-fallback");
+        svc.store.insert_agent_session(&pending).await.unwrap();
+        svc.store
+            .append_agent_message(&pending.id, "assistant", &question_content(), &now_iso())
+            .await
+            .unwrap();
+
+        let malformed = mk_session(&ws, "agent-malformed-tail");
+        svc.store.insert_agent_session(&malformed).await.unwrap();
+        let malformed_message = svc
+            .store
+            .append_agent_message(
+                &malformed.id,
+                "assistant",
+                &json!([{ "type": "text", "text": "plain" }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_message SET content = 'not-json' WHERE id = ?")
+            .bind(&malformed_message.id)
+            .execute(svc.store.write_pool())
+            .await
+            .expect("corrupt one legacy tail");
+        assert!(
+            svc.store
+                .list_legacy_question_tail_candidates_by_workspace(std::slice::from_ref(&ws))
+                .await
+                .is_err(),
+            "fixture must fail the batch tail read"
+        );
+
+        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let listed_ws = listed
+            .iter()
+            .find(|workspace| workspace.id == ws)
+            .expect("workspace row");
+        assert_eq!(
+            listed_ws.display_status,
+            Some(WorkspaceDisplayStatus::NeedsAttention),
+            "valid pending question survives another row's batch decode failure"
+        );
     }
 
     #[tokio::test]
