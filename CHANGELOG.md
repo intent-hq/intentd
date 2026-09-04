@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.15] - 2026-09-03
+
+### 🚀 Features
+
+- *(harness)* Mint v2.2 with a one-sentence workspace status message ([#1705](https://github.com/intent-hq/intentd/pull/1705))
+- *(transport)* Expose availableIps bind candidates on server.pairingInfo ([#1708](https://github.com/intent-hq/intentd/pull/1708))
+
+
 ## [0.9.14] - 2026-09-03
 
 ### 🚀 Features
