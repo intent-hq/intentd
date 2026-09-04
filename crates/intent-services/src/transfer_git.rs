@@ -1826,4 +1826,151 @@ mod tests {
         assert!(bundle.refs.submodules.is_empty());
         assert!(!staging2.join("submodules").exists());
     }
+
+    /// A nested unpublished submodule (`sub/inner`) is bundled after its
+    /// parent (`sub`), each in its own cloneable bundle with index-based
+    /// entry names, and `refs.submodules` lists them parent-first.
+    #[test]
+    fn bundle_orders_nested_submodules_parent_first() {
+        use crate::transfer_submodules::test_fixture::{
+            git, init_repo, local_commit, superproject_with_submodule,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let inner_src = dir.path().join("inner-src");
+        init_repo(&inner_src);
+        git(
+            dir.path(),
+            &["clone", "-q", "--bare", "inner-src", "inner.git"],
+        );
+        let (sup, _origin) = superproject_with_submodule(dir.path());
+        let sub = sup.join("sub");
+        git(&sub, &["checkout", "-q", "main"]);
+        let inner_origin = dir.path().join("inner.git");
+        git(
+            &sub,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                inner_origin.to_str().unwrap(),
+                "inner",
+            ],
+        );
+        git(&sub, &["commit", "-q", "-m", "add inner"]);
+        let sub_sha = git(&sub, &["rev-parse", "HEAD"]);
+        let inner = sub.join("inner");
+        git(&inner, &["checkout", "-q", "-b", "feat/x"]);
+        let inner_sha = local_commit(&inner, "deep.txt");
+        let ws = workspace_for_repo(&sup);
+        let staging = dir.path().join("staging");
+
+        let bundle = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        assert_eq!(bundle.submodule_bundles.len(), 2, "{bundle:?}");
+        assert_eq!(bundle.refs.submodules.len(), 2);
+        let parent = &bundle.refs.submodules[0];
+        let child = &bundle.refs.submodules[1];
+        assert_eq!(parent.path, "sub");
+        assert_eq!(parent.name, "sub");
+        assert_eq!(parent.commit_sha, sub_sha);
+        assert_eq!(parent.bundle_entry, "git/submodules/0.bundle");
+        assert_eq!(child.path, "sub/inner");
+        assert_eq!(child.name, "inner");
+        assert_eq!(child.commit_sha, inner_sha);
+        assert_eq!(child.branch.as_deref(), Some("feat/x"));
+        assert_eq!(child.bundle_entry, "git/submodules/1.bundle");
+        assert_eq!(bundle.submodule_bundles[0].1, parent.bundle_entry);
+        assert_eq!(bundle.submodule_bundles[1].1, child.bundle_entry);
+
+        for (i, (path, _)) in bundle.submodule_bundles.iter().enumerate() {
+            assert_eq!(path, &staging.join(format!("submodules/{i}.bundle")));
+            let dst = dir.path().join(format!("clone-{i}"));
+            git(
+                dir.path(),
+                &["clone", "-q", path.to_str().unwrap(), dst.to_str().unwrap()],
+            );
+            let expected = if i == 0 { &sub_sha } else { &inner_sha };
+            assert_eq!(&git(&dst, &["rev-parse", "HEAD"]), expected);
+        }
+
+        assert!(
+            [&sup, &sub, &inner]
+                .iter()
+                .flat_map(|p| repo_ref_names(p))
+                .all(|r| !r.starts_with(TRANSFER_REF_NS)),
+            "temp refs cleaned up in every repo"
+        );
+    }
+
+    /// A submodule bundle that cannot be written (its output path is a
+    /// directory) fails the whole build: the superproject bundle is removed,
+    /// the WIP snapshot is unwound, and no temp ref survives in either repo.
+    #[test]
+    fn submodule_bundle_failure_unwinds_wip_and_leaves_no_files() {
+        use crate::transfer_submodules::test_fixture::{
+            git, local_commit, superproject_with_submodule,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let (sup, _origin) = superproject_with_submodule(dir.path());
+        let sub = sup.join("sub");
+        git(&sub, &["checkout", "-q", "main"]);
+        local_commit(&sub, "wip.txt");
+        fs::write(sup.join("dirty.txt"), "uncommitted\n").unwrap();
+        let head_before = git(&sup, &["rev-parse", "HEAD"]);
+        let sub_head_before = git(&sub, &["rev-parse", "HEAD"]);
+        let before = status_fingerprint(&sup);
+        let ws = workspace_for_repo(&sup);
+        let staging = dir.path().join("staging");
+        // `git bundle create` cannot replace a directory with the bundle.
+        fs::create_dir_all(staging.join("submodules/0.bundle")).unwrap();
+
+        let err = create_transfer_bundle(&ws, &[], &staging).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("git bundle create for submodule sub failed"),
+            "error names the submodule: {err}"
+        );
+
+        assert!(!staging.join(format!("{}.bundle", ws.id.0)).exists());
+        let leftover: Vec<_> = fs::read_dir(staging.join("submodules"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no submodule bundle files: {leftover:?}"
+        );
+
+        assert_eq!(
+            git(&sup, &["rev-parse", "HEAD"]),
+            head_before,
+            "WIP unwound"
+        );
+        assert_eq!(git(&sup, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert_eq!(status_fingerprint(&sup), before);
+        assert_eq!(git(&sub, &["rev-parse", "HEAD"]), sub_head_before);
+        assert_eq!(git(&sub, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert!(
+            repo_ref_names(&sup)
+                .iter()
+                .chain(repo_ref_names(&sub).iter())
+                .all(|r| !r.starts_with(TRANSFER_REF_NS)),
+            "temp refs cleaned up"
+        );
+    }
+
+    /// A `refs.json` written before `submodules` existed still decodes.
+    #[test]
+    fn refs_manifest_without_submodules_field_decodes() {
+        let legacy = r#"{
+            "workspaceBranch": "main",
+            "workspaceBundleRef": "refs/heads/main",
+            "workspaceHeadSha": "0123456789abcdef0123456789abcdef01234567",
+            "sandboxes": []
+        }"#;
+        let refs: TransferRefsManifest = serde_json::from_str(legacy).unwrap();
+        assert!(refs.submodules.is_empty());
+        assert!(refs.sandboxes.is_empty());
+        assert!(refs.workspace_wip_commit_sha.is_none());
+    }
 }
