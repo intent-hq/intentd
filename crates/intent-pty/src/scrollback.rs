@@ -188,15 +188,21 @@ impl Scrollback {
     /// Return the unmatched OSC opener before a window boundary, if any. OSC
     /// payload may contain newlines, so slicing at a raw line boundary must
     /// retain this prefix for the caller's ANSI stripper. Only bytes since the
-    /// last BEL terminator can participate.
+    /// last BEL or ST terminator can participate.
     fn open_osc_start(&self, byte_start: usize) -> Option<usize> {
-        let search_start = (0..byte_start)
-            .rev()
-            .find(|index| self.buf[*index] == 0x07)
-            .map_or(0, |index| index + 1);
-        (search_start..byte_start.saturating_sub(1))
-            .rev()
-            .find(|index| self.buf[*index] == 0x1b && self.buf[*index + 1] == b']')
+        let mut index = byte_start;
+        while index > 0 {
+            index -= 1;
+            if self.buf[index] == 0x07
+                || (index > 0 && self.buf[index - 1] == 0x1b && self.buf[index] == b'\\')
+            {
+                return None;
+            }
+            if index + 1 < byte_start && self.buf[index] == 0x1b && self.buf[index + 1] == b']' {
+                return Some(index);
+            }
+        }
+        None
     }
 
     fn copy_range(&self, start: usize, end: usize) -> Vec<u8> {
@@ -351,5 +357,15 @@ mod tests {
             lines.bytes,
             b"\x1b]0;hidden\nhidden-tail\x07visible-after\nlast"
         );
+    }
+
+    #[test]
+    fn line_window_stops_at_st_terminated_osc() {
+        let mut sb = Scrollback::new(128);
+        sb.push(b"\x1b]0;t\x1b\\line1\nline2\nline3");
+
+        let lines = sb.snapshot_lines(1, None);
+        assert_eq!((lines.start_line, lines.end_line), (2, 3));
+        assert_eq!(lines.bytes, b"line3");
     }
 }

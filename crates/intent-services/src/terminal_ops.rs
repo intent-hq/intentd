@@ -480,13 +480,20 @@ fn strip_ansi(input: &str) -> String {
         if bytes[i] == 0x1b {
             // ESC
             match bytes.get(i + 1) {
-                // OSC: ESC ] ... BEL(0x07)
+                // OSC: ESC ] ... BEL(0x07) or ST(ESC \\)
                 Some(b']') => {
                     i += 2;
-                    while i < bytes.len() && bytes[i] != 0x07 {
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
                         i += 1;
                     }
-                    i += 1; // consume BEL
                     continue;
                 }
                 // CSI: ESC [ (optional '?') params (0-9;) final letter
@@ -1086,6 +1093,18 @@ mod tests {
     fn bounded_line_decode_strips_osc_sequence_straddling_window_start() {
         let snapshot = LineSnapshot {
             bytes: b"\x1b]0;hidden\nhidden-tail\x07visible-after\nlast".to_vec(),
+            total_lines: 4,
+            start_line: 2,
+            end_line: 4,
+            retained_has_non_whitespace: true,
+        };
+        assert_eq!(decoded_snapshot_lines(&snapshot), ["visible-after", "last"]);
+    }
+
+    #[test]
+    fn bounded_line_decode_strips_st_terminated_osc_straddling_window_start() {
+        let snapshot = LineSnapshot {
+            bytes: b"\x1b]0;hidden\nhidden-tail\x1b\\visible-after\nlast".to_vec(),
             total_lines: 4,
             start_line: 2,
             end_line: 4,
