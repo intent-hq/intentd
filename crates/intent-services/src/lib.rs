@@ -795,6 +795,10 @@ pub struct Services {
     /// To prevent race conditions where an old task removes a newer handle, each
     /// entry stores a generation counter alongside the abort handle. Tasks only
     /// remove their own entry if the generation still matches.
+    ///
+    /// Lock order when nested with `agent_activity`: `agent_activity` →
+    /// `idle_debouncers` (`workspace_activity`, `agent_activity_end`). Never
+    /// take `agent_activity` while holding this lock.
     idle_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
     /// Generation counter for idle debounce tasks (incremented on each schedule).
     idle_debounce_gen: Arc<Mutex<u64>>,
@@ -2968,13 +2972,17 @@ impl Services {
         if transitioned {
             self.schedule_idle_debounce(workspace_id.clone());
         }
-        drop(map);
     }
 
     /// Schedule a debounced `workspace:activity-changed { idle }` event emission
     /// for the workspace. The event is emitted only after the workspace stays idle
     /// for the full debounce window (~3s default, env-overridable for tests). A new
     /// `agent_activity_begin` within the window cancels the pending flip.
+    ///
+    /// Called with the `agent_activity` guard held (intent#4283): must stay
+    /// synchronous, must not lock `agent_activity` (non-reentrant `std::sync::Mutex`),
+    /// and may only take `idle_debounce_gen` / `idle_debouncers` (lock order
+    /// `agent_activity → idle_debouncers`).
     fn schedule_idle_debounce(&self, workspace_id: WorkspaceId) {
         // Increment generation counter and cancel any existing debouncer.
         let gen = if let Ok(mut gen_lock) = self.idle_debounce_gen.lock() {
