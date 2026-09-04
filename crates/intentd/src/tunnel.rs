@@ -563,9 +563,38 @@ esac
     /// env var with tests whose error path reads it (`tailcat_spawn_error`).
     static TAILCAT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Removes `INTENTD_TAILCAT_BIN` for the guard's lifetime and restores the
+    /// prior value on drop (including on panic), so a test whose assertions
+    /// depend on the var being unset does not inherit one from the calling
+    /// shell. The caller must hold `TAILCAT_ENV_LOCK` for the guard's lifetime.
+    struct TailcatEnvUnset {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TailcatEnvUnset {
+        fn new() -> Self {
+            let prev = std::env::var_os("INTENTD_TAILCAT_BIN");
+            std::env::remove_var("INTENTD_TAILCAT_BIN");
+            Self { prev }
+        }
+    }
+
+    impl Drop for TailcatEnvUnset {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("INTENTD_TAILCAT_BIN", v),
+                None => std::env::remove_var("INTENTD_TAILCAT_BIN"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn stop_is_idempotent_and_start_fails_on_missing_binary() {
         let _env = TAILCAT_ENV_LOCK.lock().await;
+        // The asserted guidance is the unset-override branch of
+        // `tailcat_spawn_error`; an INTENTD_TAILCAT_BIN inherited from the
+        // shell would flip it to the override branch (intent-hq/intent#4348).
+        let _unset = TailcatEnvUnset::new();
         let dir = tempfile::tempdir().unwrap();
         let sup = TunnelSupervisor::new(dir.path().join("no-such-tailcat"), dir.path())
             .with_address_timeout(Duration::from_secs(2));
