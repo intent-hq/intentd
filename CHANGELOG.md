@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.22] - 2026-09-04
+
+### 🐛 Bug Fixes
+
+- *(tests)* Poll for watch retirement after the terminal wake in the WSS watch e2e ([#1729](https://github.com/intent-hq/intentd/pull/1729))
+
+
 ## [0.9.21] - 2026-09-04
 
 ### 🐛 Bug Fixes
