@@ -12444,6 +12444,176 @@ async fn wss_workspace_transfer_plan_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `workspace.transfer.plan` over the real WSS transport (PROTOCOL §5.1) for
+/// a worktree whose submodule checkout points at a commit that exists only
+/// locally: the plan carries exactly one `submodule-unpublished-commits`
+/// warning naming the submodule path, short sha and branch, and
+/// `manifest.git.submodules` lists the finding as
+/// `{ name, path, commitSha, branch, carried: true }`. After the commit is
+/// pushed to the submodule's origin the warning and the entry are gone.
+#[tokio::test]
+async fn wss_workspace_transfer_plan_reports_unpublished_submodule_commits() {
+    let srv = start(WsOptions::default()).await;
+    let root_dir = test_tempdir("intentd-wss-transfer-submodule-");
+    let root = root_dir.path().to_path_buf();
+    let git = |dir: &std::path::Path, args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let init_repo = |dir: &std::path::Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    };
+
+    // Submodule origin: a bare repo seeded with one commit. Superproject
+    // tracks it at `sub`, checked out on `main` (attached).
+    init_repo(&root.join("sub-src"));
+    git(&root, &["clone", "-q", "--bare", "sub-src", "origin.git"]);
+    let origin = root.join("origin.git");
+    let sup = root.join("super");
+    init_repo(&sup);
+    git(
+        &sup,
+        &["submodule", "add", "-q", origin.to_str().unwrap(), "sub"],
+    );
+    git(&sup, &["commit", "-q", "-m", "add submodule"]);
+    let sub = sup.join("sub");
+    git(&sub, &["checkout", "-q", "main"]);
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS Transfer Submodule","worktreePath":"{}","path":"{}"}}}}"#,
+        sup.display(),
+        sup.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+    let plan_frame = |id: u32| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"workspace.transfer.plan","params":{{"workspaceId":"{ws_id}"}}}}"#
+        )
+    };
+
+    // Everything published: no warning, empty submodules list.
+    let resp = wss_call(srv.port, srv.cfg.clone(), &plan_frame(2)).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 2, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    assert_eq!(plan["manifest"]["git"]["hasRepository"], true, "{resp}");
+    assert_eq!(
+        plan["manifest"]["git"]["submodules"],
+        serde_json::json!([]),
+        "published submodule yields no entry: {resp}"
+    );
+    assert!(
+        !plan["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|w| w["code"] == "submodule-unpublished-commits"),
+        "published submodule yields no warning: {resp}"
+    );
+    let clean_bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
+
+    // A commit made inside the submodule checkout and never pushed.
+    std::fs::write(sub.join("wip.txt"), "wip\n").unwrap();
+    git(&sub, &["add", "wip.txt"]);
+    git(&sub, &["commit", "-q", "-m", "local wip"]);
+    let sha = git(&sub, &["rev-parse", "HEAD"]);
+
+    let resp = wss_call(srv.port, srv.cfg.clone(), &plan_frame(3)).await;
+    assert_eq!(resp["id"], 3, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    let warnings = plan["warnings"].as_array().expect("warnings array");
+    let sub_warns: Vec<_> = warnings
+        .iter()
+        .filter(|w| w["code"] == "submodule-unpublished-commits")
+        .collect();
+    assert_eq!(sub_warns.len(), 1, "exactly one submodule warning: {resp}");
+    let message = sub_warns[0]["message"].as_str().expect("message string");
+    assert!(
+        message.contains(&format!("sub @ {} (main)", &sha[..7])),
+        "warning names path, short sha and branch: {resp}"
+    );
+    assert!(
+        message.contains("will ride in the archive"),
+        "worktree finding is carried: {resp}"
+    );
+    assert_eq!(
+        plan["manifest"]["git"]["submodules"],
+        serde_json::json!([{
+            "name": "sub",
+            "path": "sub",
+            "commitSha": sha,
+            "branch": "main",
+            "carried": true
+        }]),
+        "manifest lists the unpublished submodule: {resp}"
+    );
+    assert!(
+        plan["estimatedGitBundleBytes"].as_u64().expect("bundle") > clean_bundle,
+        "estimate grows by the submodule objects: {resp}"
+    );
+    let total = plan["totalSizeBytes"].as_u64().expect("total");
+    let db = plan["dbRowBytes"].as_u64().expect("db");
+    let assets = plan["assetBytes"].as_u64().expect("assets");
+    let attachments = plan["attachmentBytes"].as_u64().expect("attachments");
+    let bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
+    assert_eq!(
+        total,
+        db + assets + attachments + bundle,
+        "size breakdown still sums: {resp}"
+    );
+    // The superproject sees the gitlink move; the plan itself never wrote.
+    assert_eq!(
+        plan["manifest"]["git"]["dirtyFiles"],
+        serde_json::json!(["sub"]),
+        "{resp}"
+    );
+
+    // Publishing the commit clears the warning and the manifest entry.
+    git(&sub, &["push", "-q", "origin", "main"]);
+    let resp = wss_call(srv.port, srv.cfg.clone(), &plan_frame(4)).await;
+    assert_eq!(resp["id"], 4, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    assert_eq!(
+        plan["manifest"]["git"]["submodules"],
+        serde_json::json!([]),
+        "pushed submodule commit yields no entry: {resp}"
+    );
+    assert!(
+        !plan["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|w| w["code"] == "submodule-unpublished-commits"),
+        "pushed submodule commit yields no warning: {resp}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `file.placeAttachment` over the real WSS wire (PROTOCOL §5.9,
 /// monorepo#1948): a base64 payload lands in the workspace's
 /// `.intent/attachments/` directory and the response carries the

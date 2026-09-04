@@ -153,7 +153,7 @@ pub fn submodule_paths(repo: &Repository) -> Result<std::collections::BTreeSet<S
 /// Ceiling on nested-submodule recursion depth: real nesting is shallow
 /// (two or three levels), and the bound keeps a pathological or
 /// self-referencing layout from recursing without end.
-const MAX_SUBMODULE_NESTING: u32 = 10;
+pub const MAX_SUBMODULE_NESTING: u32 = 10;
 
 /// The registered submodule paths of the repository at `worktree_path` and,
 /// recursively, of every openable submodule work tree beneath it — one flat

@@ -1835,6 +1835,7 @@ mod tests {
                 branch: None,
                 dirty_files: vec![],
                 sandbox_branches: vec![],
+                submodules: vec![],
             },
         }
     }
