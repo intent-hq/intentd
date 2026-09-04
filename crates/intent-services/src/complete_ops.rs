@@ -204,18 +204,22 @@ pub(crate) fn one_shot_launch(
 /// Resolve the adapter binary a one-shot launch (`agent.completeOnce`, the
 /// live test prompt) runs for `provider`, matching `resolve_spawn`'s
 /// precedence: an npx-only provider honors ONLY a valid `providers.paths`
-/// adapter override (never auto-discovery — monorepo#4352), any other
-/// provider walks `find_provider_binary`'s tiers. `explicit_path` is the raw
+/// adapter override, and only when it opts in (never auto-discovery —
+/// monorepo#4352; pi resolves nothing), any other provider walks
+/// `find_provider_binary`'s tiers. `explicit_path` is the raw
 /// `providers.paths[primary_binary_provider_id]` value (blank = unset).
 pub(crate) fn resolve_one_shot_binary(
     provider: &intent_providers::ProviderConfig,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
-    let key = provider.primary_binary_provider_id();
     if provider.npx_only_package.is_some() {
-        intent_providers::resolve_npx_only_override(key, explicit_path)
+        intent_providers::resolve_npx_only_override(provider, explicit_path)
     } else {
-        intent_providers::find_provider_binary(key, provider.command, explicit_path)
+        intent_providers::find_provider_binary(
+            provider.primary_binary_provider_id(),
+            provider.command,
+            explicit_path,
+        )
     }
 }
 
@@ -846,6 +850,12 @@ rl.on('line', (line) => {
         assert_eq!(
             resolve_one_shot_binary(claude, Some(missing.to_str().unwrap())),
             None
+        );
+        let pi = intent_providers::find_provider("pi").unwrap();
+        assert_eq!(
+            resolve_one_shot_binary(pi, Some(adapter.to_str().unwrap())),
+            None,
+            "pi does not opt in: a valid override still resolves nothing"
         );
     }
 

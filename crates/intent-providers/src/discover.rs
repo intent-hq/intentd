@@ -257,9 +257,14 @@ fn availability_for(
     // A valid override for the primary binary, keyed by the provider that
     // OWNS it ([`ProviderConfig::primary_binary_provider_id`], matching
     // `resolve_spawn`: unsloth's opencode primary honors the `opencode`
-    // key). npx-only providers honor the override too — `resolve_spawn`
-    // exec's a valid one in place of the pinned npx spawn (monorepo#4352).
-    let primary_override = if gated_off.is_some() {
+    // key). npx-only providers only honor it when they opt in
+    // (`npx_only_honors_path_override`; claude-code) — `resolve_spawn` then
+    // exec's a valid override in place of the pinned npx spawn
+    // (monorepo#4352); pi keeps npx-only semantics, so an override never
+    // flips its `installed`.
+    let primary_override = if gated_off.is_some()
+        || (provider.npx_only_package.is_some() && !provider.npx_only_honors_path_override)
+    {
         None
     } else {
         let key = provider.primary_binary_provider_id();
@@ -528,20 +533,30 @@ fn find_provider_binary_with_home_and_dirs(
 }
 
 /// The explicit-override tier ALONE for an npx-only provider
-/// ([`ProviderConfig::npx_only_package`]): a valid `providers.paths[id]`
-/// value (absolute, executable) resolves to the adapter binary to exec in
-/// place of the pinned `npx -y <package>` spawn; an absent, blank, or invalid
-/// value yields `None` and the caller keeps the pinned npx spawn. There is
+/// ([`ProviderConfig::npx_only_package`]) that opts in via
+/// [`ProviderConfig::npx_only_honors_path_override`]: a valid
+/// `providers.paths[id]` value (absolute, executable; `id` is the
+/// [`ProviderConfig::primary_binary_provider_id`]) resolves to the adapter
+/// binary to exec in place of the pinned `npx -y <package>` spawn; an
+/// absent, blank, or invalid value — or a provider that does not opt in (pi)
+/// — yields `None` and the caller keeps the pinned npx spawn. There is
 /// deliberately no auto-discovery fallthrough (managed bin / PATH scan) —
-/// that is what makes the provider npx-only. Shared by the ACP spawn, the
-/// one-shot / test-prompt launches, and the model / auth probes so every
-/// surface runs the same adapter (intent-hq/monorepo#4352).
+/// that is what makes the provider npx-only. Shared by the ACP spawn,
+/// discovery's `installed`, the one-shot / test-prompt launches, and the
+/// claude-code ACP auth fallback probe so every launch surface runs the same
+/// adapter (intent-hq/monorepo#4352). The model-catalog fetch is NOT on this
+/// path: it always runs the pinned package (the catalog registry has no
+/// settings access, and the list is not an auth signal).
 #[must_use]
 pub fn resolve_npx_only_override(
-    provider_id: &str,
+    provider: &ProviderConfig,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
-    explicit_path.and_then(|p| resolve_explicit_path(provider_id, p))
+    if !provider.npx_only_honors_path_override {
+        return None;
+    }
+    let key = provider.primary_binary_provider_id();
+    explicit_path.and_then(|p| resolve_explicit_path(key, p))
 }
 
 /// Validate + resolve an explicit `providers.paths` value: trimmed, absolute,
@@ -1450,6 +1465,13 @@ mod override_aware_discovery_tests {
             .expect("claude-code must be registered")
     }
 
+    fn pi_config() -> &'static ProviderConfig {
+        crate::config::ACP_PROVIDERS
+            .iter()
+            .find(|p| p.id == "pi")
+            .expect("pi must be registered")
+    }
+
     /// monorepo#4352: a valid `providers.paths["claude-code"]` override
     /// resolves to the adapter binary the spawn will exec in place of the
     /// pinned npx package; absent / blank / relative / missing /
@@ -1459,21 +1481,22 @@ mod override_aware_discovery_tests {
         let dir = unique_temp_dir("npx-only-override");
         let adapter = dir.path().join("claude-agent-acp");
         make_executable(&adapter);
+        let claude = claude_code_config();
         assert_eq!(
-            resolve_npx_only_override("claude-code", Some(adapter.to_str().unwrap())),
+            resolve_npx_only_override(claude, Some(adapter.to_str().unwrap())),
             Some(adapter.clone()),
             "valid absolute executable resolves"
         );
-        assert_eq!(resolve_npx_only_override("claude-code", None), None);
-        assert_eq!(resolve_npx_only_override("claude-code", Some("   ")), None);
+        assert_eq!(resolve_npx_only_override(claude, None), None);
+        assert_eq!(resolve_npx_only_override(claude, Some("   ")), None);
         assert_eq!(
-            resolve_npx_only_override("claude-code", Some("relative/claude-agent-acp")),
+            resolve_npx_only_override(claude, Some("relative/claude-agent-acp")),
             None,
             "relative paths are rejected"
         );
         let missing = dir.path().join("missing");
         assert_eq!(
-            resolve_npx_only_override("claude-code", Some(missing.to_str().unwrap())),
+            resolve_npx_only_override(claude, Some(missing.to_str().unwrap())),
             None,
             "missing files are rejected"
         );
@@ -1482,11 +1505,35 @@ mod override_aware_discovery_tests {
             let not_exec = dir.path().join("not-exec");
             fs::write(&not_exec, "x").unwrap();
             assert_eq!(
-                resolve_npx_only_override("claude-code", Some(not_exec.to_str().unwrap())),
+                resolve_npx_only_override(claude, Some(not_exec.to_str().unwrap())),
                 None,
                 "non-executable files are rejected"
             );
         }
+    }
+
+    /// pi does not opt in (`npx_only_honors_path_override` is false): even a
+    /// valid override resolves to nothing, so every surface keeps the pinned
+    /// npx spawn and discovery never advertises an `installed` pi that the
+    /// real `pi` CLI gate would still reject.
+    #[test]
+    fn pi_override_is_ignored_on_every_surface() {
+        let dir = unique_temp_dir("npx-only-override-pi");
+        let adapter = dir.path().join("pi-acp");
+        make_executable(&adapter);
+        assert!(!pi_config().npx_only_honors_path_override);
+        assert_eq!(
+            resolve_npx_only_override(pi_config(), Some(adapter.to_str().unwrap())),
+            None,
+            "pi keeps pinned-npx-only semantics"
+        );
+        let overrides = |key: &str| (key == "pi").then(|| adapter.display().to_string());
+        let availability = availability_for(pi_config(), None, &|_, _| None, &overrides);
+        assert_eq!(
+            availability.installed,
+            availability.resolved_path.is_some(),
+            "a pi override must not flip installed"
+        );
     }
 
     /// monorepo#4352: discovery honors the claude-code override for the

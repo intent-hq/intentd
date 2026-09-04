@@ -428,7 +428,11 @@ fn opencode_models_ready(stdout: &str) -> bool {
 /// [`resolve_probe_binary`]) already reflects it where it applies; the
 /// claude-code arm additionally resolves it as the ADAPTER override
 /// ([`intent_providers::resolve_npx_only_override`]) so the ACP fallback probe
-/// runs the same adapter binary a session spawn would (monorepo#4352).
+/// runs the same adapter binary a session spawn would (monorepo#4352). That
+/// resolution happens INSIDE the fallback closure — only when the CLI verdict
+/// is inconclusive and the adapter is actually spawned — so an invalid
+/// override warns on a real spawn attempt (parity with `resolve_spawn` and
+/// the one-shot launches), not on every conclusive 60s-TTL probe.
 async fn probe_provider(
     provider_id: &'static str,
     program: std::ffi::OsString,
@@ -456,9 +460,11 @@ async fn probe_provider(
                 return AuthVerdict::default();
             }
             let status = check_claude_code_auth_cli(&program, args).await;
-            let adapter_override =
-                intent_providers::resolve_npx_only_override(provider_id, override_path);
             let authenticated = claude_code_auth_verdict(status.probe, move || {
+                let adapter_override =
+                    intent_providers::find_provider(provider_id).and_then(|cfg| {
+                        intent_providers::resolve_npx_only_override(cfg, override_path)
+                    });
                 crate::provider_models::probe_claude_code_auth(adapter_override)
             })
             .await;
@@ -1273,6 +1279,49 @@ mod tests {
             .await;
             assert_eq!(verdict, cli.auth_status());
         }
+    }
+
+    /// monorepo#4352: `probe_provider`'s claude-code arm hands the resolved
+    /// `providers.paths["claude-code"]` adapter override to the ACP fallback
+    /// probe, which then runs the override binary instead of the pinned npx
+    /// package. Drives the real wiring end to end: an inconclusive
+    /// `claude auth status` stub (exit 0, no `loggedIn`) forces the fallback,
+    /// and an override stub that answers `initialize` with the adapter's
+    /// auth-required RPC error records its invocation and yields the
+    /// conclusive `Some(false)` — a regression that dropped the argument
+    /// (back to pinned npx) would neither touch the marker nor demote.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_code_probe_hands_override_to_acp_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("claude-override-fallback");
+        let claude = dir.path().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\necho '{}'\nexit 0\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let marker = dir.path().join("override-ran");
+        let adapter = dir.path().join("claude-agent-acp");
+        std::fs::write(
+            &adapter,
+            format!(
+                "#!/bin/sh\nIFS= read -r _init\n: > '{}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32000,\"message\":\"Authentication required\"}}}}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let verdict = probe_provider(
+            "claude-code",
+            claude.into_os_string(),
+            Some(adapter.to_str().unwrap()),
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "the ACP fallback must spawn the override adapter"
+        );
+        assert_eq!(verdict.authenticated, Some(false));
+        assert!(verdict.identity.is_none());
     }
 
     #[tokio::test]

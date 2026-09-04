@@ -8973,13 +8973,15 @@ fn resolve_spawn(
 
     // npx-only providers (claude-code, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
-    // skipped entirely. A valid `providers.paths` override (absolute,
-    // executable) is the one exception: it is exec'd directly in place of the
-    // pinned npx spawn (monorepo#4352); an invalid override is ignored.
+    // skipped entirely. For providers that opt in
+    // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
+    // override (absolute, executable) is the one exception: it is exec'd
+    // directly in place of the pinned npx spawn (monorepo#4352); an invalid
+    // override — or any override for pi — is ignored.
     if provider.npx_only_package.is_some() {
         let explicit_path = read_provider_path_setting(settings, &provider_id);
         if let Some(binary) =
-            intent_providers::resolve_npx_only_override(&provider_id, explicit_path.as_deref())
+            intent_providers::resolve_npx_only_override(&provider, explicit_path.as_deref())
         {
             tracing::info!(
                 provider_id = provider_id,
