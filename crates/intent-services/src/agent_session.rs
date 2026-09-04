@@ -786,22 +786,32 @@ pub(crate) struct FlushedTurn {
 
 /// Outcome of one
 /// [`flush_partial_turn_on_interruption`](Services::flush_partial_turn_on_interruption)
-/// attempt. The three arms are deliberately kept apart: only `Appended` is an
-/// interruption the flush recorded, `AlreadyPersisted` means the turn was
-/// NOT interrupted at all (the worker's own full row won), and `Failed`
-/// leaves the slot as the only copy of the content.
+/// attempt. The arms are deliberately kept apart: only `Appended` is an
+/// interruption THIS flush recorded; the two `Already*` arms are the
+/// `agent_message.id` UNIQUE collision, split by what the durable row says
+/// (`AlreadyPersisted` — the worker's full row won, the turn was NOT
+/// interrupted at all; `AlreadyInterrupted` — another interrupt flush's row
+/// won); and `Failed` leaves the slot as the only copy of the content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InterruptFlushOutcome {
     /// This flush appended the interrupted assistant row under the turn's
     /// minted id (carried here).
     Appended(String),
-    /// The append hit the `agent_message.id` UNIQUE collision: the worker had
-    /// already persisted the turn's FULL row under this id — the interrupt
-    /// landed in the persist→worker-exit gap of a turn that completed
-    /// normally. Carries that completed row's id so the interrupt path can
-    /// close the stream as the completion it really was, rather than stamp
+    /// The append hit the `agent_message.id` UNIQUE collision and the durable
+    /// row is NOT tagged `metadata.interrupted`: the worker had already
+    /// persisted the turn's FULL row under this id — the interrupt landed in
+    /// the persist→worker-exit gap of a turn that completed normally. Carries
+    /// that completed row's id so the interrupt path can close the stream as
+    /// the completion it really was, rather than stamp
     /// `stopReason: "interrupted"` on a turn that was never cut short.
     AlreadyPersisted(String),
+    /// The append hit the `agent_message.id` UNIQUE collision and the durable
+    /// row IS an interrupted row — a concurrent interrupt flush (the suspend
+    /// enrollment, `owns_slot: false`) persisted it first. Carries that row's
+    /// id and its metadata (`Null` when the row could not be re-read) so the
+    /// interrupt path's terminal emit mirrors the row's `interruptReason` /
+    /// `interruptedBy` rather than misreporting the turn as completed.
+    AlreadyInterrupted { message_id: String, metadata: Value },
     /// A genuine store error: nothing was persisted; the slot is kept.
     Failed,
 }
@@ -812,7 +822,7 @@ impl InterruptFlushOutcome {
     pub(crate) fn appended_message_id(&self) -> Option<&str> {
         match self {
             Self::Appended(id) => Some(id.as_str()),
-            Self::AlreadyPersisted(_) | Self::Failed => None,
+            Self::AlreadyPersisted(_) | Self::AlreadyInterrupted { .. } | Self::Failed => None,
         }
     }
 }
@@ -1973,9 +1983,11 @@ impl Services {
     ///
     /// Returns an [`InterruptFlushOutcome`]: `Appended` (this flush persisted
     /// the interrupted row) so the interrupt path can carry `messageId` on the
-    /// terminal `agent:stream:end`; `AlreadyPersisted` (the UNIQUE collision —
-    /// the worker's full row won, so the turn actually completed) so that path
-    /// can close the stream as a normal completion; or `Failed`.
+    /// terminal `agent:stream:end`; on the UNIQUE collision either
+    /// `AlreadyPersisted` (the worker's full row won, so the turn actually
+    /// completed — that path closes the stream as a normal completion) or
+    /// `AlreadyInterrupted` (a concurrent interrupt flush's row won — that
+    /// path mirrors the row's interrupted metadata); or `Failed`.
     /// `owns_slot` says whose slot this flush may release: the teardown flush
     /// owns the pin it is flushing and clears unconditionally; the suspend
     /// enrollment flushes caller-held content and must NOT release a pin a
@@ -2088,12 +2100,52 @@ impl Services {
                 } else {
                     self.clear_unpinned_live_turn(agent_id);
                 }
-                tracing::debug!(
-                    agent = %agent_id,
-                    error = %e,
-                    "partial flush skipped: worker already persisted the full turn under this id"
-                );
-                InterruptFlushOutcome::AlreadyPersisted(live.message_id)
+                // The collision alone does not say WHO won: the worker's
+                // normal turn-end append (a completed turn) or another
+                // interrupt flush racing this one (the suspend enrollment
+                // flushing caller-held content while a teardown holds the
+                // pin). Only the durable row's own metadata tells them apart,
+                // and the terminal emit must not call an interrupted row a
+                // completion — re-read it. An unreadable row is reported as
+                // interrupted (metadata `Null`): the conservative shape, and
+                // the one this path always emitted before the split.
+                let durable_metadata = match self
+                    .store
+                    .get_agent_message_by_id(agent_id, &live.message_id)
+                    .await
+                {
+                    Ok(Some(row)) => Some(row.metadata.unwrap_or(Value::Null)),
+                    Ok(None) => None,
+                    Err(read_err) => {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            error = %read_err,
+                            "interrupt flush collided with a durable row that could not be re-read"
+                        );
+                        None
+                    }
+                };
+                let row_interrupted = durable_metadata
+                    .as_ref()
+                    .is_none_or(|m| m.get("interrupted").and_then(Value::as_bool) == Some(true));
+                if row_interrupted {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        error = %e,
+                        "partial flush skipped: a concurrent interrupt flush already persisted this turn's row"
+                    );
+                    InterruptFlushOutcome::AlreadyInterrupted {
+                        message_id: live.message_id,
+                        metadata: durable_metadata.unwrap_or(Value::Null),
+                    }
+                } else {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        error = %e,
+                        "partial flush skipped: worker already persisted the full turn under this id"
+                    );
+                    InterruptFlushOutcome::AlreadyPersisted(live.message_id)
+                }
             }
             Err(e) => {
                 tracing::warn!(

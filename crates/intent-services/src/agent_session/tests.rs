@@ -7442,10 +7442,28 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
         .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
         .await
         .expect("the pinned slot survived to its owner");
-    assert_eq!(
-        flushed.outcome,
-        super::InterruptFlushOutcome::AlreadyPersisted("m1".to_string()),
-        "the enrollment row won the collision"
+    match &flushed.outcome {
+        super::InterruptFlushOutcome::AlreadyInterrupted {
+            message_id,
+            metadata,
+        } => {
+            assert_eq!(message_id, "m1", "the enrollment row won the collision");
+            assert_eq!(
+                metadata.get("interrupted"),
+                Some(&json!(true)),
+                "the collision is reported as an interrupted row, not a completed turn: {metadata}"
+            );
+            assert_eq!(
+                metadata.get("interruptReason"),
+                Some(&json!("system_suspend")),
+                "the durable row's own reason is surfaced: {metadata}"
+            );
+        }
+        other => panic!("expected AlreadyInterrupted, got {other:?}"),
+    }
+    assert!(
+        flushed.outcome.appended_message_id().is_none(),
+        "this flush appended nothing"
     );
     assert!(flushed.had_output, "the turn really did produce output");
     assert!(

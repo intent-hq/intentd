@@ -4473,17 +4473,25 @@ impl AgentManager {
                 Some(f) => (f.outcome, f.text_blocks, f.block_count, f.had_output),
                 None => (InterruptFlushOutcome::Failed, Vec::new(), 0, false),
             };
-        // `AlreadyPersisted` (the `agent_message.id` UNIQUE collision) means the
-        // worker's own full row won: the interrupt landed in the persist→exit
-        // gap of a turn that COMPLETED normally. That row is the turn's real
-        // assistant message with normal metadata, so the terminal emit below
-        // must close the stream as the completion it was — a
-        // `stopReason: "interrupted"` there would pin a spurious Stopped
-        // marker on a finished message. The return value stays `None`: no
-        // interrupted marker row was appended for callers to exclude.
-        let completed_message_id = match &flush_outcome {
-            InterruptFlushOutcome::AlreadyPersisted(id) => Some(id.clone()),
-            InterruptFlushOutcome::Appended(_) | InterruptFlushOutcome::Failed => None,
+        // `AlreadyPersisted` (the `agent_message.id` UNIQUE collision with a
+        // row NOT tagged interrupted) means the worker's own full row won: the
+        // interrupt landed in the persist→exit gap of a turn that COMPLETED
+        // normally. That row is the turn's real assistant message with normal
+        // metadata, so the terminal emit below must close the stream as the
+        // completion it was — a `stopReason: "interrupted"` there would pin a
+        // spurious Stopped marker on a finished message. `AlreadyInterrupted`
+        // is the same collision against a row a CONCURRENT interrupt flush
+        // wrote (the suspend enrollment racing this teardown): the emit stays
+        // interrupted-shaped and mirrors that row's metadata. The return value
+        // stays `None` on both: no marker row was appended for callers to
+        // exclude.
+        let (completed_message_id, already_interrupted) = match &flush_outcome {
+            InterruptFlushOutcome::AlreadyPersisted(id) => (Some(id.clone()), None),
+            InterruptFlushOutcome::AlreadyInterrupted {
+                message_id,
+                metadata,
+            } => (None, Some((message_id.clone(), metadata.clone()))),
+            InterruptFlushOutcome::Appended(_) | InterruptFlushOutcome::Failed => (None, None),
         };
         let interrupted_message_id = flush_outcome.appended_message_id().map(str::to_owned);
         // Zero-output user stop (intent-hq/monorepo#1757): the cancelled
@@ -4628,7 +4636,8 @@ impl AgentManager {
         if let Some(workspace_id) = workspace_id {
             let diagnostic_id = completed_message_id
                 .as_deref()
-                .or(interrupted_message_id.as_deref());
+                .or(interrupted_message_id.as_deref())
+                .or(already_interrupted.as_ref().map(|(id, _)| id.as_str()));
             let mut end_data = json!({ "agentId": agent_id.0 });
             if let Some(ref message_id) = completed_message_id {
                 // The turn completed before the interrupt could cut it short:
@@ -4656,16 +4665,32 @@ impl AgentManager {
                 // metadata so clients can render the reason-specific Stopped
                 // indicator live, without refetching the transcript.
                 end_data["stopReason"] = json!("interrupted");
-                end_data["interruptReason"] = json!(reason.as_str());
-                // Same reason gate as the persisted row: `interruptedBy` is
-                // defined only for message preemption.
-                if reason == InterruptReason::PreemptedByMessage {
-                    if let Some(ref by) = interrupted_by {
-                        end_data["interruptedBy"] = by.to_json();
+                if let Some((ref message_id, ref row_metadata)) = already_interrupted {
+                    // A concurrent interrupt flush's row won the collision:
+                    // mirror THAT row's metadata (its reason may differ from
+                    // this interrupt's, e.g. `system_suspend`), falling back
+                    // to this interrupt's reason when the row was unreadable.
+                    end_data["interruptReason"] = row_metadata
+                        .get("interruptReason")
+                        .filter(|r| r.is_string())
+                        .cloned()
+                        .unwrap_or_else(|| json!(reason.as_str()));
+                    if let Some(by) = row_metadata.get("interruptedBy") {
+                        end_data["interruptedBy"] = by.clone();
                     }
-                }
-                if let Some(ref message_id) = interrupted_message_id {
                     end_data["messageId"] = json!(message_id);
+                } else {
+                    end_data["interruptReason"] = json!(reason.as_str());
+                    // Same reason gate as the persisted row: `interruptedBy`
+                    // is defined only for message preemption.
+                    if reason == InterruptReason::PreemptedByMessage {
+                        if let Some(ref by) = interrupted_by {
+                            end_data["interruptedBy"] = by.to_json();
+                        }
+                    }
+                    if let Some(ref message_id) = interrupted_message_id {
+                        end_data["messageId"] = json!(message_id);
+                    }
                 }
             }
             // Final live-preview values from the flushed partial turn (same
