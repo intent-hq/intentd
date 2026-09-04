@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.24] - 2026-09-04
+
+### 🚀 Features
+
+- Back off accept loops on EMFILE, raise RLIMIT_NOFILE, and report fd usage in system.status ([#1740](https://github.com/intent-hq/intentd/pull/1740))
+
+
 ## [0.9.23] - 2026-09-04
 
 ### 🚀 Features
