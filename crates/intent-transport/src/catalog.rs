@@ -371,6 +371,10 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "host.status",
     "host.toolAvailability",
     "pairing.getInfo",
+    "providers.setup.cancel",
+    "providers.setup.login",
+    "providers.setup.start",
+    "providers.setup.status",
     "server.pairingInfo",
     "server.rotateToken",
     "system.gitCredential",
@@ -399,4 +403,5 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
     "host.openExternal",
     "host.openInEditor",
     "host.pickApplication",
+    "providers.setup.openLogin",
 ];

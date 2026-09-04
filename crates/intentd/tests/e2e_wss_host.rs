@@ -366,6 +366,129 @@ async fn host_detection_services_over_wss() {
     );
 }
 
+/// Setup is deliberately unavailable over WSS, even after an app-capability
+/// hello. The real UDS path requires that handshake and owns its operation.
+#[tokio::test]
+async fn antigravity_setup_is_local_app_only_and_connection_owned() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn uds_call(
+        reader: &mut BufReader<UnixStream>,
+        id: i64,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let frame = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        reader
+            .get_mut()
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+        loop {
+            let mut line = String::new();
+            timeout(common::rpc_read_timeout(), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: Value = serde_json::from_str(&line).unwrap();
+            if response["id"] == id {
+                return response;
+            }
+        }
+    }
+
+    let (daemon, port, cfg) = boot().await;
+    let mut ws = connect_ws(port, cfg).await;
+    let hello = wss_rpc(
+        &mut ws,
+        1,
+        "client.hello",
+        json!({"capabilities":{"antigravitySetup":1}}),
+    )
+    .await;
+    assert_eq!(hello["server"]["capabilities"]["antigravitySetup"], 1);
+    for (id, method) in (2_i64..).zip([
+        "providers.setup.status",
+        "providers.setup.start",
+        "providers.setup.login",
+        "providers.setup.cancel",
+    ]) {
+        ws.send(Message::Text(
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":{"providerId":"antigravity"}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let response = wss_expect_error(&mut ws, id).await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], id);
+        assert_eq!(response["error"]["code"], -32001);
+        assert_eq!(
+            response["error"]["message"],
+            "Antigravity setup requires an authorized local app connection"
+        );
+        assert!(response.get("result").is_none());
+    }
+    let mut local = BufReader::new(
+        UnixStream::connect(daemon.data_dir.join("intentd.sock"))
+            .await
+            .unwrap(),
+    );
+    let request = json!({"providerId":"antigravity"});
+    let anonymous = uds_call(&mut local, 10, "providers.setup.status", request.clone()).await;
+    assert_eq!(anonymous["error"]["code"], -32001);
+    let hello = uds_call(
+        &mut local,
+        11,
+        "client.hello",
+        json!({"capabilities":{"antigravitySetup":1}}),
+    )
+    .await;
+    assert!(hello.get("error").is_none());
+    let status = uds_call(&mut local, 12, "providers.setup.status", request.clone()).await;
+    assert_eq!(status["result"]["phase"], "idle");
+    assert!(status["result"]["cliDetected"].is_boolean());
+    assert!(status["result"]["runtimeInstalled"].is_boolean());
+    assert!(status["result"]["operationId"].is_null());
+    // A deliberately invalid custom path guarantees no downloads or real ACP
+    // subprocesses, even on a developer host with Antigravity installed.
+    let setting = uds_call(&mut local,13,"settings.update",json!({"changes":[{"path":"providers.paths","value":{"antigravity":daemon.data_dir.join("missing-bridge")}}]})).await;
+    assert!(setting.get("error").is_none(), "{setting}");
+    let started = uds_call(&mut local, 14, "providers.setup.start", request).await;
+    let operation_id = started["result"]["operationId"].as_str().unwrap();
+    let mut other = BufReader::new(
+        UnixStream::connect(daemon.data_dir.join("intentd.sock"))
+            .await
+            .unwrap(),
+    );
+    uds_call(
+        &mut other,
+        15,
+        "client.hello",
+        json!({"capabilities":{"antigravitySetup":1}}),
+    )
+    .await;
+    let params = json!({"providerId":"antigravity","operationId":operation_id});
+    for method in ["providers.setup.login", "providers.setup.cancel"] {
+        let response = uds_call(&mut other, 16, method, params.clone()).await;
+        assert_eq!(response["error"]["code"], -32602);
+    }
+    let cancelled = uds_call(&mut local, 17, "providers.setup.cancel", params.clone()).await;
+    assert_eq!(cancelled["result"]["phase"], "cancelled");
+    let login = uds_call(&mut local, 18, "providers.setup.login", params).await;
+    assert_eq!(login["error"]["code"], -32602);
+    uds_call(&mut local, 19, "client.hello", json!({})).await;
+    let revoked = uds_call(
+        &mut local,
+        20,
+        "providers.setup.status",
+        json!({"providerId":"antigravity"}),
+    )
+    .await;
+    assert_eq!(revoked["error"]["code"], -32001);
+}
+
 /// host.findApp / host.listInstalledEditors over the real WSS wire.
 #[tokio::test]
 async fn host_app_detection_services_over_wss() {

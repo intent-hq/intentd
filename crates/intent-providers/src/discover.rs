@@ -528,8 +528,12 @@ fn find_provider_binary_with_home_and_dirs(
         }
     }
 
-    // 5. Scan enhanced PATH directories
-    find_in_dirs(enhanced_dirs, command)
+    // 5. Preserve existing installations before considering our managed bridge.
+    find_in_dirs(enhanced_dirs, command).or_else(|| {
+        (provider_id == "antigravity" && crate::antigravity::supported_host())
+            .then(|| home.and_then(crate::antigravity::managed_binary))
+            .flatten()
+    })
 }
 
 /// The explicit-override tier ALONE for an npx-only provider
@@ -566,7 +570,8 @@ pub fn resolve_npx_only_override(
 /// and the override-aware `installed` determination in
 /// [`discover_providers_with_overrides`], so every side accepts exactly the
 /// same overrides.
-fn resolve_explicit_path(provider_id: &str, path: &str) -> Option<PathBuf> {
+#[must_use]
+pub fn resolve_explicit_path(provider_id: &str, path: &str) -> Option<PathBuf> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return None;
@@ -722,6 +727,12 @@ fn find_in_enhanced_dirs(command: &str) -> Option<PathBuf> {
     find_in_dirs(&intent_core::path_utils::enhanced_path_dirs(), command)
 }
 
+/// Detect the user's CLI separately from the ACP runtime. Never spawn it.
+#[must_use]
+pub fn find_antigravity_cli() -> Option<PathBuf> {
+    find_in_enhanced_dirs("agy")
+}
+
 /// Find the first executable for `command` in `dirs`, in order (test seam —
 /// lets tests scan a controlled dir list without spawning a login shell).
 fn find_in_dirs(dirs: &[PathBuf], command: &str) -> Option<PathBuf> {
@@ -822,6 +833,80 @@ mod find_provider_binary_tests {
         make_executable(&bin);
         let result = find_provider_binary("test", "my-provider", Some(bin.to_str().unwrap()));
         assert_eq!(result, Some(bin));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_managed_discovery_requires_a_complete_activated_bundle() {
+        use crate::antigravity::{
+            install_root, managed_binary, ARCHIVE_SHA256, FILES, HARNESS, SERVER, VERSION,
+        };
+        let home = unique_temp_dir("antigravity-managed");
+        let version = install_root(home.path()).join(VERSION);
+        fs::create_dir_all(&version).unwrap();
+        for (name, bytes, _) in FILES {
+            let path = version.join(name);
+            make_executable(&path);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+        }
+        assert_eq!(
+            managed_binary(home.path()),
+            None,
+            "staging is not discoverable"
+        );
+        fs::write(version.join("ready"), ARCHIVE_SHA256).unwrap();
+        assert_eq!(managed_binary(home.path()), Some(version.join(SERVER)));
+        fs::remove_file(version.join(HARNESS)).unwrap();
+        assert_eq!(
+            managed_binary(home.path()),
+            None,
+            "missing companion is not installed"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn antigravity_cli_is_not_acp_and_custom_installations_keep_precedence() {
+        use crate::antigravity::{install_root, ARCHIVE_SHA256, FILES, SERVER, VERSION};
+        let home = unique_temp_dir("antigravity-precedence");
+        let bin = home.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        make_executable(&bin.join("agy"));
+        let find = |explicit: Option<&str>| {
+            find_provider_binary_with_home_and_dirs(
+                "antigravity",
+                "antigravity-acp",
+                explicit,
+                Some(home.path()),
+                std::slice::from_ref(&bin),
+            )
+        };
+        assert_eq!(find(None), None);
+        let version = install_root(home.path()).join(VERSION);
+        fs::create_dir_all(&version).unwrap();
+        for (name, bytes, _) in FILES {
+            let path = version.join(name);
+            make_executable(&path);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+        }
+        fs::write(version.join("ready"), ARCHIVE_SHA256).unwrap();
+        assert_eq!(find(None), Some(version.join(SERVER)));
+        let on_path = bin.join("antigravity-acp");
+        make_executable(&on_path);
+        assert_eq!(find(None), Some(on_path));
+        let custom = home.path().join("custom");
+        make_executable(&custom);
+        assert_eq!(find(custom.to_str()), Some(custom));
     }
 
     #[test]
