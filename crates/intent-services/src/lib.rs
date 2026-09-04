@@ -2867,6 +2867,20 @@ impl Services {
         // Re-read the workspace to avoid overwriting fields populated after the
         // candidate was built (backfill race guard).
         let mut ws = self.store.get_workspace(&candidate.workspace_id).await?;
+        let current_repository_path = ws
+            .repository_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        if current_repository_path != Some(candidate.repository_path.as_str()) {
+            tracing::debug!(
+                workspace_id = %ws.id.as_str(),
+                candidate_repository_path = %candidate.repository_path,
+                current_repository_path = current_repository_path.unwrap_or(""),
+                "repository owner backfill skipped; workspace repository path changed"
+            );
+            return Ok(());
+        }
         let mut changes = serde_json::Map::new();
 
         // Only fill fields that are still missing in the currently persisted state.

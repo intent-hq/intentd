@@ -13,7 +13,7 @@ use intent_core::{
 };
 use intent_store::Store;
 
-use crate::{repository_backfill_probe_count, Services};
+use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
@@ -24170,6 +24170,79 @@ mod known_repo {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// A stale probe for repository A must not populate repository B after the
+    /// workspace path changes; B's own candidate remains able to fill the row.
+    #[tokio::test]
+    async fn repository_owner_backfill_skips_candidate_after_path_change() {
+        use git2::Repository;
+
+        let repo_a = tempfile::tempdir().expect("repo A tempdir");
+        let git_a = Repository::init(repo_a.path()).expect("init repo A");
+        git_a
+            .remote("origin", "https://github.com/owner-a/repo-a.git")
+            .expect("repo A origin");
+        let repo_b = tempfile::tempdir().expect("repo B tempdir");
+        let git_b = Repository::init(repo_b.path()).expect("init repo B");
+        git_b
+            .remote("origin", "https://github.com/owner-b/repo-b.git")
+            .expect("repo B origin");
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = crate::events::bus::EventBus::new(store.clone());
+        let svc = Services::new(store.clone()).with_event_bus(bus);
+        let id = WorkspaceId::from_string("backfill-path-race-test".to_string());
+        let path_a = repo_a.path().to_string_lossy().into_owned();
+        let path_b = repo_b.path().to_string_lossy().into_owned();
+        let mut ws = workspace(&id);
+        ws.repository_path = Some(path_a.clone());
+        store.insert_workspace(&ws).await.expect("insert workspace");
+
+        let candidate_a = BackfillCandidate {
+            workspace_id: id.clone(),
+            repository_path: path_a,
+        };
+        ws.repository_path = Some(path_b.clone());
+        store
+            .update_workspace(&ws)
+            .await
+            .expect("change repository path to B");
+
+        svc.backfill_one_workspace(candidate_a)
+            .await
+            .expect("stale A backfill");
+        let after_a = store.get_workspace(&id).await.expect("get after A");
+        assert_eq!(after_a.repository_owner, None);
+        assert_eq!(after_a.repository_name, None);
+        assert!(
+            store
+                .events_by_type(&id, "workspace:updated", 10)
+                .await
+                .expect("events after A")
+                .is_empty(),
+            "stale A candidate must not emit workspace:updated"
+        );
+
+        svc.backfill_one_workspace(BackfillCandidate {
+            workspace_id: id.clone(),
+            repository_path: path_b,
+        })
+        .await
+        .expect("current B backfill");
+        let after_b = store.get_workspace(&id).await.expect("get after B");
+        assert_eq!(after_b.repository_owner.as_deref(), Some("owner-b"));
+        assert_eq!(after_b.repository_name.as_deref(), Some("repo-b"));
+        assert_eq!(
+            store
+                .events_by_type(&id, "workspace:updated", 10)
+                .await
+                .expect("events after B")
+                .len(),
+            1,
+            "current B candidate emits workspace:updated"
+        );
     }
 }
 
