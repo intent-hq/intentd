@@ -11,7 +11,7 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 297 canonical methods routed through the main dispatch match in
+/// These are the 299 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -129,6 +129,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.issues.get",
     "github.issues.list",
     "github.issues.search",
     "github.listReviewComments",

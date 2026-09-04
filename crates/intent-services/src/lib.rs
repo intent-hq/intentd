@@ -26590,6 +26590,26 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_issues_get(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let issue = sc
+                .get_issue(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "issue": github_ops::issue_to_json(&issue, &repo_ref.owner, &repo_ref.name)
+            }))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,

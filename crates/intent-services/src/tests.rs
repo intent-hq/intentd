@@ -12625,20 +12625,30 @@ mod pr {
         async fn create_issue(&self, _: &RepoRef, _: &str, _: Option<&str>) -> ScResult<Issue> {
             unimplemented!()
         }
-        async fn get_issue(&self, _: &RepoRef, _: u64) -> ScResult<Issue> {
-            unimplemented!()
+        async fn get_issue(&self, _: &RepoRef, number: u64) -> ScResult<Issue> {
+            Ok(Issue {
+                number,
+                ..stub_issue()
+            })
         }
         async fn list_issues(&self, _: &RepoRef, _: IssueQuery) -> ScResult<Page<Issue>> {
             Ok(Page {
-                items: vec![Issue {
-                    number: 11,
-                    title: "Bug report".into(),
-                    body: Some("something broke".into()),
-                    state: "open".into(),
-                    url: "https://github.com/o/r/issues/11".into(),
-                }],
+                items: vec![stub_issue()],
                 next_cursor: None,
             })
+        }
+    }
+
+    fn stub_issue() -> Issue {
+        Issue {
+            number: 11,
+            title: "Bug report".into(),
+            body: Some("something broke".into()),
+            state: "open".into(),
+            url: "https://github.com/o/r/issues/11".into(),
+            author: "reporter".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-02T00:00:00Z".into(),
         }
     }
 
@@ -14314,6 +14324,27 @@ mod pr {
     }
 
     #[tokio::test]
+    async fn github_issues_get_shape() {
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let g = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        let issue = &g["issue"];
+        assert_eq!(issue["number"], 7);
+        assert_eq!(issue["title"], "Bug report");
+        assert_eq!(issue["state"], "open");
+        assert_eq!(issue["htmlUrl"], "https://github.com/o/r/issues/11");
+        assert_eq!(issue["user"]["login"], "reporter");
+        assert_eq!(issue["createdAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(issue["updatedAt"], "2026-01-02T00:00:00Z");
+        assert_eq!(issue["owner"], "o");
+        assert_eq!(issue["repo"], "r");
+        assert_eq!(issue["labels"], json!([]));
+        assert_eq!(issue["comments"], 0);
+    }
+
+    #[tokio::test]
     async fn github_issues_list_and_search_shapes() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
         let l = svc
@@ -14330,6 +14361,10 @@ mod pr {
         assert_eq!(l["issues"][0]["number"], 11);
         assert_eq!(l["issues"][0]["owner"], "o");
         assert_eq!(l["issues"][0]["repo"], "r");
+        // The list DTO carries the real author/timestamps, not placeholders.
+        assert_eq!(l["issues"][0]["user"]["login"], "reporter");
+        assert_eq!(l["issues"][0]["createdAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(l["issues"][0]["updatedAt"], "2026-01-02T00:00:00Z");
         assert!(l["nextToken"].is_null());
 
         let s = svc

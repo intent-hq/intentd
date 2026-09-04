@@ -338,6 +338,9 @@ pub struct Issue {
     pub body: Option<String>,
     pub state: String,
     pub url: String,
+    pub author: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Filter for listing issues.

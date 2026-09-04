@@ -5613,6 +5613,7 @@ async fn github_methods_are_routed_not_unknown() {
         r#"{"jsonrpc":"2.0","id":6,"method":"github.pulls.updateBranch","params":{"owner":"o","repo":"r","number":1}}"#,
         r#"{"jsonrpc":"2.0","id":7,"method":"github.issues.list","params":{"owner":"o","repo":"r"}}"#,
         r#"{"jsonrpc":"2.0","id":8,"method":"github.issues.search","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":14,"method":"github.issues.get","params":{"owner":"o","repo":"r","number":1}}"#,
         r#"{"jsonrpc":"2.0","id":9,"method":"github.listReviewComments","params":{"owner":"o","repo":"r","number":1}}"#,
         r#"{"jsonrpc":"2.0","id":10,"method":"github.replyReviewComment","params":{"owner":"o","repo":"r","number":1,"commentId":2,"body":"b"}}"#,
         r#"{"jsonrpc":"2.0","id":11,"method":"github.getReviewThreads","params":{"owner":"o","repo":"r","number":1}}"#,
@@ -5632,6 +5633,9 @@ async fn github_missing_required_params_are_minus_32602() {
         r#"{"jsonrpc":"2.0","id":2,"method":"github.pulls.get","params":{"owner":"o","repo":"r"}}"#,
         // missing number
         r#"{"jsonrpc":"2.0","id":3,"method":"github.pulls.merge","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"github.issues.get","params":{"owner":"o","repo":"r"}}"#,
+        // missing owner
+        r#"{"jsonrpc":"2.0","id":8,"method":"github.issues.get","params":{"repo":"r","number":1}}"#,
         // missing required create fields
         r#"{"jsonrpc":"2.0","id":4,"method":"github.pulls.create","params":{"owner":"o","repo":"r","title":"t"}}"#,
         // missing commentId / body
