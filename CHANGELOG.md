@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.19] - 2026-09-04
+
+### 🐛 Bug Fixes
+
+- *(agent)* Claim a completion watch before its terminal wake is sent ([#1718](https://github.com/intent-hq/intentd/pull/1718))
+
+
 ## [0.9.18] - 2026-09-04
 
 ### 🚀 Features
