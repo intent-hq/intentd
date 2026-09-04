@@ -10,7 +10,9 @@
 //! `crate::v1_1_goldens`; [`v2`] builds on v1.1 doctrine with scoped sibling
 //! workspace handoffs; [`v2_1`] adds the Vulnerability Scanner specialist;
 //! [`v2_2`] rewrites the workspace status-message guidance to one short
-//! plain sentence). Call sites carry typed data
+//! plain sentence; [`v2_3`] rewords the `## Suggested Next Steps` prompt
+//! hint so suggestions are levers on the plan, not a restatement of it,
+//! byte-pinned by `crate::v2_3_goldens`). Call sites carry typed data
 //! into the harness and never format doctrine/envelope text themselves, so a
 //! future version can reword or reorder surfaces without touching managers.
 //! A new version starts as `pub use` re-exports of the prior version's
@@ -26,7 +28,8 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, or `"2.2"`) to the
+//! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, `"2.2"`, or
+//! `"2.3"`) to the
 //! pair, so a session keeps assembling the exact doctrine it was created with
 //! even after the binary ships a newer set. All past versions stay bundled.
 
@@ -35,6 +38,7 @@ pub(crate) mod v1_1;
 pub(crate) mod v2;
 pub(crate) mod v2_1;
 pub(crate) mod v2_2;
+pub(crate) mod v2_3;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -411,6 +415,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2::ENTRY,
     &v2_1::ENTRY,
     &v2_2::ENTRY,
+    &v2_3::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -536,7 +541,7 @@ mod tests {
     fn latest_is_current_harness_version() {
         assert_eq!(LATEST_VERSION, intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(latest_entry().version, LATEST_VERSION);
-        assert!(std::ptr::eq(data_ptr(latest()), data_ptr(&v1::V1)));
+        assert!(std::ptr::eq(data_ptr(latest()), data_ptr(&v2_3::V2_3)));
     }
 
     /// Every registry row is coherent: unique version keys, a doctrine whose
@@ -617,5 +622,35 @@ mod tests {
         assert_eq!(a.code_walkthrough, b.code_walkthrough);
         assert_eq!(a.commit_message, b.commit_message);
         assert_eq!(a.pr_description, b.pr_description);
+    }
+
+    /// v2.3 keeps v2.2's doctrine (instructions + specialists) byte-for-byte
+    /// and swaps only the text-surface implementation, so the diff is exactly
+    /// the reworded suggested-next-steps block.
+    #[test]
+    fn v2_3_rewords_only_suggested_next_steps() {
+        let v2_2 = resolve_entry("2.2");
+        let v2_3 = resolve_entry("2.3");
+        assert_eq!(v2_2.doctrine.specialists, v2_3.doctrine.specialists);
+        assert!(std::ptr::eq(
+            v2_2.doctrine.instructions,
+            v2_3.doctrine.instructions
+        ));
+        assert!(std::ptr::eq(data_ptr(v2_2.harness), data_ptr(&v1::V1)));
+        assert!(std::ptr::eq(data_ptr(v2_3.harness), data_ptr(&v2_3::V2_3)));
+        for auto_commit in [false, true] {
+            assert_ne!(
+                v2_2.harness.suggested_next_steps_block(auto_commit),
+                v2_3.harness.suggested_next_steps_block(auto_commit)
+            );
+        }
+        assert_eq!(
+            v2_2.harness.ask_questions_block(),
+            v2_3.harness.ask_questions_block()
+        );
+        assert_eq!(
+            v2_2.harness.commit_policy_clause(),
+            v2_3.harness.commit_policy_clause()
+        );
     }
 }

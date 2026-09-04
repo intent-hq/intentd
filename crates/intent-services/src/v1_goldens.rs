@@ -1566,10 +1566,13 @@ fn golden_supervisor_history_truncation_markers() {
 /// questions, next-steps footer, specialist role wrapper, role-reminder
 /// footer, user-rules wrapper) plus the `\n\n---\n\n` layer separator, pinned
 /// via a hermetic assembly with no workspace path (no rule files, no skills,
-/// no RTK — only the always-on layers).
+/// no RTK — only the always-on layers). Assembled under a session pinned to
+/// `harnessVersion: "1.0"` so the bytes stay frozen as later versions reword
+/// surfaces (v2.3 rewords the next-steps layer; `v2_3_goldens` pins that).
 #[tokio::test]
 async fn golden_assembled_prompt_static_layers() {
-    let (_t, svc, _ws) = setup().await;
+    let (_t, svc, ws) = setup().await;
+    let session = v1_pinned_session(&svc, &ws, "agent-v1-static").await;
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: Some("Implement the task.".to_string()),
         specialist_name: Some("Implementor".to_string()),
@@ -1585,7 +1588,7 @@ async fn golden_assembled_prompt_static_layers() {
         false,
         &intent_core::settings_file::AgentFeaturesSettings::default(),
         None,
-        None,
+        Some(&session),
         None,
     )
     .await
@@ -1650,9 +1653,12 @@ async fn golden_assembled_prompt_static_layers() {
 
 /// Auto-commit flips the next-steps example line and appends the
 /// auto-commit clause; sub-agents skip questions + next-steps entirely.
+/// Assembled under a `"1.0"`-pinned session (see
+/// `golden_assembled_prompt_static_layers`).
 #[tokio::test]
 async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
-    let (_t, svc, _ws) = setup().await;
+    let (_t, svc, ws) = setup().await;
+    let session = v1_pinned_session(&svc, &ws, "agent-v1-variants").await;
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
     let auto_on = crate::rules::assemble_system_prompt(
         svc.store(),
@@ -1664,7 +1670,7 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
         false,
         &features,
         None,
-        None,
+        Some(&session),
         None,
     )
     .await
@@ -1698,7 +1704,7 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
         false,
         &features,
         None,
-        None,
+        Some(&session),
         None,
     )
     .await
@@ -1708,11 +1714,29 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
     assert!(sub_agent.contains("## Commit Policy"));
 }
 
+/// A seeded session re-stamped to `harnessVersion: "1.0"` so assembly
+/// resolves the v1 harness + doctrine regardless of the current version.
+async fn v1_pinned_session(
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &str,
+) -> intent_core::AgentSession {
+    let owner = AgentId::from(id);
+    seed_agent(svc, ws, &owner).await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&owner)
+        .await
+        .expect("session");
+    session.harness_version = "1.0".to_string();
+    session
+}
+
 /// H2 regression: a session stamped `harnessVersion: "1.0"` (every pre-1.1
 /// session) resolves the v1 doctrine set and assembles the exact bytes the
 /// v1 layout produced — its common layer is the v1 body, not the v1.1
 /// or v2 rewrite (the v1 composition stays byte-pinned by the doctrine hashes
-/// below). A current-stamp session ("2.0") assembles byte-identical to the
+/// below). A current-stamp session assembles byte-identical to the
 /// session-less (latest) assembly, and an unknown/corrupt stamp falls back
 /// to the latest instead of failing.
 #[tokio::test]
@@ -1780,18 +1804,40 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     );
     assert!(!pinned_v1.contains("ws.workspace.proposeSibling"));
     assert!(latest.contains("ws.workspace.proposeSibling"));
-    // Only the doctrine layer differs: the static layers after the
-    // specialization rules are byte-identical.
+    // Only the doctrine layer differs between v1 and v2.2 (the last version
+    // on v1 text surfaces): the static layers after the specialization
+    // rules are byte-identical. Latest (v2.3) additionally rewords the
+    // next-steps layer and nothing else.
+    session.harness_version = "2.2".to_string();
+    let pinned_v2_2 = assemble(Some(session.clone())).await;
+    let v2_2_rules = crate::instructions::get_instruction_with_common_for(
+        crate::harness::resolve_entry("2.2").doctrine.instructions,
+        "task-loop",
+        &features,
+    );
+    let v1_static = pinned_v1.strip_prefix(&v1_rules).expect("v1 prefix");
+    assert_eq!(
+        v1_static,
+        pinned_v2_2.strip_prefix(&v2_2_rules).expect("2.2 prefix"),
+        "static layers identical across v1-surface versions"
+    );
     let latest_rules = crate::instructions::get_instruction_with_common_for(
         crate::harness::latest_entry().doctrine.instructions,
         "task-loop",
         &features,
     );
-    assert_eq!(
-        pinned_v1.strip_prefix(&v1_rules).expect("v1 prefix"),
-        latest.strip_prefix(&latest_rules).expect("latest prefix"),
-        "static layers identical across versions"
-    );
+    let latest_static = latest.strip_prefix(&latest_rules).expect("latest prefix");
+    let v1_layers: Vec<&str> = v1_static.split("\n\n---\n\n").collect();
+    let latest_layers: Vec<&str> = latest_static.split("\n\n---\n\n").collect();
+    assert_eq!(v1_layers.len(), latest_layers.len());
+    for (a, b) in v1_layers.iter().zip(&latest_layers) {
+        if a.starts_with("## Suggested Next Steps") {
+            assert!(b.starts_with("## Suggested Next Steps"));
+            assert_ne!(a, b, "latest rewords the next-steps layer");
+        } else {
+            assert_eq!(a, b, "static layers identical across versions");
+        }
+    }
     // A stale/corrupt stamp falls back to the latest (never fails a spawn).
     session.harness_version = "9.9".to_string();
     let unknown = assemble(Some(session)).await;

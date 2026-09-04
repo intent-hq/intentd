@@ -22010,9 +22010,9 @@ mod rules {
     /// SP-1: top-level (non-sub-agent) interactive agents get the
     /// `## Suggested Next Steps` directive at the very end of the assembled
     /// prompt so the model reliably emits a `<!-- suggested-prompts ... -->`
-    /// block. The default (`auto_commit_enabled = false`) variant uses the
-    /// "Review changes before committing." example line and appends no
-    /// auto-commit clause.
+    /// block. The default (`auto_commit_enabled = false`) variant carries the
+    /// lever examples and appends no auto-commit clause (v2.3 wording; the
+    /// v1 bytes stay pinned in `v1_goldens`).
     #[tokio::test]
     async fn assembly_appends_suggested_prompts_for_top_level_agent() {
         let tree = worktree();
@@ -22037,8 +22037,12 @@ mod rules {
             "SP-1 directive present for non-sub-agent"
         );
         assert!(
-            prompt.contains("Review changes before committing."),
-            "auto-commit-off example line"
+            prompt.contains("Hold off on opening the PR until I have reviewed the diff."),
+            "lever example line"
+        );
+        assert!(
+            prompt.contains("Never suggest a step you already said you will take"),
+            "no-duplication rule present"
         );
         assert!(
             !prompt.contains("Auto-commit is enabled;"),
@@ -22055,7 +22059,7 @@ mod rules {
         assert!(
             prompt
                 .trim_end()
-                .ends_with("something the user might say next."),
+                .ends_with("or a decision only they can make."),
             "suggested-prompts block is the tail of the assembled prompt: {:?}",
             &prompt[tail_start..]
         );
@@ -22094,10 +22098,10 @@ mod rules {
         );
     }
 
-    /// SP-1: when auto-commit is enabled the directive swaps the example
-    /// second-line (`Check the changes in the diff view.`) and appends the
-    /// auto-commit clause that tells the model not to propose commit-review
-    /// prompts, matching the reference `autoCommitEnabled` branch.
+    /// SP-1: when auto-commit is enabled the directive keeps the same lever
+    /// examples (v2.3 no longer varies them by auto-commit state) and appends
+    /// the auto-commit clause that tells the model not to propose
+    /// commit-review prompts, matching the reference `autoCommitEnabled` branch.
     #[tokio::test]
     async fn assembly_suggested_prompts_toggles_auto_commit_clause() {
         let tree = worktree();
@@ -22119,12 +22123,12 @@ mod rules {
         .expect("assembled prompt");
         assert!(prompt.contains("## Suggested Next Steps"));
         assert!(
-            prompt.contains("Check the changes in the diff view."),
-            "auto-commit-on example line"
+            prompt.contains("Skip the verifier pass and open the PR now."),
+            "lever example line"
         );
         assert!(
             !prompt.contains("Review changes before committing."),
-            "auto-commit-off example line must not appear when auto-commit is on"
+            "v1 auto-commit-off example line must not appear"
         );
         assert!(
             prompt.contains(
