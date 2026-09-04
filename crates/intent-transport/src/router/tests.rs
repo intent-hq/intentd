@@ -150,6 +150,36 @@ impl WorkspaceApi for FakeApi {
             }))
         })
     }
+    fn workspace_local_changes(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(serde_json::json!({
+                "roots": [
+                    {
+                        "kind": "primary",
+                        "path": "/tmp/ws-1",
+                        "branch": "feat/x",
+                        "hasRemoteRefs": true,
+                        "unpushedCount": 3,
+                        "uncommittedCount": 2,
+                    },
+                    {
+                        "kind": "secondary",
+                        "gitRootId": "gr-1",
+                        "path": "/tmp/ws-1/vendor/sub",
+                        "hasRemoteRefs": false,
+                        "unpushedCount": 0,
+                        "uncommittedCount": 0,
+                        "error": "boom",
+                    },
+                ],
+                "hasUnpushedCommits": true,
+                "hasUncommittedChanges": true,
+            }))
+        })
+    }
     fn workspace_transfer_plan(
         &self,
         id: WorkspaceId,
@@ -2648,6 +2678,59 @@ async fn workspace_disk_usage_missing_id_is_minus_32602() {
 async fn workspace_disk_usage_not_found_maps_to_workspace_err() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
+/// `workspace.localChanges` returns the service payload verbatim:
+/// `{ roots, hasUnpushedCommits, hasUncommittedChanges }` with no extra
+/// envelope nesting (PROTOCOL §5.1).
+#[tokio::test]
+async fn workspace_local_changes_returns_payload() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.localChanges","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["hasUnpushedCommits"], serde_json::json!(true));
+    assert_eq!(
+        v["result"]["hasUncommittedChanges"],
+        serde_json::json!(true)
+    );
+    let roots = v["result"]["roots"].as_array().expect("roots array");
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0]["kind"], serde_json::json!("primary"));
+    assert!(roots[0].get("gitRootId").is_none());
+    assert_eq!(roots[0]["branch"], serde_json::json!("feat/x"));
+    assert_eq!(roots[0]["unpushedCount"], serde_json::json!(3));
+    assert_eq!(roots[0]["uncommittedCount"], serde_json::json!(2));
+    assert_eq!(roots[1]["kind"], serde_json::json!("secondary"));
+    assert_eq!(roots[1]["gitRootId"], serde_json::json!("gr-1"));
+    assert_eq!(roots[1]["error"], serde_json::json!("boom"));
+}
+
+#[tokio::test]
+async fn workspace_local_changes_missing_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.localChanges","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+}
+
+#[tokio::test]
+async fn workspace_local_changes_not_found_maps_to_workspace_err() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.localChanges","params":{"workspaceId":"missing"}}"#,
     )
     .await
     .unwrap();

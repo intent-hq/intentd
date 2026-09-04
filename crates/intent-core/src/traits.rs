@@ -93,6 +93,27 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.localChanges`: local git work that archiving or deleting
+    /// the workspace would lose or orphan (PROTOCOL §5.1) —
+    /// `{ roots: [...], hasUnpushedCommits, hasUncommittedChanges }`. One
+    /// row per evaluated root: the primary worktree first (skipped when the
+    /// workspace is remote or the worktree is not a git repository), then
+    /// every registered secondary git root in `gitRoot.list` order (always
+    /// evaluated — registered paths are host-local by construction). Each
+    /// row carries `kind`, `gitRootId` (secondary only), `path`, and the
+    /// per-repository signals (`branch?`, `hasRemoteRefs`, `unpushedCount`,
+    /// `uncommittedCount`); a root that cannot be read yields an `error` row
+    /// with zero counts instead of failing the call. `NotFound` only if the
+    /// workspace is absent.
+    fn workspace_local_changes(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_local_changes not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `workspace.transfer.plan`: read-only preview of a workspace transfer
     /// (PROTOCOL §5.1) — the versioned [`crate::transfer::TransferManifest`]
     /// plus a size estimate broken down as DB row bytes + asset bytes +

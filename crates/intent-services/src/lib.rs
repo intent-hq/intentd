@@ -2693,6 +2693,84 @@ impl Services {
         Ok(result)
     }
 
+    /// `workspace.localChanges` (§5.1): the local git work archiving or
+    /// deleting the workspace would lose — one row per evaluated root, the
+    /// primary worktree first, then every registered secondary root in
+    /// `gitRoot.list` order. The primary row is skipped when the workspace is
+    /// remote (no daemon-provisioned checkout), when it skipped worktree
+    /// provisioning (`worktree_path` then falls back to the user's own
+    /// `repository_path`, which archive/delete never removes), or when its
+    /// worktree has no `.git` entry (the same gate as `git.status`); any other
+    /// failure to read it surfaces as an `error` row like a secondary root's.
+    /// Secondary roots are always evaluated because registration only accepts
+    /// host-local repository roots. Roots are scanned concurrently, one
+    /// blocking-pool task each (git I/O never runs on the RPC task), and
+    /// merged back in order; a root that cannot be read — or whose task
+    /// panics — yields an `error` row with zero counts rather than failing
+    /// the call. An unknown id is `NotFound`.
+    pub(crate) async fn workspace_local_changes_op(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<serde_json::Value> {
+        let ws = self.store.get_workspace(&id).await?;
+        let secondary = self.store.list_workspace_git_roots(&id).await?;
+
+        // (kind, gitRootId, path, whether a missing `.git` skips the row).
+        let mut targets: Vec<(&'static str, Option<String>, PathBuf, bool)> =
+            Vec::with_capacity(secondary.len() + 1);
+        if !ws.is_remote && !ws.skip_worktree {
+            if let Some(primary) = git_ops::worktree_path(&ws) {
+                targets.push(("primary", None, primary, true));
+            }
+        }
+        for root in secondary {
+            targets.push((
+                "secondary",
+                Some(root.id.as_str().to_string()),
+                PathBuf::from(&root.path),
+                false,
+            ));
+        }
+
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|(kind, git_root_id, path, skip_without_git_dir)| {
+                let kind = *kind;
+                let git_root_id = git_root_id.clone();
+                let path = path.clone();
+                let skip_without_git_dir = *skip_without_git_dir;
+                tokio::task::spawn_blocking(move || {
+                    if skip_without_git_dir && !path.join(".git").exists() {
+                        return None;
+                    }
+                    Some(LocalChangesRow::compute(kind, git_root_id, &path))
+                })
+            })
+            .collect();
+
+        let mut roots: Vec<LocalChangesRow> = Vec::with_capacity(handles.len());
+        for ((kind, git_root_id, path, _), handle) in targets.into_iter().zip(handles) {
+            match handle.await {
+                Ok(Some(row)) => roots.push(row),
+                Ok(None) => {}
+                Err(e) => roots.push(LocalChangesRow::failed(
+                    kind,
+                    git_root_id,
+                    &path,
+                    format!("workspace.localChanges task failed: {e}"),
+                )),
+            }
+        }
+
+        let has_unpushed_commits = roots.iter().any(|r| r.changes.unpushed_count > 0);
+        let has_uncommitted_changes = roots.iter().any(|r| r.changes.uncommitted_count > 0);
+        Ok(serde_json::json!({
+            "roots": roots,
+            "hasUnpushedCommits": has_unpushed_commits,
+            "hasUncommittedChanges": has_uncommitted_changes,
+        }))
+    }
+
     /// The currently configured `workspace.worktreesLocation` directory for
     /// teardown sweeps: `None` when the setting is empty or the startup pin
     /// (`INTENTD_WORKSPACES_DIR`) keeps precedence, or when the expanded path
@@ -11468,6 +11546,53 @@ pub(crate) fn git_root_wire_rows(
         .collect()
 }
 
+/// One `workspace.localChanges` root row (§5.1): the identity fields the
+/// service owns plus the flattened per-repository signals from
+/// [`intent_git::local_changes`]. On a read failure the signals are zeroed and
+/// `error` carries the message, so a single unreadable root never fails the
+/// aggregate.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalChangesRow {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_root_id: Option<String>,
+    path: String,
+    #[serde(flatten)]
+    changes: intent_git::LocalChanges,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl LocalChangesRow {
+    /// Compute the row for the repository at `path`. Blocking git I/O —
+    /// callers run this on the blocking pool.
+    fn compute(kind: &'static str, git_root_id: Option<String>, path: &Path) -> Self {
+        match intent_git::local_changes(path) {
+            Ok(changes) => Self {
+                kind,
+                git_root_id,
+                path: path.to_string_lossy().into_owned(),
+                changes,
+                error: None,
+            },
+            Err(e) => Self::failed(kind, git_root_id, path, e.to_string()),
+        }
+    }
+
+    /// The fail-soft row for a root that could not be evaluated: zeroed
+    /// signals plus `error`.
+    fn failed(kind: &'static str, git_root_id: Option<String>, path: &Path, error: String) -> Self {
+        Self {
+            kind,
+            git_root_id,
+            path: path.to_string_lossy().into_owned(),
+            changes: intent_git::LocalChanges::default(),
+            error: Some(error),
+        }
+    }
+}
+
 /// Build a `gitRoot:unregistered` event (§6.5, monorepo#2053). Carries the
 /// removed root's id and path so clients drop the row without a re-list.
 pub(crate) fn git_root_unregistered_event(
@@ -15780,6 +15905,10 @@ impl WorkspaceApi for Services {
 
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.workspace_disk_usage_op(id).await })
+    }
+
+    fn workspace_local_changes(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_local_changes_op(id).await })
     }
 
     fn workspace_transfer_plan(
