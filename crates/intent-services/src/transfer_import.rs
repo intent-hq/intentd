@@ -581,10 +581,12 @@ impl Services {
     }
 
     /// Materialize the imported git payload (`git/repo.bundle` +
-    /// `git/refs.json` under `extracted_dir`) via
+    /// `git/refs.json`, plus any `git/submodules/<n>.bundle` the refs list,
+    /// under `extracted_dir`) via
     /// [`crate::transfer_materialize::materialize_workspace_git`]: clone the
-    /// bundle into `<workspaces_root>/<wsId>/<repo-slug>`, fetch the base
-    /// ref, re-provision sandboxes, and unwind WIP snapshots. The checkout
+    /// bundle into `<workspaces_root>/<wsId>/<repo-slug>`, hydrate the
+    /// bundled submodules, fetch the base ref, re-provision sandboxes, and
+    /// unwind WIP snapshots. The checkout
     /// is workspace-owned storage and is NOT registered in `known_repo`
     /// (intent-hq/monorepo#2227). Runs BEFORE the store insert with the
     /// transformed rows passed mutably: the [`MaterializedGit::apply`] row

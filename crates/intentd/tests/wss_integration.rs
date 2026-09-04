@@ -13927,6 +13927,311 @@ async fn wss_workspace_import_commit_materializes_git() {
     srv.ws.stop().await;
 }
 
+/// Export → import round trip over the real WSS transport between two daemons
+/// (§5.1) for a worktree whose submodule checkout sits on a commit that
+/// exists only locally (intent-hq/intent#4219): the source daemon's export
+/// carries the submodule's own bundle (`git/submodules/0.bundle`, listed in
+/// the ready event's `manifest.git.submodules` with `carried: true`), and
+/// the target daemon's `workspace.import.commit` hydrates the submodule from
+/// it — initialized at the unpublished commit on its original branch, with
+/// the original origin URL and no trace of the staging bundle path — while
+/// the superproject's dirty gitlink lands exactly as on the source.
+/// Finalizing the export without archiving restores the source. Skips when
+/// `git` is unavailable on PATH.
+#[tokio::test]
+async fn wss_transfer_round_trip_hydrates_unpublished_submodule() {
+    use base64::Engine as _;
+
+    if std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |s| !s.success())
+    {
+        eprintln!("skipping WSS submodule transfer E2E: git not available");
+        return;
+    }
+
+    let git = |dir: &std::path::Path, args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let init_repo = |dir: &std::path::Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    };
+
+    // Source: superproject `super` tracking `sub` (origin = bare repo), with
+    // one commit made inside the submodule checkout and never pushed.
+    let root_dir = test_tempdir("intentd-wss-transfer-submodule-rt-");
+    let root = root_dir.path().to_path_buf();
+    init_repo(&root.join("sub-src"));
+    git(&root, &["clone", "-q", "--bare", "sub-src", "origin.git"]);
+    let origin = root.join("origin.git");
+    let sup = root.join("super");
+    init_repo(&sup);
+    git(
+        &sup,
+        &["submodule", "add", "-q", origin.to_str().unwrap(), "sub"],
+    );
+    git(&sup, &["commit", "-q", "-m", "add submodule"]);
+    let sub = sup.join("sub");
+    git(&sub, &["checkout", "-q", "main"]);
+    std::fs::write(sub.join("wip.txt"), "wip\n").unwrap();
+    git(&sub, &["add", "wip.txt"]);
+    git(&sub, &["commit", "-q", "-m", "local wip"]);
+    let sha = git(&sub, &["rev-parse", "HEAD"]);
+    let src_status = git(&sup, &["status", "--porcelain"]);
+    assert_eq!(src_status, "M sub", "source gitlink is modified");
+
+    let source = start(WsOptions::default()).await;
+    let target = start(WsOptions::default()).await;
+
+    let created = wss_call(
+        source.port,
+        source.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS Submodule Transfer","worktreePath":"{}","path":"{}"}}}}"#,
+            sup.display(),
+            sup.display(),
+        ),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+
+    // Subscribe BEFORE start so this connection sees the build's events.
+    let mut sub_ws = connect_ws(source.port, source.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{{"eventTypes":["workspace:transfer:ready","workspace:transfer:failed"],"workspaceId":"{ws_id}"}}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .expect("send subscribe");
+    loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                assert!(v["result"]["subscriptionId"].is_string(), "subscribe: {v}");
+                break;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    let started = wss_call(
+        source.port,
+        source.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.export.start","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let export_id = started["result"]["exportId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("exportId: {started}"))
+        .to_string();
+
+    let ready = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] != "events.event" {
+                        continue;
+                    }
+                    let event = &v["params"]["event"];
+                    match event["type"].as_str() {
+                        Some("workspace:transfer:ready") => return event.clone(),
+                        Some("workspace:transfer:failed") => panic!("export failed: {event}"),
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:transfer:ready");
+    let data = &ready["data"];
+    assert_eq!(data["exportId"], export_id.as_str(), "{ready}");
+    let manifest = data["manifest"].clone();
+    assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{ready}");
+    assert_eq!(
+        manifest["git"]["submodules"],
+        serde_json::json!([{
+            "name": "sub", "path": "sub", "commitSha": sha, "branch": "main", "carried": true
+        }]),
+        "ready manifest lists the carried submodule commit: {ready}"
+    );
+    let size = data["archiveSizeBytes"].as_u64().expect("size");
+    let sha256 = data["archiveSha256"].as_str().expect("sha").to_string();
+    let total_chunks = data["totalChunks"].as_u64().expect("totalChunks");
+
+    // Relay: chunked reads on the source → begin/chunk/commit on the target.
+    let begin = wss_call(
+        target.port,
+        target.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.import.begin","params":{{"manifest":{manifest},"archiveSizeBytes":{size},"archiveSha256":"{sha256}"}}}}"#
+        ),
+    )
+    .await;
+    let import_id = begin["result"]["importId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("importId: {begin}"))
+        .to_string();
+    let mut archive = Vec::new();
+    for seq in 0..total_chunks {
+        let chunk = wss_call(
+            source.port,
+            source.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":{seq}}}}}"#,
+                10 + seq
+            ),
+        )
+        .await;
+        let b64 = chunk["result"]["data"]
+            .as_str()
+            .unwrap_or_else(|| panic!("chunk data: {chunk}"));
+        archive.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("base64"),
+        );
+        let put = wss_call(
+            target.port,
+            target.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"workspace.import.chunk","params":{{"importId":"{import_id}","seq":{seq},"data":"{b64}"}}}}"#,
+                50 + seq
+            ),
+        )
+        .await;
+        assert_eq!(put["result"]["seq"], seq, "{put}");
+    }
+    assert_eq!(archive.len() as u64, size);
+    assert_eq!(sha256_hex(&archive), sha256);
+    {
+        let reader = std::io::Cursor::new(&archive);
+        let mut zip = zip::ZipArchive::new(reader).expect("valid zip");
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            names.contains(&"git/submodules/0.bundle".to_string()),
+            "archive carries the submodule bundle: {names:?}"
+        );
+    }
+
+    let committed = wss_call(
+        target.port,
+        target.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":90,"method":"workspace.import.commit","params":{{"importId":"{import_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(committed["result"]["workspace"]["id"], ws_id, "{committed}");
+    let checkout = std::path::PathBuf::from(
+        committed["result"]["workspace"]["repositoryPath"]
+            .as_str()
+            .unwrap_or_else(|| panic!("repositoryPath: {committed}")),
+    );
+    assert!(
+        checkout.starts_with(target.dir.path().join("workspaces").join(&ws_id)),
+        "checkout under the target's workspaces root: {}",
+        checkout.display()
+    );
+    assert_eq!(committed["result"]["workspace"]["checkoutMode"], "direct");
+
+    // The hydrated submodule: at the unpublished commit, on its branch, with
+    // its original origin, content present, gitlink dirty as on the source.
+    let dst_sub = checkout.join("sub");
+    assert!(dst_sub.join(".git").exists(), "submodule initialized");
+    assert_eq!(git(&dst_sub, &["rev-parse", "HEAD"]), sha);
+    assert_eq!(git(&dst_sub, &["branch", "--show-current"]), "main");
+    assert_eq!(
+        std::fs::read_to_string(dst_sub.join("wip.txt")).expect("submodule file"),
+        "wip\n"
+    );
+    assert_eq!(
+        git(&dst_sub, &["remote", "get-url", "origin"]),
+        origin.to_str().unwrap()
+    );
+    assert_eq!(
+        git(&checkout, &["config", "submodule.sub.url"]),
+        origin.to_str().unwrap()
+    );
+    assert_eq!(git(&checkout, &["status", "--porcelain"]), src_status);
+    assert!(
+        git(&checkout, &["submodule", "status"]).starts_with(&format!("+{sha}")),
+        "gitlink differs from HEAD exactly as on the source"
+    );
+    // No config under the checkout mentions the target's staging area.
+    for config in [
+        checkout.join(".git/config"),
+        checkout.join(".git/modules/sub/config"),
+    ] {
+        let text = std::fs::read_to_string(&config).expect("config");
+        assert!(
+            !text.contains(".bundle"),
+            "{} references a bundle path:\n{text}",
+            config.display()
+        );
+    }
+    // The superproject itself has no remotes (the bundle was the only source).
+    assert_eq!(git(&checkout, &["remote"]), "");
+
+    // Finalize on the source without archiving: the WIP snapshot is unwound
+    // and the source is exactly as before the export.
+    let finalized = wss_call(
+        source.port,
+        source.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":91,"method":"workspace.export.finalize","params":{{"exportId":"{export_id}","archiveSource":false}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(finalized["result"]["finalized"], true, "{finalized}");
+    assert_eq!(git(&sup, &["status", "--porcelain"]), src_status);
+    assert_eq!(git(&sub, &["rev-parse", "HEAD"]), sha);
+
+    source.ws.stop().await;
+    target.ws.stop().await;
+}
+
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
 /// `graceful_shutdown_allows_immediate_restart`). Prefer `base_port: 0` for normal tests.
