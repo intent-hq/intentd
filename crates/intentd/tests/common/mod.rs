@@ -741,13 +741,19 @@ impl Drop for DaemonGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
+    #[cfg(unix)]
     #[test]
     fn guard_kills_process_on_drop() {
-        // Spawn a sleep process
+        // Spawn a sleep process. Detach all three stdio streams so the child
+        // never inherits nextest's stdout/stderr capture pipes — an inherited
+        // pipe is what nextest's leak detector keys on (intent-hq/intent#4284).
         let child = Command::new("sleep")
             .arg("3600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
@@ -757,14 +763,13 @@ mod tests {
             // Guard goes out of scope here
         }
 
-        // Process should be dead
-        // Check using kill -0 (send signal 0 to test if process exists)
-        let status = Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .expect("run kill -0");
+        // Process should be dead. Probe with signal 0 in-process instead of
+        // spawning an external `kill -0`, which would inherit the same pipes.
+        let probe = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None);
 
-        assert!(!status.success(), "process should be dead after guard drop");
+        assert!(
+            probe.is_err(),
+            "process should be dead after guard drop (kill(pid, 0) returned {probe:?})"
+        );
     }
 }
