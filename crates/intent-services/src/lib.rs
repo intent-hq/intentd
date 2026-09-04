@@ -234,11 +234,13 @@ struct ChildCompletionPasses {
     /// Ungrouped watch ids whose terminal wake is in flight on some pass.
     claimed_watches: HashSet<String>,
     /// The child's flipped-completion triggers, consumed from the store by
-    /// the first pass to stamp them and shared by every pass overlapping
-    /// it. The store take is destructive, so without this a split snapshot
-    /// (pass 1 claims watch A, pass 2 claims watch B) would stamp the flips
-    /// on one parent's terminal wake and lose them on the other's.
-    taken_flip_triggers: Option<Vec<(String, String)>>,
+    /// exactly one pass and shared by every pass overlapping it. The store
+    /// take is destructive, so without this a split snapshot (pass 1 claims
+    /// watch A, pass 2 claims watch B) would stamp the flips on one
+    /// parent's terminal wake and lose them on the other's. The cell
+    /// serializes the take itself: a second pass arriving before the first
+    /// take completes awaits it instead of taking an empty set.
+    taken_flip_triggers: Arc<tokio::sync::OnceCell<Vec<(String, String)>>>,
 }
 
 /// Registration of one in-flight delivery pass over `child`; dropping it
@@ -633,6 +635,13 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_claim_park`.
     completion_claim_park: Option<Arc<CompletionClassifyPark>>,
+    /// Test park seam (intent-hq/intent#4367) for the flipped-completion
+    /// take→publish window: parks the pass that consumed the child's flips
+    /// from the store before it publishes them to the overlapping passes,
+    /// so a concurrent pass reaching the take inside that window is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_completion_flip_take_park`.
+    completion_flip_take_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (monorepo#1481) for the attention mutation race window
     /// — parks `raise_attention` / `mark_seen` / `dismiss_attention`
     /// immediately before their scoped attention write (the site of the
@@ -1111,6 +1120,7 @@ impl Services {
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
             completion_claim_park: None,
+            completion_flip_take_park: None,
             attention_write_park: None,
             wake_archived_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
@@ -1792,6 +1802,20 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_completion_claim_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
         self.completion_claim_park = Some(park);
+        self
+    }
+
+    /// Test seam (intent-hq/intent#4367): park the delivery pass that
+    /// consumed the child's flipped-completion triggers from the store
+    /// between its take and the publish to the overlapping passes, so a
+    /// concurrent pass reaching the take inside that window is
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_completion_flip_take_park(
+        mut self,
+        park: Arc<CompletionClassifyPark>,
+    ) -> Self {
+        self.completion_flip_take_park = Some(park);
         self
     }
 
@@ -5190,40 +5214,40 @@ impl Services {
     }
 
     /// The flipped-completion triggers of `child_id` for the calling
-    /// delivery pass: the store take is destructive, so the first pass to
-    /// need them publishes the taken set in the child's in-flight entry
-    /// and every overlapping pass reads the same set (intent-hq/intent#4367
-    /// review: two ungrouped parents settled by two concurrent passes must
-    /// both stamp the flips). Two passes racing the first take merge their
-    /// takes, so the union is what each of them stamps.
+    /// delivery pass: the store take is destructive, so exactly one pass
+    /// takes them and publishes the set in the child's in-flight entry,
+    /// and every overlapping pass awaits and reads that same set
+    /// (intent-hq/intent#4367 review: two ungrouped parents settled by two
+    /// concurrent passes must both stamp the flips). The cell serializes
+    /// the take: a pass arriving while the take is in flight awaits its
+    /// result instead of taking an empty set from the store. The cell is
+    /// cloned out under the registry lock and awaited outside it.
     async fn shared_flipped_completion_triggers(
         &self,
         child_id: &AgentId,
     ) -> Vec<(String, String)> {
-        let published = self
+        let cell = self
             .completion_deliveries_in_flight
             .lock()
             .expect("completion delivery claim registry poisoned")
             .get(child_id)
-            .and_then(|entry| entry.taken_flip_triggers.clone());
-        if let Some(flips) = published {
-            return flips;
-        }
-        let taken = self.take_flipped_completion_triggers(child_id).await;
-        let mut registry = self
-            .completion_deliveries_in_flight
-            .lock()
-            .expect("completion delivery claim registry poisoned");
-        let Some(entry) = registry.get_mut(child_id) else {
-            return taken;
-        };
-        let shared = entry.taken_flip_triggers.get_or_insert_with(Vec::new);
-        for pair in taken {
-            if !shared.contains(&pair) {
-                shared.push(pair);
+            .map(|entry| entry.taken_flip_triggers.clone())
+            .unwrap_or_default();
+        cell.get_or_init(|| async {
+            let taken = self.take_flipped_completion_triggers(child_id).await;
+            // Test seam: park the consuming pass between its take and the
+            // publish so a concurrent pass reaching the take inside that
+            // window is deterministic.
+            if let Some(park) = &self.completion_flip_take_park {
+                if !taken.is_empty() {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
             }
-        }
-        shared.clone()
+            taken
+        })
+        .await
+        .clone()
     }
 
     /// Whether `agent_id` is currently idle-but-waiting on OTHER agents: it

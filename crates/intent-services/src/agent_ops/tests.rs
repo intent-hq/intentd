@@ -20142,8 +20142,12 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
 /// watch (pass 1 claims A's, pass 2 claims C's). The flipped-completion take
 /// is destructive, so a per-pass memo would stamp the child's flips on only
 /// the first taker's wake and lose them on the other parent's ONLY terminal
-/// wake. The taken set is shared across overlapping passes per child: both
-/// wakes carry the flipped task.
+/// wake — and a shared memo that is merely check-then-take still loses them
+/// when pass 2 reaches the take while pass 1's take is in flight (pass 2
+/// takes an empty set). The take is serialized per child and its result
+/// shared across overlapping passes: both wakes carry the flipped task. The
+/// flip-take park forces exactly that interleaving: pass 1 is held between
+/// its take and the publish while pass 2 is released into the take.
 #[tokio::test]
 async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
     let tmp = TempDb::new();
@@ -20151,7 +20155,10 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let park = Arc::new(crate::CompletionClassifyPark::default());
-    let svc = Services::new(store).with_completion_claim_park(park.clone());
+    let flip_park = Arc::new(crate::CompletionClassifyPark::default());
+    let svc = Services::new(store)
+        .with_completion_claim_park(park.clone())
+        .with_completion_flip_take_park(flip_park.clone());
     let a = create_agent(&svc, &ws, "A").await;
     let c = create_agent(&svc, &ws, "C").await;
     let b = create_agent(&svc, &ws, "B").await;
@@ -20191,8 +20198,22 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
         .await
         .expect("second pass parked on the other claimed watch");
 
+    // Release pass 1 alone: it consumes the child's flips from the store and
+    // parks before publishing them.
     park.release.notify_one();
+    timeout(Duration::from_secs(2), flip_park.entered.notified())
+        .await
+        .expect("first pass parked between its flip take and the publish");
+    // Release pass 2 while pass 1 holds that window: it reaches the flip
+    // take with the store already drained and must await pass 1's result
+    // rather than take (and stamp) an empty set.
     park.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !second.is_finished(),
+        "second pass must not settle its wake before the flips are published"
+    );
+    flip_park.release.notify_one();
     timeout(Duration::from_secs(5), first)
         .await
         .expect("first pass completes")
