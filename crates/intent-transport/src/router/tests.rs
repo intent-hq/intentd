@@ -5943,7 +5943,7 @@ mod send_message_payload_forwarding {
     }
 }
 
-/// `agent.dismissQuestions` (PROTOCOL §5.5, question hold): the dispatch arm
+/// `agent.dismissQuestions` (PROTOCOL §5.5, pending questions): the dispatch arm
 /// forwards `workspaceId`/`agentId`/`messageId` verbatim and rejects missing
 /// params with `-32602` before any API call.
 mod dismiss_questions_dispatch {

@@ -528,7 +528,7 @@ async fn transfer_plan_stays_within_statement_budget() {
 /// fold `updated_at` and count task stats, read the agent-session summaries
 /// TWICE per workspace (once for `agentSummary`/`lastActivity`, once inside
 /// the attention probe), and issued a per-session store probe for the
-/// question hold even when the summary already carried the persisted marker
+/// pending questions even when the summary already carried the persisted marker
 /// — so dispatch duration scaled with stored note bytes and session count,
 /// blowing the 1s duration budget at ~120-agent scale. The enrichment now
 /// reads the note MAX aggregate + counting query, passes its one summaries

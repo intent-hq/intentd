@@ -3126,8 +3126,8 @@ impl Services {
                 .await;
             message_persisted = true;
         }
-        // Stored-on-write pending-questions marker (PROTOCOL §5.5, question
-        // hold): a question-bearing assistant tail arms the hold under this
+        // Stored-on-write pending-questions marker (PROTOCOL §5.5): a
+        // question-bearing assistant tail arms the marker under this
         // turn's message id (a newer question set overwrites an older marker
         // — single-slot). A question-FREE turn end deliberately does NOT
         // clear the marker: pendingness survives the agent's later turns
@@ -3902,7 +3902,7 @@ impl Services {
             tracing::debug!(agent = %agent_id, "harness-wake turn produced no content");
         }
         // Same stored-on-write pending-questions marker as the prompt-turn
-        // persist: a question-bearing wake tail arms the hold (question-free
+        // persist: a question-bearing wake tail arms the marker (question-free
         // tails leave the marker untouched).
         let marker_moved = if message_persisted && questions_persisted {
             self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
@@ -3911,7 +3911,7 @@ impl Services {
             false
         };
         // Same §6.5 step-0 recompute as the prompt-turn persist: only a
-        // question-bearing tail moves the question-hold derivation.
+        // question-bearing tail moves the pending-questions derivation.
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }

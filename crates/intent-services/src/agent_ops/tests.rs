@@ -22637,7 +22637,7 @@ async fn agent_watch_accepts_idle_target_with_pending_question() {
 
     svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
         .await
-        .expect("question-holding target is accepted");
+        .expect("target with pending questions is accepted");
     assert_eq!(
         svc.find_watches_for_child(&target).len(),
         1,
@@ -32199,7 +32199,7 @@ async fn resolve_proposal_resolutions_map_evicts_oldest_past_cap() {
 /// row cannot make it disappear — the tail walk alone would stop seeing the
 /// question behind that row.
 #[tokio::test]
-async fn question_hold_tail_fallback_materializes_marker_and_survives_user_row() {
+async fn pending_questions_tail_fallback_materializes_marker_and_survives_user_row() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
 
@@ -32319,7 +32319,7 @@ async fn materialize_legacy_pending_questions_marker_writes_marker_from_tail() {
 /// still-pending question message, matching the FE's `derivePendingQuestions`
 /// (which only ever resolves on a `user`/`assistant` row).
 #[tokio::test]
-async fn question_hold_survives_trailing_system_row() {
+async fn pending_questions_survive_trailing_system_row() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
 
@@ -32373,7 +32373,7 @@ async fn question_hold_survives_trailing_system_row() {
 /// tail — so repeated interruption markers can never bury a still-pending
 /// question and let an automatic delivery supersede it.
 #[tokio::test]
-async fn question_hold_survives_many_trailing_system_rows() {
+async fn pending_questions_survive_many_trailing_system_rows() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
 
@@ -32852,7 +32852,7 @@ async fn dismiss_questions_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------
-// Persisted pending-questions marker (PROTOCOL §5.5, question hold)
+// Persisted pending-questions marker (PROTOCOL §5.5)
 // ---------------------------------------------------------------------------
 
 /// A `question_answers` `messageMetadata` tag naming `answered`.

@@ -154,7 +154,7 @@ impl PendingQuestionMutationLocks {
 /// turn that are still waiting for the turn-end drain (turn-attachment
 /// registry), plus questions already presented on the trailing assistant
 /// message and not yet answered or dismissed (the counting form of the
-/// question-hold derivation) — see [`Services::pending_question_count`].
+/// pending-questions derivation) — see [`Services::pending_question_count`].
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentSnapshot {
@@ -1981,7 +1981,7 @@ pub(crate) fn has_question_blocks(content: &Value) -> bool {
 }
 
 /// `messageMetadata.type` marker the FE's question wizard stamps on the
-/// flattened `Q:`/`A:` answer message (PROTOCOL §5.5, question hold). The daemon
+/// flattened `Q:`/`A:` answer message (PROTOCOL §5.5, pending questions). The daemon
 /// keys the pending-questions marker clear on this structured tag plus
 /// [`ANSWERED_QUESTIONS_MESSAGE_ID_FIELD`] — never on the answer TEXT.
 pub(crate) const QUESTION_ANSWERS_METADATA_TYPE: &str = "question_answers";
@@ -5020,12 +5020,13 @@ impl Services {
         }
         self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
             .await;
-        // Stored-on-write question-hold markers (PROTOCOL §5.5), same contract
-        // as the turn-end and user-send persists: an appended assistant row
-        // bearing question blocks arms the pending marker, an appended user
-        // row tagged `question_answers` for the marked message clears it.
-        // Only those two transitions move the hold — a plain user row leaves
-        // it pending — so they also gate the displayStatus recompute below.
+        // Stored-on-write pending-questions markers (PROTOCOL §5.5), same
+        // contract as the turn-end and user-send persists: an appended
+        // assistant row bearing question blocks arms the pending marker, an
+        // appended user row tagged `question_answers` for the marked message
+        // clears it. Only those two transitions move the marker — a plain user
+        // row leaves it pending — so they also gate the displayStatus
+        // recompute below.
         let hold_moved = if role == "assistant" && has_question_blocks(&content) {
             self.record_pending_questions_marker(&session.workspace_id, &agent_id, &message.id)
                 .await
@@ -5050,9 +5051,9 @@ impl Services {
         } else {
             false
         };
-        // A moved question-hold derivation — an answered question set retires
-        // the hold, an assistant row with a trailing question block raises it
-        // — flips the workspace's needs_attention displayStatus (§6.5 step 0):
+        // A moved pending-questions derivation — an answered question set
+        // retires it, an assistant row with a trailing question block raises
+        // it — flips the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare (monorepo#1266).
         if hold_moved {
             self.maybe_emit_display_status_changed(&session.workspace_id)
@@ -5156,7 +5157,7 @@ impl Services {
         // The swap re-mints row ids, so any surviving pending-questions marker
         // is dangling: re-derive it from the new transcript (same contract as
         // the `agent.editAndRegenerate` truncation). The swapped transcript can
-        // move the question-hold derivation in either direction, so the
+        // move the pending-questions derivation in either direction, so the
         // re-derivation also recomputes the workspace's needs_attention
         // displayStatus (§6.5 step 0, monorepo#1266) and kicks the queue drain
         // for entries a now-released hold parked.
@@ -5242,11 +5243,11 @@ impl Services {
         let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         let truncated_count = messages.len() - inserted.len();
-        // Question hold (PROTOCOL §5.5): truncation drops the rows the
+        // Pending questions (PROTOCOL §5.5): truncation drops the rows the
         // pending-questions marker may name AND re-mints ids for the kept rows
         // (`replace_agent_messages`), so a surviving marker would be dangling
-        // — and since the hold derivation never checks that the marked row
-        // still exists, a dangling marker would wedge the hold forever. The
+        // — and since the derivation never checks that the marked row still
+        // exists, a dangling marker would wedge the pending set forever. The
         // marker is therefore explicitly RE-DERIVED from the post-truncation
         // transcript (never tolerated as dangling), which also recomputes the
         // needs_attention displayStatus and kicks the drain when the
@@ -5916,7 +5917,7 @@ impl Services {
                 // Publish agent:message events using the store-returned message id.
                 self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
                     .await;
-                // Answer intake (PROTOCOL §5.5, question hold): parity with
+                // Answer intake (PROTOCOL §5.5, pending questions): parity with
                 // the runtime `AgentManager::send_message` persist — a
                 // `question_answers` tag naming the marked assistant message
                 // clears the pending-questions marker, and only that clear can
@@ -5953,7 +5954,7 @@ impl Services {
                 // path's behavior. `message_metadata` rides along too: an
                 // answer auto-queued after a failed write must keep its
                 // `question_answers` tag, or the drain persist can no longer
-                // clear the pending-questions marker and the hold wedges.
+                // clear the pending-questions marker and the pending set wedges.
                 let (queued, position) = self.enqueue_message(
                     &agent_id,
                     content,
@@ -6072,7 +6073,7 @@ impl Services {
         // Publish agent:message events using the store-returned message id.
         self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
             .await;
-        // Answer intake (PROTOCOL §5.5, question hold): parity with the
+        // Answer intake (PROTOCOL §5.5, pending questions): parity with the
         // runtime `send_queued_message_now` persist — only a matching answer
         // tag clears the marker, and only that clear can retire the
         // workspace's needs_attention displayStatus (§6.5 step 0).
@@ -6229,7 +6230,7 @@ impl Services {
         // statement that decodes at most ONE message
         // ([`Store::get_last_non_system_message`]), never by paging full
         // rows back through the tail. An empty or all-system transcript has
-        // no hold; store errors fail open.
+        // nothing pending; store errors fail open.
         let Ok(Some(last)) = self.store.get_last_non_system_message(agent_id).await else {
             return None;
         };
@@ -6254,7 +6255,7 @@ impl Services {
     /// `agent:updated` with the marker so clients re-read the `AgentLite`
     /// projection. Returns `true` only when this call committed the latest
     /// marker. Best-effort: a failure is logged and never fails the turn (the
-    /// hold simply stays as it was).
+    /// marker simply stays as it was).
     pub(crate) async fn record_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
@@ -6788,7 +6789,7 @@ impl Services {
         }
         // Self-contained event (monorepo#3180): carry the session's
         // pending-questions marker alongside the dismissal marker so clients
-        // can re-derive the hold from this one event without an extra
+        // can re-derive the pending set from this one event without an extra
         // `agent.get` round-trip. Same projection rule as `AgentLite`:
         // present when the marker was ever written (the empty string is the
         // authoritative clear), omitted for legacy marker-less sessions. The
@@ -6796,7 +6797,7 @@ impl Services {
         // mutation lock — marker set/clear paths hold that lock across their
         // write + event, so the value emitted here is coherent with the event
         // order a client observes; the top-of-op snapshot could be stale by
-        // emit time and would let a client re-derive an already-cleared hold
+        // emit time and would let a client re-derive an already-cleared set
         // (PR #1496 review).
         {
             let lock = self.pending_question_mutation_locks.lock_for(&agent_id);

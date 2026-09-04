@@ -1944,12 +1944,12 @@ mod workspace_needs_attention {
     }
 
     /// A written pending-questions marker on the summary decides the
-    /// question hold inline (monorepo#3058): no per-session store probe, so
-    /// the hold reads correctly even with the message log unavailable. Set
-    /// marker → holds; marker matching the dismissal → no hold; cleared
-    /// (empty-written) marker → no hold and NO tail-walk fallback.
+    /// pending set inline (monorepo#3058): no per-session store probe, so
+    /// pendingness reads correctly even with the message log unavailable. Set
+    /// marker → pending; marker matching the dismissal → not pending; cleared
+    /// (empty-written) marker → not pending and NO tail-walk fallback.
     #[tokio::test]
-    async fn written_markers_decide_question_hold_without_store_reads() {
+    async fn written_markers_decide_pending_questions_without_store_reads() {
         let (svc, ws, _tmp) = setup().await;
         let pending = mk_session(&ws, "agent-pending");
         let mut pending = pending;
@@ -1975,7 +1975,7 @@ mod workspace_needs_attention {
                 Some(std::slice::from_ref(&pending)),
             )
             .await;
-        assert!(holds.needs_attention, "set marker holds");
+        assert!(holds.needs_attention, "set marker is pending");
         for (name, session) in [("resolved", resolved), ("cleared", cleared)] {
             let s = svc
                 .workspace_attention_signals(
@@ -1984,7 +1984,7 @@ mod workspace_needs_attention {
                     Some(std::slice::from_ref(&session)),
                 )
                 .await;
-            assert!(!s.needs_attention, "{name} marker must not hold");
+            assert!(!s.needs_attention, "{name} marker must not be pending");
         }
     }
 }
@@ -2425,7 +2425,7 @@ mod display_status_events {
     }
 
     /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
-    /// persisting the dismissal marker retires the question hold and emits the
+    /// persisting the dismissal marker retires the pending set and emits the
     /// `needs_attention` → idle demotion.
     #[tokio::test]
     async fn question_dismiss_transition_emits() {
@@ -2902,7 +2902,7 @@ mod display_status_events {
     /// `agent.sendMessage` path). A PLAIN user message leaves the Q&A pending,
     /// so the workspace stays `needs_attention` and nothing emits.
     #[tokio::test]
-    async fn user_answer_retires_question_hold_and_emits() {
+    async fn user_answer_retires_pending_questions_and_emits() {
         let h = harness().await;
         let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-q2");
         h.store
