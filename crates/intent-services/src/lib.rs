@@ -224,6 +224,21 @@ pub(crate) struct CompletionClassifyPark {
     pub(crate) release: tokio::sync::Notify,
 }
 
+/// Ownership of one ungrouped watch's in-flight terminal delivery
+/// (intent-hq/intent#4367); see [`Services::claim_watch_delivery`]. Dropping
+/// the guard releases the claim on every exit of the delivering pass —
+/// delivered, retried, or unwound.
+struct WatchDeliveryClaim<'a> {
+    services: &'a Services,
+    watch_id: String,
+}
+
+impl Drop for WatchDeliveryClaim<'_> {
+    fn drop(&mut self) {
+        self.services.release_watch_delivery(&self.watch_id);
+    }
+}
+
 /// Test park for one pending-question marker mutation before it acquires the
 /// per-agent ordering lock. The target is `"set"` or `"clear"`; only the
 /// first matching call parks.
@@ -438,6 +453,21 @@ pub struct Services {
     /// any re-mark that does not re-qualify. In-memory only, like the
     /// parent set.
     advisory_pending_interim_skips: Arc<Mutex<HashSet<AgentId>>>,
+    /// Ungrouped completion watches whose terminal wake is being delivered
+    /// RIGHT NOW by some delivery pass (intent-hq/intent#4367). Two passes
+    /// can settle the same child concurrently — the completion-delivery
+    /// loop handling the live `agent:idle`, and the worker-exit
+    /// `redeliver_completion_after_queue_mutation` synthesizing the same
+    /// completion off a stale interim-skip marker — and each reads the
+    /// watch as still armed before either retires it. The stable wake id
+    /// does not close that window (a direct-send wake is not in the queue
+    /// and not yet persisted while its turn starts), so the parent received
+    /// two terminal wakes. The claim is taken before the "watch still
+    /// armed" check and released when the pass is done with the watch
+    /// (delivered + retired, or handed to the retry task); a pass that
+    /// finds the watch claimed skips it. In-memory only, like the other
+    /// live delivery state.
+    completion_deliveries_in_flight: Arc<Mutex<HashSet<String>>>,
     /// Process-local mirror of the persisted `advisory_wake_delivery`
     /// once-per-period markers: `(parent, child)` pairs whose monitoring-idle
     /// advisory was delivered this waiting period (PR #1686 review). The
@@ -561,6 +591,13 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_classify_park`.
     completion_classify_park: Option<Arc<CompletionClassifyPark>>,
+    /// Test park seam (intent-hq/intent#4367) for the completion-delivery
+    /// claim→send window: parks the ungrouped terminal delivery right after
+    /// it claims the watch and before the durable send, so a concurrent
+    /// delivery pass for the same child landing inside that window is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_completion_claim_park`.
+    completion_claim_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (monorepo#1481) for the attention mutation race window
     /// — parks `raise_attention` / `mark_seen` / `dismiss_attention`
     /// immediately before their scoped attention write (the site of the
@@ -1018,6 +1055,7 @@ impl Services {
             advisory_wake_periods: Arc::new(Mutex::new(HashSet::new())),
             stale_report_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             advisory_pending_interim_skips: Arc::new(Mutex::new(HashSet::new())),
+            completion_deliveries_in_flight: Arc::new(Mutex::new(HashSet::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -1037,6 +1075,7 @@ impl Services {
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
+            completion_claim_park: None,
             attention_write_park: None,
             wake_archived_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
@@ -1707,6 +1746,17 @@ impl Services {
         park: Arc<CompletionClassifyPark>,
     ) -> Self {
         self.completion_classify_park = Some(park);
+        self
+    }
+
+    /// Test seam (intent-hq/intent#4367): park the ungrouped terminal
+    /// delivery in its claim→send window (after the watch is claimed,
+    /// before the durable wake is sent) so a concurrent delivery pass for
+    /// the same child inside that window is deterministic. Production
+    /// wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_completion_claim_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.completion_claim_park = Some(park);
         self
     }
 
@@ -5036,6 +5086,30 @@ impl Services {
             .remove(child_id)
     }
 
+    /// Claim the ungrouped watch `watch_id` for terminal delivery
+    /// (intent-hq/intent#4367). `None` when another delivery pass already
+    /// holds it — the caller skips the watch: the owning pass either
+    /// delivers + retires it or hands it to the stable-id retry task, so a
+    /// skipped concurrent pass never strands the watch. The returned guard
+    /// releases the claim on drop.
+    fn claim_watch_delivery(&self, watch_id: &str) -> Option<WatchDeliveryClaim<'_>> {
+        self.completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned")
+            .insert(watch_id.to_string())
+            .then(|| WatchDeliveryClaim {
+                services: self,
+                watch_id: watch_id.to_string(),
+            })
+    }
+
+    fn release_watch_delivery(&self, watch_id: &str) {
+        self.completion_deliveries_in_flight
+            .lock()
+            .expect("completion delivery claim registry poisoned")
+            .remove(watch_id);
+    }
+
     /// Whether `agent_id` is currently idle-but-waiting on OTHER agents: it
     /// holds at least one live outgoing completion watch. The predicate never
     /// probes the target's settlement itself — it relies on the
@@ -6462,6 +6536,22 @@ impl Services {
                     continue;
                 }
             }
+            // intent-hq/intent#4367: the live `agent:idle` pass and the
+            // worker-exit synthesized redelivery can settle the same child
+            // concurrently; without a claim both read the watch as armed
+            // below (retirement only lands after the durable send) and the
+            // parent gets two terminal wakes. Claim BEFORE the armed check
+            // so the loser skips; the guard releases on every exit of this
+            // iteration (delivered, retried, or unwound).
+            let Some(_claim) = self.claim_watch_delivery(&watch.id) else {
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    watch = %watch.id,
+                    "terminal delivery already in flight on a concurrent pass, skipping"
+                );
+                continue;
+            };
             if !self
                 .find_watches_for_child(child_id)
                 .iter()
@@ -6473,6 +6563,13 @@ impl Services {
                     "watch already removed, skipping terminal delivery"
                 );
                 continue;
+            }
+            // Test seam: park in the claim→send window so a test can run a
+            // concurrent delivery pass for the same child while this one
+            // holds the claim.
+            if let Some(park) = &self.completion_claim_park {
+                park.entered.notify_one();
+                park.release.notified().await;
             }
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
