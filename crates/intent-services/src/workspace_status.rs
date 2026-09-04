@@ -435,7 +435,7 @@ impl Services {
     /// - `blocked` — a top-level pending `blocker` attention request.
     /// - `needs_attention` — a top-level pending non-blocker attention
     ///   request (`discussion`), pending structured questions
-    ///   ([`Services::question_hold_active`] — pending until answered or
+    ///   ([`Services::questions_pending`] — pending until answered or
     ///   dismissed, so a question the user walked away from keeps the
     ///   workspace flagged across the agent's later turns and daemon
     ///   restarts), or the workspace `attention` flag at `review_required`.
@@ -448,10 +448,10 @@ impl Services {
     /// deferred-attention registry does not count either: the workspace
     /// stays `in_progress` until the raising agent's turn-end flush
     /// surfaces the request. The cheap metadata
-    /// checks run over every candidate first, so the per-session hold reads
+    /// checks run over every candidate first, so the per-session pending reads
     /// only happen when `needs_attention` is still undecided. Best-effort: a
     /// store read failure fails open — session-derived signals read `false`
-    /// (and `question_hold_active` fails open itself) so list/get emission
+    /// (and `questions_pending` fails open itself) so list/get emission
     /// is never wedged; the flag-derived signal needs no store read.
     ///
     /// `sessions` — the workspace's session summaries when the caller already
@@ -511,18 +511,18 @@ impl Services {
                 // The summaries already carry the session `metadata`, so a
                 // written pending-questions marker is decided right here with
                 // no extra store read (monorepo#3058) — same derivation as
-                // [`Services::question_hold_active`]. Only pre-upgrade
+                // [`Services::questions_pending`]. Only pre-upgrade
                 // sessions (marker key never written) fall back to the full
                 // per-session probe, which also materializes the marker.
-                let hold = if session.pending_questions_marker_written() {
+                let pending = if session.pending_questions_marker_written() {
                     match session.pending_questions_message_id() {
                         Some(pending) => session.dismissed_questions_message_id() != Some(pending),
                         None => false,
                     }
                 } else {
-                    self.question_hold_active(&session.id).await
+                    self.questions_pending(&session.id).await
                 };
-                if hold {
+                if pending {
                     signals.needs_attention = true;
                     break;
                 }
@@ -1944,12 +1944,12 @@ mod workspace_needs_attention {
     }
 
     /// A written pending-questions marker on the summary decides the
-    /// question hold inline (monorepo#3058): no per-session store probe, so
-    /// the hold reads correctly even with the message log unavailable. Set
-    /// marker → holds; marker matching the dismissal → no hold; cleared
-    /// (empty-written) marker → no hold and NO tail-walk fallback.
+    /// pending set inline (monorepo#3058): no per-session store probe, so
+    /// pendingness reads correctly even with the message log unavailable. Set
+    /// marker → pending; marker matching the dismissal → not pending; cleared
+    /// (empty-written) marker → not pending and NO tail-walk fallback.
     #[tokio::test]
-    async fn written_markers_decide_question_hold_without_store_reads() {
+    async fn written_markers_decide_pending_questions_without_store_reads() {
         let (svc, ws, _tmp) = setup().await;
         let pending = mk_session(&ws, "agent-pending");
         let mut pending = pending;
@@ -1975,7 +1975,7 @@ mod workspace_needs_attention {
                 Some(std::slice::from_ref(&pending)),
             )
             .await;
-        assert!(holds.needs_attention, "set marker holds");
+        assert!(holds.needs_attention, "set marker is pending");
         for (name, session) in [("resolved", resolved), ("cleared", cleared)] {
             let s = svc
                 .workspace_attention_signals(
@@ -1984,7 +1984,7 @@ mod workspace_needs_attention {
                     Some(std::slice::from_ref(&session)),
                 )
                 .await;
-            assert!(!s.needs_attention, "{name} marker must not hold");
+            assert!(!s.needs_attention, "{name} marker must not be pending");
         }
     }
 }
@@ -2425,7 +2425,7 @@ mod display_status_events {
     }
 
     /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
-    /// persisting the dismissal marker retires the question hold and emits the
+    /// persisting the dismissal marker retires the pending set and emits the
     /// `needs_attention` → idle demotion.
     #[tokio::test]
     async fn question_dismiss_transition_emits() {
@@ -2902,7 +2902,7 @@ mod display_status_events {
     /// `agent.sendMessage` path). A PLAIN user message leaves the Q&A pending,
     /// so the workspace stays `needs_attention` and nothing emits.
     #[tokio::test]
-    async fn user_answer_retires_question_hold_and_emits() {
+    async fn user_answer_retires_pending_questions_and_emits() {
         let h = harness().await;
         let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-q2");
         h.store
@@ -2937,7 +2937,7 @@ mod display_status_events {
             .await
             .expect("send plain message");
         assert!(
-            h.services.question_hold_active(&session.id).await,
+            h.services.questions_pending(&session.id).await,
             "a plain user message must not resolve the pending Q&A"
         );
         assert_silent(&mut sub).await;

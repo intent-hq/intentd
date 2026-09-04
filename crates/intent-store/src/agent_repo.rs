@@ -3823,7 +3823,7 @@ impl Store {
     }
 
     /// The newest non-`system` message of an agent's log, hydrated as a
-    /// single row — the question-hold tail anchor (PROTOCOL §5.5). Trailing
+    /// single row — the pending-questions tail anchor (PROTOCOL §5.5). Trailing
     /// `system` rows are skipped inside SQL (a backwards walk over the
     /// `UNIQUE(agent_id, seq)` index), so per-call cost is one statement and
     /// at most ONE decoded message regardless of transcript size — the

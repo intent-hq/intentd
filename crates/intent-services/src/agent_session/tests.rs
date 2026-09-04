@@ -2480,7 +2480,7 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     // The user's ANSWER resolves the questions (appended via the op so the
     // pending-questions marker clears — the send paths carry the same
     // resolution, exercised elsewhere), then turn 2 persists a question-free
-    // tail: the turn-end recompute retires the hold and emits the demotion.
+    // tail: the turn-end recompute retires the pending set and emits the demotion.
     let asked_id = bus
         .store()
         .get_agent_messages(&agent_id, None)
@@ -2526,7 +2526,7 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     );
 }
 
-/// Stored-on-write pending-questions marker (PROTOCOL §5.5, question hold):
+/// Stored-on-write pending-questions marker (PROTOCOL §5.5):
 /// the turn-end persist writes the marker under the turn's message id when the
 /// assistant tail bears question blocks, and a subsequent question-FREE turn
 /// leaves it in place (pendingness survives the agent's own later turns).
@@ -2577,7 +2577,7 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
         Some(asked_id.as_str()),
         "turn end persists the pending-questions marker"
     );
-    assert!(services.question_hold_active(&agent_id).await);
+    assert!(services.questions_pending(&agent_id).await);
 
     // A question-free turn must NOT clear the marker.
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
@@ -2604,8 +2604,8 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
         "a question-free turn end must not clear the marker"
     );
     assert!(
-        services.question_hold_active(&agent_id).await,
-        "hold survives the agent's later turn"
+        services.questions_pending(&agent_id).await,
+        "pending questions survive the agent's later turn"
     );
 }
 
@@ -2910,7 +2910,7 @@ async fn delayed_question_set_cannot_resurrect_answered_marker() {
         None,
         "delayed set must not resurrect the answered marker"
     );
-    assert!(!services.question_hold_active(&agent_id).await);
+    assert!(!services.questions_pending(&agent_id).await);
     assert!(
         timeout(Duration::from_millis(300), sub.recv())
             .await
@@ -2970,7 +2970,7 @@ async fn append_message_op_answer_row_retires_needs_attention() {
         .await
         .expect("plain appendMessage succeeds");
     assert!(
-        services.question_hold_active(&agent_id).await,
+        services.questions_pending(&agent_id).await,
         "a plain user row must not resolve the pending Q&A"
     );
     assert!(
@@ -3006,7 +3006,7 @@ async fn append_message_op_answer_row_retires_needs_attention() {
 
 /// monorepo#1266 regression (raise): an assistant row with a trailing
 /// question resource block appended via `agent.appendMessage` activates the
-/// question hold, so the op's own recompute must promote the workspace's
+/// pending set, so the op's own recompute must promote the workspace's
 /// displayStatus to `needs_attention` and emit the transition.
 #[tokio::test]
 async fn append_message_op_question_row_raises_needs_attention() {
@@ -3039,7 +3039,7 @@ async fn append_message_op_question_row_raises_needs_attention() {
 }
 
 /// monorepo#1266 regression: `agent.replaceMessages` swaps the whole
-/// transcript, which can move the question-hold derivation in either
+/// transcript, which can move the pending-questions derivation in either
 /// direction — a swap whose question row is answered retires
 /// `needs_attention`, a swap ending on an unanswered question-bearing
 /// assistant row raises it again. Both flips must emit. The swap re-mints row
@@ -3106,7 +3106,7 @@ async fn replace_messages_op_moves_needs_attention_both_ways() {
 }
 
 /// monorepo#1266 transition-only guard: an `agent.appendMessage` mutation
-/// that does NOT move the derivation (a user row onto an already-hold-free
+/// that does NOT move the derivation (a user row onto an already question-free
 /// transcript) recomputes silently — no `workspace:displayStatus-changed`.
 #[tokio::test]
 async fn append_message_op_without_derivation_change_emits_nothing() {

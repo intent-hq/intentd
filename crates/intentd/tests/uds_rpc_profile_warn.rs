@@ -388,12 +388,12 @@ async fn get_subscriptions_stays_within_statement_budget() {
 /// now a chunked bulk statement, keeping every queue mutation at a flat
 /// statement count regardless of queue depth.
 ///
-/// Hermetic shape: an assistant message carrying a pending-question resource
-/// block arms the question hold, whose drain gate parks automatic-origin
-/// entries (no provider turn ever spawns). 40 `agent.queueMessage` calls then
-/// grow the queue to 40 entries; pre-fix the later dispatches ran 40+
-/// statements each (DELETE + one INSERT per entry), tripping the default
-/// budget of 25 — the batched shape stays at a handful per call.
+/// Hermetic shape: the workspace is archived, whose drain gate parks
+/// automatic-origin entries (no provider turn ever spawns). 40
+/// `agent.queueMessage` calls then grow the queue to 40 entries; pre-fix the
+/// later dispatches ran 40+ statements each (DELETE + one INSERT per entry),
+/// tripping the default budget of 25 — the batched shape stays at a handful
+/// per call.
 #[tokio::test]
 async fn queue_mutations_stay_within_statement_budget_at_depth() {
     let (_daemon, socket, log_path) = spawn_daemon("itdp-queue", &[]);
@@ -422,28 +422,15 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
         .expect("agent id")
         .to_string();
 
-    // Arm the question hold so queued entries park instead of draining into
+    // Archive the workspace so queued entries park instead of draining into
     // a (non-hermetic) provider turn.
-    let question_blocks = json!([{
-        "type": "resource",
-        "resource": {
-            "uri": "intent://question/q-1",
-            "mimeType": "application/vnd.intent.question+json",
-            "text": "{\"questions\":[]}"
-        }
-    }]);
     let resp = rpc_with_params(
         &socket,
-        "agent.appendMessage",
-        json!({
-            "workspaceId": workspace_id,
-            "agentId": agent_id,
-            "role": "assistant",
-            "contentBlocks": question_blocks,
-        }),
+        "workspace.archive",
+        json!({ "workspaceId": workspace_id }),
     )
     .await;
-    assert!(resp["error"].is_null(), "question append failed: {resp}");
+    assert!(resp["error"].is_null(), "workspace archive failed: {resp}");
 
     for i in 0..40 {
         let resp = rpc_with_params(
@@ -459,7 +446,7 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
         assert!(resp["error"].is_null(), "queueMessage {i} failed: {resp}");
     }
 
-    // All 40 entries are parked (the hold never released).
+    // All 40 entries are parked (the workspace stays archived).
     let resp = rpc_with_params(
         &socket,
         "agent.getQueue",
@@ -541,7 +528,7 @@ async fn transfer_plan_stays_within_statement_budget() {
 /// fold `updated_at` and count task stats, read the agent-session summaries
 /// TWICE per workspace (once for `agentSummary`/`lastActivity`, once inside
 /// the attention probe), and issued a per-session store probe for the
-/// question hold even when the summary already carried the persisted marker
+/// pending questions even when the summary already carried the persisted marker
 /// — so dispatch duration scaled with stored note bytes and session count,
 /// blowing the 1s duration budget at ~120-agent scale. The enrichment now
 /// reads the note MAX aggregate + counting query, passes its one summaries

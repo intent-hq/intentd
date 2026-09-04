@@ -1565,7 +1565,6 @@ fn merge_replace_report(obj: &mut serde_json::Map<String, Value>, report: Option
 }
 
 /// Classify a successful send result into the top-level `delivery` outcome:
-/// `"held"` (parked behind the target's pending Q&A, `heldForQuestions`),
 /// `"queued"` (parked in the target's queue: target busy / non-interrupt
 /// send — but ALSO the indefinite parks, `quarantined: true` which drains
 /// only after `agent.retry` and `archivedParked: true` which drains only on
@@ -1602,9 +1601,7 @@ fn delivery_outcome(obj: &serde_json::Map<String, Value>) -> Option<&'static str
         _ => obj,
     };
     let flag = |k: &str| flags.get(k).and_then(Value::as_bool).unwrap_or(false);
-    if flag("heldForQuestions") {
-        Some("held")
-    } else if flag("queued") {
+    if flag("queued") {
         Some("queued")
     } else if flags.get("turnId").is_some() || flag("deduplicated") {
         Some("delivered")
@@ -1953,12 +1950,6 @@ mod tests {
             outcome(&json!({ "ok": true, "success": true, "queued": true })),
             Some("queued")
         );
-        assert_eq!(
-            outcome(&json!({
-                "ok": true, "success": true, "queued": true, "heldForQuestions": true
-            })),
-            Some("held")
-        );
         // Pre-merge `success: true` alone still classifies.
         assert_eq!(
             outcome(&json!({ "success": true, "queued": false, "turnId": "t-2" })),
@@ -1989,13 +1980,6 @@ mod tests {
                 "result": { "success": true, "queued": true }
             })),
             Some("queued")
-        );
-        assert_eq!(
-            outcome(&json!({
-                "ok": true, "agentId": "a-1",
-                "result": { "success": true, "queued": true, "heldForQuestions": true }
-            })),
-            Some("held")
         );
     }
 

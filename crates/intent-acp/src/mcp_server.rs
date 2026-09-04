@@ -38,8 +38,8 @@ pub use bindings::app::proposal::{
     is_valid_proposal, proposal_resource_uri, PROPOSAL_RESOURCE_MIME_TYPE,
 };
 
-// Canonical question MIME type (§7.1): the question-hold derivation in
-// `intent-services` reuses this so hold detection cannot drift from what
+// Canonical question MIME type (§7.1): the pending-questions derivation in
+// `intent-services` reuses this so question detection cannot drift from what
 // `ws.app.question.ask` emits.
 pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
 

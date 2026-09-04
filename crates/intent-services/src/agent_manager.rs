@@ -437,15 +437,13 @@ pub struct TurnOptions {
     /// `publish_error_status_and_requeue` threads it onto the requeued entry
     /// so a retry of the same logical turn keeps the original id.
     pub turn_id: Option<String>,
-    /// Who originated this delivery (question hold, PROTOCOL §5.5):
-    /// `MessageOrigin::User` (FE `agent.sendMessage` / explicit user actions)
-    /// is never held (but never releases the hold either); the `Automatic`
-    /// default fails closed — an automatic send to an agent whose question
-    /// hold is active enqueues instead of claiming the turn slot, so a
-    /// pending Q&A is never buried by a system/agent turn.
+    /// Who originated this delivery: `MessageOrigin::User` (FE
+    /// `agent.sendMessage` / explicit user actions) clears a pending
+    /// attention request and is exempt from the archived-workspace park;
+    /// the `Automatic` default is a system/agent delivery.
     pub origin: intent_core::MessageOrigin,
     /// `true` when this delivery carries `priority: "interrupt"`. Every
-    /// fallback path that parks the message in the queue (question hold,
+    /// fallback path that parks the message in the queue (archived park,
     /// busy race, quarantine park, append-failure auto-queue, terminal-
     /// failure requeue) inserts it with interrupt priority — front of the
     /// queue, behind earlier interrupts (user decision, spec §Decisions).
@@ -476,8 +474,8 @@ impl TurnOptions {
 
 /// Reconstruct a [`TurnOptions::origin`] from a `QueuedMessage`'s persisted
 /// `user_origin` flag at the queue-drain handoffs, so a drained entry keeps
-/// its originator's semantics (question-hold bypass recorded at enqueue time;
-/// attention-request clear gated on user origin).
+/// its originator's semantics (archived-park exemption recorded at enqueue
+/// time; attention-request clear gated on user origin).
 fn origin_from_user_flag(user_origin: bool) -> intent_core::MessageOrigin {
     if user_origin {
         intent_core::MessageOrigin::User
@@ -5037,6 +5035,19 @@ impl AgentManager {
                     .await;
                 self.arm_auto_unarchive_flag_if_slot_held(agent_id);
             }
+            // Pre-upgrade pending-questions marker (PROTOCOL §5.5): a session
+            // whose marker key was never written derives pendingness from the
+            // transcript tail, and this turn's user row is about to become
+            // that tail. Materialize the marker HERE — the single choke point
+            // every runtime delivery (user or automatic, direct, drained, or
+            // wake) claims through before its user row INSERT — so a pending
+            // set live across the upgrade stays sticky instead of vanishing
+            // under the first delivery. One session-row read on the
+            // post-upgrade norm (marker written); best-effort, never blocks
+            // the turn.
+            self.services
+                .materialize_legacy_pending_questions_marker(agent_id)
+                .await;
             // A real turn is starting: this agent's monitoring-idle waiting
             // period (if any) is over, so clear its once-per-period advisory
             // markers — the NEXT hook-/PR-monitor-waiting idle opens a NEW
@@ -5616,94 +5627,6 @@ impl AgentManager {
                 }
             }
         }
-        // Question hold (PROTOCOL §5.5): an automatic delivery to an agent
-        // with un-dismissed pending questions must NOT start a turn — its
-        // turn would bury the pending Q&A under later transcript rows and
-        // steal the user's chance to answer. Park the message in the queue
-        // instead (interrupt priority included — no exceptions, spec
-        // §Decisions); only `agent.dismissQuestions` or an answer-tagged user
-        // row flips the hold false and kicks the drain. Checked BEFORE
-        // `try_begin` so even an idle agent holds the delivery.
-        if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
-            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
-                &agent_id,
-                Some(message_id.clone()),
-                content,
-                options.image_blocks.clone(),
-                options.file_blocks.clone(),
-                options.message_metadata.clone(),
-                options.queued_prepend(),
-                options.interrupt_priority,
-                false,
-            );
-            let result = json!({
-                "success": true,
-                "queued": true,
-                "heldForQuestions": true,
-                "queuedMessage": queued.to_value(position),
-                "turnId": queued.turn_id,
-            });
-            self.services.publish_queue_updated(&agent_id).await;
-            // Race close (hold-check → enqueue vs a concurrent
-            // `dismissQuestions`/answer): the hold may have flipped false
-            // between the check above and the enqueue just completing — the
-            // dismiss's own `try_drain_queue` kick could have fired against
-            // a still-empty queue and found nothing to drain. Re-check and
-            // kick again if the hold has since cleared, so this entry is not
-            // stranded until some unrelated future trigger.
-            if !self.services.question_hold_active(&agent_id).await {
-                self.clone()
-                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                    .await;
-            }
-            return Ok(result);
-        }
-        // FIFO restore under an active hold (monorepo#1791): a USER-origin
-        // send to an agent whose hold has parked ready-to-send entries must
-        // not bypass them with a direct turn — the parked backlog (e.g. an
-        // `after_all` settlement wake) would sit at position 0 while newer
-        // user messages run whole turns past it. Convert the send into a
-        // queue-fallback enqueue (user-origin) and kick the drain: the batch
-        // flush delivers the older parked entries FIFO in the SAME combined
-        // turn as this user message. Requires the `all` flush mode (the
-        // default): without batching no combined turn exists to carry the
-        // parked entries, so the conversion would only add a queue hop —
-        // under `systemOnly`/`off` the direct send stays as documented (the
-        // hold contract for automatic entries is unchanged either way).
-        // Also skipped when nothing is parked, so the common direct-send
-        // path is untouched — and for a session parked in `Error`, whose
-        // documented recovery IS the direct fresh send (the STAB-52 gate in
-        // `try_drain_queue` would strand a converted entry there).
-        if options.origin.is_user()
-            && session.status != AgentStatus::Error
-            && self.services.flush_queued_messages_mode()
-                == intent_core::FlushQueuedMessagesMode::All
-            && self.services.has_ready_to_send(&agent_id)
-            && self.services.question_hold_active(&agent_id).await
-        {
-            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
-                &agent_id,
-                Some(message_id.clone()),
-                content,
-                options.image_blocks.clone(),
-                options.file_blocks.clone(),
-                options.message_metadata.clone(),
-                options.queued_prepend(),
-                options.interrupt_priority,
-                true,
-            );
-            let result = json!({
-                "success": true,
-                "queued": true,
-                "queuedMessage": queued.to_value(position),
-                "turnId": queued.turn_id,
-            });
-            self.services.publish_queue_updated(&agent_id).await;
-            self.clone()
-                .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                .await;
-            return Ok(result);
-        }
         // Combined flush of parked archive notices (intent-hq/intent#3883):
         // a USER send into an ARCHIVED workspace whose queue holds parked
         // ready-to-send entries (hook/PR-monitor archive-cancellation wakes)
@@ -5715,9 +5638,9 @@ impl AgentManager {
         // auto-unarchives at the single existing choke point, and the batch
         // flush delivers the parked entries FIFO in the SAME combined turn
         // as this user message with the trailing unarchive prompt notice.
-        // Same guards as the #1791 hold arm above: requires the `all` flush
-        // mode (without batching no combined turn exists to carry the
-        // parked entries), skipped when nothing is parked (the common
+        // Requires the `all` flush mode (without batching no combined turn
+        // exists to carry the parked entries), skipped when nothing is
+        // parked (the common
         // direct-send path is untouched), and skipped for a session parked
         // in `Error`, whose documented recovery IS the direct fresh send
         // (the STAB-52 gate in `try_drain_queue` would strand a converted
@@ -5903,13 +5826,13 @@ impl AgentManager {
             self.services
                 .schedule_last_activity_event(workspace_id.clone());
         }
-        // Answer intake (PROTOCOL §5.5, question hold): a user row tagged
+        // Answer intake (PROTOCOL §5.5, pending questions): a user row tagged
         // `question_answers` naming the marked assistant message resolves the
         // pending Q&A and clears the marker (a stale/foreign
         // `answeredQuestionsMessageId` is a no-op). Only an ANSWER retires the
-        // hold now that pendingness is persisted — a plain user row leaves the
-        // marker as it was. Runs BEFORE the displayStatus recompute so the
-        // retired hold is reflected.
+        // marker now that pendingness is persisted — a plain user row leaves
+        // it as it was. Runs BEFORE the displayStatus recompute so the
+        // resolved marker is reflected.
         self.services
             .resolve_pending_questions_for_answer(
                 &workspace_id,
@@ -5917,7 +5840,7 @@ impl AgentManager {
                 options.message_metadata.as_ref(),
             )
             .await;
-        // The retired hold can drop the workspace's needs_attention
+        // The resolved marker can drop the workspace's needs_attention
         // displayStatus (§6.5 step 0): recompute-and-compare. This recompute
         // ALSO produces the visible `failed → in_progress` transition on the
         // errored-agent redrive path (a fresh sendMessage to a non-poisoned
@@ -5962,8 +5885,7 @@ impl AgentManager {
         // must not respawn a turn while the workspace is archived — messages
         // park until unarchive, which kicks this drain for every parked
         // queue (see `unarchive_workspace`). A USER-origin entry queued at
-        // or after `archivedAt` is exempt (intent-hq/intent#3883, mirroring
-        // the question-hold `hold_drain` exemption below): a user send made
+        // or after `archivedAt` is exempt (intent-hq/intent#3883): a user send made
         // INTO the archived workspace is the explicit resurrection signal,
         // so the drain proceeds — its `try_begin` claim performs the
         // auto-unarchive at the single existing choke point, and the batch
@@ -6010,28 +5932,6 @@ impl AgentManager {
                     false
                 }
             }
-        };
-        // Question hold (PROTOCOL §5.5): AUTOMATIC queued messages stay
-        // parked while the agent has un-dismissed pending questions — the
-        // turn a drained entry starts would bury the pending Q&A. The park
-        // now lasts across turns and daemon restarts (the marker is
-        // persisted): only `agent.dismissQuestions` and an answer-tagged user
-        // row flip the derivation false, and both re-kick this drain (mirrors
-        // the STAB-52 Error gate below). A parked USER-origin entry is
-        // exempt — it may itself BE the answer that releases the hold, so it
-        // drains rather than deadlocking behind it (`hold_drain` below); a
-        // plain user entry drains too but leaves the hold armed.
-        let hold_drain = if self.services.question_hold_active(&agent_id).await {
-            if !self.services.has_user_origin_ready(&agent_id) {
-                tracing::debug!(
-                    agent = %agent_id,
-                    "skipping queue drain: question hold active (awaiting answer or dismissQuestions)"
-                );
-                return;
-            }
-            true
-        } else {
-            false
         };
         // A session parked in `Error` must NOT be auto-redriven (STAB-52): the
         // terminal spawn/turn-failure handler requeues the failed message and
@@ -6103,19 +6003,17 @@ impl AgentManager {
         // Batch flush (`agents.flushQueuedMessages`, default `all`): with a
         // batching mode and MORE THAN ONE eligible entry waiting, drain them
         // all into ONE combined provider turn while persisting each entry as
-        // its own transcript row. Under an active hold (`hold_drain`) or an
-        // archived-workspace exemption (`archived_drain`) the flush fires
-        // only because a user-origin entry is ready — the parked automatic
-        // entries ride its combined turn FIFO instead of being bypassed
-        // (monorepo#1791; intent-hq/intent#3883). A single eligible entry
-        // (or the `off` mode) falls through to the existing single-entry
-        // path unchanged.
-        let user_led_drain = hold_drain || archived_drain;
+        // its own transcript row. Under an archived-workspace exemption
+        // (`archived_drain`) the flush fires only because a user-origin
+        // entry is ready — the parked automatic entries ride its combined
+        // turn FIFO instead of being bypassed (intent-hq/intent#3883). A
+        // single eligible entry (or the `off` mode) falls through to the
+        // existing single-entry path unchanged.
         {
             let mode = self.services.flush_queued_messages_mode();
             if let Some(batch) =
                 self.services
-                    .dequeue_flush_batch(&agent_id, mode, user_led_drain, 2)
+                    .dequeue_flush_batch(&agent_id, mode, archived_drain, 2)
             {
                 match prepare_flush_turn(&self, &agent_id, &workspace_id, batch).await {
                     FlushPrep::Turn { content, options } => {
@@ -6131,10 +6029,9 @@ impl AgentManager {
                 return;
             }
         }
-        // Under an active hold (or the archived-workspace exemption) only a
-        // user-origin entry may drain; the normal path pops the queue head
-        // as before.
-        let dequeued = if user_led_drain {
+        // Under the archived-workspace exemption only a user-origin entry
+        // may drain; the normal path pops the queue head as before.
+        let dequeued = if archived_drain {
             self.services.dequeue_user_origin_message(&agent_id)
         } else {
             self.services.dequeue_message(&agent_id)
@@ -6341,10 +6238,9 @@ impl AgentManager {
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
             prepend_file_blocks: entry.prepend_file_blocks.clone(),
-            // Explicit user action (question hold, PROTOCOL §5.5): "send
-            // now" bypasses the hold by design, and it delivers with
-            // interrupt priority — a terminal-failure requeue keeps the
-            // front-of-queue position.
+            // Explicit user action: "send now" is user-originated and
+            // delivers with interrupt priority — a terminal-failure requeue
+            // keeps the front-of-queue position.
             origin: intent_core::MessageOrigin::User,
             interrupt_priority: true,
             ..TurnOptions::default()
@@ -6357,8 +6253,8 @@ impl AgentManager {
             // the race): restore the entry at the FRONT so it is the next
             // message delivered, and report the queued outcome honestly.
             // The explicit "send now" is a user action: mark the restored
-            // entry user-origin so the winner's end-of-turn drain delivers
-            // it even while the question hold is active (§5.5 bypass).
+            // entry user-origin so the winner's end-of-turn drain keeps its
+            // user-origin semantics (attention clear, archived exemption).
             entry.user_origin = true;
             let restored = entry.to_value(0);
             self.services.requeue_front(&agent_id, entry);
@@ -6418,8 +6314,8 @@ impl AgentManager {
                     Some(entry.turn_id.as_str()),
                 )
                 .await;
-            // Answer intake (PROTOCOL §5.5, question hold): an answer that was
-            // queued and then explicitly sent still resolves the pending Q&A.
+            // Answer intake (PROTOCOL §5.5, pending questions): an answer that
+            // was queued and then explicitly sent still resolves the pending Q&A.
             // An untagged entry leaves the marker (and the workspace's
             // needs_attention displayStatus, §6.5 step 0) untouched, so the
             // recompute only runs on an actual clear.
@@ -6540,11 +6436,10 @@ impl AgentManager {
         if dropped {
             self.sync_stop_redelivery(&agent_id).await;
         }
-        // Explicit user action (question hold, PROTOCOL §5.5): the send is
-        // user-origin so it is never held. The truncation above already
-        // re-derived the pending-questions marker against the post-truncation
-        // transcript, so a Q&A the edit cut away is gone and one that survived
-        // stays pending.
+        // Explicit user action: the send is user-origin. The truncation
+        // above already re-derived the pending-questions marker (PROTOCOL
+        // §5.5) against the post-truncation transcript, so a Q&A the edit
+        // cut away is gone and one that survived stays pending.
         options.origin = intent_core::MessageOrigin::User;
         let mut result = self
             .send_message(agent_id, workspace_id, content, None, options)
@@ -6598,8 +6493,8 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
-        // Every queue fallback below (hold gate, busy race, quarantine park,
-        // append-failure auto-queue) must park this message at the FRONT of
+        // Every queue fallback below (archived gate, busy race, quarantine
+        // park, append-failure auto-queue) must park this message at the FRONT of
         // the queue (spec §Decisions: interrupts always enter ahead of
         // normal entries, arrival-ordered among themselves).
         options.interrupt_priority = true;
@@ -6608,12 +6503,9 @@ impl AgentManager {
         self.services.require_agent_session(&agent_id).await?;
         // Duplicate-delivery guard: check-and-record is atomic under the lock,
         // so of two racing duplicates exactly one proceeds. Runs BEFORE the
-        // hold check below so a held interrupt still records its id — an
-        // interrupt parked by the hold keeps the same at-most-once contract
-        // as one that streamed immediately: a duplicate with the same
-        // `message_id` arriving while the hold is active is deduplicated
-        // instead of double-enqueuing, and a replay arriving after the hold
-        // releases is deduplicated too.
+        // archived gate below so a parked interrupt still records its id and
+        // keeps the same at-most-once contract as one that streamed
+        // immediately.
         if let Some(mid) = message_id.as_deref() {
             let mut ids = self.interrupt_ids.lock().unwrap();
             if ids.get(&agent_id).map(String::as_str) == Some(mid) {
@@ -6625,16 +6517,6 @@ impl AgentManager {
                 }));
             }
             ids.insert(agent_id.clone(), mid.to_string());
-        }
-        // Question hold (PROTOCOL §5.5): an automatic interrupt is ALSO held
-        // — no exceptions (spec §Decisions). Skip the preemption entirely
-        // (there is nothing to preempt: the asking agent is idle, and a busy
-        // agent's hold cannot be active since the Q&A message is terminal)
-        // and let `send_message`'s hold gate park the message front-of-queue.
-        if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
-            return self
-                .send_message(agent_id, workspace_id, content, message_id, options)
-                .await;
         }
         // Archived-workspace gate (intent-hq/monorepo#2732): an automatic
         // interrupt into an archived workspace is ALSO parked — skip the
@@ -6944,11 +6826,11 @@ impl AgentManager {
         if self.busy.lock().unwrap().contains(agent_id) {
             return true;
         }
-        // Perf (PR review, PROTOCOL §5.5): a non-consuming peek — in-memory,
-        // no store round-trip — so the two `question_hold_active` reads
-        // below only run once a notification is actually buffered. Without
-        // this, every idle agent with a live handle costs ~2 SQLite reads
-        // per `HARNESS_WAKE_POLL` tick (50ms) even when nothing is pending.
+        // Perf (PR review): a non-consuming peek — in-memory, no store
+        // round-trip — so the retired-state read below only runs once a
+        // notification is actually buffered. Without this, every idle agent
+        // with a live handle costs a SQLite read per `HARNESS_WAKE_POLL`
+        // tick (50ms) even when nothing is pending.
         {
             let Ok(peek) = notes.try_lock() else {
                 return true;
@@ -6970,13 +6852,6 @@ impl AgentManager {
             .get_agent_session_retired_at(agent_id)
             .await
         {
-            return true;
-        }
-        // Question hold (PROTOCOL §5.5): an implicit harness wake turn would
-        // append a fresh assistant message, burying the pending Q&A the hold
-        // protects. Skip the tick (buffered notifications stay untouched)
-        // until the questions are answered or dismissed.
-        if self.services.question_hold_active(agent_id).await {
             return true;
         }
         // Owned lock so the claimed path below can move the receiver guard
@@ -9764,32 +9639,13 @@ async fn run_message_worker(
                 }
             }
         }
-        // Question hold (PROTOCOL §5.5): questions may still be pending —
-        // asked by the turn that just ended, or by an earlier turn the hold
-        // has kept armed since — so draining the next AUTOMATIC queued
-        // message would bury them. A parked USER-origin entry (a user answer
-        // that lost the busy race against this very turn) is exempt: it may
-        // itself be the hold's release, so it drains regardless. Otherwise
-        // skip the pre-release drain (no `break 'outer` here!) and fall through to the
-        // post-`end_turn` raced re-check below, which repeats this same
-        // hold-aware `dequeue_user_origin_message` check AFTER the slot is
-        // actually released — closing the window where a user answer enqueued
-        // between `has_user_origin_ready` returning false and the slot's
-        // release would otherwise strand behind a gone worker with nothing to
-        // kick `try_drain_queue`.
-        let hold_active = mgr.services.question_hold_active(&agent_id).await;
         // Batch flush (`agents.flushQueuedMessages`): same contract as the
         // `try_drain_queue` flush arm — ≥2 ready entries drain into one
-        // combined provider turn. Under an active hold the flush fires only
-        // when a user-origin entry is ready, and then carries EVERY ready
-        // entry FIFO (parked automatic wakes included, monorepo#1791);
-        // otherwise the single-entry arm below runs unchanged.
+        // combined provider turn; otherwise the single-entry arm below runs
+        // unchanged.
         {
             let mode = mgr.services.flush_queued_messages_mode();
-            if let Some(batch) = mgr
-                .services
-                .dequeue_flush_batch(&agent_id, mode, hold_active, 2)
-            {
+            if let Some(batch) = mgr.services.dequeue_flush_batch(&agent_id, mode, false, 2) {
                 match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
                     FlushPrep::Turn {
                         content: c,
@@ -9810,20 +9666,7 @@ async fn run_message_worker(
                 }
             }
         }
-        let drained = if hold_active {
-            if mgr.services.has_user_origin_ready(&agent_id) {
-                mgr.services.dequeue_user_origin_message(&agent_id)
-            } else {
-                tracing::debug!(
-                    agent = %agent_id,
-                    "worker drain suspended: question hold active (awaiting answer or dismissQuestions)"
-                );
-                None
-            }
-        } else {
-            mgr.services.dequeue_message(&agent_id)
-        };
-        if let Some(mut next) = drained {
+        if let Some(mut next) = mgr.services.dequeue_message(&agent_id) {
             mgr.services
                 .publish_queue_updated_for(
                     &agent_id,
@@ -9903,39 +9746,15 @@ async fn run_message_worker(
         // raced in just before / after the release. The re-check is wrapped in
         // the outer `'outer` loop (not its own inner loop) so the agent never
         // goes idle while ready-to-send messages remain — each re-claim of the
-        // slot continues `'outer` and re-enters the drain at the top. Same
-        // question-hold contract as the pre-release arm: while the hold is
-        // active only a user-origin entry may drain.
+        // slot continues `'outer` and re-enters the drain at the top. The
+        // popped entry travels as a batch so the slot-race failure below
+        // hands it back unchanged (`requeue_front_batch`).
         mgr.end_turn(&agent_id).await;
-        let raced_mode = mgr.services.flush_queued_messages_mode();
-        // Under an active hold with the `all` flush mode the raced re-check
-        // pops the WHOLE ready batch in ONE locked call (it fires only when
-        // a user-origin entry is ready). The oldest ready user entry may sit
-        // BEHIND older parked automatic entries, so a user-origin pop
-        // followed by a later batch fold + prepend would persist and prompt
-        // the newer user message ahead of the parked wakes it was dequeued
-        // from behind — a FIFO violation in exactly the race window this
-        // arm handles (monorepo#1791 review). The atomic batch keeps stored
-        // order end-to-end, and the slot-race failure below hands it back
-        // unchanged (`requeue_front_batch`).
-        let mut raced: Vec<QueuedMessage> = if mgr.services.question_hold_active(&agent_id).await {
-            match raced_mode {
-                intent_core::FlushQueuedMessagesMode::All => mgr
-                    .services
-                    .dequeue_ready_batch(&agent_id, true, 1)
-                    .unwrap_or_default(),
-                _ => mgr
-                    .services
-                    .dequeue_user_origin_message(&agent_id)
-                    .into_iter()
-                    .collect(),
-            }
-        } else {
-            mgr.services
-                .dequeue_message(&agent_id)
-                .into_iter()
-                .collect()
-        };
+        let mut raced: Vec<QueuedMessage> = mgr
+            .services
+            .dequeue_message(&agent_id)
+            .into_iter()
+            .collect();
         if raced.is_empty() {
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
@@ -10009,57 +9828,23 @@ async fn run_message_worker(
                     }
                 }
             }
-            // A multi-entry raced pop (hold + `all` above) is already the
-            // complete ready batch in stored order — run it as one combined
-            // turn directly; folding or reordering here would break the
-            // FIFO guarantee the atomic pop just preserved.
-            if raced.len() > 1 {
-                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, raced).await {
-                    FlushPrep::Turn {
-                        content: c,
-                        options: o,
-                    } => {
-                        content = c;
-                        options = *o;
-                        user_persisted = true;
-                        // New messages → fresh silent-redrive budget
-                        // (monorepo#764).
-                        silent_redrive_used = false;
-                        continue 'outer;
-                    }
-                    FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id);
-                        break 'outer;
-                    }
-                }
-            }
             let mut next = raced.pop().expect("raced batch non-empty");
             // Batch flush (`agents.flushQueuedMessages`): the single `next`
             // was popped before the slot re-claim, so fold any FURTHER
             // eligible entries in behind it and run them as one combined
             // turn. Mode `all`: any further ready entry (min 1 more ⇒ ≥2
-            // total; only the multi-entry hold case was handled atomically
-            // above, so a hold armed SINCE the pop still requires a
-            // user-origin entry — see the arm comment below). Mode
-            // `systemOnly`: only when `next` is ITSELF system-origin (and no
-            // hold is active) — a user-origin `next` never batches under
+            // total). Mode `systemOnly`: only when `next` is ITSELF
+            // system-origin — a user-origin `next` never batches under
             // `systemOnly`, so it falls through to the single-entry path
             // below unchanged. With no extra entry (or the `off` mode) the
             // single-entry path below also runs unchanged.
             let mode = mgr.services.flush_queued_messages_mode();
-            let hold = mgr.services.question_hold_active(&agent_id).await;
             let extra_batch = match mode {
                 intent_core::FlushQueuedMessagesMode::All => {
-                    // A single-entry raced pop under hold + `all` means
-                    // `next` was the ONLY ready entry at pop time; a hold
-                    // armed since (or an entry that raced in) still requires
-                    // a ready user-origin entry unless `next` itself is one
-                    // (monorepo#1791).
-                    mgr.services
-                        .dequeue_ready_batch(&agent_id, hold && !next.user_origin, 1)
+                    mgr.services.dequeue_ready_batch(&agent_id, false, 1)
                 }
                 intent_core::FlushQueuedMessagesMode::SystemOnly => {
-                    if hold || next.user_origin {
+                    if next.user_origin {
                         None
                     } else {
                         mgr.services.dequeue_system_only_batch(&agent_id, 1)
@@ -10530,7 +10315,7 @@ async fn persist_user(
     mgr.services
         .publish_agent_message_events(workspace_id, agent_id, &message, turn_id)
         .await;
-    // Answer intake (PROTOCOL §5.5, question hold): same contract as the
+    // Answer intake (PROTOCOL §5.5, pending questions): same contract as the
     // direct-send persist — a `question_answers` tag naming the marked
     // assistant message clears the pending-questions marker; anything else is
     // a no-op, and only the clear can move the workspace's needs_attention

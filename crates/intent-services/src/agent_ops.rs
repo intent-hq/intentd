@@ -154,7 +154,7 @@ impl PendingQuestionMutationLocks {
 /// turn that are still waiting for the turn-end drain (turn-attachment
 /// registry), plus questions already presented on the trailing assistant
 /// message and not yet answered or dismissed (the counting form of the
-/// question-hold derivation) — see [`Services::pending_question_count`].
+/// pending-questions derivation) — see [`Services::pending_question_count`].
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentSnapshot {
@@ -1017,7 +1017,7 @@ pub(crate) struct QueuedMessage {
     #[serde(default)]
     pub prepend_file_blocks: Option<Value>,
     /// `true` when this entry was enqueued with `priority: "interrupt"`
-    /// (question hold / PROTOCOL §5.5): interrupt entries ALWAYS enter the
+    /// (PROTOCOL §5.5): interrupt entries ALWAYS enter the
     /// queue ahead of all normal entries, preserving arrival order among
     /// themselves ([`Services::enqueue_message`]). Persisted so the ordering
     /// survives daemon restarts; `to_value` emits `interruptPriority: true`
@@ -1026,12 +1026,11 @@ pub(crate) struct QueuedMessage {
     pub interrupt_priority: bool,
     /// `true` when the entry carries a USER-originated `agent.sendMessage`
     /// that was parked by a queue-fallback path (busy race, quarantine,
-    /// append-failure). The question hold never blocks user messages
-    /// (PROTOCOL §5.5), so the hold-gated drain paths deliver the first
-    /// user-origin entry instead of suspending — without this marker a user
-    /// answer parked by the turn-end busy race would deadlock against the
-    /// hold its answer tag is supposed to release. Persisted so the bypass
-    /// survives daemon restarts.
+    /// append-failure). A drained user-origin entry keeps its originator's
+    /// semantics (attention-request clear, `systemOnly` flush exclusion),
+    /// and a user entry queued into an ARCHIVED workspace is the explicit
+    /// resurrection signal its drain gate exempts (intent-hq/intent#3883).
+    /// Persisted so the marker survives daemon restarts.
     #[serde(default)]
     pub user_origin: bool,
     /// Debounce-hold marker: `Some` marks the entry **held** — excluded from
@@ -1982,7 +1981,7 @@ pub(crate) fn has_question_blocks(content: &Value) -> bool {
 }
 
 /// `messageMetadata.type` marker the FE's question wizard stamps on the
-/// flattened `Q:`/`A:` answer message (PROTOCOL §5.5, question hold). The daemon
+/// flattened `Q:`/`A:` answer message (PROTOCOL §5.5, pending questions). The daemon
 /// keys the pending-questions marker clear on this structured tag plus
 /// [`ANSWERED_QUESTIONS_MESSAGE_ID_FIELD`] — never on the answer TEXT.
 pub(crate) const QUESTION_ANSWERS_METADATA_TYPE: &str = "question_answers";
@@ -4664,7 +4663,7 @@ impl Services {
         // organically, so without this a wake parked during retirement would
         // stay stranded until someone happened to message the agent (mirrors
         // `unarchive_workspace`'s kick). Best-effort: `try_drain_queue`
-        // re-checks its own gates (busy, question hold, Error park).
+        // re-checks its own gates (busy, archived, Error park).
         if let Some(manager) = self.agent_manager() {
             if self.has_ready_to_send(&agent_id) {
                 manager
@@ -5021,12 +5020,13 @@ impl Services {
         }
         self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
             .await;
-        // Stored-on-write question-hold markers (PROTOCOL §5.5), same contract
-        // as the turn-end and user-send persists: an appended assistant row
-        // bearing question blocks arms the pending marker, an appended user
-        // row tagged `question_answers` for the marked message clears it.
-        // Only those two transitions move the hold — a plain user row leaves
-        // it pending — so they also gate the displayStatus recompute below.
+        // Stored-on-write pending-questions markers (PROTOCOL §5.5), same
+        // contract as the turn-end and user-send persists: an appended
+        // assistant row bearing question blocks arms the pending marker, an
+        // appended user row tagged `question_answers` for the marked message
+        // clears it. Only those two transitions move the marker — a plain user
+        // row leaves it pending — so they also gate the displayStatus
+        // recompute below.
         let hold_moved = if role == "assistant" && has_question_blocks(&content) {
             self.record_pending_questions_marker(&session.workspace_id, &agent_id, &message.id)
                 .await
@@ -5051,9 +5051,9 @@ impl Services {
         } else {
             false
         };
-        // A moved question-hold derivation — an answered question set retires
-        // the hold, an assistant row with a trailing question block raises it
-        // — flips the workspace's needs_attention displayStatus (§6.5 step 0):
+        // A moved pending-questions derivation — an answered question set
+        // retires it, an assistant row with a trailing question block raises
+        // it — flips the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare (monorepo#1266).
         if hold_moved {
             self.maybe_emit_display_status_changed(&session.workspace_id)
@@ -5157,7 +5157,7 @@ impl Services {
         // The swap re-mints row ids, so any surviving pending-questions marker
         // is dangling: re-derive it from the new transcript (same contract as
         // the `agent.editAndRegenerate` truncation). The swapped transcript can
-        // move the question-hold derivation in either direction, so the
+        // move the pending-questions derivation in either direction, so the
         // re-derivation also recomputes the workspace's needs_attention
         // displayStatus (§6.5 step 0, monorepo#1266) and kicks the queue drain
         // for entries a now-released hold parked.
@@ -5243,11 +5243,11 @@ impl Services {
         let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         let truncated_count = messages.len() - inserted.len();
-        // Question hold (PROTOCOL §5.5): truncation drops the rows the
+        // Pending questions (PROTOCOL §5.5): truncation drops the rows the
         // pending-questions marker may name AND re-mints ids for the kept rows
         // (`replace_agent_messages`), so a surviving marker would be dangling
-        // — and since the hold derivation never checks that the marked row
-        // still exists, a dangling marker would wedge the hold forever. The
+        // — and since the derivation never checks that the marked row still
+        // exists, a dangling marker would wedge the pending set forever. The
         // marker is therefore explicitly RE-DERIVED from the post-truncation
         // transcript (never tolerated as dangling), which also recomputes the
         // needs_attention displayStatus and kicks the drain when the
@@ -5917,7 +5917,7 @@ impl Services {
                 // Publish agent:message events using the store-returned message id.
                 self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
                     .await;
-                // Answer intake (PROTOCOL §5.5, question hold): parity with
+                // Answer intake (PROTOCOL §5.5, pending questions): parity with
                 // the runtime `AgentManager::send_message` persist — a
                 // `question_answers` tag naming the marked assistant message
                 // clears the pending-questions marker, and only that clear can
@@ -5954,7 +5954,7 @@ impl Services {
                 // path's behavior. `message_metadata` rides along too: an
                 // answer auto-queued after a failed write must keep its
                 // `question_answers` tag, or the drain persist can no longer
-                // clear the pending-questions marker and the hold wedges.
+                // clear the pending-questions marker and the pending set wedges.
                 let (queued, position) = self.enqueue_message(
                     &agent_id,
                     content,
@@ -6073,7 +6073,7 @@ impl Services {
         // Publish agent:message events using the store-returned message id.
         self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
             .await;
-        // Answer intake (PROTOCOL §5.5, question hold): parity with the
+        // Answer intake (PROTOCOL §5.5, pending questions): parity with the
         // runtime `send_queued_message_now` persist — only a matching answer
         // tag clears the marker, and only that clear can retire the
         // workspace's needs_attention displayStatus (§6.5 step 0).
@@ -6091,7 +6091,7 @@ impl Services {
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
-    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff the
+    /// Pending-questions derivation (PROTOCOL §5.5): `true` iff the
     /// session's persisted pending-questions marker
     /// ([`intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY`], written at turn end
     /// when the assistant tail bears `application/vnd.intent.question+json`
@@ -6104,21 +6104,23 @@ impl Services {
     /// question-bearing turn resolves it.
     ///
     /// Pre-upgrade sessions (marker key absent entirely — the daemon never
-    /// wrote it) fall back to the legacy transcript tail walk so a hold that
-    /// was live across the upgrade is not lost: walk back from the tail past
-    /// any trailing `system` rows (e.g. the resume-interruption marker
-    /// `resume_interrupted_agent` appends BEFORE its `Automatic`
-    /// continuation) and hold when the first non-system row is an
+    /// wrote it) fall back to the legacy transcript tail walk so a pending
+    /// set that was live across the upgrade is not lost: walk back from the
+    /// tail past any trailing `system` rows (e.g. the resume-interruption
+    /// marker `resume_interrupted_agent` appends BEFORE its `Automatic`
+    /// continuation) and report pending when the first non-system row is an
     /// un-dismissed question-bearing assistant message. A marker written as
     /// the empty string is authoritative ("nothing pending") and does NOT
-    /// fall back. A hold derived that way is immediately MATERIALIZED as a
-    /// marker so it survives the very next user message: the tail walk stops
-    /// seeing the question once a plain user row lands, which is exactly the
-    /// disappearance this contract exists to prevent.
+    /// fall back. A pending set derived that way is immediately MATERIALIZED
+    /// as a marker so it survives the very next user message: the tail walk
+    /// stops seeing the question once a plain user row lands, which is
+    /// exactly the disappearance this contract exists to prevent.
     ///
-    /// Fails open (`false`) on store errors so a read failure can never wedge
-    /// deliveries.
-    pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
+    /// Drives ONLY the `needs_attention` derivation and the `numQuestionsAsked`
+    /// snapshot field — it never gates delivery or the queue drain (automatic
+    /// deliveries run under pending questions; the FE wizard stays sticky on
+    /// `pendingQuestionsMessageId`). Fails open (`false`) on store errors.
+    pub(crate) async fn questions_pending(&self, agent_id: &AgentId) -> bool {
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
@@ -6128,7 +6130,7 @@ impl Services {
                 None => false,
             };
         }
-        let Some(pending) = self.question_hold_active_from_tail(agent_id).await else {
+        let Some(pending) = self.pending_questions_from_tail(agent_id).await else {
             return false;
         };
         self.record_pending_questions_marker(&session.workspace_id, agent_id, &pending)
@@ -6136,14 +6138,38 @@ impl Services {
         true
     }
 
+    /// Turn-start materialization of the pre-upgrade fallback in
+    /// [`Services::questions_pending`]: for a session whose pending-questions
+    /// marker key was never written, derive pendingness from the transcript
+    /// tail and persist it as the marker BEFORE the starting turn appends its
+    /// user row (the tail walk stops seeing the question once any later
+    /// non-system row lands). Called from the runtime turn-slot claim
+    /// (`AgentManager::try_begin_outcome`), which every delivery path —
+    /// user or automatic, direct, drained, or wake — passes through ahead of
+    /// its user row INSERT. A session with a written marker (the
+    /// post-upgrade norm) costs one session-row read and returns; store
+    /// errors fail open.
+    pub(crate) async fn materialize_legacy_pending_questions_marker(&self, agent_id: &AgentId) {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return;
+        };
+        if session.pending_questions_marker_written() {
+            return;
+        }
+        if let Some(pending) = self.pending_questions_from_tail(agent_id).await {
+            self.record_pending_questions_marker(&session.workspace_id, agent_id, &pending)
+                .await;
+        }
+    }
+
     /// The number of question resource blocks still pending on the marked
-    /// question message — the counting form of the question-hold derivation
-    /// ([`Services::question_hold_active`] holds exactly when this is
-    /// non-zero, both keyed on the persisted pending-questions marker): the
+    /// question message — the counting form of the pending-questions
+    /// derivation ([`Services::questions_pending`] is `true` exactly when this
+    /// is non-zero, both keyed on the persisted pending-questions marker): the
     /// block count of the marker's message when the marker is set and not
     /// dismissed, `0` otherwise. Pre-upgrade sessions (marker key never
     /// written) fall back to the tail derivation and materialize the marker,
-    /// mirroring [`Services::question_hold_active`]. Backs the
+    /// mirroring [`Services::questions_pending`]. Backs the
     /// `numQuestionsAsked` snapshot field alongside the turn-attachment
     /// registry count ([`Services::pending_question_count`]). Bounded: one
     /// session read plus at most one single-row message read
@@ -6156,7 +6182,7 @@ impl Services {
         let pending = if session.pending_questions_marker_written() {
             session.pending_questions_message_id().map(str::to_string)
         } else {
-            let pending = self.question_hold_active_from_tail(agent_id).await;
+            let pending = self.pending_questions_from_tail(agent_id).await;
             if let Some(id) = pending.as_deref() {
                 self.record_pending_questions_marker(&session.workspace_id, agent_id, id)
                     .await;
@@ -6192,19 +6218,19 @@ impl Services {
         in_turn + self.pending_question_tail_count(agent_id).await
     }
 
-    /// Legacy transcript tail-walk hold derivation, retained as the
-    /// pre-upgrade fallback for sessions with no persisted pending-questions
-    /// marker (see [`Services::question_hold_active`]). Returns the id of the
-    /// question-bearing assistant message holding the session, so the caller
-    /// can materialize it as the marker.
-    async fn question_hold_active_from_tail(&self, agent_id: &AgentId) -> Option<String> {
+    /// Legacy transcript tail-walk derivation, retained as the pre-upgrade
+    /// fallback for sessions with no persisted pending-questions marker (see
+    /// [`Services::questions_pending`]). Returns the id of the
+    /// question-bearing assistant message pending on the session, so the
+    /// caller can materialize it as the marker.
+    async fn pending_questions_from_tail(&self, agent_id: &AgentId) -> Option<String> {
         // Trailing `system` rows (e.g. repeated interruption notices) are
         // transparent to the derivation, so the anchor is simply the newest
         // non-system row — resolved by the store in one index-backed
         // statement that decodes at most ONE message
         // ([`Store::get_last_non_system_message`]), never by paging full
         // rows back through the tail. An empty or all-system transcript has
-        // no hold; store errors fail open.
+        // nothing pending; store errors fail open.
         let Ok(Some(last)) = self.store.get_last_non_system_message(agent_id).await else {
             return None;
         };
@@ -6229,7 +6255,7 @@ impl Services {
     /// `agent:updated` with the marker so clients re-read the `AgentLite`
     /// projection. Returns `true` only when this call committed the latest
     /// marker. Best-effort: a failure is logged and never fails the turn (the
-    /// hold simply stays as it was).
+    /// marker simply stays as it was).
     pub(crate) async fn record_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
@@ -6596,12 +6622,11 @@ impl Services {
     /// are meaningful). Bounded — the caller already holds the (post-swap)
     /// rows.
     ///
-    /// A swap can move the hold in either direction, so this also performs the
-    /// two follow-ups every other hold-transition path performs: recompute the
-    /// workspace's `needs_attention` displayStatus (transition-only, §6.5 step
-    /// 0) and — when the re-derivation leaves no hold — kick the queue drain
-    /// for the automatic entries the hold parked (these paths start no turn of
-    /// their own, so without the kick those entries sit on an idle agent).
+    /// A swap can move the pending marker in either direction, so this also
+    /// recomputes the workspace's `needs_attention` displayStatus
+    /// (transition-only, §6.5 step 0) and — when the re-derivation leaves
+    /// nothing pending — kicks the queue drain as a best-effort nudge for
+    /// entries parked by other gates (these paths start no turn of their own).
     pub(crate) async fn reconcile_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
@@ -6647,15 +6672,14 @@ impl Services {
     /// Resolve a just-persisted user row against the pending-questions marker:
     /// when the row's `messageMetadata` is a `question_answers` tag naming
     /// EXACTLY the marked message, the questions are answered and the marker
-    /// clears (releasing the hold). A missing/foreign/stale
+    /// clears. A missing/foreign/stale
     /// `answeredQuestionsMessageId` — e.g. an answer for a question set a newer
     /// turn already superseded — is a no-op, so a late answer can neither
-    /// release a newer hold nor re-arm an old one. The daemon never inspects
-    /// the answer TEXT (spec §Decisions 3).
+    /// resolve a newer pending set nor re-arm an old one. The daemon never
+    /// inspects the answer TEXT (spec §Decisions 3).
     ///
     /// Returns `true` when the marker was cleared, so callers can recompute
-    /// displayStatus and — on the persist-only paths that start no turn of
-    /// their own — kick the queue drain for the entries the hold parked.
+    /// displayStatus.
     pub(crate) async fn resolve_pending_questions_for_answer(
         &self,
         workspace_id: &WorkspaceId,
@@ -6684,8 +6708,8 @@ impl Services {
     /// question set never re-surfaces (survives reload), emit `agent:updated`,
     /// deliver the questions-dismissed system notice to the agent
     /// ([`Services::notify_questions_dismissed`] — marker persists FIRST so
-    /// the question hold cannot re-park the notice), and kick the queue drain
-    /// so messages held by the question hold resume. Idempotent: re-dismissing
+    /// the notice's turn observes the dismissed state), and kick the queue
+    /// drain so queued messages resume. Idempotent: re-dismissing
     /// the same message succeeds without a duplicate notice. Fails closed on a
     /// nonexistent target or a workspace mismatch (`NotFound`).
     pub(crate) async fn agent_dismiss_questions_op(
@@ -6765,7 +6789,7 @@ impl Services {
         }
         // Self-contained event (monorepo#3180): carry the session's
         // pending-questions marker alongside the dismissal marker so clients
-        // can re-derive the hold from this one event without an extra
+        // can re-derive the pending set from this one event without an extra
         // `agent.get` round-trip. Same projection rule as `AgentLite`:
         // present when the marker was ever written (the empty string is the
         // authoritative clear), omitted for legacy marker-less sessions. The
@@ -6773,7 +6797,7 @@ impl Services {
         // mutation lock — marker set/clear paths hold that lock across their
         // write + event, so the value emitted here is coherent with the event
         // order a client observes; the top-of-op snapshot could be stale by
-        // emit time and would let a client re-derive an already-cleared hold
+        // emit time and would let a client re-derive an already-cleared set
         // (PR #1496 review).
         {
             let lock = self.pending_question_mutation_locks.lock_for(&agent_id);
@@ -6804,21 +6828,20 @@ impl Services {
             self.publish_agent_mutation_event(&workspace_id, &agent_id, AGENT_UPDATED, event_data)
                 .await;
         }
-        // Dismissing the questions retires the question hold, which can
+        // Dismissing the questions resolves the pending marker, which can
         // retire the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare.
         self.maybe_emit_display_status_changed(&workspace_id).await;
         // Deliver the questions-dismissed system notice (first dismissal of
         // this messageId only) BEFORE the drain kick, so an idle agent's next
-        // turn is the notice rather than a previously held entry. The marker
-        // above is already persisted, so the hold cannot re-park it.
+        // turn is the notice rather than a previously queued entry.
         if !already_dismissed {
             self.notify_questions_dismissed(&workspace_id, &agent_id, &message_id)
                 .await;
         }
-        // The hold (if it was gating this message's questions) is now released:
-        // kick the drain so held queue entries resume without waiting for the
-        // next end-of-turn drain.
+        // Kick the drain so entries parked for other reasons (busy race,
+        // notice enqueued above) resume without waiting for the next
+        // end-of-turn drain.
         if let Some(manager) = self.agent_manager() {
             manager
                 .try_drain_queue(agent_id.clone(), workspace_id)
@@ -6995,10 +7018,9 @@ impl Services {
     /// any work — it ends its turn and waits for the user's next message.
     /// Reuses the wake-delivery machinery ([`Services::deliver_wake_message`]):
     /// an idle agent gets the notice as an immediate turn; when it lands in
-    /// the queue instead (busy turn, store-append fallback, or a NEWER pending
-    /// question re-holding automatic deliveries) the entry is promoted to the
-    /// FRONT of the queue so the notice is the next delivery, ahead of parked
-    /// interrupts and held wakes. The promotion is a separate queue-lock
+    /// the queue instead (busy turn or store-append fallback) the entry is
+    /// promoted to the FRONT of the queue so the notice is the next delivery,
+    /// ahead of parked interrupts and wakes. The promotion is a separate queue-lock
     /// acquisition from the enqueue, so a concurrent drain can pop a
     /// previously parked entry (or the notice itself) in the window between
     /// them — benign: the notice still delivers, just not strictly first, and
@@ -10640,8 +10662,7 @@ impl Services {
     /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
     /// responding raises a `stale-queue-entry` stuck-risk
     /// (intent-hq/monorepo#1897). Affirmatively-parked queues are excluded:
-    /// archived workspaces park every entry, and an active question hold
-    /// parks automatic (non-user-origin) entries — neither is stuck.
+    /// archived workspaces park every entry — that is not stuck.
     /// The daemon does not track per-agent event queues, deleted-agent
     /// references, or delivery health, so `deletedAgentReferences` and
     /// `recentEvents` are empty and `deliveryStats` is zeroed — honestly
@@ -11136,12 +11157,7 @@ impl Services {
         //
         // Affirmatively-parked queues are expected, not stuck: an archived
         // workspace parks every queue until unarchive (the drain kick then
-        // delivers), and an active question hold (PROTOCOL §5.5) parks
-        // automatic entries until the user answers or dismisses — but never
-        // user-origin entries, which drain through the hold, so a stale
-        // user-origin entry under a hold is still a genuine risk. Both checks
-        // are lazy — one workspace read per call and one bounded
-        // [`Services::question_hold_active`] session read per agent, paid
+        // delivers). The check is lazy — one workspace read per call, paid
         // only when a stale candidate actually exists.
         let mut workspace_archived: Option<bool> = None;
         for q in &queues {
@@ -11159,7 +11175,7 @@ impl Services {
             if actively_responding {
                 continue;
             }
-            let mut stale: Vec<(&str, i64)> = q["entries"]
+            let stale: Vec<(&str, i64)> = q["entries"]
                 .as_array()
                 .map(|entries| {
                     entries
@@ -11198,26 +11214,6 @@ impl Services {
             };
             if archived {
                 break;
-            }
-            let agent = AgentId(aid.to_string());
-            if self.question_hold_active(&agent).await {
-                let user_origin_ids: HashSet<String> = {
-                    let guard = self
-                        .agent_queues
-                        .lock()
-                        .expect("agent queue registry poisoned");
-                    guard
-                        .get(&agent)
-                        .map(|entries| {
-                            entries
-                                .iter()
-                                .filter(|m| m.user_origin)
-                                .map(|m| m.id.clone())
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                };
-                stale.retain(|(id, _)| user_origin_ids.contains(*id));
             }
             let Some((oldest_id, oldest_age)) = stale.iter().max_by_key(|(_, age)| *age) else {
                 continue;
@@ -11455,55 +11451,20 @@ impl Services {
                     .send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
-            (None, interrupt) => {
+            (None, _) => {
                 // Read-only fallback (no `agent_manager` wired): mirrors
                 // `agent_send_message` — plumb the metadata through the
                 // store-only append so attribution is consistent across
-                // deployments with and without a runtime manager. Question
-                // hold (PROTOCOL §5.5): sendToTask is automatic by
-                // definition, so an active hold parks the message instead
-                // of persisting a user row that buries the pending Q&A.
-                if self.question_hold_active(&agent).await {
-                    // A2A sender header (intent-hq/intent#3721, monorepo#1015): this hold-park
-                    // bypasses `agent_send_message_op`'s prepend, so the
-                    // queued entry is annotated here — the drain persist
-                    // then inherits it.
-                    let mut message = message;
-                    annotate_sender_attribution(&mut message, options.message_metadata.as_ref());
-                    let (queued, position) = self.enqueue_message(
-                        &agent,
-                        message,
-                        None,
-                        None,
-                        options.message_metadata,
-                        None,
-                        interrupt,
-                    );
-                    let held = json!({
-                        "success": true,
-                        "queued": true,
-                        "heldForQuestions": true,
-                        "queuedMessage": queued.to_value(position),
-                        "turnId": queued.turn_id,
-                    });
-                    self.publish_queue_updated(&agent).await;
-                    // Race close (hold-check → enqueue vs a concurrent
-                    // `dismissQuestions`/answer): this `(None, _)` arm only
-                    // runs with no `AgentManager` attached, so there is no
-                    // drain to kick here — same as the other store-only
-                    // fallbacks above.
-                    held
-                } else {
-                    self.agent_send_message_op(
-                        agent.clone(),
-                        message,
-                        None,
-                        None,
-                        None,
-                        options.message_metadata,
-                    )
-                    .await?
-                }
+                // deployments with and without a runtime manager.
+                self.agent_send_message_op(
+                    agent.clone(),
+                    message,
+                    None,
+                    None,
+                    None,
+                    options.message_metadata,
+                )
+                .await?
             }
         };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
@@ -12234,7 +12195,7 @@ impl Services {
         // Up-front vanished-session gate (intent-hq/monorepo#2762): reject
         // nonexistent targets BEFORE any state change (the monorepo#564
         // contract). This covers the enqueue-only routes below
-        // (archived-workspace park, question hold, busy-agent fast enqueue)
+        // (archived-workspace park, retired park, busy-agent fast enqueue)
         // that return queued success without ever touching `agent_message` —
         // without it a wake racing an `agent.delete` parks a phantom entry no
         // drain can ever deliver. The append-failure arms keep their own
@@ -12397,41 +12358,6 @@ impl Services {
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
-        // Question hold (PROTOCOL §5.5): wakes are automatic by definition
-        // (`agent.wakeOrCreate` context messages, reportToParent /
-        // completion-watch wakes) — while the target's hold is active they
-        // park in the queue instead of claiming the slot, so the pending Q&A
-        // is never superseded. Checked BEFORE `try_begin_turn` so even an
-        // idle asking agent holds the wake.
-        if self.question_hold_active(agent_id).await {
-            let (queued, position) = self.enqueue_message(
-                agent_id,
-                content_owned,
-                None,
-                None,
-                message_metadata.cloned(),
-                None,
-                false,
-            );
-            self.publish_queue_updated(agent_id).await;
-            // Race close (hold-check → enqueue vs a concurrent
-            // `dismissQuestions`/answer): re-check and kick the drain if the
-            // hold cleared while the enqueue above was in flight, mirroring
-            // `AgentManager::send_message`'s hold-gate re-check — otherwise
-            // this entry could be stranded with no future drain trigger.
-            if !self.question_hold_active(agent_id).await {
-                manager
-                    .clone()
-                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                    .await;
-            }
-            return Ok(json!({
-                "success": true,
-                "queued": true,
-                "heldForQuestions": true,
-                "queuedMessage": queued.to_value(position),
-            }));
-        }
         if !manager.try_begin_turn(agent_id, workspace_id).await {
             // Fast enqueue branch: the manager is already draining a turn. The
             // metadata rides along on the queue entry so the drain re-persist
@@ -12557,43 +12483,6 @@ impl Services {
     where
         F: Fn() -> Value,
     {
-        // Question hold (PROTOCOL §5.5): same automatic-delivery gate as the
-        // runtime path above — the store-only persist would append the user
-        // row whose turn would bury the pending Q&A, so park the wake in the queue
-        // instead (hermetic wiring keeps the hold contract testable).
-        if self.question_hold_active(agent_id).await {
-            let (queued, position) = self.enqueue_message(
-                agent_id,
-                content.to_string(),
-                None,
-                None,
-                message_metadata.cloned(),
-                None,
-                false,
-            );
-            let result = json!({
-                "success": true,
-                "queued": true,
-                "heldForQuestions": true,
-                "queuedMessage": queued.to_value(position),
-            });
-            self.publish_queue_updated(agent_id).await;
-            // Race close (hold-check → enqueue vs a concurrent
-            // `dismissQuestions`/answer), same shape as the runtime path
-            // above. This wiring has no attached `AgentManager` by
-            // definition (that is why we are in the store-only fallback),
-            // so there is nothing to kick — the re-check only matters if a
-            // manager is (or becomes) attached, which `try_drain_queue`
-            // itself would then handle on its own next trigger.
-            if !self.question_hold_active(agent_id).await {
-                if let Some(manager) = self.agent_manager() {
-                    manager
-                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                        .await;
-                }
-            }
-            return Ok(result);
-        }
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         // Row-level metadata parity with the runtime branch (monorepo#1217).
@@ -12717,12 +12606,12 @@ impl Services {
     /// of the interrupt message on drain; sends without prepend content pass
     /// `None`.
     ///
-    /// `interrupt` marks a `priority: "interrupt"` enqueue (question hold /
-    /// PROTOCOL §5.5): the entry is inserted AFTER the queue's leading
-    /// interrupt entries but AHEAD of all normal entries — arrival order is
-    /// preserved among interrupts, and every fallback path that parks an
-    /// interrupt (hold gate, busy race, quarantine park, append-failure
-    /// auto-queue) shares this ordering. Normal enqueues append at the tail.
+    /// `interrupt` marks a `priority: "interrupt"` enqueue (PROTOCOL §5.5):
+    /// the entry is inserted AFTER the queue's leading interrupt entries but
+    /// AHEAD of all normal entries — arrival order is preserved among
+    /// interrupts, and every fallback path that parks an interrupt (archived
+    /// gate, busy race, quarantine park, append-failure auto-queue) shares
+    /// this ordering. Normal enqueues append at the tail.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message(
         &self,
@@ -12749,9 +12638,10 @@ impl Services {
     /// [`Services::enqueue_message`] with an explicit `user_origin` marker:
     /// `true` records that the entry carries a USER-originated
     /// `agent.sendMessage` parked by a queue-fallback path (busy race,
-    /// quarantine, append-failure). The question-hold drain gates deliver
-    /// user-origin entries instead of suspending (PROTOCOL §5.5: a user
-    /// answer must never deadlock against the hold its answer tag releases).
+    /// quarantine, append-failure). The archived-workspace drain gate
+    /// delivers post-archive user-origin entries instead of parking them
+    /// (intent-hq/intent#3883), and a drained user-origin entry keeps its
+    /// originator's semantics.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message_with_origin(
         &self,
@@ -13256,10 +13146,10 @@ impl Services {
         }
     }
 
-    /// Kick the runtime drain for an agent (hold release/flush path): look up
-    /// the owning workspace and defer to the manager's `try_drain_queue` —
-    /// which no-ops when the agent is busy (the released entry then rides the
-    /// normal end-of-turn drain) and starts a turn when idle. Quiet no-op
+    /// Kick the runtime drain for an agent (flush path): look up the owning
+    /// workspace and defer to the manager's `try_drain_queue` — which no-ops
+    /// when the agent is busy (the parked entry then rides the normal
+    /// end-of-turn drain) and starts a turn when idle. Quiet no-op
     /// when no manager is attached (read-only/test wiring) or the session row
     /// is gone.
     async fn kick_queue_drain(&self, agent_id: &AgentId) {
@@ -13324,12 +13214,11 @@ impl Services {
         Some(queue.remove(idx))
     }
 
-    /// Pop the oldest ready-to-send **user-origin** queued message, if any
-    /// (question hold, PROTOCOL §5.5). While the hold is active the drain
-    /// paths deliver ONLY user-origin entries — a user answer parked by the
-    /// turn-end busy race must reach the transcript instead of deadlocking
-    /// behind the hold its answer tag releases; automatic entries stay
-    /// parked.
+    /// Pop the oldest ready-to-send **user-origin** queued message, if any.
+    /// Under the archived-workspace drain exemption
+    /// (intent-hq/intent#3883) the drain delivers ONLY user-origin entries —
+    /// the user's send into the archived workspace is the resurrection
+    /// signal; automatic entries stay parked until unarchive.
     pub(crate) fn dequeue_user_origin_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
@@ -13346,14 +13235,13 @@ impl Services {
     /// EVERY ready-to-send entry in stored order — which IS the drain order
     /// (interrupt-priority first, then FIFO); `editing: true` entries stay
     /// queued — so the drain can deliver them as one combined provider turn.
-    /// `require_user_origin` mirrors the question-hold contract
-    /// (monorepo#1791): while the hold is active the flush fires ONLY when a
-    /// ready user-origin entry is present — a user delivery is starting a
-    /// turn anyway, so the parked automatic entries ride along FIFO instead
-    /// of being bypassed by the newer user message; with NO user-origin
-    /// entry ready the whole batch is a no-op and automatic entries stay
-    /// parked (an automatic delivery must never start a turn over the
-    /// pending Q&A). Returns `None` — leaving the queue untouched — unless
+    /// `require_user_origin` mirrors the archived-workspace drain exemption
+    /// (intent-hq/intent#3883): the flush fires ONLY when a ready
+    /// user-origin entry is present — a user delivery is starting a turn
+    /// anyway, so the parked automatic entries ride along FIFO instead of
+    /// being bypassed by the newer user message; with NO user-origin entry
+    /// ready the whole batch is a no-op and automatic entries stay parked.
+    /// Returns `None` — leaving the queue untouched — unless
     /// at least `min_ready` entries are ready, so callers keep the
     /// single-entry drain path byte-for-byte when too few messages are
     /// waiting.
@@ -13425,14 +13313,15 @@ impl Services {
 
     /// Mode-dispatching batch dequeue for `agents.flushQueuedMessages`: `All`
     /// defers to [`Services::dequeue_ready_batch`] (every ready entry;
-    /// `require_user_origin` under an active hold — the flush fires only
-    /// when a user-origin entry is ready, carrying the parked automatic
-    /// entries along FIFO, monorepo#1791); `SystemOnly` defers to
-    /// [`Services::dequeue_system_only_batch`] (system-origin entries
-    /// anywhere in the queue) but NEVER batches while a hold is active
-    /// (`require_user_origin`) — the hold's release is a user-origin entry,
-    /// which `SystemOnly` by definition excludes; `Off` always returns `None`
-    /// so every caller falls through to the single-entry FIFO path.
+    /// `require_user_origin` under the archived-workspace exemption — the
+    /// flush fires only when a user-origin entry is ready, carrying the
+    /// parked automatic entries along FIFO, intent-hq/intent#3883);
+    /// `SystemOnly` defers to [`Services::dequeue_system_only_batch`]
+    /// (system-origin entries anywhere in the queue) but NEVER batches under
+    /// that exemption (`require_user_origin`) — the exemption's trigger is a
+    /// user-origin entry, which `SystemOnly` by definition excludes; `Off`
+    /// always returns `None` so every caller falls through to the
+    /// single-entry FIFO path.
     pub(crate) fn dequeue_flush_batch(
         &self,
         agent_id: &AgentId,
@@ -13530,9 +13419,9 @@ impl Services {
             .is_some_and(|q| q.iter().any(QueuedMessage::ready_to_send))
     }
 
-    /// `true` iff at least one ready-to-send queued entry is user-origin
-    /// (question hold, PROTOCOL §5.5): the hold-gated drain paths use this
-    /// to decide whether a drain may proceed for the user entry alone.
+    /// `true` iff at least one ready-to-send queued entry is user-origin:
+    /// the archived-drain exemption's legacy-row fallback (no `archivedAt`)
+    /// uses this to decide whether a drain may proceed for the user entry.
     pub(crate) fn has_user_origin_ready(&self, agent_id: &AgentId) -> bool {
         self.agent_queues
             .lock()
@@ -14807,10 +14696,9 @@ impl Services {
 
         // Use the send-message machinery to deliver the continuation (lazily
         // respawns the provider and resumes via ACP `session/load`).
-        // Automatic origin: a resume continuation must not bury a Q&A the
-        // agent had pending when the harness shut down (question hold — the
-        // marker is persisted, so the hold survives the restart). The manager
-        // path is called directly so the recap can ride
+        // Automatic origin: a resume continuation is a system delivery, not a
+        // user action (it must not clear a pending attention request). The
+        // manager path is called directly so the recap can ride
         // `TurnOptions::prepend_content`; the store-only fallback (no manager
         // attached) keeps the plain trait call — it drives no outbound
         // prompt, so there is no context to repair.

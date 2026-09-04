@@ -953,7 +953,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
 }
 
 /// Single-pending-message guard on `ws.agent.send` / `ws.agent.sendToTask`:
-/// the target is pinned behind a question hold so agent-origin sends park in
+/// the target lives in an archived workspace so agent-origin sends park in
 /// its queue. The caller's FIRST send parks fine (a pre-seeded FOREIGN entry
 /// does not trigger the guard); the second send and a `sendToTask` against
 /// the same target are refused with `ok: false` + the full queue echo
@@ -980,9 +980,17 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .await
         .expect("disable toonOutput");
 
+    // The workspace is ARCHIVED up front (intent-hq/monorepo#2732): every
+    // agent-origin send into an archived workspace parks in the target's
+    // queue instead of driving a turn — the deterministic way to exercise
+    // the guard. The caller's own turn below is driven directly through
+    // `run_turn`, which does not consult the archived gate.
     let ws = WorkspaceId::new();
+    let mut archived_ws = workspace(&ws, None);
+    archived_ws.archived = true;
+    archived_ws.archived_at = Some(now_iso());
     store
-        .insert_workspace(&workspace(&ws, None))
+        .insert_workspace(&archived_ws)
         .await
         .expect("insert ws");
 
@@ -1012,27 +1020,6 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .await
         .expect("create target");
     let target_id = AgentId::from(target_val["agent"]["id"].as_str().unwrap());
-
-    // Pin the target behind a question hold (PROTOCOL §5.5): its last
-    // transcript message is an assistant row carrying a question resource
-    // block, so every agent-origin send parks in the queue instead of
-    // driving a turn — the deterministic way to exercise the guard.
-    store
-        .append_agent_message(
-            &target_id,
-            "assistant",
-            &serde_json::json!([{
-                "type": "resource",
-                "resource": {
-                    "uri": "question://hold-1",
-                    "mimeType": "application/vnd.intent.question+json",
-                    "text": "{\"question\":\"Which environment?\"}",
-                },
-            }]),
-            &now_iso(),
-        )
-        .await
-        .expect("seed question hold");
 
     // Seed a FOREIGN pending entry (long content — the refusal echo must
     // truncate it): another agent's parked send must NOT trigger the guard
@@ -1222,16 +1209,16 @@ async fn agent_bindings_send_single_pending_message_guard() {
     let out: serde_json::Value =
         serde_json::from_str(last_output).expect("tool output should be JSON");
 
-    // First send parks (question hold) despite the pre-seeded FOREIGN entry:
+    // First send parks (archived gate) despite the pre-seeded FOREIGN entry:
     // another sender's pending message never triggers the guard. Omitted
     // priority resolves to interrupt in the binding, so the entry parks
     // AHEAD of the foreign normal entry.
     assert_eq!(out["first"]["ok"], true, "{out}");
     assert_eq!(out["first"]["queued"], true, "{out}");
-    assert_eq!(out["first"]["heldForQuestions"], true, "{out}");
+    assert_eq!(out["first"]["archivedParked"], true, "{out}");
     assert_eq!(
-        out["first"]["delivery"], "held",
-        "held-for-questions park is self-describing: {out}"
+        out["first"]["delivery"], "queued",
+        "archived park is self-describing: {out}"
     );
     let first_id = out["first"]["queuedMessage"]["id"]
         .as_str()
@@ -1319,7 +1306,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
     assert_eq!(out["removed"]["ok"], true, "{out}");
     assert_eq!(out["resend"]["ok"], true, "{out}");
     assert_eq!(out["resend"]["queued"], true, "{out}");
-    assert_eq!(out["resend"]["delivery"], "held", "{out}");
+    assert_eq!(out["resend"]["delivery"], "queued", "{out}");
     let resend_id = out["resend"]["queuedMessage"]["id"]
         .as_str()
         .expect("resend parked entry id");
@@ -1334,7 +1321,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
     assert_eq!(replace["replacedMessageId"], resend_id, "{out}");
     assert!(replace.get("refused").is_none(), "{replace}");
     assert_eq!(replace["queued"], true, "{out}");
-    assert_eq!(replace["delivery"], "held", "{out}");
+    assert_eq!(replace["delivery"], "queued", "{out}");
 
     // Backend state: foreign entry untouched, caller's queue slot holds ONLY
     // the replacement (the refused sends never parked; the combined re-send
