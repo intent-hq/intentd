@@ -249,9 +249,19 @@ async fn start_with_auggie(opts: WsOptions, auggie_bin: Option<std::path::PathBu
 /// [`start_with_auggie`] with an optional persisted models-cache dir so
 /// `models.list` cache-fallback tests (§5.30) can seed a last-good entry.
 async fn start_with_auggie_and_models_cache(
+    opts: WsOptions,
+    auggie_bin: Option<std::path::PathBuf>,
+    models_cache_dir: Option<std::path::PathBuf>,
+) -> Server {
+    start_with_control(opts, auggie_bin, models_cache_dir, None).await
+}
+
+/// Build + start a WSS listener with an optional system control implementation.
+async fn start_with_control(
     mut opts: WsOptions,
     auggie_bin: Option<std::path::PathBuf>,
     models_cache_dir: Option<std::path::PathBuf>,
+    system_control: Option<Arc<dyn SystemControl>>,
 ) -> Server {
     let (api, bus, store, registry, dir) = make_services(auggie_bin, models_cache_dir).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
@@ -270,7 +280,7 @@ async fn start_with_auggie_and_models_cache(
         &token_store,
         opts,
         reverse_registry.clone(),
-        None,
+        system_control,
     )
     .expect("server");
     let cfg = client_config(&tls.fingerprint256);
@@ -350,6 +360,21 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// One authenticated WSS round-trip preserving the literal response bytes.
+async fn wss_call_text(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> String {
+    let mut ws = connect_ws(port, cfg).await;
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send");
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => return text.to_string(),
             Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
@@ -1966,7 +1991,10 @@ async fn wss_agent_list_caps_previews_get_serves_full() {
 async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     use std::collections::BTreeMap;
 
-    use intent_core::{AgentId, AgentSession, AgentStatus, TokenUsage, TokenUsageTotals};
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, Hook, HookId, HookState, PrMonitor, PrMonitorId,
+        PrMonitorState, TokenUsage, TokenUsageTotals,
+    };
 
     let srv = start(WsOptions::default()).await;
 
@@ -1998,6 +2026,8 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     };
     let ws_active = WorkspaceId::new();
     let mut active = fixture_workspace(&ws_active);
+    active.created_at = "2026-01-01T00:00:00Z".to_string();
+    active.updated_at = active.created_at.clone();
     active.token_usage = Some(usage.clone());
     srv.store
         .insert_workspace(&active)
@@ -2005,6 +2035,8 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         .expect("insert active workspace");
     let ws_archived = WorkspaceId::new();
     let mut archived = fixture_workspace(&ws_archived);
+    archived.created_at = "2026-01-02T00:00:00Z".to_string();
+    archived.updated_at = archived.created_at.clone();
     archived.archived = true;
     archived.archived_at = Some(now_iso());
     archived.token_usage = Some(usage);
@@ -2059,8 +2091,12 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         pending_delete_at: None,
         retired_at: None,
     };
+    let mut active_session = mk_session("agent-slim-a", &ws_active);
+    active_session.metadata = Some(serde_json::json!({
+        "pendingQuestionsMessageId": "msg-pending"
+    }));
     srv.store
-        .insert_agent_session(&mk_session("agent-slim-a", &ws_active))
+        .insert_agent_session(&active_session)
         .await
         .expect("insert active-workspace session");
     srv.store
@@ -2073,6 +2109,72 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         .insert_agent_session(&background)
         .await
         .expect("insert background active-workspace session");
+    srv.store
+        .append_agent_message_with_id(
+            &active_session.id,
+            "msg-pending",
+            "assistant",
+            &serde_json::json!([
+                { "type": "text", "text": "I have a question." },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "intent-question://shape-test",
+                        "mimeType": "application/vnd.intent.question+json",
+                        "text": "{\"question\":\"?\"}"
+                    }
+                }
+            ]),
+            None,
+            "2026-01-03T00:00:00Z",
+        )
+        .await
+        .expect("append pending question message");
+    srv.store
+        .insert_hook(&Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws_active.clone(),
+            agent_id: active_session.id.clone(),
+            name: "shape hook".to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            cron: None,
+            run_at: None,
+            state: HookState::Scheduled,
+            created_at: "2026-01-03T00:00:00Z".to_string(),
+            last_run_at: None,
+            next_run_at: Some("2026-01-03T01:00:00Z".to_string()),
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some("2026-01-04T00:00:00Z".to_string()),
+            perpetual: false,
+            dispatch_count: 0,
+        })
+        .await
+        .expect("insert active hook");
+    srv.store
+        .insert_pr_monitor(&PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: ws_archived.clone(),
+            agent_id: AgentId("agent-slim-b".to_string()),
+            repo_owner: "acme".to_string(),
+            repo_name: "widgets".to_string(),
+            pr_number: 7,
+            state: PrMonitorState::Active,
+            last_snapshot: None,
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: "2026-01-03T00:00:00Z".to_string(),
+            updated_at: "2026-01-03T00:00:00Z".to_string(),
+        })
+        .await
+        .expect("insert active PR monitor");
 
     // workspace.list (includeArchived): tokenUsage absent on every row;
     // agentSummary absent on the archived row, present on the active one.
@@ -2093,6 +2195,13 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         .iter()
         .find(|w| w["id"] == ws_archived.0.as_str())
         .expect("archived row");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![ws_active.0.as_str(), ws_archived.0.as_str()],
+        "workspace.list preserves store ordering"
+    );
     assert!(
         row_active.get("tokenUsage").is_none(),
         "list rows omit tokenUsage (monorepo#3041): {row_active}"
@@ -2135,6 +2244,31 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         );
     };
     assert_is_background_rows(row_active, "workspace.list");
+    assert_eq!(
+        row_active["attention"], "unread",
+        "batch unread signal: {row_active}"
+    );
+    assert_eq!(
+        row_active["displayStatus"], "needs_attention",
+        "pending-question marker survives bulk session enrichment: {row_active}"
+    );
+    assert_eq!(
+        row_active["waiting"], true,
+        "active hook signal: {row_active}"
+    );
+    assert_eq!(
+        row_archived["waiting"], true,
+        "active PR-monitor signal: {row_archived}"
+    );
+    assert_eq!(
+        row_active["tags"],
+        serde_json::json!([]),
+        "empty sets stay arrays"
+    );
+    assert!(
+        row_active.get("pullRequests").is_none(),
+        "optional empty field stays omitted"
+    );
 
     // workspace.get keeps both fields for detail reads — archived included.
     for ws_id in [&ws_active, &ws_archived] {
@@ -2198,6 +2332,14 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert_eq!(snap["params"]["kind"], "snapshot", "{snap}");
     assert_eq!(snap["params"]["seq"], 0, "{snap}");
     let snap_rows = snap["params"]["snapshot"].as_array().expect("snapshot");
+    assert_eq!(
+        snap_rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![ws_active.0.as_str(), ws_archived.0.as_str()],
+        "workspace.subscribe preserves store ordering"
+    );
     for ws_id in [&ws_active, &ws_archived] {
         let row = snap_rows
             .iter()
@@ -2207,7 +2349,21 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
             row.get("tokenUsage").is_none(),
             "seq-0 snapshot rows omit tokenUsage (monorepo#3041): {row}"
         );
+        assert_eq!(
+            row["waiting"], true,
+            "batched hook/PR waiting signal: {row}"
+        );
     }
+    let active_snap = snap_rows
+        .iter()
+        .find(|row| row["id"] == ws_active.0.as_str())
+        .unwrap();
+    assert_eq!(active_snap["attention"], "unread");
+    assert_eq!(active_snap["displayStatus"], "needs_attention");
+    assert!(
+        active_snap.get("agentSummary").is_none(),
+        "lite shape stays slim"
+    );
 
     srv.ws.stop().await;
 }
@@ -14834,5 +14990,148 @@ async fn wss_file_ops_symlink_escape_rejected() {
     let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_eq!(resp["result"], serde_json::json!("ok"), "{resp}");
 
+    srv.ws.stop().await;
+}
+
+/// Moving `file.list` / `file.tree` to the blocking pool must not alter their
+/// legacy bare-array payloads, field order, or JSON-RPC envelope bytes.
+#[tokio::test]
+async fn wss_file_list_and_tree_preserve_serialized_shape() {
+    let srv = start(WsOptions::default()).await;
+    let dir = test_tempdir("intentd-wss-file-enumeration-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    std::fs::create_dir(root.join("single")).expect("create fixture directory");
+    std::fs::write(root.join("single/only.txt"), "x").expect("write fixture file");
+
+    let ws_id = WorkspaceId::new();
+    let mut workspace = fixture_workspace(&ws_id);
+    workspace.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+
+    let list = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":101,"method":"file.list","params":{{"workspaceId":"{}","path":"single"}}}}"#,
+            ws_id.0
+        ),
+    )
+    .await;
+    assert_eq!(
+        list,
+        r#"{"jsonrpc":"2.0","result":[{"name":"only.txt","type":"file"}],"id":101}"#
+    );
+
+    let tree = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":102,"method":"file.tree","params":{{"workspaceId":"{}","path":"single"}}}}"#,
+            ws_id.0
+        ),
+    )
+    .await;
+    assert_eq!(
+        tree,
+        r#"{"jsonrpc":"2.0","result":[{"path":"single/only.txt","name":"only.txt","isDirectory":false}],"id":102}"#
+    );
+
+    srv.ws.stop().await;
+}
+
+/// Disconnecting during a blocking-pool traversal detaches that work without
+/// pinning an async worker or retaining the dead WSS connection.
+#[tokio::test]
+async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
+    let control: Arc<dyn SystemControl> = Arc::new(WatchHealthControl {
+        health: WatchHealth::default(),
+    });
+    let srv = start_with_control(WsOptions::default(), None, None, Some(control)).await;
+    let dir = test_tempdir("intentd-wss-file-disconnect-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let heavy = root.join("heavy");
+    std::fs::create_dir(&heavy).expect("create heavy fixture directory");
+    for index in 0..20_000 {
+        std::fs::write(heavy.join(format!("file-{index:05}.txt")), "x")
+            .expect("write heavy fixture file");
+    }
+
+    let ws_id = WorkspaceId::new();
+    let mut workspace = fixture_workspace(&ws_id);
+    workspace.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+
+    let mut enumeration = connect_ws(srv.port, srv.cfg.clone()).await;
+    let mut status = connect_ws(srv.port, srv.cfg.clone()).await;
+    enumeration
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":201,"method":"file.tree","params":{{"workspaceId":"{}","path":"heavy"}}}}"#,
+                ws_id.0
+            )
+            .into(),
+        ))
+        .await
+        .expect("send heavy file.tree request");
+
+    // Give dispatch time to enter the blocking traversal, then simulate an
+    // abrupt client disconnect rather than waiting for its large response.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    drop(enumeration);
+
+    let started = std::time::Instant::now();
+    status
+        .send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":202,"method":"system.status"}"#
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send system.status");
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match status.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let response: Value = serde_json::from_str(&text).expect("status json");
+                    if response["id"] == 202 {
+                        break response;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected system.status response, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("system.status stayed responsive during detached traversal");
+    assert!(response["result"].is_object(), "system.status: {response}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "system.status was delayed by file.tree"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while srv.ws.client_count() > 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        srv.ws.client_count(),
+        1,
+        "disconnected enumeration client must be reclaimed"
+    );
+
+    status.close(None).await.expect("close status client");
+    drop(status);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while srv.ws.client_count() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(srv.ws.client_count(), 0, "all clients must be reclaimed");
     srv.ws.stop().await;
 }

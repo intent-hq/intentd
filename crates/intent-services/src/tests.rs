@@ -9,11 +9,11 @@ use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, Note, NoteAddInput,
     NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata, NoteUpdateInput,
     NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    WorkspaceStatus, WorkspaceUpdate,
 };
 use intent_store::Store;
 
-use crate::Services;
+use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
@@ -921,11 +921,20 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
         .await
         .unwrap();
 
+    let bulk = store
+        .count_task_stats_by_workspace(&[ws1.clone(), ws2.clone(), ws3.clone()])
+        .await
+        .expect("bulk task stats");
     for ws in [&ws1, &ws2, &ws3] {
         let notes = store.list_notes(ws).await.expect("list notes");
         let enriched = crate::compute_task_stats(&notes);
         let cheap = store.count_task_stats(ws).await.expect("cheap stats");
         assert_eq!(cheap, enriched, "parity failed for workspace {ws:?}");
+        assert_eq!(
+            bulk.get(ws),
+            Some(&cheap),
+            "bulk parity failed for workspace {ws:?}"
+        );
     }
 
     // Spot-check the expected counts and the services-side helper.
@@ -938,10 +947,176 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
     assert_eq!((s3.total, s3.completed, s3.in_progress), (0, 0, 0));
 }
 
+/// A malformed task/session projection in one workspace must not erase the
+/// healthy rows' aggregates when list-shaped reads fall back from the bulk
+/// query. The failed workspace alone retains the single-workspace omission
+/// behavior, for both `workspace.list` and the lite subscription snapshot.
+#[tokio::test]
+async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    let healthy = WorkspaceId::from("ws-healthy-projections");
+    let bad_task = WorkspaceId::from("ws-malformed-task-projection");
+    let bad_session = WorkspaceId::from("ws-malformed-session-projection");
+    for workspace_id in [&healthy, &bad_task, &bad_session] {
+        store
+            .insert_workspace(&workspace(workspace_id))
+            .await
+            .expect("workspace");
+        store
+            .insert_note(&note(workspace_id, "spec", "no task links"))
+            .await
+            .expect("spec");
+    }
+
+    let mut task = note(&healthy, "task-complete", "body");
+    task.parent_id = Some(NoteId::from("spec"));
+    task.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::Complete,
+        ..Default::default()
+    });
+    store.insert_note(&task).await.expect("healthy task");
+    let mut malformed_task = note(&bad_task, "task-malformed", "body");
+    malformed_task.parent_id = Some(NoteId::from("spec"));
+    malformed_task.metadata.task = Some(TaskMetadata::default());
+    store
+        .insert_note(&malformed_task)
+        .await
+        .expect("malformed task seed");
+
+    let session = |workspace_id: &WorkspaceId, id: &str| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from(id),
+        workspace_id: workspace_id.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Agent".to_string(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Idle,
+        is_active: false,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+        retired_at: None,
+    };
+    store
+        .insert_agent_session(&session(&healthy, "agent-healthy-projection"))
+        .await
+        .expect("healthy session");
+    let malformed_agent = "agent-malformed-projection";
+    store
+        .insert_agent_session(&session(&bad_session, malformed_agent))
+        .await
+        .expect("malformed session seed");
+
+    sqlx::query("UPDATE note SET task_json = ? WHERE workspace_id = ? AND id = 'task-malformed'")
+        .bind(vec![0xff_u8])
+        .bind(bad_task.as_str())
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt task projection");
+    sqlx::query("UPDATE agent_session SET harness_features = '{bad' WHERE id = ?")
+        .bind(malformed_agent)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt session projection");
+
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let mut gets = std::collections::HashMap::new();
+    for workspace_id in [healthy.clone(), bad_task.clone(), bad_session.clone()] {
+        let row = svc
+            .get_workspace(workspace_id.clone())
+            .await
+            .expect("workspace.get");
+        gets.insert(workspace_id, row);
+    }
+    let list = svc.list_workspaces(false).await.expect("workspace.list");
+    let lite = svc
+        .list_workspaces_lite(false)
+        .await
+        .expect("workspace.subscribe snapshot");
+
+    for workspace_id in [&healthy, &bad_task, &bad_session] {
+        let get = gets.get(workspace_id).expect("get row");
+        let listed = list.iter().find(|row| &row.id == workspace_id).unwrap();
+        let snapshot = lite.iter().find(|row| &row.id == workspace_id).unwrap();
+        assert_eq!(
+            listed.task_stats, get.task_stats,
+            "list taskStats: {workspace_id}"
+        );
+        assert_eq!(
+            listed.display_status, get.display_status,
+            "list displayStatus: {workspace_id}"
+        );
+        assert_eq!(
+            snapshot.task_stats, get.task_stats,
+            "lite taskStats: {workspace_id}"
+        );
+        assert_eq!(
+            snapshot.display_status, get.display_status,
+            "lite displayStatus: {workspace_id}"
+        );
+    }
+    assert_eq!(gets[&healthy].task_stats.as_ref().unwrap().completed, 1);
+    assert_eq!(
+        list.iter()
+            .find(|row| row.id == healthy)
+            .unwrap()
+            .agent_summary
+            .as_ref()
+            .unwrap()
+            .count,
+        1
+    );
+    assert!(gets[&bad_task].task_stats.is_none());
+    assert!(gets[&bad_session].agent_summary.is_none());
+    assert!(list
+        .iter()
+        .find(|row| row.id == bad_session)
+        .unwrap()
+        .agent_summary
+        .is_none());
+}
+
 /// The lite list path (workspace.subscribe seq-0 snapshot) is self-sufficient
 /// for client status rendering: rows carry `taskStats` (cheap counting query),
 /// `displayStatus` (same derivation as the enriched path — a subsequent
-/// enriched `workspace.get` must agree for the same data), and `cowSupported`,
+/// enriched `workspace.get` must agree for the same data), and a prewarmed
+/// `cowSupported`,
 /// while continuing to omit `agentSummary`/`diffSummary`. The lite read also
 /// seeds the `last_display_statuses` baseline (a seed never emits).
 #[tokio::test]
@@ -973,7 +1148,36 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
         store.insert_note(&tn).await.expect("task note");
     }
 
-    let list = svc.list_workspaces_lite(true).await.expect("lite list");
+    // A cold read is cache-only: it omits immediately instead of probing the
+    // filesystem from the RPC path.
+    let cold = svc
+        .list_workspaces_lite(true)
+        .await
+        .expect("cold lite list");
+    assert!(
+        cold.iter()
+            .find(|row| row.id == ws)
+            .unwrap()
+            .cow_supported
+            .is_none(),
+        "cold CoW cache miss stays absent"
+    );
+    svc.prewarm_cow_supported();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if svc.compute_cow_supported().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("CoW prewarm completes");
+
+    let list = svc
+        .list_workspaces_lite(true)
+        .await
+        .expect("warm lite list");
     let row = list.iter().find(|w| w.id == ws).expect("row in lite list");
     let stats = row.task_stats.as_ref().expect("taskStats populated");
     assert_eq!((stats.total, stats.completed, stats.in_progress), (3, 1, 1));
@@ -999,6 +1203,51 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
     // The lite read seeded the displayStatus baseline map.
     let seeded = svc.last_display_statuses.contains(&ws);
     assert!(seeded, "lite list must seed the displayStatus baseline");
+}
+
+/// The bulk list projection is byte-for-byte identical to the former
+/// per-workspace enrichment path, including row order and omitted optionals.
+#[tokio::test]
+async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
+    let db = test_tempdir("intentd-bulk-list-shape-");
+    let store = Store::open(&db.path().join("shape.db")).await.unwrap();
+    let active_id = WorkspaceId::from("ws-shape-active");
+    let archived_id = WorkspaceId::from("ws-shape-archived");
+    let mut active = workspace(&active_id);
+    active.created_at = "2026-01-01T00:00:00Z".to_string();
+    active.updated_at = active.created_at.clone();
+    let mut archived = workspace(&archived_id);
+    archived.created_at = "2026-01-02T00:00:00Z".to_string();
+    archived.updated_at = archived.created_at.clone();
+    archived.archived = true;
+    archived.archived_at = Some("2026-01-03T00:00:00Z".to_string());
+    store.insert_workspace(&active).await.unwrap();
+    store.insert_workspace(&archived).await.unwrap();
+
+    let root = WorkspacesRoot::new();
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let unread = store
+        .workspaces_with_unread_top_level_sessions()
+        .await
+        .unwrap();
+    let mut expected = store.list_workspaces(true).await.unwrap();
+    for row in &mut expected {
+        row.activity = svc.workspace_activity(&row.id);
+        row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
+        svc.enrich_workspace_aggregates_with_unread(row, Some(unread.contains(row.id.as_str())))
+            .await;
+        row.token_usage = None;
+        if row.archived {
+            row.agent_summary = None;
+        }
+    }
+
+    let actual = svc.list_workspaces(true).await.unwrap();
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap(),
+        "bulk enrichment changed serialized workspace.list bytes"
+    );
 }
 
 /// Both list emit paths (`workspace.list` and the lite path behind
@@ -9725,6 +9974,41 @@ mod change_event_parity {
         assert!(
             quiet.is_err(),
             "reseed must publish exactly one event, got extra: {quiet:?}"
+        );
+    }
+
+    /// Concurrent `note.list` callers may both observe a missing spec before
+    /// either creates it. Both calls still succeed with the same seeded row,
+    /// while the insert winner alone captures a version and emits the event.
+    #[tokio::test]
+    async fn concurrent_note_lists_reseed_missing_spec_once() {
+        use intent_core::NoteId;
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        let (first, second) =
+            tokio::join!(h.services.list_notes(&h.ws), h.services.list_notes(&h.ws),);
+        for notes in [first.expect("first list"), second.expect("second list")] {
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].id, NoteId::from("spec"));
+            assert_eq!(notes[0].content, "");
+        }
+
+        let event = recv_one(&mut sub).await;
+        assert_envelope(&event, &h.ws.0, "note:created");
+        assert_eq!(event["data"]["noteId"], "spec");
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(quiet.is_err(), "concurrent reseed must emit exactly once");
+
+        let versions = h
+            .store
+            .list_note_versions(&h.ws, &NoteId::from("spec"))
+            .await
+            .expect("versions");
+        assert_eq!(
+            versions.len(),
+            1,
+            "concurrent reseed must capture one version"
         );
     }
 
@@ -23832,13 +24116,13 @@ mod known_repo {
         );
     }
 
-    /// `workspace.list` backfills `repository_owner` and `repository_name` for
+    /// Startup prewarming backfills `repository_owner` and `repository_name` for
     /// existing workspaces with a `repositoryPath` and missing owner/name:
     /// derive from the `origin` remote URL (same helper as `workspace.create`),
     /// persist, and emit `workspace:updated` with the changed fields (STAB-64
     /// backfill).
     #[tokio::test]
-    async fn list_workspaces_backfills_owner_and_name_from_origin_remote() {
+    async fn startup_prewarm_backfills_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
         struct TempRepo(PathBuf);
@@ -23939,9 +24223,18 @@ mod known_repo {
                     ..Default::default()
                 });
 
-        // Trigger workspace.list → spawns backfill
-        let list = svc.list_workspaces(false).await.expect("list workspaces");
-        assert!(list.iter().any(|w| w.id == id), "workspace appears in list");
+        let probes_before = repository_backfill_probe_count(&repo_path.0);
+        let listed = svc.list_workspaces(false).await.expect("list workspaces");
+        assert!(listed.iter().any(|workspace| workspace.id == id));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            repository_backfill_probe_count(&repo_path.0),
+            probes_before,
+            "workspace.list must not probe repository paths"
+        );
+
+        // Startup prewarm loads candidates once, then spawns the backfill.
+        svc.prewarm_repository_metadata().await;
 
         // Wait for the backfill to complete and emit workspace:updated
         let mut updated_event = None;
@@ -24003,6 +24296,117 @@ mod known_repo {
             ws.repository_name.as_deref(),
             Some("hello-world"),
             "repositoryName persisted"
+        );
+
+        // A repository path that appears after startup uses the same
+        // background probe and does not require another daemon prewarm.
+        let path_update_repo = make_repo("git@github.com:octocat/path-update.git");
+        let path_update_id = WorkspaceId::from_string("path-update-test".to_string());
+        let mut path_update_ws = workspace(&path_update_id);
+        path_update_ws.repository_path = None;
+        path_update_ws.repository_owner = None;
+        path_update_ws.repository_name = None;
+        store
+            .insert_workspace(&path_update_ws)
+            .await
+            .expect("insert path-update workspace");
+        svc.update_workspace(
+            path_update_id.clone(),
+            WorkspaceUpdate {
+                repository_path: Some(path_update_repo.0.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update repository path");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let updated = store
+                .get_workspace(&path_update_id)
+                .await
+                .expect("get path-update workspace");
+            if updated.repository_owner.as_deref() == Some("octocat") {
+                assert_eq!(updated.repository_name.as_deref(), Some("path-update"));
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "repository-path update backfill did not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A stale probe for repository A must not populate repository B after the
+    /// workspace path changes; B's own candidate remains able to fill the row.
+    #[tokio::test]
+    async fn repository_owner_backfill_skips_candidate_after_path_change() {
+        use git2::Repository;
+
+        let repo_a = tempfile::tempdir().expect("repo A tempdir");
+        let git_a = Repository::init(repo_a.path()).expect("init repo A");
+        git_a
+            .remote("origin", "https://github.com/owner-a/repo-a.git")
+            .expect("repo A origin");
+        let repo_b = tempfile::tempdir().expect("repo B tempdir");
+        let git_b = Repository::init(repo_b.path()).expect("init repo B");
+        git_b
+            .remote("origin", "https://github.com/owner-b/repo-b.git")
+            .expect("repo B origin");
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = crate::events::bus::EventBus::new(store.clone());
+        let svc = Services::new(store.clone()).with_event_bus(bus);
+        let id = WorkspaceId::from_string("backfill-path-race-test".to_string());
+        let path_a = repo_a.path().to_string_lossy().into_owned();
+        let path_b = repo_b.path().to_string_lossy().into_owned();
+        let mut ws = workspace(&id);
+        ws.repository_path = Some(path_a.clone());
+        store.insert_workspace(&ws).await.expect("insert workspace");
+
+        let candidate_a = BackfillCandidate {
+            workspace_id: id.clone(),
+            repository_path: path_a,
+        };
+        ws.repository_path = Some(path_b.clone());
+        store
+            .update_workspace(&ws)
+            .await
+            .expect("change repository path to B");
+
+        svc.backfill_one_workspace(candidate_a)
+            .await
+            .expect("stale A backfill");
+        let after_a = store.get_workspace(&id).await.expect("get after A");
+        assert_eq!(after_a.repository_owner, None);
+        assert_eq!(after_a.repository_name, None);
+        assert!(
+            store
+                .events_by_type(&id, "workspace:updated", 10)
+                .await
+                .expect("events after A")
+                .is_empty(),
+            "stale A candidate must not emit workspace:updated"
+        );
+
+        svc.backfill_one_workspace(BackfillCandidate {
+            workspace_id: id.clone(),
+            repository_path: path_b,
+        })
+        .await
+        .expect("current B backfill");
+        let after_b = store.get_workspace(&id).await.expect("get after B");
+        assert_eq!(after_b.repository_owner.as_deref(), Some("owner-b"));
+        assert_eq!(after_b.repository_name.as_deref(), Some("repo-b"));
+        assert_eq!(
+            store
+                .events_by_type(&id, "workspace:updated", 10)
+                .await
+                .expect("events after B")
+                .len(),
+            1,
+            "current B candidate emits workspace:updated"
         );
     }
 }
@@ -24609,7 +25013,7 @@ mod worktree_provisioning {
                 prior: std::env::var_os("INTENTD_WORKSPACES_DIR"),
             };
             std::env::set_var("INTENTD_WORKSPACES_DIR", &root.0);
-            svc.compute_cow_supported().await
+            svc.probe_cow_supported().await
         };
         assert!(
             result.is_some(),
@@ -24637,7 +25041,7 @@ mod worktree_provisioning {
         );
         assert_eq!(
             obj.get("cowSupported").and_then(serde_json::Value::as_bool),
-            svc.compute_cow_supported().await,
+            svc.compute_cow_supported(),
             "capability mirrors the shared workspaces-root probe"
         );
     }

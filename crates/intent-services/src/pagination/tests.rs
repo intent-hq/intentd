@@ -33,12 +33,14 @@ fn token_round_trips_through_opaque_base64() {
     // Opaque: not a bare number, and base64-decodes back to the cursor.
     assert!(token.parse::<u64>().is_err());
     assert_eq!(decode_token(&token), Some(cursor));
+    assert_eq!(backward_page_boundary(&token), Some(7));
 }
 
 #[test]
 fn malformed_token_decodes_to_none() {
     assert_eq!(decode_token("not valid base64!!!"), None);
     assert_eq!(decode_token(""), None);
+    assert_eq!(backward_page_boundary("not valid base64!!!"), None);
 }
 
 #[test]

@@ -935,6 +935,39 @@ async fn count_tasks_by_status_groups_by_wire_status() {
         .is_empty());
 }
 
+#[tokio::test]
+async fn note_exists_is_workspace_scoped() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_a = WorkspaceId::new();
+    let ws_b = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_a, "A", false))
+        .await
+        .expect("insert A");
+    store
+        .insert_workspace(&sample_workspace(&ws_b, "B", false))
+        .await
+        .expect("insert B");
+
+    let mut note = stray_note(&ws_a, "spec", "Spec");
+    note.content = "large body".repeat(10_000);
+    store.insert_note(&note).await.expect("insert note");
+
+    assert!(store
+        .note_exists(&ws_a, &NoteId::from("spec"))
+        .await
+        .expect("existing note"));
+    assert!(!store
+        .note_exists(&ws_a, &NoteId::from("missing"))
+        .await
+        .expect("missing note"));
+    assert!(!store
+        .note_exists(&ws_b, &NoteId::from("spec"))
+        .await
+        .expect("same id in other workspace"));
+}
+
 /// `max_note_updated_at` (monorepo#3058): the newest note `updated_at` per
 /// workspace as a single aggregate — `None` for a workspace with no notes,
 /// the max across notes otherwise, matching what folding hydrated

@@ -317,6 +317,23 @@ pub(crate) struct DeferredAttention {
     pub(crate) attention_data: serde_json::Value,
 }
 
+/// Store-backed aggregates for one complete list-shaped workspace snapshot.
+/// Each component is loaded with one bulk statement and joined to workspace
+/// rows in memory. Batch projection failures fall back to the existing
+/// per-workspace reads; a missing map entry then retains the existing
+/// best-effort omission behavior for only that workspace.
+struct WorkspaceAggregateSnapshot {
+    max_note_updated_at: HashMap<WorkspaceId, String>,
+    task_stats: Option<HashMap<WorkspaceId, WorkspaceTaskStats>>,
+    sessions: Option<HashMap<WorkspaceId, Vec<AgentSession>>>,
+    unread: Option<HashSet<WorkspaceId>>,
+    active_hooks: HashSet<WorkspaceId>,
+    active_pr_monitors: HashSet<WorkspaceId>,
+    monitor_pr_signals: HashMap<WorkspaceId, workspace_status::MonitorPrSignals>,
+    legacy_question_holds: HashSet<AgentId>,
+    cow_supported: Option<bool>,
+}
+
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
 /// (§6.8) and dispatched to by the transport router.
@@ -2412,7 +2429,7 @@ impl Services {
         }
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
-        ws.cow_supported = self.compute_cow_supported().await;
+        ws.cow_supported = self.compute_cow_supported();
         // diskUsage is deliberately NOT populated here: list/get/subscription
         // re-reads never touch the DiskUsageCache or arm walks (rung 3 of the
         // derived-field ladder). Clients fetch it on demand via the dedicated
@@ -2422,6 +2439,224 @@ impl Services {
         // [`Services::enrich_display_status`] (workspace_status module).
         self.enrich_display_status(ws, sessions.as_deref(), unread)
             .await;
+    }
+
+    /// Load every store-backed list aggregate in a constant number of
+    /// statements, then pre-fold the PR and legacy-question projections.
+    async fn workspace_aggregate_snapshot(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> WorkspaceAggregateSnapshot {
+        let (max_note_updated_at, task_stats, sessions, unread) = tokio::join!(
+            self.store.max_note_updated_at_by_workspace(workspace_ids),
+            self.store.count_task_stats_by_workspace(workspace_ids),
+            self.store
+                .list_agent_session_summaries_by_workspace(workspace_ids),
+            self.store
+                .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
+        );
+        let (active_hooks, monitors, legacy_question_tails) = tokio::join!(
+            self.store.workspaces_with_active_hooks(workspace_ids),
+            self.store
+                .list_display_status_pr_monitors_by_workspaces(workspace_ids),
+            self.store
+                .list_legacy_question_tail_candidates_by_workspace(workspace_ids),
+        );
+
+        let task_stats = match task_stats {
+            Ok(stats) => Some(stats),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch task stats projection failed; falling back to per-workspace reads"
+                );
+                let mut stats = HashMap::new();
+                for workspace_id in workspace_ids {
+                    match self.cheap_task_stats(workspace_id).await {
+                        Ok(workspace_stats) => {
+                            stats.insert(workspace_id.clone(), workspace_stats);
+                        }
+                        Err(error) => tracing::debug!(
+                            %error,
+                            %workspace_id,
+                            "per-workspace task stats projection failed"
+                        ),
+                    }
+                }
+                Some(stats)
+            }
+        };
+        let sessions = match sessions {
+            Ok(mut sessions) => {
+                for workspace_id in workspace_ids {
+                    sessions.entry(workspace_id.clone()).or_default();
+                }
+                Some(sessions)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch session projection failed; falling back to per-workspace reads"
+                );
+                let mut sessions = HashMap::new();
+                for workspace_id in workspace_ids {
+                    match self.store.list_agent_session_summaries(workspace_id).await {
+                        Ok(workspace_sessions) => {
+                            sessions.insert(workspace_id.clone(), workspace_sessions);
+                        }
+                        Err(error) => tracing::debug!(
+                            %error,
+                            %workspace_id,
+                            "per-workspace session projection failed"
+                        ),
+                    }
+                }
+                Some(sessions)
+            }
+        };
+        let mut active_pr_monitors = HashSet::new();
+        let mut monitor_rows: HashMap<WorkspaceId, Vec<intent_core::PrMonitor>> = HashMap::new();
+        if let Ok(monitors) = monitors {
+            for monitor in monitors {
+                if monitor.state == intent_core::PrMonitorState::Active {
+                    active_pr_monitors.insert(monitor.workspace_id.clone());
+                }
+                monitor_rows
+                    .entry(monitor.workspace_id.clone())
+                    .or_default()
+                    .push(monitor);
+            }
+        }
+        let monitor_pr_signals = monitor_rows
+            .into_iter()
+            .map(|(id, monitors)| (id, pr_monitor::fold_monitor_pr_signals(&monitors)))
+            .collect();
+
+        let sessions_by_agent: HashMap<&AgentId, &AgentSession> = sessions
+            .iter()
+            .flat_map(|by_workspace| by_workspace.values().flatten())
+            .map(|session| (&session.id, session))
+            .collect();
+        let legacy_question_holds = match legacy_question_tails {
+            Ok(tails) => tails
+                .into_iter()
+                .filter_map(|(agent_id, message_id, role, content)| {
+                    let session = sessions_by_agent.get(&agent_id)?;
+                    (role == "assistant"
+                        && agent_ops::has_question_blocks(&content)
+                        && session.dismissed_questions_message_id() != Some(message_id.as_str()))
+                    .then_some(agent_id)
+                })
+                .collect(),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch legacy question tail read failed; falling back to per-session probes"
+                );
+                let legacy_agent_ids: Vec<_> = sessions_by_agent
+                    .values()
+                    .filter(|session| {
+                        session.parent_agent_id.is_none()
+                            && !session.is_background
+                            && session.status != intent_core::AgentStatus::Deleted
+                            && !session.pending_questions_marker_written()
+                    })
+                    .map(|session| session.id.clone())
+                    .collect();
+                let mut holds = HashSet::new();
+                for agent_id in legacy_agent_ids {
+                    if self.questions_pending(&agent_id).await {
+                        holds.insert(agent_id);
+                    }
+                }
+                holds
+            }
+        };
+
+        WorkspaceAggregateSnapshot {
+            max_note_updated_at: max_note_updated_at.unwrap_or_default(),
+            task_stats,
+            sessions,
+            unread: unread.ok(),
+            active_hooks: active_hooks.unwrap_or_default(),
+            active_pr_monitors,
+            monitor_pr_signals,
+            legacy_question_holds,
+            cow_supported: self.compute_cow_supported(),
+        }
+    }
+
+    /// Join one workspace row with a pre-fetched aggregate snapshot. The full
+    /// list retains agent summaries and session-derived activity; the lite
+    /// subscription snapshot intentionally omits the summary payload.
+    async fn enrich_workspace_from_snapshot(
+        &self,
+        ws: &mut Workspace,
+        snapshot: &WorkspaceAggregateSnapshot,
+        include_agent_summary: bool,
+    ) {
+        ws.activity = self.workspace_activity(&ws.id);
+        ws.pending_delete_at = self.pending_workspace_deletes.deadline(ws.id.as_str());
+        let mut activity_max = if include_agent_summary {
+            latest_activity_candidate(&[
+                ws.last_activity.as_deref(),
+                Some(ws.updated_at.as_str()),
+                Some(ws.created_at.as_str()),
+                snapshot.max_note_updated_at.get(&ws.id).map(String::as_str),
+            ])
+        } else {
+            None
+        };
+        ws.task_stats = snapshot
+            .task_stats
+            .as_ref()
+            .and_then(|stats| stats.get(&ws.id).cloned());
+        let sessions = snapshot
+            .sessions
+            .as_ref()
+            .and_then(|by_workspace| by_workspace.get(&ws.id).map(Vec::as_slice));
+        if let Some(sessions) = sessions {
+            for session in sessions {
+                if include_agent_summary {
+                    activity_max = latest_activity_candidate(&[
+                        activity_max.as_deref(),
+                        Some(session.updated_at.as_str()),
+                    ]);
+                }
+            }
+            if include_agent_summary {
+                ws.agent_summary = Some(build_agent_summary(sessions));
+            }
+        }
+        if !include_agent_summary {
+            ws.agent_summary = None;
+        }
+        ws.diff_summary = None;
+        if let Some(activity_max) = activity_max {
+            ws.last_activity = Some(activity_max);
+        }
+        ws.cow_supported = snapshot.cow_supported;
+        let unread = snapshot.unread.as_ref().map(|ids| ids.contains(&ws.id));
+        let waiting = snapshot.active_hooks.contains(&ws.id)
+            || snapshot.active_pr_monitors.contains(&ws.id)
+            || sessions.is_some_and(|sessions| {
+                self.workspace_has_waiting_agent_subscriptions_in_sessions(&ws.id, sessions)
+            });
+        self.enrich_display_status_with_snapshot(
+            ws,
+            sessions,
+            unread,
+            Some(workspace_status::WorkspaceStatusSnapshot {
+                waiting,
+                monitor_pr_signals: snapshot
+                    .monitor_pr_signals
+                    .get(&ws.id)
+                    .copied()
+                    .unwrap_or_default(),
+                legacy_question_holds: &snapshot.legacy_question_holds,
+            }),
+        )
+        .await;
     }
 
     /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
@@ -2609,6 +2844,20 @@ impl Services {
         None
     }
 
+    /// Start the one-time repository owner/name backfill after daemon listeners
+    /// are live. The daemon invokes this from a detached readiness task, so the
+    /// candidate read and every git/filesystem probe stay off startup and RPC
+    /// critical paths.
+    pub async fn prewarm_repository_metadata(&self) {
+        match self.store.list_workspaces(false).await {
+            Ok(workspaces) => self.spawn_repository_owner_backfill(&workspaces),
+            Err(error) => tracing::warn!(
+                %error,
+                "repository metadata startup prewarm skipped; workspace read failed"
+            ),
+        }
+    }
+
     /// Spawn a background task to backfill `repository_owner` / `repository_name`
     /// for active workspaces with a local `repositoryPath` and missing owner/name.
     /// Non-blocking for the caller; each workspace is probed at most once per
@@ -2626,21 +2875,24 @@ impl Services {
 
             let mut candidates = Vec::new();
             for ws in workspaces {
-                if ws.archived || backfilled.contains(ws.id.as_str()) {
+                let Some(repository_path) = ws.repository_path.as_deref().filter(|p| !p.is_empty())
+                else {
+                    continue;
+                };
+                let dedupe_key = format!("{}\0{repository_path}", ws.id.as_str());
+                if ws.archived || backfilled.contains(&dedupe_key) {
                     continue;
                 }
                 let missing_owner = ws.repository_owner.is_none()
                     || ws.repository_owner.as_deref().is_some_and(str::is_empty);
                 let missing_name = ws.repository_name.is_none()
                     || ws.repository_name.as_deref().is_some_and(str::is_empty);
-                if (missing_owner || missing_name)
-                    && ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
-                {
+                if missing_owner || missing_name {
                     candidates.push(BackfillCandidate {
                         workspace_id: ws.id.clone(),
-                        repository_path: ws.repository_path.clone().unwrap(),
+                        repository_path: repository_path.to_string(),
                     });
-                    backfilled.insert(ws.id.0.clone());
+                    backfilled.insert(dedupe_key);
                 }
             }
             candidates
@@ -2668,24 +2920,42 @@ impl Services {
     /// and emit `workspace:updated` with the changed fields. Non-github remotes
     /// are skipped silently.
     async fn backfill_one_workspace(&self, candidate: BackfillCandidate) -> Result<()> {
-        let repo_path = std::path::PathBuf::from(&candidate.repository_path);
-        if !repo_path.join(".git").exists() {
-            return Ok(());
-        }
-
-        let origin_url = intent_git::remote::origin_url(&repo_path).ok().flatten();
-
-        let Some(origin_url) = origin_url else {
-            return Ok(());
-        };
-
-        let Some((owner, name)) = Self::parse_github_owner_repo(&origin_url) else {
+        let repository_path = candidate.repository_path.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            let repo_path = std::path::PathBuf::from(&repository_path);
+            #[cfg(test)]
+            record_repository_backfill_probe(&repo_path);
+            if !repo_path.join(".git").exists() {
+                return None;
+            }
+            intent_git::remote::origin_url(&repo_path)
+                .ok()
+                .flatten()
+                .and_then(|url| Self::parse_github_owner_repo(&url))
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("repository metadata probe failed: {error}")))?;
+        let Some((owner, name)) = metadata else {
             return Ok(());
         };
 
         // Re-read the workspace to avoid overwriting fields populated after the
         // candidate was built (backfill race guard).
         let mut ws = self.store.get_workspace(&candidate.workspace_id).await?;
+        let current_repository_path = ws
+            .repository_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        if current_repository_path != Some(candidate.repository_path.as_str()) {
+            tracing::debug!(
+                workspace_id = %ws.id.as_str(),
+                candidate_repository_path = %candidate.repository_path,
+                current_repository_path = current_repository_path.unwrap_or(""),
+                "repository owner backfill skipped; workspace repository path changed"
+            );
+            return Ok(());
+        }
         let mut changes = serde_json::Map::new();
 
         // Only fill fields that are still missing in the currently persisted state.
@@ -2726,26 +2996,50 @@ impl Services {
         Ok(())
     }
 
-    /// Compute whether `CoW` isolation is supported on this machine. Probes the
-    /// workspaces root's filesystem (root→root) — a machine capability,
-    /// independent of any workspace or checkout mode (the FE uses it to gate
-    /// the `CoW` opt-in toggle, which affects newly created workspaces).
+    /// Read whether `CoW` isolation is supported on this machine from the
+    /// prewarmed cache. A cache miss returns `None` immediately: RPC reads never
+    /// start or await filesystem work.
     /// Resolves the root like every other consumer — the injected
     /// `workspaces_root`, else [`default_workspaces_root`]
     /// (`$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces`) — so
     /// production daemons, which never inject a root, still report the
-    /// capability. Returns Some(true) if the `CoW` probe reports Supported;
-    /// Some(false) on an unsupported filesystem; None if the probe cannot
-    /// run. The live probe is offloaded to the blocking pool and cached per
-    /// workspaces root by the shared aggregate cache.
-    async fn compute_cow_supported(&self) -> Option<bool> {
+    /// capability. Returns Some(true) if the completed `CoW` probe reports
+    /// Supported, Some(false) on an unsupported filesystem, and None until the
+    /// startup/event prewarm completes or when it cannot run.
+    fn compute_cow_supported(&self) -> Option<bool> {
         let workspaces_root = self
             .workspaces_root
             .clone()
-            .unwrap_or_else(default_workspaces_root);
+            .or_else(try_default_workspaces_root)?;
+        self.workspace_aggregates
+            .cached_cow_supported(&workspaces_root)
+    }
+
+    /// Probe `CoW` support on a cache miss, or join the shared startup prewarm.
+    /// This is reserved for the on-demand machine capability RPC; workspace
+    /// list/get paths use [`Self::compute_cow_supported`] and remain cache-only.
+    async fn probe_cow_supported(&self) -> Option<bool> {
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .or_else(try_default_workspaces_root)?;
         self.workspace_aggregates
             .cow_supported(workspaces_root)
             .await
+    }
+
+    /// Prewarm the machine-level `CoW` capability off the RPC read path.
+    /// Idempotent and single-flight per resolved workspaces root.
+    pub fn prewarm_cow_supported(&self) {
+        let Some(workspaces_root) = self
+            .workspaces_root
+            .clone()
+            .or_else(try_default_workspaces_root)
+        else {
+            return;
+        };
+        self.workspace_aggregates
+            .prewarm_cow_supported(workspaces_root);
     }
 
     /// The daemon-managed directory whose footprint `workspace.diskUsage`
@@ -8821,10 +9115,8 @@ async fn ensure_spec_note(
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
     let spec_id = NoteId::from("spec");
-    match fetch_note(store, workspace_id, &spec_id).await {
-        Ok(_) => return Ok(()),
-        Err(Error::NotFound(_)) => {}
-        Err(e) => return Err(e),
+    if store.note_exists(workspace_id, &spec_id).await? {
+        return Ok(());
     }
     // The reseed writes target `note.workspace_id → workspace(id)` (migration
     // 0030), so a deleted/nonexistent workspace has no FK target: verify the
@@ -9974,6 +10266,28 @@ pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
 struct BackfillCandidate {
     workspace_id: WorkspaceId,
     repository_path: String,
+}
+
+#[cfg(test)]
+fn repository_backfill_probe_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_repository_backfill_probe(path: &Path) {
+    let mut counts = repository_backfill_probe_counts().lock().unwrap();
+    *counts.entry(path.to_path_buf()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn repository_backfill_probe_count(path: &Path) -> u64 {
+    repository_backfill_probe_counts()
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Recursively scan `dir` for git repositories (a directory that contains a
@@ -14413,7 +14727,7 @@ impl WorkspaceApi for Services {
             // (§5.1); it is included as true/false when the probe ran and
             // omitted when it could not run (presence-detected by clients).
             let mut caps = serde_json::Map::new();
-            if let Some(cow_supported) = self.compute_cow_supported().await {
+            if let Some(cow_supported) = self.probe_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
             Ok(serde_json::Value::Object(caps))
@@ -15268,7 +15582,16 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::list(&root, &path)
+            // Containment checks and directory enumeration both touch the
+            // filesystem, so keep the complete synchronous operation off the
+            // async runtime. RPC dispatch tasks are detached from their client
+            // connection, so a disconnect lets this finish and the closed
+            // outbound channel discards its response. If this future is
+            // otherwise dropped, dropping the JoinHandle detaches the already
+            // running blocking task; neither case pins a runtime worker.
+            tokio::task::spawn_blocking(move || file_ops::list(&root, &path))
+                .await
+                .map_err(|e| Error::Internal(format!("file.list task failed: {e}")))?
         })
     }
 
@@ -15400,7 +15723,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             let root = file_ops::resolve_root(&store, &workspace_id, None).await;
-            file_ops::tree(&root, &path)
+            tokio::task::spawn_blocking(move || file_ops::tree(&root, &path))
+                .await
+                .map_err(|e| Error::Internal(format!("file.tree task failed: {e}")))?
         })
     }
 
@@ -15977,63 +16302,15 @@ impl WorkspaceApi for Services {
             let mut list = store.list_workspaces(include_archived).await?;
             // `activity` is derived from live agent state, never persisted (§9.9);
             // the card aggregates are computed fresh on the emit path (§9.1).
-            // Enrichment fans out per workspace (bounded by a semaphore so a
-            // large workspace count doesn't burst-issue unbounded store reads):
-            // store reads stay on the async pool while the git/FS rollups are
-            // offloaded, bounded, and cached inside `enrich_workspace_aggregates`,
-            // so list latency is bounded by the per-aggregate budget instead of
-            // O(workspaces × workdir diff).
+            // Every store-backed aggregate is fetched once for the requested ids
+            // and joined below in store order; no per-workspace store futures.
             let started = std::time::Instant::now();
             let count = list.len();
-            // Batch unread derivation (§5.1): ONE indexed statement for the
-            // whole list instead of a per-row EXISTS probe, so the hot RPC's
-            // statement count stays independent of the workspace count
-            // (AGENTS.md RPC cost contract). A batch failure degrades to
-            // `None` per row — enrichment falls back to its bounded
-            // per-workspace probe rather than serving the stale stored flag.
-            let unread_set = store
-                .workspaces_with_unread_top_level_sessions()
-                .await
-                .ok()
-                .map(Arc::new);
-            let enrich_gate = Arc::new(tokio::sync::Semaphore::new(
-                workspace_aggregates::MAX_CONCURRENT_ENRICHMENTS,
-            ));
-            let mut join = tokio::task::JoinSet::new();
-            for (idx, ws) in list.iter().enumerate() {
-                let mut ws = ws.clone();
-                let this = this.clone();
-                let enrich_gate = Arc::clone(&enrich_gate);
-                let unread_set = unread_set.clone();
-                join.spawn(async move {
-                    // The semaphore is never closed, so acquisition can only
-                    // fail on a bug; fail loudly rather than dropping the bound.
-                    let _permit = enrich_gate
-                        .acquire_owned()
-                        .await
-                        .expect("enrichment semaphore closed");
-                    ws.activity = this.workspace_activity(&ws.id);
-                    // Delete grace window (§5.1): surface the in-memory
-                    // pending-deletion deadline; O(1) map read, never persisted.
-                    ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
-                    let unread = unread_set.as_ref().map(|set| set.contains(ws.id.as_str()));
-                    this.enrich_workspace_aggregates_with_unread(&mut ws, unread)
-                        .await;
-                    (idx, ws)
-                });
-            }
-            // Merge back into store order (ORDER BY created_at) by index. If an
-            // enrichment task panics, degrade to the un-enriched base row —
-            // aggregates are advisory and optional on the wire, so one bad
-            // worktree must not fail the whole list call.
-            while let Some(res) = join.join_next().await {
-                match res {
-                    Ok((idx, ws)) => list[idx] = ws,
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "workspace.list: enrichment task failed; serving base row"
-                    ),
-                }
+            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
+            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
+            for ws in &mut list {
+                this.enrich_workspace_from_snapshot(ws, &snapshot, true)
+                    .await;
             }
             // List-frame slimming (monorepo#3041), following the v4.2
             // `diskUsage` precedent — optional fields simply never present on
@@ -16066,10 +16343,6 @@ impl WorkspaceApi for Services {
             // derivation still sees only the persisted workspace PRs).
             this.merge_external_pull_requests(&mut list, include_archived)
                 .await;
-            // Background backfill: active workspaces with repository_path but missing
-            // repository_owner/repository_name get derived from origin remote (STAB-64
-            // backfill). Spawned non-blocking so list latency stays green.
-            this.spawn_repository_owner_backfill(&list);
             Ok(list)
         })
     }
@@ -16091,32 +16364,14 @@ impl WorkspaceApi for Services {
             // `displayStatus` (same derivation as the enriched path), and
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(include_archived).await?;
-            let cow_supported = this.compute_cow_supported().await;
-            // Batch unread derivation, same as the full list path: ONE
-            // statement for the whole snapshot; a batch failure degrades to
-            // the per-workspace probe inside `enrich_display_status`.
-            let unread_set = store.workspaces_with_unread_top_level_sessions().await.ok();
+            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
+            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
             for ws in &mut list {
-                ws.activity = this.workspace_activity(&ws.id);
-                // Delete grace window (§5.1): surface the in-memory
-                // pending-deletion deadline; O(1) map read, never persisted.
-                ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
-                ws.agent_summary = None;
-                ws.diff_summary = None;
+                this.enrich_workspace_from_snapshot(ws, &snapshot, false)
+                    .await;
                 // Detail-only on the wire (monorepo#3041): list rows never
                 // carry `tokenUsage` — same rationale as the full list path.
                 ws.token_usage = None;
-                ws.cow_supported = cow_supported;
-                // Keep PR fields if already on the row (cheap, already stored);
-                // do not fetch/refresh them here.
-                // A stats-read failure degrades to absent taskStats +
-                // displayStatus (clients fall back to local derivation on a
-                // missing field), mirroring `enrich_workspace_aggregates`.
-                // Same derivation + baseline seeding as the enriched path
-                // (see [`Services::enrich_display_status`]).
-                ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
-                let unread = unread_set.as_ref().map(|set| set.contains(ws.id.as_str()));
-                this.enrich_display_status(ws, None, unread).await;
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
@@ -18355,6 +18610,7 @@ impl WorkspaceApi for Services {
                 || update.active_pull_request.is_some()
                 || update.pull_requests.is_some();
             let attention_changed = update.attention.is_some();
+            let repository_path_changed = update.repository_path.is_some();
             let mut ws = if id.is_chief() {
                 chief_workspace()
             } else {
@@ -18484,6 +18740,9 @@ impl WorkspaceApi for Services {
                 // response carries `agent_running` when agents are in-flight,
                 // not the stale default `idle` from the persisted row.
                 ws.activity = this.workspace_activity(&ws.id);
+                if repository_path_changed {
+                    this.spawn_repository_owner_backfill(std::slice::from_ref(&ws));
+                }
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.

@@ -1,6 +1,6 @@
 //! Note repository: insert + list, mapping rows ↔ [`Note`] (§9.2).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use intent_core::{
     ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, Result, TaskMetadata,
@@ -78,6 +78,29 @@ impl Store {
         rows.iter().map(map_note_row).collect()
     }
 
+    /// Test whether a workspace owns a note without hydrating its row.
+    ///
+    /// The query runs under [`crate::with_read_retry`] for the same transient
+    /// `SQLITE_BUSY` protection as [`Store::get_note`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when the underlying query fails.
+    pub async fn note_exists(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<bool> {
+        let present = crate::with_read_retry(|| async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM note WHERE id = ? AND workspace_id = ? LIMIT 1",
+            )
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("note existence check failed: {e}")))
+        })
+        .await?;
+        Ok(present.is_some())
+    }
+
     /// Newest `updated_at` across a workspace's notes, or `None` when the
     /// workspace has none — the note half of the `lastActivity` derivation
     /// (`enrich_workspace_aggregates` / `derive_last_activity`) as a single
@@ -102,6 +125,41 @@ impl Store {
             .fetch_one(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("max note updated_at failed: {e}")))
+    }
+
+    /// Maximum note timestamp per requested workspace in one statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the aggregate query or row projection fails.
+    pub async fn max_note_updated_at_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, String>> {
+        if workspace_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT workspace_id, MAX(updated_at) AS updated_at FROM note \
+             WHERE workspace_id IN ({placeholders}) GROUP BY workspace_id"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("batch max note updated_at failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    WorkspaceId(col(row, "workspace_id")?),
+                    col(row, "updated_at")?,
+                ))
+            })
+            .collect()
     }
 
     /// List every note across all workspaces, oldest first. Backs the global
@@ -422,6 +480,74 @@ impl Store {
             *counts.entry(key).or_insert(0) += u64::try_from(n).unwrap_or(0);
         }
         Ok(counts)
+    }
+
+    /// Task statistics for every requested workspace in one projected read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the query or row projection fails.
+    pub async fn count_task_stats_by_workspace(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, WorkspaceTaskStats>> {
+        let mut out: HashMap<WorkspaceId, WorkspaceTaskStats> = workspace_ids
+            .iter()
+            .cloned()
+            .map(|id| (id, WorkspaceTaskStats::default()))
+            .collect();
+        if workspace_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT workspace_id, id, \
+                CASE WHEN id = 'spec' THEN content END AS spec_content, \
+                CASE WHEN task_json IS NOT NULL THEN json_extract(task_json, '$.status') END AS status \
+             FROM note WHERE workspace_id IN ({placeholders}) AND \
+                (id = 'spec' OR (task_json IS NOT NULL AND id != 'spec' AND parent_id = 'spec'))"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("batch task stats read failed: {e}")))?;
+        let mut linked_by_workspace: HashMap<WorkspaceId, HashSet<String>> = HashMap::new();
+        for row in &rows {
+            let workspace_id = WorkspaceId(col(row, "workspace_id")?);
+            if let Some(content) = col::<Option<String>>(row, "spec_content")? {
+                linked_by_workspace
+                    .insert(workspace_id, intent_core::extract_spec_task_ids(&content));
+            }
+        }
+        for row in &rows {
+            let workspace_id = WorkspaceId(col(row, "workspace_id")?);
+            let id: String = col(row, "id")?;
+            if id == "spec" {
+                continue;
+            }
+            let linked = linked_by_workspace.get(&workspace_id);
+            if linked.is_some_and(|ids| !ids.is_empty() && !ids.contains(&id)) {
+                continue;
+            }
+            let stats = out.entry(workspace_id).or_default();
+            match col::<Option<String>>(row, "status")?.as_deref() {
+                Some("cancelled") => {}
+                Some("complete") => {
+                    stats.total += 1;
+                    stats.completed += 1;
+                }
+                Some("in_progress" | "review_required") => {
+                    stats.total += 1;
+                    stats.in_progress += 1;
+                }
+                _ => stats.total += 1,
+            }
+        }
+        Ok(out)
     }
 
     /// Self-heal for workspaces damaged by the pre-#110 global-note-identity

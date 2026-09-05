@@ -16,13 +16,13 @@
 //! cache internals are private to this module, so nothing outside it can
 //! emit `workspace:displayStatus-changed` or touch the baseline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use intent_core::events::{WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_WAITING_CHANGED};
 use intent_core::{
-    now_iso, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
+    now_iso, AgentId, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
 };
 use intent_store::NewEvent;
 
@@ -185,6 +185,20 @@ impl Services {
         sessions: Option<&[intent_core::AgentSession]>,
         unread: Option<bool>,
     ) {
+        self.enrich_display_status_with_snapshot(ws, sessions, unread, None)
+            .await;
+    }
+
+    /// List-shaped variant of [`Self::enrich_display_status`]. All store-backed
+    /// signals are supplied by one bulk snapshot, so this method performs only
+    /// in-memory enrichment and cache seeding for each row.
+    pub(crate) async fn enrich_display_status_with_snapshot(
+        &self,
+        ws: &mut Workspace,
+        sessions: Option<&[intent_core::AgentSession]>,
+        unread: Option<bool>,
+        snapshot: Option<WorkspaceStatusSnapshot<'_>>,
+    ) {
         // Served `attention` is DERIVED on this same emit path (§5.1):
         // `unread` = any top-level (non-background, non-deleted) session
         // whose newest user/assistant message is an unseen assistant message
@@ -235,7 +249,10 @@ impl Services {
             // eviction racing the probe must not have this seed
             // resurrect the baseline.
             let waiting_generation = self.last_waiting_statuses.generation();
-            let waiting = self.workspace_is_waiting(&ws.id).await;
+            let waiting = match snapshot {
+                Some(snapshot) => snapshot.waiting,
+                None => self.workspace_is_waiting(&ws.id).await,
+            };
             self.last_waiting_statuses
                 .seed(&ws.id, waiting, waiting_generation);
             waiting
@@ -254,13 +271,21 @@ impl Services {
         // agent-monitored PRs DO feed the PR rungs: an active monitor on an
         // open PR (including cross-repo) reads as an open-PR signal.
         let display_status = compute_display_status(
-            self.workspace_attention_signals(&ws.id, ws.attention, sessions)
-                .await,
+            self.workspace_attention_signals_with_legacy_holds(
+                &ws.id,
+                ws.attention,
+                sessions,
+                snapshot.map(|snapshot| snapshot.legacy_question_holds),
+            )
+            .await,
             ws.activity == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
-            self.workspace_monitor_pr_signals(&ws.id).await,
+            match snapshot {
+                Some(snapshot) => snapshot.monitor_pr_signals,
+                None => self.workspace_monitor_pr_signals(&ws.id).await,
+            },
             ws.task_stats.as_ref(),
         );
         self.last_display_statuses
@@ -464,6 +489,17 @@ impl Services {
         attention: WorkspaceAttention,
         sessions: Option<&[intent_core::AgentSession]>,
     ) -> AttentionSignals {
+        self.workspace_attention_signals_with_legacy_holds(workspace_id, attention, sessions, None)
+            .await
+    }
+
+    async fn workspace_attention_signals_with_legacy_holds(
+        &self,
+        workspace_id: &WorkspaceId,
+        attention: WorkspaceAttention,
+        sessions: Option<&[intent_core::AgentSession]>,
+        legacy_question_holds: Option<&HashSet<AgentId>>,
+    ) -> AttentionSignals {
         let mut signals = AttentionSignals {
             needs_attention: attention == WorkspaceAttention::ReviewRequired,
             ..AttentionSignals::default()
@@ -519,6 +555,8 @@ impl Services {
                         Some(pending) => session.dismissed_questions_message_id() != Some(pending),
                         None => false,
                     }
+                } else if let Some(holds) = legacy_question_holds {
+                    holds.contains(&session.id)
                 } else {
                     self.questions_pending(&session.id).await
                 };
@@ -530,6 +568,14 @@ impl Services {
         }
         signals
     }
+}
+
+/// Store-backed status inputs already fetched for a complete list snapshot.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkspaceStatusSnapshot<'a> {
+    pub(crate) waiting: bool,
+    pub(crate) monitor_pr_signals: MonitorPrSignals,
+    pub(crate) legacy_question_holds: &'a HashSet<AgentId>,
 }
 
 /// Attention-axis inputs to [`compute_display_status`], probed by
@@ -1660,7 +1706,8 @@ mod display_status {
 #[cfg(test)]
 mod workspace_needs_attention {
     use intent_core::{
-        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceAttention, WorkspaceId,
+        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceApi, WorkspaceAttention,
+        WorkspaceDisplayStatus, WorkspaceId,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -1852,6 +1899,119 @@ mod workspace_needs_attention {
             .await
             .unwrap();
         assert!(signals(&svc, &ws).await.needs_attention);
+    }
+
+    #[tokio::test]
+    async fn question_marker_shapes_match_across_get_list_and_lite_snapshot() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store.clone());
+        let cases = [
+            ("absent", None, WorkspaceDisplayStatus::NeedsAttention),
+            (
+                "null",
+                Some(json!(null)),
+                WorkspaceDisplayStatus::NeedsAttention,
+            ),
+            (
+                "number",
+                Some(json!(42)),
+                WorkspaceDisplayStatus::NeedsAttention,
+            ),
+            ("empty", Some(json!("")), WorkspaceDisplayStatus::Idle),
+            (
+                "set",
+                Some(json!("set")),
+                WorkspaceDisplayStatus::NeedsAttention,
+            ),
+        ];
+        let mut expected = Vec::new();
+
+        for (name, marker, status) in cases {
+            let ws = WorkspaceId::from(format!("ws-marker-{name}"));
+            store.insert_workspace(&workspace(&ws)).await.expect("ws");
+            let mut session = mk_session(&ws, &format!("agent-marker-{name}"));
+            store.insert_agent_session(&session).await.expect("session");
+            let message = store
+                .append_agent_message(&session.id, "assistant", &question_content(), &now_iso())
+                .await
+                .expect("question");
+            session.metadata = marker.map(|value| {
+                json!({
+                    (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY):
+                        if name == "set" { json!(message.id) } else { value }
+                })
+            });
+            store
+                .update_agent_session(&ws, &session)
+                .await
+                .expect("update marker");
+            expected.push((ws, status));
+        }
+
+        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let lite = svc
+            .list_workspaces_lite(false)
+            .await
+            .expect("workspace.subscribe snapshot");
+        for (ws, status) in expected {
+            let get = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+            let list = listed.iter().find(|row| row.id == ws).expect("list row");
+            let snapshot = lite.iter().find(|row| row.id == ws).expect("lite row");
+            assert_eq!(get.display_status, Some(status), "get: {ws}");
+            assert_eq!(list.display_status, get.display_status, "list: {ws}");
+            assert_eq!(
+                snapshot.display_status, get.display_status,
+                "snapshot: {ws}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_tail_failure_falls_back_without_hiding_pending_questions() {
+        let (svc, ws, _tmp) = setup().await;
+        let pending = mk_session(&ws, "agent-pending-batch-fallback");
+        svc.store.insert_agent_session(&pending).await.unwrap();
+        svc.store
+            .append_agent_message(&pending.id, "assistant", &question_content(), &now_iso())
+            .await
+            .unwrap();
+
+        let malformed = mk_session(&ws, "agent-malformed-tail");
+        svc.store.insert_agent_session(&malformed).await.unwrap();
+        let malformed_message = svc
+            .store
+            .append_agent_message(
+                &malformed.id,
+                "assistant",
+                &json!([{ "type": "text", "text": "plain" }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_message SET content = 'not-json' WHERE id = ?")
+            .bind(&malformed_message.id)
+            .execute(svc.store.write_pool())
+            .await
+            .expect("corrupt one legacy tail");
+        assert!(
+            svc.store
+                .list_legacy_question_tail_candidates_by_workspace(std::slice::from_ref(&ws))
+                .await
+                .is_err(),
+            "fixture must fail the batch tail read"
+        );
+
+        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let listed_ws = listed
+            .iter()
+            .find(|workspace| workspace.id == ws)
+            .expect("workspace row");
+        assert_eq!(
+            listed_ws.display_status,
+            Some(WorkspaceDisplayStatus::NeedsAttention),
+            "valid pending question survives another row's batch decode failure"
+        );
     }
 
     #[tokio::test]

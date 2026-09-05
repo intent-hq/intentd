@@ -29,4 +29,4 @@ pub mod host;
 pub mod scrollback;
 
 pub use host::{Attachment, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
-pub use scrollback::Scrollback;
+pub use scrollback::{LineSnapshot, Scrollback};
