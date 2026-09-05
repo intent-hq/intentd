@@ -5,11 +5,15 @@
 mod common;
 
 use std::net::Ipv4Addr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::{Result as CoreResult, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    Result as CoreResult, SetupResult, SetupResultState, WorkspaceApi, WorkspaceDraftId,
+    WorkspaceId,
+};
 use intent_services::{EventBus, Services, WorkspaceDraftPromotionFailpoint};
 use intent_store::Store;
 use intent_transport::{
@@ -21,12 +25,19 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 
 type Ws = common::TlsWs;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+
+fn use_short_cache_clone_timeout() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| std::env::set_var("INTENTD_CACHE_CLONE_TIMEOUT_SECS", "1"));
+}
 
 #[derive(Default)]
 struct MemTokenStore(Mutex<Option<String>>);
@@ -147,6 +158,10 @@ async fn boot_with_failpoint(
     failpoint: Option<WorkspaceDraftPromotionFailpoint>,
 ) -> (WsApiServer, u16, Arc<ClientConfig>) {
     let store = Store::open(&root.join("intentd.db")).await.expect("store");
+    store
+        .reconcile_interrupted_setup_results()
+        .await
+        .expect("reconcile interrupted setup results");
     let bus = EventBus::new(store.clone());
     let mut services = Services::new(store)
         .with_workspaces_root(root.join("workspaces"))
@@ -328,8 +343,80 @@ async fn rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     response["result"].clone()
 }
 
+async fn send_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) {
+    let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(request.to_string().into()))
+        .await
+        .unwrap();
+}
+
+async fn wait_for_setup_state(ws: &mut Ws, workspace_id: &str, state: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let workspace = rpc(ws, 91, "workspace.get", json!({"workspaceId":workspace_id})).await
+            ["workspace"]
+            .clone();
+        if workspace["setupResult"]["state"] == state {
+            return workspace;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "setupResult: {workspace}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn assert_failed_draft_without_workspace(
+    ws: &mut Ws,
+    draft_id: &str,
+    expected_error_fragment: &str,
+) {
+    let retained = rpc(ws, 92, "workspaceDraft.get", json!({"id":draft_id})).await;
+    assert_eq!(retained["phase"], "failed");
+    assert!(
+        retained["lastError"]
+            .as_str()
+            .is_some_and(|error| error.to_lowercase().contains(expected_error_fragment)),
+        "retained draft error: {retained}"
+    );
+    let workspaces = rpc(ws, 93, "workspace.list", json!({})).await;
+    assert!(workspaces["workspaces"].as_array().unwrap().is_empty());
+}
+
+async fn spawn_http_error_server(status: &'static str, delay: Duration) -> (u16, Arc<Notify>) {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind HTTP fixture");
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(Notify::new());
+    let accepted_task = accepted.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            accepted_task.notify_one();
+            tokio::spawn(async move {
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                sleep(delay).await;
+                let response =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (port, accepted)
+}
+
 fn make_repo(root: &Path) -> PathBuf {
-    let repo = root.join("repo");
+    make_repo_named(root, "repo")
+}
+
+fn make_repo_named(root: &Path, name: &str) -> PathBuf {
+    let repo = root.join(name);
     std::fs::create_dir_all(&repo).unwrap();
     for args in [
         vec!["init", "-b", "main"],
@@ -357,6 +444,31 @@ fn make_repo(root: &Path) -> PathBuf {
         .unwrap()
         .success());
     repo
+}
+
+async fn assert_single_workspace_agent_and_turn(ws: &mut Ws, workspace_id: &str, agent_id: &str) {
+    let workspaces = rpc(ws, 94, "workspace.list", json!({})).await;
+    assert_eq!(workspaces["workspaces"].as_array().unwrap().len(), 1);
+    let agents = rpc(ws, 95, "agent.list", json!({"workspaceId":workspace_id})).await;
+    assert_eq!(agents["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(agents["agents"][0]["id"], agent_id);
+    let conversation = rpc(
+        ws,
+        96,
+        "agent.getConversation",
+        json!({"workspaceId":workspace_id,"agentId":agent_id}),
+    )
+    .await;
+    assert_eq!(
+        conversation["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .count(),
+        1,
+        "promotion retry must not duplicate the initial turn"
+    );
 }
 
 #[tokio::test]
@@ -633,5 +745,538 @@ async fn new_folder_promotion_initializes_main_and_rejects_non_empty_target() {
     assert_eq!(
         std::fs::read_to_string(occupied_path.join("keep.txt")).unwrap(),
         "keep\n"
+    );
+}
+
+#[tokio::test]
+async fn restart_restores_acknowledged_draft_boundaries_and_lost_promote_ack() {
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let (server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let created = rpc(
+        &mut ws,
+        1,
+        "workspaceDraft.create",
+        json!({"ownerClientId":"restart-client"}),
+    )
+    .await;
+    let draft_id = created["id"].as_str().unwrap().to_string();
+    let operation_key = created["operationKey"].clone();
+    assert_eq!(created["phase"], "editing");
+    drop(ws);
+    drop(server);
+
+    let (server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let restored_created = rpc(&mut ws, 2, "workspaceDraft.get", json!({"id":draft_id})).await;
+    assert_eq!(restored_created["operationKey"], operation_key);
+    assert_eq!(restored_created["intentText"], "");
+    let edited = rpc(
+        &mut ws,
+        3,
+        "workspaceDraft.update",
+        json!({"id":draft_id,"expectedRevision":0,"patch":{"intentText":"acknowledged"}}),
+    )
+    .await;
+    assert_eq!(edited["revision"], 1);
+    let unsent_client_value = "not sent before the debounce fired";
+    drop(ws);
+    drop(server);
+
+    let (server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let restored_edit = rpc(&mut ws, 4, "workspaceDraft.get", json!({"id":draft_id})).await;
+    assert_eq!(restored_edit["intentText"], "acknowledged");
+    assert_ne!(restored_edit["intentText"], unsent_client_value);
+    let source_selected = rpc(
+        &mut ws,
+        5,
+        "workspaceDraft.update",
+        json!({
+            "id":draft_id,
+            "expectedRevision":1,
+            "patch":{"source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}}
+        }),
+    )
+    .await;
+    assert_eq!(source_selected["revision"], 2);
+    drop(ws);
+    drop(server);
+
+    let probe_store = Store::open(&root.0.join("intentd.db")).await.unwrap();
+    let promoting = probe_store
+        .set_workspace_draft_phase(
+            &WorkspaceDraftId::from(draft_id.as_str()),
+            intent_core::DraftPhase::Promoting,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(promoting.revision, 3);
+    probe_store.close().await;
+    let (server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config.clone()).await;
+    let restored_promoting = rpc(&mut ws, 6, "workspaceDraft.get", json!({"id":draft_id})).await;
+    assert_eq!(restored_promoting["phase"], "promoting");
+
+    send_rpc(
+        &mut ws,
+        7,
+        "workspaceDraft.promote",
+        json!({
+            "id":draft_id,
+            "expectedRevision":2,
+            "initialAgent":{"name":"Coordinator","provider":"codex","prompt":"first turn"}
+        }),
+    )
+    .await;
+    let completion_store = Store::open(&root.0.join("intentd.db")).await.unwrap();
+    let promoted = timeout(Duration::from_secs(10), async {
+        loop {
+            let draft = completion_store
+                .get_workspace_draft(&WorkspaceDraftId::from(draft_id.as_str()))
+                .await
+                .unwrap();
+            if draft.phase == intent_core::DraftPhase::Promoted {
+                break draft;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("promotion completed before dropped ACK");
+    let workspace_id = promoted.promoted_workspace_id.unwrap().0;
+    let agent_id = promoted.initial_agent_id.unwrap().0;
+    drop(ws);
+    drop(server);
+    completion_store.close().await;
+
+    let (_server, port, config) = boot(&root.0).await;
+    let mut fresh_ws = connect(port, config).await;
+    let replay = rpc(
+        &mut fresh_ws,
+        8,
+        "workspaceDraft.promote",
+        json!({"id":draft_id,"expectedRevision":2}),
+    )
+    .await;
+    assert_eq!(replay["workspace"]["id"], workspace_id);
+    assert_eq!(replay["initialAgent"]["id"], agent_id);
+    assert_eq!(replay["draft"]["operationKey"], operation_key);
+    assert_single_workspace_agent_and_turn(&mut fresh_ws, &workspace_id, &agent_id).await;
+}
+
+#[tokio::test]
+async fn concurrent_clients_surface_revision_conflict_and_share_one_promotion() {
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let (_server, port, config) = boot(&root.0).await;
+    let mut first = connect(port, config.clone()).await;
+    let mut second = connect(port, config).await;
+    let created = rpc(
+        &mut first,
+        1,
+        "workspaceDraft.create",
+        json!({
+            "intentText":"original",
+            "source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}
+        }),
+    )
+    .await;
+    let draft_id = created["id"].as_str().unwrap().to_string();
+    let (left, right) = tokio::join!(
+        rpc_raw(
+            &mut first,
+            2,
+            "workspaceDraft.update",
+            json!({"id":draft_id,"expectedRevision":0,"patch":{"title":"left"}}),
+        ),
+        rpc_raw(
+            &mut second,
+            3,
+            "workspaceDraft.update",
+            json!({"id":draft_id,"expectedRevision":0,"patch":{"title":"right"}}),
+        )
+    );
+    let responses = [&left, &right];
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.get("result").is_some())
+            .count(),
+        1
+    );
+    let conflict = responses
+        .iter()
+        .find(|response| response.get("error").is_some())
+        .unwrap();
+    assert_eq!(conflict["error"]["code"], -32009);
+    assert_eq!(conflict["error"]["data"]["current"]["revision"], 1);
+
+    let (first_promotion, second_promotion) = tokio::join!(
+        rpc(
+            &mut first,
+            4,
+            "workspaceDraft.promote",
+            json!({
+                "id":draft_id,"expectedRevision":1,
+                "initialAgent":{"name":"Coordinator","provider":"codex","prompt":"one turn"}
+            }),
+        ),
+        rpc(
+            &mut second,
+            5,
+            "workspaceDraft.promote",
+            json!({
+                "id":draft_id,"expectedRevision":1,
+                "initialAgent":{"name":"Coordinator","provider":"codex","prompt":"one turn"}
+            }),
+        )
+    );
+    assert_eq!(
+        first_promotion["workspace"]["id"],
+        second_promotion["workspace"]["id"]
+    );
+    assert_eq!(
+        first_promotion["initialAgent"]["id"],
+        second_promotion["initialAgent"]["id"]
+    );
+    assert_single_workspace_agent_and_turn(
+        &mut first,
+        first_promotion["workspace"]["id"].as_str().unwrap(),
+        first_promotion["initialAgent"]["id"].as_str().unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn setup_result_covers_absent_nonzero_prespawn_and_listener_reconnect() {
+    let root = TempDir::new();
+    let absent_repo = make_repo_named(&root.0, "absent-repo");
+    let failing_repo = make_repo_named(&root.0, "failing-repo");
+    let prespawn_repo = make_repo_named(&root.0, "prespawn-repo");
+    std::fs::write(prespawn_repo.join(".intent"), "block directory creation\n").unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["add", ".intent"])
+        .current_dir(&prespawn_repo)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("git")
+        .args(["commit", "-m", "block setup directory"])
+        .current_dir(&prespawn_repo)
+        .status()
+        .unwrap()
+        .success());
+
+    let (_server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config.clone()).await;
+    let absent = rpc(
+        &mut ws,
+        1,
+        "workspaceDraft.create",
+        json!({"source":{"kind":"local","path":absent_repo,"branch":"main","isolation":"worktree"}}),
+    )
+    .await;
+    let absent_promotion = rpc(
+        &mut ws,
+        2,
+        "workspaceDraft.promote",
+        json!({"id":absent["id"],"expectedRevision":0}),
+    )
+    .await;
+    let absent_workspace = rpc(
+        &mut ws,
+        3,
+        "workspace.get",
+        json!({"workspaceId":absent_promotion["workspace"]["id"]}),
+    )
+    .await;
+    assert!(absent_workspace["workspace"].get("setupResult").is_none());
+
+    let failing = rpc(
+        &mut ws,
+        4,
+        "workspaceDraft.create",
+        json!({
+            "source":{"kind":"local","path":failing_repo,"branch":"main","isolation":"worktree"},
+            "config":{"setupScript":"sleep 0.25; exit 23"}
+        }),
+    )
+    .await;
+    let failing_promotion = rpc(
+        &mut ws,
+        5,
+        "workspaceDraft.promote",
+        json!({"id":failing["id"],"expectedRevision":0}),
+    )
+    .await;
+    let failing_workspace_id = failing_promotion["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(ws);
+    let mut reconnected = connect(port, config).await;
+    let failed = wait_for_setup_state(&mut reconnected, &failing_workspace_id, "failed").await;
+    assert_eq!(failed["setupResult"]["exitCode"], 23);
+    assert_eq!(
+        failed["setupResult"]["error"],
+        "setup script exited with code 23"
+    );
+
+    let prespawn = rpc(
+        &mut reconnected,
+        6,
+        "workspaceDraft.create",
+        json!({
+            "source":{"kind":"local","path":prespawn_repo,"branch":"main","isolation":"worktree"},
+            "config":{"setupScript":"echo should-not-run"}
+        }),
+    )
+    .await;
+    let prespawn_promotion = rpc(
+        &mut reconnected,
+        7,
+        "workspaceDraft.promote",
+        json!({"id":prespawn["id"],"expectedRevision":0}),
+    )
+    .await;
+    let prespawn_failed = wait_for_setup_state(
+        &mut reconnected,
+        prespawn_promotion["workspace"]["id"].as_str().unwrap(),
+        "failed",
+    )
+    .await;
+    assert!(prespawn_failed["setupResult"].get("exitCode").is_none());
+    assert_eq!(
+        prespawn_failed["setupResult"]["error"],
+        ".intent is not a directory"
+    );
+}
+
+#[tokio::test]
+async fn restart_reconciles_unfinished_setup_result_to_unknown() {
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let (server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let draft = rpc(
+        &mut ws,
+        1,
+        "workspaceDraft.create",
+        json!({"source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}}),
+    )
+    .await;
+    let promotion = rpc(
+        &mut ws,
+        2,
+        "workspaceDraft.promote",
+        json!({"id":draft["id"],"expectedRevision":0}),
+    )
+    .await;
+    let workspace_id = promotion["workspace"]["id"].as_str().unwrap().to_string();
+    let store = Store::open(&root.0.join("intentd.db")).await.unwrap();
+    store
+        .update_workspace_setup_result(
+            &WorkspaceId::from(workspace_id.as_str()),
+            &SetupResult {
+                state: SetupResultState::Running,
+                started_at: Some("2026-09-05T00:00:00Z".into()),
+                ..SetupResult::default()
+            },
+        )
+        .await
+        .unwrap();
+    store.close().await;
+    drop(ws);
+    drop(server);
+
+    let (_restarted, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+    let restored = rpc(
+        &mut ws,
+        3,
+        "workspace.get",
+        json!({"workspaceId":workspace_id}),
+    )
+    .await;
+    assert_eq!(restored["workspace"]["setupResult"]["state"], "unknown");
+    assert_eq!(
+        restored["workspace"]["setupResult"]["startedAt"],
+        "2026-09-05T00:00:00Z"
+    );
+}
+
+#[tokio::test]
+async fn github_clone_failures_retain_drafts_without_orphan_workspaces() {
+    use_short_cache_clone_timeout();
+    let root = TempDir::new();
+    let (_server, port, config) = boot(&root.0).await;
+    let mut ws = connect(port, config).await;
+
+    let (forbidden_port, _) =
+        spawn_http_error_server("403 Forbidden", Duration::from_millis(0)).await;
+    let forbidden = rpc(
+        &mut ws,
+        1,
+        "workspaceDraft.create",
+        json!({"source":{
+            "kind":"github","url":format!("http://127.0.0.1:{forbidden_port}/private/repo.git"),
+            "owner":"private","name":"repo"
+        }}),
+    )
+    .await;
+    let forbidden_response = rpc_raw(
+        &mut ws,
+        2,
+        "workspaceDraft.promote",
+        json!({"id":forbidden["id"],"expectedRevision":0}),
+    )
+    .await;
+    assert!(forbidden_response.get("error").is_some());
+    assert_failed_draft_without_workspace(&mut ws, forbidden["id"].as_str().unwrap(), "403").await;
+
+    let (timeout_port, _) = spawn_http_error_server("200 OK", Duration::from_secs(5)).await;
+    let stalled = rpc(
+        &mut ws,
+        3,
+        "workspaceDraft.create",
+        json!({"source":{
+            "kind":"github","url":format!("http://127.0.0.1:{timeout_port}/slow/repo.git"),
+            "owner":"slow","name":"repo"
+        }}),
+    )
+    .await;
+    let timeout_response = rpc_raw(
+        &mut ws,
+        4,
+        "workspaceDraft.promote",
+        json!({"id":stalled["id"],"expectedRevision":0}),
+    )
+    .await;
+    assert!(timeout_response.get("error").is_some());
+    assert_failed_draft_without_workspace(&mut ws, stalled["id"].as_str().unwrap(), "timed out")
+        .await;
+
+    let occupied_target = root.0.join("workspaces/clones/occupied");
+    std::fs::create_dir_all(&occupied_target).unwrap();
+    std::fs::write(occupied_target.join("keep"), "keep").unwrap();
+    let occupied = rpc(
+        &mut ws,
+        5,
+        "workspaceDraft.create",
+        json!({"source":{
+            "kind":"github","url":"occupied","owner":"local","name":"occupied"
+        }}),
+    )
+    .await;
+    let occupied_response = rpc_raw(
+        &mut ws,
+        6,
+        "workspaceDraft.promote",
+        json!({"id":occupied["id"],"expectedRevision":0}),
+    )
+    .await;
+    assert_eq!(occupied_response["error"]["code"], -32602);
+    assert_eq!(
+        occupied_response["error"]["data"]["code"],
+        "destination-exists-non-empty"
+    );
+    assert_failed_draft_without_workspace(&mut ws, occupied["id"].as_str().unwrap(), "not empty")
+        .await;
+
+    let permission_source = make_repo_named(&root.0, "permission-source");
+    let cache_owner = root
+        .0
+        .join("workspaces/.repo-cache")
+        .join(root.0.file_name().unwrap());
+    std::fs::create_dir_all(&cache_owner).unwrap();
+    std::fs::set_permissions(&cache_owner, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let denied = rpc(
+        &mut ws,
+        7,
+        "workspaceDraft.create",
+        json!({"source":{
+            "kind":"github","url":format!("file://{}", permission_source.display()),
+            "owner":"local","name":"denied"
+        }}),
+    )
+    .await;
+    let denied_response = rpc_raw(
+        &mut ws,
+        8,
+        "workspaceDraft.promote",
+        json!({"id":denied["id"],"expectedRevision":0}),
+    )
+    .await;
+    std::fs::set_permissions(&cache_owner, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(denied_response.get("error").is_some());
+    assert_failed_draft_without_workspace(
+        &mut ws,
+        denied["id"].as_str().unwrap(),
+        "permission denied",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn late_clone_reply_cannot_mutate_a_switched_backend_draft() {
+    use_short_cache_clone_timeout();
+    let old_root = TempDir::new();
+    let new_root = TempDir::new();
+    let (http_port, accepted) = spawn_http_error_server("200 OK", Duration::from_secs(5)).await;
+    let (_old_server, old_port, old_config) = boot(&old_root.0).await;
+    let mut old_ws = connect(old_port, old_config).await;
+    let old_draft = rpc(
+        &mut old_ws,
+        1,
+        "workspaceDraft.create",
+        json!({"ownerClientId":"same-client","source":{
+            "kind":"github","url":format!("http://127.0.0.1:{http_port}/late/repo.git"),
+            "owner":"late","name":"repo"
+        }}),
+    )
+    .await;
+    let old_id = old_draft["id"].as_str().unwrap().to_string();
+    let old_promotion = tokio::spawn(async move {
+        rpc_raw(
+            &mut old_ws,
+            2,
+            "workspaceDraft.promote",
+            json!({"id":old_id,"expectedRevision":0}),
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), accepted.notified())
+        .await
+        .expect("old backend clone reached fixture");
+
+    let (_new_server, new_port, new_config) = boot(&new_root.0).await;
+    let mut new_ws = connect(new_port, new_config).await;
+    let new_draft = rpc(
+        &mut new_ws,
+        3,
+        "workspaceDraft.create",
+        json!({"ownerClientId":"same-client","intentText":"new backend truth"}),
+    )
+    .await;
+    let old_result = old_promotion.await.unwrap();
+    assert!(old_result.get("error").is_some());
+    let still_new = rpc(
+        &mut new_ws,
+        4,
+        "workspaceDraft.get",
+        json!({"id":new_draft["id"]}),
+    )
+    .await;
+    assert_eq!(still_new["phase"], "editing");
+    assert_eq!(still_new["intentText"], "new backend truth");
+    assert_eq!(still_new["revision"], 0);
+    assert!(
+        rpc(&mut new_ws, 5, "workspace.list", json!({})).await["workspaces"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
 }
