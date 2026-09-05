@@ -12770,7 +12770,6 @@ pub(crate) async fn with_idempotency<T, F, Fut>(
     workspace_id: &str,
     key: Option<String>,
     method: &str,
-    after_op: Option<Box<dyn FnOnce() -> Result<()> + Send>>,
     op: F,
 ) -> Result<T>
 where
@@ -12791,9 +12790,6 @@ where
         return Ok(value);
     }
     let result = op().await?;
-    if let Some(after_op) = after_op {
-        after_op()?;
-    }
     let result_json = serde_json::to_string(&result)
         .map_err(|e| Error::Internal(format!("encode idempotent result failed: {e}")))?;
     store
@@ -16723,7 +16719,6 @@ impl WorkspaceApi for Services {
                 "",
                 idempotency_key,
                 "workspace.create",
-                None,
                 move || async move {
                     let store = op_store;
                     let now = now_iso();
@@ -21188,7 +21183,6 @@ impl WorkspaceApi for Services {
                 &ws_scope,
                 idempotency_key,
                 "note.create",
-                None,
                 move || async move {
                     let store = op_store;
                     let now = now_iso();
@@ -23026,7 +23020,6 @@ impl WorkspaceApi for Services {
                 &ws_scope,
                 idempotency_key,
                 "comment.add",
-                None,
                 move || async move {
                     let store = op_store;
                     if comment.trim().is_empty() {
@@ -25004,7 +24997,6 @@ impl WorkspaceApi for Services {
                 &ws_scope,
                 idempotency_key,
                 "git.commit",
-                None,
                 move || async move {
                     let store = op_store;
                     git_ops::assert_agent_commit_allowed(auto_commit_enabled, false)?;
@@ -26053,7 +26045,6 @@ impl WorkspaceApi for Services {
                 &ws_scope,
                 idempotency_key,
                 "agent.create",
-                None,
                 move || async move {
                     self.agent_create_op(
                         workspace_id,
