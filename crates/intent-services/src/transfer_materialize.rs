@@ -349,7 +349,7 @@ fn materialize_inner(
     //    provisioned, so they keep the remote-less shape they have on the
     //    source, and after the bundle origin was removed, so `origin` can be
     //    recreated with its real URL.
-    crate::transfer_remotes::restore_remotes(&checkout_dir, bundle, refs)?;
+    crate::transfer_remotes::restore_remotes(&checkout_dir, bundle, refs, &ws.id.0)?;
 
     Ok(MaterializedGit {
         checkout_dir,
@@ -2501,6 +2501,107 @@ mod tests {
         assert_eq!(intent_git::local_changes(&dst).unwrap().unpushed_count, 1);
     }
 
+    fn assert_local_anchor_tamper_rolls_back(use_sandbox: bool) {
+        let src = tempfile::tempdir().unwrap();
+        let repo = src.path().join("source-repo");
+        init_repo(&repo);
+        let published = repo_head(&repo);
+        add_remote_with_tracking(
+            &repo,
+            "origin",
+            "https://example.invalid/repo",
+            &[("main", &published)],
+        );
+        let local = commit_file(&repo, "local.txt", "local\n", "local-only commit");
+        fgit(&repo, &["checkout", "-b", "feature"]);
+        let mut ws = workspace_for_repo(&repo);
+        ws.branch = "feature".into();
+        ws.base_commit_sha = Some(local.clone());
+        let agent = AgentId::new();
+        let branch = format!("sb/{}", agent.0);
+        let sandbox = src.path().join("sandbox");
+        make_sandbox_clone(&repo, &sandbox, &branch);
+        let sb = sandbox_row(&ws, &agent, &sandbox, &branch);
+        let sandboxes = std::slice::from_ref(&sb);
+        let bundle = create_transfer_bundle(&ws, sandboxes, &src.path().join("staging")).unwrap();
+        assert_eq!(bundle.refs.base_sha.as_deref(), Some(local.as_str()));
+        assert_eq!(bundle.refs.sandboxes[0].head_sha, local);
+        assert_eq!(bundle.refs.remotes[0].tracking_refs[0].sha, published);
+        assert!(bundle.refs.workspace_wip_commit_sha.is_none());
+        assert!(bundle.refs.sandboxes[0].wip_commit_sha.is_none());
+        assert_eq!(intent_git::local_changes(&repo).unwrap().unpushed_count, 1);
+
+        let valid_target = tempfile::tempdir().unwrap();
+        let valid = materialize_workspace_git_blocking(
+            &bundle.bundle_path,
+            &bundle.refs,
+            &ws,
+            sandboxes,
+            valid_target.path(),
+        )
+        .unwrap();
+        assert_eq!(repo_head(&valid.checkout_dir), local);
+        assert_eq!(
+            intent_git::local_changes(&valid.checkout_dir)
+                .unwrap()
+                .unpushed_count,
+            1
+        );
+
+        let anchor = if use_sandbox {
+            bundle.refs.sandboxes[0].bundle_ref.clone()
+        } else {
+            bundle.refs.base_bundle_ref.clone().unwrap()
+        };
+        assert!(fgit(
+            &repo,
+            &["bundle", "list-heads", bundle.bundle_path.to_str().unwrap()]
+        )
+        .lines()
+        .any(|line| line == format!("{local} {anchor}")));
+        let bundle_bytes = fs::read(&bundle.bundle_path).unwrap();
+        let mut metadata = serde_json::to_value(&bundle.refs).unwrap();
+        metadata["remotes"][0]["trackingRefs"][0]["bundleRef"] = anchor.into();
+        metadata["remotes"][0]["trackingRefs"][0]["sha"] = local.clone().into();
+        let tampered: TransferRefsManifest = serde_json::from_value(metadata).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("keep.txt"), "untouched").unwrap();
+        let result = materialize_workspace_git_blocking(
+            &bundle.bundle_path,
+            &tampered,
+            &ws,
+            sandboxes,
+            target.path(),
+        );
+        if let Ok(out) = result {
+            let unpushed = intent_git::local_changes(&out.checkout_dir)
+                .unwrap()
+                .unpushed_count;
+            panic!("local-only anchor accepted as published: unpushed={unpushed}");
+        }
+        assert!(
+            !target.path().join(&ws.id.0).exists(),
+            "full workspace rollback"
+        );
+        assert_eq!(
+            fs::read_to_string(target.path().join("keep.txt")).unwrap(),
+            "untouched"
+        );
+        assert_eq!(fs::read(&bundle.bundle_path).unwrap(), bundle_bytes);
+        assert_eq!(repo_head(&repo), local);
+        assert_eq!(ref_sha(&repo, "refs/remotes/origin/main"), Some(published));
+    }
+
+    #[test]
+    fn review_r5_base_anchor_tamper_rejects_and_rolls_back() {
+        assert_local_anchor_tamper_rolls_back(false);
+    }
+
+    #[test]
+    fn review_r5_sandbox_anchor_tamper_rejects_and_rolls_back() {
+        assert_local_anchor_tamper_rolls_back(true);
+    }
+
     type Tamper = Box<dyn Fn(&mut TransferRefsManifest)>;
 
     /// Manifest metadata is re-validated on import: a tracking ref outside
@@ -2716,6 +2817,7 @@ mod tests {
             &[("main", &head)],
         );
         fgit(&source, &["branch", "-u", "origin/main", "main"]);
+        let local = commit_file(&source, "local.txt", "local\n", "unpublished legacy commit");
         let ws = workspace_for_repo(&source);
         let bundle = create_transfer_bundle(&ws, &[], &tmp.path().join("staging")).unwrap();
         let mut json = serde_json::to_value(bundle.refs).unwrap();
@@ -2760,11 +2862,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fgit(&out.checkout_dir, &["rev-parse", "@{upstream}"]), head);
+        assert_eq!(repo_head(&out.checkout_dir), local);
         assert_eq!(
             intent_git::local_changes(&out.checkout_dir)
                 .unwrap()
                 .unpushed_count,
-            0
+            1
         );
     }
 

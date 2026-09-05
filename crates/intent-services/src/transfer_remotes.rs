@@ -498,6 +498,25 @@ pub(crate) fn capture_remotes(
     Ok((remotes, upstream))
 }
 
+/// Only dedicated remote snapshots may establish publication. In particular,
+/// base/sandbox anchors also carry local-only commits and must never be sources
+/// for remote-tracking refs. Match the exporter's workspace/remotes/UUID/index
+/// layout exactly, including canonical UUID and decimal index spelling.
+fn validate_remote_snapshot_ref(anchor: &str, workspace_id: &str) -> Result<()> {
+    let prefix = format!("refs/intent/transfer/{workspace_id}/remotes/");
+    validate_ref_under(anchor, &prefix).map_err(|_| unsupported_config())?;
+    let (snapshot, index) = anchor
+        .strip_prefix(&prefix)
+        .and_then(|suffix| suffix.split_once('/'))
+        .ok_or_else(unsupported_config)?;
+    let snapshot_id = uuid::Uuid::parse_str(snapshot).map_err(|_| unsupported_config())?;
+    let index_value = index.parse::<usize>().map_err(|_| unsupported_config())?;
+    if snapshot_id.to_string() != snapshot || index_value.to_string() != index {
+        return Err(unsupported_config());
+    }
+    Ok(())
+}
+
 /// Import side: recreate the manifest's remotes on the materialized checkout
 /// and fetch their tracking refs from the bundle (no network), then restore
 /// the workspace branch's upstream. Every field is re-validated; anything a
@@ -508,6 +527,7 @@ pub(crate) fn restore_remotes(
     checkout_dir: &Path,
     bundle: &str,
     refs: &TransferRefsManifest,
+    workspace_id: &str,
 ) -> Result<()> {
     let wip_shas: Vec<&str> = refs
         .workspace_wip_commit_sha
@@ -567,8 +587,7 @@ pub(crate) fn restore_remotes(
                 return Err(unsupported_config());
             }
             if let Some(anchor) = &t.bundle_ref {
-                validate_ref_under(anchor, "refs/intent/transfer/")
-                    .map_err(|_| unsupported_config())?;
+                validate_remote_snapshot_ref(anchor, workspace_id)?;
             }
             if !is_full_sha(&t.sha) {
                 return Err(unsupported_config());
@@ -692,6 +711,49 @@ fn add_config_value(checkout: &Path, key: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_r5_remote_snapshot_ref_requires_exact_exporter_layout() {
+        let workspace = "test-workspace";
+        let snapshot = "6dfd0a2b-768e-458c-8a84-6957ca7e6d24";
+        let prefix = format!("refs/intent/transfer/{workspace}");
+        for index in [0, 1, 42, usize::MAX] {
+            validate_remote_snapshot_ref(
+                &format!("{prefix}/remotes/{snapshot}/{index}"),
+                workspace,
+            )
+            .unwrap();
+        }
+        for suffix in [
+            "base".to_string(),
+            "sandbox/agent".to_string(),
+            "submodule/0".to_string(),
+            "other".to_string(),
+            "remotes".to_string(),
+            "remotes/not-a-uuid/0".to_string(),
+            format!("remotes/{snapshot}"),
+            format!("remotes/{snapshot}/"),
+            format!("remotes/{snapshot}/+1"),
+            format!("remotes/{snapshot}/-1"),
+            format!("remotes/{snapshot}/01"),
+            format!("remotes/{snapshot}/18446744073709551616"),
+            format!("remotes/{snapshot}/0/extra"),
+            format!("remotes/{}/0", snapshot.replace('-', "")),
+            format!("remotes/{}/0", snapshot.to_uppercase()),
+            format!("extra/remotes/{snapshot}/0"),
+        ] {
+            assert!(
+                validate_remote_snapshot_ref(&format!("{prefix}/{suffix}"), workspace).is_err()
+            );
+        }
+        for other_workspace in ["other-workspace", "test-workspace-extra"] {
+            assert!(validate_remote_snapshot_ref(
+                &format!("refs/intent/transfer/{other_workspace}/remotes/{snapshot}/0"),
+                workspace,
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn review_r1_rejects_ambiguous_urls_and_decoded_authority_controls() {
