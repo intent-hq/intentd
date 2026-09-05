@@ -36,6 +36,27 @@ pub(crate) fn clear_workspace_unread_if_all_seen_sql() -> String {
 }
 
 impl Store {
+    /// Mark setup attempts that were still running when the previous daemon
+    /// exited as unknown. Call once during daemon startup, before serving
+    /// clients; calling this from [`Store::open`] would incorrectly affect a
+    /// live daemon when another store handle opens the same database.
+    ///
+    /// Returns the number of reconciled workspace rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the startup update fails.
+    pub async fn reconcile_interrupted_setup_results(&self) -> Result<u64> {
+        sqlx::query(
+            "UPDATE workspace SET setup_result = json_set(setup_result, '$.state', 'unknown') \
+             WHERE json_extract(setup_result, '$.state') = 'running'",
+        )
+        .execute(self.write_pool())
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|e| Error::Internal(format!("reconcile interrupted setup results failed: {e}")))
+    }
+
     /// Persist only the setup outcome column, avoiding a stale full-row write
     /// from the background setup task.
     ///
