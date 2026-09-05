@@ -392,23 +392,15 @@ pub(crate) fn read_output(
             let total = snapshot.total_lines;
             (snapshot, lines, total, token)
         } else {
-            // The historical helper trims blank lines at the newest end before
-            // paging. Probe backward in bounded chunks so even an ANSI-only
-            // blank suffix does not require cloning the complete scrollback.
-            let mut probe_end = None;
-            let effective_end = loop {
-                let probe = pty.scrollback_lines(id, limit, probe_end)?;
-                let probe_lines = decoded_snapshot_lines(&probe);
-                if let Some(last_content) =
-                    probe_lines.iter().rposition(|line| !line.trim().is_empty())
-                {
-                    break probe.start_line + last_content + 1;
-                }
-                if probe.start_line == 0 {
-                    break 0;
-                }
-                probe_end = Some(probe.start_line);
-            };
+            // Locate the trailing-content boundary once. Repeated bounded
+            // probes restart OSC-context scans at every chunk and make a long
+            // blank suffix quadratic even though each copied page is tiny.
+            let full = pty.scrollback_lines(id, usize::MAX, None)?;
+            let full_lines = decoded_snapshot_lines(&full);
+            let effective_end = full_lines
+                .iter()
+                .rposition(|line| !line.trim().is_empty())
+                .map_or(0, |last_content| last_content + 1);
             let snapshot = pty.scrollback_lines(id, limit, Some(effective_end))?;
             let lines = decoded_snapshot_lines(&snapshot);
             (snapshot, lines, effective_end, None)

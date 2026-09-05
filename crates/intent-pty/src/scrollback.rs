@@ -55,6 +55,8 @@ pub struct Scrollback {
     non_whitespace_bytes: usize,
     #[cfg(test)]
     last_snapshot_copied_bytes: Cell<usize>,
+    #[cfg(test)]
+    last_snapshot_scanned_bytes: Cell<usize>,
 }
 
 impl Scrollback {
@@ -69,6 +71,8 @@ impl Scrollback {
             non_whitespace_bytes: 0,
             #[cfg(test)]
             last_snapshot_copied_bytes: Cell::new(0),
+            #[cfg(test)]
+            last_snapshot_scanned_bytes: Cell::new(0),
         }
     }
 
@@ -191,8 +195,15 @@ impl Scrollback {
     /// last BEL or ST terminator can participate.
     fn open_osc_start(&self, byte_start: usize) -> Option<usize> {
         let mut index = byte_start;
+        #[cfg(test)]
+        let mut scanned = 0;
         while index > 0 {
             index -= 1;
+            #[cfg(test)]
+            {
+                scanned += 1;
+                self.last_snapshot_scanned_bytes.set(scanned);
+            }
             if self.buf[index] == 0x07
                 || (index > 0 && self.buf[index - 1] == 0x1b && self.buf[index] == b'\\')
             {
@@ -202,6 +213,8 @@ impl Scrollback {
                 return Some(index);
             }
         }
+        #[cfg(test)]
+        self.last_snapshot_scanned_bytes.set(scanned);
         None
     }
 
@@ -239,6 +252,11 @@ impl Scrollback {
     #[cfg(test)]
     fn last_snapshot_copied_bytes(&self) -> usize {
         self.last_snapshot_copied_bytes.get()
+    }
+
+    #[cfg(test)]
+    fn last_snapshot_scanned_bytes(&self) -> usize {
+        self.last_snapshot_scanned_bytes.get()
     }
 }
 
@@ -344,6 +362,27 @@ mod tests {
         assert_eq!(lines.bytes, b"line-147\nline-148\nline-149\n");
         assert_eq!(sb.last_snapshot_copied_bytes(), lines.bytes.len());
         assert!(sb.last_snapshot_copied_bytes() < sb.len());
+    }
+
+    #[test]
+    fn blank_suffix_first_page_boundary_work_is_linear() {
+        let mut sb = Scrollback::new(512 * 1024);
+        for _ in 0..128 {
+            sb.push(b"prefix\n");
+        }
+        sb.push(b"visible\n");
+        for _ in 0..16_000 {
+            sb.push(b"\x1b[31m\x1b[0m\n");
+        }
+
+        let full = sb.snapshot_lines(usize::MAX, None);
+        let first_scan = sb.last_snapshot_scanned_bytes();
+        assert_eq!(full.start_line, 0);
+
+        let page = sb.snapshot_lines(1, Some(129));
+        let page_scan = sb.last_snapshot_scanned_bytes();
+        assert_eq!(page.bytes, b"visible\n");
+        assert!(first_scan + page_scan <= sb.len());
     }
 
     #[test]
