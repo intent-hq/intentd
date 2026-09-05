@@ -1097,6 +1097,63 @@ mod tests {
             .contains("last 2 of 3 lines"));
     }
 
+    #[tokio::test]
+    async fn read_output_blank_suffix_scan_work_is_linear() {
+        let pty = host();
+        let mut spec = SpawnSpec::new("ws-1", "sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "i=0; while [ $i -lt 128 ]; do printf 'prefix\\n'; i=$((i+1)); done; \
+             printf 'visible\\n'; i=0; while [ $i -lt 16000 ]; do \
+             printf '\\033[31m\\033[0m\\n'; i=$((i+1)); done; \
+             printf '\\033]0;scan-complete\\007\\n'"
+                .to_string(),
+        ];
+        let id = pty.spawn(spec).expect("spawn output producer");
+        let retained = poll_until(
+            || {
+                let bytes = pty.scrollback(id).ok()?;
+                contains_sub(&bytes, b"scan-complete").then_some(bytes)
+            },
+            LONG_TIMEOUT,
+        )
+        .await
+        .expect("blank suffix reaches scrollback");
+
+        let before = pty
+            .scrollback_line_snapshot_metrics(id)
+            .expect("metrics before read");
+        let page = read_output(
+            pty.as_ref(),
+            &ws("ws-1"),
+            &id.to_string(),
+            Some(1),
+            true,
+            None,
+        )
+        .expect("paginated read");
+        let after = pty
+            .scrollback_line_snapshot_metrics(id)
+            .expect("metrics after read");
+        let calls = after.0 - before.0;
+        let scanned = after.1 - before.1;
+
+        let items = page["items"].as_array().expect("page items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_str().expect("visible item").trim(), "visible");
+        assert!(
+            calls <= 2,
+            "read_output issued {calls} line snapshots for one page"
+        );
+        assert!(
+            scanned <= retained.len(),
+            "read_output scanned {scanned} bytes across {calls} snapshots for {} retained bytes",
+            retained.len()
+        );
+
+        kill(pty.as_ref(), &id.to_string()).await.unwrap();
+    }
+
     // ---- credential injection helpers (no spawn) ----
 
     /// A registry backed by a throwaway config file, optionally overriding

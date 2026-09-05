@@ -8,9 +8,11 @@
 //! newly attached subscriber can still back-fill recent history before tailing
 //! live output.
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::VecDeque;
 
 /// Default scrollback budget per PTY (512 KiB), matching the terminal byte
 /// buffer cap in `MainProcessTerminalManager.ts`.
@@ -53,10 +55,10 @@ pub struct Scrollback {
     newlines: VecDeque<u64>,
     stream_offset: u64,
     non_whitespace_bytes: usize,
+    line_snapshot_calls: AtomicUsize,
+    line_snapshot_scanned_bytes: AtomicUsize,
     #[cfg(test)]
     last_snapshot_copied_bytes: Cell<usize>,
-    #[cfg(test)]
-    last_snapshot_scanned_bytes: Cell<usize>,
 }
 
 impl Scrollback {
@@ -69,10 +71,10 @@ impl Scrollback {
             newlines: VecDeque::new(),
             stream_offset: 0,
             non_whitespace_bytes: 0,
+            line_snapshot_calls: AtomicUsize::new(0),
+            line_snapshot_scanned_bytes: AtomicUsize::new(0),
             #[cfg(test)]
             last_snapshot_copied_bytes: Cell::new(0),
-            #[cfg(test)]
-            last_snapshot_scanned_bytes: Cell::new(0),
         }
     }
 
@@ -157,6 +159,7 @@ impl Scrollback {
     /// invariants or its length cannot fit in `u64`.
     #[must_use]
     pub fn snapshot_lines(&self, max_lines: usize, end_line: Option<usize>) -> LineSnapshot {
+        self.line_snapshot_calls.fetch_add(1, Ordering::Relaxed);
         let total_lines = if self.buf.is_empty() {
             0
         } else {
@@ -195,27 +198,36 @@ impl Scrollback {
     /// last BEL or ST terminator can participate.
     fn open_osc_start(&self, byte_start: usize) -> Option<usize> {
         let mut index = byte_start;
-        #[cfg(test)]
         let mut scanned = 0;
         while index > 0 {
             index -= 1;
-            #[cfg(test)]
-            {
-                scanned += 1;
-                self.last_snapshot_scanned_bytes.set(scanned);
-            }
+            scanned += 1;
             if self.buf[index] == 0x07
                 || (index > 0 && self.buf[index - 1] == 0x1b && self.buf[index] == b'\\')
             {
+                self.record_snapshot_scan(scanned);
                 return None;
             }
             if index + 1 < byte_start && self.buf[index] == 0x1b && self.buf[index + 1] == b']' {
+                self.record_snapshot_scan(scanned);
                 return Some(index);
             }
         }
-        #[cfg(test)]
-        self.last_snapshot_scanned_bytes.set(scanned);
+        self.record_snapshot_scan(scanned);
         None
+    }
+
+    fn record_snapshot_scan(&self, scanned: usize) {
+        self.line_snapshot_scanned_bytes
+            .fetch_add(scanned, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub(crate) fn line_snapshot_metrics(&self) -> (usize, usize) {
+        (
+            self.line_snapshot_calls.load(Ordering::Relaxed),
+            self.line_snapshot_scanned_bytes.load(Ordering::Relaxed),
+        )
     }
 
     fn copy_range(&self, start: usize, end: usize) -> Vec<u8> {
@@ -252,11 +264,6 @@ impl Scrollback {
     #[cfg(test)]
     fn last_snapshot_copied_bytes(&self) -> usize {
         self.last_snapshot_copied_bytes.get()
-    }
-
-    #[cfg(test)]
-    fn last_snapshot_scanned_bytes(&self) -> usize {
-        self.last_snapshot_scanned_bytes.get()
     }
 }
 
@@ -362,27 +369,6 @@ mod tests {
         assert_eq!(lines.bytes, b"line-147\nline-148\nline-149\n");
         assert_eq!(sb.last_snapshot_copied_bytes(), lines.bytes.len());
         assert!(sb.last_snapshot_copied_bytes() < sb.len());
-    }
-
-    #[test]
-    fn blank_suffix_first_page_boundary_work_is_linear() {
-        let mut sb = Scrollback::new(512 * 1024);
-        for _ in 0..128 {
-            sb.push(b"prefix\n");
-        }
-        sb.push(b"visible\n");
-        for _ in 0..16_000 {
-            sb.push(b"\x1b[31m\x1b[0m\n");
-        }
-
-        let full = sb.snapshot_lines(usize::MAX, None);
-        let first_scan = sb.last_snapshot_scanned_bytes();
-        assert_eq!(full.start_line, 0);
-
-        let page = sb.snapshot_lines(1, Some(129));
-        let page_scan = sb.last_snapshot_scanned_bytes();
-        assert_eq!(page.bytes, b"visible\n");
-        assert!(first_scan + page_scan <= sb.len());
     }
 
     #[test]
