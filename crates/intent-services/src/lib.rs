@@ -344,8 +344,8 @@ pub struct Services {
     /// Per-draft single-flight gates for idempotent promotion. Shared by clones.
     workspace_draft_promotion_locks:
         Arc<Mutex<HashMap<WorkspaceDraftId, Arc<tokio::sync::Mutex<()>>>>>,
-    /// Integration-test seam after `workspace.create` has durably completed
-    /// but before the draft is finalized. Production wiring keeps this unset.
+    /// Integration-test seam immediately after the workspace/draft transaction
+    /// commits, before post-insert setup or initial-agent creation.
     workspace_draft_promotion_failpoint: Option<WorkspaceDraftPromotionFailpoint>,
     /// Per-agent in-memory send queues backing `agent.queueMessage` /
     /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
@@ -1206,7 +1206,7 @@ impl Services {
     }
 
     /// Install an integration-test promotion failpoint. Returning `true` after
-    /// `workspace.create` simulates process loss before the RPC result is acknowledged.
+    /// the workspace/draft transaction simulates process loss before initial-agent creation.
     #[must_use]
     pub fn with_workspace_draft_promotion_failpoint(
         mut self,
@@ -16381,28 +16381,12 @@ impl WorkspaceApi for Services {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let wrapper_bus = bus.clone();
-            let promotion_failpoint = input.workspace_draft_id.clone().and_then(|draft_id| {
-                services
-                    .workspace_draft_promotion_failpoint
-                    .clone()
-                    .map(|failpoint| {
-                        Box::new(move || {
-                            if failpoint(&draft_id) {
-                                Err(Error::Internal(
-                                    "injected workspace draft promotion crash after create".into(),
-                                ))
-                            } else {
-                                Ok(())
-                            }
-                        }) as Box<dyn FnOnce() -> Result<()> + Send>
-                    })
-            });
             let result = with_idempotency(
                 &store,
                 "",
                 idempotency_key,
                 "workspace.create",
-                promotion_failpoint,
+                None,
                 move || async move {
                     let store = op_store;
                     let now = now_iso();
@@ -17862,6 +17846,16 @@ impl WorkspaceApi for Services {
                                 draft_id,
                             )
                             .await?;
+                        if services
+                            .workspace_draft_promotion_failpoint
+                            .as_ref()
+                            .is_some_and(|failpoint| failpoint(draft_id))
+                        {
+                            return Err(Error::Internal(
+                                "injected workspace draft promotion crash after workspace insert"
+                                    .into(),
+                            ));
+                        }
                     } else {
                         store
                             .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
