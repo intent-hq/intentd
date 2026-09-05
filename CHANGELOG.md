@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.25] - 2026-09-05
+
+### 🚀 Features
+
+- Add managed Antigravity setup ([#1742](https://github.com/intent-hq/intentd/pull/1742))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Carry persisted assistant metadata on chat terminal deltas ([#1746](https://github.com/intent-hq/intentd/pull/1746))
+
+
 ## [0.9.24] - 2026-09-04
 
 ### 🚀 Features
