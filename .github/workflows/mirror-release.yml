@@ -60,7 +60,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ inputs.tag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       - name: Validate tag format
@@ -152,7 +152,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ inputs.tag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       - name: Republish beta manifest on intentd-releases
@@ -205,7 +205,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ inputs.tag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
       - name: Republish stable manifest on intentd-releases

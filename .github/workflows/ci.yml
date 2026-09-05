@@ -228,7 +228,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
       # Fail-fast disk preflight (tinybox only; monorepo#1253): the 8 runner
       # slots share one /raid CI-scratch volume, and the per-slot persistent
       # target dirs (see "Point CARGO_TARGET_DIR outside the work dir" below)
@@ -494,7 +494,7 @@ jobs:
     outputs:
       fast_path: ${{ steps.decide.outputs.fast_path }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
       - name: Fetch PR base commit
         run: git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
       - name: Evaluate diff shape
@@ -562,7 +562,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
         if: needs.release-fast-path.outputs.fast_path != 'true'
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
@@ -667,7 +667,7 @@ jobs:
       # route.
       NEXTEST_TEST_THREADS: 16
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
       # Fail-fast disk preflight — see the `check` job's comment for the full
       # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
       # target dirs are multi-GiB and the run also writes profraw files.
@@ -862,7 +862,7 @@ jobs:
       # burst runner, so the value no longer varies by route.
       NEXTEST_TEST_THREADS: 16
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
       # Fail-fast disk preflight — see the `check` job's comment for the full
       # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
       # target dirs are multi-GiB and the run also writes profraw files.
@@ -1086,7 +1086,7 @@ jobs:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
       - name: Fetch PR base commit
         run: git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
       - name: Scan changed files for conflict markers
@@ -1133,7 +1133,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
       - name: Assert systemd user unit content
         run: |
           unit=packaging/deb/intentd.service
@@ -1171,7 +1171,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6.1.0
       - name: Test aggregate-channel-notes.sh
         run: ./scripts/test-aggregate-channel-notes.sh
 
