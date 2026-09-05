@@ -4,9 +4,9 @@
 //! tracked. Without it the import lands as a remote-less repository and
 //! every commit on the branch reads as unpublished.
 //!
-//! What travels is a narrow, validated allowlist — remote name, fetch URL,
-//! optional push URL, the direct `refs/remotes/<name>/*` tips (whose objects
-//! ride the bundle), and the workspace branch's `branch.<b>.remote/merge` —
+//! What travels is a narrow, validated allowlist — remote names, ordered
+//! fetch/push URLs and refspecs, direct `refs/remotes/<name>/*` tips (whose
+//! objects ride the bundle), and workspace upstream/push selection —
 //! never arbitrary git config, hooks, credential helpers or credentials. The
 //! same validation runs on export and on import: the manifest is untrusted
 //! input, so an entry a compliant daemon would never have written fails the
@@ -17,9 +17,11 @@
 //! URL, or a remote-helper address (`<helper>::…`); embedded credentials are
 //! stripped — the whole `http(s)` userinfo (a token may masquerade as a
 //! username) and any `ssh`/`git` password — so the remote survives but the
-//! target authenticates on its own; fetch refspecs are not copied (the
-//! restored remote gets git's default); symbolic refs such as
-//! `refs/remotes/origin/HEAD` are not restored. The restored tracking refs
+//! target authenticates on its own. Query/fragment URLs, unsupported explicit
+//! push destinations, refspecs and behavior-changing configuration fail with
+//! value-free errors rather than silently changing addressing or enabling a
+//! push fallback. Symbolic refs such as `refs/remotes/origin/HEAD` are not restored.
+//! The restored tracking refs
 //! are the source's snapshot at export time, not a fresh fetch.
 
 use std::path::Path;
@@ -37,6 +39,8 @@ pub(crate) enum RemoteSkip {
     /// Not a form this module allowlists: local path, `file://`, unknown
     /// scheme, remote helper, malformed, or unsafe characters.
     Unportable,
+    /// Ambiguous addressing may embed a credential; never strip or echo it.
+    Ambiguous,
     /// The remote name is not a plain, safe name.
     Name,
 }
@@ -45,6 +49,7 @@ impl std::fmt::Display for RemoteSkip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Unportable => "URL is not a portable remote form",
+            Self::Ambiguous => "URL query or fragment cannot be transferred safely",
             Self::Name => "remote name is not a plain safe name",
         })
     }
@@ -73,6 +78,9 @@ pub(crate) fn validate_remote_name(name: &str) -> std::result::Result<(), Remote
 /// and scp-like `[user@]host:path`. `http(s)` userinfo is dropped entirely;
 /// `ssh` / `git` keep the username and drop any password.
 pub(crate) fn sanitize_remote_url(url: &str) -> std::result::Result<String, RemoteSkip> {
+    if url.contains(['?', '#']) {
+        return Err(RemoteSkip::Ambiguous);
+    }
     if url.is_empty()
         || url.starts_with('-')
         || url
@@ -91,6 +99,13 @@ pub(crate) fn sanitize_remote_url(url: &str) -> std::result::Result<String, Remo
     }
     if let Some(rest) = url[scheme_end..].strip_prefix("://") {
         let scheme = url[..scheme_end].to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "https" | "http" | "ssh" | "git") {
+            return Err(RemoteSkip::Unportable);
+        }
+        let parsed = reqwest::Url::parse(url).map_err(|_| RemoteSkip::Unportable)?;
+        if parsed.host_str().is_none() || parsed.cannot_be_a_base() {
+            return Err(RemoteSkip::Unportable);
+        }
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, ""),
@@ -99,7 +114,14 @@ pub(crate) fn sanitize_remote_url(url: &str) -> std::result::Result<String, Remo
             Some((u, h)) => (Some(u), h),
             None => (None, authority),
         };
-        if host.is_empty() || host.starts_with('-') {
+        // Reject encoded authority outright: URL parsers and Git/SSH differ
+        // in when they decode it. In particular, encoded controls, separators
+        // and leading options must not acquire meaning on the target.
+        if authority.contains('%')
+            || authority.matches('@').count() > 1
+            || !safe_host_port(host)
+            || userinfo.is_some_and(|u| !safe_user(u.split(':').next().unwrap_or("")))
+        {
             return Err(RemoteSkip::Unportable);
         }
         return match scheme.as_str() {
@@ -120,17 +142,64 @@ pub(crate) fn sanitize_remote_url(url: &str) -> std::result::Result<String, Remo
     let Some((prefix, path)) = url.split_once(':') else {
         return Err(RemoteSkip::Unportable);
     };
-    let host = prefix.rsplit_once('@').map_or(prefix, |(_, h)| h);
+    let (user, host) = prefix
+        .rsplit_once('@')
+        .map_or((None, prefix), |(u, h)| (Some(u), h));
     if prefix.contains('/')
         || prefix.len() < 2
-        || host.is_empty()
-        || host.starts_with('-')
+        || !safe_host_port(host)
+        || prefix.contains('%')
+        || user.is_some_and(|u| !safe_user(u))
         || prefix.starts_with('@')
         || path.is_empty()
     {
         return Err(RemoteSkip::Unportable);
     }
     Ok(url.to_string())
+}
+
+fn safe_user(user: &str) -> bool {
+    !user.is_empty()
+        && !user.starts_with('-')
+        && user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+' | b'~'))
+}
+
+fn safe_host_port(host: &str) -> bool {
+    let (host, port) = if let Some(ipv6) = host.strip_prefix('[') {
+        let Some((address, tail)) = ipv6.split_once(']') else {
+            return false;
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        (
+            address,
+            if tail.is_empty() {
+                None
+            } else {
+                let Some(port) = tail.strip_prefix(':') else {
+                    return false;
+                };
+                Some(port)
+            },
+        )
+    } else {
+        let (host, port) = host
+            .split_once(':')
+            .map_or((host, None), |(h, p)| (h, Some(p)));
+        if host.is_empty()
+            || host.starts_with('-')
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        {
+            return false;
+        }
+        (host, port)
+    };
+    !host.is_empty() && port.is_none_or(|p| !p.is_empty() && p.parse::<u16>().is_ok())
 }
 
 /// Validate a full ref name under a fixed `prefix` (`refs/remotes/<name>/`
@@ -172,6 +241,127 @@ fn is_full_sha(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn unsupported_config() -> Error {
+    Error::Internal("remote transfer cannot safely preserve configured Git behavior; review remote URLs, refspecs and push selection on the source".into())
+}
+
+/// Read only an explicitly selected key, preserving order and empty values.
+/// Never propagate libgit2 diagnostics, which may contain configuration data.
+fn config_values(config: &git2::Config, key: &str) -> Result<Vec<String>> {
+    let mut entries = match config.multivar(key, None) {
+        Ok(entries) => entries,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(unsupported_config()),
+    };
+    let mut values = Vec::new();
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(|_| unsupported_config())?;
+        if !entry.has_value() {
+            return Err(unsupported_config());
+        }
+        values.push(entry.value().map_err(|_| unsupported_config())?.to_string());
+    }
+    Ok(values)
+}
+
+fn config_last(config: &git2::Config, key: &str) -> Result<Option<String>> {
+    Ok(config_values(config, key)?.pop())
+}
+
+/// Rewriting rules can change a portable literal's effective fetch/push
+/// destination. They are not part of the allowlist, so reject applicable
+/// rules without serializing their keys (which themselves may contain secrets).
+fn reject_url_rewrites(config: &git2::Config, urls: &[String]) -> Result<()> {
+    let mut entries = config
+        .entries(Some(r"^url\..*\.(insteadof|pushinsteadof)$"))
+        .map_err(|_| unsupported_config())?;
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(|_| unsupported_config())?;
+        if !entry.has_value() {
+            return Err(unsupported_config());
+        }
+        let prefix = entry.value().map_err(|_| unsupported_config())?;
+        if urls.iter().any(|url| url.starts_with(prefix)) {
+            return Err(unsupported_config());
+        }
+    }
+    Ok(())
+}
+
+/// Refspecs never select executable config or arbitrary local namespaces.
+/// Unsupported forms are errors, not replacements with Git's defaults.
+fn validate_refspec(spec: &str, remote: &str, push: bool) -> Result<()> {
+    let valid_pattern = |name: &str, prefix: &str| {
+        name.matches('*').count() <= 1
+            && validate_ref_under(&name.replace('*', "wildcard"), prefix).is_ok()
+    };
+    let remote_source =
+        |name: &str| valid_pattern(name, "refs/heads/") || valid_pattern(name, "refs/tags/");
+    if !push {
+        if let Some(negative) = spec.strip_prefix('^') {
+            return if remote_source(negative) {
+                Ok(())
+            } else {
+                Err(unsupported_config())
+            };
+        }
+    }
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    if push && spec == ":" {
+        return Ok(());
+    }
+    let Some((source, destination)) = spec.split_once(':') else {
+        return Err(unsupported_config());
+    };
+    let valid_source = remote_source(source) || (push && (source == "HEAD" || source.is_empty()));
+    let valid_destination = if push {
+        remote_source(destination)
+    } else {
+        valid_pattern(destination, &format!("refs/remotes/{remote}/"))
+    };
+    if valid_source
+        && valid_destination
+        && source.matches('*').count() == destination.matches('*').count()
+    {
+        Ok(())
+    } else {
+        Err(unsupported_config())
+    }
+}
+
+fn validate_push_default(value: &str) -> Result<()> {
+    if matches!(
+        value,
+        "nothing" | "current" | "upstream" | "tracking" | "simple" | "matching"
+    ) {
+        Ok(())
+    } else {
+        Err(unsupported_config())
+    }
+}
+
+type PushSelection = (Option<String>, Option<String>, Option<String>);
+
+pub(crate) fn capture_push_selection(
+    repo: &git2::Repository,
+    branch: &str,
+    remotes: &[RemoteBundleRef],
+) -> Result<PushSelection> {
+    let config = repo.config().map_err(|_| unsupported_config())?;
+    let branch_remote = config_last(&config, &format!("branch.{branch}.pushRemote"))?;
+    let default_remote = config_last(&config, "remote.pushDefault")?;
+    for name in branch_remote.iter().chain(default_remote.iter()) {
+        if !remotes.iter().any(|r| &r.name == name) {
+            return Err(unsupported_config());
+        }
+    }
+    let push_default = config_last(&config, "push.default")?;
+    if let Some(value) = &push_default {
+        validate_push_default(value)?;
+    }
+    Ok((branch_remote, default_remote, push_default))
+}
+
 /// Export side: the remotes of `repo` that pass the allowlist, each with its
 /// direct remote-tracking tips, plus the workspace branch's upstream when it
 /// names one of those remotes. Skips are logged by remote name only.
@@ -179,32 +369,76 @@ pub(crate) fn capture_remotes(
     repo: &git2::Repository,
     workspace_branch: &str,
 ) -> Result<(Vec<RemoteBundleRef>, Option<BranchUpstream>)> {
-    let names = repo
-        .remotes()
-        .map_err(|e| Error::Internal(format!("list remotes failed: {e}")))?;
+    let names = repo.remotes().map_err(|_| unsupported_config())?;
+    let config = repo.config().map_err(|_| unsupported_config())?;
     let mut remotes = Vec::new();
     for name in names.iter().flatten().flatten() {
-        let remote = repo
-            .find_remote(name)
-            .map_err(|e| Error::Internal(format!("read remote {name} failed: {e}")))?;
-        let sanitized = validate_remote_name(name)
-            .and_then(|()| remote.url().map_err(|_| RemoteSkip::Unportable))
-            .and_then(sanitize_remote_url);
-        let url = match sanitized {
-            Ok(url) => url,
-            Err(reason) => {
-                tracing::warn!(remote = %name, %reason, "transfer bundle: remote not transferred");
-                continue;
+        if validate_remote_name(name).is_err() {
+            return Err(unsupported_config());
+        }
+        let key = |suffix: &str| format!("remote.{name}.{suffix}");
+        let urls = config_values(&config, &key("url"))?;
+        let push_urls = config_values(&config, &key("pushurl"))?;
+        reject_url_rewrites(&config, &urls)?;
+        reject_url_rewrites(&config, &push_urls)?;
+        let mut sanitized = Vec::new();
+        for url in &urls {
+            match sanitize_remote_url(url) {
+                Ok(url) => sanitized.push(url),
+                Err(RemoteSkip::Ambiguous) => return Err(unsupported_config()),
+                Err(_) => {}
             }
-        };
-        let push_url = match remote.pushurl().ok().flatten().map(sanitize_remote_url) {
-            None => None,
-            Some(Ok(u)) => Some(u),
-            Some(Err(reason)) => {
-                tracing::warn!(remote = %name, %reason, "transfer bundle: push URL not transferred");
-                None
+        }
+        // A wholly unportable remote can be omitted conservatively. Never
+        // drop just one URL from a portable multi-destination configuration.
+        if sanitized.is_empty() {
+            // Dropping a configured push destination can change selection of
+            // the default push remote, even if this fetch URL is unportable.
+            if !push_urls.is_empty() {
+                return Err(unsupported_config());
             }
-        };
+            tracing::warn!(remote = %name, "transfer bundle: unportable remote not transferred");
+            continue;
+        }
+        if sanitized.len() != urls.len() {
+            return Err(unsupported_config());
+        }
+        let mut sanitized = sanitized.into_iter();
+        let url = sanitized.next().ok_or_else(unsupported_config)?;
+        let mut push_urls = push_urls
+            .iter()
+            .map(|u| sanitize_remote_url(u).map_err(|_| unsupported_config()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter();
+        let push_url = push_urls.next();
+        let fetch_refspecs = config_values(&config, &key("fetch"))?;
+        let push_refspecs = config_values(&config, &key("push"))?;
+        for spec in &fetch_refspecs {
+            validate_refspec(spec, name, false)?;
+        }
+        for spec in &push_refspecs {
+            validate_refspec(spec, name, true)?;
+        }
+        // These settings change fetch/push behavior or invoke external code.
+        // Do not copy them and do not silently restore different semantics.
+        for suffix in [
+            "mirror",
+            "receivepack",
+            "uploadpack",
+            "vcs",
+            "proxy",
+            "tagopt",
+            "prune",
+            "prunetags",
+            "promisor",
+            "partialclonefilter",
+            "skipdefaultupdate",
+            "skipfetchall",
+        ] {
+            if !config_values(&config, &key(suffix))?.is_empty() {
+                return Err(unsupported_config());
+            }
+        }
         let prefix = format!("refs/remotes/{name}/");
         let mut tracking_refs = Vec::new();
         let glob = repo
@@ -220,34 +454,46 @@ pub(crate) fn capture_remotes(
             tracking_refs.push(TrackingRef {
                 ref_name: ref_name.to_string(),
                 sha: oid.to_string(),
+                bundle_ref: None,
             });
         }
         remotes.push(RemoteBundleRef {
             name: name.to_string(),
             url,
             push_url,
+            additional_urls: sanitized.collect(),
+            additional_push_urls: push_urls.collect(),
+            fetch_refspecs: Some(fetch_refspecs),
+            push_refspecs,
             tracking_refs,
         });
     }
 
-    let config = repo
-        .config()
-        .map_err(|e| Error::Internal(format!("read repo config failed: {e}")))?;
-    let upstream = match (
-        config
-            .get_string(&format!("branch.{workspace_branch}.remote"))
-            .ok(),
-        config
-            .get_string(&format!("branch.{workspace_branch}.merge"))
-            .ok(),
-    ) {
-        (Some(remote), Some(merge_ref))
-            if remotes.iter().any(|r| r.name == remote)
-                && validate_ref_under(&merge_ref, "refs/heads/").is_ok() =>
-        {
-            Some(BranchUpstream { remote, merge_ref })
+    let branch_remote = config_last(&config, &format!("branch.{workspace_branch}.remote"))?;
+    let merge_refs = config_values(&config, &format!("branch.{workspace_branch}.merge"))?;
+    let upstream = if let Some(remote) = branch_remote {
+        if remote == "." {
+            return Err(unsupported_config());
         }
-        _ => None,
+        if remotes.iter().any(|r| r.name == remote) {
+            for merge_ref in &merge_refs {
+                validate_ref_under(merge_ref, "refs/heads/").map_err(|_| unsupported_config())?;
+            }
+            let mut merge_refs = merge_refs.into_iter();
+            Some(BranchUpstream {
+                remote,
+                merge_ref: merge_refs.next().ok_or_else(unsupported_config)?,
+                additional_merge_refs: merge_refs.collect(),
+            })
+        } else if names.iter().flatten().flatten().any(|name| name == remote) {
+            None
+        } else {
+            return Err(unsupported_config());
+        }
+    } else if merge_refs.is_empty() {
+        None
+    } else {
+        return Err(unsupported_config());
     };
     Ok((remotes, upstream))
 }
@@ -274,62 +520,114 @@ pub(crate) fn restore_remotes(
         .map(String::as_str)
         .collect();
     let mut seen = std::collections::HashSet::new();
+    validate_ref_under(
+        &format!("refs/heads/{}", refs.workspace_branch),
+        "refs/heads/",
+    )
+    .map_err(|_| unsupported_config())?;
     for remote in &refs.remotes {
         let name = remote.name.as_str();
-        let fail = |what: String| Error::Internal(format!("restore remote {name}: {what}"));
-        validate_remote_name(name).map_err(|e| fail(e.to_string()))?;
+        validate_remote_name(name).map_err(|_| unsupported_config())?;
         if !seen.insert(name) {
-            return Err(fail("listed twice".to_string()));
+            return Err(unsupported_config());
         }
-        let url = sanitize_remote_url(&remote.url).map_err(|e| fail(e.to_string()))?;
+        let url = sanitize_remote_url(&remote.url).map_err(|_| unsupported_config())?;
         let push_url = remote
             .push_url
             .as_deref()
             .map(sanitize_remote_url)
             .transpose()
-            .map_err(|e| fail(format!("push URL: {e}")))?;
+            .map_err(|_| unsupported_config())?;
+        let additional_urls = remote
+            .additional_urls
+            .iter()
+            .map(|u| sanitize_remote_url(u).map_err(|_| unsupported_config()))
+            .collect::<Result<Vec<_>>>()?;
+        let additional_push_urls = remote
+            .additional_push_urls
+            .iter()
+            .map(|u| sanitize_remote_url(u).map_err(|_| unsupported_config()))
+            .collect::<Result<Vec<_>>>()?;
+        if push_url.is_none() && !additional_push_urls.is_empty() {
+            return Err(unsupported_config());
+        }
+        if let Some(specs) = &remote.fetch_refspecs {
+            for spec in specs {
+                validate_refspec(spec, name, false)?;
+            }
+        }
+        for spec in &remote.push_refspecs {
+            validate_refspec(spec, name, true)?;
+        }
         let prefix = format!("refs/remotes/{name}/");
+        let mut tracking_names = std::collections::HashSet::new();
         for t in &remote.tracking_refs {
-            validate_ref_under(&t.ref_name, &prefix).map_err(fail)?;
+            validate_ref_under(&t.ref_name, &prefix).map_err(|_| unsupported_config())?;
+            if !tracking_names.insert(&t.ref_name) {
+                return Err(unsupported_config());
+            }
+            if let Some(anchor) = &t.bundle_ref {
+                validate_ref_under(anchor, "refs/intent/transfer/")
+                    .map_err(|_| unsupported_config())?;
+            }
             if !is_full_sha(&t.sha) {
-                return Err(fail(format!(
-                    "tracking ref {} sha is not a full sha",
-                    t.ref_name
-                )));
+                return Err(unsupported_config());
             }
             if wip_shas.contains(&t.sha.as_str()) {
-                return Err(fail(format!(
-                    "tracking ref {} points at a WIP snapshot commit",
-                    t.ref_name
-                )));
+                return Err(unsupported_config());
             }
         }
 
         run_git(checkout_dir, |cmd| {
             cmd.args(["remote", "add", name, &url]);
         })
-        .map_err(|e| fail(format!("remote add failed: {e}")))?;
-        if let Some(push_url) = &push_url {
+        .map_err(|_| unsupported_config())?;
+        if let Some(specs) = &remote.fetch_refspecs {
+            // `remote add` installed an unrestricted default. Remove it even
+            // when the source intentionally had zero fetch mappings.
             run_git(checkout_dir, |cmd| {
-                cmd.args(["config", &format!("remote.{name}.pushurl"), push_url]);
+                cmd.args([
+                    "config",
+                    "--local",
+                    "--unset-all",
+                    &format!("remote.{name}.fetch"),
+                ]);
             })
-            .map_err(|e| fail(format!("set push URL failed: {e}")))?;
+            .map_err(|_| unsupported_config())?;
+            for spec in specs {
+                add_config_value(checkout_dir, &format!("remote.{name}.fetch"), spec)?;
+            }
+        }
+        for url in &additional_urls {
+            add_config_value(checkout_dir, &format!("remote.{name}.url"), url)?;
+        }
+        for url in push_url.iter().chain(additional_push_urls.iter()) {
+            add_config_value(checkout_dir, &format!("remote.{name}.pushurl"), url)?;
+        }
+        for spec in &remote.push_refspecs {
+            add_config_value(checkout_dir, &format!("remote.{name}.push"), spec)?;
         }
         if remote.tracking_refs.is_empty() {
             continue;
         }
         run_git(checkout_dir, |cmd| {
-            cmd.args(["fetch", "--no-tags", "--quiet", bundle]);
-            cmd.args(
-                remote
-                    .tracking_refs
-                    .iter()
-                    .map(|t| format!("+{0}:{0}", t.ref_name)),
-            );
+            cmd.args([
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--quiet",
+                bundle,
+            ]);
+            cmd.args(remote.tracking_refs.iter().map(|t| {
+                format!(
+                    "+{}:{}",
+                    t.bundle_ref.as_deref().unwrap_or(&t.ref_name),
+                    t.ref_name
+                )
+            }));
         })
-        .map_err(|e| fail(format!("fetch tracking refs from bundle failed: {e}")))?;
-        let repo = git2::Repository::open(checkout_dir)
-            .map_err(|e| fail(format!("open checkout failed: {e}")))?;
+        .map_err(|_| unsupported_config())?;
+        let repo = git2::Repository::open(checkout_dir).map_err(|_| unsupported_config())?;
         for t in &remote.tracking_refs {
             let actual = repo
                 .find_reference(&t.ref_name)
@@ -337,39 +635,224 @@ pub(crate) fn restore_remotes(
                 .and_then(|r| r.target())
                 .map(|o| o.to_string());
             if actual.as_deref() != Some(t.sha.as_str()) {
-                return Err(fail(format!(
-                    "tracking ref {} restored at {actual:?}, manifest recorded {}",
-                    t.ref_name, t.sha
-                )));
+                return Err(unsupported_config());
             }
         }
     }
 
     if let Some(up) = &refs.workspace_upstream {
-        let fail = |what: String| Error::Internal(format!("restore upstream: {what}"));
         if !seen.contains(up.remote.as_str()) {
-            return Err(fail(format!(
-                "remote {:?} is not among the restored remotes",
-                up.remote
-            )));
+            return Err(unsupported_config());
         }
-        validate_ref_under(&up.merge_ref, "refs/heads/").map_err(fail)?;
+        validate_ref_under(&up.merge_ref, "refs/heads/").map_err(|_| unsupported_config())?;
+        for merge_ref in &up.additional_merge_refs {
+            validate_ref_under(merge_ref, "refs/heads/").map_err(|_| unsupported_config())?;
+        }
         let branch = &refs.workspace_branch;
         run_git(checkout_dir, |cmd| {
             cmd.args(["config", &format!("branch.{branch}.remote"), &up.remote]);
         })
-        .map_err(|e| fail(format!("set branch remote failed: {e}")))?;
+        .map_err(|_| unsupported_config())?;
         run_git(checkout_dir, |cmd| {
             cmd.args(["config", &format!("branch.{branch}.merge"), &up.merge_ref]);
         })
-        .map_err(|e| fail(format!("set branch merge failed: {e}")))?;
+        .map_err(|_| unsupported_config())?;
+        for merge_ref in &up.additional_merge_refs {
+            add_config_value(checkout_dir, &format!("branch.{branch}.merge"), merge_ref)?;
+        }
+    }
+    for (key, remote) in [
+        (
+            format!("branch.{}.pushRemote", refs.workspace_branch),
+            &refs.workspace_push_remote,
+        ),
+        ("remote.pushDefault".into(), &refs.remote_push_default),
+    ] {
+        if let Some(remote) = remote {
+            if !seen.contains(remote.as_str()) {
+                return Err(unsupported_config());
+            }
+            add_config_value(checkout_dir, &key, remote)?;
+        }
+    }
+    if let Some(value) = &refs.push_default {
+        validate_push_default(value)?;
+        add_config_value(checkout_dir, "push.default", value)?;
     }
     Ok(())
+}
+
+fn add_config_value(checkout: &Path, key: &str, value: &str) -> Result<()> {
+    run_git(checkout, |cmd| {
+        cmd.args(["config", "--local", "--add", key, value]);
+    })
+    .map_err(|_| unsupported_config())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_r1_rejects_ambiguous_urls_and_decoded_authority_controls() {
+        for url in [
+            "https://example.invalid/repo?access_token=PUBLIC_TEST_MARKER",
+            "https://example.invalid/repo#PUBLIC_TEST_MARKER",
+            "ssh://git@example.invalid/repo?PUBLIC_TEST_MARKER",
+            "https://example.invalid?PUBLIC_TEST_MARKER",
+            "ssh://%2doption@example.invalid/repo",
+            "ssh://git@%2dhost/repo",
+            "ssh://git%0auser@example.invalid/repo",
+            "https://user%00name@example.invalid/repo",
+            "ssh://git@host%09name/repo",
+            "ssh://git@host:invalid/repo",
+            "git@host:repo#PUBLIC_TEST_MARKER",
+            "-option@host:repo",
+        ] {
+            assert!(sanitize_remote_url(url).is_err(), "unsafe URL accepted");
+        }
+    }
+
+    #[test]
+    fn review_r2_explicit_unsupported_push_destination_fails_export() {
+        for push in [
+            "DISABLED",
+            "/local/repo.git",
+            "ext::false",
+            "file:///local/repo",
+            "",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init(tmp.path()).unwrap();
+            repo.remote("origin", "https://example.invalid/repo")
+                .unwrap();
+            repo.config()
+                .unwrap()
+                .set_str("remote.origin.pushurl", push)
+                .unwrap();
+            assert!(
+                capture_remotes(&repo, "main").is_err(),
+                "must not enable push fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn review_r3_unsupported_config_is_not_silently_replaced() {
+        for (key, value) in [
+            ("remote.origin.fetch", "+refs/heads/*:refs/heads/*"),
+            (
+                "remote.origin.fetch",
+                "^refs/heads/main:refs/remotes/origin/main",
+            ),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/other/*"),
+            ("remote.origin.push", "HEAD~1:refs/heads/main"),
+            ("remote.origin.push", "refs/heads/main:refs/intent/unsafe"),
+            ("remote.origin.mirror", "true"),
+            ("remote.origin.uploadpack", "PUBLIC_TEST_MARKER"),
+            ("remote.origin.receivepack", "PUBLIC_TEST_MARKER"),
+            ("remote.origin.tagopt", "--no-tags"),
+            ("branch.main.remote", "."),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init(tmp.path()).unwrap();
+            repo.remote("origin", "https://example.invalid/repo")
+                .unwrap();
+            repo.config().unwrap().set_str(key, value).unwrap();
+            let error = capture_remotes(&repo, "main").unwrap_err();
+            assert!(!error.to_string().contains("PUBLIC_TEST_MARKER"));
+        }
+    }
+
+    #[test]
+    fn review_r2_r3_mixed_url_lists_fail_without_dropping_destinations() {
+        for suffix in ["url", "pushurl"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init(tmp.path()).unwrap();
+            repo.remote("origin", "https://example.invalid/repo")
+                .unwrap();
+            let key = format!("remote.origin.{suffix}");
+            add_config_value(tmp.path(), &key, "https://example.invalid/safe").unwrap();
+            add_config_value(tmp.path(), &key, "DISABLED").unwrap();
+            assert!(capture_remotes(&repo, "main").is_err());
+        }
+    }
+
+    #[test]
+    fn review_r3_refspec_allowlist_preserves_safe_forms_only() {
+        for spec in [
+            "+refs/heads/*:refs/remotes/origin/*",
+            "refs/heads/main:refs/remotes/origin/published",
+            "^refs/heads/private/*",
+            "^refs/heads/excluded",
+            "refs/tags/v*:refs/remotes/origin/tags/v*",
+        ] {
+            assert!(validate_refspec(spec, "origin", false).is_ok());
+        }
+        for spec in [
+            "refs/heads/main:refs/heads/main",
+            "+refs/heads/*:refs/heads/*",
+            "HEAD:refs/heads/review",
+            "refs/tags/v1:refs/tags/v1",
+            ":refs/heads/old",
+            ":",
+            "+:",
+        ] {
+            assert!(validate_refspec(spec, "origin", true).is_ok());
+        }
+        for spec in [
+            "",
+            "--upload-pack=PUBLIC_TEST_MARKER",
+            "+^refs/heads/x",
+            "refs/heads/*:refs/remotes/origin/plain",
+            "refs/heads/*/*:refs/remotes/origin/*/*",
+            "refs/heads/main:refs/remotes/origin/../main",
+        ] {
+            assert!(validate_refspec(spec, "origin", false).is_err());
+        }
+    }
+
+    #[test]
+    fn review_r3_unrestorable_push_selection_fails_export() {
+        for key in [
+            "branch.main.pushRemote",
+            "remote.pushDefault",
+            "push.default",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init(tmp.path()).unwrap();
+            repo.remote("origin", "https://example.invalid/repo")
+                .unwrap();
+            let (remotes, _) = capture_remotes(&repo, "main").unwrap();
+            repo.config()
+                .unwrap()
+                .set_str(key, "PUBLIC_TEST_MARKER")
+                .unwrap();
+            let error = capture_push_selection(&repo, "main", &remotes).unwrap_err();
+            assert!(!error.to_string().contains("PUBLIC_TEST_MARKER"));
+        }
+    }
+
+    #[test]
+    fn review_r3_matching_url_rewrites_fail_without_copying_config() {
+        for suffix in ["insteadOf", "pushInsteadOf"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init(tmp.path()).unwrap();
+            repo.remote("origin", "https://example.invalid/repo")
+                .unwrap();
+            repo.config()
+                .unwrap()
+                .set_str(
+                    &format!("url.ssh://git@example.invalid/PUBLIC_TEST_MARKER.{suffix}"),
+                    "https://example.invalid/",
+                )
+                .unwrap();
+            assert!(
+                capture_remotes(&repo, "main").is_err(),
+                "cannot drop an effective URL rewrite"
+            );
+        }
+    }
 
     #[test]
     fn portable_urls_pass_through() {

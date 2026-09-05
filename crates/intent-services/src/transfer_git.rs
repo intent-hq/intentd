@@ -125,6 +125,12 @@ pub struct TransferRefsManifest {
     /// one of `remotes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_upstream: Option<BranchUpstream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_push_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_push_default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_default: Option<String>,
 }
 
 /// One root-repository remote as recorded in the manifest.
@@ -138,6 +144,16 @@ pub struct RemoteBundleRef {
     /// Sanitized `remote.<name>.pushurl`, when configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_url: Option<String>,
+    /// Further URL values in their original order, after the first URL above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_push_urls: Vec<String>,
+    /// None means a legacy manifest; Some(empty) means explicitly no mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_refspecs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub push_refspecs: Vec<String>,
     /// Direct refs under `refs/remotes/<name>/` and their tips at export.
     #[serde(default)]
     pub tracking_refs: Vec<TrackingRef>,
@@ -149,6 +165,9 @@ pub struct RemoteBundleRef {
 pub struct TrackingRef {
     pub ref_name: String,
     pub sha: String,
+    /// Transfer-owned snapshot anchor; absent in legacy remote manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_ref: Option<String>,
 }
 
 /// The workspace branch's upstream: `branch.<b>.remote` + `branch.<b>.merge`.
@@ -158,6 +177,8 @@ pub struct BranchUpstream {
     pub remote: String,
     /// Full ref on the remote (`refs/heads/<branch>`).
     pub merge_ref: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_merge_refs: Vec<String>,
 }
 
 /// One submodule as bundled into the archive: unpublished, or the published
@@ -584,8 +605,34 @@ fn build_bundle(
     //     tips are bundled too so the target can restore them offline and
     //     the workspace branch's published prefix stays reachable from
     //     `refs/remotes/*` (intent-hq/intent#4438).
-    let (remotes, workspace_upstream) =
+    let (mut remotes, workspace_upstream) =
         crate::transfer_remotes::capture_remotes(&repo, &workspace_branch)?;
+    let (workspace_push_remote, remote_push_default, push_default) =
+        crate::transfer_remotes::capture_push_selection(&repo, &workspace_branch, &remotes)?;
+
+    // Bundle immutable OIDs, not mutable refs that a concurrent fetch/prune
+    // can advance or delete. Register each anchor immediately for cleanup,
+    // and never overwrite an existing ref (including another transfer's).
+    let snapshot_id = uuid::Uuid::new_v4();
+    for (index, tracking) in remotes
+        .iter_mut()
+        .flat_map(|r| &mut r.tracking_refs)
+        .enumerate()
+    {
+        let anchor = format!(
+            "{TRANSFER_REF_NS}/{}/remotes/{snapshot_id}/{index}",
+            ws.id.0
+        );
+        let oid = git2::Oid::from_str(&tracking.sha)
+            .map_err(|_| Error::Internal("invalid remote snapshot OID".into()))?;
+        repo.reference(&anchor, oid, false, "transfer remote snapshot")
+            .map_err(|_| Error::Internal("could not anchor remote snapshot".into()))?;
+        temp_refs.push(anchor.clone());
+        tracking.bundle_ref = Some(anchor);
+    }
+
+    #[cfg(test)]
+    tests::after_remote_capture();
 
     // 5. Create and verify the bundle (full history — self-contained, no
     //    prerequisites, so the target can clone/fetch with no other remote).
@@ -597,7 +644,7 @@ fn build_bundle(
     ref_args.extend(
         remotes
             .iter()
-            .flat_map(|r| r.tracking_refs.iter().map(|t| t.ref_name.clone())),
+            .flat_map(|r| r.tracking_refs.iter().filter_map(|t| t.bundle_ref.clone())),
     );
     run_git(worktree, |cmd| {
         cmd.arg("bundle").arg("create").arg(bundle_path);
@@ -658,6 +705,9 @@ fn build_bundle(
         submodules: submodule_refs,
         remotes,
         workspace_upstream,
+        workspace_push_remote,
+        remote_push_default,
+        push_default,
     })
 }
 
@@ -822,6 +872,143 @@ mod tests {
     use intent_core::{AgentId, WorkspaceId, WorkspaceStatus};
     use intent_store::SandboxStatus;
     use std::fs;
+
+    thread_local! {
+        static AFTER_REMOTE_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_remote_capture() {
+        AFTER_REMOTE_CAPTURE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+
+    fn remote_snapshot_survives_change(delete: bool) {
+        let (dir, path) = temp_repo("remote-race");
+        let repo = git2::Repository::open(&path).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.invalid").unwrap();
+        let captured = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "remote-only snapshot",
+                &head.tree().unwrap(),
+                &[&head],
+            )
+            .unwrap();
+        let advanced = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "later remote tip",
+                &head.tree().unwrap(),
+                &[&head],
+            )
+            .unwrap();
+        repo.remote("origin", "https://example.invalid/repo")
+            .unwrap();
+        let tracking = "refs/remotes/origin/main";
+        repo.reference(tracking, captured, false, "fixture")
+            .unwrap();
+        let change_path = path.clone();
+        AFTER_REMOTE_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let repo = git2::Repository::open(change_path).unwrap();
+                if delete {
+                    repo.find_reference(tracking).unwrap().delete().unwrap();
+                } else {
+                    repo.reference(tracking, advanced, true, "concurrent fetch fixture")
+                        .unwrap();
+                }
+            }));
+        });
+        let ws = workspace_for_repo(&path);
+        let bundle = create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
+        assert_eq!(head_sha(&path), head.id().to_string(), "HEAD unchanged");
+        assert!(repo_ref_names(&path)
+            .iter()
+            .all(|r| !r.starts_with(TRANSFER_REF_NS)));
+        let out = crate::transfer_materialize::materialize_workspace_git_blocking(
+            &bundle.bundle_path,
+            &bundle.refs,
+            &ws,
+            &[],
+            &dir.path().join("target"),
+        )
+        .unwrap();
+        let dst = git2::Repository::open(&out.checkout_dir).unwrap();
+        assert_eq!(
+            dst.find_reference(tracking).unwrap().target(),
+            Some(captured)
+        );
+        assert_eq!(
+            intent_git::local_changes(&out.checkout_dir)
+                .unwrap()
+                .unpushed_count,
+            0
+        );
+        assert!(repo_ref_names(&out.checkout_dir)
+            .iter()
+            .all(|r| !r.starts_with(TRANSFER_REF_NS)));
+        assert_eq!(
+            repo.find_reference(tracking).ok().and_then(|r| r.target()),
+            if delete { None } else { Some(advanced) }
+        );
+    }
+
+    #[test]
+    fn review_r4_remote_advance_preserves_captured_snapshot() {
+        remote_snapshot_survives_change(false);
+    }
+
+    #[test]
+    fn review_r4_remote_deletion_preserves_captured_snapshot() {
+        remote_snapshot_survives_change(true);
+    }
+
+    #[test]
+    fn review_r4_bundle_failure_cleans_remote_anchors_and_unwinds_wip() {
+        let (dir, path) = temp_repo("remote-failure");
+        let repo = git2::Repository::open(&path).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.remote("origin", "https://example.invalid/repo")
+            .unwrap();
+        repo.reference("refs/remotes/origin/main", head, false, "fixture")
+            .unwrap();
+        fs::write(path.join("dirty.txt"), "local work").unwrap();
+        let before = status_fingerprint(&path);
+        let ws = workspace_for_repo(&path);
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let lock = staging.join(format!("{}.bundle.lock", ws.id.0));
+        let inspect_path = path.clone();
+        AFTER_REMOTE_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(repo_ref_names(&inspect_path)
+                    .iter()
+                    .any(|r| r.contains("/remotes/") && r.starts_with(TRANSFER_REF_NS)));
+                fs::write(lock, "force bundle lock failure").unwrap();
+            }));
+        });
+        assert!(create_transfer_bundle(&ws, &[], &staging).is_err());
+        assert_eq!(head_sha(&path), head.to_string());
+        assert_eq!(status_fingerprint(&path), before);
+        assert!(repo_ref_names(&path)
+            .iter()
+            .all(|r| !r.starts_with(TRANSFER_REF_NS)));
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/main")
+                .unwrap()
+                .target(),
+            Some(head)
+        );
+        assert!(!staging.join(format!("{}.bundle", ws.id.0)).exists());
+    }
 
     fn now_iso() -> String {
         intent_core::now_iso()
