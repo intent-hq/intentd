@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::{Result as CoreResult, WorkspaceApi};
+use intent_core::{Result as CoreResult, WorkspaceApi, WorkspaceId};
 use intent_services::{EventBus, Services, WorkspaceDraftPromotionFailpoint};
 use intent_store::Store;
 use intent_transport::{
@@ -178,7 +178,7 @@ async fn boot_with_failpoint(
 }
 
 #[tokio::test]
-async fn promotion_restart_after_create_recovers_one_workspace_agent_and_turn() {
+async fn promotion_restart_after_workspace_insert_recovers_agent_and_turn() {
     let root = TempDir::new();
     let repo = make_repo(&root.0);
     let fail_draft = Arc::new(Mutex::new(None::<String>));
@@ -215,9 +215,26 @@ async fn promotion_restart_after_create_recovers_one_workspace_agent_and_turn() 
     let interrupted_draft = rpc(&mut ws, 3, "workspaceDraft.get", json!({"id":draft_id})).await;
     assert_eq!(interrupted_draft["phase"], "failed");
     let operation_key = interrupted_draft["operationKey"].as_str().unwrap();
+    let workspace_id = interrupted_draft["promotedWorkspaceId"]
+        .as_str()
+        .expect("workspace mapping committed before interruption")
+        .to_string();
+    let workspace_id_typed = WorkspaceId::from(workspace_id.as_str());
     let probe_store = Store::open(&root.0.join("intentd.db"))
         .await
         .expect("probe store");
+    probe_store
+        .get_workspace(&workspace_id_typed)
+        .await
+        .expect("workspace row committed before interruption");
+    assert!(
+        probe_store
+            .list_agent_session_summaries(&workspace_id_typed)
+            .await
+            .expect("probe agents")
+            .is_empty(),
+        "failpoint must interrupt before initial-agent creation"
+    );
     assert_eq!(
         probe_store
             .get_idempotent("", operation_key)
@@ -226,10 +243,6 @@ async fn promotion_restart_after_create_recovers_one_workspace_agent_and_turn() 
         None,
         "interruption must occur before the workspace.create result is cached"
     );
-    let workspace_id = interrupted_draft["promotedWorkspaceId"]
-        .as_str()
-        .expect("workspace mapping committed before interruption")
-        .to_string();
     drop(ws);
     drop(server);
 

@@ -11,7 +11,7 @@ use intent_core::{
 use intent_store::{NewEvent, WorkspaceDraftPatch};
 use serde_json::{json, Map, Value};
 
-use crate::{publish_event, system_actor, Result, Services};
+use crate::{nonempty_owned, publish_event, system_actor, Result, Services};
 
 impl Services {
     pub(crate) async fn workspace_draft_create_op(&self, input: Value) -> Result<Value> {
@@ -84,14 +84,24 @@ impl Services {
         };
         let _guard = gate.lock().await;
         let draft = self.store.get_workspace_draft(&id).await?;
+        let initial_agent = initial_agent
+            .map(|value| {
+                serde_json::from_value::<WorkspaceCreateInitialAgent>(value)
+                    .map_err(|e| Error::InvalidParams(format!("invalid initialAgent: {e}")))
+            })
+            .transpose()?;
 
         if let Some(workspace_id) = draft.promoted_workspace_id.clone() {
-            if draft.phase == DraftPhase::Promoted {
+            if draft.phase == DraftPhase::Promoted
+                && (draft.initial_agent_id.is_some() || initial_agent.is_none())
+            {
                 return self.promotion_result(draft, workspace_id).await;
             }
             match self.store.get_workspace(&workspace_id).await {
                 Ok(workspace) => {
-                    let initial_agent = self.recover_initial_agent(&workspace_id).await?;
+                    let initial_agent = self
+                        .recover_or_create_initial_agent(&workspace_id, initial_agent.clone())
+                        .await?;
                     let agent_id = initial_agent.as_ref().map(|agent| agent.id.clone());
                     let promoted = self
                         .store
@@ -116,12 +126,6 @@ impl Services {
             });
         }
 
-        let initial_agent = initial_agent
-            .map(|value| {
-                serde_json::from_value::<WorkspaceCreateInitialAgent>(value)
-                    .map_err(|e| Error::InvalidParams(format!("invalid initialAgent: {e}")))
-            })
-            .transpose()?;
         let input = promotion_input(&draft, initial_agent);
         let promoting = if draft.phase == DraftPhase::Promoting {
             draft
@@ -210,9 +214,10 @@ impl Services {
         Ok(result)
     }
 
-    async fn recover_initial_agent(
+    async fn recover_or_create_initial_agent(
         &self,
         workspace_id: &WorkspaceId,
+        requested: Option<WorkspaceCreateInitialAgent>,
     ) -> Result<Option<intent_core::AgentLite>> {
         let sessions = self
             .store
@@ -227,12 +232,157 @@ impl Services {
                 .and_then(Value::as_bool)
                 == Some(true)
         });
-        match initial {
-            Some(session) => WorkspaceApi::agent_get(self, session.id, Some(workspace_id.clone()))
-                .await
-                .map(Some),
-            None => Ok(None),
+        let (agent_id, requested) = if let Some(session) = initial {
+            (session.id, requested)
+        } else {
+            let Some(requested) = requested else {
+                return Ok(None);
+            };
+            let prompt = requested
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let mut metadata = match requested.metadata.clone() {
+                Some(Value::Object(metadata)) => metadata,
+                _ => Map::new(),
+            };
+            metadata.insert("isInitialAgent".into(), json!(true));
+            metadata.insert("isFirstWorkspaceAgent".into(), json!(true));
+            if let Some(prompt) = &prompt {
+                metadata.insert("initialMessage".into(), json!(prompt));
+            } else {
+                metadata.remove("initialMessage");
+            }
+            let image_blocks = requested
+                .image_blocks
+                .clone()
+                .or_else(|| metadata.get("imageBlocks").cloned())
+                .filter(|value| !value.is_null());
+            let extra = intent_core::AgentCreateExtra {
+                provider: nonempty_owned(requested.provider.clone()),
+                agent_type: nonempty_owned(requested.agent_type.clone()),
+                metadata: Some(Value::Object(metadata)),
+                context_references: requested
+                    .context_references
+                    .clone()
+                    .filter(|value| !value.is_null()),
+                image_blocks,
+                file_blocks: requested
+                    .file_blocks
+                    .clone()
+                    .filter(|value| !value.is_null()),
+                is_background: Some(false),
+                ..Default::default()
+            };
+            let skip_auto_commit = !self.effective_auto_commit(workspace_id).await;
+            let created = self
+                .agent_create_op(
+                    workspace_id.clone(),
+                    nonempty_owned(requested.name.clone()),
+                    nonempty_owned(requested.model.clone()),
+                    nonempty_owned(requested.specialist.clone()),
+                    None,
+                    None,
+                    skip_auto_commit,
+                    extra,
+                )
+                .await?;
+            let agent_id =
+                intent_core::AgentId::from(created["agent"]["id"].as_str().unwrap_or_default());
+            (agent_id, Some(requested))
+        };
+        if let Some(requested) = requested {
+            self.ensure_initial_agent_turn(workspace_id, &agent_id, &requested)
+                .await?;
         }
+        WorkspaceApi::agent_get(self, agent_id, Some(workspace_id.clone()))
+            .await
+            .map(Some)
+    }
+
+    async fn ensure_initial_agent_turn(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &intent_core::AgentId,
+        requested: &WorkspaceCreateInitialAgent,
+    ) -> Result<()> {
+        let prompt = requested
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default();
+        let image_blocks = requested
+            .image_blocks
+            .clone()
+            .or_else(|| {
+                requested
+                    .metadata
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|metadata| metadata.get("imageBlocks"))
+                    .cloned()
+            })
+            .filter(|value| !value.is_null());
+        let file_blocks = requested
+            .file_blocks
+            .clone()
+            .filter(|value| !value.is_null());
+        if prompt.is_empty() && image_blocks.is_none() && file_blocks.is_none() {
+            return Ok(());
+        }
+        let session = self.store.get_agent_session(agent_id).await?;
+        if session
+            .messages
+            .iter()
+            .any(|message| message.role == "user")
+        {
+            return Ok(());
+        }
+        let options = crate::agent_manager::TurnOptions {
+            image_blocks: image_blocks.clone(),
+            file_blocks: file_blocks.clone(),
+            context_references: requested
+                .context_references
+                .clone()
+                .filter(|value| !value.is_null()),
+            ..crate::agent_manager::TurnOptions::default()
+        };
+        let send = match self.agent_manager() {
+            Some(manager) => {
+                manager
+                    .send_message(
+                        agent_id.clone(),
+                        workspace_id.clone(),
+                        prompt.to_string(),
+                        None,
+                        options,
+                    )
+                    .await
+            }
+            None => {
+                self.agent_send_message_op(
+                    agent_id.clone(),
+                    prompt.to_string(),
+                    None,
+                    image_blocks,
+                    file_blocks,
+                    None,
+                )
+                .await
+            }
+        };
+        if let Err(error) = send {
+            tracing::warn!(
+                workspace = %workspace_id,
+                agent = %agent_id,
+                error = %error,
+                "workspaceDraft.promote: failed to resume initial agent turn"
+            );
+        }
+        Ok(())
     }
 
     async fn publish_workspace_draft_updated(&self, draft: &WorkspaceDraft) {
