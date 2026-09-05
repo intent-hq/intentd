@@ -578,7 +578,23 @@ pub struct TokenUsage {
     pub by_agent_id: BTreeMap<String, TokenUsageTotals>,
     pub totals: TokenUsageTotals,
     pub by_model: BTreeMap<String, TokenUsageTotals>,
+    /// Sparse, deterministic agent × model projection. `None` means the
+    /// persisted snapshot predates this additive field; new materializations
+    /// always write `Some`, including `Some([])` for an empty workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_agent_model: Option<Vec<TokenUsageCrossFilterRow>>,
     pub last_scan_at: Option<String>,
+}
+
+/// One sparse cell in [`TokenUsage::by_agent_model`] (PROTOCOL §5.23).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageCrossFilterRow {
+    pub agent_id: String,
+    pub model: String,
+    pub totals: TokenUsageTotals,
+    pub human_messages: u64,
+    pub agent_messages: u64,
 }
 
 /// Coarse project classification for worktree setup (PROTOCOL §5.25), detected
@@ -5334,6 +5350,7 @@ mod tests {
             by_agent_id,
             totals: by_model["opus-4.8"].clone(),
             by_model,
+            by_agent_model: None,
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -5350,6 +5367,30 @@ mod tests {
         assert!(v["totals"].get("thoughtTokens").is_none());
         let back: TokenUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn token_usage_cross_filter_wire_shape_is_additive() {
+        let row = TokenUsageCrossFilterRow {
+            agent_id: "agent-123".to_string(),
+            model: "opus-4.8".to_string(),
+            totals: TokenUsageTotals {
+                input_tokens: 7,
+                ..Default::default()
+            },
+            human_messages: 2,
+            agent_messages: 3,
+        };
+        let usage = TokenUsage {
+            by_agent_model: Some(vec![row]),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&usage).unwrap();
+        assert_eq!(value["byAgentModel"][0]["agentId"], "agent-123");
+        assert_eq!(value["byAgentModel"][0]["model"], "opus-4.8");
+        assert_eq!(value["byAgentModel"][0]["totals"]["inputTokens"], 7);
+        assert_eq!(value["byAgentModel"][0]["humanMessages"], 2);
+        assert_eq!(value["byAgentModel"][0]["agentMessages"], 3);
     }
 
     /// Reported reasoning tokens serialize as the additive camelCase
@@ -5371,6 +5412,7 @@ mod tests {
             by_agent_id,
             totals,
             by_model,
+            by_agent_model: None,
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -5415,6 +5457,7 @@ mod tests {
             by_agent_id,
             totals,
             by_model,
+            by_agent_model: None,
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();

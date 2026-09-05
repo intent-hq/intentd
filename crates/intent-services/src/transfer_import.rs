@@ -1148,6 +1148,7 @@ fn sandbox_for_materialize(row: &serde_json::Value) -> Sandbox {
 /// archive splice payload bytes into an existing message elsewhere.
 /// Collision validation ran only for the manifest's id, so anything else
 /// would land unvalidated.
+/// `agent_usage_cell` rows use the same owning-session scope.
 fn validate_row_scope(
     rows: &[(String, Vec<serde_json::Value>)],
     workspace_id: &WorkspaceId,
@@ -1174,7 +1175,7 @@ fn validate_row_scope(
         for row in objects {
             let ok = match table.as_str() {
                 "workspace" => field(row, "id") == workspace_id.0,
-                "agent_message" | "agent_queue" => {
+                "agent_message" | "agent_usage_cell" | "agent_queue" => {
                     session_ids.contains(field(row, "agent_id").as_str())
                 }
                 "agent_message_payload" => {
@@ -1661,6 +1662,10 @@ mod tests {
                     "block_ordinal": 0, "kind": "tool_result_output",
                     "encoding": "none", "body": { "$base64": "e30=" }
                 })],
+            ),
+            (
+                "agent_usage_cell",
+                vec![serde_json::json!({ "agent_id": "agent-a", "model": "m" })],
             ),
             (
                 "completion_watch",

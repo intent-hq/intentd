@@ -1067,6 +1067,22 @@ pub(crate) struct QueuedMessage {
 /// retracted and folded into the terminal wake when the child settles first.
 pub(crate) const REPORT_DEBOUNCE_HOLD_KIND: &str = "report-debounce";
 
+fn queued_usage_origin(entry: &QueuedMessage) -> intent_store::UsageMessageOrigin {
+    if entry.user_origin {
+        intent_store::UsageMessageOrigin::Human
+    } else if entry
+        .message_metadata
+        .as_ref()
+        .and_then(|m| m.get("fromAgentId"))
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        intent_store::UsageMessageOrigin::Agent
+    } else {
+        intent_store::UsageMessageOrigin::Excluded
+    }
+}
+
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
     /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
@@ -4211,6 +4227,8 @@ impl Services {
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;
             self.invalidate_agent_list_cache(session_ws);
+            self.recompute_workspace_token_usage(session_ws, false)
+                .await?;
         }
         self.agent_queues
             .lock()
@@ -5029,6 +5047,8 @@ impl Services {
         }
         self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
             .await;
+        self.recompute_workspace_token_usage(&session.workspace_id, false)
+            .await?;
         // Stored-on-write pending-questions markers (PROTOCOL §5.5), same
         // contract as the turn-end and user-send persists: an appended
         // assistant row bearing question blocks arms the pending marker, an
@@ -5178,6 +5198,8 @@ impl Services {
         // (dropping entries whose blocks are gone).
         self.reconcile_pending_proposals(&session.workspace_id, &agent_id, &inserted)
             .await;
+        self.recompute_workspace_token_usage(&session.workspace_id, false)
+            .await?;
         Ok(json!({ "success": true, "messages": inserted }))
     }
 
@@ -5270,6 +5292,8 @@ impl Services {
         // truncated away.
         self.reconcile_pending_proposals(&session.workspace_id, agent_id, &inserted)
             .await;
+        self.recompute_workspace_token_usage(&session.workspace_id, false)
+            .await?;
         self.publish_agent_mutation_event(
             &session.workspace_id,
             agent_id,
@@ -5943,6 +5967,8 @@ impl Services {
                     self.maybe_emit_display_status_changed(&session.workspace_id)
                         .await;
                 }
+                self.recompute_workspace_token_usage(&session.workspace_id, false)
+                    .await?;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(append_err) => {
@@ -5964,7 +5990,7 @@ impl Services {
                 // answer auto-queued after a failed write must keep its
                 // `question_answers` tag, or the drain persist can no longer
                 // clear the pending-questions marker and the pending set wedges.
-                let (queued, position) = self.enqueue_message(
+                let (queued, position) = self.enqueue_message_with_origin(
                     &agent_id,
                     content,
                     image_blocks,
@@ -5972,6 +5998,7 @@ impl Services {
                     message_metadata,
                     None,
                     false,
+                    true,
                 );
                 let result = json!({
                     "success": true,
@@ -6044,13 +6071,14 @@ impl Services {
         let created_at = now_iso();
         let message = match self
             .store
-            .append_agent_message_with_id(
+            .append_agent_message_with_provenance(
                 &agent_id,
                 &entry.id,
                 "user",
                 &blocks,
                 entry.message_metadata.as_ref(),
                 &created_at,
+                queued_usage_origin(&entry),
             )
             .await
         {
@@ -12425,12 +12453,22 @@ impl Services {
         // the FE attribution chip reads the row's `metadata` column.
         let message = match self
             .store
-            .append_agent_message_with_metadata(
+            .append_agent_message_with_provenance(
                 agent_id,
+                &new_message_id(),
                 "user",
                 &blocks,
                 message_metadata,
                 &created_at,
+                if message_metadata
+                    .and_then(|m| m.get("fromAgentId"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                {
+                    intent_store::UsageMessageOrigin::Agent
+                } else {
+                    intent_store::UsageMessageOrigin::Excluded
+                },
             )
             .await
         {
@@ -12528,12 +12566,22 @@ impl Services {
         // Row-level metadata parity with the runtime branch (monorepo#1217).
         match self
             .store
-            .append_agent_message_with_metadata(
+            .append_agent_message_with_provenance(
                 agent_id,
+                &new_message_id(),
                 "user",
                 &blocks,
                 message_metadata,
                 &created_at,
+                if message_metadata
+                    .and_then(|m| m.get("fromAgentId"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                {
+                    intent_store::UsageMessageOrigin::Agent
+                } else {
+                    intent_store::UsageMessageOrigin::Excluded
+                },
             )
             .await
         {

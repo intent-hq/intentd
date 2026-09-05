@@ -57,6 +57,10 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
     (
+        "agent_usage_cell",
+        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
+    ),
+    (
         "agent_queue",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
@@ -630,6 +634,7 @@ mod tests {
             format!("INSERT INTO draft (workspace_id, agent_id, client_id, text, updated_at) VALUES ('{ws}', '{agent}', '{client}', 'd', '{t}')"),
             format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}')"),
             format!("INSERT INTO agent_message_payload (message_id, agent_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', '{agent}', 0, 'tool_result_output', 'none', X'227822')"),
+            format!("INSERT INTO agent_usage_cell (agent_id, model, human_messages) VALUES ('{agent}', 'test-model', 1)"),
             format!("INSERT INTO agent_queue (id, agent_id, position, payload, created_at) VALUES ('q-{ws}', '{agent}', 0, '{{}}', '{t}')"),
             format!("INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) VALUES ('{agent}', '{ws}', 'working', '{t}')"),
             format!("INSERT INTO agent_flipped_completion (agent_id, workspace_id, task_note_id, recorded_at) VALUES ('{agent}', '{ws}', 'n1', '{t}')"),
@@ -882,8 +887,9 @@ note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes
-agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails
+agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails, usage_model, usage_origin
 agent_message_payload: message_id, agent_id, block_ordinal, kind, encoding, body
+agent_usage_cell: agent_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, thought_tokens, costs_json, human_messages, agent_messages
 agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
 agent_flipped_completion: agent_id, workspace_id, task_note_id, recorded_at
