@@ -1435,7 +1435,12 @@ impl ChatDeltaState {
     /// persisted block as `updated` (or `added` if never emitted live) carrying
     /// the authoritative `messageSeq`/`timestamp` and `streamingComplete:true`,
     /// plus `removedIds` for any block emitted live that the persisted message
-    /// does not contain (e.g. a mispredicted `tool_result` index).
+    /// does not contain (e.g. a mispredicted `tool_result` index). Each entity
+    /// also carries the persisted row's `metadata` verbatim when present
+    /// (intent#4409 — mirrors the `agent:message` re-read lift), so a
+    /// subscribe-only client renders interrupted / finish-reason state exactly
+    /// as `agent.getConversation` does; rows without metadata keep the lean
+    /// entity shape.
     ///
     /// The re-read is retried once, and a persistent failure still emits a
     /// terminal frame — the best-effort one built from the accumulated live
@@ -1503,6 +1508,7 @@ impl ChatDeltaState {
         {
             let seq = msg.get("seq").and_then(Value::as_u64);
             let ts = msg.get("timestamp").and_then(Value::as_str);
+            let metadata = msg.get("metadata").filter(|m| !m.is_null());
             if let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) {
                 for block in blocks {
                     let Some(bid) = block.get("id").and_then(Value::as_str) else {
@@ -1510,7 +1516,10 @@ impl ChatDeltaState {
                     };
                     persisted_ids.insert(bid.to_string());
                     let is_added = !self.seen_ids.contains(bid);
-                    let entity = self.entity(&message_id, block.clone(), seq, ts, true);
+                    let mut entity = self.entity(&message_id, block.clone(), seq, ts, true);
+                    if let (Some(obj), Some(md)) = (entity.as_object_mut(), metadata) {
+                        obj.insert("metadata".to_string(), md.clone());
+                    }
                     push_entity(&mut added, &mut updated, is_added, entity);
                 }
             }
@@ -1530,8 +1539,9 @@ impl ChatDeltaState {
     /// delivered live or seeded from the seq-0 snapshot) stamped
     /// `streamingComplete: true`, so the client still flips out of the
     /// streaming state on the content it has. No authoritative
-    /// `messageSeq`/`timestamp` (the store read failed) and no `removedIds`
-    /// (without the persisted message no orphan is provable). Text/thinking
+    /// `messageSeq`/`timestamp` (the store read failed), no `removedIds`
+    /// (without the persisted message no orphan is provable), and no
+    /// `metadata` (there is no persisted row to lift it from). Text/thinking
     /// entries are markers — their FULL text is rebuilt from
     /// [`Self::text_acc`] here, the one place the degraded frame needs it.
     ///
