@@ -34,7 +34,7 @@ pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 /// Pinned npx package spec for the codex ACP fallback. intentd is the only
 /// pin site (cloudlands-fe no longer pins a managed codex-acp version);
 /// bumping the version is a deliberate code change.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.6.2";
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.9.0";
 
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
 /// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
@@ -419,9 +419,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // time and DOES get the NODE_OPTIONS heap cap
         // (`build_provider_env_for_spawn`, intent-hq/monorepo#1661).
         can_be_disabled: true,
-        // The pinned @agentclientprotocol/codex-acp adapter (1.6.2) ignores
+        // The pinned @agentclientprotocol/codex-acp adapter (1.9.0) ignores
         // `_meta.developerInstructions` (verified empirically, #479; still
-        // true at 1.6.2 — the adapter never reads that key from session
+        // true at 1.9.0 — the adapter never reads that key from session
         // params), so the system prompt is delivered via the first-turn
         // `<system>` prepend instead of SessionMeta.
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,

@@ -1287,6 +1287,56 @@ fn parse_codex_models_collapse_live_bracket_effort_ids() {
 }
 
 #[test]
+fn parse_codex_models_collapse_live_1_9_0_new_model_catalog() {
+    // Canned from a live codex-acp@1.9.0 session/new result (2026-09-04).
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "vega-alpha[low]", "name": "vega-alpha (low)",
+              "description": "Latest frontier agentic coding model. Fast responses with lighter reasoning" },
+            { "modelId": "vega-alpha[medium]", "name": "vega-alpha (medium)",
+              "description": "Latest frontier agentic coding model. Balances speed and reasoning depth for everyday tasks" },
+            { "modelId": "vega-alpha[high]", "name": "vega-alpha (high)",
+              "description": "Latest frontier agentic coding model. Greater reasoning depth for complex problems" },
+            { "modelId": "vega-alpha[xhigh]", "name": "vega-alpha (xhigh)",
+              "description": "Latest frontier agentic coding model. Extra high reasoning depth for complex problems" },
+            { "modelId": "vega-alpha[max]", "name": "vega-alpha (max)",
+              "description": "Latest frontier agentic coding model. Maximum reasoning depth for the hardest problems" },
+            { "modelId": "vega-alpha[ultra]", "name": "vega-alpha (ultra)",
+              "description": "Latest frontier agentic coding model. Maximum reasoning with automatic task delegation" },
+            { "modelId": "gpt-6-astra[low]", "name": "GPT-6-Astra (low)",
+              "description": "Our most capable model for complex, demanding work. Fast responses with lighter reasoning" },
+            { "modelId": "gpt-6-astra[medium]", "name": "GPT-6-Astra (medium)",
+              "description": "Our most capable model for complex, demanding work. Balances speed and reasoning depth for everyday tasks" },
+            { "modelId": "gpt-6-astra[high]", "name": "GPT-6-Astra (high)",
+              "description": "Our most capable model for complex, demanding work. Greater reasoning depth for complex problems" },
+            { "modelId": "gpt-6-astra[xhigh]", "name": "GPT-6-Astra (xhigh)",
+              "description": "Our most capable model for complex, demanding work. Extra high reasoning depth for complex problems" },
+            { "modelId": "gpt-6-astra[max]", "name": "GPT-6-Astra (max)",
+              "description": "Our most capable model for complex, demanding work. Maximum reasoning depth for the hardest problems" },
+            { "modelId": "gpt-6-astra[ultra]", "name": "GPT-6-Astra (ultra)",
+              "description": "Our most capable model for complex, demanding work. Maximum reasoning with automatic task delegation" }
+        ] },
+        "configOptions": [
+            { "id": "model", "options": [
+                { "value": "vega-alpha", "name": "vega-alpha",
+                  "description": "Latest frontier agentic coding model." },
+                { "value": "gpt-6-astra", "name": "GPT-6-Astra",
+                  "description": "Our most capable model for complex, demanding work." }
+            ] }
+        ]
+    });
+    let rows = parse_codex_acp_models(&payload);
+    let ids: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["vega-alpha", "gpt-6-astra"]);
+    for row in rows {
+        assert_eq!(
+            row["effortLevels"],
+            json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+        );
+    }
+}
+
+#[test]
 fn parse_codex_models_none_only_variant_has_no_effort_evidence() {
     let payload = json!({
         "models": { "availableModels": [
