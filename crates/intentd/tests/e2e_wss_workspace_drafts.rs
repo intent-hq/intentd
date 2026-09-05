@@ -367,6 +367,26 @@ async fn wait_for_setup_state(ws: &mut Ws, workspace_id: &str, state: &str) -> V
     }
 }
 
+async fn wait_for_setup_event(ws: &mut Ws, workspace_id: &str, event_type: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let Ok(Some(Ok(Message::Text(text)))) =
+            timeout(Duration::from_millis(250), ws.next()).await
+        else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "missing {event_type}"
+            );
+            continue;
+        };
+        let message: Value = serde_json::from_str(&text).unwrap();
+        let event = &message["params"]["event"];
+        if event["type"] == event_type && event["workspaceId"] == workspace_id {
+            return event["data"].clone();
+        }
+    }
+}
+
 async fn assert_failed_draft_without_workspace(
     ws: &mut Ws,
     draft_id: &str,
@@ -972,6 +992,14 @@ async fn setup_result_covers_absent_running_failures_and_listener_reconnect() {
         .success());
 
     let (_server, port, config) = boot(&root.0).await;
+    let mut setup_events = connect(port, config.clone()).await;
+    rpc(
+        &mut setup_events,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["workspace:setup:started","workspace:setup:completed"]}),
+    )
+    .await;
     let mut ws = connect(port, config.clone()).await;
     let absent = rpc(
         &mut ws,
@@ -1017,6 +1045,13 @@ async fn setup_result_covers_absent_running_failures_and_listener_reconnect() {
         .as_str()
         .unwrap()
         .to_string();
+    let started = wait_for_setup_event(
+        &mut setup_events,
+        &failing_workspace_id,
+        "workspace:setup:started",
+    )
+    .await;
+    assert_eq!(started, json!({"workspaceId":failing_workspace_id}));
     let running = wait_for_setup_state(&mut ws, &failing_workspace_id, "running").await;
     assert!(running["setupResult"]["startedAt"].is_string());
     assert!(running["setupResult"].get("finishedAt").is_none());
@@ -1024,8 +1059,18 @@ async fn setup_result_covers_absent_running_failures_and_listener_reconnect() {
     assert!(running["setupResult"].get("error").is_none());
     drop(ws);
     let mut reconnected = connect(port, config).await;
+    let completed = wait_for_setup_event(
+        &mut setup_events,
+        &failing_workspace_id,
+        "workspace:setup:completed",
+    )
+    .await;
+    assert_eq!(completed["ranScript"], true);
+    assert_eq!(completed["exitCode"], 23);
     let failed = wait_for_setup_state(&mut reconnected, &failing_workspace_id, "failed").await;
     assert_eq!(failed["setupResult"]["exitCode"], 23);
+    assert!(failed["setupResult"]["startedAt"].is_string());
+    assert!(failed["setupResult"]["finishedAt"].is_string());
     assert_eq!(
         failed["setupResult"]["error"],
         "setup script exited with code 23"
@@ -1048,12 +1093,26 @@ async fn setup_result_covers_absent_running_failures_and_listener_reconnect() {
         json!({"id":prespawn["id"],"expectedRevision":0}),
     )
     .await;
-    let prespawn_failed = wait_for_setup_state(
-        &mut reconnected,
-        prespawn_promotion["workspace"]["id"].as_str().unwrap(),
-        "failed",
+    let prespawn_workspace_id = prespawn_promotion["workspace"]["id"].as_str().unwrap();
+    let started = wait_for_setup_event(
+        &mut setup_events,
+        prespawn_workspace_id,
+        "workspace:setup:started",
     )
     .await;
+    assert_eq!(started, json!({"workspaceId":prespawn_workspace_id}));
+    let completed = wait_for_setup_event(
+        &mut setup_events,
+        prespawn_workspace_id,
+        "workspace:setup:completed",
+    )
+    .await;
+    assert_eq!(completed["ranScript"], false);
+    assert!(completed.get("exitCode").is_none());
+    let prespawn_failed =
+        wait_for_setup_state(&mut reconnected, prespawn_workspace_id, "failed").await;
+    assert!(prespawn_failed["setupResult"]["startedAt"].is_string());
+    assert!(prespawn_failed["setupResult"]["finishedAt"].is_string());
     assert!(prespawn_failed["setupResult"].get("exitCode").is_none());
     assert_eq!(
         prespawn_failed["setupResult"]["error"],
@@ -1077,14 +1136,29 @@ async fn setup_result_covers_absent_running_failures_and_listener_reconnect() {
         json!({"id":missing_interpreter["id"],"expectedRevision":0}),
     )
     .await;
-    let spawn_failed = wait_for_setup_state(
-        &mut reconnected,
-        missing_interpreter_promotion["workspace"]["id"]
-            .as_str()
-            .unwrap(),
-        "failed",
+    let missing_interpreter_workspace_id = missing_interpreter_promotion["workspace"]["id"]
+        .as_str()
+        .unwrap();
+    let started = wait_for_setup_event(
+        &mut setup_events,
+        missing_interpreter_workspace_id,
+        "workspace:setup:started",
     )
     .await;
+    assert_eq!(
+        started,
+        json!({"workspaceId":missing_interpreter_workspace_id})
+    );
+    let completed = wait_for_setup_event(
+        &mut setup_events,
+        missing_interpreter_workspace_id,
+        "workspace:setup:completed",
+    )
+    .await;
+    assert_eq!(completed["ranScript"], true);
+    assert_eq!(completed["exitCode"], 127);
+    let spawn_failed =
+        wait_for_setup_state(&mut reconnected, missing_interpreter_workspace_id, "failed").await;
     assert_eq!(spawn_failed["setupResult"]["exitCode"], 127);
     assert_eq!(
         spawn_failed["setupResult"]["error"],
