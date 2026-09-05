@@ -951,11 +951,12 @@ async fn concurrent_clients_surface_revision_conflict_and_share_one_promotion() 
 }
 
 #[tokio::test]
-async fn setup_result_covers_absent_nonzero_prespawn_and_listener_reconnect() {
+async fn setup_result_covers_absent_running_failures_and_listener_reconnect() {
     let root = TempDir::new();
     let absent_repo = make_repo_named(&root.0, "absent-repo");
     let failing_repo = make_repo_named(&root.0, "failing-repo");
     let prespawn_repo = make_repo_named(&root.0, "prespawn-repo");
+    let missing_interpreter_repo = make_repo_named(&root.0, "missing-interpreter-repo");
     std::fs::write(prespawn_repo.join(".intent"), "block directory creation\n").unwrap();
     assert!(std::process::Command::new("git")
         .args(["add", ".intent"])
@@ -1001,7 +1002,7 @@ async fn setup_result_covers_absent_nonzero_prespawn_and_listener_reconnect() {
         "workspaceDraft.create",
         json!({
             "source":{"kind":"local","path":failing_repo,"branch":"main","isolation":"worktree"},
-            "config":{"setupScript":"sleep 0.25; exit 23"}
+            "config":{"setupScript":"sleep 1; exit 23"}
         }),
     )
     .await;
@@ -1016,6 +1017,11 @@ async fn setup_result_covers_absent_nonzero_prespawn_and_listener_reconnect() {
         .as_str()
         .unwrap()
         .to_string();
+    let running = wait_for_setup_state(&mut ws, &failing_workspace_id, "running").await;
+    assert!(running["setupResult"]["startedAt"].is_string());
+    assert!(running["setupResult"].get("finishedAt").is_none());
+    assert!(running["setupResult"].get("exitCode").is_none());
+    assert!(running["setupResult"].get("error").is_none());
     drop(ws);
     let mut reconnected = connect(port, config).await;
     let failed = wait_for_setup_state(&mut reconnected, &failing_workspace_id, "failed").await;
@@ -1052,6 +1058,37 @@ async fn setup_result_covers_absent_nonzero_prespawn_and_listener_reconnect() {
     assert_eq!(
         prespawn_failed["setupResult"]["error"],
         ".intent is not a directory"
+    );
+
+    let missing_interpreter = rpc(
+        &mut reconnected,
+        8,
+        "workspaceDraft.create",
+        json!({
+            "source":{"kind":"local","path":missing_interpreter_repo,"branch":"main","isolation":"worktree"},
+            "config":{"setupScript":"exec /definitely-missing/intent-setup-interpreter"}
+        }),
+    )
+    .await;
+    let missing_interpreter_promotion = rpc(
+        &mut reconnected,
+        9,
+        "workspaceDraft.promote",
+        json!({"id":missing_interpreter["id"],"expectedRevision":0}),
+    )
+    .await;
+    let spawn_failed = wait_for_setup_state(
+        &mut reconnected,
+        missing_interpreter_promotion["workspace"]["id"]
+            .as_str()
+            .unwrap(),
+        "failed",
+    )
+    .await;
+    assert_eq!(spawn_failed["setupResult"]["exitCode"], 127);
+    assert_eq!(
+        spawn_failed["setupResult"]["error"],
+        "setup script exited with code 127"
     );
 }
 
