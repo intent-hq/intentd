@@ -377,89 +377,67 @@ pub(crate) fn read_output(
         ));
     }
 
-    // TA-2 / §5.5 opt-in pagination: when engaged, return the historical
-    // scrollback as a `{ items, nextToken }` envelope of ANSI-stripped lines
-    // ordered newest→oldest, with an opaque append-stable continuation token.
-    // Absent the opt-in, preserve the legacy bare formatted string verbatim.
+    // OSC payloads may contain newlines, so raw scrollback line coordinates
+    // cannot safely drive formatted or paginated visible-output boundaries.
+    // Decode the retained snapshot once, then split and page in logical lines.
+    let snapshot = pty.scrollback_lines(id, usize::MAX, None)?;
+    Ok(render_output(
+        &snapshot,
+        terminal_id,
+        info.cwd.as_deref().unwrap_or_default(),
+        max_lines,
+        paginate,
+        page_token,
+    ))
+}
+
+fn render_output(
+    snapshot: &LineSnapshot,
+    terminal_id: &str,
+    cwd: &str,
+    max_lines: Option<i64>,
+    paginate: bool,
+    page_token: Option<&String>,
+) -> Value {
+    let raw = String::from_utf8_lossy(&snapshot.bytes);
+    let clean = strip_ansi(&raw);
     if paginate || page_token.is_some() {
-        let limit = crate::pagination::clamp_limit(max_lines);
-        let token = page_token.map(std::string::String::as_str);
-        let boundary = token.and_then(crate::pagination::backward_page_boundary);
-
-        let (snapshot, lines, effective_total, window_token) = if boundary.is_some() {
-            let snapshot = pty.scrollback_lines(id, limit, boundary)?;
-            let lines = decoded_snapshot_lines(&snapshot);
-            let total = snapshot.total_lines;
-            (snapshot, lines, total, token)
-        } else {
-            // Locate the trailing-content boundary once. Repeated bounded
-            // probes restart OSC-context scans at every chunk and make a long
-            // blank suffix quadratic even though each copied page is tiny.
-            let full = pty.scrollback_lines(id, usize::MAX, None)?;
-            let full_lines = decoded_snapshot_lines(&full);
-            let effective_end = full_lines
-                .iter()
-                .rposition(|line| !line.trim().is_empty())
-                .map_or(0, |last_content| last_content + 1);
-            let snapshot = pty.scrollback_lines(id, limit, Some(effective_end))?;
-            let lines = decoded_snapshot_lines(&snapshot);
-            (snapshot, lines, effective_end, None)
-        };
-
-        let window = crate::pagination::page_window(effective_total, max_lines, window_token);
-        debug_assert_eq!(
-            (snapshot.start_line, snapshot.end_line),
-            (window.start, window.end)
+        return crate::pagination::paginate_text_lines(
+            &clean,
+            max_lines,
+            page_token.map(std::string::String::as_str),
         );
-        return Ok(json!({
-            "items": lines.into_iter().rev().collect::<Vec<_>>(),
-            "nextToken": window.next_token,
-        }));
+    }
+    if !snapshot.retained_has_non_whitespace {
+        return Value::String("Terminal has no output yet.".to_string());
     }
 
+    let lines: Vec<&str> = clean.split('\n').collect();
     let max_line_count =
         usize::try_from(max_lines.unwrap_or(200).clamp(1, 10000)).expect("value fits in usize");
-    let snapshot = pty.scrollback_lines(id, max_line_count, None)?;
-    if !snapshot.retained_has_non_whitespace {
-        return Ok(Value::String("Terminal has no output yet.".to_string()));
-    }
-
-    let mut output_lines = decoded_snapshot_lines(&snapshot);
+    let mut output_lines = if lines.len() > max_line_count {
+        lines[lines.len() - max_line_count..].to_vec()
+    } else {
+        lines.clone()
+    };
     while output_lines.last().is_some_and(|l| l.trim().is_empty()) {
         output_lines.pop();
     }
 
-    let truncated = snapshot.total_lines > max_line_count;
-    let cwd = info.cwd.unwrap_or_default();
+    let truncated = lines.len() > max_line_count;
     let header = if truncated {
         format!(
             "Terminal {terminal_id} (cwd: {cwd}) [showing last {max_line_count} of {} lines]",
-            snapshot.total_lines
+            lines.len()
         )
     } else {
         format!("Terminal {terminal_id} (cwd: {cwd})")
     };
     let separator = "\u{2500}".repeat(40);
-    Ok(Value::String(format!(
+    Value::String(format!(
         "{header}\n{separator}\n{}",
         output_lines.join("\n")
-    )))
-}
-
-/// Decode and ANSI-strip the raw lines copied by `scrollback_lines`, including
-/// any leading unmatched OSC context needed to make the window sequence-safe.
-/// The ring includes the newline after a window that ends before the live tail;
-/// `take(line_count)` excludes the synthetic split item after that delimiter.
-fn decoded_snapshot_lines(snapshot: &LineSnapshot) -> Vec<String> {
-    let raw = String::from_utf8_lossy(&snapshot.bytes);
-    let clean = strip_ansi(&raw);
-    let mut lines: Vec<String> = clean
-        .split('\n')
-        .take(snapshot.line_count())
-        .map(str::to_string)
-        .collect();
-    lines.resize(snapshot.line_count(), String::new());
-    lines
+    ))
 }
 
 /// Strip ANSI escape sequences from terminal output, mirroring the TS
@@ -1067,10 +1045,14 @@ mod tests {
     fn strip_ansi_removes_sequences_and_keeps_unicode() {
         let input = "\u{1b}[31mred\u{1b}[0m \u{1b}[?25lhide \u{1b}]0;title\u{07}é✓😀";
         assert_eq!(strip_ansi(input), "red hide é✓😀");
+        assert_eq!(
+            strip_ansi("before\u{1b}]0;hidden\nhidden-tail\u{1b}\\after"),
+            "beforeafter"
+        );
     }
 
     #[test]
-    fn bounded_line_decode_tolerates_utf8_and_ansi_split_edges() {
+    fn strip_ansi_tolerates_utf8_and_ansi_split_edges() {
         let snapshot = LineSnapshot {
             bytes: b"\xa9prefix\x1b[31mred\x1b[0m\x1b[32".to_vec(),
             total_lines: 1,
@@ -1078,31 +1060,41 @@ mod tests {
             end_line: 1,
             retained_has_non_whitespace: true,
         };
-        assert_eq!(decoded_snapshot_lines(&snapshot), ["�prefixred"]);
+        assert_eq!(
+            strip_ansi(&String::from_utf8_lossy(&snapshot.bytes)),
+            "�prefixred"
+        );
     }
 
     #[test]
-    fn bounded_line_decode_strips_osc_sequence_straddling_window_start() {
+    fn multiline_osc_uses_visible_line_coordinates() {
         let snapshot = LineSnapshot {
-            bytes: b"\x1b]0;hidden\nhidden-tail\x07visible-after\nlast".to_vec(),
+            bytes: b"before\n\x1b]0;hidden\nhidden-tail\x07after\nlast".to_vec(),
             total_lines: 4,
-            start_line: 2,
+            start_line: 0,
             end_line: 4,
             retained_has_non_whitespace: true,
         };
-        assert_eq!(decoded_snapshot_lines(&snapshot), ["visible-after", "last"]);
-    }
+        let full = render_output(&snapshot, "pty-1", "/tmp", Some(50), true, None);
+        assert_eq!(
+            full,
+            json!({ "items": ["last", "after", "before"], "nextToken": null })
+        );
 
-    #[test]
-    fn bounded_line_decode_strips_st_terminated_osc_straddling_window_start() {
-        let snapshot = LineSnapshot {
-            bytes: b"\x1b]0;hidden\nhidden-tail\x1b\\visible-after\nlast".to_vec(),
-            total_lines: 4,
-            start_line: 2,
-            end_line: 4,
-            retained_has_non_whitespace: true,
-        };
-        assert_eq!(decoded_snapshot_lines(&snapshot), ["visible-after", "last"]);
+        let first = render_output(&snapshot, "pty-1", "/tmp", Some(2), true, None);
+        assert_eq!(first["items"], json!(["last", "after"]));
+        let token = first["nextToken"]
+            .as_str()
+            .expect("continuation")
+            .to_string();
+        let second = render_output(&snapshot, "pty-1", "/tmp", Some(2), false, Some(&token));
+        assert_eq!(second, json!({ "items": ["before"], "nextToken": null }));
+
+        let legacy = render_output(&snapshot, "pty-1", "/tmp", Some(2), false, None);
+        assert!(legacy
+            .as_str()
+            .expect("formatted")
+            .contains("last 2 of 3 lines"));
     }
 
     // ---- credential injection helpers (no spawn) ----
