@@ -1442,7 +1442,8 @@ impl Store {
              WHERE s.workspace_id IN ({placeholders}) \
                AND s.parent_agent_id IS NULL AND s.is_background = 0 \
                AND s.status != 'deleted' \
-               AND json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL"
+               AND (json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL \
+                    OR json_type(s.metadata, '$.pendingQuestionsMessageId') != 'text')"
         );
         let mut query = sqlx::query(&sql);
         for id in workspace_ids {

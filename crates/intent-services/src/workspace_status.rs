@@ -1902,6 +1902,72 @@ mod workspace_needs_attention {
     }
 
     #[tokio::test]
+    async fn question_marker_shapes_match_across_get_list_and_lite_snapshot() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store.clone());
+        let cases = [
+            ("absent", None, WorkspaceDisplayStatus::NeedsAttention),
+            (
+                "null",
+                Some(json!(null)),
+                WorkspaceDisplayStatus::NeedsAttention,
+            ),
+            (
+                "number",
+                Some(json!(42)),
+                WorkspaceDisplayStatus::NeedsAttention,
+            ),
+            ("empty", Some(json!("")), WorkspaceDisplayStatus::Idle),
+            (
+                "set",
+                Some(json!("set")),
+                WorkspaceDisplayStatus::NeedsAttention,
+            ),
+        ];
+        let mut expected = Vec::new();
+
+        for (name, marker, status) in cases {
+            let ws = WorkspaceId::from(format!("ws-marker-{name}"));
+            store.insert_workspace(&workspace(&ws)).await.expect("ws");
+            let mut session = mk_session(&ws, &format!("agent-marker-{name}"));
+            store.insert_agent_session(&session).await.expect("session");
+            let message = store
+                .append_agent_message(&session.id, "assistant", &question_content(), &now_iso())
+                .await
+                .expect("question");
+            session.metadata = marker.map(|value| {
+                json!({
+                    (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY):
+                        if name == "set" { json!(message.id) } else { value }
+                })
+            });
+            store
+                .update_agent_session(&ws, &session)
+                .await
+                .expect("update marker");
+            expected.push((ws, status));
+        }
+
+        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let lite = svc
+            .list_workspaces_lite(false)
+            .await
+            .expect("workspace.subscribe snapshot");
+        for (ws, status) in expected {
+            let get = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+            let list = listed.iter().find(|row| row.id == ws).expect("list row");
+            let snapshot = lite.iter().find(|row| row.id == ws).expect("lite row");
+            assert_eq!(get.display_status, Some(status), "get: {ws}");
+            assert_eq!(list.display_status, get.display_status, "list: {ws}");
+            assert_eq!(
+                snapshot.display_status, get.display_status,
+                "snapshot: {ws}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn batch_tail_failure_falls_back_without_hiding_pending_questions() {
         let (svc, ws, _tmp) = setup().await;
         let pending = mk_session(&ws, "agent-pending-batch-fallback");
