@@ -114,6 +114,50 @@ pub struct TransferRefsManifest {
     /// daemons and when every submodule is published.
     #[serde(default)]
     pub submodules: Vec<SubmoduleBundleRef>,
+    /// The root repository's portable remotes with their remote-tracking
+    /// tips as of export (see `transfer_remotes`); the tips' objects ride
+    /// the bundle. Absent/empty in archives from older daemons and when the
+    /// source had no transferable remote — the import then lands without
+    /// remotes, as before.
+    #[serde(default)]
+    pub remotes: Vec<RemoteBundleRef>,
+    /// `branch.<workspace_branch>.remote/merge` on the source, when it named
+    /// one of `remotes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_upstream: Option<BranchUpstream>,
+}
+
+/// One root-repository remote as recorded in the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBundleRef {
+    /// The `remote.<name>` key.
+    pub name: String,
+    /// Sanitized fetch URL (credential-free, portable form only).
+    pub url: String,
+    /// Sanitized `remote.<name>.pushurl`, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_url: Option<String>,
+    /// Direct refs under `refs/remotes/<name>/` and their tips at export.
+    #[serde(default)]
+    pub tracking_refs: Vec<TrackingRef>,
+}
+
+/// One remote-tracking ref: full name and the commit it pointed at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingRef {
+    pub ref_name: String,
+    pub sha: String,
+}
+
+/// The workspace branch's upstream: `branch.<b>.remote` + `branch.<b>.merge`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchUpstream {
+    pub remote: String,
+    /// Full ref on the remote (`refs/heads/<branch>`).
+    pub merge_ref: String,
 }
 
 /// One submodule as bundled into the archive: unpublished, or the published
@@ -536,6 +580,13 @@ fn build_bundle(
         });
     }
 
+    // 4b. Record the portable remotes and their remote-tracking tips; the
+    //     tips are bundled too so the target can restore them offline and
+    //     the workspace branch's published prefix stays reachable from
+    //     `refs/remotes/*` (intent-hq/intent#4438).
+    let (remotes, workspace_upstream) =
+        crate::transfer_remotes::capture_remotes(&repo, &workspace_branch)?;
+
     // 5. Create and verify the bundle (full history — self-contained, no
     //    prerequisites, so the target can clone/fetch with no other remote).
     let mut ref_args = vec![workspace_bundle_ref.clone()];
@@ -543,6 +594,11 @@ fn build_bundle(
         ref_args.push(r.clone());
     }
     ref_args.extend(sandbox_refs.iter().map(|s| s.bundle_ref.clone()));
+    ref_args.extend(
+        remotes
+            .iter()
+            .flat_map(|r| r.tracking_refs.iter().map(|t| t.ref_name.clone())),
+    );
     run_git(worktree, |cmd| {
         cmd.arg("bundle").arg("create").arg(bundle_path);
         cmd.args(&ref_args);
@@ -600,6 +656,8 @@ fn build_bundle(
         base_sha,
         sandboxes: sandbox_refs,
         submodules: submodule_refs,
+        remotes,
+        workspace_upstream,
     })
 }
 

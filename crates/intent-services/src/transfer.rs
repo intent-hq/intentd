@@ -272,17 +272,20 @@ impl Services {
 }
 
 /// Estimate the size of the git bundle a transfer would carry: the on-disk
-/// bytes of all objects reachable from HEAD plus the (existing) sandbox
-/// branches, via `git rev-list --disk-usage --objects`. An estimate only —
-/// the real bundle also snapshots dirty state as WIP commits and recompresses
-/// on pack — and degrades to 0 when git or the refs are unavailable.
+/// bytes of all objects reachable from HEAD, the remote-tracking refs (the
+/// bundler carries them so the import keeps its publication state) and the
+/// (existing) sandbox branches, via `git rev-list --disk-usage --objects`.
+/// An estimate only — the real bundle also snapshots dirty state as WIP
+/// commits, drops the tracking refs of untransferable remotes and
+/// recompresses on pack — and degrades to 0 when git or the refs are
+/// unavailable.
 ///
 /// Sandbox branches are resolved in the worktree repo, while the bundler
 /// (`transfer_git`) fetches each branch from its sandbox's own repo — so for
 /// `CoW` sandboxes whose branch exists only in the sandbox repo, the estimate
 /// may undercount those refs.
 fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
-    let mut refs: Vec<String> = vec!["HEAD".to_string()];
+    let mut refs: Vec<String> = vec!["HEAD".to_string(), "--glob=refs/remotes".to_string()];
     for branch in sandbox_branches {
         let exists = std::process::Command::new("git")
             .arg("-C")
@@ -995,6 +998,30 @@ mod tests {
             .message;
         assert!(msg.contains("will ride in the archive"), "{msg}");
         assert!(!msg.contains("Not carried"), "{msg}");
+    }
+
+    /// The estimate counts objects reachable only from remote-tracking refs:
+    /// the bundler carries those refs (intent-hq/intent#4438), so a remote
+    /// branch ahead of HEAD grows the estimate.
+    #[test]
+    fn estimate_bundle_bytes_includes_remote_tracking_refs() {
+        let dir = TempDir::new("intentd-transfer-estimate");
+        let root = dir.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        run_git(&root, &["add", "a.txt"]);
+        run_git(&root, &["commit", "-q", "-m", "a"]);
+        let head_only = super::estimate_bundle_bytes(&root, &[]);
+        assert!(head_only > 0);
+
+        // A commit reachable only from `refs/remotes/origin/ahead`.
+        std::fs::write(root.join("big.txt"), "x".repeat(64 * 1024)).unwrap();
+        run_git(&root, &["add", "big.txt"]);
+        run_git(&root, &["commit", "-q", "-m", "ahead"]);
+        run_git(&root, &["update-ref", "refs/remotes/origin/ahead", "HEAD"]);
+        run_git(&root, &["reset", "-q", "--hard", "HEAD~1"]);
+        assert!(super::estimate_bundle_bytes(&root, &[]) > head_only);
     }
 
     /// Message formatting: carried, carried-published-parent and sandbox-only

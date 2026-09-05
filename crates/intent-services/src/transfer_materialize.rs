@@ -34,9 +34,9 @@ pub(crate) struct MaterializedSandbox {
 #[derive(Debug, Clone)]
 pub(crate) struct MaterializedGit {
     /// The workspace checkout (`<workspaces_root>/<wsId>/<repo-slug>`),
-    /// standalone (`CheckoutMode::Direct`) with no remotes configured — the
-    /// bundle was the only source and its staging path must not leak into
-    /// the repo config.
+    /// standalone (`CheckoutMode::Direct`) with only the source's portable
+    /// remotes configured (`refs.remotes`) — the bundle was the only source
+    /// and its staging path must not leak into the repo config.
     pub checkout_dir: PathBuf,
     /// Branch the checkout is on — the bundled `workspace_branch`, which is
     /// whatever HEAD pointed at when the bundle was built and may differ
@@ -141,9 +141,11 @@ pub(crate) fn rollback_materialized(out: &MaterializedGit, ws_dir: &Path) {
 /// `refs.submodules` from its own bundle (see [`hydrate_submodules`]), fetch
 /// the base ref as a local branch, re-provision each sandbox as a `CoW`
 /// clone of the checkout (plain local clone when `CoW` is unavailable) with
-/// its branch fetched from the bundle and checked out, then unwind the WIP
+/// its branch fetched from the bundle and checked out, unwind the WIP
 /// snapshot commits (sandboxes first, then the workspace) so the dirty state
-/// lands exactly as captured.
+/// lands exactly as captured, then restore the source's portable remotes,
+/// remote-tracking refs and workspace-branch upstream from `refs.remotes`
+/// (see `transfer_remotes`).
 ///
 /// Submodule bundles are resolved next to `bundle_path` in the archive's
 /// `git/` layout: entry `git/submodules/<n>.bundle` lives at
@@ -333,13 +335,21 @@ fn materialize_inner(
         });
     }
 
-    // 4. Unwind the workspace WIP snapshot last, restoring the exact
+    // 4. Unwind the workspace WIP snapshot, restoring the exact
     //    staged/unstaged/untracked split on the workspace branch.
     if refs.workspace_wip_commit_sha.is_some() && !unwind_wip(&checkout_dir)? {
         return Err(Error::Internal(
             "manifest records a workspace WIP snapshot but the checkout tip is not one".to_string(),
         ));
     }
+
+    // 5. Reconnect the checkout to the source's portable remotes: recreate
+    //    each remote, fetch its recorded tracking refs from the bundle, and
+    //    restore the workspace branch's upstream — after the sandboxes were
+    //    provisioned, so they keep the remote-less shape they have on the
+    //    source, and after the bundle origin was removed, so `origin` can be
+    //    recreated with its real URL.
+    crate::transfer_remotes::restore_remotes(&checkout_dir, bundle, refs)?;
 
     Ok(MaterializedGit {
         checkout_dir,
@@ -740,7 +750,7 @@ fn head_sha(repo_path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transfer_git::{create_transfer_bundle, TransferBundle};
+    use crate::transfer_git::{create_transfer_bundle, BranchUpstream, TransferBundle};
     use intent_core::{AgentId, WorkspaceId, WorkspaceStatus};
     use intent_store::SandboxStatus;
     use std::fs;
@@ -1881,5 +1891,512 @@ mod tests {
             vec![],
             "materialized checkout is not registered"
         );
+    }
+
+    // -- remote state (intent-hq/intent#4438) -------------------------------
+
+    /// Configure a remote and remote-tracking refs at the given shas — the
+    /// published state a fetch would have produced, without any network.
+    fn add_remote_with_tracking(repo_path: &Path, name: &str, url: &str, refs: &[(&str, &str)]) {
+        let repo = git2::Repository::open(repo_path).unwrap();
+        repo.remote(name, url).unwrap();
+        for (branch, sha) in refs {
+            repo.reference(
+                &format!("refs/remotes/{name}/{branch}"),
+                git2::Oid::from_str(sha).unwrap(),
+                true,
+                "test tracking ref",
+            )
+            .unwrap();
+        }
+    }
+
+    fn ref_sha(repo_path: &Path, name: &str) -> Option<String> {
+        let repo = git2::Repository::open(repo_path).unwrap();
+        repo.find_reference(name)
+            .ok()
+            .and_then(|r| r.target())
+            .map(|o| o.to_string())
+    }
+
+    fn config_value(repo_path: &Path, key: &str) -> Option<String> {
+        let repo = git2::Repository::open(repo_path).unwrap();
+        repo.config().unwrap().get_string(key).ok()
+    }
+
+    /// A dirty workspace on a published branch: origin (portable https URL),
+    /// `origin/main` at the base, `origin/feature` at the branch tip, and the
+    /// branch tracking `origin/feature`. After an offline import the checkout
+    /// is still connected to origin with the same tracking refs and upstream,
+    /// so the archive-facing count reports zero unpushed commits while the
+    /// dirty state is still reported.
+    #[test]
+    fn roundtrip_restores_remote_tracking_refs_and_upstream() {
+        let src = tempfile::TempDir::new().unwrap();
+        let repo = src.path().join("source-repo");
+        init_repo(&repo);
+        let base = repo_head(&repo);
+        fgit(&repo, &["checkout", "-q", "-b", "feature"]);
+        let feature_tip = commit_file(&repo, "feature.txt", "feature\n", "feat: branch work");
+        let url = "https://example.com/org/repo.git";
+        add_remote_with_tracking(
+            &repo,
+            "origin",
+            url,
+            &[("main", &base), ("feature", &feature_tip)],
+        );
+        fgit(&repo, &["branch", "-q", "-u", "origin/feature", "feature"]);
+        fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+        fs::write(repo.join("README.md"), "modified\n").unwrap();
+        let src_changes = intent_git::local_changes(&repo).unwrap();
+        assert_eq!(src_changes.unpushed_count, 0);
+        assert_eq!(src_changes.uncommitted_count, 2);
+
+        let mut ws = workspace_for_repo(&repo);
+        ws.branch = "feature".to_string();
+        ws.base_ref = Some("main".to_string());
+        let staging = src.path().join("staging");
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        assert!(refs.workspace_wip_commit_sha.is_some());
+
+        let target = tempfile::TempDir::new().unwrap();
+        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+            .unwrap();
+        let dst = &out.checkout_dir;
+
+        assert_eq!(remote_names(dst), vec!["origin".to_string()]);
+        assert_eq!(fgit(dst, &["remote", "get-url", "origin"]), url);
+        assert_eq!(
+            ref_sha(dst, "refs/remotes/origin/main").as_deref(),
+            Some(base.as_str())
+        );
+        assert_eq!(
+            ref_sha(dst, "refs/remotes/origin/feature").as_deref(),
+            Some(feature_tip.as_str())
+        );
+        assert_eq!(
+            config_value(dst, "branch.feature.remote").as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            config_value(dst, "branch.feature.merge").as_deref(),
+            Some("refs/heads/feature")
+        );
+        assert_eq!(repo_head(dst), feature_tip, "WIP unwound");
+        let dst_changes = intent_git::local_changes(dst).unwrap();
+        assert_eq!(dst_changes, src_changes, "archive-facing counts match");
+        assert_no_config_mentions(&dst.join(".git"), staging.to_str().unwrap());
+    }
+
+    /// Bundle + materialize a remote-less clean repo on `feature` (one commit
+    /// past `main`) after `prepare` has shaped its remote state; returns the
+    /// materialized checkout.
+    fn materialize_feature_repo(
+        tmp: &Path,
+        prepare: impl FnOnce(&Path, &str, &str),
+    ) -> (PathBuf, TransferRefsManifest) {
+        let repo = tmp.join("source-repo");
+        init_repo(&repo);
+        let base = repo_head(&repo);
+        fgit(&repo, &["checkout", "-q", "-b", "feature"]);
+        let tip = commit_file(&repo, "feature.txt", "feature\n", "feat: branch work");
+        prepare(&repo, &base, &tip);
+        let mut ws = workspace_for_repo(&repo);
+        ws.branch = "feature".to_string();
+        ws.base_ref = Some("main".to_string());
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &tmp.join("staging")).unwrap();
+        let target = tmp.join("target");
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], &target).unwrap();
+        (out.checkout_dir, refs)
+    }
+
+    /// `origin/feature` two commits behind the local branch: the import
+    /// reports exactly those two as unpushed, not the whole history.
+    #[test]
+    fn ahead_branch_reports_exact_unpushed_count_after_import() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dst, _) = materialize_feature_repo(tmp.path(), |repo, base, tip| {
+            add_remote_with_tracking(
+                repo,
+                "origin",
+                "https://example.com/org/repo.git",
+                &[("main", base), ("feature", tip)],
+            );
+            commit_file(repo, "a.txt", "a\n", "feat: local a");
+            commit_file(repo, "b.txt", "b\n", "feat: local b");
+            assert_eq!(intent_git::local_changes(repo).unwrap().unpushed_count, 2);
+        });
+        let changes = intent_git::local_changes(&dst).unwrap();
+        assert!(changes.has_remote_refs);
+        assert_eq!(changes.unpushed_count, 2);
+    }
+
+    /// A branch never pushed, off a published base: only the branch's own
+    /// commit counts, because `origin/main` still bounds the walk.
+    #[test]
+    fn never_pushed_branch_with_published_base_counts_only_new_commits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dst, refs) = materialize_feature_repo(tmp.path(), |repo, base, _tip| {
+            add_remote_with_tracking(
+                repo,
+                "origin",
+                "https://example.com/org/repo.git",
+                &[("main", base)],
+            );
+        });
+        assert_eq!(refs.workspace_upstream, None, "no upstream to restore");
+        assert_eq!(config_value(&dst, "branch.feature.remote"), None);
+        let changes = intent_git::local_changes(&dst).unwrap();
+        assert!(changes.has_remote_refs);
+        assert_eq!(changes.unpushed_count, 1);
+    }
+
+    /// No remotes on the source: the import stays remote-less and reports
+    /// the whole history as unpushed, exactly as before.
+    #[test]
+    fn remote_less_source_keeps_truthful_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dst, refs) = materialize_feature_repo(tmp.path(), |_, _, _| {});
+        assert!(refs.remotes.is_empty());
+        assert!(remote_names(&dst).is_empty());
+        let changes = intent_git::local_changes(&dst).unwrap();
+        assert!(!changes.has_remote_refs);
+        assert_eq!(changes.unpushed_count, 2);
+    }
+
+    /// Two non-origin remotes (scp-like and ssh URLs, one with a push URL),
+    /// tracking tips ahead of and diverged from HEAD, and the branch tracking
+    /// the fork: everything is restored as configured on the source, the
+    /// sandbox stays remote-less, and no `origin` is invented.
+    #[test]
+    fn multiple_non_origin_remotes_roundtrip() {
+        let src = tempfile::TempDir::new().unwrap();
+        let repo = src.path().join("source-repo");
+        init_repo(&repo);
+        let base = repo_head(&repo);
+        fgit(&repo, &["checkout", "-q", "-b", "feature"]);
+        let tip = commit_file(&repo, "feature.txt", "feature\n", "feat: branch work");
+        // upstream/main is AHEAD of the base (a commit the branch lacks);
+        // fork/feature has DIVERGED (a commit off the base, not on the branch).
+        fgit(&repo, &["checkout", "-q", "main"]);
+        let upstream_tip = commit_file(&repo, "up.txt", "up\n", "feat: upstream ahead");
+        fgit(&repo, &["checkout", "-q", "-b", "diverged", &base]);
+        let fork_tip = commit_file(&repo, "fork.txt", "fork\n", "feat: fork diverged");
+        fgit(&repo, &["checkout", "-q", "feature"]);
+        fgit(&repo, &["branch", "-q", "-D", "diverged"]);
+        add_remote_with_tracking(
+            &repo,
+            "upstream",
+            "git@example.com:org/repo.git",
+            &[("main", &upstream_tip)],
+        );
+        add_remote_with_tracking(
+            &repo,
+            "fork",
+            "ssh://git@example.com/me/repo.git",
+            &[("feature", &fork_tip), ("main", &base)],
+        );
+        fgit(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "fork",
+                "https://example.com/me/repo.git",
+            ],
+        );
+        fgit(&repo, &["branch", "-q", "-u", "fork/feature", "feature"]);
+        let src_changes = intent_git::local_changes(&repo).unwrap();
+        assert_eq!(src_changes.unpushed_count, 1, "only the branch commit");
+
+        let mut ws = workspace_for_repo(&repo);
+        ws.branch = "feature".to_string();
+        ws.base_ref = Some("main".to_string());
+        let agent = AgentId::new();
+        let branch = format!("sb/{}", agent.0);
+        let sb_src = src.path().join("sandbox");
+        make_sandbox_clone(&repo, &sb_src, &branch);
+        fgit(&sb_src, &["remote", "remove", "origin"]);
+        let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
+        let staging = src.path().join("staging");
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
+        let names: Vec<&str> = refs.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["fork", "upstream"]);
+        assert_eq!(
+            refs.workspace_upstream,
+            Some(BranchUpstream {
+                remote: "fork".to_string(),
+                merge_ref: "refs/heads/feature".to_string(),
+            })
+        );
+
+        let target = tempfile::TempDir::new().unwrap();
+        let out = materialize_workspace_git_blocking(
+            &bundle_path,
+            &refs,
+            &ws,
+            std::slice::from_ref(&sb),
+            target.path(),
+        )
+        .unwrap();
+        let dst = &out.checkout_dir;
+        assert_eq!(
+            remote_names(dst),
+            vec!["fork".to_string(), "upstream".to_string()]
+        );
+        assert_eq!(
+            fgit(dst, &["remote", "get-url", "upstream"]),
+            "git@example.com:org/repo.git"
+        );
+        assert_eq!(
+            fgit(dst, &["remote", "get-url", "fork"]),
+            "ssh://git@example.com/me/repo.git"
+        );
+        assert_eq!(
+            fgit(dst, &["remote", "get-url", "--push", "fork"]),
+            "https://example.com/me/repo.git"
+        );
+        assert_eq!(
+            ref_sha(dst, "refs/remotes/upstream/main").as_deref(),
+            Some(upstream_tip.as_str())
+        );
+        assert_eq!(
+            ref_sha(dst, "refs/remotes/fork/feature").as_deref(),
+            Some(fork_tip.as_str())
+        );
+        assert_eq!(
+            ref_sha(dst, "refs/remotes/fork/main").as_deref(),
+            Some(base.as_str())
+        );
+        assert_eq!(repo_head(dst), tip);
+        assert_eq!(
+            fgit(dst, &["rev-parse", "--abbrev-ref", "feature@{upstream}"]),
+            "fork/feature"
+        );
+        assert_eq!(intent_git::local_changes(dst).unwrap(), src_changes);
+        assert_eq!(out.sandboxes.len(), 1);
+        assert!(
+            remote_names(&out.sandboxes[0].path).is_empty(),
+            "sandboxes stay remote-less"
+        );
+        assert_no_config_mentions(&dst.join(".git"), staging.to_str().unwrap());
+    }
+
+    /// Unsafe or machine-local remotes never enter the manifest: a local
+    /// path, a `file://` URL and a remote-helper address are skipped (their
+    /// tracking refs with them), and an upstream naming a skipped remote is
+    /// not recorded. Credential-bearing URLs survive stripped — fetch and
+    /// push URLs alike — so the remote stays connected while the archive's
+    /// manifest and the target's git config never contain the secret.
+    #[test]
+    fn unsafe_remotes_are_skipped_without_leaking_values() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let local_origin = tmp.path().join("local-origin.git");
+        let (dst, refs) = materialize_feature_repo(tmp.path(), |repo, base, tip| {
+            add_remote_with_tracking(
+                repo,
+                "local",
+                local_origin.to_str().unwrap(),
+                &[("main", base), ("feature", tip)],
+            );
+            add_remote_with_tracking(repo, "filed", "file:///srv/git/repo.git", &[("main", base)]);
+            add_remote_with_tracking(repo, "helper", "ext::sh -c touch% /tmp/pwned", &[]);
+            add_remote_with_tracking(
+                repo,
+                "tokenish",
+                "https://ghp_abcdef:s3cret-token@example.com/org/repo.git",
+                &[("main", base)],
+            );
+            fgit(
+                repo,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "tokenish",
+                    "ssh://git:s3cret-push@example.com/org/repo.git",
+                ],
+            );
+            fgit(repo, &["branch", "-q", "-u", "local/feature", "feature"]);
+        });
+        let names: Vec<&str> = refs.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["tokenish"], "{refs:?}");
+        assert_eq!(refs.remotes[0].url, "https://example.com/org/repo.git");
+        assert_eq!(
+            refs.remotes[0].push_url.as_deref(),
+            Some("ssh://git@example.com/org/repo.git")
+        );
+        assert_eq!(refs.workspace_upstream, None);
+        let manifest = serde_json::to_string(&refs).unwrap();
+        assert!(!manifest.contains("s3cret"), "{manifest}");
+        assert!(!manifest.contains("ghp_"), "{manifest}");
+        assert!(!manifest.contains("pwned"), "{manifest}");
+        assert!(!manifest.contains(local_origin.to_str().unwrap()));
+
+        assert_eq!(remote_names(&dst), vec!["tokenish".to_string()]);
+        assert_eq!(
+            fgit(&dst, &["remote", "get-url", "tokenish"]),
+            "https://example.com/org/repo.git"
+        );
+        assert_eq!(
+            fgit(&dst, &["remote", "get-url", "--push", "tokenish"]),
+            "ssh://git@example.com/org/repo.git"
+        );
+        assert_eq!(ref_sha(&dst, "refs/remotes/local/feature"), None);
+        assert_eq!(ref_sha(&dst, "refs/remotes/local/main"), None);
+        assert_eq!(ref_sha(&dst, "refs/remotes/filed/main"), None);
+        assert_eq!(config_value(&dst, "branch.feature.remote"), None);
+        assert_no_config_mentions(&dst.join(".git"), "s3cret");
+        assert_no_config_mentions(&dst.join(".git"), "ghp_");
+        assert_no_config_mentions(&dst.join(".git"), "pwned");
+        // The published prefix under the surviving remote keeps the count
+        // truthful: only the branch commit is unpushed.
+        assert_eq!(intent_git::local_changes(&dst).unwrap().unpushed_count, 1);
+    }
+
+    type Tamper = Box<dyn Fn(&mut TransferRefsManifest)>;
+
+    /// Manifest metadata is re-validated on import: a tracking ref outside
+    /// the remote's namespace, a tracking ref at the WIP snapshot commit, an
+    /// unsafe URL, an unsafe remote name, and an upstream naming an unknown
+    /// remote each fail the import and roll the target back.
+    #[test]
+    fn invalid_remote_metadata_fails_import_and_rolls_back() {
+        let src = tempfile::TempDir::new().unwrap();
+        let repo = src.path().join("source-repo");
+        init_repo(&repo);
+        let base = repo_head(&repo);
+        add_remote_with_tracking(
+            &repo,
+            "origin",
+            "https://example.com/org/repo.git",
+            &[("main", &base)],
+        );
+        fs::write(repo.join("dirty.txt"), "dirty\n").unwrap();
+        let ws = workspace_for_repo(&repo);
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        let wip = refs.workspace_wip_commit_sha.clone().unwrap();
+
+        let tamper: Vec<(&str, Tamper)> = vec![
+            (
+                "ref outside namespace",
+                Box::new(|m| {
+                    m.remotes[0].tracking_refs[0].ref_name = "refs/heads/main".to_string();
+                }),
+            ),
+            (
+                "ref escaping namespace",
+                Box::new(|m| {
+                    m.remotes[0].tracking_refs[0].ref_name =
+                        "refs/remotes/origin/../../heads/main".to_string();
+                }),
+            ),
+            (
+                "tracking ref at WIP commit",
+                Box::new(move |m| m.remotes[0].tracking_refs[0].sha.clone_from(&wip)),
+            ),
+            (
+                "unsafe url",
+                Box::new(|m| m.remotes[0].url = "ext::sh -c id".to_string()),
+            ),
+            (
+                "local path url",
+                Box::new(|m| m.remotes[0].url = "/srv/git/repo.git".to_string()),
+            ),
+            (
+                "unsafe name",
+                Box::new(|m| m.remotes[0].name = "--upload-pack=id".to_string()),
+            ),
+            (
+                "unknown upstream remote",
+                Box::new(|m| {
+                    m.workspace_upstream = Some(BranchUpstream {
+                        remote: "ghost".to_string(),
+                        merge_ref: "refs/heads/main".to_string(),
+                    });
+                }),
+            ),
+            (
+                "upstream merge ref outside heads",
+                Box::new(|m| {
+                    m.workspace_upstream = Some(BranchUpstream {
+                        remote: "origin".to_string(),
+                        merge_ref: "refs/tags/v1".to_string(),
+                    });
+                }),
+            ),
+        ];
+        for (case, mutate) in tamper {
+            let mut bad = refs.clone();
+            mutate(&mut bad);
+            let target = tempfile::TempDir::new().unwrap();
+            let err =
+                materialize_workspace_git_blocking(&bundle_path, &bad, &ws, &[], target.path());
+            assert!(err.is_err(), "{case}: import must fail");
+            assert!(
+                !target.path().join(&ws.id.0).exists(),
+                "{case}: workspace dir rolled back"
+            );
+        }
+
+        // A credential-bearing URL in the manifest is stripped, not stored.
+        let mut cred = refs.clone();
+        cred.remotes[0].url = "ssh://u:s3cret@example.com/r.git".to_string();
+        let target = tempfile::TempDir::new().unwrap();
+        let out = materialize_workspace_git_blocking(&bundle_path, &cred, &ws, &[], target.path())
+            .unwrap();
+        assert_eq!(
+            fgit(&out.checkout_dir, &["remote", "get-url", "origin"]),
+            "ssh://u@example.com/r.git"
+        );
+        assert_no_config_mentions(&out.checkout_dir.join(".git"), "s3cret");
+
+        // The untampered manifest still imports.
+        let target = tempfile::TempDir::new().unwrap();
+        materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path()).unwrap();
+    }
+
+    /// An archive from a daemon that predates remote capture (no `remotes`
+    /// / `workspaceUpstream` keys) imports exactly as before: no remote is
+    /// guessed.
+    #[test]
+    fn legacy_manifest_without_remote_fields_imports_remote_less() {
+        let src = tempfile::TempDir::new().unwrap();
+        let repo = src.path().join("source-repo");
+        init_repo(&repo);
+        add_remote_with_tracking(
+            &repo,
+            "origin",
+            "https://example.com/org/repo.git",
+            &[("main", &repo_head(&repo))],
+        );
+        let ws = workspace_for_repo(&repo);
+        let TransferBundle {
+            bundle_path, refs, ..
+        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        let mut json: serde_json::Value = serde_json::to_value(&refs).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        assert!(obj.remove("remotes").is_some());
+        obj.remove("workspaceUpstream");
+        let legacy: TransferRefsManifest = serde_json::from_value(json).unwrap();
+        assert!(legacy.remotes.is_empty());
+        assert_eq!(legacy.workspace_upstream, None);
+
+        let target = tempfile::TempDir::new().unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &legacy, &ws, &[], target.path())
+                .unwrap();
+        assert!(remote_names(&out.checkout_dir).is_empty());
+        assert_eq!(ref_sha(&out.checkout_dir, "refs/remotes/origin/main"), None);
     }
 }
