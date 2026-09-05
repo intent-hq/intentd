@@ -115,7 +115,8 @@ pub fn valid_login_url(value: &str) -> bool {
 
 /// Run explicit personal OAuth, then verify the login in a fresh guarded
 /// process. Only `on_url` receives the authorization URL; callers must write
-/// it directly to the invoking terminal, never to tracing or telemetry.
+/// it only to the invoking terminal or initiating app connection, never to
+/// shared events, tracing, telemetry, or persisted state.
 ///
 /// # Errors
 ///

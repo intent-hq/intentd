@@ -205,6 +205,7 @@ impl Drop for ConnSub {
 #[derive(Default)]
 pub(crate) struct ConnSubs {
     subs: HashMap<String, ConnSub>,
+    setup: crate::provider_setup::Connection,
 }
 
 impl ConnSubs {
@@ -370,6 +371,18 @@ pub(crate) async fn process_frame(
                 };
             }
         }
+        if let Some(req) = crate::provider_setup::classify(value) {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                subs.setup.handle(req, api.as_ref(), reverse),
+            )
+            .await;
+            return match frame {
+                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                None => true,
+            };
+        }
         if let Some(req) = host::classify(value) {
             let host_environment = control
                 .map(|control| control.host_environment())
@@ -464,12 +477,27 @@ pub(crate) async fn process_frame(
             };
         }
         if let Some(req) = client::classify(value) {
+            let setup_requested = req.id_present
+                && req
+                    .capabilities
+                    .as_ref()
+                    .and_then(|v| v.get("antigravitySetup"))
+                    .and_then(Value::as_u64)
+                    == Some(1);
+            // A new hello revokes the previous connection-local operation.
+            subs.setup = crate::provider_setup::Connection::default();
             let frame = panic_guard::guard_frame(
                 &method,
                 rpc_id.clone(),
                 client::handle(req, api.as_ref(), client_id, is_local),
             )
             .await;
+            subs.setup.authorized = setup_requested
+                && !crate::context::is_tcp_connection()
+                && frame
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .is_some_and(|v| v.get("result").is_some());
             return match frame {
                 Some(frame) => out_tx.send_priority(frame).await.is_ok(),
                 None => true,

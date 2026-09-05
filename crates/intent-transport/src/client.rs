@@ -86,7 +86,7 @@ pub(crate) fn server_json(
         "osArch": format!("{os}/{arch}"),
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "liveState": true },
+        "capabilities": { "liveState": true, "antigravitySetup": 1 },
     });
     if let Some(build_commit) = build_commit {
         server

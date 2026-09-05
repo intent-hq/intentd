@@ -374,12 +374,20 @@
 //! be read (counts then 0). Unknown workspace → `-32602`. Method catalog
 //! grows by one router method — 300 router methods, 39 fast-path, 341
 //! total.
+//!
+//! Version 9.8 adds guided Antigravity setup (§5.44). The four local-app
+//! methods are `providers.setup.status`, `providers.setup.start`,
+//! `providers.setup.login`, and `providers.setup.cancel`. The reverse request
+//! `providers.setup.openLogin` asks the owning app to open the sign-in URL
+//! after explicit user consent. The catalog contains 300 router methods,
+//! 43 fast-path methods, and two aliases: 345 client-callable names.
+//! The five reverse methods are counted separately.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.7";
+pub const PROTOCOL_VERSION: &str = "9.8";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
