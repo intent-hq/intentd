@@ -12828,6 +12828,12 @@ async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
 /// Before the fix, the abort dropped the live-turn slot unflushed: the
 /// persisted transcript had no assistant row, so the reconcile emitted the
 /// streamed block id in `removedIds` and the FE erased the partial output.
+///
+/// Also covers intent#4409 over the real wire: every terminal entity carries
+/// the persisted row's `metadata` verbatim (byte-identical to the row
+/// `agent.getConversation` serves), while the live pre-terminal entity carried
+/// none — so a subscribe-only client renders the interrupted state without a
+/// refetch.
 #[tokio::test]
 async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
     let Some(script) = gate("WSS interrupt partial-flush E2E") else {
@@ -12944,6 +12950,12 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
                         .is_some_and(|t| t.contains("streaming-before-cancel"))
                 })
             {
+                // Live (pre-terminal) entities carry no row metadata — there
+                // is no persisted row yet to lift it from.
+                assert!(
+                    entity.get("metadata").is_none(),
+                    "live chunk entity carries no row metadata: {entity}"
+                );
                 return entity["block"]["id"].as_str().map(String::from);
             }
         }
@@ -13022,6 +13034,33 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
             .contains("streaming-before-cancel"),
         "the streamed-so-far text persisted: {assistant}"
     );
+
+    // intent#4409: the terminal `subscription.push` entities lift the persisted
+    // row's `metadata` verbatim — byte-identical to what `agent.getConversation`
+    // serves — so the reduced subscribe-only state matches a fresh snapshot.
+    assert_eq!(
+        assistant["metadata"]["interruptReason"],
+        json!("user_stop"),
+        "assistant row carries the machine-readable reason: {assistant}"
+    );
+    let terminal_entities: Vec<&Value> = ["added", "updated"]
+        .iter()
+        .flat_map(|key| terminal[*key].as_array().into_iter().flatten())
+        .collect();
+    assert!(
+        !terminal_entities.is_empty(),
+        "terminal frame carries entities: {terminal}"
+    );
+    for entity in terminal_entities {
+        assert_eq!(
+            entity["messageId"], assistant["id"],
+            "terminal entity points at the persisted row: {entity}"
+        );
+        assert_eq!(
+            entity["metadata"], assistant["metadata"],
+            "terminal entity lifts the persisted row metadata verbatim: {entity}"
+        );
+    }
 }
 
 /// §7.1: a tool completing with a proposal-MIME resource item in its output

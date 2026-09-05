@@ -235,6 +235,12 @@ fn apply_entity(messages: &mut Vec<Value>, entity: &Value) {
     if let Some(v) = entity.get("timestamp") {
         msg["timestamp"] = v.clone();
     }
+    // Re-read entities (`agent:message` rows and the terminal reconcile) lift
+    // the persisted row's `metadata`; a client applies it to the message
+    // envelope so interrupted / finish-reason state renders without a refetch.
+    if let Some(v) = entity.get("metadata") {
+        msg["metadata"] = v.clone();
+    }
     // The terminal reconcile (`streamingComplete: true`) flips an in-flight
     // message to its durable form: a client drops the transient `isStreaming`
     // render hint the mid-turn snapshot carried so it converges to the persisted
@@ -582,7 +588,14 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
     .await;
 
     // Persist the assistant message BEFORE stream:end (as run_prompt_turn does),
-    // so the terminal reconcile re-reads the now-durable transcript.
+    // so the terminal reconcile re-reads the now-durable transcript. The row
+    // carries interrupted-turn metadata (intent#4409): the terminal frame must
+    // lift it so the reduced state matches `agent.getConversation` exactly.
+    let row_metadata = json!({
+        "interrupted": true,
+        "stopReason": "interrupted",
+        "interruptReason": "user_stop",
+    });
     store
         .append_agent_message_with_id(
             &AgentId::from(agent_id.as_str()),
@@ -597,7 +610,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
                   "output": "12 passed", "is_error": false },
                 { "type": "text", "id": format!("{mid}:3"), "text": "Done." },
             ]),
-            None,
+            Some(&row_metadata),
             &now_iso(),
         )
         .await
@@ -643,7 +656,25 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
         }
         apply_delta(&mut reconstructed, &delta);
         if is_terminal_delta(&delta) {
+            for e in ["added", "updated"]
+                .iter()
+                .flat_map(|k| delta[*k].as_array().into_iter().flatten())
+            {
+                assert_eq!(
+                    e["metadata"], row_metadata,
+                    "every terminal entity carries the persisted row metadata: {delta}"
+                );
+            }
             break;
+        }
+        for e in ["added", "updated"]
+            .iter()
+            .flat_map(|k| delta[*k].as_array().into_iter().flatten())
+        {
+            assert!(
+                e.get("metadata").is_none(),
+                "mid-turn live entities carry no row metadata: {delta}"
+            );
         }
     }
     assert!(saw_text_growth, "a text block grew via an updated delta");
