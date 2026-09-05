@@ -156,11 +156,54 @@ pub(crate) const EMBEDDED_BUNDLED_V2_1: &[(&str, &str)] = &[
     ),
 ];
 
+/// The v2.4 embedded specialist bundle: v2.3 with versioned PR-context
+/// handoffs for the Coordinator, Implementor, and Verifier. Unchanged
+/// specialist bytes keep reusing their prior resources so sessions pinned to
+/// v2.3 and earlier retain their exact doctrine.
+pub(crate) const EMBEDDED_BUNDLED_V2_4: &[(&str, &str)] = &[
+    (
+        "chief-of-staff",
+        include_str!("../resources/specialists/v1.1/chief-of-staff.md"),
+    ),
+    (
+        "developer",
+        include_str!("../resources/specialists/v1.1/developer.md"),
+    ),
+    (
+        "implementor",
+        include_str!("../resources/specialists/v2.4/implementor.md"),
+    ),
+    (
+        "pr-reviewer",
+        include_str!("../resources/specialists/v1.1/pr-reviewer.md"),
+    ),
+    (
+        "ralph",
+        include_str!("../resources/specialists/v1.1/ralph.md"),
+    ),
+    (
+        "spec-writer",
+        include_str!("../resources/specialists/v2.4/spec-writer.md"),
+    ),
+    (
+        "ui-designer",
+        include_str!("../resources/specialists/v1.1/ui-designer.md"),
+    ),
+    (
+        "verifier",
+        include_str!("../resources/specialists/v2.4/verifier.md"),
+    ),
+    (
+        "vulnerability-scanner",
+        include_str!("../resources/specialists/v2.1/vulnerability-scanner.md"),
+    ),
+];
+
 /// The embedded bundled floor the specialist 3-tier resolution uses by
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V2_1;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V2_4;
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
 /// base tier: no shipped specialist survives the replacement.
@@ -2722,6 +2765,34 @@ mod tests {
                 && (body.contains("MISSING") || body.contains("❌ MISSING")),
             "verifier.md must specify APPROVED/DEVIATION/MISSING completion policy"
         );
+
+        assert!(body.contains("PR Context — <branch>") && body.contains("pr-context"));
+        assert!(body.contains("re-derive only fields missing from the note"));
+        assert!(body.contains("do not rebuild the base commit"));
+        assert!(body.contains("base SHA supplied by the PR context note"));
+        assert!(body.contains("gh run list --commit <sha>"));
+        assert!(body.contains("Verifier findings"));
+    }
+
+    #[test]
+    fn collaboration_prompts_share_pr_context_note() {
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        let implementor = svc.get("implementor", None).unwrap();
+        let implementor_body = implementor["specialist"]["behaviorPrompt"]
+            .as_str()
+            .unwrap();
+        assert!(implementor_body.contains("PR Context — <branch>"));
+        assert!(implementor_body.contains("known pre-existing failures"));
+        assert!(implementor_body.contains("add_to_note"));
+        assert!(implementor_body.contains("rather than creating a duplicate"));
+
+        let coordinator = svc.get("spec-writer", None).unwrap();
+        let coordinator_body = coordinator["specialist"]["behaviorPrompt"]
+            .as_str()
+            .unwrap();
+        assert!(coordinator_body.contains("PR Context — <branch>"));
+        assert!(coordinator_body.contains("before any implementor delegation"));
     }
 
     #[test]
