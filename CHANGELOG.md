@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.26] - 2026-09-05
+
+### 🐛 Bug Fixes
+
+- *(providers)* Bump codex-acp npx pin to 1.9.0 ([#1741](https://github.com/intent-hq/intentd/pull/1741))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Cargo.lock dependencies
+
+
 ## [0.9.25] - 2026-09-05
 
 ### 🚀 Features
