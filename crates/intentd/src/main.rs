@@ -1511,6 +1511,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let interrupted_setups = store
+        .reconcile_interrupted_setup_results()
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if interrupted_setups > 0 {
+        tracing::info!(
+            count = interrupted_setups,
+            "marked setup results interrupted by daemon restart as unknown"
+        );
+    }
     // One-time auto_vacuum activation (monorepo#720 finding 1): a legacy
     // database created before the `auto_vacuum = INCREMENTAL` pragma stays in
     // NONE mode until a full VACUUM rebuilds the file, leaving the retention
