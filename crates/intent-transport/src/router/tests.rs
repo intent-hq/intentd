@@ -43,6 +43,7 @@ fn sample_ws() -> Workspace {
         scope: None,
         skip_worktree: false,
         setup_script: None,
+        setup_result: None,
         is_remote: false,
         default_model: None,
         pr_number: None,
@@ -2557,15 +2558,15 @@ fn adapter_busy_maps_to_structured_error_data() {
 }
 
 #[tokio::test]
-async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
-    // A stale `expectedVersion` on `note.update` surfaces -32005 carrying the
+async fn expected_version_conflict_maps_to_minus_32009_with_data_current() {
+    // A stale `expectedVersion` on `note.update` surfaces -32009 carrying the
     // current entity under `error.data.current` (PROTOCOL §4, §5.6).
     let v = call(
         r#"{"jsonrpc":"2.0","id":9,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"conflict","content":"x","expectedVersion":1}}"#,
     )
     .await
     .unwrap();
-    assert_eq!(err_code(&v), -32005);
+    assert_eq!(err_code(&v), -32009);
     assert_eq!(v["error"]["message"], serde_json::json!("Conflict"));
     assert_eq!(v["error"]["data"]["code"], serde_json::json!("conflict"));
     let current = &v["error"]["data"]["current"];
@@ -2575,15 +2576,15 @@ async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
 }
 
 #[tokio::test]
-async fn update_metadata_expected_version_conflict_maps_to_minus_32005() {
-    // A stale `expectedVersion` on `note.updateMetadata` surfaces -32005 carrying
+async fn update_metadata_expected_version_conflict_maps_to_minus_32009() {
+    // A stale `expectedVersion` on `note.updateMetadata` surfaces -32009 carrying
     // the current entity under `error.data.current` (PROTOCOL §4, §5.6).
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"note.updateMetadata","params":{"workspaceId":"ws-1","noteId":"conflict","title":"x","expectedVersion":1}}"#,
     )
     .await
     .unwrap();
-    assert_eq!(err_code(&v), -32005);
+    assert_eq!(err_code(&v), -32009);
     assert_eq!(v["error"]["message"], serde_json::json!("Conflict"));
     assert_eq!(v["error"]["data"]["code"], serde_json::json!("conflict"));
     assert_eq!(
@@ -2594,15 +2595,15 @@ async fn update_metadata_expected_version_conflict_maps_to_minus_32005() {
 }
 
 #[tokio::test]
-async fn delete_expected_version_conflict_maps_to_minus_32005() {
-    // A stale `expectedVersion` on `note.delete` surfaces -32005 carrying the
+async fn delete_expected_version_conflict_maps_to_minus_32009() {
+    // A stale `expectedVersion` on `note.delete` surfaces -32009 carrying the
     // current entity snapshot under `error.data.current` (PROTOCOL §4, §5.6).
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"note.delete","params":{"workspaceId":"ws-1","noteId":"conflict","expectedVersion":1}}"#,
     )
     .await
     .unwrap();
-    assert_eq!(err_code(&v), -32005);
+    assert_eq!(err_code(&v), -32009);
     assert_eq!(v["error"]["message"], serde_json::json!("Conflict"));
     assert_eq!(v["error"]["data"]["code"], serde_json::json!("conflict"));
     assert_eq!(

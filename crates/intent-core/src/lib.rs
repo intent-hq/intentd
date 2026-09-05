@@ -50,8 +50,8 @@ pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
 pub use ids::{
-    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
-    CHIEF_WORKSPACE_ID,
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceDraftId, WorkspaceGitRootId,
+    WorkspaceId, CHIEF_WORKSPACE_ID,
 };
 pub use model::asset_extension_from_mime;
 pub use model::extract_spec_task_ids;
@@ -82,7 +82,8 @@ pub use model::{
     CommentListResult, CommentLocation, CommentResolveThreadResult, CommentRespondResult,
     CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary, CommentType,
     CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
-    CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
+    CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, DraftDelivery, DraftDeliveryState,
+    DraftIsolation, DraftPhase, DraftSource, Event, EventActor, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
     GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
     GitStatus, Hook, HookState, KnownRepo, LineAttributionAuthor, LineAttributionComputeResult,
@@ -93,13 +94,14 @@ pub use model::{
     NoteVisibility, PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo,
     PullRequestStatus, ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode,
     SaveAssetResult, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus,
-    SessionStats, SetupScript, SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
-    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
-    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, Workspace, WorkspaceActivity,
-    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus,
+    SessionStats, SetupResult, SetupResultState, SetupScript, SetupScriptGeneratedBy,
+    TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
+    TokenUsageTotals, TopChangedFile, UsageCost, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
+    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateInitialAgent,
+    WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceDraft,
     WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus,
     WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
 };

@@ -7,7 +7,130 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
+use crate::ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceDraftId, WorkspaceGitRootId,
+    WorkspaceId,
+};
+
+/// Lifecycle of a durable workspace draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DraftPhase {
+    #[default]
+    Editing,
+    Promoting,
+    Promoted,
+    Failed,
+}
+
+/// Isolation requested for an existing local checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DraftIsolation {
+    Worktree,
+    InPlace,
+}
+
+/// Resolved source selected while editing a workspace draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DraftSource {
+    Local {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        isolation: DraftIsolation,
+    },
+    Github {
+        url: String,
+        owner: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
+    NewFolder {
+        #[serde(rename = "parentPath")]
+        parent_path: String,
+        name: String,
+    },
+}
+
+/// Delivery state for a promoted draft's initial message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DraftDeliveryState {
+    #[default]
+    None,
+    Pending,
+    Sent,
+    Unknown,
+}
+
+/// Durable initial-message delivery reconciliation state.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftDelivery {
+    pub state: DraftDeliveryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Daemon-owned workspace draft restored across client and daemon restarts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDraft {
+    pub id: WorkspaceDraftId,
+    pub owner_client_id: ClientId,
+    pub revision: u64,
+    pub phase: DraftPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub intent_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<DraftSource>,
+    pub context_links: Vec<ContextLink>,
+    pub attachments: Vec<serde_json::Value>,
+    pub config: serde_json::Map<String, serde_json::Value>,
+    pub operation_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_agent_id: Option<AgentId>,
+    pub delivery: DraftDelivery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Observed state of workspace setup after promotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SetupResultState {
+    #[default]
+    None,
+    Running,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+/// Durable setup outcome returned with a workspace after reconnect.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupResult {
+    pub state: SetupResultState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the `PascalCase` variant names (`Active`/`Inactive`/`Archived`/
@@ -219,6 +342,10 @@ pub struct Workspace {
     /// `null`) until a script has been saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_script: Option<SetupScript>,
+    /// Last observed setup execution outcome. Persisted so reconnects can
+    /// reconcile an interrupted or completed setup without fabricating state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_result: Option<SetupResult>,
     pub is_remote: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
@@ -416,6 +543,7 @@ pub fn chief_workspace() -> Workspace {
         scope: None,
         skip_worktree: false,
         setup_script: None,
+        setup_result: None,
         is_remote: false,
         default_model: None,
         pr_number: None,
@@ -922,6 +1050,11 @@ pub struct WorkspaceCreate {
     pub context_links: Option<Vec<ContextLink>>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
+    /// Internal draft correlation used to atomically persist the
+    /// draft-to-workspace mapping with the workspace row. Never accepted from
+    /// the wire; ordinary `workspace.create` callers leave it unset.
+    #[serde(skip)]
+    pub workspace_draft_id: Option<WorkspaceDraftId>,
 }
 
 /// The `initialAgent` sub-object of `workspace.create` (PROTOCOL §5.1). Full
@@ -5095,6 +5228,7 @@ mod tests {
             scope: None,
             skip_worktree: false,
             setup_script: None,
+            setup_result: None,
             is_remote: false,
             default_model: None,
             pr_number: None,

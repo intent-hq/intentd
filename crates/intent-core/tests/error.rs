@@ -30,7 +30,7 @@ fn conflict_code_and_display_and_payload() {
     let e = Error::Conflict {
         current: current.clone(),
     };
-    assert_eq!(e.code(), -32005);
+    assert_eq!(e.code(), -32009);
     assert_eq!(e.to_string(), "conflict: version mismatch");
     if let Error::Conflict { current: c } = e {
         assert_eq!(c, current);

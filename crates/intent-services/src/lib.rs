@@ -39,18 +39,21 @@ use intent_core::{
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     ProjectType, PullRequestInfo, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
-    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRoot,
-    WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
-    WorkspaceUpdate,
+    SessionStats, SetupResult, SetupResultState, SetupScript, TaskAgentLink, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary,
+    WorkspaceAttention, WorkspaceCreate, WorkspaceCreateResult, WorkspaceDraftId,
+    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceId, WorkspaceStatus,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
+
+/// Integration-test callback for interrupting workspace draft promotion.
+pub type WorkspaceDraftPromotionFailpoint = Arc<dyn Fn(&WorkspaceDraftId) -> bool + Send + Sync>;
 
 mod acp_adapter;
 mod agent_locks;
@@ -137,6 +140,7 @@ mod transfer_submodules;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
+mod workspace_draft;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
@@ -337,6 +341,12 @@ pub struct Services {
     /// `None` until wired by the composition root; when unset, mutations persist
     /// as before but emit no events (keeps read-only/test wiring unchanged).
     event_bus: Option<EventBus>,
+    /// Per-draft single-flight gates for idempotent promotion. Shared by clones.
+    workspace_draft_promotion_locks:
+        Arc<Mutex<HashMap<WorkspaceDraftId, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Integration-test seam immediately after the workspace/draft transaction
+    /// commits, before post-insert setup or initial-agent creation.
+    workspace_draft_promotion_failpoint: Option<WorkspaceDraftPromotionFailpoint>,
     /// Per-agent in-memory send queues backing `agent.queueMessage` /
     /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
@@ -1082,6 +1092,8 @@ impl Services {
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
+            workspace_draft_promotion_locks: Arc::new(Mutex::new(HashMap::new())),
+            workspace_draft_promotion_failpoint: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
@@ -1191,6 +1203,17 @@ impl Services {
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
+    }
+
+    /// Install an integration-test promotion failpoint. Returning `true` after
+    /// the workspace/draft transaction simulates process loss before initial-agent creation.
+    #[must_use]
+    pub fn with_workspace_draft_promotion_failpoint(
+        mut self,
+        failpoint: WorkspaceDraftPromotionFailpoint,
+    ) -> Self {
+        self.workspace_draft_promotion_failpoint = Some(failpoint);
+        self
     }
 
     /// Pin the PR-monitor poll cadence, bypassing the live
@@ -14068,6 +14091,63 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn workspace_draft_create(
+        &self,
+        input: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_create_op(input).await })
+    }
+
+    fn workspace_draft_get(
+        &self,
+        id: WorkspaceDraftId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_get_op(id).await })
+    }
+
+    fn workspace_draft_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_list_op().await })
+    }
+
+    fn workspace_draft_update(
+        &self,
+        id: WorkspaceDraftId,
+        expected_revision: u64,
+        patch: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_draft_update_op(id, expected_revision, patch)
+                .await
+        })
+    }
+
+    fn workspace_draft_promote(
+        &self,
+        id: WorkspaceDraftId,
+        expected_revision: u64,
+        initial_agent: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_draft_promote_op(id, expected_revision, initial_agent)
+                .await
+        })
+    }
+
+    fn workspace_draft_mark_delivery(
+        &self,
+        id: WorkspaceDraftId,
+        delivery: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_mark_delivery_op(id, delivery).await })
+    }
+
+    fn workspace_draft_delete(
+        &self,
+        id: WorkspaceDraftId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_draft_delete_op(id).await })
+    }
+
     fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let _revision_guard = self.settings_revision_gate.read().await;
@@ -17065,6 +17145,7 @@ impl WorkspaceApi for Services {
                         scope: input.scope,
                         skip_worktree: input.skip_isolation.unwrap_or(false),
                         setup_script: None,
+                        setup_result: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
                         // PR linkage from a pr-kind contextLink: number/url
@@ -17752,9 +17833,29 @@ impl WorkspaceApi for Services {
                     // in the same INSERT so later global changes don't
                     // retroactively flip existing workspaces — atomic, so the
                     // row can never exist without its seed.
-                    store
-                        .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
-                        .await?;
+                    if let Some(draft_id) = input.workspace_draft_id.as_ref() {
+                        store
+                            .insert_workspace_for_draft_with_auto_commit(
+                                &ws,
+                                Some(global_auto_commit),
+                                draft_id,
+                            )
+                            .await?;
+                        if services
+                            .workspace_draft_promotion_failpoint
+                            .as_ref()
+                            .is_some_and(|failpoint| failpoint(draft_id))
+                        {
+                            return Err(Error::Internal(
+                                "injected workspace draft promotion crash after workspace insert"
+                                    .into(),
+                            ));
+                        }
+                    } else {
+                        store
+                            .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
+                            .await?;
+                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -18016,6 +18117,7 @@ impl WorkspaceApi for Services {
                     // publish nothing (same as `workspace:created`).
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
+                    let store_for_setup = self.store.clone();
                     let setup_worktree = if ws.skip_worktree {
                         None
                     } else {
@@ -18073,6 +18175,18 @@ impl WorkspaceApi for Services {
                                 worktree = %worktree_path,
                                 "executing setup script in background"
                             );
+                            let started_at = now_iso();
+                            let running = SetupResult {
+                                state: SetupResultState::Running,
+                                started_at: Some(started_at.clone()),
+                                ..SetupResult::default()
+                            };
+                            if let Err(e) = store_for_setup
+                                .update_workspace_setup_result(&workspace_id, &running)
+                                .await
+                            {
+                                tracing::warn!(error = %e, "failed to persist running setup result");
+                            }
                             // A script was resolved and a spawn will be attempted.
                             publish_event(
                                 bus_for_setup.as_ref(),
@@ -18081,7 +18195,7 @@ impl WorkspaceApi for Services {
                             .await;
                             // Every terminal path below funnels into exactly one
                             // `workspace:setup:completed` publish after this block.
-                            let (ran_script, exit_code): (bool, Option<u32>) = 'setup: {
+                            let (ran_script, exit_code, error): (bool, Option<u32>, Option<String>) = 'setup: {
                             // Write script to a private file under worktree .intent/ directory
                             // (mode 0600 on Unix, safe from other users, isolated from /tmp races).
                             let script_id = uuid::Uuid::new_v4();
@@ -18094,7 +18208,7 @@ impl WorkspaceApi for Services {
                                         workspace = %workspace_id.as_str(),
                                         "setup script execution skipped: .intent is not a real directory (symlink or file)"
                                     );
-                                    break 'setup (false, None);
+                                    break 'setup (false, None, Some(".intent is not a directory".into()));
                                 }
                             } else {
                                 // .intent doesn't exist, create it with restrictive permissions
@@ -18104,7 +18218,7 @@ impl WorkspaceApi for Services {
                                         error = %e,
                                         "failed to create .intent directory for setup script"
                                     );
-                                    break 'setup (false, None);
+                                    break 'setup (false, None, Some(e.to_string()));
                                 }
                                 #[cfg(unix)]
                                 {
@@ -18149,7 +18263,7 @@ impl WorkspaceApi for Services {
                                     error = %e,
                                     "failed to write setup script to private file"
                                 );
-                                break 'setup (false, None);
+                                break 'setup (false, None, Some(e.to_string()));
                             }
                             // cmd.exe fallback only: the timing wrapper is a
                             // sibling .cmd file rather than an inline `-c`
@@ -18167,7 +18281,7 @@ impl WorkspaceApi for Services {
                                         "failed to write setup script cmd wrapper"
                                     );
                                     let _ = tokio::fs::remove_file(&script_path).await;
-                                    break 'setup (false, None);
+                                    break 'setup (false, None, Some(e.to_string()));
                                 }
                                 Some(p)
                             } else {
@@ -18216,7 +18330,10 @@ impl WorkspaceApi for Services {
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
-                                    (true, exit.ok().map(|e| e.exit_code))
+                                    match exit {
+                                        Ok(exit) => (true, Some(exit.exit_code), None),
+                                        Err(e) => (true, None, Some(e.to_string())),
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -18229,10 +18346,31 @@ impl WorkspaceApi for Services {
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
-                                    (false, None)
+                                    (false, None, Some(e.to_string()))
                                 }
                             }
                             };
+                            let failed = error.is_some() || exit_code.is_some_and(|code| code != 0);
+                            let setup_result = SetupResult {
+                                state: if failed {
+                                    SetupResultState::Failed
+                                } else {
+                                    SetupResultState::Succeeded
+                                },
+                                exit_code: exit_code.map(|code| i32::try_from(code).unwrap_or(i32::MAX)),
+                                started_at: Some(started_at),
+                                finished_at: Some(now_iso()),
+                                error: error.or_else(|| {
+                                    exit_code.filter(|code| *code != 0)
+                                        .map(|code| format!("setup script exited with code {code}"))
+                                }),
+                            };
+                            if let Err(e) = store_for_setup
+                                .update_workspace_setup_result(&workspace_id, &setup_result)
+                                .await
+                            {
+                                tracing::warn!(error = %e, "failed to persist terminal setup result");
+                            }
                             publish_event(
                                 bus_for_setup.as_ref(),
                                 workspace_setup_completed_event(
@@ -19418,6 +19556,7 @@ impl WorkspaceApi for Services {
                 scope: source.scope.clone(),
                 skip_worktree: source.skip_worktree,
                 setup_script: None,
+                setup_result: None,
                 is_remote: source.is_remote,
                 default_model: source.default_model.clone(),
                 pr_number: None,

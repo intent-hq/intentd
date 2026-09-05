@@ -175,6 +175,7 @@ fn seed_workspace(title: &str, worktree_path: Option<String>, skip_worktree: boo
         scope: None,
         skip_worktree,
         setup_script: None,
+        setup_result: None,
         is_remote: false,
         default_model: None,
         pr_number: None,

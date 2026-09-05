@@ -7,7 +7,10 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
+use crate::ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceDraftId, WorkspaceGitRootId,
+    WorkspaceId,
+};
 use crate::model::{
     AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
@@ -277,6 +280,98 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::create_workspace not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Create a durable pre-workspace draft from the wire-authored fields.
+    fn workspace_draft_create(
+        &self,
+        input: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = input;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_draft_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Fetch one durable workspace draft.
+    fn workspace_draft_get(
+        &self,
+        id: WorkspaceDraftId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_draft_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// List non-promoted workspace drafts on this daemon.
+    fn workspace_draft_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_draft_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Optimistically update editable draft fields.
+    fn workspace_draft_update(
+        &self,
+        id: WorkspaceDraftId,
+        expected_revision: u64,
+        patch: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, expected_revision, patch);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_draft_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Idempotently promote a draft through the existing workspace-create path.
+    fn workspace_draft_promote(
+        &self,
+        id: WorkspaceDraftId,
+        expected_revision: u64,
+        initial_agent: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, expected_revision, initial_agent);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_draft_promote not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Persist initial-message delivery reconciliation state for a draft.
+    fn workspace_draft_mark_delivery(
+        &self,
+        id: WorkspaceDraftId,
+        delivery: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, delivery);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_draft_mark_delivery not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Delete a draft, returning whether it existed.
+    fn workspace_draft_delete(
+        &self,
+        id: WorkspaceDraftId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_draft_delete not implemented".to_string(),
             ))
         })
     }

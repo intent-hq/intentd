@@ -23,7 +23,7 @@ pub enum Error {
     /// A conditional write lost an optimistic-concurrency check: the entity's
     /// current `rev` did not match the supplied `expectedVersion`. Carries the
     /// current entity so the client can reconcile (PROTOCOL §4, §5.6 — surfaced
-    /// as `-32005` with `error.data.current`).
+    /// as `-32009` with `error.data.current`).
     #[error("conflict: version mismatch")]
     Conflict { current: serde_json::Value },
 
@@ -201,7 +201,7 @@ impl Error {
             | Error::RateLimited(_)
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
-            Error::Conflict { .. } => -32005,
+            Error::Conflict { .. } => -32009,
         }
     }
 }

@@ -1,9 +1,9 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    now_iso, CheckoutMode, ContextLink, Error, PullRequestInfo, Result, SetupScript, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    CHIEF_WORKSPACE_ID,
+    now_iso, CheckoutMode, ContextLink, Error, PullRequestInfo, Result, SetupResult, SetupScript,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceDraftId, WorkspaceId,
+    WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -17,7 +17,8 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     status_message, status_image_asset_id, attention, path, repository_path, repository_owner, \
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
-    tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode";
+    tags, created_at, updated_at, last_activity, token_usage, setup_script, setup_result, \
+    checkout_mode";
 
 /// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
 /// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
@@ -35,6 +36,54 @@ pub(crate) fn clear_workspace_unread_if_all_seen_sql() -> String {
 }
 
 impl Store {
+    /// Mark setup attempts that were still running when the previous daemon
+    /// exited as unknown. Call once during daemon startup, before serving
+    /// clients; calling this from [`Store::open`] would incorrectly affect a
+    /// live daemon when another store handle opens the same database.
+    ///
+    /// Returns the number of reconciled workspace rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the startup update fails.
+    pub async fn reconcile_interrupted_setup_results(&self) -> Result<u64> {
+        sqlx::query(
+            "UPDATE workspace SET setup_result = json_set(setup_result, '$.state', 'unknown') \
+             WHERE json_extract(setup_result, '$.state') = 'running'",
+        )
+        .execute(self.write_pool())
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|e| Error::Internal(format!("reconcile interrupted setup results failed: {e}")))
+    }
+
+    /// Persist only the setup outcome column, avoiding a stale full-row write
+    /// from the background setup task.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when encoding or persistence fails, and
+    /// `Error::NotFound` when the workspace no longer exists.
+    pub async fn update_workspace_setup_result(
+        &self,
+        id: &WorkspaceId,
+        result: &SetupResult,
+    ) -> Result<()> {
+        let encoded = serde_json::to_string(result)
+            .map_err(|e| Error::Internal(format!("encode setup_result failed: {e}")))?;
+        let res = sqlx::query("UPDATE workspace SET setup_result = ?, updated_at = ? WHERE id = ?")
+            .bind(encoded)
+            .bind(now_iso())
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("update workspace setup_result failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     ///
     /// # Errors
@@ -61,7 +110,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -96,12 +145,114 @@ impl Store {
             .bind(&ws.last_activity)
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
+            .bind(setup_result_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
             .bind(auto_commit.map(i64::from))
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
         Ok(())
+    }
+
+    /// Insert a workspace and durably correlate it to a promoting draft in one
+    /// transaction. A restart can therefore recover the original workspace
+    /// even if the process exits before promotion finalization/idempotency.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` when the draft is no longer promoting, or
+    /// `Error::Internal` when serialization or the transaction fails.
+    pub async fn insert_workspace_for_draft_with_auto_commit(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+        draft_id: &WorkspaceDraftId,
+    ) -> Result<()> {
+        let status = enum_to_db(&ws.status)?;
+        let attention = enum_to_db(&ws.attention)?;
+        let pr_status = pr_status_to_db(ws)?;
+        let active_pr = active_pr_to_db(ws)?;
+        let pull_requests = pull_requests_to_db(ws)?;
+        let context_links = context_links_to_db(ws)?;
+        let tags = tags_to_db(&ws.tags)?;
+        let token_usage = token_usage_to_db(ws)?;
+        let setup_script = setup_script_to_db(ws)?;
+        let setup_result = setup_result_to_db(ws)?;
+        let checkout_mode = checkout_mode_to_db(ws)?;
+        let mut conn =
+            self.write_pool().acquire().await.map_err(|e| {
+                Error::Internal(format!("acquire workspace insert connection: {e}"))
+            })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("begin workspace draft insert: {e}")))?;
+        let sql = format!(
+            "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        );
+        let inserted = sqlx::query(&sql)
+            .bind(&ws.id.0)
+            .bind(&ws.title)
+            .bind(&ws.branch)
+            .bind(&ws.base_ref)
+            .bind(&ws.base_commit_sha)
+            .bind(status)
+            .bind(&ws.status_message)
+            .bind(&ws.status_image_asset_id)
+            .bind(attention)
+            .bind(&ws.path)
+            .bind(&ws.repository_path)
+            .bind(&ws.repository_owner)
+            .bind(&ws.repository_name)
+            .bind(&ws.worktree_path)
+            .bind(&ws.scope)
+            .bind(i64::from(ws.skip_worktree))
+            .bind(i64::from(ws.is_remote))
+            .bind(&ws.default_model)
+            .bind(ws.pr_number.map(u64::cast_signed))
+            .bind(&ws.pr_url)
+            .bind(pr_status)
+            .bind(active_pr)
+            .bind(pull_requests)
+            .bind(context_links)
+            .bind(i64::from(ws.archived))
+            .bind(&ws.archived_at)
+            .bind(tags)
+            .bind(&ws.created_at)
+            .bind(&ws.updated_at)
+            .bind(&ws.last_activity)
+            .bind(token_usage)
+            .bind(setup_script)
+            .bind(setup_result)
+            .bind(checkout_mode)
+            .bind(auto_commit.map(i64::from))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")));
+        let body = match inserted {
+            Ok(_) => sqlx::query(
+                "UPDATE workspace_draft SET promoted_workspace_id=?, updated_at=? \
+                 WHERE id=? AND phase='promoting'",
+            )
+            .bind(&ws.id.0)
+            .bind(now_iso())
+            .bind(&draft_id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("map workspace draft promotion failed: {e}")))
+            .and_then(|result| {
+                if result.rows_affected() == 1 {
+                    Ok(())
+                } else {
+                    Err(Error::NotFound(format!(
+                        "promoting workspace draft {draft_id}"
+                    )))
+                }
+            }),
+            Err(error) => Err(error),
+        };
+        crate::commit_with_rollback_guard(conn, body, "commit workspace draft insert").await
     }
 
     /// Fetch a single workspace by id, or `NotFound`.
@@ -148,7 +299,7 @@ impl Store {
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, checkout_mode=? WHERE id=?",
+             token_usage=?, setup_script=?, setup_result=?, checkout_mode=? WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -183,6 +334,7 @@ impl Store {
         .bind(&ws.last_activity)
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
+        .bind(setup_result_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
         .bind(&ws.id.0)
         .execute(self.write_pool())
@@ -812,6 +964,26 @@ fn setup_script_from_db(s: Option<String>) -> Result<Option<SetupScript>> {
     .transpose()
 }
 
+/// Encode the optional durable setup outcome to a JSON column.
+fn setup_result_to_db(ws: &Workspace) -> Result<Option<String>> {
+    ws.setup_result
+        .as_ref()
+        .map(|result| {
+            serde_json::to_string(result)
+                .map_err(|e| Error::Internal(format!("encode setup_result failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the optional durable setup outcome JSON column.
+fn setup_result_from_db(s: Option<String>) -> Result<Option<SetupResult>> {
+    s.map(|json| {
+        serde_json::from_str::<SetupResult>(&json)
+            .map_err(|e| Error::Internal(format!("decode setup_result failed: {e}")))
+    })
+    .transpose()
+}
+
 /// Encode the optional `checkout_mode` enum to a TEXT column (§5.1).
 fn checkout_mode_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.checkout_mode.as_ref().map(enum_to_db).transpose()
@@ -828,6 +1000,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
     let context_links = context_links_from_db(col::<Option<String>>(row, "context_links")?)?;
     let token_usage = token_usage_from_db(col::<Option<String>>(row, "token_usage")?)?;
     let setup_script = setup_script_from_db(col::<Option<String>>(row, "setup_script")?)?;
+    let setup_result = setup_result_from_db(col::<Option<String>>(row, "setup_result")?)?;
     let checkout_mode = col::<Option<String>>(row, "checkout_mode")?
         .map(|s| enum_from_db::<CheckoutMode>(&s))
         .transpose()?;
@@ -855,6 +1028,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         scope: col(row, "scope")?,
         skip_worktree: col::<i64>(row, "skip_worktree")? != 0,
         setup_script,
+        setup_result,
         is_remote: col::<i64>(row, "is_remote")? != 0,
         default_model: col(row, "default_model")?,
         pr_number: pr_number.map(i64::cast_unsigned),
