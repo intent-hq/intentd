@@ -317,8 +317,9 @@ pub(crate) struct DeferredAttention {
 
 /// Store-backed aggregates for one complete list-shaped workspace snapshot.
 /// Each component is loaded with one bulk statement and joined to workspace
-/// rows in memory; `None` retains the existing best-effort omission behavior
-/// when that component's read fails.
+/// rows in memory. Batch projection failures fall back to the existing
+/// per-workspace reads; a missing map entry then retains the existing
+/// best-effort omission behavior for only that workspace.
 struct WorkspaceAggregateSnapshot {
     max_note_updated_at: HashMap<WorkspaceId, String>,
     task_stats: Option<HashMap<WorkspaceId, WorkspaceTaskStats>>,
@@ -2460,7 +2461,57 @@ impl Services {
                 .list_legacy_question_tail_candidates_by_workspace(workspace_ids),
         );
 
-        let sessions = sessions.ok();
+        let task_stats = match task_stats {
+            Ok(stats) => Some(stats),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch task stats projection failed; falling back to per-workspace reads"
+                );
+                let mut stats = HashMap::new();
+                for workspace_id in workspace_ids {
+                    match self.cheap_task_stats(workspace_id).await {
+                        Ok(workspace_stats) => {
+                            stats.insert(workspace_id.clone(), workspace_stats);
+                        }
+                        Err(error) => tracing::debug!(
+                            %error,
+                            %workspace_id,
+                            "per-workspace task stats projection failed"
+                        ),
+                    }
+                }
+                Some(stats)
+            }
+        };
+        let sessions = match sessions {
+            Ok(mut sessions) => {
+                for workspace_id in workspace_ids {
+                    sessions.entry(workspace_id.clone()).or_default();
+                }
+                Some(sessions)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch session projection failed; falling back to per-workspace reads"
+                );
+                let mut sessions = HashMap::new();
+                for workspace_id in workspace_ids {
+                    match self.store.list_agent_session_summaries(workspace_id).await {
+                        Ok(workspace_sessions) => {
+                            sessions.insert(workspace_id.clone(), workspace_sessions);
+                        }
+                        Err(error) => tracing::debug!(
+                            %error,
+                            %workspace_id,
+                            "per-workspace session projection failed"
+                        ),
+                    }
+                }
+                Some(sessions)
+            }
+        };
         let mut active_pr_monitors = HashSet::new();
         let mut monitor_rows: HashMap<WorkspaceId, Vec<intent_core::PrMonitor>> = HashMap::new();
         if let Ok(monitors) = monitors {
@@ -2522,7 +2573,7 @@ impl Services {
 
         WorkspaceAggregateSnapshot {
             max_note_updated_at: max_note_updated_at.unwrap_or_default(),
-            task_stats: task_stats.ok(),
+            task_stats,
             sessions,
             unread: unread.ok(),
             active_hooks: active_hooks.unwrap_or_default(),
@@ -2558,12 +2609,10 @@ impl Services {
             .task_stats
             .as_ref()
             .and_then(|stats| stats.get(&ws.id).cloned());
-        let sessions = snapshot.sessions.as_ref().map(|by_workspace| {
-            by_workspace
-                .get(&ws.id)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-        });
+        let sessions = snapshot
+            .sessions
+            .as_ref()
+            .and_then(|by_workspace| by_workspace.get(&ws.id).map(Vec::as_slice));
         if let Some(sessions) = sessions {
             for session in sessions {
                 if include_agent_summary {

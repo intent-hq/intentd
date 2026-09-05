@@ -947,6 +947,171 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
     assert_eq!((s3.total, s3.completed, s3.in_progress), (0, 0, 0));
 }
 
+/// A malformed task/session projection in one workspace must not erase the
+/// healthy rows' aggregates when list-shaped reads fall back from the bulk
+/// query. The failed workspace alone retains the single-workspace omission
+/// behavior, for both `workspace.list` and the lite subscription snapshot.
+#[tokio::test]
+async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    let healthy = WorkspaceId::from("ws-healthy-projections");
+    let bad_task = WorkspaceId::from("ws-malformed-task-projection");
+    let bad_session = WorkspaceId::from("ws-malformed-session-projection");
+    for workspace_id in [&healthy, &bad_task, &bad_session] {
+        store
+            .insert_workspace(&workspace(workspace_id))
+            .await
+            .expect("workspace");
+        store
+            .insert_note(&note(workspace_id, "spec", "no task links"))
+            .await
+            .expect("spec");
+    }
+
+    let mut task = note(&healthy, "task-complete", "body");
+    task.parent_id = Some(NoteId::from("spec"));
+    task.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::Complete,
+        ..Default::default()
+    });
+    store.insert_note(&task).await.expect("healthy task");
+    let mut malformed_task = note(&bad_task, "task-malformed", "body");
+    malformed_task.parent_id = Some(NoteId::from("spec"));
+    malformed_task.metadata.task = Some(TaskMetadata::default());
+    store
+        .insert_note(&malformed_task)
+        .await
+        .expect("malformed task seed");
+
+    let session = |workspace_id: &WorkspaceId, id: &str| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from(id),
+        workspace_id: workspace_id.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Agent".to_string(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Idle,
+        is_active: false,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+        retired_at: None,
+    };
+    store
+        .insert_agent_session(&session(&healthy, "agent-healthy-projection"))
+        .await
+        .expect("healthy session");
+    let malformed_agent = "agent-malformed-projection";
+    store
+        .insert_agent_session(&session(&bad_session, malformed_agent))
+        .await
+        .expect("malformed session seed");
+
+    sqlx::query("UPDATE note SET task_json = ? WHERE workspace_id = ? AND id = 'task-malformed'")
+        .bind(vec![0xff_u8])
+        .bind(bad_task.as_str())
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt task projection");
+    sqlx::query("UPDATE agent_session SET harness_features = '{bad' WHERE id = ?")
+        .bind(malformed_agent)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt session projection");
+
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let mut gets = std::collections::HashMap::new();
+    for workspace_id in [healthy.clone(), bad_task.clone(), bad_session.clone()] {
+        let row = svc
+            .get_workspace(workspace_id.clone())
+            .await
+            .expect("workspace.get");
+        gets.insert(workspace_id, row);
+    }
+    let list = svc.list_workspaces(false).await.expect("workspace.list");
+    let lite = svc
+        .list_workspaces_lite(false)
+        .await
+        .expect("workspace.subscribe snapshot");
+
+    for workspace_id in [&healthy, &bad_task, &bad_session] {
+        let get = gets.get(workspace_id).expect("get row");
+        let listed = list.iter().find(|row| &row.id == workspace_id).unwrap();
+        let snapshot = lite.iter().find(|row| &row.id == workspace_id).unwrap();
+        assert_eq!(
+            listed.task_stats, get.task_stats,
+            "list taskStats: {workspace_id}"
+        );
+        assert_eq!(
+            listed.display_status, get.display_status,
+            "list displayStatus: {workspace_id}"
+        );
+        assert_eq!(
+            snapshot.task_stats, get.task_stats,
+            "lite taskStats: {workspace_id}"
+        );
+        assert_eq!(
+            snapshot.display_status, get.display_status,
+            "lite displayStatus: {workspace_id}"
+        );
+    }
+    assert_eq!(gets[&healthy].task_stats.as_ref().unwrap().completed, 1);
+    assert_eq!(
+        list.iter()
+            .find(|row| row.id == healthy)
+            .unwrap()
+            .agent_summary
+            .as_ref()
+            .unwrap()
+            .count,
+        1
+    );
+    assert!(gets[&bad_task].task_stats.is_none());
+    assert!(gets[&bad_session].agent_summary.is_none());
+    assert!(list
+        .iter()
+        .find(|row| row.id == bad_session)
+        .unwrap()
+        .agent_summary
+        .is_none());
+}
+
 /// The lite list path (workspace.subscribe seq-0 snapshot) is self-sufficient
 /// for client status rendering: rows carry `taskStats` (cheap counting query),
 /// `displayStatus` (same derivation as the enriched path — a subsequent
