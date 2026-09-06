@@ -407,6 +407,13 @@ pub struct Services {
     /// the `after_all` group fan-in (AS-4) consume it later. Shared across
     /// clones like the other in-memory registries.
     agent_subscriptions: Arc<Mutex<agent_subscriptions::SubscriptionRegistry>>,
+    /// Sender side of the delegation-group persistence lane: every write to
+    /// the `delegation_group` table is enqueued here (under the registry
+    /// lock) and executed by ONE worker task in enqueue order, so a
+    /// best-effort upsert spawned at group create/enroll can never land after
+    /// a later sweep/settlement delete and resurrect the row
+    /// (intent-hq/intent#4460). Lazily spawned on first use.
+    group_persist_lane: Arc<OnceLock<agent_subscriptions::GroupPersistSender>>,
     /// Serializes strict completion-only ask registration so a watch is
     /// durably persisted before it becomes visible to completion delivery.
     completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
@@ -1096,6 +1103,7 @@ impl Services {
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
+            group_persist_lane: Arc::new(OnceLock::new()),
             completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
@@ -7368,8 +7376,7 @@ impl Services {
             return;
         }
         if let Err(e) = self
-            .store
-            .settle_delegation_group_after_delivery(group_id, &failed_children)
+            .settle_delegation_group_persisted(group_id, &failed_children)
             .await
         {
             tracing::warn!(

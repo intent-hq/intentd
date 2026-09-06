@@ -10427,8 +10427,11 @@ impl Services {
         // no cancelled-in-memory group can rehydrate on restart. (A concurrent
         // `try_fire_group` racing this delete is benign: both deletes are
         // idempotent, and whichever removes the in-memory group first wins.)
+        // Routed through the group persistence lane so a create/enroll upsert
+        // still queued ahead cannot land after it (intent-hq/intent#4460).
         if let Some(group) = &target_group {
-            self.store.delete_delegation_group(&group.group_id).await?;
+            self.delete_delegation_group_persisted(&group.group_id)
+                .await?;
         }
 
         // Parent home workspaces to publish `agent:subscriptions-changed` in
