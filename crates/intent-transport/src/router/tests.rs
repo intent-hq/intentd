@@ -846,6 +846,62 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn map_get(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "workspaceId": workspace_id })) })
+    }
+
+    fn map_set_manifest(
+        &self,
+        _workspace_id: WorkspaceId,
+        json: Value,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "json": json })) })
+    }
+
+    fn map_classify(
+        &self,
+        _workspace_id: WorkspaceId,
+        paths: Vec<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "paths": paths })) })
+    }
+
+    fn map_activity(
+        &self,
+        _workspace_id: WorkspaceId,
+        since_ts: Option<String>,
+        minutes_ago: Option<i64>,
+        agent_id: Option<String>,
+        kinds: Vec<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "sinceTs": since_ts,
+                "minutesAgo": minutes_ago,
+                "agentId": agent_id,
+                "kinds": kinds,
+                "limit": limit,
+            }))
+        })
+    }
+
+    fn map_route(
+        &self,
+        _workspace_id: WorkspaceId,
+        agent_id: Option<String>,
+        task_note_id: Option<NoteId>,
+        since_ts: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "agentId": agent_id,
+                "taskNoteId": task_note_id,
+                "sinceTs": since_ts,
+            }))
+        })
+    }
+
     fn git_root_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             if workspace_id.as_str() == "missing" {
@@ -3728,6 +3784,67 @@ async fn event_query_methods_route_and_pass_params() {
     .await
     .unwrap();
     assert_eq!(v["result"][0]["type"], serde_json::json!("file:changed"));
+}
+
+#[tokio::test]
+async fn map_methods_route_and_pass_params() {
+    let get =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"map.get","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(get["result"]["workspaceId"], "ws-1");
+
+    let set = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"map.setManifest","params":{"workspaceId":"ws-1","json":{"version":1,"regions":[]}}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(set["result"]["json"]["version"], 1);
+
+    let classify = call(
+        r#"{"jsonrpc":"2.0","id":3,"method":"map.classify","params":{"workspaceId":"ws-1","paths":["src/lib.rs"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(classify["result"]["paths"][0], "src/lib.rs");
+
+    let activity = call(
+        r#"{"jsonrpc":"2.0","id":4,"method":"map.activity","params":{"workspaceId":"ws-1","sinceTs":"t0","minutesAgo":5,"agentId":"a1","kinds":["edit"],"limit":25}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(activity["result"]["sinceTs"], "t0");
+    assert_eq!(activity["result"]["minutesAgo"], 5);
+    assert_eq!(activity["result"]["agentId"], "a1");
+    assert_eq!(activity["result"]["kinds"], serde_json::json!(["edit"]));
+    assert_eq!(activity["result"]["limit"], 25);
+
+    for (subject, key, value) in [
+        (r#""agentId":"a1""#, "agentId", "a1"),
+        (r#""taskNoteId":"n1""#, "taskNoteId", "n1"),
+    ] {
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"map.route","params":{{"workspaceId":"ws-1",{subject},"sinceTs":"t0"}}}}"#
+        );
+        let route = call(&request).await.unwrap();
+        assert_eq!(route["result"][key], value);
+        assert_eq!(route["result"]["sinceTs"], "t0");
+    }
+}
+
+#[tokio::test]
+async fn map_methods_reject_invalid_params() {
+    for request in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"map.get","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"map.setManifest","params":{"workspaceId":"ws-1"}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"map.classify","params":{"workspaceId":"ws-1","paths":"src"}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"map.activity","params":{"workspaceId":"ws-1","kinds":[1]}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"map.route","params":{"workspaceId":"ws-1"}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"map.route","params":{"workspaceId":"ws-1","agentId":"a1","taskNoteId":"n1"}}"#,
+    ] {
+        let response = call(request).await.unwrap();
+        assert_eq!(err_code(&response), -32602, "request={request}");
+    }
 }
 
 /// `event.recentFiles` / `event.directoryChanges` were removed end-to-end: the

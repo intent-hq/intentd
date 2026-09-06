@@ -3058,6 +3058,79 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `map.get`: curated manifest or structural fallback plus coverage.
+    fn map_get(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::map_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `map.setManifest`: validate and upsert the workspace's semantic-map note.
+    fn map_set_manifest(
+        &self,
+        workspace_id: WorkspaceId,
+        json: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, json);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::map_set_manifest not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `map.classify`: classify workspace-relative paths against the active map.
+    fn map_classify(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, paths);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::map_classify not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `map.activity`: bounded projection of persisted events onto map regions.
+    #[allow(clippy::too_many_arguments)]
+    fn map_activity(
+        &self,
+        workspace_id: WorkspaceId,
+        since_ts: Option<String>,
+        minutes_ago: Option<i64>,
+        agent_id: Option<String>,
+        kinds: Vec<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, since_ts, minutes_ago, agent_id, kinds, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::map_activity not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `map.route`: derive an agent or task assignee's route through the map.
+    fn map_route(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<String>,
+        task_note_id: Option<NoteId>,
+        since_ts: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, task_note_id, since_ts);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::map_route not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `event.subscribe` (deprecated alias): service-style subscription result;
     /// does NOT wire WS streaming (use `events.subscribe`) (PROTOCOL §5.10/§6).
     /// `exclude_self`/`batch_window` mirror the TS shim's forwarded options.

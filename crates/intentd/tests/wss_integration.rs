@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    now_iso, AgentReverseDispatch, ContentType, Note, NoteId, NoteMetadata, NoteVisibility,
-    Result as CoreResult, ReverseTarget, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, ActorType, AgentReverseDispatch, ContentType, EventActor, Note, NoteId, NoteMetadata,
+    NoteVisibility, Result as CoreResult, ReverseTarget, TaskMetadata, TaskStatus, Workspace,
+    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
-use intent_store::Store;
+use intent_store::{NewEvent, Store};
 use intent_transport::{
     ensure_tls_certificate, serve_uds, AsyncTokenStore, FileWatchStatus, PrimaryReverseRegistry,
     SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions, MAX_INBOUND_MESSAGE_BYTES,
@@ -7447,6 +7447,224 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         disk_usage: None,
         pending_delete_at: None,
     }
+}
+
+/// Semantic-map RPCs over the real WSS transport (§5.45): structural fallback,
+/// curated-manifest persistence and validation atomicity, classification,
+/// bounded activity projection + transient push, and route derivation.
+#[tokio::test]
+async fn wss_semantic_map_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let ws = WorkspaceId::new();
+    let root = test_tempdir("intentd-wss-map-");
+    std::fs::create_dir_all(root.path().join("src")).expect("mkdir src");
+    std::fs::create_dir_all(root.path().join("tests")).expect("mkdir tests");
+    std::fs::write(root.path().join("src/lib.rs"), "pub fn mapped() {}\n").expect("write src");
+    std::fs::write(root.path().join("tests/map.rs"), "#[test] fn mapped() {}\n")
+        .expect("write test");
+    let mut workspace = fixture_workspace(&ws);
+    workspace.worktree_path = Some(root.path().to_string_lossy().into_owned());
+    srv.store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"map.get","params":{{"workspaceId":"{}"}}}}"#,
+        ws.0
+    );
+    let structural = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(structural["jsonrpc"], "2.0", "{structural}");
+    assert_eq!(structural["id"], 1, "{structural}");
+    assert_eq!(structural["result"]["source"], "structural", "{structural}");
+    assert_eq!(
+        structural["result"]["coverage"],
+        serde_json::json!({"matched": 2, "total": 2})
+    );
+
+    let manifest = serde_json::json!({
+        "version": 1,
+        "regions": [
+            {"id":"code","label":"Code","responsibility":"Runtime code","anchor":[0.25,0.5],"paths":["src/**"]},
+            {"id":"tests","label":"Tests","responsibility":"Test code","anchor":[0.75,0.5],"paths":["tests/**"]}
+        ],
+        "crossings": [{"from":"code","to":"tests","label":"verified by"}]
+    });
+    let set = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "map.setManifest",
+        "params": {"workspaceId": ws.0, "json": manifest}
+    });
+    let set = wss_call(srv.port, srv.cfg.clone(), &set.to_string()).await;
+    assert_eq!(set["result"]["ok"], true, "{set}");
+    assert!(set["result"]["noteId"].is_string(), "{set}");
+
+    let invalid = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "map.setManifest",
+        "params": {"workspaceId": ws.0, "json": {"version": 2, "regions": []}}
+    });
+    let invalid = wss_call(srv.port, srv.cfg.clone(), &invalid.to_string()).await;
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    let curated = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(curated["result"]["source"], "curated", "{curated}");
+    assert_eq!(
+        curated["result"]["manifest"], manifest,
+        "invalid write changed manifest"
+    );
+
+    let classify = serde_json::json!({
+        "jsonrpc":"2.0", "id":4, "method":"map.classify",
+        "params":{"workspaceId":ws.0,"paths":["src/lib.rs","README.md"]}
+    });
+    let classify = wss_call(srv.port, srv.cfg.clone(), &classify.to_string()).await;
+    assert_eq!(
+        classify["result"],
+        serde_json::json!([
+            {"regionId":"code","confidence":"curated"},
+            {"regionId":"unsorted","confidence":"unsorted"}
+        ])
+    );
+
+    let actor = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-map".to_string()),
+        name: Some("Mapper".to_string()),
+        ..Default::default()
+    };
+    let seeded = [
+        ("2026-09-06T00:00:01Z", "src/lib.rs"),
+        ("2026-09-06T00:00:02Z", "tests/map.rs"),
+    ]
+    .map(|(timestamp, path)| NewEvent {
+        workspace_id: ws.clone(),
+        timestamp: timestamp.to_string(),
+        event_type: "file:changed".to_string(),
+        actor: actor.clone(),
+        session_id: Some("agent-map".to_string()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({"action":"modify","relativePath":path}),
+    });
+    srv.store
+        .insert_events(&seeded)
+        .await
+        .expect("seed map activity");
+
+    let route = serde_json::json!({
+        "jsonrpc":"2.0", "id":5, "method":"map.route",
+        "params":{"workspaceId":ws.0,"agentId":"agent-map"}
+    });
+    let route = wss_call(srv.port, srv.cfg.clone(), &route.to_string()).await;
+    assert_eq!(
+        route["result"]["visits"],
+        serde_json::json!(["code", "tests"]),
+        "{route}"
+    );
+    assert_eq!(
+        route["result"]["transitions"][0]["label"], "verified by",
+        "{route}"
+    );
+
+    let mut subscriber = connect_ws(srv.port, srv.cfg.clone()).await;
+    let subscribe = serde_json::json!({
+        "jsonrpc":"2.0", "id":6, "method":"events.subscribe",
+        "params":{"workspaceId":ws.0,"eventTypes":["map:*"]}
+    });
+    subscriber
+        .send(Message::Text(subscribe.to_string().into()))
+        .await
+        .expect("subscribe");
+    let ack = loop {
+        match subscriber.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let value: Value = serde_json::from_str(&text).expect("subscribe json");
+                if value["id"] == 6 {
+                    break value;
+                }
+            }
+            Some(Ok(Message::Ping(payload))) => {
+                subscriber
+                    .send(Message::Pong(payload))
+                    .await
+                    .expect("subscribe pong");
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected subscribe response, got {other:?}"),
+        }
+    };
+    assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
+
+    let activity = serde_json::json!({
+        "jsonrpc":"2.0", "id":7, "method":"map.activity",
+        "params":{"workspaceId":ws.0,"agentId":"agent-map","kinds":["edit"],"limit":0}
+    });
+    let activity = wss_call(srv.port, srv.cfg.clone(), &activity.to_string()).await;
+    assert_eq!(
+        activity["result"].as_array().map(Vec::len),
+        Some(1),
+        "lower clamp: {activity}"
+    );
+    let pushed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match subscriber.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).expect("map event json");
+                    if value["method"] == "events.event" {
+                        break value;
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => subscriber
+                    .send(Message::Pong(payload))
+                    .await
+                    .expect("map event pong"),
+                Some(Ok(_)) => {}
+                other => panic!("expected map activity event, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("map activity push timeout");
+    assert_eq!(pushed["method"], "events.event", "{pushed}");
+    assert_eq!(
+        pushed["params"]["event"]["type"], "map:activity",
+        "{pushed}"
+    );
+    assert_eq!(
+        pushed["params"]["event"]["data"], activity["result"][0],
+        "{pushed}"
+    );
+
+    let extras = (0..499)
+        .map(|index| NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: format!("2026-09-06T01:{:02}:{:02}Z", index / 60, index % 60),
+            event_type: "file:changed".to_string(),
+            actor: actor.clone(),
+            session_id: Some("agent-map".to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({"action":"modify","relativePath":"src/lib.rs"}),
+        })
+        .collect::<Vec<_>>();
+    for batch in extras.chunks(100) {
+        srv.store
+            .insert_events(batch)
+            .await
+            .expect("seed clamp batch");
+    }
+    let upper = serde_json::json!({
+        "jsonrpc":"2.0", "id":8, "method":"map.activity",
+        "params":{"workspaceId":ws.0,"agentId":"agent-map","limit":999}
+    });
+    let upper = wss_call(srv.port, srv.cfg.clone(), &upper.to_string()).await;
+    assert_eq!(
+        upper["result"].as_array().map(Vec::len),
+        Some(500),
+        "upper clamp: {upper}"
+    );
+
+    srv.ws.stop().await;
 }
 
 /// Minimal `Note` fixture used by `task.list` seeding below.

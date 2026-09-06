@@ -426,12 +426,17 @@
 //! workspace is not connected"). The catalog contains 303 router methods,
 //! 49 fast-path methods, and two aliases: 354 client-callable names. The
 //! five reverse methods are counted separately.
+//!
+//! Version 9.12 adds the semantic codebase map (§5.45): five `map.*` router
+//! methods plus the transient `map:activity` event. The catalog contains 308
+//! router methods, 49 fast-path methods, and two aliases: 359 client-callable
+//! names. The five reverse methods remain counted separately.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.11";
+pub const PROTOCOL_VERSION: &str = "9.12";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

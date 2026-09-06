@@ -127,12 +127,13 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`browser.listTabs` / `browser.upsertTab` / `browser.removeTab` /
 /// `browser.syncTabs`), protocol 9.10. REV-2 routing: +2 fast-path methods
 /// (`browser.navigateTab` / `browser.closeTab`), protocol 9.11.
-const EXPECTED_TOTAL_METHODS: usize = 354;
+/// Semantic map family: +5 router methods, protocol 9.12.
+const EXPECTED_TOTAL_METHODS: usize = 359;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 303;
+const EXPECTED_ROUTER_METHODS: usize = 308;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 49;

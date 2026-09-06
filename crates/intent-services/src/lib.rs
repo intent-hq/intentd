@@ -13,16 +13,16 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine as _;
 use intent_core::events::{
-    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED, CHANGES_GIT_STATUS,
-    CHANGES_METRICS_CHANGED, COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL,
-    GIT_PUSH, GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED,
-    LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
-    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
-    TASK_AGENT_UNLINKED, TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
-    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED,
-    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED,
-    WORKSPACE_SETUP_COMPLETED, WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED,
-    WORKSPACE_UPDATED,
+    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED, AGENT_STREAM_ACTIVITY, AGENT_TOOL_CALL,
+    CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED, COMMENT_ADDED, COMMENT_RESOLVED, FILE_CHANGED,
+    FILE_CREATED, FILE_DELETED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH, GIT_ROOT_REGISTERED,
+    GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED, LINE_ATTRIBUTION_UPDATED, MAP_ACTIVITY, NOTE_CREATED,
+    NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE, SEARCH_RESULT,
+    SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED, TASK_AGENT_UNLINKED, TASK_CREATED,
+    TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED, WORKSPACE_SETUP_COMPLETED,
+    WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::{
     chief_workspace, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso, ActorType,
@@ -120,6 +120,7 @@ mod rtk;
 mod sandbox_ops;
 mod script_ops;
 mod search_ops;
+pub mod semantic_map;
 mod sentry_ops;
 mod settings;
 mod settings_registry;
@@ -12681,6 +12682,87 @@ pub(crate) fn publish_event_transient(bus: Option<&EventBus>, event: &NewEvent) 
     bus.map(|b| b.publish_transient(event))
 }
 
+const MAP_EVENT_TYPES: [&str; 6] = [
+    FILE_CHANGED,
+    FILE_CREATED,
+    FILE_DELETED,
+    "file:renamed",
+    AGENT_TOOL_CALL,
+    AGENT_STREAM_ACTIVITY,
+];
+
+async fn semantic_map_paths(store: &Store, workspace_id: &WorkspaceId) -> Result<Vec<String>> {
+    let workspace = store.get_workspace(workspace_id).await?;
+    let Some(root) = git_ops::worktree_path(&workspace) else {
+        return Ok(Vec::new());
+    };
+    tokio::task::spawn_blocking(move || {
+        ignore::WalkBuilder::new(&root)
+            .hidden(false)
+            .build()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(&root)
+                    .ok()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| Error::Internal(format!("semantic map scan failed: {error}")))
+}
+
+async fn active_semantic_map(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+) -> Result<(semantic_map::Manifest, Vec<String>)> {
+    let paths = semantic_map_paths(store, workspace_id).await?;
+    let loader = semantic_map::ManifestLoader::default();
+    let manifest = match loader.load(store, workspace_id).await {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => semantic_map::structural_manifest(&paths),
+        Err(semantic_map::ManifestLoadError::Store(error)) => return Err(error),
+        Err(semantic_map::ManifestLoadError::Parse(error)) => {
+            return Err(Error::InvalidParams(format!(
+                "invalid semantic map: {error}"
+            )))
+        }
+    };
+    Ok((manifest, paths))
+}
+
+fn project_map_events(
+    manifest: &semantic_map::Manifest,
+    events: Vec<Event>,
+    kinds: &[semantic_map::MapActivityKind],
+) -> Vec<semantic_map::MapActivity> {
+    events
+        .iter()
+        .filter_map(|event| semantic_map::project(manifest, event))
+        .filter(|activity| kinds.is_empty() || kinds.contains(&activity.kind))
+        .collect()
+}
+
+fn map_activity_event(
+    workspace_id: &WorkspaceId,
+    activity: &semantic_map::MapActivity,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: activity.ts.clone(),
+        event_type: MAP_ACTIVITY.to_string(),
+        actor: system_actor(),
+        session_id: activity.agent_id.clone(),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::to_value(activity).unwrap_or_else(|_| serde_json::json!({})),
+    }
+}
+
 /// Best-effort workspace lookup by worktree path (§6.5). Path-scoped git
 /// methods (e.g. `git.pull` during workspace-create auto-pull) reach this to
 /// resolve an owning workspace for change-event emission; missing rows are a
@@ -23457,6 +23539,221 @@ impl WorkspaceApi for Services {
                 status: if resolved { "resolved" } else { "open" }.to_string(),
                 comment_count: count,
             })
+        })
+    }
+
+    fn map_get(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let (manifest, paths) = active_semantic_map(&store, &workspace_id).await?;
+            let classifier = semantic_map::Classifier::new(&manifest);
+            let matched = paths
+                .iter()
+                .filter(|path| {
+                    classifier.classify(path).confidence
+                        != semantic_map::AssignmentConfidence::Unsorted
+                })
+                .count();
+            Ok(serde_json::json!({
+                "manifest": manifest,
+                "source": manifest.source,
+                "coverage": { "matched": matched, "total": paths.len() },
+            }))
+        })
+    }
+
+    fn map_set_manifest(
+        &self,
+        workspace_id: WorkspaceId,
+        json: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let services = self.clone();
+        Box::pin(async move {
+            let raw = match json {
+                serde_json::Value::String(raw) => raw,
+                value => serde_json::to_string_pretty(&value).map_err(|error| {
+                    Error::InvalidParams(format!("invalid semantic map JSON: {error}"))
+                })?,
+            };
+            let manifest = semantic_map::parse_manifest(&raw)
+                .map_err(|error| Error::InvalidParams(format!("invalid semantic map: {error}")))?;
+            let content = serde_json::to_string_pretty(&manifest).map_err(|error| {
+                Error::Internal(format!("serialize semantic map failed: {error}"))
+            })?;
+            services.store.get_workspace(&workspace_id).await?;
+            let existing = services
+                .store
+                .list_notes(&workspace_id)
+                .await?
+                .into_iter()
+                .filter(|note| {
+                    note.tags
+                        .iter()
+                        .any(|tag| tag == semantic_map::MANIFEST_TAG)
+                })
+                .max_by(|left, right| {
+                    (&left.updated_at, &left.created_at, left.id.as_str()).cmp(&(
+                        &right.updated_at,
+                        &right.created_at,
+                        right.id.as_str(),
+                    ))
+                });
+            let note_id = if let Some(note) = existing {
+                let id = note.id;
+                services
+                    .update_note(
+                        workspace_id,
+                        id.clone(),
+                        NoteUpdateInput {
+                            content: Some(content),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                id
+            } else {
+                services
+                    .create_note(
+                        workspace_id,
+                        NoteCreate {
+                            title: "Semantic map".to_string(),
+                            content: Some(content),
+                            tags: Some(vec![semantic_map::MANIFEST_TAG.to_string()]),
+                            parent_id: None,
+                        },
+                        None,
+                        None,
+                    )
+                    .await?
+                    .note
+                    .id
+            };
+            Ok(serde_json::json!({ "ok": true, "noteId": note_id }))
+        })
+    }
+
+    fn map_classify(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let (manifest, _) = active_semantic_map(&store, &workspace_id).await?;
+            let classifier = semantic_map::Classifier::new(&manifest);
+            serde_json::to_value(
+                paths
+                    .iter()
+                    .map(|path| classifier.classify(path))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| Error::Internal(format!("serialize assignments failed: {error}")))
+        })
+    }
+
+    fn map_activity(
+        &self,
+        workspace_id: WorkspaceId,
+        since_ts: Option<String>,
+        minutes_ago: Option<i64>,
+        agent_id: Option<String>,
+        kinds: Vec<String>,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let (manifest, _) = active_semantic_map(&store, &workspace_id).await?;
+            let kinds = kinds
+                .into_iter()
+                .map(|kind| {
+                    serde_json::from_value(serde_json::Value::String(kind.clone())).map_err(|_| {
+                        Error::InvalidParams(format!("unknown map activity kind: {kind}"))
+                    })
+                })
+                .collect::<Result<Vec<semantic_map::MapActivityKind>>>()?;
+            let limit = limit.unwrap_or(50).clamp(1, 500);
+            let events = store
+                .query_events(&EventQuery {
+                    workspace_id: Some(workspace_id.clone()),
+                    event_types: MAP_EVENT_TYPES
+                        .iter()
+                        .map(|kind| (*kind).to_string())
+                        .collect(),
+                    actor_id: agent_id,
+                    since: since_ts.or_else(|| minutes_ago.map(iso_minutes_ago)),
+                    limit: Some(limit),
+                    ..Default::default()
+                })
+                .await?;
+            let activities = project_map_events(&manifest, events, &kinds);
+            for activity in &activities {
+                publish_event_transient(bus.as_ref(), &map_activity_event(&workspace_id, activity));
+            }
+            serde_json::to_value(activities)
+                .map_err(|error| Error::Internal(format!("serialize map activity failed: {error}")))
+        })
+    }
+
+    fn map_route(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<String>,
+        task_note_id: Option<NoteId>,
+        since_ts: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let (manifest, _) = active_semantic_map(&store, &workspace_id).await?;
+            let agent_ids = if let Some(agent_id) = agent_id {
+                vec![agent_id]
+            } else if let Some(note_id) = task_note_id {
+                fetch_note(&store, &workspace_id, &note_id)
+                    .await?
+                    .metadata
+                    .task
+                    .map(|task| task.assigned_agent_ids.into_iter().map(|id| id.0).collect())
+                    .unwrap_or_default()
+            } else {
+                return Err(Error::InvalidParams(
+                    "exactly one of agentId or taskNoteId is required".to_string(),
+                ));
+            };
+            if agent_ids.is_empty() {
+                return Ok(serde_json::json!({ "visits": [], "transitions": [] }));
+            }
+            let events = store
+                .query_events(&EventQuery {
+                    workspace_id: Some(workspace_id),
+                    event_types: MAP_EVENT_TYPES
+                        .iter()
+                        .map(|kind| (*kind).to_string())
+                        .collect(),
+                    actor_id: (agent_ids.len() == 1).then(|| agent_ids[0].clone()),
+                    since: since_ts.clone(),
+                    limit: Some(500),
+                    ..Default::default()
+                })
+                .await?;
+            let activities = project_map_events(&manifest, events, &[])
+                .into_iter()
+                .filter(|activity| {
+                    activity
+                        .agent_id
+                        .as_ref()
+                        .is_some_and(|id| agent_ids.contains(id))
+                })
+                .collect::<Vec<_>>();
+            let route = semantic_map::derive_route(
+                &manifest,
+                &activities,
+                &semantic_map::RouteFilter {
+                    since: since_ts,
+                    ..Default::default()
+                },
+            );
+            serde_json::to_value(route)
+                .map_err(|error| Error::Internal(format!("serialize map route failed: {error}")))
         })
     }
 

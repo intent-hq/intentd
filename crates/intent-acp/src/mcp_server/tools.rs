@@ -150,6 +150,7 @@ Namespaces (index — full signatures in API below):
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
+  ws.map.* — semantic codebase map reads, authoring, classification, and routes
   ws.script.* — saved build/test/service scripts
   ws.host.* — host.exec = one-shot host command exec
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
@@ -266,6 +267,11 @@ API:
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
 
+  ws.map.get() → { manifest, source, coverage }  // Load the curated semantic map or a structural fallback.
+  ws.map.setManifest(json) → { ok, noteId }  // Validate and upsert the workspace's `semantic-map` note.
+  ws.map.classify(paths) → [{ regionId, confidence }]  // Classify workspace-relative paths against the active map.
+  ws.map.route({ agentId? | taskNoteId?, sinceTs? }) → { visits, transitions }  // Derive one agent or task assignee's route through map regions.
+
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
   ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
   ws.script.remove(scriptId) → { ok, scriptId }  // Stops and removes a saved script definition.
@@ -375,6 +381,7 @@ Namespaces (index — full signatures in API below):
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
+  ws.map.* — semantic codebase map reads, authoring, classification, and routes
   ws.script.* — saved build/test/service scripts
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
   ws.browser.* — Chrome DevTools browser automation
@@ -513,6 +520,11 @@ API:
   ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["file:*", "task:*"]`. Use explicit categories or event types such as `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
+
+  ws.map.get() → { manifest, source, coverage }  // Load the curated semantic map or a structural fallback.
+  ws.map.setManifest(json) → { ok, noteId }  // Validate and upsert the workspace's `semantic-map` note.
+  ws.map.classify(paths) → [{ regionId, confidence }]  // Classify workspace-relative paths against the active map.
+  ws.map.route({ agentId? | taskNoteId?, sinceTs? }) → { visits, transitions }  // Derive one agent or task assignee's route through map regions.
 
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
   ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.

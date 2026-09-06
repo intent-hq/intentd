@@ -28,6 +28,7 @@ pub(crate) mod git;
 pub(crate) mod help;
 pub(crate) mod hook;
 pub(crate) mod host;
+pub(crate) mod map;
 pub(crate) mod mcp;
 pub(crate) mod note;
 pub(crate) mod pr;
@@ -93,7 +94,7 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
         fragments.push(browser::PRELUDE);
     }
     let agent = agent::prelude_for(features);
-    fragments.extend([agent.as_ref(), event::PRELUDE, git::PRELUDE]);
+    fragments.extend([agent.as_ref(), event::PRELUDE, map::PRELUDE, git::PRELUDE]);
     if features.host_exec {
         fragments.push(host::PRELUDE);
     }
@@ -196,6 +197,9 @@ pub(crate) async fn try_dispatch(
         return event::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("map.") {
+        return map::dispatch(api, workspace_id, rest, args).await.map(Some);
     }
     if let Some(rest) = method.strip_prefix("git.") {
         return git::dispatch(api, workspace_id, caller_agent_id, rest, args)

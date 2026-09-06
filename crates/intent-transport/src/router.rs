@@ -1320,6 +1320,53 @@ async fn dispatch(
             };
             api.event_query(ws, query).await.map_err(domain_to_rpc)
         }
+        "map.get" => {
+            let ws = require_ws_note(params)?;
+            api.map_get(ws).await.map_err(domain_to_rpc)
+        }
+        "map.setManifest" => {
+            let ws = require_ws_note(params)?;
+            let manifest = params
+                .get("json")
+                .filter(|value| !value.is_null())
+                .cloned()
+                .ok_or_else(|| invalid_params("json is required"))?;
+            api.map_set_manifest(ws, manifest)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "map.classify" => {
+            let ws = require_ws_note(params)?;
+            let paths = require_string_array(params, "paths")?;
+            api.map_classify(ws, paths).await.map_err(domain_to_rpc)
+        }
+        "map.activity" => {
+            let ws = require_ws_note(params)?;
+            let kinds = optional_string_array(params, "kinds")?.unwrap_or_default();
+            api.map_activity(
+                ws,
+                opt_str(params, "sinceTs"),
+                opt_int(params, "minutesAgo"),
+                opt_str(params, "agentId"),
+                kinds,
+                opt_int(params, "limit"),
+            )
+            .await
+            .map_err(domain_to_rpc)
+        }
+        "map.route" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = opt_nonempty_str(params, "agentId");
+            let task_note_id = opt_nonempty_str(params, "taskNoteId").map(NoteId::from);
+            if agent_id.is_some() == task_note_id.is_some() {
+                return Err(invalid_params(
+                    "exactly one of agentId or taskNoteId is required",
+                ));
+            }
+            api.map_route(ws, agent_id, task_note_id, opt_str(params, "sinceTs"))
+                .await
+                .map_err(domain_to_rpc)
+        }
         "agent.list" => {
             let ws = require_ws_note(params)?;
             // Soft retire (§5.5): retired rows are excluded by default;
@@ -4047,6 +4094,33 @@ fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, 
             "Missing required parameter: {name}"
         ))),
     }
+}
+
+fn optional_string_array(
+    params: &Map<String, Value>,
+    name: &str,
+) -> Result<Option<Vec<String>>, RpcErr> {
+    let Some(value) = params.get(name).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| invalid_params(format!("{name} must be an array of strings")))?;
+    array
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| invalid_params(format!("{name} must be an array of strings")))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn require_string_array(params: &Map<String, Value>, name: &str) -> Result<Vec<String>, RpcErr> {
+    optional_string_array(params, name)?
+        .ok_or_else(|| invalid_params(format!("{name} is required")))
 }
 
 /// Require an integer param (e.g. `v` on `note.getVersion`/`restoreVersion`).

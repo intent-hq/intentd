@@ -9671,6 +9671,42 @@ mod wsapi4_bindings_tests {
             Box::pin(async move { Ok(json!([])) })
         }
 
+        fn map_get(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move { Ok(json!({ "workspaceId": workspace_id })) })
+        }
+
+        fn map_set_manifest(
+            &self,
+            _workspace_id: WorkspaceId,
+            json: Value,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move { Ok(json!({ "json": json })) })
+        }
+
+        fn map_classify(
+            &self,
+            _workspace_id: WorkspaceId,
+            paths: Vec<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move { Ok(json!({ "paths": paths })) })
+        }
+
+        fn map_route(
+            &self,
+            _workspace_id: WorkspaceId,
+            agent_id: Option<String>,
+            task_note_id: Option<NoteId>,
+            since_ts: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id,
+                    "taskNoteId": task_note_id,
+                    "sinceTs": since_ts,
+                }))
+            })
+        }
+
         fn event_subscribe(
             &self,
             _ws: WorkspaceId,
@@ -11396,6 +11432,65 @@ mod wsapi4_bindings_tests {
         assert_eq!(p.path.as_deref(), Some("src/"));
         assert_eq!(p.minutes_ago, Some(10));
         assert_eq!(p.limit, Some(25));
+    }
+
+    #[tokio::test]
+    async fn map_bindings_route_arguments_and_validate_subjects() {
+        let (srv, _) = server();
+        for (js, key, expected) in [
+            ("return await ws.map.get();", "workspaceId", "ws-1"),
+            (
+                "return await ws.map.setManifest({ version: 1, regions: [] });",
+                "json.version",
+                "1",
+            ),
+            (
+                "return await ws.map.classify(['src/lib.rs']);",
+                "paths.0",
+                "src/lib.rs",
+            ),
+            (
+                "return await ws.map.route({ agentId: 'a-1', sinceTs: 't0' });",
+                "agentId",
+                "a-1",
+            ),
+            (
+                "return await ws.map.route({ taskNoteId: 'n-1' });",
+                "taskNoteId",
+                "n-1",
+            ),
+        ] {
+            let response = call(&srv, js).await;
+            assert_eq!(response["result"]["isError"], json!(false), "{js}");
+            let value: Value = serde_json::from_str(text(&response)).unwrap();
+            let actual = key.split('.').fold(&value, |value, part| {
+                part.parse::<usize>()
+                    .map_or_else(|_| &value[part], |index| &value[index])
+            });
+            assert_eq!(actual.to_string().trim_matches('"'), expected, "{js}");
+        }
+
+        for js in [
+            "return await ws.map.setManifest();",
+            "return await ws.map.classify();",
+            "return await ws.map.route({});",
+            "return await ws.map.route({ agentId: 'a', taskNoteId: 'n' });",
+        ] {
+            let response = call(&srv, js).await;
+            assert_eq!(response["result"]["isError"], json!(true), "{js}");
+        }
+    }
+
+    #[tokio::test]
+    async fn map_help_lists_binding() {
+        let (srv, _) = server();
+        let response = call(&srv, "return ws.help('map');").await;
+        assert_eq!(response["result"]["isError"], json!(false));
+        let docs = text(&response);
+        assert!(docs.contains("ws.map.get()"));
+        assert!(docs.contains("ws.map.setManifest(json)"));
+        assert!(docs.contains("ws.map.classify(paths)"));
+        assert!(docs.contains("ws.map.route("));
     }
 
     #[tokio::test]

@@ -116,6 +116,10 @@ pub const AGENT_STREAM_STATUS: &str = "agent:stream:status";
 // instead. Transient / broadcast-only, like the activity event.
 pub const CHAT_STREAM_DELTA: &str = "chat:stream:delta";
 
+// Transient semantic-map projection emitted by `map.activity` (§5.45 / §6.5).
+// The payload is one `MapActivity`; it is broadcast-only and never persisted.
+pub const MAP_ACTIVITY: &str = "map:activity";
+
 // Agent queue events (for the WebSocket API).
 pub const AGENT_QUEUE_UPDATED: &str = "agent:queue:updated";
 pub const AGENT_QUEUE_PROCESSING: &str = "agent:queue:processing";
@@ -513,6 +517,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_STREAM_END,
     AGENT_STREAM_STATUS,
     CHAT_STREAM_DELTA,
+    MAP_ACTIVITY,
     AGENT_QUEUE_UPDATED,
     AGENT_QUEUE_PROCESSING,
     AGENT_QUEUE_PROCESSING_CANCELLED,
