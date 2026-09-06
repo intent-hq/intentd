@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.29] - 2026-09-06
+
+### 🧪 Testing
+
+- *(services)* Cover shrink-after-delivery-claim on a settled delegation group ([#1752](https://github.com/intent-hq/intentd/pull/1752))
+- *(intentd)* Make WSS statement-count e2e immune to lazy read-pool growth ([#1755](https://github.com/intent-hq/intentd/pull/1755))
+
+
 ## [0.9.28] - 2026-09-06
 
 ### ⚡ Performance
