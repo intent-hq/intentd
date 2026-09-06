@@ -131,6 +131,7 @@ mod transfer_export;
 pub mod transfer_git;
 mod transfer_import;
 pub(crate) mod transfer_materialize;
+mod transfer_remotes;
 #[cfg(test)]
 mod transfer_roundtrip;
 mod transfer_submodules;
