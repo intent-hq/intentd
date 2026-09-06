@@ -1354,7 +1354,12 @@ impl Services {
             self.enqueue_group_persist(GroupPersistOp::Delete(group_id.to_string()));
             false
         } else {
-            self.persist_delegation_group(g.clone());
+            // A group claimed for delivery (`take_group_if_ready`) is owned by
+            // settlement: its row is deleted by the queued `Settle`, and a
+            // shrink snapshot enqueued behind it would re-create the row.
+            if !g.delivered {
+                self.persist_delegation_group(g.clone());
+            }
             true
         };
         drop(guard);
@@ -1862,7 +1867,9 @@ impl Services {
         // retired) BEFORE loading them (monorepo#4183): an aggregated wake
         // toward such a parent can never be delivered, so rehydrating the
         // group only feeds the delivery-retry loop from persisted state
-        // after every restart. Delete the row so it stays pruned. The
+        // after every restart. Delete the row so it stays pruned — through
+        // the persistence lane, since rehydration also runs on resume/retry
+        // and transfer import while live group writes may be queued. The
         // liveness probe fails open — a transient store error keeps the
         // group (the delivery-path backstop catches it later).
         let mut survivors = Vec::with_capacity(persisted.len());
@@ -1880,7 +1887,7 @@ impl Services {
                     parent = %p.parent_agent_id.0,
                     "pruning persisted delegation group — parent agent gone or retired"
                 );
-                if let Err(e) = self.store.delete_delegation_group(&p.group_id).await {
+                if let Err(e) = self.delete_delegation_group_persisted(&p.group_id).await {
                     tracing::warn!("delegation_group delete failed {}: {e}", p.group_id);
                 }
                 continue;
