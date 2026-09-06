@@ -1120,6 +1120,11 @@ async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
         serde_json::to_string_pretty(&completed.data).unwrap()
     );
     assert_eq!(completed.data["title"], summary);
+    // The kind derives from the recorded name, so it no longer varies with
+    // whatever words the model put in the summary (a summary mentioning
+    // "note" used to record as `note`); `workspace_api` is `other` on every
+    // provider.
+    assert_eq!(completed.data["toolKind"], "other");
     let registered = completed.data["registeredAttachments"]
         .as_array()
         .unwrap_or_else(|| {
