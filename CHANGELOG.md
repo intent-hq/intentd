@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.33] - 2026-09-06
+
+### 🚀 Features
+
+- Per-workspace browser-client pin + client.list RPCs (REV-2) ([#1760](https://github.com/intent-hq/intentd/pull/1760))
+
+
 ## [0.9.32] - 2026-09-06
 
 ### 🐛 Bug Fixes
