@@ -2019,10 +2019,15 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
     // `host:exec:*`, `script:output`, plus the high-churn state-notification
     // families — see `Store::delete_ephemeral_events_before`) older than the
-    // configured TTL, preserving lifecycle/tool/note/task events. Disabled
-    // when `events.streamRetentionHours == 0`.
-    let retention_task =
-        spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
+    // configured TTL, preserving lifecycle/tool/note/task events. The event
+    // sweep is disabled when `events.streamRetentionHours == 0`, but the loop
+    // still ticks so the tool-payload retention sweep (read live from
+    // `agents.toolPayloadRetentionDays`) can run.
+    let retention_task = spawn_stream_retention_loop(
+        retention_store,
+        config.stream_retention_hours,
+        settings_registry.clone(),
+    );
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
     // 24h so the `idempotency_key` table stays bounded. The same cadence prunes
     // per-agent stderr capture files older than 7 days (STAB-53); the first tick
@@ -2519,9 +2524,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     if let Some(reap_task) = reap_task {
         reap_task.abort();
     }
-    if let Some(retention_task) = retention_task {
-        retention_task.abort();
-    }
+    retention_task.abort();
     idempotency_reap_task.abort();
     merge_retry_task.abort();
     // Drop the watcher registry (and every filesystem/skills/specialists watch
@@ -4690,67 +4693,105 @@ const TOOL_CALL_RETENTION_HOURS: u32 = 6;
 /// ~54k free pages) drains over successive ticks instead of one long stall.
 const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 2000;
 
-/// Spawn the periodic event-retention/compaction sweep (§10.2 / finding F4),
-/// or `None` when disabled (`stream_retention_hours == 0`). Each tick deletes
-/// high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
-/// `host:exec:*`, `script:output`, plus the high-churn state-notification
-/// families — see `Store::delete_ephemeral_events_before`) older than the
-/// TTL, plus `agent:tool:call` events older than
-/// [`TOOL_CALL_RETENTION_HOURS`], while preserving lifecycle/note/task
-/// events. After the sweeps each tick runs a
-/// bounded `PRAGMA incremental_vacuum` ([`INCREMENTAL_VACUUM_MAX_PAGES`]) to
-/// release freelist pages back to the filesystem (effective on
-/// incremental-auto-vacuum databases; a no-op otherwise — see
-/// `intent_store::connect_write` for the activation story) and
-/// `PRAGMA optimize` to keep planner statistics current. The sweep interval
-/// is derived from the TTL (≈4×/TTL), clamped so long TTLs still sweep
-/// periodically and short ones do not busy-loop. A failed sweep is logged and
+/// Spawn the periodic retention/compaction sweep (§10.2 / finding F4). When
+/// `stream_retention_hours > 0` each tick deletes high-volume ephemeral
+/// events (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`,
+/// `script:output`, plus the high-churn state-notification families — see
+/// `Store::delete_ephemeral_events_before`) older than the TTL, plus
+/// `agent:tool:call` events older than [`TOOL_CALL_RETENTION_HOURS`], while
+/// preserving lifecycle/note/task events; `0` disables the event sweeps but
+/// NOT the loop. Every tick also reads `agents.toolPayloadRetentionDays`
+/// LIVE from the settings registry and, when it is `> 0`, compacts full
+/// tool bodies older than that window into replay previews
+/// (`Store::compact_tool_payloads_before`, at the live
+/// `agents.historyReplayToolContentChars` cap) — so a value set later from
+/// the Settings UI takes effect on the next tick without a restart. After
+/// the sweeps each tick runs a bounded `PRAGMA incremental_vacuum`
+/// ([`INCREMENTAL_VACUUM_MAX_PAGES`]) to release freelist pages back to the
+/// filesystem (effective on incremental-auto-vacuum databases; a no-op
+/// otherwise — see `intent_store::connect_write` for the activation story)
+/// and `PRAGMA optimize` to keep planner statistics current. The sweep
+/// interval is derived from the event TTL (≈4×/TTL), clamped so long TTLs
+/// still sweep periodically and short ones do not busy-loop; with the event
+/// sweep disabled it is the hourly ceiling. A failed sweep is logged and
 /// retried on the next tick (never aborts the loop).
 fn spawn_stream_retention_loop(
     store: Store,
     stream_retention_hours: u32,
-) -> Option<tokio::task::JoinHandle<()>> {
-    if stream_retention_hours == 0 {
-        tracing::info!("event retention sweep disabled (events.streamRetentionHours = 0)");
-        return None;
-    }
-    let ttl = Duration::from_secs(u64::from(stream_retention_hours) * 3600);
-    let interval = (ttl / 4).clamp(Duration::from_secs(300), Duration::from_secs(3600));
-    tracing::info!(
-        ttl_hours = stream_retention_hours,
-        tool_call_ttl_hours = TOOL_CALL_RETENTION_HOURS,
-        interval_secs = interval.as_secs(),
-        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*, script:output, state-notification churn families, agent:tool:call)"
-    );
-    Some(tokio::spawn(async move {
+    settings_registry: Arc<intent_services::SettingsRegistry>,
+) -> tokio::task::JoinHandle<()> {
+    let max_interval = Duration::from_secs(3600);
+    let interval = if stream_retention_hours == 0 {
+        tracing::info!(
+            interval_secs = max_interval.as_secs(),
+            "event retention sweep disabled (events.streamRetentionHours = 0); retention loop still ticks for the tool-payload sweep"
+        );
+        max_interval
+    } else {
+        let ttl = Duration::from_secs(u64::from(stream_retention_hours) * 3600);
+        let interval = (ttl / 4).clamp(Duration::from_secs(300), max_interval);
+        tracing::info!(
+            ttl_hours = stream_retention_hours,
+            tool_call_ttl_hours = TOOL_CALL_RETENTION_HOURS,
+            interval_secs = interval.as_secs(),
+            "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*, script:output, state-notification churn families, agent:tool:call)"
+        );
+        interval
+    };
+    tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let cutoff = intent_core::iso_minutes_ago(i64::from(stream_retention_hours) * 60);
-            match store.delete_ephemeral_events_before(&cutoff).await {
-                Ok(removed) if removed > 0 => {
-                    tracing::info!(
-                        removed,
-                        cutoff,
-                        "event retention sweep trimmed ephemeral events"
-                    );
+            if stream_retention_hours > 0 {
+                let cutoff = intent_core::iso_minutes_ago(i64::from(stream_retention_hours) * 60);
+                match store.delete_ephemeral_events_before(&cutoff).await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(
+                            removed,
+                            cutoff,
+                            "event retention sweep trimmed ephemeral events"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "event retention sweep failed"),
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "event retention sweep failed"),
+                let tool_cutoff =
+                    intent_core::iso_minutes_ago(i64::from(TOOL_CALL_RETENTION_HOURS) * 60);
+                match store.delete_tool_call_events_before(&tool_cutoff).await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(
+                            removed,
+                            cutoff = tool_cutoff,
+                            "event retention sweep trimmed agent:tool:call events"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "tool-call retention sweep failed"),
+                }
             }
-            let tool_cutoff =
-                intent_core::iso_minutes_ago(i64::from(TOOL_CALL_RETENTION_HOURS) * 60);
-            match store.delete_tool_call_events_before(&tool_cutoff).await {
-                Ok(removed) if removed > 0 => {
-                    tracing::info!(
-                        removed,
-                        cutoff = tool_cutoff,
-                        "event retention sweep trimmed agent:tool:call events"
-                    );
+            // Tool-payload retention: both knobs are read live per tick.
+            let settings = settings_registry.snapshot();
+            if let Some(days) = intent_services::tool_payload_retention_days(&settings.effective) {
+                let replay_chars =
+                    intent_services::history_replay_tool_content_chars(&settings.effective);
+                let payload_cutoff = intent_core::iso_minutes_ago(i64::from(days) * 24 * 60);
+                match store
+                    .compact_tool_payloads_before(&payload_cutoff, replay_chars)
+                    .await
+                {
+                    Ok(compacted) if compacted > 0 => {
+                        tracing::info!(
+                            compacted,
+                            cutoff = payload_cutoff,
+                            retention_days = days,
+                            replay_chars,
+                            "tool-payload retention sweep compacted full tool bodies into replay previews"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "tool-payload retention sweep failed"),
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "tool-call retention sweep failed"),
             }
             match store.incremental_vacuum(INCREMENTAL_VACUUM_MAX_PAGES).await {
                 Ok(freed) if freed > 0 => {
@@ -4766,7 +4807,7 @@ fn spawn_stream_retention_loop(
                 tracing::warn!(error = %e, "PRAGMA optimize failed");
             }
         }
-    }))
+    })
 }
 
 /// Spawn the periodic idempotency-key reaper (design note TB-0 §5.4). Runs

@@ -7634,6 +7634,52 @@ fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
     assert_eq!(passthrough.content, json!("raw"));
 }
 
+/// `agent.getMessageBlock` pruned-body flag: a block that still carries a
+/// write-time `inputTruncated` / `outputTruncated` slim flag AFTER the
+/// full-fidelity hydration has no full side row left (retention-pruned), so it
+/// gains the additive `inputPruned` / `outputPruned: true`; the existing flags
+/// and body are untouched. Hydrated / under-budget blocks (no slim flag), a
+/// `false` flag, and non-object blocks are never marked.
+#[test]
+fn mark_pruned_tool_body_flags_only_still_truncated_blocks() {
+    use crate::agent_ops::mark_pruned_tool_body;
+    let mut pruned_result = json!({
+        "type": "tool_result", "id": "b:1", "tool_use_id": "tc-1",
+        "output": "preview…", "outputTruncated": true, "outputBytes": 65536,
+    });
+    mark_pruned_tool_body(&mut pruned_result);
+    assert_eq!(
+        pruned_result,
+        json!({
+            "type": "tool_result", "id": "b:1", "tool_use_id": "tc-1",
+            "output": "preview…", "outputTruncated": true, "outputBytes": 65536,
+            "outputPruned": true,
+        })
+    );
+
+    let mut pruned_use = json!({
+        "type": "tool_use", "id": "tc-1", "name": "bash",
+        "input": { "cmd": "prev" }, "inputTruncated": true, "inputBytes": 9000,
+    });
+    mark_pruned_tool_body(&mut pruned_use);
+    assert_eq!(pruned_use["inputPruned"], json!(true));
+    assert!(pruned_use.get("outputPruned").is_none());
+
+    let hydrated = json!({ "type": "tool_result", "id": "b:2", "output": "full body" });
+    let mut untouched = hydrated.clone();
+    mark_pruned_tool_body(&mut untouched);
+    assert_eq!(untouched, hydrated, "a hydrated block gains no flag");
+
+    let not_truncated = json!({ "type": "tool_result", "id": "b:3", "outputTruncated": false });
+    let mut untouched = not_truncated.clone();
+    mark_pruned_tool_body(&mut untouched);
+    assert_eq!(untouched, not_truncated, "a false flag is not a prune");
+
+    let mut raw = json!("not-an-object");
+    mark_pruned_tool_body(&mut raw);
+    assert_eq!(raw, json!("not-an-object"));
+}
+
 /// `agent_last_message_event_payload` (PROTOCOL §6.5): the id-only echo
 /// enriched with the preview projections derived from the appended row —
 /// assistant rows carry `lastAgentResponse` (+ `lastToolUse` when the row

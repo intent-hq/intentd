@@ -2318,6 +2318,30 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// Flag a `agent.getMessageBlock` result whose full tool body is no longer
+/// retained. The full-fidelity read splices every externalized full body
+/// back in and drops the write-time `inputTruncated` / `outputTruncated`
+/// slim flags as it does; a block that still carries one AFTER hydration has
+/// no full side row left — the retention sweep compacted it into a
+/// `*_replay` preview (`agents.toolPayloadRetentionDays`). Serve the stored
+/// preview and its existing flags untouched, PLUS the additive
+/// `inputPruned: true` / `outputPruned: true`, so the response never implies
+/// a full body. Under-budget and hydrated blocks carry no flag and are
+/// untouched.
+fn mark_pruned_tool_body(block: &mut Value) {
+    let Some(obj) = block.as_object_mut() else {
+        return;
+    };
+    for (truncated_flag, pruned_flag) in [
+        ("inputTruncated", "inputPruned"),
+        ("outputTruncated", "outputPruned"),
+    ] {
+        if obj.get(truncated_flag) == Some(&Value::Bool(true)) {
+            obj.insert(pruned_flag.to_string(), Value::Bool(true));
+        }
+    }
+}
+
 /// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
 /// `projection: "slim"`) to one served message. The block bounding itself
 /// lives in [`crate::tool_block::slim_message_blocks`], shared with the live
@@ -3221,6 +3245,17 @@ impl Services {
     /// whole page down rather than just itself. The slim flags
     /// (`inputBytes`/`outputBytes`/`dataBytes`) carry the full body size, so
     /// a client can predict the fetch size before calling.
+    ///
+    /// Retention-pruned bodies (`agents.toolPayloadRetentionDays`): when the
+    /// sweep has compacted a block's full side row into its `*_replay`
+    /// preview, the full body no longer exists anywhere — the message row
+    /// still carries the stored slim preview with its `inputTruncated` /
+    /// `outputTruncated` (+ `*Bytes`) flags after hydration (only the two
+    /// FULL-body kinds are spliced). Such a block is served as that stored
+    /// preview, flags intact, PLUS the additive `inputPruned: true` /
+    /// `outputPruned: true` so a client can tell "the full output is no
+    /// longer retained" from "the fetch returned the full body" and does not
+    /// re-request in a loop.
     pub(crate) async fn agent_get_message_block_op(
         &self,
         agent_id: AgentId,
@@ -3269,7 +3304,7 @@ impl Services {
             },
         };
         let message = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
-        let block = message
+        let mut block = message
             .content
             .as_array()
             .and_then(|blocks| {
@@ -3279,6 +3314,7 @@ impl Services {
             })
             .cloned()
             .ok_or_else(|| Error::InvalidParams(format!("unknown block id: {block_id}")))?;
+        mark_pruned_tool_body(&mut block);
         Ok(json!({ "block": block }))
     }
 
