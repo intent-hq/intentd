@@ -11438,7 +11438,7 @@ mod wsapi4_bindings_tests {
     async fn map_bindings_route_arguments_and_validate_subjects() {
         let (srv, _) = server();
         for (js, key, expected) in [
-            ("return await ws.map.get();", "workspaceId", "ws-1"),
+            ("return await ws.map.get();", "workspaceId", "amber-forest"),
             (
                 "return await ws.map.setManifest({ version: 1, regions: [] });",
                 "json.version",

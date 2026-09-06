@@ -4122,11 +4122,6 @@ fn optional_string_array(
         .map(Some)
 }
 
-fn require_string_array(params: &Map<String, Value>, name: &str) -> Result<Vec<String>, RpcErr> {
-    optional_string_array(params, name)?
-        .ok_or_else(|| invalid_params(format!("{name} is required")))
-}
-
 /// Require an integer param (e.g. `v` on `note.getVersion`/`restoreVersion`).
 fn require_int_param(params: &Map<String, Value>, name: &str) -> Result<i64, RpcErr> {
     match params.get(name).and_then(Value::as_i64) {
