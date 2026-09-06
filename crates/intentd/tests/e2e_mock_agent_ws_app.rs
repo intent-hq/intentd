@@ -975,6 +975,215 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     }
 }
 
+/// Regression e2e (intent-hq/intent#4491): auggie's `tool_call` frame for
+/// `workspace_api` carries `title` = the call's `summary`, NO `name`, `kind:
+/// 'other'` and `rawInput` = `{code, summary}` verbatim — no tool identifier
+/// anywhere. With a prose summary (no `workspace_api` substring) the summary
+/// used to be recorded as the tool name, the completion-side FIFO claim gate
+/// (`tool_name.contains("workspace_api")`) never fired, and the proposal the
+/// JS discarded was never attached. Asserts the `{code, summary}` input-shape
+/// rule (name derivation + claim second gate) attaches it.
+#[tokio::test]
+async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
+    let Some(script) = gate() else { return };
+
+    let db = std::env::temp_dir().join(format!(
+        "intentd-e2e-ws-app-auggie-shape-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
+        .with_event_bus(bus.clone());
+
+    let chief_ws = WorkspaceId(CHIEF_WORKSPACE_ID.to_string());
+    let agent_val = services
+        .agent_create(
+            chief_ws.clone(),
+            Some("Chief Auggie Shape E2E".into()),
+            None,
+            None,
+            None,
+            None,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create chief agent");
+    let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+
+    // Call ws.app.proposal.show via MCP but DISCARD the returned envelope —
+    // the tool output is a plain `{ ok: true }` with no resource item.
+    let js = r#"
+        const proposal = {
+            kind: "settings-change",
+            payload: { key: "test.setting", value: "new-value" },
+            preview: {
+                title: "Update Test Setting",
+                description: "Change test setting to new value"
+            }
+        };
+        const result = await ws.app.proposal.show(proposal);
+        return { ok: result.ok };
+    "#;
+
+    // Prose summary: no `workspace_api` substring and no `<name>: ` prefix,
+    // so nothing but the `{code, summary}` input shape identifies the tool.
+    let summary = "Propose a follow-up workspace";
+    let behavior = json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": summary }
+        },
+        "response": "show proposal",
+        "emitToolBlocks": true,
+        "auggieShapedToolCall": true,
+    })
+    .to_string();
+
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = AgentManager::new(services.clone(), sink, 8)
+        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+
+    manager
+        .create_agent(
+            agent_id.clone(),
+            chief_ws.clone(),
+            "Chief Auggie Shape E2E",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&agent_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(json!({ "type": "text", "text": "show proposal" })).unwrap();
+    let stop = manager
+        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block], None)
+        .await
+        .expect("run_turn");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let conversation = services
+        .agent_get_conversation(
+            agent_id.clone(),
+            None,
+            Some(chief_ws.clone()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("read conversation");
+    let messages = conversation["messages"].as_array().expect("messages array");
+
+    // (a) Deterministic attach: the standalone proposal-resource block is
+    // persisted, claimed from the binding-time registration through the
+    // input-shape gate.
+    let standalone = messages.iter().find_map(|msg| {
+        msg["contentBlocks"].as_array().and_then(|blocks| {
+            blocks.iter().find(|block| {
+                block["type"] == "resource"
+                    && block["resource"]["mimeType"] == "application/vnd.intent.proposal+json"
+                    && block["id"].is_string()
+            })
+        })
+    });
+    let standalone = standalone.unwrap_or_else(|| {
+        panic!(
+            "Standalone proposal resource block not attached on auggie-shaped tool_call: {}",
+            serde_json::to_string_pretty(&conversation).unwrap()
+        )
+    });
+    assert_eq!(standalone["resource"]["name"], "Update Test Setting");
+    assert_eq!(
+        standalone["resource"]["uri"],
+        "intent-proposal://settings-change/Update%20Test%20Setting"
+    );
+    let text = standalone["resource"]["text"].as_str().expect("text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("proposal text parses");
+    assert_eq!(parsed["kind"], "settings-change");
+    assert_eq!(parsed["payload"]["key"], "test.setting");
+    assert_eq!(parsed["payload"]["value"], "new-value");
+
+    // (b) The persisted tool_use block resolved `workspace_api` from the
+    // input shape — NOT the prose title — and still echoes the ACP title.
+    let tool_use = messages
+        .iter()
+        .find_map(|msg| {
+            msg["contentBlocks"]
+                .as_array()
+                .and_then(|blocks| blocks.iter().find(|block| block["type"] == "tool_use"))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "No tool_use block in transcript: {}",
+                serde_json::to_string_pretty(&conversation).unwrap()
+            )
+        });
+    assert_eq!(
+        tool_use["name"],
+        "workspace_api",
+        "tool_use name must derive from the {{code, summary}} input shape: {}",
+        serde_json::to_string_pretty(&conversation).unwrap()
+    );
+    assert_eq!(tool_use["input"]["_acpTitle"], summary);
+    assert_eq!(tool_use["input"]["summary"], summary);
+    assert_eq!(tool_use["input"]["code"], js);
+
+    // (c) The tool_result carries NO resource item anywhere — the JS returned
+    // a plain object, so the output is just the rendered `{ ok: true }` body.
+    let tool_result_has_resource = messages.iter().any(|msg| {
+        msg["contentBlocks"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["type"] == "tool_result"
+                    && block["output"]
+                        .as_array()
+                        .is_some_and(|output| output.iter().any(|item| item["type"] == "resource"))
+            })
+        })
+    });
+    assert!(
+        !tool_result_has_resource,
+        "Discarded envelope must not surface a resource item in tool output: {}",
+        serde_json::to_string_pretty(&conversation).unwrap()
+    );
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+}
+
 /// Gap 3 (P3): Non-chief workspace agent calls ws.app.* and receives the
 /// gating error through the MCP tool result.
 #[tokio::test]

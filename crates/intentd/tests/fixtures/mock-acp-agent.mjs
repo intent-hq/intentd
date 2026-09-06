@@ -13,6 +13,11 @@
 // delegating parent and several distinct children (first matching rule wins;
 // falls back to the top-level behavior). `rawUpdates` is an array of
 // session/update `update` objects echoed verbatim before the text response.
+// With `emitToolBlocks`, `auggieShapedToolCall: true` emits the `tool_call`
+// frame the way auggie does for `workspace_api` (intent-hq/intent#4491):
+// `title` = the call's `summary` argument (falling back to the tool name),
+// NO `name` field, `kind: 'other'`, `rawInput` = the arguments verbatim — so
+// the frame carries no tool identifier other than its `{code, summary}` shape.
 import readline from 'node:readline';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -767,19 +772,33 @@ async function handlePrompt(id, params) {
   // Emit tool blocks if emitToolBlocks is enabled (opt-in for transcript persistence testing)
   if (active.emitToolBlocks && toolResults.length > 0) {
     for (const { toolCall, result } of toolResults) {
-      // Emit tool_call notification (creates tool_use block in transcript)
+      // Emit tool_call notification (creates tool_use block in transcript).
+      // With auggieShapedToolCall, reproduce auggie's frame for workspace_api
+      // (intent-hq/intent#4491): title = summary, no name, kind 'other'.
       const toolCallId = `tc_${Math.random().toString(36).slice(2, 11)}`;
+      const args = toolCall.arguments || {};
+      const auggieShaped = active.auggieShapedToolCall === true;
+      const summary = typeof args.summary === 'string' ? args.summary : null;
       note('session/update', {
         sessionId: SESSION_ID,
-        update: {
-          sessionUpdate: 'tool_call',
-          toolCallId,
-          title: toolCall.name,
-          name: toolCall.name,
-          kind: 'mcp',
-          status: 'in_progress',
-          rawInput: toolCall.arguments || {},
-        },
+        update: auggieShaped
+          ? {
+              sessionUpdate: 'tool_call',
+              toolCallId,
+              title: summary ?? toolCall.name,
+              kind: 'other',
+              status: 'in_progress',
+              rawInput: args,
+            }
+          : {
+              sessionUpdate: 'tool_call',
+              toolCallId,
+              title: toolCall.name,
+              name: toolCall.name,
+              kind: 'mcp',
+              status: 'in_progress',
+              rawInput: args,
+            },
       });
 
       // Emit tool_call_update with output (creates tool_result block in transcript).
