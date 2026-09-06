@@ -17,8 +17,8 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     status_message, status_image_asset_id, attention, path, repository_path, repository_owner, \
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
-    tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    setup_result, browser_client_id";
+    tags, created_at, updated_at, last_activity, token_usage, setup_script, setup_result, \
+    checkout_mode, browser_client_id";
 
 /// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
 /// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
@@ -110,7 +110,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -190,7 +190,7 @@ impl Store {
             .map_err(|e| Error::Internal(format!("begin workspace draft insert: {e}")))?;
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let inserted = sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -227,6 +227,7 @@ impl Store {
             .bind(setup_script)
             .bind(setup_result)
             .bind(checkout_mode)
+            .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
             .bind(auto_commit.map(i64::from))
             .execute(&mut *conn)
             .await

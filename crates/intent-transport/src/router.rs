@@ -10,9 +10,8 @@ use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
     NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode,
-    WorkspaceApi, WorkspaceCreate, WorkspaceDraftId, WorkspaceGitRootId, WorkspaceId,
-    WorkspaceUpdate,
-    TaskAgentLink,
+    TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceDraftId, WorkspaceGitRootId,
+    WorkspaceId, WorkspaceUpdate,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
