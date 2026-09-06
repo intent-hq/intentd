@@ -550,7 +550,9 @@ fn resolve_input_and_name(
         }
     }
     if let Some((input, rewritten)) = unwrap_codex_mcp_input(raw_input) {
-        let name = derive_tool_name(&rewritten, Some(&input));
+        // `server`/`tool` are authoritative: a foreign tool whose arguments
+        // happen to be `{ code, summary }` must keep its own name.
+        let name = derive_tool_name_inner(&rewritten, Some(&input), false);
         return (input, name);
     }
     let name = derive_tool_name(title, raw_input);
@@ -600,28 +602,42 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// ACP providers (auggie, codex, opencode, …) deliver a prose `title` (e.g.
 /// `"sub-agent-explore: Explore the AI agent system…"`) rather than the raw
 /// tool name the model invoked. Rules, in order:
-///  1. A title of the form `<name>: <description>` (`<name>` a bare identifier
-///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
-///     becomes the name.
-///  2. Codex titles MCP tools `mcp.<server>.<tool>` (dot-separated, no
+///  1. Codex titles MCP tools `mcp.<server>.<tool>` (dot-separated, no
 ///     whitespace — prose titles containing dots never match); the title is
 ///     rewritten to `{server}_{tool}` and fed through the affix strip below,
 ///     the same downstream treatment as [`unwrap_codex_mcp_input`]'s
 ///     rewritten name (`mcp.workspace-mcp.workspace_api` → `workspace_api`,
 ///     `mcp.other-server.some_tool` → `other-server_some_tool`).
-///  3. Claude Code titles MCP tools `mcp__<server>__<tool>`
+///  2. Claude Code titles MCP tools `mcp__<server>__<tool>`
 ///     (double-underscore-separated, no whitespace — prose titles containing
 ///     `mcp__` never match); the title is rewritten to `{server}_{tool}` and
 ///     fed through the affix strip below, the same downstream treatment as
 ///     the codex dot rule (`mcp__workspace-mcp__workspace_api` →
 ///     `workspace_api`, `mcp__github__list_issues` → `github_list_issues`).
-///  4. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
+///     Rules 1–2 name the server explicitly and therefore run before the
+///     input-shape inference in rule 3: a foreign MCP tool whose arguments
+///     happen to be `{ code, summary }` keeps its own name.
+///  3. A `raw_input` carrying the daemon's own `workspace_api` schema — an
+///     object holding exactly a non-empty string `code` plus a string
+///     `summary` (an `_acpTitle` echo is tolerated) — is `workspace_api`
+///     regardless of the title. Auggie titles an MCP call with the
+///     model-authored `summary` (plain prose, no `name`, `kind: other`), so
+///     the input shape is the only identifier; it is checked before the
+///     `<name>: <description>` split below because a prose summary can
+///     accidentally match it (intent-hq/intent#4491). Providers that title
+///     the call with the tool name resolve to `workspace_api` through rules
+///     1–2 and 4–5 anyway. Skipped on the [`unwrap_codex_mcp_input`] path,
+///     where `server`/`tool` are authoritative.
+///  4. A title of the form `<name>: <description>` (`<name>` a bare identifier
+///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
+///     becomes the name.
+///  5. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
 ///     `<tool>_<server>` (trailing `_workspace-mcp` suffix), opencode names it
 ///     `<server>_<tool>` (leading `workspace-mcp_` prefix); stripping either
 ///     (repeatedly) recovers the registry name (§18.4).
-///  5. A bare `webfetch` title (opencode's fetch tool) is normalized to the
+///  6. A bare `webfetch` title (opencode's fetch tool) is normalized to the
 ///     canonical `web-fetch` builtin name.
-///  6. When none of the above yielded an identifier (the title is prose
+///  7. When none of the above yielded an identifier (the title is prose
 ///     like `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous
 ///     shapes. Evaluated in the same order as the reference
 ///     (`acp-provider-streaming.ts` ~L1635–1666), first match wins:
@@ -642,7 +658,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///       - string `command` + string `cwd` (no `wait`/`max_wait_seconds`,
 ///         which would mean auggie's `launch-process`) → `bash`
 ///       - `url` → `web-fetch`
-///  7. Otherwise the title passes through as-is.
+///  8. Otherwise the title passes through as-is.
 ///
 /// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
 /// The reference keys off its local `toolName` variable, which may have been
@@ -653,14 +669,27 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// every path.
 #[must_use]
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
-    if let Some(name) = split_name_prefix(title) {
-        return strip_workspace_mcp_affix(name);
-    }
+    derive_tool_name_inner(title, raw_input, true)
+}
+
+/// [`derive_tool_name`] with the `workspace_api` input-shape rule (rule 3)
+/// switchable off for callers that already hold an authoritative tool name.
+fn derive_tool_name_inner(
+    title: &str,
+    raw_input: Option<&Value>,
+    infer_workspace_api: bool,
+) -> String {
     if let Some(rewritten) = split_codex_mcp_title(title) {
         return strip_workspace_mcp_affix(&rewritten);
     }
     if let Some(rewritten) = split_claude_mcp_title(title) {
         return strip_workspace_mcp_affix(&rewritten);
+    }
+    if infer_workspace_api && raw_input.is_some_and(is_workspace_api_input) {
+        return "workspace_api".to_string();
+    }
+    if let Some(name) = split_name_prefix(title) {
+        return strip_workspace_mcp_affix(name);
     }
     let stripped = strip_workspace_mcp_affix(title);
     if stripped != title {
@@ -768,6 +797,23 @@ fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
         return Some("web-fetch".to_string());
     }
     None
+}
+
+/// The `workspace_api` MCP tool's input schema: a string `code` (the JS to
+/// run) plus a string `summary` (the model-authored one-line description),
+/// and nothing else. Both keys are required by the schema and no daemon tool
+/// carries that pair, so the exact shape identifies the tool on its own; any
+/// extra key (other than a daemon-stamped `_acpTitle` echo) means some other
+/// tool's arguments and disqualifies the match.
+fn is_workspace_api_input(input: &Value) -> bool {
+    let Some(obj) = input.as_object() else {
+        return false;
+    };
+    is_non_empty_string(obj.get("code"))
+        && obj.get("summary").is_some_and(Value::is_string)
+        && obj
+            .keys()
+            .all(|k| matches!(k.as_str(), "code" | "summary" | "_acpTitle"))
 }
 
 /// JS-truthy on a `path`-style field: present, a string, and non-empty.
