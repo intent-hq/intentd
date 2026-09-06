@@ -4356,10 +4356,30 @@ pub struct WorkspaceGitRoot {
     pub updated_at: String,
 }
 
+/// Host identification a client supplies about *its own* device in
+/// `client.hello` (§5.17) — the mirror image of the `hostname` /
+/// `prettyHostname` / `deviceKind` triple the daemon reports about itself in
+/// `host.status` / `server.pairingInfo`, with the same semantics: `hostname`
+/// is the OS hostname, `pretty_hostname` the user-facing device name (macOS
+/// Computer Name) falling back to the hostname, `device_kind` the detected
+/// device category. All optional: clients pre-dating the fields send none.
+/// Persisted on the `client` row and refreshed on every hello.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientHostInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretty_hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_kind: Option<String>,
+}
+
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
 /// survives reconnects; persisted to the `client` table with `name`,
-/// `capabilities`, `first_seen`, and `last_seen`. The ephemeral per-connection
-/// id is transport-only and never stored here.
+/// `capabilities`, the [`ClientHostInfo`] triple, `first_seen`, and
+/// `last_seen`. The ephemeral per-connection id is transport-only and never
+/// stored here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
@@ -4367,6 +4387,8 @@ pub struct Client {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub capabilities: serde_json::Value,
+    #[serde(flatten)]
+    pub host: ClientHostInfo,
     pub first_seen: String,
     pub last_seen: String,
 }

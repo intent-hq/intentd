@@ -26,8 +26,8 @@ use intent_core::events::{
 };
 use intent_core::{
     chief_workspace, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso, ActorType,
-    AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientId, Comment,
-    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientHostInfo,
+    ClientId, Comment, CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
     CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
@@ -28750,9 +28750,13 @@ impl WorkspaceApi for Services {
         client_id: ClientId,
         name: Option<String>,
         capabilities: Option<serde_json::Value>,
+        host: ClientHostInfo,
     ) -> BoxFuture<'_, Result<()>> {
         let svc = self.clone();
-        Box::pin(async move { svc.client_hello_upsert(client_id, name, capabilities).await })
+        Box::pin(async move {
+            svc.client_hello_upsert(client_id, name, capabilities, host)
+                .await
+        })
     }
 
     fn draft_get(

@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 use crate::model::{
-    AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
-    CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
-    ContextItem, Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
-    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts,
-    GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData, MessageOrigin,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    AgentDelegateInput, AgentLite, AgentSession, ClientHostInfo, CommentAddResult,
+    CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentResolveThreadResult,
+    CommentRespondResult, ContextItem, Draft, EventQueryParams, EventSubscribeResult,
+    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
+    GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
+    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
     RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
@@ -5781,15 +5781,17 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `client.hello` persistence: upsert the logical `client` row, setting
     /// `first_seen` once and touching `last_seen`, and persisting `name` /
-    /// `capabilities` (a JSON bag). The connection→client binding and the
-    /// `server` capability block are transport concerns (§16) (PROTOCOL §5.17).
+    /// `capabilities` (a JSON bag) / the client's [`ClientHostInfo`]. The
+    /// connection→client binding and the `server` capability block are
+    /// transport concerns (§16) (PROTOCOL §5.17).
     fn upsert_client(
         &self,
         client_id: ClientId,
         name: Option<String>,
         capabilities: Option<serde_json::Value>,
+        host: ClientHostInfo,
     ) -> BoxFuture<'_, Result<()>> {
-        let _ = (client_id, name, capabilities);
+        let _ = (client_id, name, capabilities, host);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::upsert_client not implemented".to_string(),
@@ -6748,7 +6750,9 @@ pub struct ResolvedClient {
 /// `browserExec` replaced by the per-client aggregate — a client is
 /// `browserExec`-eligible when **any** of its live connections advertises it,
 /// so a later auxiliary socket without the capability never masks an earlier
-/// eligible connection (#1756 review). `transports` carries the wire spelling
+/// eligible connection (#1756 review). `host` (flattened: `hostname` /
+/// `prettyHostname` / `deviceKind`, each presence-detected) is the newest
+/// hello's device identification. `transports` carries the wire spelling
 /// (`"uds"` / `"wss"`) of each live connection, oldest first; `connected_at`
 /// is the ISO-8601 registration time of the oldest live connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6758,6 +6762,8 @@ pub struct ReverseLiveClient {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub capabilities: serde_json::Value,
+    #[serde(flatten)]
+    pub host: ClientHostInfo,
     pub connections: usize,
     pub transports: Vec<String>,
     pub connected_at: String,

@@ -205,12 +205,17 @@ async fn try_read_text(ws: &mut PlainWs, dur: Duration) -> Option<Value> {
 }
 
 /// `client.hello` params for logical client `client_id`, advertising (or not)
-/// the `browserExec` capability (REV-2 eligibility, PROTOCOL §5.17).
+/// the `browserExec` capability (REV-2 eligibility, PROTOCOL §5.17), with the
+/// client's own host identification (`hostname` / `prettyHostname` /
+/// `deviceKind`, mirroring `host.status`).
 fn hello(client_id: &str, browser_exec: bool) -> Value {
     json!({
         "clientId": client_id,
         "name": format!("Intent Desktop @ {client_id}"),
         "capabilities": { "browserExec": browser_exec },
+        "hostname": format!("{client_id}.local"),
+        "prettyHostname": format!("{client_id} (pretty)"),
+        "deviceKind": "laptop",
     })
 }
 
@@ -957,6 +962,9 @@ async fn workspace_browser_client_pin_rpcs_over_wss() {
         "the newer non-capable socket must not mask the eligible one"
     );
     assert!(clients[1]["connectedAt"].is_string());
+    assert_eq!(clients[1]["hostname"], "desktop-b.local");
+    assert_eq!(clients[1]["prettyHostname"], "desktop-b (pretty)");
+    assert_eq!(clients[1]["deviceKind"], "laptop");
     let mut keys: Vec<&str> = clients[1]
         .as_object()
         .unwrap()
@@ -971,10 +979,35 @@ async fn workspace_browser_client_pin_rpcs_over_wss() {
             "clientId",
             "connectedAt",
             "connections",
+            "deviceKind",
+            "hostname",
             "name",
+            "prettyHostname",
             "transports"
         ]
     );
+
+    // A hello without host identification lists no host keys (presence-
+    // detected, never null).
+    let mut bare = connect(fx.port).await;
+    let _ = wss_rpc(
+        &mut bare,
+        1,
+        "client.hello",
+        json!({ "clientId": "bare-c", "capabilities": { "browserExec": false } }),
+    )
+    .await;
+    let listed = wss_rpc(&mut a, 2, "client.list", json!({})).await;
+    let bare_entry = listed["result"]["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["clientId"] == "bare-c")
+        .unwrap_or_else(|| panic!("bare-c listed: {listed}"));
+    for key in ["hostname", "prettyHostname", "deviceKind", "name"] {
+        assert!(bare_entry.get(key).is_none(), "{key} omitted: {bare_entry}");
+    }
+    close_and_await_deregistration(bare, &fx.registry, 3).await;
 
     let created = wss_rpc(
         &mut a,

@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use intent_core::{
-    events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
-    CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, EventActor,
-    Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility,
-    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientHostInfo,
+    ClientId, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType,
+    Error, EventActor, Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor,
+    NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -104,7 +104,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114, 116
+            110, 111, 112, 113, 114, 116, 117
         ]
     );
     assert_eq!(
@@ -115,7 +115,7 @@ async fn migration_status_reports_current_after_open() {
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114, 116
+            110, 111, 112, 113, 114, 116, 117
         ]
     );
 }
@@ -4730,22 +4730,40 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let id = ClientId::from_string("cli-abc");
 
+    let host = ClientHostInfo {
+        hostname: Some("mbp.local".to_string()),
+        pretty_hostname: Some("Clement's MacBook Pro".to_string()),
+        device_kind: Some("laptop".to_string()),
+    };
     store
-        .upsert_client(&id, Some("Laptop"), Some(&json!({ "forward": true })))
+        .upsert_client(
+            &id,
+            Some("Laptop"),
+            Some(&json!({ "forward": true })),
+            &host,
+        )
         .await
         .expect("insert client");
     let first = store.get_client(&id).await.expect("get").expect("present");
     assert_eq!(first.name, Some("Laptop".to_string()));
     assert_eq!(first.capabilities, json!({ "forward": true }));
+    assert_eq!(first.host, host, "host identification round-trips");
 
-    // Re-hello updates name/capabilities and touches last_seen; first_seen stays.
+    // Re-hello updates name/capabilities/host and touches last_seen;
+    // first_seen stays. A hello that omits the host triple clears it.
     store
-        .upsert_client(&id, Some("Desktop"), Some(&json!({ "forward": false })))
+        .upsert_client(
+            &id,
+            Some("Desktop"),
+            Some(&json!({ "forward": false })),
+            &ClientHostInfo::default(),
+        )
         .await
         .expect("re-upsert");
     let again = store.get_client(&id).await.expect("get").expect("present");
     assert_eq!(again.name, Some("Desktop".to_string()));
     assert_eq!(again.capabilities, json!({ "forward": false }));
+    assert_eq!(again.host, ClientHostInfo::default());
     assert_eq!(
         again.first_seen, first.first_seen,
         "first_seen is preserved"
@@ -4836,7 +4854,7 @@ async fn draft_round_trip_upsert_get_delete() {
         .expect("insert ws");
     let client = ClientId::from_string("cli-1");
     store
-        .upsert_client(&client, None, None)
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
         .await
         .expect("client");
     let agent = AgentId::from_string("agent-1");
@@ -4920,7 +4938,7 @@ async fn draft_round_trip_for_workspace_id_without_row() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let client = ClientId::from_string("cli-1");
     store
-        .upsert_client(&client, None, None)
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
         .await
         .expect("client");
     let ws = WorkspaceId::from("__new-workspace__");
@@ -4965,7 +4983,10 @@ async fn draft_fk_drop_migration_preserves_existing_rows() {
         .await
         .expect("insert ws");
     let client = ClientId::from_string("cli-1");
-    store.upsert_client(&client, None, None).await.unwrap();
+    store
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
+        .await
+        .unwrap();
 
     // Restore the pre-0050 shape: 0007 columns + workspace FK, with the 0048
     // `attachments` column appended.
@@ -5045,8 +5066,9 @@ async fn drafts_are_isolated_by_client_and_removed_on_workspace_delete() {
     let agent = AgentId::from_string("agent-1");
     let a = ClientId::from_string("cli-a");
     let b = ClientId::from_string("cli-b");
-    store.upsert_client(&a, None, None).await.unwrap();
-    store.upsert_client(&b, None, None).await.unwrap();
+    let no_host = ClientHostInfo::default();
+    store.upsert_client(&a, None, None, &no_host).await.unwrap();
+    store.upsert_client(&b, None, None, &no_host).await.unwrap();
 
     store
         .upsert_draft(&ws, &agent, &a, "from-a", None)

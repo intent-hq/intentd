@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use intent_core::{AgentId, BoxFuture, ClientId, Draft, Result, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    AgentId, BoxFuture, ClientHostInfo, ClientId, Draft, Result, WorkspaceApi, WorkspaceId,
+};
 use serde_json::{json, Value};
 
 use super::*;
@@ -27,6 +29,7 @@ impl WorkspaceApi for MemApi {
         client_id: ClientId,
         _name: Option<String>,
         _capabilities: Option<Value>,
+        _host: ClientHostInfo,
     ) -> BoxFuture<'_, Result<()>> {
         self.minted.lock().unwrap().push(client_id.0);
         Box::pin(async { Ok(()) })

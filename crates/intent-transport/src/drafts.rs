@@ -9,7 +9,7 @@
 //! its `client` row created) lazily on first write, so its drafts round-trip
 //! within the connection but do not survive reconnect.
 
-use intent_core::{AgentId, ClientId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, ClientHostInfo, ClientId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use crate::events::{error_frame, success_frame};
@@ -90,7 +90,7 @@ async fn resolve_for_write(
         return Ok(id.clone());
     }
     let minted = ClientId::new();
-    api.upsert_client(minted.clone(), None, None)
+    api.upsert_client(minted.clone(), None, None, ClientHostInfo::default())
         .await
         .map_err(|e| (-32603, e.to_string()))?;
     *client_id = Some(minted.clone());

@@ -39,8 +39,8 @@ use std::sync::{Arc, Mutex};
 
 pub use intent_core::ResolvedClient;
 use intent_core::{
-    now_iso, AgentReverseDispatch, BoxFuture, ClientId, ReverseDispatchError, ReverseLiveClient,
-    ReverseTarget, WorkspaceApi, WorkspaceId,
+    now_iso, AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, ReverseDispatchError,
+    ReverseLiveClient, ReverseTarget, WorkspaceApi, WorkspaceId,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -75,12 +75,14 @@ impl ReverseTransport {
 
 /// The logical-client identity a connection established via `client.hello`
 /// (§5.17). `capabilities` is the hello's `capabilities` object verbatim
-/// (`{}` when omitted).
+/// (`{}` when omitted); `host` is the hello's device identification
+/// (`hostname` / `prettyHostname` / `deviceKind`, each optional).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReverseClientIdentity {
     pub client_id: ClientId,
     pub name: Option<String>,
     pub capabilities: Value,
+    pub host: ClientHostInfo,
 }
 
 impl ReverseClientIdentity {
@@ -142,17 +144,18 @@ impl ClientTransition {
 }
 
 /// One logical client as seen by [`PrimaryReverseRegistry::live_clients`]:
-/// every hello'd connection sharing a `clientId`, grouped. `name` comes from
-/// the newest connection's hello; `capabilities` is the newest hello's bag
-/// with `browserExec` replaced by the per-client aggregate `browser_exec`
-/// (true when ANY live connection advertises it — see the module docs);
-/// `connected_at` is the ISO-8601 registration time of the oldest live
-/// connection.
+/// every hello'd connection sharing a `clientId`, grouped. `name` and `host`
+/// come from the newest connection's hello; `capabilities` is the newest
+/// hello's bag with `browserExec` replaced by the per-client aggregate
+/// `browser_exec` (true when ANY live connection advertises it — see the
+/// module docs); `connected_at` is the ISO-8601 registration time of the
+/// oldest live connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveClient {
     pub client_id: ClientId,
     pub name: Option<String>,
     pub capabilities: Value,
+    pub host: ClientHostInfo,
     /// Whether any live connection of this client is `browserExec`-eligible
     /// — the same predicate `resolve` / `dispatch` route on.
     pub browser_exec: bool,
@@ -170,6 +173,7 @@ impl LiveClient {
             client_id: self.client_id.clone(),
             name: self.name.clone(),
             capabilities: self.capabilities.clone(),
+            host: self.host.clone(),
             connections: self.connections,
             transports: self
                 .transports
@@ -393,11 +397,13 @@ impl PrimaryReverseRegistry {
                     // Newest hello wins for the display fields.
                     client.name.clone_from(&identity.name);
                     client.capabilities.clone_from(&identity.capabilities);
+                    client.host.clone_from(&identity.host);
                 }
                 None => clients.push(LiveClient {
                     client_id: identity.client_id.clone(),
                     name: identity.name.clone(),
                     capabilities: identity.capabilities.clone(),
+                    host: identity.host.clone(),
                     browser_exec: identity.browser_exec(),
                     connections: 1,
                     transports: vec![entry.transport],

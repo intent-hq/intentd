@@ -9,7 +9,9 @@
 
 use std::time::Duration;
 
-use intent_core::{AgentReverseDispatch, ClientId, ReverseDispatchError, ReverseTarget};
+use intent_core::{
+    AgentReverseDispatch, ClientHostInfo, ClientId, ReverseDispatchError, ReverseTarget,
+};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -24,12 +26,17 @@ fn idle_channel() -> (ReverseChannel, mpsc::Receiver<String>) {
 }
 
 /// A `client.hello` identity for logical client `id`, advertising (or not)
-/// the `browserExec` capability.
+/// the `browserExec` capability, with a `hostname` derived from `id`.
 fn identity(id: &str, browser_exec: bool) -> ReverseClientIdentity {
     ReverseClientIdentity {
         client_id: ClientId::from_string(id),
         name: Some(format!("client {id}")),
         capabilities: json!({ "browserExec": browser_exec }),
+        host: ClientHostInfo {
+            hostname: Some(format!("{id}.local")),
+            pretty_hostname: None,
+            device_kind: None,
+        },
     }
 }
 
@@ -498,6 +505,7 @@ fn live_clients_groups_hellod_connections_by_client() {
     assert_eq!(a.client_id.as_str(), "a", "ordered by first connection");
     assert_eq!(a.name.as_deref(), Some("client a"));
     assert_eq!(a.capabilities, json!({ "browserExec": true }));
+    assert_eq!(a.host.hostname.as_deref(), Some("a.local"));
     assert_eq!(a.connections, 2);
     assert_eq!(
         a.transports,

@@ -7,7 +7,9 @@
 //! **never** the draft text (no leakage, PROTOCOL §5.16/§6.5).
 
 use intent_core::events::DRAFT_CHANGED;
-use intent_core::{now_iso, AgentId, ClientId, Draft, EventActor, Result, WorkspaceId};
+use intent_core::{
+    now_iso, AgentId, ClientHostInfo, ClientId, Draft, EventActor, Result, WorkspaceId,
+};
 use intent_store::NewEvent;
 
 use crate::{publish_event, Services};
@@ -15,15 +17,16 @@ use crate::{publish_event, Services};
 impl Services {
     /// `client.hello` persistence: upsert the logical `client` row, setting
     /// `first_seen` once and touching `last_seen`, persisting `name` /
-    /// `capabilities` (PROTOCOL §5.17).
+    /// `capabilities` / the client's host identification (PROTOCOL §5.17).
     pub(crate) async fn client_hello_upsert(
         &self,
         client_id: ClientId,
         name: Option<String>,
         capabilities: Option<serde_json::Value>,
+        host: ClientHostInfo,
     ) -> Result<()> {
         self.store
-            .upsert_client(&client_id, name.as_deref(), capabilities.as_ref())
+            .upsert_client(&client_id, name.as_deref(), capabilities.as_ref(), &host)
             .await
     }
 

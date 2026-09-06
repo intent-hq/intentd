@@ -12203,7 +12203,7 @@ mod drafts_events {
     use std::time::Duration;
 
     use intent_core::events::DRAFT_CHANGED;
-    use intent_core::{AgentId, ClientId, WorkspaceId};
+    use intent_core::{AgentId, ClientHostInfo, ClientId, WorkspaceId};
     use intent_store::Store;
     use serde_json::json;
 
@@ -12218,7 +12218,7 @@ mod drafts_events {
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let client = ClientId::from_string("cli-secret");
         store
-            .upsert_client(&client, None, None)
+            .upsert_client(&client, None, None, &ClientHostInfo::default())
             .await
             .expect("client");
         let agent = AgentId::from_string("agent-1");
@@ -12293,7 +12293,7 @@ mod drafts_events {
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let client = ClientId::from_string("cli-attach");
         store
-            .upsert_client(&client, None, None)
+            .upsert_client(&client, None, None, &ClientHostInfo::default())
             .await
             .expect("client");
         let agent = AgentId::from_string("agent-1");
@@ -30653,8 +30653,9 @@ mod browser_client_pin {
     use std::time::Duration;
 
     use intent_core::{
-        AgentReverseDispatch, BoxFuture, ClientId, Error, ResolvedClient, ReverseDispatchError,
-        ReverseLiveClient, ReverseTarget, WorkspaceApi, WorkspaceId, CHIEF_WORKSPACE_ID,
+        AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, Error, ResolvedClient,
+        ReverseDispatchError, ReverseLiveClient, ReverseTarget, WorkspaceApi, WorkspaceId,
+        CHIEF_WORKSPACE_ID,
     };
     use intent_store::Store;
     use serde_json::{json, Value};
@@ -30725,6 +30726,7 @@ mod browser_client_pin {
                     client_id: id.clone(),
                     name: name.clone(),
                     capabilities: json!({ "browserExec": eligible }),
+                    host: ClientHostInfo::default(),
                     connections: 1,
                     transports: vec!["wss".to_string()],
                     connected_at: "2026-09-06T00:00:00Z".to_string(),
@@ -30766,6 +30768,7 @@ mod browser_client_pin {
                     &ClientId::from_string(id),
                     Some(name),
                     Some(&json!({ "browserExec": true })),
+                    &ClientHostInfo::default(),
                 )
                 .await
                 .expect("client");
