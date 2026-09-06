@@ -5,8 +5,9 @@ use intent_core::{ActorType, Event};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::classifier::classify;
+use super::classifier::Classifier;
 use super::manifest::Manifest;
+use super::paths::WorkspacePaths;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +37,15 @@ pub struct MapActivity {
 }
 
 pub fn project(manifest: &Manifest, event: &Event) -> Option<MapActivity> {
+    project_with_paths(manifest, &WorkspacePaths::default(), event)
+}
+
+pub fn project_with_paths(
+    manifest: &Manifest,
+    workspace_paths: &WorkspacePaths,
+    event: &Event,
+) -> Option<MapActivity> {
+    let classifier = Classifier::new(manifest);
     match event.event_type.as_str() {
         FILE_CHANGED | FILE_CREATED | FILE_DELETED | "file:renamed" => {
             let kind = file_kind(event)?;
@@ -45,10 +55,10 @@ pub fn project(manifest: &Manifest, event: &Event) -> Option<MapActivity> {
                 .or_else(|| event.data.get("path"))
                 .and_then(Value::as_str)
                 .filter(|path| !path.is_empty())
-                .map(str::to_string);
+                .map(|path| workspace_paths.normalize(path, event_git_root_id(event)));
             let region_id = path
                 .as_deref()
-                .map(|path| classify(manifest, path).region_id);
+                .map(|path| classifier.classify(path).region_id);
             let (agent_id, agent_name) = agent_identity(event);
             Some(MapActivity {
                 region_id,
@@ -70,10 +80,19 @@ pub fn project(manifest: &Manifest, event: &Event) -> Option<MapActivity> {
                 .get("toolKind")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let path = event.data.get("input").and_then(find_path);
+            let input = event.data.get("input");
+            let path = input.and_then(find_path).map(|path| {
+                workspace_paths.normalize(
+                    &path,
+                    event_git_root_id(event).or_else(|| input.and_then(find_git_root_id)),
+                )
+            });
             let is_read = path.is_some() && is_read_tool(tool_name, tool_kind);
-            let region_id = is_read
-                .then(|| classify(manifest, path.as_deref().expect("checked above")).region_id);
+            let region_id = is_read.then(|| {
+                classifier
+                    .classify(path.as_deref().expect("checked above"))
+                    .region_id
+            });
             let (agent_id, agent_name) = agent_identity(event);
             Some(MapActivity {
                 region_id,
@@ -101,6 +120,10 @@ pub fn project(manifest: &Manifest, event: &Event) -> Option<MapActivity> {
         }
         _ => None,
     }
+}
+
+fn event_git_root_id(event: &Event) -> Option<&str> {
+    event.data.get("gitRootId").and_then(Value::as_str)
 }
 
 fn file_kind(event: &Event) -> Option<MapActivityKind> {
@@ -168,6 +191,17 @@ fn find_path(value: &Value) -> Option<String> {
             object.values().find_map(find_path)
         }
         Value::Array(values) => values.iter().find_map(find_path),
+        _ => None,
+    }
+}
+
+fn find_git_root_id(value: &Value) -> Option<&str> {
+    match value {
+        Value::Object(object) => object
+            .get("gitRootId")
+            .and_then(Value::as_str)
+            .or_else(|| object.values().find_map(find_git_root_id)),
+        Value::Array(values) => values.iter().find_map(find_git_root_id),
         _ => None,
     }
 }
@@ -265,5 +299,31 @@ mod tests {
         let thinking = project(&manifest(), &event(AGENT_STREAM_ACTIVITY, json!({}))).unwrap();
         assert_eq!(thinking.kind, MapActivityKind::Thinking);
         assert_eq!(thinking.agent_id.as_deref(), Some("agent-1"));
+    }
+
+    #[test]
+    fn projects_registered_root_paths_relative_to_the_workspace() {
+        let mut manifest = manifest();
+        manifest.regions[0].paths = vec!["packages/intentd/crates/**".into()];
+        let paths = WorkspacePaths::with_prefix("intentd-root", "packages/intentd");
+        let activity = project_with_paths(
+            &manifest,
+            &paths,
+            &event(
+                FILE_CHANGED,
+                json!({
+                    "relativePath": "./crates/intent-transport/src/router.rs",
+                    "gitRootId": "intentd-root",
+                    "action": "modify"
+                }),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(activity.region_id.as_deref(), Some("code"));
+        assert_eq!(
+            activity.path.as_deref(),
+            Some("packages/intentd/crates/intent-transport/src/router.rs")
+        );
     }
 }
