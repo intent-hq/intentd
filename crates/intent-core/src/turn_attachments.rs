@@ -79,22 +79,6 @@ pub fn is_workspace_api_input(input: &Value) -> bool {
             .all(|k| matches!(k.as_str(), "code" | "summary" | "_acpTitle"))
 }
 
-/// The auggie frame signature (intent-hq/intent#4491): a recorded tool input
-/// with the [`workspace_api` schema](is_workspace_api_input) whose echoed ACP
-/// title (`_acpTitle`, stamped by the transcript writer) is the call's own
-/// `summary` — the provider titled the call with the model-authored summary,
-/// so no tool identifier exists anywhere in the frame. A foreign tool that
-/// merely shares the argument shape is titled by its own name (codex
-/// `server`/`tool` metadata, `mcp.<server>.<tool>`, `mcp__<server>__<tool>`)
-/// and never matches, which keeps the claim gate consistent with the
-/// mapper's authoritative-name ordering.
-fn is_summary_titled_workspace_api_input(input: &Value) -> bool {
-    is_workspace_api_input(input)
-        && input
-            .get("_acpTitle")
-            .is_some_and(|title| Some(title) == input.get("summary"))
-}
-
 /// Where in the turn transcript a registered attachment is emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentPolicy {
@@ -202,20 +186,24 @@ impl TurnAttachmentRegistry {
     /// nonce (the dispatch layer stamped it into the model-facing output, so
     /// any non-garbled echo carries it). Fallback path: when no nonce matches
     /// and the call is the daemon's own `workspace_api` tool — EITHER
-    /// `tool_name` contains `workspace_api` OR `tool_input` (the recorded
-    /// `tool_use` input, `_acpTitle` included) carries the auggie frame
-    /// signature: the `workspace_api` schema ([`is_workspace_api_input`])
-    /// titled by its own `summary`, so the frame holds no tool identifier
-    /// and the recorded name is whatever the mapper made of the prose
-    /// (intent-hq/intent#4491) — the oldest batch with an `AtToolResult`
-    /// entry is claimed FIFO — a garbled echo cannot defeat the attach, and
-    /// only the tool that registers through this registry can trigger the
-    /// blind claim. The input gate is independent of the mapper's name
-    /// derivation (a second line of defense should a title rule ever
-    /// pre-empt the shape rule again) but defers to it on authority: a
-    /// foreign tool sharing the argument shape is titled by its own name and
-    /// never opens the gate. Empty when nothing is pending (the caller falls
-    /// back to echo parsing).
+    /// `tool_name` contains `workspace_api` OR `unidentified_input` carries
+    /// the `workspace_api` schema ([`is_workspace_api_input`]) — the oldest
+    /// batch with an `AtToolResult` entry is claimed FIFO — a garbled echo
+    /// cannot defeat the attach, and only the tool that registers through
+    /// this registry can trigger the blind claim.
+    ///
+    /// `unidentified_input` is the call's input ONLY when the frame carried
+    /// no authoritative tool identifier — no MCP `server`/`tool` metadata, no
+    /// `mcp.<server>.<tool>` / `mcp__<server>__<tool>` title — so the recorded
+    /// name is whatever the mapper made of a prose title (auggie titles the
+    /// call with its model-authored `summary`; intent-hq/intent#4491). The
+    /// caller passes `None` for an authoritatively named call: the shape
+    /// gate is a second line of defense for the identifier-less frame (should
+    /// a title rule ever pre-empt the mapper's shape rule again), not a way
+    /// around the authoritative-name ordering — a foreign tool whose
+    /// arguments happen to be `{ code, summary }` keeps its own name, and
+    /// the registry cannot tell that from the (unwrapped) input alone. Empty
+    /// when nothing is pending (the caller falls back to echo parsing).
     ///
     /// # Panics
     ///
@@ -225,7 +213,7 @@ impl TurnAttachmentRegistry {
         agent_id: &AgentId,
         echoed_output: Option<&Value>,
         tool_name: &str,
-        tool_input: Option<&Value>,
+        unidentified_input: Option<&Value>,
     ) -> Vec<TurnAttachment> {
         let mut inner = self.inner.lock().unwrap();
         let Some(entries) = inner.get_mut(agent_id) else {
@@ -239,7 +227,7 @@ impl TurnAttachmentRegistry {
             .find(|e| is_claimable(e) && !echo.is_empty() && echo.contains(&e.attachment.id))
             .map(|e| e.batch);
         let is_workspace_api = tool_name.contains("workspace_api")
-            || tool_input.is_some_and(is_summary_titled_workspace_api_input);
+            || unidentified_input.is_some_and(is_workspace_api_input);
         let batch = by_nonce.or_else(|| {
             is_workspace_api.then(|| entries.iter().find(|e| is_claimable(e)).map(|e| e.batch))?
         });
@@ -394,14 +382,13 @@ mod tests {
     }
 
     /// intent-hq/intent#4491: a provider that titles the call with its
-    /// `summary` records no usable name, so the auggie frame signature —
-    /// `workspace_api` schema + `_acpTitle == summary` — is the second FIFO
-    /// gate, independent of whatever name the mapper recorded. `{code}`
-    /// alone, a non-string `summary`, no input, or a shaped input titled by
-    /// something other than its summary does not open it; the name gate
+    /// `summary` records no usable name, so the `workspace_api` schema on
+    /// the identifier-less input is the second FIFO gate, independent of
+    /// whatever name the mapper recorded. `{code}` alone, a non-string
+    /// `summary`, an extra key, or no input does not open it; the name gate
     /// still works with no input.
     #[test]
-    fn claim_falls_back_to_fifo_on_summary_titled_workspace_api_input() {
+    fn claim_falls_back_to_fifo_on_workspace_api_shaped_unidentified_input() {
         let reg = TurnAttachmentRegistry::new();
         let a = agent();
         reg.register(&a, attachment("tar-aaa", AttachmentPolicy::AtToolResult));
@@ -413,8 +400,6 @@ mod tests {
         for shaped_wrong in [
             json!({ "code": "ws.workspace.proposeSibling(p)", "_acpTitle": prose }),
             json!({ "code": "x", "summary": 42, "_acpTitle": prose }),
-            json!({ "code": "x", "summary": prose }),
-            json!({ "code": "x", "summary": prose, "_acpTitle": "Something else" }),
             json!({ "code": "x", "summary": prose, "_acpTitle": prose, "language": "py" }),
         ] {
             assert!(
@@ -442,23 +427,20 @@ mod tests {
     }
 
     /// Authoritative names win: a foreign tool whose arguments happen to be
-    /// `{ code, summary }` is titled by its own name (`_acpTitle` is the
-    /// codex / claude namespaced title, not the summary), so the input gate
-    /// stays shut and the batch waits for the daemon's own tool.
+    /// `{ code, summary }` was identified by MCP metadata or a namespaced
+    /// title, so the caller withholds its input (`None`) and the shape gate
+    /// stays shut — the batch waits for the daemon's own tool. The registry
+    /// cannot distinguish that input from auggie's by itself, which is why
+    /// the contract puts the provenance check on the caller.
     #[test]
     fn foreign_tool_with_workspace_api_shaped_arguments_does_not_claim() {
         let reg = TurnAttachmentRegistry::new();
         let a = agent();
         reg.register(&a, attachment("tar-aaa", AttachmentPolicy::AtToolResult));
         let garbled = json!({ "output": "ok" });
-        for title in ["mcp.python.execute", "mcp__python__execute", "execute"] {
-            let input = json!({ "code": "print(1)", "summary": "Run Python", "_acpTitle": title });
-            assert!(
-                reg.claim_at_tool_result(&a, Some(&garbled), "python_execute", Some(&input))
-                    .is_empty(),
-                "title={title}"
-            );
-        }
+        assert!(reg
+            .claim_at_tool_result(&a, Some(&garbled), "python_execute", None)
+            .is_empty());
         let claimed = reg.claim_at_tool_result(&a, Some(&garbled), "workspace_api", None);
         assert_eq!(ids(&claimed), vec!["tar-aaa"]);
     }

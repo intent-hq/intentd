@@ -2423,6 +2423,146 @@ async fn auggie_shaped_workspace_api_call_claims_registered_attachment() {
         .is_empty());
 }
 
+/// A `tool_call` / `tool_call_update` pair routed through the real claim
+/// site with a bare transcript (no ACP round trip).
+fn tool_call_notification(update: &Value) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({ "sessionId": ACP_SID, "update": update }),
+    }
+}
+
+/// intent-hq/intent#4491 negative control at the real claim site: a foreign
+/// tool identified authoritatively — codex `server`/`tool` metadata, a
+/// `mcp__<server>__<tool>` title, a `mcp.<server>.<tool>` title — whose
+/// arguments happen to be `{ code, summary }` AND whose title equals the
+/// model-authored `summary` must never claim a pending `workspace_api` batch
+/// on a garbled completion. The recorded input is indistinguishable from
+/// auggie's (the codex unwrap strips `server`/`tool`; a summary may equal a
+/// namespaced title), so only the mapper's provenance keeps the gate shut.
+#[tokio::test]
+async fn summary_titled_foreign_tool_never_claims_registered_attachment() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let args = |summary: &str| json!({ "code": "print(1)", "summary": summary });
+    let frames = [
+        (
+            "t1",
+            "Run Python",
+            json!({ "arguments": args("Run Python"), "server": "python", "tool": "execute" }),
+        ),
+        ("t2", "mcp__python__execute", args("mcp__python__execute")),
+        ("t3", "mcp.python.execute", args("mcp.python.execute")),
+    ];
+    for (id, title, raw_input) in frames {
+        let mut transcript = super::Transcript::new("m1".to_string());
+        services.turn_attachments().register(
+            &agent_id,
+            test_attachment("tar-foreign", intent_core::AttachmentPolicy::AtToolResult),
+        );
+        services
+            .route_notification(
+                &tool_call_notification(&json!({
+                    "sessionUpdate": "tool_call", "toolCallId": id, "title": title,
+                    "kind": "execute", "status": "in_progress", "rawInput": raw_input })),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+        services
+            .route_notification(
+                &tool_call_notification(&json!({
+                    "sessionUpdate": "tool_call_update", "toolCallId": id,
+                    "status": "completed", "rawOutput": { "output": "ok" } })),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+        let blocks = transcript.into_blocks();
+        assert_eq!(blocks[0]["name"], "python_execute", "title={title}");
+        assert!(
+            intent_core::is_workspace_api_input(&blocks[0]["input"]),
+            "recorded input is workspace_api-shaped: title={title}"
+        );
+        assert_eq!(
+            blocks.len(),
+            2,
+            "tool_use + tool_result only, no attached resource: title={title}"
+        );
+        // The batch is still pending for the daemon's own tool.
+        let claimed = services.turn_attachments().claim_at_tool_result(
+            &agent_id,
+            None,
+            "workspace_api",
+            None,
+        );
+        assert_eq!(claimed.len(), 1, "title={title}");
+        assert_eq!(claimed[0].id, "tar-foreign", "title={title}");
+    }
+}
+
+/// intent-hq/intent#4491 (sparse-input ordering): a prose-titled first sight
+/// with `rawInput: null` records the prose as the name and only an
+/// `_acpTitle` placeholder as the input; the completed update then supplies
+/// the first `{ code, summary }` input alongside a garbled echo. The claim
+/// must inspect the update's fresh input — not the persisted placeholder —
+/// so the shape gate opens even though the recorded name never became
+/// `workspace_api`. This is the recorded-input path's own coverage: with the
+/// name gate alone the batch would be dropped.
+#[tokio::test]
+async fn sparse_input_workspace_api_call_claims_on_the_update_that_supplies_input() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let prose = "Propose a follow-up workspace";
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.turn_attachments().register(
+        &agent_id,
+        test_attachment("tar-sparse", intent_core::AttachmentPolicy::AtToolResult),
+    );
+    services
+        .route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call", "toolCallId": "t1", "title": prose,
+                "kind": "other", "status": "in_progress", "rawInput": null })),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    assert_eq!(transcript.tool_name_for("t1"), Some(prose));
+    services
+        .route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed",
+                "rawInput": { "code": "ws.workspace.proposeSibling(p)", "summary": prose },
+                "rawOutput": { "output": "[tool ran] {\"ok\": tru…(truncated)" } })),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    let blocks = transcript.into_blocks();
+    assert_eq!(blocks.len(), 3, "tool_use + tool_result + registered block");
+    assert_eq!(blocks[0]["name"], prose, "the recorded name stays prose");
+    assert_eq!(
+        blocks[0]["input"],
+        json!({ "code": "ws.workspace.proposeSibling(p)", "summary": prose, "_acpTitle": prose })
+    );
+    assert_eq!(
+        blocks[2]["resource"]["text"],
+        "{\"kind\":\"settings-change\",\"attachmentId\":\"tar-sparse\"}"
+    );
+    assert_eq!(
+        services
+            .turn_attachments()
+            .claim_at_tool_result(&agent_id, None, "workspace_api", None)
+            .len(),
+        0,
+        "the batch was consumed by the claim"
+    );
+}
+
 /// §7.1 `AtTurnEnd` policy: attachments registered with the turn-end policy
 /// are appended as trailing resource blocks when the turn finalizes, and
 /// unclaimed `AtToolResult` leftovers are dropped (not attached, not leaked
