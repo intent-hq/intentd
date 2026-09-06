@@ -10454,7 +10454,19 @@ impl Services {
             anchors.push(watch.parent_workspace_id);
         }
         if let Some(group) = target_group {
-            self.remove_group_with_watches(&agent_id, &group.group_id);
+            // The group stayed live between the up-front delete and this
+            // removal, so an enroll/completion upsert may sit on the lane
+            // behind that delete. The removal enqueues a trailing delete
+            // ordered after any such upsert; await it so `success` is not
+            // published while an undelivered row could still rehydrate.
+            if let Some((_, ack)) = self.remove_group_with_watches(&agent_id, &group.group_id) {
+                if let Err(e) = Self::await_group_persist(ack).await {
+                    tracing::warn!(
+                        group = %group.group_id,
+                        "trailing delegation_group delete failed after scoped cancel: {e}"
+                    );
+                }
+            }
             if !anchors.contains(&group.workspace_id) {
                 anchors.push(group.workspace_id);
             }

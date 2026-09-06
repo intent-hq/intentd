@@ -1274,17 +1274,19 @@ impl Services {
     /// parented by `parent_id`; returns the removed snapshot or `None` when
     /// no such group exists. The persisted watch rows are swept best-effort
     /// (spawned, like every other watch-delete path); the persisted GROUP row
-    /// delete is enqueued on the lane under the lock (the scoped
-    /// `agent.cancelSubscriptions` path already committed one
-    /// durable-before-observable — this trailing delete only guarantees that
-    /// any create/enroll upsert still queued ahead of it cannot resurrect
-    /// the row).
+    /// delete is enqueued on the lane under the lock and its ack returned:
+    /// the scoped `agent.cancelSubscriptions` path already committed one
+    /// delete durable-before-observable, but the group stayed live in the
+    /// registry until this call, so an enroll/completion upsert may have been
+    /// enqueued after that delete. This trailing delete is ordered after any
+    /// such upsert; awaiting its ack before publishing success is what makes
+    /// the cancel fully durable-before-observable.
     pub(crate) fn remove_group_with_watches(
         &self,
         parent_id: &AgentId,
         group_id: &str,
-    ) -> Option<DelegationGroup> {
-        let (group, watch_ids) = {
+    ) -> Option<(DelegationGroup, oneshot::Receiver<Result<()>>)> {
+        let (group, ack, watch_ids) = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
@@ -1294,7 +1296,8 @@ impl Services {
                 .iter()
                 .position(|g| g.group_id == group_id && &g.parent_agent_id == parent_id)?;
             let group = guard.delegation_groups.remove(idx);
-            self.enqueue_group_persist(GroupPersistOp::Delete(group.group_id.clone()));
+            let ack =
+                self.enqueue_group_persist_acked(GroupPersistOp::Delete(group.group_id.clone()));
             let mut watch_ids = Vec::new();
             guard.subscriptions.retain(|s| {
                 if s.group_id.as_deref() == Some(group_id) {
@@ -1304,7 +1307,7 @@ impl Services {
                     true
                 }
             });
-            (group, watch_ids)
+            (group, ack, watch_ids)
         };
         if !watch_ids.is_empty() {
             let store = self.store.clone();
@@ -1316,7 +1319,7 @@ impl Services {
                 }
             });
         }
-        Some(group)
+        Some((group, ack))
     }
 
     /// Drop `child_id` from a group's expected/completed/deleted sets (the
@@ -1414,7 +1417,7 @@ impl Services {
         rx
     }
 
-    async fn await_group_persist(ack: oneshot::Receiver<Result<()>>) -> Result<()> {
+    pub(crate) async fn await_group_persist(ack: oneshot::Receiver<Result<()>>) -> Result<()> {
         ack.await.unwrap_or_else(|_| {
             Err(Error::Internal(
                 "delegation_group persistence lane closed".to_string(),
