@@ -4124,8 +4124,15 @@ impl AgentManager {
         if prior.is_empty() {
             return content.to_string();
         }
-        let history_xml =
-            crate::history_xml::format_history_as_xml(prior, crate::history_xml::MAX_HISTORY_CHARS);
+        // The per-block cap is read live so a `config.toml` edit applies to
+        // the next replay without a daemon restart.
+        let tool_content_chars =
+            crate::settings::history_replay_tool_content_chars(&self.services.effective_settings());
+        let history_xml = crate::history_xml::format_history_as_xml(
+            prior,
+            crate::history_xml::MAX_HISTORY_CHARS,
+            tool_content_chars,
+        );
         format!("{history_xml}\n\n{content}")
     }
 

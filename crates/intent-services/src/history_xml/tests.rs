@@ -1,10 +1,17 @@
 //! Unit tests for the `<supervisor>` history XML formatter (parity with the TS
 //! `formatHistoryAsXml` / `sanitizeMessagesForHistory`).
 
+use intent_core::replay_preview::{
+    truncate_marked, INPUT_REPLAY_ORIGINAL_CHARS_KEY, OUTPUT_REPLAY_ORIGINAL_CHARS_KEY,
+};
 use intent_core::{AgentId, AgentMessage};
 use serde_json::{json, Value};
 
 use super::{format_history_as_xml, MAX_HISTORY_CHARS};
+
+/// The schema default of `agents.historyReplayToolContentChars` (4000).
+const TOOL_CONTENT_CHARS: usize =
+    intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS as usize;
 
 fn msg(role: &str, content: Value) -> AgentMessage {
     AgentMessage {
@@ -21,7 +28,10 @@ fn msg(role: &str, content: Value) -> AgentMessage {
 
 #[test]
 fn empty_input_renders_empty_string() {
-    assert_eq!(format_history_as_xml(&[], MAX_HISTORY_CHARS), "");
+    assert_eq!(
+        format_history_as_xml(&[], MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS),
+        ""
+    );
 }
 
 #[test]
@@ -30,7 +40,7 @@ fn wraps_exchanges_in_supervisor_with_text_blocks() {
         msg("user", json!([{ "type": "text", "text": "hello" }])),
         msg("assistant", json!([{ "type": "text", "text": "hi there" }])),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.starts_with("<supervisor>\n"));
     assert!(xml.ends_with("</supervisor>"));
     assert!(xml.contains("<exchange>\n"));
@@ -44,7 +54,7 @@ fn escapes_xml_special_characters() {
         "user",
         json!([{ "type": "text", "text": "a < b & c > d \"q\"" }]),
     )];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("<text>a &lt; b &amp; c &gt; d &quot;q&quot;</text>"));
 }
 
@@ -66,7 +76,7 @@ fn renders_tool_use_and_tool_result_blocks() {
             }]),
         ),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("<tool_use name=\"edit\" tool_use_id=\"t1\">"));
     // The JSON input is rendered then XML-escaped (quotes → &quot;).
     assert!(xml.contains("{&quot;path&quot;:&quot;src/lib.rs&quot;}"));
@@ -95,7 +105,7 @@ fn sanitizes_malformed_tool_results_and_empty_assistants() {
             ]),
         ),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("<tool_result tool_use_id=\"a\" is_error=\"false\">"));
     assert!(xml.contains("done"));
     assert!(!xml.contains("dup"));
@@ -128,7 +138,7 @@ fn sanitizes_dangling_tool_use_blocks() {
             ]),
         ),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     // t1 with result should appear.
     assert!(xml.contains("<tool_use name=\"edit\" tool_use_id=\"t1\">"));
     assert!(xml.contains("<tool_result tool_use_id=\"t1\" is_error=\"false\">"));
@@ -144,7 +154,7 @@ fn truncates_oversized_tool_content_in_the_middle() {
         "user",
         json!([{ "type": "tool_result", "tool_use_id": "t", "output": big }]),
     )];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("characters truncated"));
     assert!(xml.len() < 10_000);
 }
@@ -154,7 +164,7 @@ fn truncates_oversized_tool_content_in_the_middle() {
 #[test]
 fn preamble_carries_truncation_hint_paragraph() {
     let messages = vec![msg("user", json!([{ "type": "text", "text": "hello" }]))];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     let (preamble, _) = xml
         .split_once("<exchange>")
         .expect("preamble before exchanges");
@@ -170,6 +180,108 @@ fn preamble_carries_truncation_hint_paragraph() {
     assert!(preamble.contains("Do not re-fetch the same inputs repeatedly"));
 }
 
+/// The preamble names the configured cap and the truncation follows it, so a
+/// `config.toml` edit changes both without a restart.
+#[test]
+fn preamble_and_truncation_follow_the_configured_cap() {
+    let big = "x".repeat(10_000);
+    let messages = vec![msg(
+        "user",
+        json!([{ "type": "tool_result", "tool_use_id": "t", "output": big }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, 8000);
+    let (preamble, body) = xml.split_once("<exchange>").expect("exchange body");
+    assert!(preamble.contains("longer than 8000 characters is middle-truncated"));
+    assert!(!preamble.contains("4000"));
+    // 8000 cap → 3970-char halves; 10000 - 7940 = 2060 omitted.
+    assert!(body.contains(
+        "<tool_result tool_use_id=\"t\" is_error=\"false\" truncated=\"true\" original_chars=\"10000\">"
+    ));
+    assert!(body.contains("\n... [2060 characters truncated] ...\n"));
+    // Above the body size the block renders whole, unmarked.
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, 12_000);
+    let (_, body) = xml.split_once("<exchange>").expect("exchange body");
+    assert!(!body.contains("truncated="));
+    assert!(body.contains(&"x".repeat(10_000)));
+}
+
+/// Replay-preview blocks (the heavy field pre-truncated by the retention
+/// sweep, marked with `*ReplayOriginalChars`) render byte-identically to
+/// the full-body rendering at the same cap, and re-truncate when the cap is
+/// smaller than the stored preview.
+#[test]
+fn replay_preview_blocks_render_identically_to_full_bodies() {
+    let full_input = json!({ "path": "p".repeat(6_000), "n": 7 });
+    let full_output: String = (0..9_000u32)
+        .map(|i| char::from(b'a' + u8::try_from(i % 26).unwrap()))
+        .collect();
+    let full = vec![
+        msg(
+            "assistant",
+            json!([{ "type": "tool_use", "name": "view", "tool_use_id": "t1", "input": full_input }]),
+        ),
+        msg(
+            "user",
+            json!([{ "type": "tool_result", "tool_use_id": "t1", "output": full_output }]),
+        ),
+    ];
+    for (stored_cap, caps) in [
+        (4000usize, vec![4000usize]),
+        (12_000, vec![4000, 500, 8000]),
+    ] {
+        let (input_preview, input_original) =
+            truncate_marked(&serde_json::to_string(&full_input).unwrap(), stored_cap);
+        let (output_preview, output_original) = truncate_marked(&full_output, stored_cap);
+        let pruned = vec![
+            msg(
+                "assistant",
+                json!([{
+                    "type": "tool_use", "name": "view", "tool_use_id": "t1",
+                    "input": input_preview,
+                    INPUT_REPLAY_ORIGINAL_CHARS_KEY: input_original,
+                }]),
+            ),
+            msg(
+                "user",
+                json!([{
+                    "type": "tool_result", "tool_use_id": "t1",
+                    "output": output_preview,
+                    OUTPUT_REPLAY_ORIGINAL_CHARS_KEY: output_original,
+                }]),
+            ),
+        ];
+        for cap in caps {
+            assert_eq!(
+                format_history_as_xml(&pruned, MAX_HISTORY_CHARS, cap),
+                format_history_as_xml(&full, MAX_HISTORY_CHARS, cap),
+                "stored cap {stored_cap}, replay cap {cap}"
+            );
+        }
+    }
+}
+
+/// A preview stored at a smaller cap than the current one is never expanded:
+/// it renders as stored, still carrying the truncation attribute.
+#[test]
+fn replay_preview_below_current_cap_is_not_expanded() {
+    let full_output = "o".repeat(20_000);
+    let (preview, original) = truncate_marked(&full_output, 4000);
+    let messages = vec![msg(
+        "user",
+        json!([{
+            "type": "tool_result", "tool_use_id": "t1",
+            "output": preview,
+            OUTPUT_REPLAY_ORIGINAL_CHARS_KEY: original,
+        }]),
+    )];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, 8000);
+    let (_, body) = xml.split_once("<exchange>").expect("exchange body");
+    assert!(body.contains(
+        "<tool_result tool_use_id=\"t1\" is_error=\"false\" truncated=\"true\" original_chars=\"20000\">"
+    ));
+    assert!(body.contains(&format!("      {preview}\n")));
+}
+
 /// intent#3696: an over-cap `tool_result` is marked at the element level
 /// (`truncated="true" original_chars="N"`) in addition to the inline marker.
 #[test]
@@ -179,7 +291,7 @@ fn oversized_tool_result_carries_truncated_attribute_and_marker() {
         "user",
         json!([{ "type": "tool_result", "tool_use_id": "t", "output": big }]),
     )];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains(
         "<tool_result tool_use_id=\"t\" is_error=\"false\" truncated=\"true\" original_chars=\"10000\">"
     ));
@@ -196,7 +308,7 @@ fn truncated_attribute_and_marker_count_chars_not_bytes() {
         "user",
         json!([{ "type": "tool_result", "tool_use_id": "t", "output": multibyte }]),
     )];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains(
         "<tool_result tool_use_id=\"t\" is_error=\"false\" truncated=\"true\" original_chars=\"5000\">"
     ));
@@ -213,7 +325,7 @@ fn under_cap_tool_result_has_no_truncated_attribute() {
         "user",
         json!([{ "type": "tool_result", "tool_use_id": "t", "output": exact }]),
     )];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     // The preamble mentions the attribute/marker by name; only the exchange
     // body must be free of them.
     let (_, body) = xml.split_once("<exchange>").expect("exchange body");
@@ -245,7 +357,7 @@ fn tool_use_input_truncated_attribute_tracks_cap() {
             ]),
         ),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     let (_, body) = xml.split_once("<exchange>").expect("exchange body");
     // `{"path":"` + 10000 + `"}` = 10011 chars of stringified JSON input.
     assert!(body.contains(
@@ -266,8 +378,8 @@ fn budget_omits_older_exchanges_newest_first() {
     ];
     // Budget large enough for the wrapper + one exchange (plus the reserved
     // omission-comment overhead) but not both exchanges.
-    let one = format_history_as_xml(&messages[2..], MAX_HISTORY_CHARS);
-    let xml = format_history_as_xml(&messages, one.len() + 80);
+    let one = format_history_as_xml(&messages[2..], MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
+    let xml = format_history_as_xml(&messages, one.len() + 80, TOOL_CONTENT_CHARS);
     assert!(xml.contains("NEWEST"));
     assert!(!xml.contains("OLDEST"));
     assert!(xml.contains("earlier exchanges omitted due to size limits"));
@@ -279,7 +391,7 @@ fn renders_thinking_block_as_thinking_tag() {
         "assistant",
         json!([{ "type": "thinking", "text": "pondering <x>" }]),
     )];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     // Thinking blocks are escaped just like text blocks (TS `escapeXml`).
     assert!(xml.contains("<thinking>pondering &lt;x&gt;</thinking>"));
 }
@@ -297,7 +409,7 @@ fn unknown_block_type_and_unknown_role_are_dropped_silently() {
         // Unknown roles fall through the `_ => {}` arm in the exchange grouper.
         msg("system", json!([{ "type": "text", "text": "sys" }])),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("<text>ok</text>"));
     assert!(!xml.contains("ignored"));
     assert!(!xml.contains("sys"));
@@ -309,7 +421,7 @@ fn empty_user_and_null_error_content_render_as_empty_wrappers() {
     // (sanitize pushes a Msg with empty blocks); the assistant variant is
     // dropped entirely (already covered).
     let messages = vec![msg("user", json!([])), msg("error", Value::Null)];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("<user_request_or_tool_results>\n  </user_request_or_tool_results>"));
     assert!(xml.contains("<error>\n  </error>"));
 }
@@ -322,7 +434,7 @@ fn assistant_whose_blocks_all_get_sanitized_is_dropped() {
         "assistant",
         json!([{ "type": "tool_result", "tool_use_id": "", "output": "x" }]),
     )];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     // The supervisor wrapper still appears, but the (now-empty) exchange list
     // contains no assistant tag and no tool_result element (the preamble's
     // prose mentions `tool_result` by name, so match the element form).
@@ -345,7 +457,7 @@ fn tool_use_without_name_or_input_renders_defaults() {
             json!([{ "type": "tool_result", "tool_use_id": "t1", "output": "ok" }]),
         ),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("<tool_use name=\"\" tool_use_id=\"t1\">"));
     // Empty input object stringifies to `{}` (then XML-escapes to `{}`).
     assert!(xml.contains("  {}\n"));
@@ -365,7 +477,7 @@ fn long_tool_name_is_truncated_with_ellipsis() {
             json!([{ "type": "tool_result", "tool_use_id": "t", "output": "ok" }]),
         ),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     // 200 cap → 197 chars of head + "..." (3 chars).
     let head: String = "n".repeat(197);
     assert!(xml.contains(&format!("<tool_use name=\"{head}...\" tool_use_id=\"t\">")));
@@ -392,7 +504,7 @@ fn tool_result_falls_back_to_content_when_output_is_null_or_missing() {
             ]),
         ),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("from-content"));
     assert!(xml.contains("bare-content"));
 }
@@ -405,7 +517,7 @@ fn tool_result_is_error_true_with_no_output_renders_empty_content() {
         "assistant",
         json!([{ "type": "tool_result", "tool_use_id": "e", "is_error": true }]),
     )];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("<tool_result tool_use_id=\"e\" is_error=\"true\">"));
 }
 
@@ -432,7 +544,7 @@ fn numeric_output_renders_as_json_and_zero_falls_back_to_content() {
             ]),
         ),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(xml.contains("<tool_result tool_use_id=\"n42\" is_error=\"true\">"));
     // Indent inside the assistant wrapper is 4 spaces; tool body adds 2 more.
     assert!(xml.contains("\n      42\n"));
@@ -448,7 +560,7 @@ fn consecutive_assistants_without_user_split_into_exchanges() {
         msg("assistant", json!([{ "type": "text", "text": "first" }])),
         msg("assistant", json!([{ "type": "text", "text": "second" }])),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert_eq!(
         xml.matches("<exchange>\n").count(),
         2,
@@ -464,7 +576,7 @@ fn error_role_renders_as_error_tag_within_current_exchange() {
         msg("user", json!([{ "type": "text", "text": "go" }])),
         msg("error", json!([{ "type": "text", "text": "boom" }])),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     // Error messages render with the `<error>` tag (not `agent_response_…`).
     assert!(xml.contains("  <error>\n    <text>boom</text>\n  </error>\n"));
 }
@@ -484,7 +596,7 @@ fn system_model_changed_notice_is_excluded_from_replay() {
         msg("user", json!([{ "type": "text", "text": "again" }])),
         msg("assistant", json!([{ "type": "text", "text": "sure" }])),
     ];
-    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
     assert!(!xml.contains("Model changed"), "notice must not render");
     assert!(
         xml.contains("hello") && xml.contains("again"),
