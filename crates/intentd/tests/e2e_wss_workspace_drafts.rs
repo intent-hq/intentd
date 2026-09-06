@@ -14,7 +14,9 @@ use intent_core::{
     Result as CoreResult, SetupResult, SetupResultState, WorkspaceApi, WorkspaceDraftId,
     WorkspaceId,
 };
-use intent_services::{EventBus, Services, WorkspaceDraftPromotionFailpoint};
+use intent_services::{
+    EventBus, Services, WorkspaceDraftPreTransitionHook, WorkspaceDraftPromotionFailpoint,
+};
 use intent_store::Store;
 use intent_transport::{
     ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
@@ -157,6 +159,14 @@ async fn boot_with_failpoint(
     root: &Path,
     failpoint: Option<WorkspaceDraftPromotionFailpoint>,
 ) -> (WsApiServer, u16, Arc<ClientConfig>) {
+    boot_with_hooks(root, failpoint, None).await
+}
+
+async fn boot_with_hooks(
+    root: &Path,
+    failpoint: Option<WorkspaceDraftPromotionFailpoint>,
+    transition_hook: Option<WorkspaceDraftPreTransitionHook>,
+) -> (WsApiServer, u16, Arc<ClientConfig>) {
     let store = Store::open(&root.join("intentd.db")).await.expect("store");
     store
         .reconcile_interrupted_setup_results()
@@ -168,6 +178,9 @@ async fn boot_with_failpoint(
         .with_event_bus(bus.clone());
     if let Some(failpoint) = failpoint {
         services = services.with_workspace_draft_promotion_failpoint(failpoint);
+    }
+    if let Some(hook) = transition_hook {
+        services = services.with_workspace_draft_pre_transition_hook(hook);
     }
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let tls = ensure_tls_certificate(root).expect("certificate");
@@ -382,6 +395,80 @@ async fn delete_waits_for_in_flight_promotion_to_finish() {
             .unwrap(),
         json!({"deleted":true})
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promote_conflicts_when_update_commits_before_phase_transition() {
+    let root = TempDir::new();
+    let repo = make_repo(&root.0);
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let callback_release = release.clone();
+    let hook: WorkspaceDraftPreTransitionHook = Arc::new(move |_| {
+        entered_tx.send(()).unwrap();
+        let (lock, ready) = &*callback_release;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = ready.wait(released).unwrap();
+        }
+    });
+    let (_server, port, config) = boot_with_hooks(&root.0, None, Some(hook)).await;
+    let mut ws = connect(port, config).await;
+    let draft = rpc(
+        &mut ws,
+        1,
+        "workspaceDraft.create",
+        json!({"intentText":"stale","source":{"kind":"local","path":repo,"branch":"main","isolation":"in-place"}}),
+    )
+    .await;
+    let draft_id = draft["id"].as_str().unwrap().to_string();
+    let promote_id = draft_id.clone();
+    let promotion = tokio::spawn(async move {
+        rpc_raw(
+            &mut ws,
+            2,
+            "workspaceDraft.promote",
+            json!({"id":promote_id,"expectedRevision":0}),
+        )
+        .await
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("promotion reached pre-transition hook");
+
+    let store = Store::open(&root.0.join("intentd.db")).await.unwrap();
+    let latest = store
+        .update_workspace_draft_with_revision(
+            &WorkspaceDraftId::from(draft_id.as_str()),
+            0,
+            intent_store::WorkspaceDraftPatch {
+                intent_text: Some("new input".to_string()),
+                ..intent_store::WorkspaceDraftPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.revision, 1);
+    let (lock, ready) = &*release;
+    *lock.lock().unwrap() = true;
+    ready.notify_one();
+
+    let conflict = timeout(Duration::from_secs(5), promotion)
+        .await
+        .expect("promotion returned conflict")
+        .unwrap();
+    assert_eq!(conflict["error"]["code"], -32009);
+    assert_eq!(conflict["error"]["data"]["current"]["revision"], 1);
+    assert_eq!(
+        store
+            .get_workspace_draft(&WorkspaceDraftId::from(draft_id.as_str()))
+            .await
+            .unwrap()
+            .phase,
+        intent_core::DraftPhase::Editing
+    );
+    assert!(store.list_workspaces(false).await.unwrap().is_empty());
 }
 
 async fn connect(port: u16, config: Arc<ClientConfig>) -> Ws {

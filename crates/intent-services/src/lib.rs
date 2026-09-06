@@ -55,6 +55,9 @@ pub use intent_core::{Error, Result, WorkspaceApi};
 /// Integration-test callback for interrupting workspace draft promotion.
 pub type WorkspaceDraftPromotionFailpoint = Arc<dyn Fn(&WorkspaceDraftId) -> bool + Send + Sync>;
 
+/// Integration-test callback immediately before the Editing→Promoting transition.
+pub type WorkspaceDraftPreTransitionHook = Arc<dyn Fn(&WorkspaceDraftId) + Send + Sync>;
+
 mod acp_adapter;
 mod agent_locks;
 mod agent_manager;
@@ -367,6 +370,8 @@ pub struct Services {
     /// Integration-test seam immediately after the workspace/draft transaction
     /// commits, before post-insert setup or initial-agent creation.
     workspace_draft_promotion_failpoint: Option<WorkspaceDraftPromotionFailpoint>,
+    /// Integration-test seam after the promotion snapshot and before its phase transition.
+    workspace_draft_pre_transition_hook: Option<WorkspaceDraftPreTransitionHook>,
     /// Per-agent in-memory send queues backing `agent.queueMessage` /
     /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
@@ -1125,6 +1130,7 @@ impl Services {
             event_bus: None,
             workspace_draft_promotion_locks: Arc::new(Mutex::new(HashMap::new())),
             workspace_draft_promotion_failpoint: None,
+            workspace_draft_pre_transition_hook: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -1246,6 +1252,16 @@ impl Services {
         failpoint: WorkspaceDraftPromotionFailpoint,
     ) -> Self {
         self.workspace_draft_promotion_failpoint = Some(failpoint);
+        self
+    }
+
+    /// Install an integration-test hook immediately before promotion changes phase.
+    #[must_use]
+    pub fn with_workspace_draft_pre_transition_hook(
+        mut self,
+        hook: WorkspaceDraftPreTransitionHook,
+    ) -> Self {
+        self.workspace_draft_pre_transition_hook = Some(hook);
         self
     }
 

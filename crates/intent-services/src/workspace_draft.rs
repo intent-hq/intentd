@@ -121,9 +121,18 @@ impl Services {
         let promoting = if draft.phase == DraftPhase::Promoting {
             draft
         } else {
+            if let Some(hook) = &self.workspace_draft_pre_transition_hook {
+                hook(&id);
+            }
             self.store
-                .set_workspace_draft_phase(&id, DraftPhase::Promoting, None)
-                .await?
+                .set_workspace_draft_phase_with_revision(
+                    &id,
+                    expected_revision,
+                    DraftPhase::Promoting,
+                    None,
+                )
+                .await?;
+            self.store.get_workspace_draft(&id).await?
         };
         self.publish_workspace_draft_updated(&promoting).await;
 

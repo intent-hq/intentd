@@ -184,6 +184,38 @@ impl Store {
         self.get_workspace_draft(id).await
     }
 
+    /// Set a draft phase only when `expected_revision` still matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` on a stale revision, `Error::NotFound` when
+    /// absent, or `Error::Internal` on write failure.
+    pub async fn set_workspace_draft_phase_with_revision(
+        &self,
+        id: &WorkspaceDraftId,
+        expected_revision: u64,
+        phase: DraftPhase,
+        last_error: Option<&str>,
+    ) -> Result<WorkspaceDraft> {
+        let res = sqlx::query(
+            "UPDATE workspace_draft SET phase=?, last_error=?, revision=revision+1, updated_at=? \
+             WHERE id=? AND revision=?",
+        )
+        .bind(enum_to_db(&phase)?)
+        .bind(last_error)
+        .bind(now_iso())
+        .bind(&id.0)
+        .bind(u64_to_i64(expected_revision, "expected_revision")?)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set workspace draft phase failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            let latest = self.get_workspace_draft(id).await?;
+            return Err(conflict(&latest)?);
+        }
+        self.get_workspace_draft(id).await
+    }
+
     /// Record the exactly-once promotion mapping and mark the draft promoted.
     ///
     /// # Errors
@@ -471,5 +503,35 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.delivery, delivery);
         assert_eq!(delivered.revision, 3);
+    }
+
+    #[tokio::test]
+    async fn phase_transition_rejects_a_stale_revision() {
+        let db = TempDb::new();
+        let store = Store::open(&db.0).await.unwrap();
+        let original = draft("operation-3");
+        store.create_workspace_draft(&original).await.unwrap();
+        store
+            .update_workspace_draft_with_revision(
+                &original.id,
+                0,
+                WorkspaceDraftPatch {
+                    intent_text: Some("newer input".to_string()),
+                    ..WorkspaceDraftPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = store
+            .set_workspace_draft_phase_with_revision(&original.id, 0, DraftPhase::Promoting, None)
+            .await
+            .unwrap_err();
+        let Error::Conflict { current } = error else {
+            panic!("expected conflict")
+        };
+        assert_eq!(current["revision"], 1);
+        assert_eq!(current["phase"], "editing");
+        assert_eq!(current["intentText"], "newer input");
     }
 }
