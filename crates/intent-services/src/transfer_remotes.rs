@@ -517,18 +517,47 @@ fn validate_remote_snapshot_ref(anchor: &str, workspace_id: &str) -> Result<()> 
     Ok(())
 }
 
+/// Refs advertised by the bundle header, by exact full name. `git fetch`
+/// applies DWIM to a source that is not advertised verbatim — `<name>` may
+/// resolve to the local branch `refs/heads/<name>` the exporter bundled — so
+/// every tracking-ref source is checked against this map before the fetch.
+fn bundle_advertised_refs(
+    checkout_dir: &Path,
+    bundle: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let listing = crate::transfer_materialize::git_stdout(checkout_dir, |cmd| {
+        cmd.args(["bundle", "list-heads", bundle]);
+    })
+    .map_err(|_| unsupported_config())?;
+    Ok(listing
+        .lines()
+        .filter_map(|line| {
+            let (sha, name) = line.trim().split_once(' ')?;
+            Some((name.to_string(), sha.to_string()))
+        })
+        .collect())
+}
+
 /// Import side: recreate the manifest's remotes on the materialized checkout
 /// and fetch their tracking refs from the bundle (no network), then restore
 /// the workspace branch's upstream. Every field is re-validated; anything a
 /// compliant export would not have written is an error, and a tracking ref
 /// pointing at a WIP snapshot commit is rejected so a local-only sentinel
-/// can never read as published.
+/// can never read as published. Each tracking ref's bundle source must be
+/// advertised by the bundle header under exactly that name and at the
+/// manifest OID, so fetch DWIM can never substitute a bundled local branch
+/// whose name is spelled like a tracking ref or a snapshot anchor.
 pub(crate) fn restore_remotes(
     checkout_dir: &Path,
     bundle: &str,
     refs: &TransferRefsManifest,
     workspace_id: &str,
 ) -> Result<()> {
+    let advertised = if refs.remotes.iter().any(|r| !r.tracking_refs.is_empty()) {
+        bundle_advertised_refs(checkout_dir, bundle)?
+    } else {
+        std::collections::HashMap::new()
+    };
     let wip_shas: Vec<&str> = refs
         .workspace_wip_commit_sha
         .iter()
@@ -593,6 +622,10 @@ pub(crate) fn restore_remotes(
                 return Err(unsupported_config());
             }
             if wip_shas.contains(&t.sha.as_str()) {
+                return Err(unsupported_config());
+            }
+            let source = t.bundle_ref.as_deref().unwrap_or(&t.ref_name);
+            if advertised.get(source).map(String::as_str) != Some(t.sha.as_str()) {
                 return Err(unsupported_config());
             }
         }

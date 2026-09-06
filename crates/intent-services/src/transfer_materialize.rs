@@ -588,7 +588,7 @@ fn is_full_sha(s: &str) -> bool {
 }
 
 /// Run `git` in `dir` and return trimmed stdout; stderr on failure.
-fn git_stdout(
+pub(crate) fn git_stdout(
     dir: &Path,
     configure: impl FnOnce(&mut Command),
 ) -> std::result::Result<String, String> {
@@ -2600,6 +2600,252 @@ mod tests {
     #[test]
     fn review_r5_sandbox_anchor_tamper_rejects_and_rolls_back() {
         assert_local_anchor_tamper_rolls_back(true);
+    }
+
+    /// Source with the published commit at `refs/remotes/origin/main`, one
+    /// local-only descendant, and the workspace branch named by `branch` — a
+    /// legal local branch whose full name (`refs/heads/<branch>`) Git fetch
+    /// DWIM would also resolve for a bare `<branch>` source.
+    struct AliasSource {
+        tmp: tempfile::TempDir,
+        repo: PathBuf,
+        ws: Workspace,
+        published: String,
+        local: String,
+    }
+
+    fn alias_source(branch: impl FnOnce(&Workspace) -> String) -> AliasSource {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("source-repo");
+        init_repo(&repo);
+        let published = repo_head(&repo);
+        add_remote_with_tracking(
+            &repo,
+            "origin",
+            "https://example.invalid/repo",
+            &[("main", &published)],
+        );
+        let local = commit_file(&repo, "local.txt", "local\n", "local-only commit");
+        let mut ws = workspace_for_repo(&repo);
+        let branch = branch(&ws);
+        fgit(&repo, &["checkout", "-q", "-b", &branch]);
+        ws.branch = branch;
+        assert_eq!(intent_git::local_changes(&repo).unwrap().unpushed_count, 1);
+        AliasSource {
+            tmp,
+            repo,
+            ws,
+            published,
+            local,
+        }
+    }
+
+    fn bundle_heads(repo: &Path, bundle: &Path) -> Vec<String> {
+        fgit(repo, &["bundle", "list-heads", bundle.to_str().unwrap()])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The untampered manifest imports and still reports the local-only
+    /// commit as unpushed.
+    fn assert_import_reports_one_unpushed(
+        src: &AliasSource,
+        bundle: &Path,
+        refs: &TransferRefsManifest,
+        case: &str,
+    ) {
+        let target = tempfile::tempdir().unwrap();
+        let out = materialize_workspace_git_blocking(bundle, refs, &src.ws, &[], target.path())
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        assert_eq!(repo_head(&out.checkout_dir), src.local, "{case}");
+        assert_eq!(
+            ref_sha(&out.checkout_dir, "refs/remotes/origin/main"),
+            Some(src.published.clone()),
+            "{case}"
+        );
+        assert_eq!(
+            intent_git::local_changes(&out.checkout_dir)
+                .unwrap()
+                .unpushed_count,
+            1,
+            "{case}"
+        );
+    }
+
+    /// A metadata-only manifest against the unchanged bundle must fail remote
+    /// validation, fully remove the new target and leave the bundle bytes,
+    /// an unrelated target sentinel and the source untouched. Acceptance would
+    /// report the local-only commit as published.
+    fn assert_metadata_only_tamper_rejects(
+        src: &AliasSource,
+        bundle: &Path,
+        refs: &TransferRefsManifest,
+        case: &str,
+    ) {
+        let bundle_bytes = fs::read(bundle).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("keep.txt"), "untouched").unwrap();
+        let err =
+            match materialize_workspace_git_blocking(bundle, refs, &src.ws, &[], target.path()) {
+                Ok(out) => {
+                    let unpushed = intent_git::local_changes(&out.checkout_dir)
+                        .unwrap()
+                        .unpushed_count;
+                    panic!("{case}: local-only commit accepted as published: unpushed={unpushed}");
+                }
+                Err(e) => e.to_string(),
+            };
+        assert!(
+            err.contains("remote transfer cannot safely preserve configured Git behavior"),
+            "{case}: {err}"
+        );
+        assert!(
+            !target.path().join(&src.ws.id.0).exists(),
+            "{case}: full workspace rollback"
+        );
+        assert_eq!(
+            fs::read_to_string(target.path().join("keep.txt")).unwrap(),
+            "untouched"
+        );
+        assert_eq!(fs::read(bundle).unwrap(), bundle_bytes, "{case}");
+        assert_eq!(repo_head(&src.repo), src.local, "{case}");
+        assert_eq!(
+            ref_sha(&src.repo, "refs/remotes/origin/main"),
+            Some(src.published.clone()),
+            "{case}"
+        );
+    }
+
+    fn with_tracking_entry(
+        refs: &TransferRefsManifest,
+        mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> TransferRefsManifest {
+        let mut json = serde_json::to_value(refs).unwrap();
+        mutate(
+            json["remotes"][0]["trackingRefs"][0]
+                .as_object_mut()
+                .unwrap(),
+        );
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// An authentic export whose workspace branch is a legal local branch
+    /// named `refs/remotes/origin/forged` advertises the local-only commit
+    /// only as `refs/heads/refs/remotes/origin/forged`. Omitting `bundleRef`
+    /// and pointing the legacy `refName` fallback at that spelling must not
+    /// let Git DWIM turn the local commit into a published tracking ref.
+    #[test]
+    fn review_r6_legacy_fallback_branch_alias_rejects_and_rolls_back() {
+        let alias = "refs/remotes/origin/forged";
+        let src = alias_source(|_| alias.to_string());
+        let bundle = create_transfer_bundle(&src.ws, &[], &src.tmp.path().join("staging")).unwrap();
+        let tracking = &bundle.refs.remotes[0].tracking_refs[0];
+        assert_eq!(tracking.ref_name, "refs/remotes/origin/main");
+        assert_eq!(tracking.sha, src.published);
+        assert!(tracking.bundle_ref.is_some());
+        let heads = bundle_heads(&src.repo, &bundle.bundle_path);
+        assert!(
+            heads.contains(&format!("{} refs/heads/{alias}", src.local)),
+            "{heads:?}"
+        );
+        assert!(
+            !heads.iter().any(|h| h.ends_with(&format!(" {alias}"))),
+            "{heads:?}"
+        );
+        assert_import_reports_one_unpushed(&src, &bundle.bundle_path, &bundle.refs, "modern");
+
+        let tampered = with_tracking_entry(&bundle.refs, |t| {
+            t.remove("bundleRef");
+            t.insert("refName".into(), alias.into());
+            t.insert("sha".into(), src.local.clone().into());
+        });
+        assert_metadata_only_tamper_rejects(
+            &src,
+            &bundle.bundle_path,
+            &tampered,
+            "modern fallback alias",
+        );
+
+        // A genuine legacy bundle advertises the real tracking ref itself.
+        let legacy_bundle = src.tmp.path().join("legacy.bundle");
+        fgit(
+            &src.repo,
+            &[
+                "bundle",
+                "create",
+                legacy_bundle.to_str().unwrap(),
+                &format!("refs/heads/{alias}"),
+                "refs/remotes/origin/main",
+            ],
+        );
+        let legacy = with_tracking_entry(&bundle.refs, |t| {
+            t.remove("bundleRef");
+        });
+        assert_import_reports_one_unpushed(&src, &legacy_bundle, &legacy, "legacy");
+        assert_metadata_only_tamper_rejects(
+            &src,
+            &legacy_bundle,
+            &tampered,
+            "legacy fallback alias",
+        );
+        let wrong_oid = with_tracking_entry(&legacy, |t| {
+            t.insert("sha".into(), src.local.clone().into());
+        });
+        assert_metadata_only_tamper_rejects(
+            &src,
+            &legacy_bundle,
+            &wrong_oid,
+            "legacy literal source at wrong OID",
+        );
+    }
+
+    /// The explicit `bundleRef` form has the same hole when a local branch is
+    /// spelled like a valid workspace remote-snapshot anchor: the exporter
+    /// advertises it under `refs/heads/`, the layout validator accepts the
+    /// name, and DWIM would supply the local-only commit.
+    #[test]
+    fn review_r6_explicit_anchor_branch_alias_rejects_and_rolls_back() {
+        let src = alias_source(|ws| {
+            format!(
+                "refs/intent/transfer/{}/remotes/{}/0",
+                ws.id.0,
+                uuid::Uuid::new_v4()
+            )
+        });
+        let alias = src.ws.branch.clone();
+        let bundle = create_transfer_bundle(&src.ws, &[], &src.tmp.path().join("staging")).unwrap();
+        let tracking = &bundle.refs.remotes[0].tracking_refs[0];
+        assert_ne!(tracking.bundle_ref.as_deref(), Some(alias.as_str()));
+        let heads = bundle_heads(&src.repo, &bundle.bundle_path);
+        assert!(
+            heads.contains(&format!("{} refs/heads/{alias}", src.local)),
+            "{heads:?}"
+        );
+        assert!(
+            heads.contains(&format!(
+                "{} {}",
+                src.published,
+                tracking.bundle_ref.as_deref().unwrap()
+            )),
+            "{heads:?}"
+        );
+        assert!(
+            !heads.iter().any(|h| h.ends_with(&format!(" {alias}"))),
+            "{heads:?}"
+        );
+        assert_import_reports_one_unpushed(&src, &bundle.bundle_path, &bundle.refs, "modern");
+
+        let tampered = with_tracking_entry(&bundle.refs, |t| {
+            t.insert("bundleRef".into(), alias.clone().into());
+            t.insert("sha".into(), src.local.clone().into());
+        });
+        assert_metadata_only_tamper_rejects(
+            &src,
+            &bundle.bundle_path,
+            &tampered,
+            "explicit anchor alias",
+        );
     }
 
     type Tamper = Box<dyn Fn(&mut TransferRefsManifest)>;

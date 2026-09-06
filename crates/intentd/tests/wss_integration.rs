@@ -14355,6 +14355,81 @@ async fn wss_transfer_preserves_remote_state() {
         bytes
     }
 
+    /// The archive with only `git/refs.json` replaced; the bundle bytes are
+    /// untouched, so a rejection is purely metadata validation.
+    fn relabel(archive: &[u8], tampered_refs: &Value) -> Vec<u8> {
+        let mut original = zip::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..original.len() {
+            let mut file = original.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            if file.name() == "git/refs.json" {
+                bytes = serde_json::to_vec(tampered_refs).unwrap();
+            }
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            writer.start_file(file.name(), options).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        let tampered = writer.finish().unwrap().into_inner();
+        assert_eq!(
+            entry(&tampered, "git/repo.bundle"),
+            entry(archive, "git/repo.bundle")
+        );
+        tampered
+    }
+
+    /// A relabeled archive must fail remote metadata validation on a fresh
+    /// daemon, leave no workspace row or directory behind, keep unrelated
+    /// files, and never touch the source.
+    async fn assert_relabel_rejected(
+        manifest: &Value,
+        tampered: &[u8],
+        ws_id: &WorkspaceId,
+        repo: &Path,
+        head: &str,
+        published: &str,
+        case: &str,
+    ) {
+        let rejected_target = start(WsOptions::default()).await;
+        let unrelated = rejected_target.dir.path().join("workspaces/keep.txt");
+        std::fs::write(&unrelated, "keep\n").unwrap();
+        let rejected = import(&rejected_target, manifest, tampered).await;
+        assert_eq!(rejected["error"]["code"], -32603, "{case}: {rejected}");
+        assert!(
+            rejected["error"]["data"]
+                .as_str()
+                .unwrap()
+                .contains("remote transfer cannot safely preserve configured Git behavior"),
+            "{case}: must fail remote metadata validation, not an unrelated import step: {rejected}"
+        );
+        assert!(
+            !rejected_target
+                .dir
+                .path()
+                .join("workspaces")
+                .join(&ws_id.0)
+                .exists(),
+            "{case}"
+        );
+        let listed = rpc(&rejected_target, "workspace.list", serde_json::json!({})).await;
+        assert!(
+            listed["result"]["workspaces"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{case}: {listed}"
+        );
+        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "keep\n");
+        assert_eq!(git(repo, &["rev-parse", "HEAD"]).trim(), head, "{case}");
+        assert_eq!(
+            git(repo, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+            published,
+            "{case}"
+        );
+        rejected_target.ws.stop().await;
+    }
+
     let source = start(WsOptions::default()).await;
     let target = start(WsOptions::default()).await;
     // Any accidental remote contact reaches only this loopback sentinel, never
@@ -14363,10 +14438,20 @@ async fn wss_transfer_preserves_remote_state() {
     remote.set_nonblocking(true).unwrap();
     let remote_url = format!("http://{}/published.git", remote.local_addr().unwrap());
 
-    for (local_commits, dirty) in [(0, false), (2, false), (2, true)] {
+    // The last fixture's branch is a legal local branch spelled like the
+    // tracking ref: the bundle advertises its local-only tip only as
+    // `refs/heads/refs/remotes/origin/forged`, which Git fetch DWIM would
+    // also resolve for a bare `refs/remotes/origin/forged` source (R6).
+    let alias = "refs/remotes/origin/forged";
+    for (local_commits, dirty, branch) in [
+        (0, false, "main"),
+        (2, false, "main"),
+        (2, true, "main"),
+        (2, false, alias),
+    ] {
         let repo_dir = test_tempdir("intentd-wss-transfer-remotes-");
         let repo = repo_dir.path();
-        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["init", "-q", "-b", branch]);
         git(repo, &["config", "user.name", "Test"]);
         git(repo, &["config", "user.email", "test@example.com"]);
         git(repo, &["config", "commit.gpgsign", "false"]);
@@ -14381,7 +14466,7 @@ async fn wss_transfer_preserves_remote_state() {
             repo,
             &["update-ref", "refs/remotes/origin/main", &published],
         );
-        git(repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+        git(repo, &["branch", "--set-upstream-to=origin/main", branch]);
         for index in 0..local_commits {
             std::fs::write(repo.join("local.txt"), format!("local {index}\n")).unwrap();
             git(repo, &["add", "local.txt"]);
@@ -14403,7 +14488,7 @@ async fn wss_transfer_preserves_remote_state() {
         workspace.worktree_path = workspace.path.clone();
         workspace.repository_path = workspace.path.clone();
         workspace.repository_name = Some("published".into());
-        workspace.branch = "main".into();
+        workspace.branch = branch.into();
         workspace.base_ref = None;
         workspace.base_commit_sha = Some(head.clone());
         source.store.insert_workspace(&workspace).await.unwrap();
@@ -14489,7 +14574,13 @@ async fn wss_transfer_preserves_remote_state() {
         assert_eq!(ready["archiveSha256"], sha256_hex(&archive));
         let refs: Value = serde_json::from_slice(&entry(&archive, "git/refs.json")).unwrap();
         assert_eq!(refs["workspaceWipCommitSha"].is_string(), dirty, "{refs}");
+        assert_eq!(refs["workspaceBranch"], branch, "{refs}");
+        assert_eq!(
+            refs["remotes"][0]["trackingRefs"][0]["refName"],
+            "refs/remotes/origin/main"
+        );
         assert_eq!(refs["remotes"][0]["trackingRefs"][0]["sha"], published);
+        assert!(refs["remotes"][0]["trackingRefs"][0]["bundleRef"].is_string());
         if dirty {
             assert_ne!(git(repo, &["rev-parse", "HEAD"]).trim(), head);
         }
@@ -14541,9 +14632,25 @@ async fn wss_transfer_preserves_remote_state() {
             }
             let status = rpc(srv, "git.status", status_params.clone()).await;
             assert_eq!(status["result"], before_status["result"], "{status}");
-            assert_eq!(status["result"]["hasUpstream"], true);
-            assert_eq!(status["result"]["ahead"], local_commits);
-            assert_eq!(status["result"]["unpushedCount"], local_commits);
+            // `git.status` counts against `refs/remotes/origin/<branch>` by
+            // naming convention, so the alias branch reports no upstream there
+            // while `@{upstream}` and `workspace.localChanges` still see it.
+            let convention_upstream = branch == "main";
+            assert_eq!(status["result"]["hasUpstream"], convention_upstream);
+            let expected_ahead = if convention_upstream {
+                local_commits
+            } else {
+                0
+            };
+            assert_eq!(status["result"]["ahead"], expected_ahead);
+            assert_eq!(
+                status["result"]["unpushedCount"],
+                if convention_upstream {
+                    serde_json::json!(local_commits)
+                } else {
+                    Value::Null
+                }
+            );
             assert_eq!(status["result"]["behind"], 0);
             assert_eq!(status["result"]["diverged"], false);
             assert_eq!(status["result"]["hasUncommittedChanges"], dirty);
@@ -14556,7 +14663,7 @@ async fn wss_transfer_preserves_remote_state() {
             let root = &result["roots"][0];
             assert_eq!(root["kind"], "primary");
             assert_eq!(root["path"], path.to_str().unwrap());
-            assert_eq!(root["branch"], "main");
+            assert_eq!(root["branch"], branch);
             assert_eq!(root["hasRemoteRefs"], true);
             assert_eq!(root["unpushedCount"], local_commits);
             assert_eq!(root["uncommittedCount"], if dirty { 3 } else { 0 });
@@ -14585,57 +14692,52 @@ async fn wss_transfer_preserves_remote_state() {
             tampered_refs["remotes"][0]["trackingRefs"][0]["bundleRef"] =
                 refs["baseBundleRef"].clone();
             tampered_refs["remotes"][0]["trackingRefs"][0]["sha"] = serde_json::json!(head);
-            let mut original = zip::ZipArchive::new(std::io::Cursor::new(&archive)).unwrap();
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            for index in 0..original.len() {
-                let mut file = original.by_index(index).unwrap();
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).unwrap();
-                if file.name() == "git/refs.json" {
-                    bytes = serde_json::to_vec(&tampered_refs).unwrap();
-                }
-                let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
-                writer.start_file(file.name(), options).unwrap();
-                writer.write_all(&bytes).unwrap();
+            assert_relabel_rejected(
+                &ready["manifest"],
+                &relabel(&archive, &tampered_refs),
+                &ws_id,
+                repo,
+                &head,
+                &published,
+                "R5 base anchor",
+            )
+            .await;
+            if branch == alias {
+                // Drop the anchor so the legacy `refName` fallback becomes the
+                // fetch source, and spell it as the bundled local branch (R6).
+                let bundle_dir = test_tempdir("intentd-wss-transfer-bundle-");
+                let bundle_file = bundle_dir.path().join("exported.bundle");
+                std::fs::write(&bundle_file, entry(&archive, "git/repo.bundle")).unwrap();
+                let heads = git(
+                    repo,
+                    &["bundle", "list-heads", bundle_file.to_str().unwrap()],
+                );
+                assert!(
+                    heads.contains(&format!("{head} refs/heads/{alias}")),
+                    "{heads}"
+                );
+                assert!(
+                    !heads.lines().any(|h| h.ends_with(&format!(" {alias}"))),
+                    "{heads}"
+                );
+                let mut tampered_refs = refs.clone();
+                let tracking = tampered_refs["remotes"][0]["trackingRefs"][0]
+                    .as_object_mut()
+                    .unwrap();
+                tracking.remove("bundleRef");
+                tracking.insert("refName".into(), serde_json::json!(alias));
+                tracking.insert("sha".into(), serde_json::json!(head));
+                assert_relabel_rejected(
+                    &ready["manifest"],
+                    &relabel(&archive, &tampered_refs),
+                    &ws_id,
+                    repo,
+                    &head,
+                    &published,
+                    "R6 fallback branch alias",
+                )
+                .await;
             }
-            let tampered = writer.finish().unwrap().into_inner();
-            assert_eq!(
-                entry(&tampered, "git/repo.bundle"),
-                entry(&archive, "git/repo.bundle")
-            );
-            let rejected_target = start(WsOptions::default()).await;
-            let unrelated = rejected_target.dir.path().join("workspaces/keep.txt");
-            std::fs::write(&unrelated, "keep\n").unwrap();
-            let rejected = import(&rejected_target, &ready["manifest"], &tampered).await;
-            assert_eq!(rejected["error"]["code"], -32603, "{rejected}");
-            assert!(
-                rejected["error"]["data"]
-                    .as_str()
-                    .unwrap()
-                    .contains("remote transfer cannot safely preserve configured Git behavior"),
-                "must fail remote metadata validation, not an unrelated import step: {rejected}"
-            );
-            assert!(!rejected_target
-                .dir
-                .path()
-                .join("workspaces")
-                .join(&ws_id.0)
-                .exists());
-            let listed = rpc(&rejected_target, "workspace.list", serde_json::json!({})).await;
-            assert!(
-                listed["result"]["workspaces"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty(),
-                "{listed}"
-            );
-            assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "keep\n");
-            assert_eq!(git(repo, &["rev-parse", "HEAD"]).trim(), head);
-            assert_eq!(
-                git(repo, &["rev-parse", "refs/remotes/origin/main"]).trim(),
-                published
-            );
-            rejected_target.ws.stop().await;
         }
     }
     assert!(
