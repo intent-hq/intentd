@@ -444,7 +444,14 @@ pub(crate) async fn process_frame(
             // Slow path: `browser.exec` awaits an FE-served reverse RPC on this
             // same connection (§12.4), so run it off the read loop for the same
             // reason as `host::classify` — inline would block frame reads until
-            // the reverse timeout.
+            // the reverse timeout. The registry methods share the path (they
+            // hit SQLite) and take the connection's hello'd identity as the
+            // reporting host plus the reverse registry for presence. The host
+            // is the identity `client.hello` bound onto the registry entry —
+            // not the `client_id` slot, which `drafts.*` mints lazily without
+            // a handshake and must not qualify a connection to host tabs. Only
+            // the host reports resolve it (an O(1) index lookup); `listTabs` /
+            // `exec` do not use it and skip the lock entirely.
             let Ok(slot) = out_tx.reserve_priority().await else {
                 return false;
             };
@@ -456,13 +463,29 @@ pub(crate) async fn process_frame(
                 }
             };
             let reverse = reverse.clone();
+            let api = Arc::clone(api);
+            let host_client_id = req
+                .method
+                .reports_as_host()
+                .then(|| reverse_guard.bound_client_id())
+                .flatten();
+            let registry = reverse_guard.registry();
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
                 crate::context::with_connection_context(is_tcp, async {
+                    let tabs = browser::TabContext {
+                        api: api.as_ref(),
+                        client_id: host_client_id.as_ref(),
+                        registry: registry.as_ref(),
+                    };
                     finish_slow_path_rpc(
                         permit,
-                        panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse)),
+                        panic_guard::guard_frame(
+                            &method,
+                            rpc_id,
+                            browser::handle(req, &reverse, tabs),
+                        ),
                         slot,
                     )
                     .await;

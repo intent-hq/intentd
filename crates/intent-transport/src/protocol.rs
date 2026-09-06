@@ -394,12 +394,25 @@
 //! offline is `-32603`, never a silent fallback. The catalog grows by three
 //! router methods — 303 router methods, 43 fast-path, two aliases: 348
 //! client-callable names.
+//!
+//! Version 9.10 adds the daemon-owned browser tab registry (REV-2 Model 2 & 6).
+//! Four additive fast-path methods: `browser.listTabs` (any client; entries
+//! decorated with `hostName` / `hostConnected` from the live reverse
+//! registry) and the host-only reports `browser.upsertTab`,
+//! `browser.removeTab`, and `browser.syncTabs`, which are keyed by the
+//! connection's `client.hello` identity (never a wire parameter) and answer
+//! `-32602` on an un-hello'd connection or when a report would move a known
+//! `tabId` to another workspace. Three additive workspace events:
+//! `browser:tab-opened`, `browser:tab-updated`, `browser:tab-closed`. The
+//! catalog contains 303 router methods, 47 fast-path methods, and two
+//! aliases: 352 client-callable names. The five reverse methods are
+//! counted separately.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.9";
+pub const PROTOCOL_VERSION: &str = "9.10";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

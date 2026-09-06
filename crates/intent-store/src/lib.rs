@@ -17,6 +17,7 @@ mod agent_flipped_completion_repo;
 mod agent_queue_repo;
 mod agent_repo;
 mod attachment_repo;
+mod browser_tab_repo;
 mod client_repo;
 mod comment_repo;
 mod completion_wake_delivery_repo;
