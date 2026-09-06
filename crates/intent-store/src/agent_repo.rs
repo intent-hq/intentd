@@ -4351,9 +4351,11 @@ impl Store {
     /// and a separate pruned-metadata read would report a `*_replay` row for a
     /// block whose full body was just served (stamping a full body "pruned",
     /// flags gone), and a side-row replacement between the reads could apply
-    /// the metadata to another content generation. Two statements over primary
-    /// keys, at most ONE decoded message. `None` when the id is unknown or
-    /// belongs to a different agent.
+    /// the metadata to another content generation. Three indexed reads inside
+    /// the snapshot — the message row by primary key, the full-payload
+    /// hydration by `message_id`, and the pruned-kind metadata by `message_id`
+    /// (the last two only when the message exists) — at most ONE decoded
+    /// message. `None` when the id is unknown or belongs to a different agent.
     ///
     /// # Errors
     ///
