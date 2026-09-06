@@ -22,7 +22,7 @@ use intent_acp::{
 };
 use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
-use intent_pty::{PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
+use intent_pty::{LineSnapshot, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -301,12 +301,13 @@ pub(crate) fn get_buffer(
     max_bytes: Option<i64>,
 ) -> Result<Value> {
     let id = resolve(terminal_id)?;
-    let mut bytes = pty.scrollback(id)?;
-    if let Some(max) = max_bytes.and_then(|n| usize::try_from(n).ok()) {
-        if bytes.len() > max {
-            bytes = bytes.split_off(bytes.len() - max);
-        }
-    }
+    // Omitted (and legacy negative) bounds retain full-history semantics. A
+    // usable bound takes the ring tail directly, without cloning its prefix.
+    let bytes = if let Some(max) = max_bytes.and_then(|n| usize::try_from(n).ok()) {
+        pty.scrollback_tail(id, max)?
+    } else {
+        pty.scrollback(id)?
+    };
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(json!({ "terminalId": terminal_id, "data": data }))
 }
@@ -376,30 +377,45 @@ pub(crate) fn read_output(
         ));
     }
 
-    let bytes = pty.scrollback(id)?;
-    let raw = String::from_utf8_lossy(&bytes);
+    // OSC payloads may contain newlines, so raw scrollback line coordinates
+    // cannot safely drive formatted or paginated visible-output boundaries.
+    // Decode the retained snapshot once, then split and page in logical lines.
+    let snapshot = pty.scrollback_lines(id, usize::MAX, None)?;
+    Ok(render_output(
+        &snapshot,
+        terminal_id,
+        info.cwd.as_deref().unwrap_or_default(),
+        max_lines,
+        paginate,
+        page_token,
+    ))
+}
 
-    // TA-2 / §5.5 opt-in pagination: when engaged, return the historical
-    // scrollback as a `{ items, nextToken }` envelope of ANSI-stripped lines
-    // ordered newest→oldest, with an opaque append-stable continuation token.
-    // Absent the opt-in, preserve the legacy bare formatted string verbatim.
+fn render_output(
+    snapshot: &LineSnapshot,
+    terminal_id: &str,
+    cwd: &str,
+    max_lines: Option<i64>,
+    paginate: bool,
+    page_token: Option<&String>,
+) -> Value {
+    let raw = String::from_utf8_lossy(&snapshot.bytes);
+    let clean = strip_ansi(&raw);
     if paginate || page_token.is_some() {
-        return Ok(crate::pagination::paginate_text_lines(
-            &strip_ansi(&raw),
+        return crate::pagination::paginate_text_lines(
+            &clean,
             max_lines,
             page_token.map(std::string::String::as_str),
-        ));
+        );
+    }
+    if !snapshot.retained_has_non_whitespace {
+        return Value::String("Terminal has no output yet.".to_string());
     }
 
-    if raw.trim().is_empty() {
-        return Ok(Value::String("Terminal has no output yet.".to_string()));
-    }
-
-    let clean = strip_ansi(&raw);
     let lines: Vec<&str> = clean.split('\n').collect();
     let max_line_count =
         usize::try_from(max_lines.unwrap_or(200).clamp(1, 10000)).expect("value fits in usize");
-    let mut output_lines: Vec<&str> = if lines.len() > max_line_count {
+    let mut output_lines = if lines.len() > max_line_count {
         lines[lines.len() - max_line_count..].to_vec()
     } else {
         lines.clone()
@@ -409,7 +425,6 @@ pub(crate) fn read_output(
     }
 
     let truncated = lines.len() > max_line_count;
-    let cwd = info.cwd.unwrap_or_default();
     let header = if truncated {
         format!(
             "Terminal {terminal_id} (cwd: {cwd}) [showing last {max_line_count} of {} lines]",
@@ -419,10 +434,10 @@ pub(crate) fn read_output(
         format!("Terminal {terminal_id} (cwd: {cwd})")
     };
     let separator = "\u{2500}".repeat(40);
-    Ok(Value::String(format!(
+    Value::String(format!(
         "{header}\n{separator}\n{}",
         output_lines.join("\n")
-    )))
+    ))
 }
 
 /// Strip ANSI escape sequences from terminal output, mirroring the TS
@@ -435,13 +450,20 @@ fn strip_ansi(input: &str) -> String {
         if bytes[i] == 0x1b {
             // ESC
             match bytes.get(i + 1) {
-                // OSC: ESC ] ... BEL(0x07)
+                // OSC: ESC ] ... BEL(0x07) or ST(ESC \\)
                 Some(b']') => {
                     i += 2;
-                    while i < bytes.len() && bytes[i] != 0x07 {
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
                         i += 1;
                     }
-                    i += 1; // consume BEL
                     continue;
                 }
                 // CSI: ESC [ (optional '?') params (0-9;) final letter
@@ -1023,6 +1045,113 @@ mod tests {
     fn strip_ansi_removes_sequences_and_keeps_unicode() {
         let input = "\u{1b}[31mred\u{1b}[0m \u{1b}[?25lhide \u{1b}]0;title\u{07}é✓😀";
         assert_eq!(strip_ansi(input), "red hide é✓😀");
+        assert_eq!(
+            strip_ansi("before\u{1b}]0;hidden\nhidden-tail\u{1b}\\after"),
+            "beforeafter"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_tolerates_utf8_and_ansi_split_edges() {
+        let snapshot = LineSnapshot {
+            bytes: b"\xa9prefix\x1b[31mred\x1b[0m\x1b[32".to_vec(),
+            total_lines: 1,
+            start_line: 0,
+            end_line: 1,
+            retained_has_non_whitespace: true,
+        };
+        assert_eq!(
+            strip_ansi(&String::from_utf8_lossy(&snapshot.bytes)),
+            "�prefixred"
+        );
+    }
+
+    #[test]
+    fn multiline_osc_uses_visible_line_coordinates() {
+        let snapshot = LineSnapshot {
+            bytes: b"before\n\x1b]0;hidden\nhidden-tail\x07after\nlast".to_vec(),
+            total_lines: 4,
+            start_line: 0,
+            end_line: 4,
+            retained_has_non_whitespace: true,
+        };
+        let full = render_output(&snapshot, "pty-1", "/tmp", Some(50), true, None);
+        assert_eq!(
+            full,
+            json!({ "items": ["last", "after", "before"], "nextToken": null })
+        );
+
+        let first = render_output(&snapshot, "pty-1", "/tmp", Some(2), true, None);
+        assert_eq!(first["items"], json!(["last", "after"]));
+        let token = first["nextToken"]
+            .as_str()
+            .expect("continuation")
+            .to_string();
+        let second = render_output(&snapshot, "pty-1", "/tmp", Some(2), false, Some(&token));
+        assert_eq!(second, json!({ "items": ["before"], "nextToken": null }));
+
+        let legacy = render_output(&snapshot, "pty-1", "/tmp", Some(2), false, None);
+        assert!(legacy
+            .as_str()
+            .expect("formatted")
+            .contains("last 2 of 3 lines"));
+    }
+
+    #[tokio::test]
+    async fn read_output_blank_suffix_scan_work_is_linear() {
+        let pty = host();
+        let mut spec = SpawnSpec::new("ws-1", "sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "i=0; while [ $i -lt 128 ]; do printf 'prefix\\n'; i=$((i+1)); done; \
+             printf 'visible\\n'; i=0; while [ $i -lt 16000 ]; do \
+             printf '\\033[31m\\033[0m\\n'; i=$((i+1)); done; \
+             printf '\\033]0;scan-complete\\007\\n'"
+                .to_string(),
+        ];
+        let id = pty.spawn(spec).expect("spawn output producer");
+        let retained = poll_until(
+            || {
+                let bytes = pty.scrollback(id).ok()?;
+                contains_sub(&bytes, b"scan-complete").then_some(bytes)
+            },
+            LONG_TIMEOUT,
+        )
+        .await
+        .expect("blank suffix reaches scrollback");
+
+        let before = pty
+            .scrollback_line_snapshot_metrics(id)
+            .expect("metrics before read");
+        let page = read_output(
+            pty.as_ref(),
+            &ws("ws-1"),
+            &id.to_string(),
+            Some(1),
+            true,
+            None,
+        )
+        .expect("paginated read");
+        let after = pty
+            .scrollback_line_snapshot_metrics(id)
+            .expect("metrics after read");
+        let calls = after.0 - before.0;
+        let scanned = after.1 - before.1;
+
+        let items = page["items"].as_array().expect("page items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_str().expect("visible item").trim(), "visible");
+        assert!(
+            calls <= 2,
+            "read_output issued {calls} line snapshots for one page"
+        );
+        assert!(
+            scanned <= retained.len(),
+            "read_output scanned {scanned} bytes across {calls} snapshots for {} retained bytes",
+            retained.len()
+        );
+
+        kill(pty.as_ref(), &id.to_string()).await.unwrap();
     }
 
     // ---- credential injection helpers (no spawn) ----
@@ -1775,7 +1904,23 @@ mod tests {
         assert!(contains_sub(&full, b"buffer-test"));
 
         let capped = get_buffer(pty.as_ref(), &id, Some(4)).unwrap();
-        assert!(decode(capped["data"].as_str().unwrap()).len() <= 4);
+        assert_eq!(
+            decode(capped["data"].as_str().unwrap()),
+            full[full.len() - 4..]
+        );
+        let zero = get_buffer(pty.as_ref(), &id, Some(0)).unwrap();
+        assert!(decode(zero["data"].as_str().unwrap()).is_empty());
+        let exact = get_buffer(
+            pty.as_ref(),
+            &id,
+            Some(i64::try_from(full.len()).expect("test buffer length fits in i64")),
+        )
+        .unwrap();
+        assert_eq!(decode(exact["data"].as_str().unwrap()), full);
+        let oversized = get_buffer(pty.as_ref(), &id, Some(i64::MAX)).unwrap();
+        assert_eq!(decode(oversized["data"].as_str().unwrap()), full);
+        let legacy_negative = get_buffer(pty.as_ref(), &id, Some(-1)).unwrap();
+        assert_eq!(decode(legacy_negative["data"].as_str().unwrap()), full);
 
         kill(pty.as_ref(), &id).await.unwrap();
     }
@@ -1940,6 +2085,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_output_reports_exact_line_total_after_exit() {
+        let pty = host();
+        let mut spec = SpawnSpec::new("ws-1", "sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "printf '\x1b[31mone\x1b[0m\\ntwo\\nthree'".to_string(),
+        ];
+        let id = pty.spawn(spec).unwrap();
+        pty.wait(id).await.unwrap();
+
+        let text = poll_until(
+            || {
+                let value = read_output(
+                    pty.as_ref(),
+                    &ws("ws-1"),
+                    &id.to_string(),
+                    Some(2),
+                    false,
+                    None,
+                )
+                .ok()?;
+                let text = value.as_str()?.to_string();
+                text.contains("three").then_some(text)
+            },
+            TIMEOUT,
+        )
+        .await
+        .expect("post-exit output drains into scrollback");
+        assert!(text.contains("[showing last 2 of 3 lines]"), "{text}");
+        assert!(text.ends_with("two\r\nthree") || text.ends_with("two\nthree"));
+        assert!(!text.contains('\u{1b}'));
+
+        kill(pty.as_ref(), &id.to_string()).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn read_output_paginates_with_token() {
         let pty = host();
         let res = create(
@@ -1976,9 +2157,29 @@ mod tests {
         .expect("first page with continuation token");
 
         let token = page1["nextToken"].as_str().unwrap().to_string();
+        write(
+            pty.as_ref(),
+            &id,
+            &base64::engine::general_purpose::STANDARD.encode(b"new-tail\n"),
+        )
+        .unwrap();
+        poll_until(
+            || {
+                let bytes = pty.scrollback(PtyId::parse(&id)?).ok()?;
+                contains_sub(&bytes, b"new-tail").then_some(())
+            },
+            TIMEOUT,
+        )
+        .await
+        .expect("concurrent append reaches scrollback");
         let page2 =
             read_output(pty.as_ref(), &ws("ws-1"), &id, Some(2), false, Some(&token)).unwrap();
         assert!(!page2["items"].as_array().unwrap().is_empty());
+        assert!(page2["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| !item.as_str().unwrap_or_default().contains("new-tail")));
 
         kill(pty.as_ref(), &id).await.unwrap();
     }

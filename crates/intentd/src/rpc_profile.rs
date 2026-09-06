@@ -11,7 +11,15 @@
 //!   (default [`DEFAULT_STATEMENT_WARN_THRESHOLD`]; N+1 / hydrate-then-discard
 //!   regressions), and
 //! - one WARN when the wall-clock duration exceeds the duration threshold
-//!   for the method's tier.
+//!   for the method's tier, and
+//! - one WARN when the intended serialized response exceeds the fixed
+//!   [`RESPONSE_SIZE_WARN_THRESHOLD_BYTES`] soft limit.
+//!
+//! Every WARN includes additive response-encoding fields recorded on the same
+//! dispatch span: `response_bytes`, `encode_elapsed_ms`,
+//! `oversized_replacement`, and `encode_failed`. Notifications record zero
+//! bytes/time and false states. A hard-cap replacement records the rejected
+//! envelope's size, not the replacement frame's size.
 //!
 //! Duration budgets are tiered: methods that fan out to a network-bound
 //! upstream ([`is_network_tier_method`] — `github.*`, `linear.*`, `sentry.*`,
@@ -41,7 +49,7 @@
 use std::time::{Duration, Instant};
 
 use tracing::field::{Field, Visit};
-use tracing::span::{Attributes, Id};
+use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::{Context, Layer};
@@ -71,6 +79,10 @@ pub const DEFAULT_DURATION_WARN_MS: u64 = 1000;
 /// WARN. Higher than [`DEFAULT_DURATION_WARN_MS`] so normal upstream latency
 /// doesn't trip the guardrail.
 pub const DEFAULT_NETWORK_DURATION_WARN_MS: u64 = 10_000;
+/// Fixed soft response-size threshold. This is deliberately far below the
+/// transport's 40 MiB hard cap so unexpectedly large hot-path responses are
+/// visible before they approach frame rejection.
+pub const RESPONSE_SIZE_WARN_THRESHOLD_BYTES: u64 = 1024 * 1024;
 /// Env override for the statement-count threshold (u64).
 pub const STATEMENT_THRESHOLD_ENV: &str = "INTENTD_RPC_STATEMENT_WARN_THRESHOLD";
 /// Env override for the compound-op-tier statement-count threshold (u64).
@@ -268,6 +280,10 @@ struct DispatchProfile {
     method: String,
     statements: u64,
     started: Instant,
+    response_bytes: u64,
+    encode_elapsed_ms: u64,
+    oversized_replacement: bool,
+    encode_failed: bool,
 }
 
 /// Extracts the `method` field recorded on the dispatch span.
@@ -288,6 +304,28 @@ impl Visit for MethodVisitor<'_> {
     }
 }
 
+struct ResponseFieldsVisitor<'a>(&'a mut DispatchProfile);
+
+impl Visit for ResponseFieldsVisitor<'_> {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "response_bytes" => self.0.response_bytes = value,
+            "encode_elapsed_ms" => self.0.encode_elapsed_ms = value,
+            _ => {}
+        }
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        match field.name() {
+            "oversized_replacement" => self.0.oversized_replacement = value,
+            "encode_failed" => self.0.encode_failed = value,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
 impl<S> Layer<S> for RpcProfileLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -304,8 +342,21 @@ where
                 method,
                 statements: 0,
                 started: Instant::now(),
+                response_bytes: 0,
+                encode_elapsed_ms: 0,
+                oversized_replacement: false,
+                encode_failed: false,
             });
         }
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else { return };
+        let mut extensions = span.extensions_mut();
+        let Some(profile) = extensions.get_mut::<DispatchProfile>() else {
+            return;
+        };
+        values.record(&mut ResponseFieldsVisitor(profile));
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
@@ -341,6 +392,10 @@ where
                 statements = profile.statements,
                 threshold = statement_threshold,
                 elapsed_ms,
+                response_bytes = profile.response_bytes,
+                encode_elapsed_ms = profile.encode_elapsed_ms,
+                oversized_replacement = profile.oversized_replacement,
+                encode_failed = profile.encode_failed,
                 "rpc dispatch exceeded SQL statement budget"
             );
         }
@@ -352,7 +407,38 @@ where
                 statements = profile.statements,
                 threshold_ms = u64::try_from(duration_threshold.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
                 elapsed_ms,
+                response_bytes = profile.response_bytes,
+                encode_elapsed_ms = profile.encode_elapsed_ms,
+                oversized_replacement = profile.oversized_replacement,
+                encode_failed = profile.encode_failed,
                 "rpc dispatch exceeded duration budget"
+            );
+        }
+        if profile.response_bytes > RESPONSE_SIZE_WARN_THRESHOLD_BYTES {
+            tracing::warn!(
+                target: WARN_TARGET,
+                method = %profile.method,
+                statements = profile.statements,
+                threshold_bytes = RESPONSE_SIZE_WARN_THRESHOLD_BYTES,
+                elapsed_ms,
+                response_bytes = profile.response_bytes,
+                encode_elapsed_ms = profile.encode_elapsed_ms,
+                oversized_replacement = profile.oversized_replacement,
+                encode_failed = profile.encode_failed,
+                "rpc response exceeded soft size budget"
+            );
+        }
+        if profile.encode_failed {
+            tracing::warn!(
+                target: WARN_TARGET,
+                method = %profile.method,
+                statements = profile.statements,
+                elapsed_ms,
+                response_bytes = profile.response_bytes,
+                encode_elapsed_ms = profile.encode_elapsed_ms,
+                oversized_replacement = profile.oversized_replacement,
+                encode_failed = true,
+                "rpc response envelope serialization failed"
             );
         }
     }
@@ -413,8 +499,15 @@ mod tests {
             .with(layer)
             .with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span =
-                tracing::info_span!(target: RPC_DISPATCH_SPAN_TARGET, "rpc_dispatch", method);
+            let span = tracing::info_span!(
+                target: RPC_DISPATCH_SPAN_TARGET,
+                "rpc_dispatch",
+                method,
+                response_bytes = tracing::field::Empty,
+                encode_elapsed_ms = tracing::field::Empty,
+                oversized_replacement = tracing::field::Empty,
+                encode_failed = tracing::field::Empty,
+            );
             span.in_scope(f);
             drop(span);
         });
@@ -437,6 +530,92 @@ mod tests {
         assert_eq!(warns.len(), 1, "warns: {warns:?}");
         assert!(warns[0].contains("method=workspace.list"), "{warns:?}");
         assert!(warns[0].contains("statements=3"), "{warns:?}");
+    }
+
+    #[test]
+    fn late_response_fields_are_added_to_the_same_dispatch_warn() {
+        let layer =
+            RpcProfileLayer::new(0, 0, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "workspace.list", || {
+            sqlx_event();
+            let span = tracing::Span::current();
+            span.record("response_bytes", 321_u64);
+            span.record("encode_elapsed_ms", 7_u64);
+            span.record("oversized_replacement", true);
+            span.record("encode_failed", false);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("response_bytes=321"), "{warns:?}");
+        assert!(warns[0].contains("encode_elapsed_ms=7"), "{warns:?}");
+        assert!(warns[0].contains("oversized_replacement=true"), "{warns:?}");
+        assert!(warns[0].contains("encode_failed=false"), "{warns:?}");
+    }
+
+    #[test]
+    fn response_size_soft_limit_warns_without_timing_sleeps() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "note.list", || {
+            let span = tracing::Span::current();
+            span.record("response_bytes", RESPONSE_SIZE_WARN_THRESHOLD_BYTES + 1);
+            span.record("encode_elapsed_ms", 3_u64);
+            span.record("oversized_replacement", false);
+            span.record("encode_failed", false);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(
+            warns[0].contains("rpc response exceeded soft size budget"),
+            "{warns:?}"
+        );
+        assert!(
+            warns[0].contains(&format!(
+                "threshold_bytes={RESPONSE_SIZE_WARN_THRESHOLD_BYTES}"
+            )),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    fn serialization_failure_warns_with_fallback_size_metrics() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "workspace.get", || {
+            let span = tracing::Span::current();
+            span.record("response_bytes", 77_u64);
+            span.record("encode_elapsed_ms", 1_u64);
+            span.record("oversized_replacement", false);
+            span.record("encode_failed", true);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(
+            warns[0].contains("rpc response envelope serialization failed"),
+            "{warns:?}"
+        );
+        assert!(warns[0].contains("response_bytes=77"), "{warns:?}");
+        assert!(warns[0].contains("encode_failed=true"), "{warns:?}");
+    }
+
+    #[test]
+    fn notification_metrics_are_zero_on_dispatch_warn() {
+        let layer =
+            RpcProfileLayer::new(0, 0, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "workspace.list", sqlx_event);
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("response_bytes=0"), "{warns:?}");
+        assert!(warns[0].contains("encode_elapsed_ms=0"), "{warns:?}");
+        assert!(
+            warns[0].contains("oversized_replacement=false"),
+            "{warns:?}"
+        );
+        assert!(warns[0].contains("encode_failed=false"), "{warns:?}");
     }
 
     #[test]

@@ -388,6 +388,41 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
+    /// Display-status monitor rows for every requested workspace in one
+    /// statement: all active rows plus the latest completed row per workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the query or row projection fails.
+    pub async fn list_display_status_pr_monitors_by_workspaces(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<Vec<PrMonitor>> {
+        if workspace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT {COLUMNS} FROM (\
+                SELECT {COLUMNS}, ROW_NUMBER() OVER (\
+                    PARTITION BY workspace_id, state ORDER BY updated_at DESC\
+                ) AS state_rank FROM pr_monitor \
+                WHERE workspace_id IN ({placeholders}) AND state IN ('active', 'completed')\
+             ) WHERE state = 'active' OR state_rank = 1 \
+             ORDER BY workspace_id, created_at"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            intent_core::Error::Internal(format!(
+                "batch list display-status pr monitors failed: {e}"
+            ))
+        })?;
+        rows.iter().map(monitor_from_row).collect()
+    }
+
     /// Every `active` monitor across all workspaces, oldest first — the poll
     /// loop's per-tick read and the boot rehydration read.
     ///

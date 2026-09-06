@@ -5892,10 +5892,39 @@ async fn terminal_create_env_over_wss() {
     .await;
     assert_eq!(buffer["terminalId"], json!(terminal_id));
     assert!(buffer["data"].is_string(), "retained scrollback: {buffer}");
+    let full = base64::engine::general_purpose::STANDARD
+        .decode(buffer["data"].as_str().unwrap())
+        .expect("full buffer is base64");
+
+    let bounded = wss_rpc(
+        &mut rpc,
+        5,
+        "terminal.getBuffer",
+        json!({ "terminalId": terminal_id, "maxBytes": 4 }),
+    )
+    .await;
+    let tail = base64::engine::general_purpose::STANDARD
+        .decode(bounded["data"].as_str().unwrap())
+        .expect("bounded buffer is base64");
+    assert_eq!(tail, full[full.len().saturating_sub(4)..]);
+
+    let formatted = wss_rpc(
+        &mut rpc,
+        6,
+        "terminal.readOutput",
+        json!({ "workspaceId": ws_id, "terminalId": terminal_id, "maxLines": 100 }),
+    )
+    .await;
+    assert!(
+        formatted
+            .as_str()
+            .is_some_and(|text| text.contains("MY_TEST_VAR=PROT_MARKER_env_wss")),
+        "post-exit readOutput retains formatted scrollback: {formatted}"
+    );
 
     let released = wss_rpc(
         &mut rpc,
-        5,
+        7,
         "terminal.kill",
         json!({ "terminalId": terminal_id }),
     )

@@ -12,7 +12,9 @@ use intent_core::{
     NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
     WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
 };
+use serde::Serialize;
 use serde_json::{json, Map, Value};
+use std::time::Instant;
 use tracing::Instrument;
 
 /// Target of the per-dispatch profiling span wrapped around [`dispatch`] in
@@ -301,33 +303,100 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         }
     };
 
-    // Per-dispatch profiling span: carries the method name so the composition
-    // root's profiling layer can count `sqlx::query` statement events scoped
-    // to this dispatch and time the handler (see RPC_DISPATCH_SPAN_TARGET).
-    let span =
-        tracing::info_span!(target: RPC_DISPATCH_SPAN_TARGET, RPC_DISPATCH_SPAN_NAME, method);
-    let result = dispatch(api, method, &params).instrument(span).await;
-
-    // Notifications never get a response, even on error / unknown method (§3.4).
-    if is_notification {
-        return None;
+    // Keep one span alive through dispatch AND response encoding. The writer
+    // queue consumes the returned frame later, so queue latency is deliberately
+    // excluded from `encode_elapsed_ms`.
+    let span = tracing::info_span!(
+        target: RPC_DISPATCH_SPAN_TARGET,
+        RPC_DISPATCH_SPAN_NAME,
+        method,
+        response_bytes = tracing::field::Empty,
+        encode_elapsed_ms = tracing::field::Empty,
+        oversized_replacement = tracing::field::Empty,
+        encode_failed = tracing::field::Empty,
+    );
+    let profile_span = span.clone();
+    async move {
+        let result = dispatch(api, method, &params).await;
+        let encode_started = Instant::now();
+        let encoded = encode_dispatch_result(
+            &echo_id,
+            method,
+            is_notification,
+            result,
+            crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        );
+        let encode_elapsed_ms = if is_notification {
+            0
+        } else {
+            millis_u64(encode_started.elapsed().as_millis())
+        };
+        profile_span.record(
+            "response_bytes",
+            u64::try_from(encoded.response_bytes).unwrap_or(u64::MAX),
+        );
+        profile_span.record("encode_elapsed_ms", encode_elapsed_ms);
+        profile_span.record("oversized_replacement", encoded.oversized_replacement);
+        profile_span.record("encode_failed", encoded.encode_failed);
+        encoded.frame
     }
-    // The log-only large-frame warning for outbound responses lives in
-    // `panic_guard::guard_frame` (the chokepoint covering fast-path responses
-    // that bypass this dispatcher, e.g. `host.exec`). The `-32010`
-    // replacement below hands a small error frame to that check, so an
-    // oversized response is never double-warned on top of its `error!`.
-    Some(match result {
-        Ok(v) => {
-            let frame = success_string(&echo_id.clone(), &v);
-            if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
-                oversized_response_string(&echo_id, method, frame.len())
-            } else {
-                frame
-            }
+    .instrument(span)
+    .await
+}
+
+fn millis_u64(millis: u128) -> u64 {
+    u64::try_from(millis.min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+}
+
+struct ResponseEncoding {
+    frame: Option<String>,
+    /// Serialized size of the intended envelope. For a hard-cap replacement,
+    /// this remains the rejected envelope's size rather than the small error
+    /// frame's size so profiling retains the payload-cost signal.
+    response_bytes: usize,
+    oversized_replacement: bool,
+    encode_failed: bool,
+}
+
+/// Encode a dispatched result and apply the hard response cap. Notifications
+/// have no envelope, therefore all response-encoding metrics are zero/false.
+fn encode_dispatch_result(
+    id: &Value,
+    method: &str,
+    is_notification: bool,
+    result: Result<Value, RpcErr>,
+    max_response_bytes: usize,
+) -> ResponseEncoding {
+    if is_notification {
+        return ResponseEncoding {
+            frame: None,
+            response_bytes: 0,
+            oversized_replacement: false,
+            encode_failed: false,
+        };
+    }
+
+    let encoded = match result {
+        Ok(value) => success_frame(id, &value),
+        Err(err) => error_frame(id, err.code, &err.message, err.data),
+    };
+    let response_bytes = encoded.frame.len();
+    if response_bytes > max_response_bytes {
+        let replacement = oversized_response_frame(id, method, response_bytes, max_response_bytes);
+        ResponseEncoding {
+            frame: Some(replacement.frame),
+            response_bytes,
+            oversized_replacement: true,
+            encode_failed: encoded.encode_failed || replacement.encode_failed,
         }
-        Err(e) => error_string(&echo_id, e.code, &e.message, e.data),
-    })
+    } else {
+        ResponseEncoding {
+            frame: Some(encoded.frame),
+            response_bytes,
+            oversized_replacement: false,
+            encode_failed: encoded.encode_failed,
+        }
+    }
 }
 
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
@@ -4353,13 +4422,13 @@ fn workspace_err(e: Error) -> RpcErr {
 }
 
 /// Serialize a success envelope. `result` is always a JSON object (§3.2).
-fn success_string(id: &Value, result: &Value) -> String {
+fn success_frame(id: &Value, result: &Value) -> EncodedEnvelope {
     let resp = json!({ "jsonrpc": "2.0", "result": result, "id": id });
-    serde_json::to_string(&resp).unwrap_or_else(|_| internal_fallback())
+    serialize_envelope(&resp)
 }
 
 /// Serialize an error envelope, optionally carrying `data`.
-fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> String {
+fn error_frame(id: &Value, code: i32, message: &str, data: Option<Value>) -> EncodedEnvelope {
     let mut err = Map::new();
     err.insert("code".to_string(), json!(code));
     err.insert("message".to_string(), json!(message));
@@ -4367,7 +4436,11 @@ fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> St
         err.insert("data".to_string(), d);
     }
     let resp = json!({ "jsonrpc": "2.0", "error": Value::Object(err), "id": id });
-    serde_json::to_string(&resp).unwrap_or_else(|_| internal_fallback())
+    serialize_envelope(&resp)
+}
+
+fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> String {
+    error_frame(id, code, message, data).frame
 }
 
 /// Replace a serialized response that exceeds
@@ -4375,32 +4448,135 @@ fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> St
 /// echoing the request id, so the client fails fast instead of hitting its
 /// RPC timeout on a silently dropped frame. The writer-task cap remains as a
 /// last-resort backstop for non-response frames (subscription pushes/events).
-fn oversized_response_string(id: &Value, method: &str, response_bytes: usize) -> String {
+fn oversized_response_frame(
+    id: &Value,
+    method: &str,
+    response_bytes: usize,
+    max_response_bytes: usize,
+) -> EncodedEnvelope {
     tracing::error!(
         method,
         response_bytes,
-        limit = crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        limit = max_response_bytes,
         "oversized JSON-RPC response replaced with error"
     );
-    error_string(
+    error_frame(
         id,
         OVERSIZED_RESPONSE,
         &format!(
-            "response for {method} exceeds maximum outbound frame size: {response_bytes} bytes > {} bytes",
-            crate::MAX_OUTBOUND_MESSAGE_BYTES
+            "response for {method} exceeds maximum outbound frame size: {response_bytes} bytes > {max_response_bytes} bytes"
         ),
         Some(json!({
             "code": "oversized-response",
             "method": method,
             "responseBytes": response_bytes,
-            "limit": crate::MAX_OUTBOUND_MESSAGE_BYTES,
+            "limit": max_response_bytes,
         })),
     )
+}
+
+struct EncodedEnvelope {
+    frame: String,
+    encode_failed: bool,
+}
+
+fn serialize_envelope(value: &impl Serialize) -> EncodedEnvelope {
+    match serde_json::to_string(value) {
+        Ok(frame) => EncodedEnvelope {
+            frame,
+            encode_failed: false,
+        },
+        Err(_) => EncodedEnvelope {
+            frame: internal_fallback(),
+            encode_failed: true,
+        },
+    }
 }
 
 /// Last-resort response if serialization itself fails (should never happen).
 fn internal_fallback() -> String {
     r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null}"#.to_string()
+}
+
+#[cfg(test)]
+mod response_profile_tests {
+    use super::*;
+    use serde::ser::Error as _;
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(S::Error::custom("intentional test failure"))
+        }
+    }
+
+    #[test]
+    fn serialization_failure_returns_profiled_fallback() {
+        let encoded = serialize_envelope(&FailingSerialize);
+        assert!(encoded.encode_failed);
+        assert_eq!(encoded.frame, internal_fallback());
+    }
+
+    #[test]
+    fn response_metrics_cover_success_error_replacement_and_notification() {
+        let success = encode_dispatch_result(
+            &json!(1),
+            "workspace.list",
+            false,
+            Ok(json!({ "workspaces": [] })),
+            usize::MAX,
+        );
+        assert_eq!(
+            success.response_bytes,
+            success.frame.as_ref().unwrap().len()
+        );
+        assert!(!success.oversized_replacement);
+        assert!(!success.encode_failed);
+
+        let error = encode_dispatch_result(
+            &json!(2),
+            "workspace.get",
+            false,
+            Err(invalid_params("bad params")),
+            usize::MAX,
+        );
+        assert_eq!(error.response_bytes, error.frame.as_ref().unwrap().len());
+        assert_eq!(
+            serde_json::from_str::<Value>(error.frame.as_ref().unwrap()).unwrap()["error"]["code"],
+            INVALID_PARAMS
+        );
+
+        let oversized = encode_dispatch_result(
+            &json!(3),
+            "note.list",
+            false,
+            Ok(json!({ "content": "x".repeat(256) })),
+            64,
+        );
+        assert!(oversized.response_bytes > 64);
+        assert!(oversized.oversized_replacement);
+        assert_eq!(
+            serde_json::from_str::<Value>(oversized.frame.as_ref().unwrap()).unwrap()["error"]
+                ["code"],
+            OVERSIZED_RESPONSE
+        );
+
+        let notification = encode_dispatch_result(
+            &Value::Null,
+            "workspace.list",
+            true,
+            Ok(json!({ "workspaces": [] })),
+            usize::MAX,
+        );
+        assert!(notification.frame.is_none());
+        assert_eq!(notification.response_bytes, 0);
+        assert!(!notification.oversized_replacement);
+        assert!(!notification.encode_failed);
+    }
 }
 
 #[cfg(test)]
