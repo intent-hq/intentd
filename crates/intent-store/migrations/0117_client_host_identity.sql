@@ -12,3 +12,9 @@ ALTER TABLE client ADD COLUMN device_kind TEXT;
 -- `workspace.setBrowserClient` pin requires a hello'd client — a draft-only
 -- id can never resolve to a reverse connection.
 ALTER TABLE client ADD COLUMN last_hello_at TEXT;
+-- Backfill: every pre-upgrade row was written by the hello upsert (the
+-- anonymous-draft path only stopped stamping a hello with this migration),
+-- so treat them all as hello'd at their last touch — otherwise a previously
+-- connected but currently offline client could not be pinned until it
+-- reconnected. Kept on one line: the store test re-runs this statement alone.
+UPDATE client SET last_hello_at = last_seen WHERE last_hello_at IS NULL;

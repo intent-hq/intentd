@@ -4789,6 +4789,28 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
     store.ensure_client(&id).await.expect("ensure existing");
     let kept = store.get_client(&id).await.unwrap().expect("present");
     assert_eq!(kept, again, "ensure never clobbers a hello'd row");
+
+    // The 0117 upgrade backfill: a pre-upgrade row (no `last_hello_at`, like
+    // the placeholder above) was written by the hello upsert, so it is
+    // stamped from `last_seen`; an already-stamped row is left alone. Re-run
+    // just the backfill statement — the ALTERs in the same file cannot run
+    // twice.
+    let backfill = include_str!("../migrations/0117_client_host_identity.sql")
+        .lines()
+        .find(|l| l.starts_with("UPDATE client SET last_hello_at"))
+        .expect("0117 backfill statement");
+    sqlx::raw_sql(backfill)
+        .execute(store.write_pool())
+        .await
+        .expect("re-run backfill");
+    let placeholder = store.get_client(&anon).await.unwrap().expect("present");
+    assert_eq!(
+        placeholder.last_hello_at,
+        Some(placeholder.last_seen.clone()),
+        "pre-upgrade rows count as hello'd at their last touch"
+    );
+    let kept = store.get_client(&id).await.unwrap().expect("present");
+    assert_eq!(kept, again, "an already-stamped row keeps its own stamp");
 }
 
 /// REV-2 per-workspace browser-client pin: NULL (unpinned) by default, a

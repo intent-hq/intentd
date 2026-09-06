@@ -20657,27 +20657,26 @@ impl WorkspaceApi for Services {
                     )));
                 }
             }
-            // Write and announce under one gate: two racing setters would
-            // otherwise publish deltas in the opposite order of their
-            // commits. The delta carries the read-back committed value, not
-            // the requested one.
-            {
-                let _gate = self.browser_client_pin_gate.lock().await;
-                store
-                    .set_workspace_browser_client(&id, client_id.as_ref())
-                    .await?;
-                let committed = store.workspace_browser_client(&id).await?;
-                // Self-sufficient `workspace:updated` delta (§6.5); `null`
-                // spells a cleared pin so clients can drop their copy.
-                let change = committed
-                    .as_ref()
-                    .map_or(serde_json::Value::Null, |c| c.as_str().into());
-                publish_event(
-                    bus.as_ref(),
-                    workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change })),
-                )
-                .await;
-            }
+            // Write, announce and read back under one gate: two racing
+            // setters would otherwise publish deltas in the opposite order of
+            // their commits, or echo the other's pin in their own reply. The
+            // delta carries the read-back committed value, not the requested
+            // one, and the reply is built from the same committed state.
+            let _gate = self.browser_client_pin_gate.lock().await;
+            store
+                .set_workspace_browser_client(&id, client_id.as_ref())
+                .await?;
+            let committed = store.workspace_browser_client(&id).await?;
+            // Self-sufficient `workspace:updated` delta (§6.5); `null`
+            // spells a cleared pin so clients can drop their copy.
+            let change = committed
+                .as_ref()
+                .map_or(serde_json::Value::Null, |c| c.as_str().into());
+            publish_event(
+                bus.as_ref(),
+                workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change })),
+            )
+            .await;
             self.browser_client_state(&id).await
         })
     }

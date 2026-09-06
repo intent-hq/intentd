@@ -30937,7 +30937,9 @@ mod browser_client_pin {
 
     /// Regression (#1760 review): racing setters must not publish
     /// `workspace:updated` deltas out of order relative to the durable pin.
-    /// The last delta a subscriber sees always equals what the store holds.
+    /// The last delta a subscriber sees always equals what the store holds,
+    /// and each reply echoes the pin *that call* committed — never a value a
+    /// racing setter committed between this call's publish and its read-back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_setters_publish_deltas_in_commit_order() {
         const ROUNDS: usize = 24;
@@ -30962,13 +30964,21 @@ mod browser_client_pin {
                 _ => None,
             };
             tasks.spawn(async move {
-                svc.set_workspace_browser_client(ws, target)
+                let requested = target.as_ref().map_or(Value::Null, |c| c.as_str().into());
+                let reply = svc
+                    .set_workspace_browser_client(ws, target)
                     .await
-                    .expect("set")
+                    .expect("set");
+                (requested, reply)
             });
         }
         while let Some(joined) = tasks.join_next().await {
-            joined.expect("join");
+            let (requested, reply) = joined.expect("join");
+            let echoed = reply.get("clientId").cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                echoed, requested,
+                "a reply echoes its own committed pin, not a racing setter's: {reply}"
+            );
         }
 
         let mut deltas: Vec<Value> = Vec::new();
