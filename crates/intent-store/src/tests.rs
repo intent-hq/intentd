@@ -4790,11 +4790,36 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
     let kept = store.get_client(&id).await.unwrap().expect("present");
     assert_eq!(kept, again, "ensure never clobbers a hello'd row");
 
-    // The 0117 upgrade backfill: a pre-upgrade row (no `last_hello_at`, like
-    // the placeholder above) was written by the hello upsert, so it is
-    // stamped from `last_seen`; an already-stamped row is left alone. Re-run
-    // just the backfill statement — the ALTERs in the same file cannot run
-    // twice.
+    // The 0117 upgrade backfill uses `name` as the hello-provenance proxy: a
+    // pre-upgrade *named* row (shaped here by nulling the stamp on a hello'd
+    // row) is stamped from `last_seen`; a pre-upgrade *nameless* row (the
+    // placeholder above) stays unstamped; an already-stamped row is left
+    // alone. Re-run just the backfill statement — the ALTERs in the same
+    // file cannot run twice.
+    let legacy = ClientId::from_string("legacy-named");
+    store
+        .upsert_client(
+            &legacy,
+            Some("Old Laptop"),
+            None,
+            &ClientHostInfo::default(),
+        )
+        .await
+        .expect("insert legacy");
+    sqlx::query("UPDATE client SET last_hello_at = NULL WHERE id = ?")
+        .bind(legacy.as_str())
+        .execute(store.write_pool())
+        .await
+        .expect("shape pre-upgrade row");
+    assert_eq!(
+        store
+            .get_client(&legacy)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_hello_at,
+        None
+    );
     let backfill = include_str!("../migrations/0117_client_host_identity.sql")
         .lines()
         .find(|l| l.starts_with("UPDATE client SET last_hello_at"))
@@ -4803,11 +4828,16 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
         .execute(store.write_pool())
         .await
         .expect("re-run backfill");
+    let legacy_row = store.get_client(&legacy).await.unwrap().expect("present");
+    assert_eq!(
+        legacy_row.last_hello_at,
+        Some(legacy_row.last_seen.clone()),
+        "a pre-upgrade named row counts as hello'd at its last touch"
+    );
     let placeholder = store.get_client(&anon).await.unwrap().expect("present");
     assert_eq!(
-        placeholder.last_hello_at,
-        Some(placeholder.last_seen.clone()),
-        "pre-upgrade rows count as hello'd at their last touch"
+        placeholder.last_hello_at, None,
+        "a pre-upgrade nameless row fails closed"
     );
     let kept = store.get_client(&id).await.unwrap().expect("present");
     assert_eq!(kept, again, "an already-stamped row keeps its own stamp");

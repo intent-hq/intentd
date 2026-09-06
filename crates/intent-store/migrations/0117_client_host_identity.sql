@@ -12,9 +12,12 @@ ALTER TABLE client ADD COLUMN device_kind TEXT;
 -- `workspace.setBrowserClient` pin requires a hello'd client — a draft-only
 -- id can never resolve to a reverse connection.
 ALTER TABLE client ADD COLUMN last_hello_at TEXT;
--- Backfill: every pre-upgrade row was written by the hello upsert (the
--- anonymous-draft path only stopped stamping a hello with this migration),
--- so treat them all as hello'd at their last touch — otherwise a previously
--- connected but currently offline client could not be pinned until it
--- reconnected. Kept on one line: the store test re-runs this statement alone.
-UPDATE client SET last_hello_at = last_seen WHERE last_hello_at IS NULL;
+-- Backfill: pre-upgrade rows carry no hello provenance, but `name` is a
+-- proxy — the anonymous-draft placeholder was always minted with a NULL
+-- name, while `client.hello` carries the client's name. Rows with a name
+-- count as hello'd at their last touch, so a previously connected but
+-- currently offline client stays pinnable; nameless rows (draft-only
+-- placeholders, or a hello'd row that somehow had no name) fail closed and
+-- become pinnable on their next hello, which stamps them. Kept on one line:
+-- the store test re-runs this statement alone.
+UPDATE client SET last_hello_at = last_seen WHERE last_hello_at IS NULL AND name IS NOT NULL;

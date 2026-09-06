@@ -31101,6 +31101,70 @@ mod browser_client_pin {
             Err(Error::NotFound(_))
         ));
     }
+
+    /// Upgrade path: pre-0117 `client` rows have no `last_hello_at`. The
+    /// migration backfills it from `last_seen` only for rows with a `name`
+    /// (the hello upsert always carried one; the anonymous-draft placeholder
+    /// never did), so a previously connected, currently offline client stays
+    /// pinnable after upgrade while a pre-upgrade draft-only placeholder is
+    /// rejected until it hellos. Pre-upgrade rows are shaped by nulling the
+    /// stamp directly, and the backfill statement is re-run from 0117.
+    #[tokio::test]
+    async fn pre_upgrade_named_row_is_pinnable_and_nameless_row_is_not() {
+        let reg = FakeRegistry::new(&[]);
+        let (_t, _r, svc, _bus, ws) = setup(reg).await;
+        let named = ClientId::from_string("desktop-a");
+        let nameless = ClientId::from_string("legacy-anon");
+        svc.ensure_client(nameless.clone())
+            .await
+            .expect("placeholder");
+        sqlx::query("UPDATE client SET last_hello_at = NULL")
+            .execute(svc.store.write_pool())
+            .await
+            .expect("shape pre-upgrade rows");
+        for id in [&named, &nameless] {
+            assert_eq!(
+                svc.store
+                    .get_client(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .last_hello_at,
+                None
+            );
+        }
+        let backfill = include_str!("../../intent-store/migrations/0117_client_host_identity.sql")
+            .lines()
+            .find(|l| l.starts_with("UPDATE client SET last_hello_at"))
+            .expect("0117 backfill statement");
+        sqlx::raw_sql(backfill)
+            .execute(svc.store.write_pool())
+            .await
+            .expect("re-run backfill");
+
+        let state = svc
+            .set_workspace_browser_client(ws.clone(), Some(named.clone()))
+            .await
+            .expect("pre-upgrade named row is pinnable");
+        assert_eq!(state["clientId"], "desktop-a");
+        assert_eq!(state["source"], "workspace");
+        assert_eq!(
+            state["resolved"],
+            Value::Null,
+            "pinned but not connected resolves to null"
+        );
+
+        let err = svc
+            .set_workspace_browser_client(ws.clone(), Some(nameless))
+            .await
+            .expect_err("pre-upgrade nameless row fails closed");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("legacy-anon")));
+        assert_eq!(
+            svc.get_workspace(ws).await.unwrap().browser_client_id,
+            Some(named),
+            "the rejected set leaves the existing pin untouched"
+        );
+    }
 }
 
 /// `scan_workspace_token_usage` tallies agent-session token counters into the
