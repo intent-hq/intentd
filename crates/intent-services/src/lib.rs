@@ -12705,6 +12705,12 @@ async fn semantic_map_paths(store: &Store, workspace_id: &WorkspaceId) -> Result
     tokio::task::spawn_blocking(move || {
         ignore::WalkBuilder::new(&root)
             .hidden(false)
+            .filter_entry(|entry| {
+                !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "target" | "node_modules")
+                )
+            })
             .build()
             .filter_map(std::result::Result::ok)
             .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
