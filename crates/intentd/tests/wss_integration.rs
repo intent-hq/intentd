@@ -10243,8 +10243,18 @@ async fn hello_browser_host(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
     client_id: &str,
 ) {
+    hello_with(ws, client_id, r#"{"browserExec":true}"#).await;
+}
+
+/// `client.hello` on `ws` as logical client `client_id` with the given
+/// `capabilities` JSON object, waiting for the reply (pings answered inline).
+async fn hello_with(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    client_id: &str,
+    capabilities: &str,
+) {
     let frame = format!(
-        r#"{{"jsonrpc":"2.0","id":"hello","method":"client.hello","params":{{"clientId":"{client_id}","capabilities":{{"browserExec":true}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":"hello","method":"client.hello","params":{{"clientId":"{client_id}","capabilities":{capabilities}}}}}"#
     );
     ws.send(Message::Text(frame.into()))
         .await
@@ -10366,6 +10376,133 @@ async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
         .expect_err("request fails on heartbeat abort");
     assert!(err.to_string().contains("closed"), "unexpected: {err}");
     assert!(srv.reverse_registry.is_empty());
+    srv.ws.stop().await;
+}
+
+/// Read `ws` until an `events.event` of `event_type` for `client_id`
+/// arrives (bounded), answering pings inline. Returns the event object.
+async fn await_client_event(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    event_type: &str,
+    client_id: &str,
+) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json frame");
+                    let event = &v["params"]["event"];
+                    if v["method"] == "events.event"
+                        && event["type"] == event_type
+                        && event["data"]["clientId"] == client_id
+                    {
+                        break event.clone();
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    ws.send(Message::Pong(payload)).await.expect("pong");
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected {event_type} event, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
+}
+
+/// REV-2 over the production TLS + bearer-auth path: capability gating and
+/// the `client:*` lifecycle events. An authenticated connection that never
+/// hellos, and one that hellos without `capabilities.browserExec`, are not
+/// eligible `browser.exec` targets; the one that advertises the capability
+/// is, and its arrival and its departure (here via the heartbeat reaper's
+/// task abort) reach an `events.subscribe` subscriber on another
+/// authenticated connection.
+#[tokio::test]
+async fn wss_tls_capability_gating_and_client_lifecycle_events() {
+    let srv = start(WsOptions {
+        heartbeat_interval: Duration::from_millis(100),
+        heartbeat_timeout: Duration::from_millis(300),
+        ..WsOptions::default()
+    })
+    .await;
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":"sub","method":"events.subscribe","params":{"eventTypes":["client:connected","client:disconnected"]}}"#
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send subscribe");
+    let ack = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match sub.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["id"] == "sub" {
+                        break v;
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => sub.send(Message::Pong(p)).await.expect("pong"),
+                Some(Ok(_)) => {}
+                other => panic!("expected subscribe ack, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("subscribe ack");
+    assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
+
+    // Authenticated but never hello'd (iOS-like): registered, not eligible.
+    let _silent = connect_ws(srv.port, srv.cfg.clone()).await;
+    // Hello'd without the capability (FE auxiliary socket): not eligible.
+    let mut aux = connect_ws(srv.port, srv.cfg.clone()).await;
+    hello_with(&mut aux, "tls-aux", "{}").await;
+    let ev = await_client_event(&mut sub, "client:connected", "tls-aux").await;
+    assert_eq!(
+        ev["data"],
+        serde_json::json!({ "clientId": "tls-aux", "capabilities": {} })
+    );
+    assert!(
+        !srv.reverse_registry.is_connected(),
+        "no eligible target without capabilities.browserExec"
+    );
+    assert!(matches!(
+        srv.reverse_registry.resolve(&ReverseTarget::Default),
+        Err(intent_core::ReverseDispatchError::NoClient)
+    ));
+
+    // The desktop hellos with the capability: eligible, and announced.
+    let mut desktop = connect_ws(srv.port, srv.cfg.clone()).await;
+    hello_browser_host(&mut desktop, "tls-desktop").await;
+    assert!(srv.reverse_registry.is_connected());
+    let resolved = srv
+        .reverse_registry
+        .resolve(&ReverseTarget::Default)
+        .expect("eligible target");
+    assert_eq!(resolved.client_id.as_str(), "tls-desktop");
+    let ev = await_client_event(&mut sub, "client:connected", "tls-desktop").await;
+    assert_eq!(ev["workspaceId"], "");
+    assert_eq!(
+        ev["data"],
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+    );
+
+    // Leave `desktop` unpolled: no pongs, so the heartbeat reaper aborts its
+    // task. The departure is still announced and the client is gone.
+    let ev = await_client_event(&mut sub, "client:disconnected", "tls-desktop").await;
+    assert_eq!(
+        ev["data"],
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+    );
+    assert!(!srv.reverse_registry.is_connected());
+    assert!(srv
+        .reverse_registry
+        .live_clients()
+        .iter()
+        .all(|c| c.client_id.as_str() != "tls-desktop"));
+    drop(desktop);
+    drop(aux);
     srv.ws.stop().await;
 }
 
