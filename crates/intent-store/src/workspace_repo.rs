@@ -150,7 +150,7 @@ impl Store {
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, checkout_mode=?, browser_client_id=? WHERE id=?",
+             token_usage=?, setup_script=?, checkout_mode=? WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -186,7 +186,6 @@ impl Store {
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
-        .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
         .bind(&ws.id.0)
         .execute(self.write_pool())
         .await
@@ -678,8 +677,10 @@ impl Store {
     }
 
     /// Scoped write of the per-workspace browser-client pin (REV-2,
-    /// `workspace.setBrowserClient`): `None` clears it. Never a full-row
-    /// replace, so a concurrent `workspace.update` cannot be clobbered.
+    /// `workspace.setBrowserClient`): `None` clears it. This setter is the
+    /// only writer of the column after insert — `update_workspace` never
+    /// touches it (like `auto_commit_enabled`), so a stale `Workspace`
+    /// snapshot passed to a general update cannot revert a concurrent pin.
     ///
     /// # Errors
     ///

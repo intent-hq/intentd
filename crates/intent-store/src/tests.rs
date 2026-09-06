@@ -4758,8 +4758,10 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
 }
 
 /// REV-2 per-workspace browser-client pin: NULL (unpinned) by default, a
-/// scoped set/clear round-trips, the column rides `Workspace` reads and the
-/// full-row `update_workspace`, and an unknown workspace is `NotFound`.
+/// scoped set/clear round-trips, the column rides `Workspace` reads, and an
+/// unknown workspace is `NotFound`. The scoped setter is the column's only
+/// writer after insert: a full-row `update_workspace` from a snapshot read
+/// before the pin must not revert it.
 #[tokio::test]
 async fn workspace_browser_client_pin_round_trip() {
     let tmp = TempDb::new();
@@ -4769,10 +4771,8 @@ async fn workspace_browser_client_pin_round_trip() {
     store.insert_workspace(&ws).await.expect("insert");
 
     assert_eq!(store.workspace_browser_client(&ws_id).await.unwrap(), None);
-    assert_eq!(
-        store.get_workspace(&ws_id).await.unwrap().browser_client_id,
-        None
-    );
+    let stale = store.get_workspace(&ws_id).await.unwrap();
+    assert_eq!(stale.browser_client_id, None);
 
     let desktop = ClientId::from_string("desktop-b");
     store
@@ -4788,7 +4788,15 @@ async fn workspace_browser_client_pin_round_trip() {
     let json = serde_json::to_value(&loaded).unwrap();
     assert_eq!(json["browserClientId"], "desktop-b");
 
-    // The full-row update carries the pin unchanged.
+    // A general update from a snapshot taken before the pin (a concurrent
+    // `workspace.update` that read early and committed late) leaves the
+    // pin alone; so does one from a fresh snapshot.
+    store.update_workspace(&stale).await.expect("stale update");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(desktop.clone()),
+        "full-row update must not revert the scoped pin"
+    );
     store.update_workspace(&loaded).await.expect("update");
     assert_eq!(
         store.workspace_browser_client(&ws_id).await.unwrap(),
