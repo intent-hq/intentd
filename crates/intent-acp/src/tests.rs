@@ -1755,12 +1755,27 @@ mod session_tests {
         // §7.1 registry: a non-workspace_api tool completing while a batch is
         // pending must not claim it, even when its arguments are shaped
         // `{ code, summary }`. Codex `server`/`tool` metadata and namespaced
-        // titles are authoritative over the input-shape rule.
+        // titles are authoritative over the input-shape rule — in the mapper
+        // AND at the registry's input-shape claim gate, which the transcript
+        // writer feeds only for calls the mapper did NOT identify
+        // authoritatively (`name_authoritative`). The titles here equal the
+        // model-authored `summary` on purpose: nothing constrains a summary
+        // from matching the title, and the codex unwrap strips `server`/`tool`
+        // from the recorded input, so the input alone cannot tell these
+        // frames from auggie's.
         use intent_core::turn_attachments::{
             AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
         };
         use intent_core::AgentId;
 
+        // What the transcript writer hands the claim gate.
+        let gate_input = |tc: &session::MappedToolCall| {
+            (!tc.name_authoritative).then(|| {
+                let mut input = tc.input.clone();
+                input["_acpTitle"] = json!(tc.title);
+                input
+            })
+        };
         let reg = TurnAttachmentRegistry::new();
         let agent = AgentId::from_string("agent-4491");
         let pending = || TurnAttachment {
@@ -1771,22 +1786,22 @@ mod session_tests {
             name: "Create workspace".to_string(),
             text: "{}".to_string(),
         };
-        let args = json!({ "code": "print(1)", "summary": "Run Python" });
+        let args = |summary: &str| json!({ "code": "print(1)", "summary": summary });
         let garbled = json!({ "output": "ok" });
 
-        let codex = ToolCall::new("t1", "execute")
+        let codex = ToolCall::new("t1", "Run Python")
             .kind(ToolKind::Execute)
             .raw_input(json!({
-                "arguments": args,
+                "arguments": args("Run Python"),
                 "server": "python",
                 "tool": "execute",
             }));
         let claude = ToolCall::new("t2", "mcp__python__execute")
             .kind(ToolKind::Execute)
-            .raw_input(args.clone());
+            .raw_input(args("mcp__python__execute"));
         let codex_title = ToolCall::new("t3", "mcp.python.execute")
             .kind(ToolKind::Execute)
-            .raw_input(args.clone());
+            .raw_input(args("mcp.python.execute"));
         for call in [codex, claude, codex_title] {
             let title = call.title.clone();
             let MappedUpdate::ToolCall(tc) =
@@ -1795,15 +1810,22 @@ mod session_tests {
                 panic!("expected tool call");
             };
             assert_eq!(tc.tool_name, "python_execute", "title={title}");
+            assert!(tc.name_authoritative, "title={title}");
+            assert!(
+                intent_core::is_workspace_api_input(&tc.input),
+                "the unwrapped input is indistinguishable from auggie's: title={title}"
+            );
+            let input = gate_input(&tc);
+            assert!(input.is_none(), "title={title}");
             reg.register(&agent, pending());
             assert!(
-                reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name)
+                reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name, input.as_ref())
                     .is_empty(),
                 "foreign tool {title} must not claim the pending batch"
             );
             // The batch is still there for the daemon's own tool.
             assert_eq!(
-                reg.claim_at_tool_result(&agent, Some(&garbled), "workspace_api")
+                reg.claim_at_tool_result(&agent, Some(&garbled), "workspace_api", None)
                     .len(),
                 1,
                 "title={title}"
@@ -1825,9 +1847,20 @@ mod session_tests {
             panic!("expected tool call");
         };
         assert_eq!(tc.tool_name, "workspace_api");
+        assert!(!tc.name_authoritative);
+        let input = gate_input(&tc);
+        assert!(input.is_some());
         reg.register(&agent, pending());
         assert_eq!(
-            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name)
+            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name, input.as_ref())
+                .len(),
+            1
+        );
+        // Second line of defense: were the name ever recorded as the prose
+        // title again, the same identifier-less input still opens the gate.
+        reg.register(&agent, pending());
+        assert_eq!(
+            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.title, input.as_ref())
                 .len(),
             1
         );

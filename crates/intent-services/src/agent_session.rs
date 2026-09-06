@@ -354,6 +354,13 @@ struct Transcript {
     /// long tool runs are legitimately silent. Anonymous updates dropped by
     /// `record_tool` (STAB-124) never enter this set.
     open_tool_calls: HashSet<String>,
+    /// `toolCallId`s whose recorded name came from an authoritative
+    /// identifier (`MappedToolCall::name_authoritative`: MCP `server`/`tool`
+    /// metadata or a namespaced title) on any frame so far. The §7.1 registry
+    /// claim's input-shape gate is withheld for these ids: a foreign tool
+    /// whose arguments happen to be `{ code, summary }` keeps its own name
+    /// and must never claim a `workspace_api` batch (intent-hq/intent#4491).
+    identified_tool_calls: HashSet<String>,
 }
 
 /// The block indices one [`Transcript::record_tool`] call materialized. The
@@ -384,6 +391,7 @@ impl Transcript {
             proposal_index: HashMap::new(),
             usage_cost: None,
             open_tool_calls: HashSet::new(),
+            identified_tool_calls: HashSet::new(),
         }
     }
 
@@ -558,6 +566,9 @@ impl Transcript {
                 index
             }
         };
+        if tc.name_authoritative {
+            self.identified_tool_calls.insert(tc.tool_call_id.clone());
+        }
         let mut result_index = None;
         let mut proposal_indices = Vec::new();
         let completed = tc.status == "completed" || tc.status == "error";
@@ -664,6 +675,26 @@ impl Transcript {
     fn tool_name_for(&self, tool_call_id: &str) -> Option<&str> {
         let &i = self.tool_use_index.get(tool_call_id)?;
         self.blocks[i].get("name").and_then(Value::as_str)
+    }
+
+    /// The input the §7.1 registry claim's input-shape gate may inspect for
+    /// `tc` (intent-hq/intent#4491): the update's own input when it carries
+    /// one (the freshest — `record_tool` is about to replace the block input
+    /// with it, and a first sight with `rawInput: null` persisted only an
+    /// `_acpTitle` placeholder), otherwise the input recorded at first sight
+    /// (`tool_call_update`s are usually input-less). `None` when the call was
+    /// authoritatively identified on this or any earlier frame
+    /// ([`identified_tool_calls`](Self::identified_tool_calls)) — the gate
+    /// is for identifier-less frames only — or when no input exists.
+    fn unidentified_input_for<'a>(&'a self, tc: &'a MappedToolCall) -> Option<&'a Value> {
+        if tc.name_authoritative || self.identified_tool_calls.contains(&tc.tool_call_id) {
+            return None;
+        }
+        if !tc.input.is_null() {
+            return Some(&tc.input);
+        }
+        let &i = self.tool_use_index.get(&tc.tool_call_id)?;
+        self.blocks[i].get("input").filter(|v| !v.is_null())
     }
 
     fn into_blocks(mut self) -> Vec<Value> {
@@ -4713,16 +4744,20 @@ impl Services {
                 // the echoed output, `workspace_api` FIFO fallback). A hit
                 // yields the canonical resource items to attach — no echo
                 // parsing; a miss falls back to the legacy lift inside
-                // `record_tool`. `tool_call_update`s are name-less, so the
-                // FIFO gate resolves the name recorded at first sight.
+                // `record_tool`. `tool_call_update`s are name-less (and
+                // usually input-less), so the name gate resolves the name
+                // recorded at first sight and the input-shape gate sees the
+                // freshest input — withheld once the call was identified
+                // authoritatively (intent-hq/intent#4491).
                 let known = transcript.tool_name_for(&tc.tool_call_id).is_some();
                 let registered: Vec<Value> = if tc.status == "completed" {
                     let name = transcript
                         .tool_name_for(&tc.tool_call_id)
                         .unwrap_or(&tc.tool_name)
                         .to_string();
+                    let input = transcript.unidentified_input_for(&tc);
                     self.turn_attachments
-                        .claim_at_tool_result(agent_id, tc.output.as_ref(), &name)
+                        .claim_at_tool_result(agent_id, tc.output.as_ref(), &name, input)
                         .iter()
                         .map(intent_core::TurnAttachment::resource_item)
                         .collect()

@@ -123,5 +123,6 @@ pub use traits::{
     ReverseLiveClient, ReverseTarget, WorkspaceApi,
 };
 pub use turn_attachments::{
-    new_attachment_id, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
+    is_workspace_api_input, new_attachment_id, AttachmentPolicy, TurnAttachment,
+    TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
 };
