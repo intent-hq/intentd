@@ -122,7 +122,11 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// removed methods without updating the catalog. The catalog freeze is
 /// intentional: any surface change requires a protocol version bump and a
 /// docs/protocol/ update.
-const EXPECTED_TOTAL_METHODS: usize = 348;
+///
+/// REV-2 browser tab registry (intent-hq/intent#461): +4 fast-path methods
+/// (`browser.listTabs` / `browser.upsertTab` / `browser.removeTab` /
+/// `browser.syncTabs`), protocol 9.10.
+const EXPECTED_TOTAL_METHODS: usize = 352;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
@@ -130,7 +134,7 @@ const EXPECTED_TOTAL_METHODS: usize = 348;
 const EXPECTED_ROUTER_METHODS: usize = 303;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 43;
+const EXPECTED_FASTPATH_METHODS: usize = 47;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;

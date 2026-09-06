@@ -227,8 +227,8 @@ impl ReverseChannel {
 
 pub mod primary;
 pub use primary::{
-    ClientTransition, LiveClient, PrimaryReverseGuard, PrimaryReverseRegistry, ResolvedClient,
-    ReverseClientIdentity, ReverseTransport, CLIENT_CONNECTED, CLIENT_DISCONNECTED,
+    ClientPresence, ClientTransition, LiveClient, PrimaryReverseGuard, PrimaryReverseRegistry,
+    ResolvedClient, ReverseClientIdentity, ReverseTransport, CLIENT_CONNECTED, CLIENT_DISCONNECTED,
 };
 
 #[cfg(test)]

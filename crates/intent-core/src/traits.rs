@@ -9,21 +9,21 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 use crate::model::{
-    AgentDelegateInput, AgentLite, AgentSession, ClientHostInfo, CommentAddResult,
-    CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentResolveThreadResult,
-    CommentRespondResult, ContextItem, Draft, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
-    GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
-    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
-    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
-    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceTask, WorkspaceUpdate,
+    AgentDelegateInput, AgentLite, AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo,
+    CommentAddResult, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
+    CommentResolveThreadResult, CommentRespondResult, ContextItem, Draft, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus,
+    GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
+    LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
+    NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
+    ScriptCreateParams, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -5864,6 +5864,75 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::draft_clear not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ------------------------------------------------------------------------
+    // browser.listTabs / upsertTab / removeTab / syncTabs — the daemon-owned
+    // browser tab registry (REV-2 Model 2 & 6). Like `drafts.*`, the write
+    // methods consume the connection's `client_id` binding (the reporting
+    // host) and are transport-level interceptors that reach persistence
+    // through this trait.
+    // ------------------------------------------------------------------------
+
+    /// `browser.listTabs`: every open tab of `workspace_id`, oldest first,
+    /// without host presence decoration (the transport adds `hostName` /
+    /// `hostConnected` from the live reverse registry).
+    fn browser_list_tabs(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<BrowserTab>>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_list_tabs not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `browser.upsertTab` (host only): `host` becomes / stays the tab's
+    /// host; a tab hosted by another client is `Error::InvalidParams`. Emits
+    /// `browser:tab-opened` for a new row or `browser:tab-updated { changes }`
+    /// when a field changed — nothing when the report matched the stored
+    /// state. Returns the persisted row.
+    fn browser_upsert_tab(
+        &self,
+        host: ClientId,
+        tab: BrowserTabInput,
+    ) -> BoxFuture<'_, Result<BrowserTab>> {
+        let _ = (host, tab);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_upsert_tab not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `browser.removeTab` (host only): delete the tab and emit
+    /// `browser:tab-closed`. Unknown ids are an idempotent no-op; a tab hosted
+    /// by another client is `Error::InvalidParams`.
+    fn browser_remove_tab(&self, host: ClientId, tab_id: String) -> BoxFuture<'_, Result<()>> {
+        let _ = (host, tab_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_remove_tab not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `browser.syncTabs` (host only): reconcile `host`'s full tab snapshot
+    /// per REV-2 Model 6, emitting the matching `browser:tab-*` events, and
+    /// return the tab ids the host must drop.
+    fn browser_sync_tabs(
+        &self,
+        host: ClientId,
+        tabs: Vec<BrowserTabInput>,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let _ = (host, tabs);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_sync_tabs not implemented".to_string(),
             ))
         })
     }

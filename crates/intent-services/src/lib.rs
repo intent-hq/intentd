@@ -65,6 +65,7 @@ mod attachment_upload;
 mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
+mod browser_tabs;
 mod clone_ops;
 mod complete_ops;
 #[cfg(test)]
@@ -371,6 +372,13 @@ pub struct Services {
     /// publish so concurrent setters never emit deltas out of order relative
     /// to the durable pin; the delta is read back from the committed row.
     browser_client_pin_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes each browser tab registry mutation (`browser.upsertTab` /
+    /// `removeTab` / `syncTabs`) together with the publication of its
+    /// `browser:tab-*` events. The store transaction alone orders the rows;
+    /// without this gate a `removeTab` could commit and publish `tab-closed`
+    /// between a `syncTabs` commit and that sync's per-row `tab-opened`,
+    /// leaving subscribers with a ghost tab the database no longer has.
+    browser_tab_gate: Arc<tokio::sync::Mutex<()>>,
     /// Per-entry debounce-hold release timers, keyed by queue-entry id: each
     /// held [`agent_ops::QueuedMessage`] gets a spawned sleeper that flushes
     /// the hold marker at `holdUntil` and kicks delivery. Release/retract
@@ -1116,6 +1124,7 @@ impl Services {
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
+            browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,
@@ -28815,6 +28824,37 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<()>> {
         let svc = self.clone();
         Box::pin(async move { svc.drafts_clear(workspace_id, agent_id, client_id).await })
+    }
+
+    fn browser_list_tabs(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<intent_core::BrowserTab>>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tabs_list(workspace_id).await })
+    }
+
+    fn browser_upsert_tab(
+        &self,
+        host: ClientId,
+        tab: intent_core::BrowserTabInput,
+    ) -> BoxFuture<'_, Result<intent_core::BrowserTab>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tab_upsert(host, tab).await })
+    }
+
+    fn browser_remove_tab(&self, host: ClientId, tab_id: String) -> BoxFuture<'_, Result<()>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tab_remove(host, tab_id).await })
+    }
+
+    fn browser_sync_tabs(
+        &self,
+        host: ClientId,
+        tabs: Vec<intent_core::BrowserTabInput>,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tabs_sync(host, tabs).await })
     }
 
     /// `browser.exec` — agent-initiated CDP forward (REV-2, PROTOCOL §5.14/§12.4).

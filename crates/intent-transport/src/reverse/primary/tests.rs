@@ -646,6 +646,180 @@ fn live_clients_project_the_most_recent_hello_regardless_of_registration_order()
     );
 }
 
+/// The presence index behind `browser.listTabs` decoration tracks every
+/// registry mutation: bind, multi-connection clients, re-hello under another
+/// id, and drop — and only answers for the ids asked about.
+#[test]
+fn host_presence_follows_bind_rehello_and_drop() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a1, _rx1) = idle_channel();
+    let (a2, _rx2) = idle_channel();
+    let (b1, _rx3) = idle_channel();
+    let guard_a_first = reg.register(a1, ReverseTransport::Wss);
+    let guard_a_second = reg.register(a2, ReverseTransport::Uds);
+    let guard_b = reg.register(b1, ReverseTransport::Uds);
+    let a_id = ClientId::from_string("a");
+    let b_id = ClientId::from_string("b");
+    let c_id = ClientId::from_string("c");
+    let ask = |ids: &[&ClientId]| reg.host_presence(&ids.iter().copied().collect());
+
+    assert!(
+        ask(&[&a_id, &b_id]).is_empty(),
+        "un-hello'd connections are not present"
+    );
+
+    guard_a_first.bind(identity("a", true));
+    guard_a_second.bind(identity("a", false));
+    guard_b.bind(identity("b", false));
+    let presence = ask(&[&a_id, &b_id, &c_id]);
+    assert_eq!(presence.len(), 2, "unknown ids are simply absent");
+    assert_eq!(presence[&a_id].connections, 2);
+    assert_eq!(presence[&a_id].name.as_deref(), Some("client a"));
+    assert_eq!(presence[&b_id].connections, 1);
+    assert_eq!(ask(&[&b_id]).len(), 1, "only the asked ids are looked up");
+
+    // Re-hello under the same id refreshes the display name only.
+    guard_a_second.bind(ReverseClientIdentity {
+        name: Some("renamed a".to_string()),
+        ..identity("a", false)
+    });
+    let presence = ask(&[&a_id]);
+    assert_eq!(presence[&a_id].connections, 2);
+    assert_eq!(presence[&a_id].name.as_deref(), Some("renamed a"));
+
+    // Re-hello under another id moves the connection between clients; a's
+    // name falls back to its remaining (older) hello instead of keeping the
+    // departed connection's "renamed a".
+    guard_a_second.bind(identity("c", false));
+    let presence = ask(&[&a_id, &c_id]);
+    assert_eq!(presence[&a_id].connections, 1);
+    assert_eq!(presence[&a_id].name.as_deref(), Some("client a"));
+    assert_eq!(presence[&c_id].connections, 1);
+    assert_eq!(presence[&c_id].name.as_deref(), Some("client c"));
+
+    // Dropping the newest connection of a multi-connection client reverts
+    // the name to the newest surviving hello — the same rule `live_clients`
+    // applies — rather than keeping the dropped connection's name.
+    let (a3, _rx4) = idle_channel();
+    let guard_a_third = reg.register(a3, ReverseTransport::Wss);
+    guard_a_third.bind(ReverseClientIdentity {
+        name: Some("third a".to_string()),
+        ..identity("a", false)
+    });
+    assert_eq!(ask(&[&a_id])[&a_id].name.as_deref(), Some("third a"));
+    drop(guard_a_third);
+    let presence = ask(&[&a_id]);
+    assert_eq!(presence[&a_id].connections, 1);
+    assert_eq!(presence[&a_id].name.as_deref(), Some("client a"));
+    assert_eq!(
+        presence[&a_id].name,
+        reg.live_clients()
+            .iter()
+            .find(|c| c.client_id == a_id)
+            .and_then(|c| c.name.clone()),
+        "presence name agrees with live_clients"
+    );
+
+    // Dropping the last connection removes the client.
+    drop(guard_a_first);
+    let presence = ask(&[&a_id, &b_id, &c_id]);
+    assert!(!presence.contains_key(&a_id));
+    assert_eq!(presence[&b_id].connections, 1);
+    assert_eq!(presence[&c_id].connections, 1);
+    drop(guard_b);
+    drop(guard_a_second);
+    assert!(ask(&[&a_id, &b_id, &c_id]).is_empty());
+}
+
+/// The presence name keys on hello order, not registration order, so it
+/// agrees with `live_clients` when an earlier-registered connection hellos
+/// (or re-hellos) after a later-registered one — including after the
+/// newest-hello'd connection drops.
+#[test]
+fn host_presence_name_follows_highest_hello_seq_not_registration_order() {
+    let reg = PrimaryReverseRegistry::new();
+    let (first, _rx_first) = idle_channel();
+    let (second, _rx_second) = idle_channel();
+    let g_first = reg.register(first, ReverseTransport::Wss);
+    let g_second = reg.register(second, ReverseTransport::Uds);
+    let x_id = ClientId::from_string("x");
+    let ask = || reg.host_presence(&[&x_id].into_iter().collect());
+    let live_name = || {
+        reg.live_clients()
+            .iter()
+            .find(|c| c.client_id == x_id)
+            .and_then(|c| c.name.clone())
+    };
+
+    // The later-registered connection hellos first ...
+    g_second.bind(ReverseClientIdentity {
+        name: Some("stale".into()),
+        ..identity("x", false)
+    });
+    // ... then the earlier-registered one hellos with the newer name.
+    g_first.bind(ReverseClientIdentity {
+        name: Some("fresh".into()),
+        ..identity("x", true)
+    });
+    let presence = ask();
+    assert_eq!(presence[&x_id].connections, 2);
+    assert_eq!(presence[&x_id].name.as_deref(), Some("fresh"));
+    assert_eq!(presence[&x_id].name, live_name());
+
+    // A re-hello on the later-registered connection supersedes again.
+    g_second.bind(ReverseClientIdentity {
+        name: Some("freshest".into()),
+        ..identity("x", false)
+    });
+    assert_eq!(ask()[&x_id].name.as_deref(), Some("freshest"));
+    assert_eq!(ask()[&x_id].name, live_name());
+
+    // Dropping the newest-hello'd connection falls back to the surviving
+    // hello even though it sits earlier in registration order.
+    drop(g_second);
+    let presence = ask();
+    assert_eq!(presence[&x_id].connections, 1);
+    assert_eq!(presence[&x_id].name.as_deref(), Some("fresh"));
+    assert_eq!(presence[&x_id].name, live_name());
+    drop(g_first);
+    assert!(ask().is_empty());
+}
+
+/// `bound_client_id` reports only what `client.hello` bound onto this
+/// connection's entry: nothing before a hello, the latest id after a
+/// re-hello, and nothing once the entry is gone — per guard, not per registry.
+#[test]
+fn bound_client_id_tracks_this_connections_hello() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a, _rx_a) = idle_channel();
+    let (b, _rx_b) = idle_channel();
+    let guard_a = reg.register(a, ReverseTransport::Wss);
+    let guard_b = reg.register(b, ReverseTransport::Uds);
+
+    assert_eq!(guard_a.bound_client_id(), None);
+    guard_b.bind(identity("b", false));
+    assert_eq!(
+        guard_a.bound_client_id(),
+        None,
+        "another connection's hello does not qualify this one"
+    );
+    assert_eq!(guard_b.bound_client_id(), Some(ClientId::from_string("b")));
+
+    guard_a.bind(identity("a", true));
+    assert_eq!(guard_a.bound_client_id(), Some(ClientId::from_string("a")));
+    guard_a.bind(identity("c", true));
+    assert_eq!(guard_a.bound_client_id(), Some(ClientId::from_string("c")));
+    drop(guard_b);
+    assert_eq!(guard_a.bound_client_id(), Some(ClientId::from_string("c")));
+    assert_eq!(
+        reg.inner.lock().bound.len(),
+        1,
+        "the index forgets a dropped connection"
+    );
+    drop(guard_a);
+    assert!(reg.inner.lock().bound.is_empty());
+}
+
 #[tokio::test]
 async fn dropping_guard_closes_an_accepted_request() {
     let reg = PrimaryReverseRegistry::new();
