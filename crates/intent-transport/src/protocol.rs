@@ -372,21 +372,16 @@
 //! `git.status.ahead`), `uncommittedCount` (distinct paths in the
 //! `git.status.files` entry set), and `error` only when the root could not
 //! be read (counts then 0). Unknown workspace → `-32602`. Method catalog
-//! grows by one router method — 300 router methods, 39 fast-path, 341 total.
+//! grows by one router method — 300 router methods, 39 fast-path, 341
+//! total.
 //!
-//! Version 9.8 is an additive minor bump over 9.7 that adds the seven
-//! daemon-global `workspaceDraft.*` router methods (§5.1.1): durable CRUD,
-//! optimistic-revision update, idempotent promotion through
-//! `workspace.create`, delivery reconciliation, and delete. It also adds the
-//! `workspace-draft:*` event family (§6.5) and the optional persisted
-//! `Workspace.setupResult` projection. Version 9.8 also adds guided
-//! Antigravity setup (§5.44): the four local-app methods
-//! `providers.setup.status`, `providers.setup.start`, `providers.setup.login`,
-//! and `providers.setup.cancel`, plus the reverse request
-//! `providers.setup.openLogin`, which asks the owning app to open the sign-in
-//! URL after explicit user consent. The catalog contains 307 router methods,
-//! 43 fast-path methods, and two aliases: 352 client-callable names. The five
-//! reverse methods are counted separately.
+//! Version 9.8 adds guided Antigravity setup (§5.44). The four local-app
+//! methods are `providers.setup.status`, `providers.setup.start`,
+//! `providers.setup.login`, and `providers.setup.cancel`. The reverse request
+//! `providers.setup.openLogin` asks the owning app to open the sign-in URL
+//! after explicit user consent. The catalog contains 300 router methods,
+//! 43 fast-path methods, and two aliases: 345 client-callable names.
+//! The five reverse methods are counted separately.
 //!
 //! Version 9.9 adds the REV-2 per-workspace browser-client pin. `client.list`
 //! (global) reports live hello'd connections grouped by `clientId`, a client
@@ -397,14 +392,23 @@
 //! `workspace:updated { changes: { browserClientId } }`). Agent-initiated
 //! `browser.exec` dispatches to the pinned client when set — pinned but
 //! offline is `-32603`, never a silent fallback. The catalog grows by three
-//! router methods — 310 router methods, 43 fast-path, two aliases: 355
+//! router methods — 303 router methods, 43 fast-path, two aliases: 348
+//! client-callable names.
+//!
+//! Version 9.10 is an additive minor bump over 9.9 that adds the seven
+//! daemon-global `workspaceDraft.*` router methods (§5.1.1): durable CRUD,
+//! optimistic-revision update, idempotent promotion through
+//! `workspace.create`, delivery reconciliation, and delete. It also adds the
+//! `workspace-draft:*` event family (§6.5) and the optional persisted
+//! `Workspace.setupResult` projection. The catalog grows by seven router
+//! methods — 310 router methods, 43 fast-path, two aliases: 355
 //! client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.9";
+pub const PROTOCOL_VERSION: &str = "9.10";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
