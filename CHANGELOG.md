@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.31] - 2026-09-06
+
+### 🚀 Features
+
+- *(agents)* Configurable tool-payload replay cap and retention compaction ([#1757](https://github.com/intent-hq/intentd/pull/1757))
+
+
 ## [0.9.30] - 2026-09-06
 
 ### 🚀 Features
