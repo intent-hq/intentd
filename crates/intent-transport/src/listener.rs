@@ -42,11 +42,13 @@ use tokio::net::UnixListener;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[cfg(any(unix, windows))]
-use crate::conn::{outbound_channel, process_frame, ConnSubs};
+use crate::conn::{
+    outbound_channel, process_frame, publish_client_event, ConnSubs, CLIENT_DISCONNECTED,
+};
 #[cfg(any(unix, windows))]
 use crate::forward::ForwardRegistry;
 #[cfg(any(unix, windows))]
-use crate::reverse::ReverseChannel;
+use crate::reverse::{ReverseChannel, ReverseTransport};
 
 /// Derive the Windows named-pipe name for a resolved socket path (the spec's
 /// pipe-name contract, mirrored byte-for-byte by cloudlands-fe):
@@ -268,12 +270,12 @@ where
     let mut subs = ConnSubs::default();
     let mut forwards = ForwardRegistry::default();
     let reverse = ReverseChannel::new(out_tx.priority_sender());
-    // REV-1: register this connection's reverse channel with the shared
-    // primary-target set so agent-initiated `browser.exec` calls can route to
-    // whichever client connected first. The guard drops when this function
-    // returns (normal exit, error, or panic-unwind) so failover is exactly the
-    // connection arrival order.
-    let reverse_guard = reverse_registry.register(reverse.clone());
+    // REV-2: register this connection's reverse channel with the shared
+    // target registry; it becomes an eligible `browser.exec` target once
+    // `client.hello` binds an identity advertising `browserExec`. The guard is
+    // released when this function returns (and drops on panic-unwind), so
+    // failover among eligible connections is exactly the arrival order.
+    let reverse_guard = reverse_registry.register(reverse.clone(), ReverseTransport::Uds);
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
     let mut line = Vec::new();
@@ -323,6 +325,7 @@ where
                 &mut subs,
                 &mut forwards,
                 &reverse,
+                &reverse_guard,
                 control.as_ref(),
                 server_pairing_info.as_ref(),
                 &mut client_id,
@@ -346,10 +349,14 @@ where
     drop(subs);
     drop(forwards);
     reverse.close();
-    drop(reverse_guard);
+    let last_of_client = reverse_guard.release();
     drop(reverse);
     drop(out_tx);
     let _ = writer.await;
+    // REV-2: the logical client lost its last live connection.
+    if let Some(identity) = last_of_client {
+        publish_client_event(api.as_ref(), CLIENT_DISCONNECTED, &identity).await;
+    }
     io_result
 }
 

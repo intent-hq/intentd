@@ -226,7 +226,10 @@ impl ReverseChannel {
 }
 
 pub mod primary;
-pub use primary::{PrimaryReverseGuard, PrimaryReverseRegistry};
+pub use primary::{
+    BindOutcome, LiveClient, PrimaryReverseGuard, PrimaryReverseRegistry, ResolvedClient,
+    ReverseClientIdentity, ReverseTransport,
+};
 
 #[cfg(test)]
 mod tests;

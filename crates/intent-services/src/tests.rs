@@ -30360,7 +30360,8 @@ mod browser_exec_reverse {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        AgentReverseDispatch, BoxFuture, Error, ReverseDispatchError, WorkspaceApi, WorkspaceId,
+        AgentReverseDispatch, BoxFuture, Error, ReverseDispatchError, ReverseTarget, WorkspaceApi,
+        WorkspaceId,
     };
     use intent_store::Store;
     use serde_json::{json, Value};
@@ -30370,7 +30371,7 @@ mod browser_exec_reverse {
 
     #[derive(Default)]
     struct RecordingDispatch {
-        calls: Mutex<Vec<(String, Value)>>,
+        calls: Mutex<Vec<(String, Value, ReverseTarget)>>,
         reply: Mutex<Option<Value>>,
         err: Mutex<Option<ReverseDispatchError>>,
     }
@@ -30396,11 +30397,12 @@ mod browser_exec_reverse {
             &'a self,
             method: &'a str,
             params: Value,
+            target: ReverseTarget,
         ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((method.to_string(), params.clone()));
+                .push((method.to_string(), params.clone(), target));
             let reply = self.reply.lock().unwrap().clone();
             let err = self.err.lock().unwrap().clone();
             Box::pin(async move {
@@ -30469,6 +30471,9 @@ mod browser_exec_reverse {
         // into the forwarded reverse-RPC params so the FE sees the same
         // envelope shape the client-triggered `browser.exec` path emits.
         assert_eq!(calls[0].1["workspaceId"], "ws-1");
+        // REV-2: until tab-host / workspace-pin resolution lands, the service
+        // always asks for the first-connected eligible client.
+        assert_eq!(calls[0].2, ReverseTarget::Default);
     }
 
     #[tokio::test]

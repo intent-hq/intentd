@@ -18,7 +18,10 @@ pub use host_env::{
 pub use listener::pipe_name_for_socket_path;
 pub use listener::{serve_uds, serve_uds_with_reverse};
 pub use protocol::{MAX_INBOUND_MESSAGE_BYTES, MAX_OUTBOUND_MESSAGE_BYTES, PROTOCOL_VERSION};
-pub use reverse::{PrimaryReverseGuard, PrimaryReverseRegistry, ReverseChannel};
+pub use reverse::{
+    BindOutcome, LiveClient, PrimaryReverseGuard, PrimaryReverseRegistry, ResolvedClient,
+    ReverseChannel, ReverseClientIdentity, ReverseTransport,
+};
 pub use router::handle_message;
 pub use rpc_limit::RpcLimiter;
 pub use server::{

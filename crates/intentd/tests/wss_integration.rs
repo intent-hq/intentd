@@ -18,8 +18,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
     now_iso, AgentReverseDispatch, ContentType, Note, NoteId, NoteMetadata, NoteVisibility,
-    Result as CoreResult, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    Result as CoreResult, ReverseTarget, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
+    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
@@ -10235,17 +10235,48 @@ async fn wss_browser_screenshot_reverse_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Make `ws` an eligible agent `browser.exec` target (REV-2): send a
+/// `client.hello` advertising `capabilities.browserExec` and wait for its
+/// reply, answering pings inline. Once the reply is in, the server-side
+/// connection loop has bound the identity onto its reverse-registry entry.
+async fn hello_browser_host(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+    client_id: &str,
+) {
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":"hello","method":"client.hello","params":{{"clientId":"{client_id}","capabilities":{{"browserExec":true}}}}}}"#
+    );
+    ws.send(Message::Text(frame.into()))
+        .await
+        .expect("send hello");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json frame");
+                    if v["id"] == "hello" {
+                        assert!(v.get("result").is_some(), "hello failed: {v}");
+                        break;
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    ws.send(Message::Pong(payload)).await.expect("pong");
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected hello reply, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("client.hello reply");
+}
+
 #[tokio::test]
 async fn wss_disconnect_wakes_accepted_screenshot_request() {
     let srv = start(WsOptions::default()).await;
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while srv.reverse_registry.is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("reverse registration");
+    hello_browser_host(&mut ws, "cli-disconnect").await;
+    assert!(srv.reverse_registry.is_connected());
 
     let reverse_registry = srv.reverse_registry.clone();
     let request = tokio::spawn(async move {
@@ -10253,6 +10284,7 @@ async fn wss_disconnect_wakes_accepted_screenshot_request() {
             .dispatch(
                 "browser.exec",
                 serde_json::json!({ "actions": [{ "action": "screenshot" }] }),
+                ReverseTarget::Default,
             )
             .await
     });
@@ -10296,13 +10328,8 @@ async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
     })
     .await;
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while srv.reverse_registry.is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("reverse registration");
+    hello_browser_host(&mut ws, "cli-heartbeat").await;
+    assert!(srv.reverse_registry.is_connected());
 
     let reverse_registry = srv.reverse_registry.clone();
     let request = tokio::spawn(async move {
@@ -10310,6 +10337,7 @@ async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
             .dispatch(
                 "browser.exec",
                 serde_json::json!({ "actions": [{ "action": "screenshot" }] }),
+                ReverseTarget::Default,
             )
             .await
     });

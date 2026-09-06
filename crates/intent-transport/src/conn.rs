@@ -29,7 +29,7 @@ use crate::events::{self, FastPath};
 use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::panic_guard;
-use crate::reverse::ReverseChannel;
+use crate::reverse::{PrimaryReverseGuard, ReverseChannel, ReverseClientIdentity};
 use crate::router::{
     check_envelope, handle_message, EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET,
 };
@@ -48,6 +48,35 @@ pub(crate) const PRIORITY_CAPACITY: usize = 1024;
 /// applies backpressure to event forwarders early, while the priority lane
 /// stays open for responses.
 pub(crate) const BULK_CAPACITY: usize = 256;
+
+/// Global event (empty `workspaceId`, like `settings:changed`) published when
+/// a logical client gains its first live hello'd connection (REV-2, §6).
+pub(crate) const CLIENT_CONNECTED: &str = "client:connected";
+
+/// Global event published when a logical client loses its last live hello'd
+/// connection (REV-2, §6).
+pub(crate) const CLIENT_DISCONNECTED: &str = "client:disconnected";
+
+/// Publish a `client:connected` / `client:disconnected` event with
+/// `data: { clientId, name?, capabilities }`. Global (empty `workspaceId`) so
+/// subscribers that omit a `workspaceId` filter still receive it; best-effort
+/// like every other change event.
+pub(crate) async fn publish_client_event(
+    api: &dyn WorkspaceApi,
+    event_type: &str,
+    identity: &ReverseClientIdentity,
+) {
+    if let Err(e) = api
+        .publish_event(intent_core::PublishEvent {
+            workspace_id: WorkspaceId::from_string(String::new()),
+            event_type: event_type.to_string(),
+            data: identity.event_data(),
+        })
+        .await
+    {
+        tracing::warn!(error = %e, event_type, "failed to publish client event");
+    }
+}
 
 /// Per-connection outbound frame queue, split into two lanes:
 ///
@@ -258,7 +287,10 @@ impl ConnSubs {
 ///
 /// The fast-paths that mutate per-connection state (`reverse.route_response`,
 /// `system.*`, `forward.*`, `client.hello`, `drafts.*`, `events.`/subscription
-/// fast-paths) run inline on the read loop and stay serialized. The two
+/// fast-paths) run inline on the read loop and stay serialized. A successful
+/// `client.hello` also binds the connection's logical identity onto its
+/// `reverse_guard` registry entry (REV-2 target selection) and publishes the
+/// global `client:connected` event when the logical client came online. The two
 /// stateless slow paths — `host::handle` and the [`handle_message`] JSON-RPC
 /// dispatcher — are spawned onto detached tokio tasks that write their response
 /// frame through a cloned outbound sender, so a long-running request (e.g.
@@ -290,6 +322,7 @@ pub(crate) async fn process_frame(
     subs: &mut ConnSubs,
     forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
+    reverse_guard: &PrimaryReverseGuard,
     control: Option<&Arc<dyn SystemControl>>,
     server_pairing_info: Option<&Arc<dyn crate::server::ServerPairingInfo>>,
     client_id: &mut Option<ClientId>,
@@ -489,12 +522,22 @@ pub(crate) async fn process_frame(
                     == Some(1);
             // A new hello revokes the previous connection-local operation.
             subs.setup = crate::provider_setup::Connection::default();
-            let frame = panic_guard::guard_frame(
-                &method,
-                rpc_id.clone(),
-                client::handle(req, api.as_ref(), client_id, is_local),
-            )
+            let mut bound = None;
+            let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
+                let outcome = client::handle(req, api.as_ref(), client_id, is_local).await;
+                bound = outcome.bound;
+                outcome.frame
+            })
             .await;
+            if let Some(identity) = bound {
+                let outcome = reverse_guard.bind(identity);
+                if let Some(identity) = outcome.disconnected {
+                    publish_client_event(api.as_ref(), CLIENT_DISCONNECTED, &identity).await;
+                }
+                if let Some(identity) = outcome.connected {
+                    publish_client_event(api.as_ref(), CLIENT_CONNECTED, &identity).await;
+                }
+            }
             subs.setup.authorized = setup_requested
                 && !crate::context::is_tcp_connection()
                 && frame

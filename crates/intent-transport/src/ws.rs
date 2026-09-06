@@ -43,7 +43,7 @@ use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenSt
 use crate::conn::{self, ConnSubs};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
-use crate::reverse::{PrimaryReverseRegistry, ReverseChannel};
+use crate::reverse::{PrimaryReverseRegistry, ReverseChannel, ReverseTransport};
 use crate::rpc_limit::RpcLimiter;
 use crate::tls::TlsCertificate;
 
@@ -688,12 +688,15 @@ impl WsInner {
         let mut subs = ConnSubs::default();
         let mut forwards = ForwardRegistry::default();
         let reverse = ReverseChannel::new(app_tx.priority_sender());
-        // REV-1: register this connection's reverse channel with the shared
-        // primary-target set so agent-initiated `browser.exec` calls can route
-        // to whichever client connected first. Guard drops when this loop
-        // returns (normal exit, remote close, heartbeat timeout, shutdown), so
-        // failover is exactly the connection arrival order.
-        let _reverse_guard = self.reverse_registry.register(reverse.clone());
+        // REV-2: register this connection's reverse channel with the shared
+        // target registry; it becomes an eligible `browser.exec` target once
+        // `client.hello` binds an identity advertising `browserExec`. The
+        // guard is released when this loop exits (normal exit, remote close,
+        // heartbeat timeout, shutdown) and drops on panic-unwind, so failover
+        // among eligible connections is exactly the arrival order.
+        let reverse_guard = self
+            .reverse_registry
+            .register(reverse.clone(), ReverseTransport::Wss);
         // Per-connection logical-client binding (§16): `None` until `client.hello`.
         let mut client_id: Option<intent_core::ClientId> = None;
         loop {
@@ -724,7 +727,7 @@ impl WsInner {
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
                         // RPCs gate on real origin, not the locality flag (§5.2).
                         let frame_ok = crate::context::with_connection_context(true, async {
-                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local, &self.rpc_limiter).await
+                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, &reverse_guard, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local, &self.rpc_limiter).await
                         }).await;
                         if !frame_ok {
                             break;
@@ -778,8 +781,14 @@ impl WsInner {
         drop(subs);
         drop(forwards);
         reverse.close();
+        let last_of_client = reverse_guard.release();
         let _ = sink.close().await;
         self.deregister(id);
+        // REV-2: the logical client lost its last live connection.
+        if let Some(identity) = last_of_client {
+            conn::publish_client_event(self.api.as_ref(), conn::CLIENT_DISCONNECTED, &identity)
+                .await;
+        }
     }
 }
 

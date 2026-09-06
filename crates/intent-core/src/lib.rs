@@ -114,7 +114,8 @@ pub use settings_file::{
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{
     AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
-    RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,
+    RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, ReverseTarget,
+    WorkspaceApi,
 };
 pub use turn_attachments::{
     new_attachment_id, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
