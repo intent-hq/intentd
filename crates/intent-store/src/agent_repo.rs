@@ -329,7 +329,7 @@ pub struct InterruptedAgent {
 
 /// The heavy field of a `tool_use` / `tool_result` content block whose full
 /// body the retention sweep has compacted away. Returned by
-/// [`Store::pruned_tool_payloads`]; the side-table `kind` strings behind it
+/// [`Store::get_agent_message_by_id_with_pruned`]; the side-table `kind` strings behind it
 /// stay inside this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrunedToolField {
@@ -4252,26 +4252,23 @@ impl Store {
     /// uses to flag a pruned block — a block that merely still carries its
     /// slim `*Truncated` flags after hydration is NOT evidence (a corrupt or
     /// undecodable full row, or a body that arrived pre-flagged and was never
-    /// extracted, looks the same yet was never pruned). One statement over
-    /// the `(message_id, block_ordinal, kind)` primary key; the replay kind
-    /// strings never leave this crate. Legacy messages (no side rows) and
-    /// unknown ids yield an empty list.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
-    pub async fn pruned_tool_payloads(
-        &self,
-        agent_id: &AgentId,
+    /// extracted, looks the same yet was never pruned). Takes the caller's
+    /// read transaction: it must share the WAL snapshot the message was
+    /// hydrated from ([`Store::get_agent_message_by_id_with_pruned`]), or a
+    /// sweep landing between the two reads would stamp a still-full body as
+    /// pruned. One statement over the `(message_id, block_ordinal, kind)`
+    /// primary key; the replay kind strings never leave this crate. Legacy
+    /// messages (no side rows) yield an empty list.
+    async fn pruned_tool_payloads_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         message_id: &str,
     ) -> Result<Vec<PrunedToolPayload>> {
         let rows = sqlx::query(
             "SELECT block_ordinal, kind FROM agent_message_payload \
-             WHERE message_id = ? AND agent_id = ? AND block_ordinal >= 0",
+             WHERE message_id = ? AND block_ordinal >= 0",
         )
         .bind(message_id)
-        .bind(&agent_id.0)
-        .fetch_all(self.read_pool())
+        .fetch_all(&mut **tx)
         .await
         .map_err(|e| Error::Internal(format!("list tool payload kinds failed: {e}")))?;
         let present: Vec<(i64, String)> = rows
@@ -4344,19 +4341,55 @@ impl Store {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Result<Option<AgentMessage>> {
+        let mut tx = self.begin_read_snapshot().await?;
+        Self::get_agent_message_by_id_in(&mut tx, agent_id, message_id).await
+    }
+
+    /// [`Store::get_agent_message_by_id`] plus the message's retention-pruned
+    /// heavy fields, both read from ONE WAL snapshot — the `agent.getMessageBlock`
+    /// read. The pairing matters: a sweep committing between a hydrated read
+    /// and a separate pruned-metadata read would report a `*_replay` row for a
+    /// block whose full body was just served (stamping a full body "pruned",
+    /// flags gone), and a side-row replacement between the reads could apply
+    /// the metadata to another content generation. Two statements over primary
+    /// keys, at most ONE decoded message. `None` when the id is unknown or
+    /// belongs to a different agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_agent_message_by_id_with_pruned(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<(AgentMessage, Vec<PrunedToolPayload>)>> {
+        let mut tx = self.begin_read_snapshot().await?;
+        match Self::get_agent_message_by_id_in(&mut tx, agent_id, message_id).await? {
+            Some(msg) => {
+                let pruned = Self::pruned_tool_payloads_in(&mut tx, message_id).await?;
+                Ok(Some((msg, pruned)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_agent_message_by_id_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<AgentMessage>> {
         let sql =
             format!("SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? AND id = ?");
-        let mut tx = self.begin_read_snapshot().await?;
         let row = sqlx::query(&sql)
             .bind(&agent_id.0)
             .bind(message_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(|e| Error::Internal(format!("get agent message by id failed: {e}")))?;
         match row.as_ref().map(map_message_row).transpose()? {
             Some(msg) => {
                 let mut messages = [msg];
-                Self::hydrate_message_payloads(&mut tx, &mut messages).await?;
+                Self::hydrate_message_payloads(tx, &mut messages).await?;
                 let [msg] = messages;
                 Ok(Some(msg))
             }
@@ -6187,13 +6220,15 @@ mod tests {
         );
     }
 
-    /// `pruned_tool_payloads` reports exactly the heavy fields the sweep
-    /// compacted (a `*_replay` row with no full row of the same field), and
-    /// nothing else: a still-truncated block whose full row is corrupt (the
-    /// sweep leaves it in place, hydration serves the stored preview + flags)
-    /// is NOT pruned, a retained full row is NOT pruned, thumbnails rows and
-    /// legacy / unknown messages yield nothing, and a wrong agent id yields
-    /// nothing.
+    /// `get_agent_message_by_id_with_pruned` reports, alongside the hydrated
+    /// body, exactly the heavy fields the sweep compacted (a `*_replay` row
+    /// with no full row of the same field) and nothing else — and the two
+    /// agree: a compacted block is served as its stored preview + flags AND
+    /// listed; a retained full row is served in full and NOT listed; a
+    /// still-truncated block whose full row is corrupt (the sweep leaves it in
+    /// place, hydration serves the stored preview + flags) is NOT listed;
+    /// thumbnails rows and legacy messages yield an empty list; an unknown id
+    /// or wrong agent yields `None`.
     #[tokio::test]
     async fn pruned_tool_payloads_reports_only_compacted_fields() {
         let tmp = TempDb::new("test-payload-pruned");
@@ -6261,15 +6296,30 @@ mod tests {
             .await
             .expect("append legacy");
 
-        for id in [&old.id, &corrupt.id, &retained.id, &legacy.id] {
-            assert!(
+        let read = |id: &str| {
+            let store = &store;
+            let agent_id = &agent_id;
+            let id = id.to_string();
+            async move {
                 store
-                    .pruned_tool_payloads(&agent_id, id)
+                    .get_agent_message_by_id_with_pruned(agent_id, &id)
                     .await
-                    .expect("pruned before sweep")
-                    .is_empty(),
-                "nothing is pruned before the sweep"
-            );
+                    .expect("combined read")
+            }
+        };
+
+        let (before_old, before_pruned) = read(&old.id).await.expect("old exists");
+        assert_eq!(
+            before_old.content, old_content,
+            "before the sweep the combined read hydrates the full body"
+        );
+        assert!(
+            before_pruned.is_empty(),
+            "nothing is pruned before the sweep"
+        );
+        for id in [&corrupt.id, &retained.id, &legacy.id] {
+            let (_, pruned) = read(id).await.expect("message exists");
+            assert!(pruned.is_empty(), "nothing is pruned before the sweep");
         }
 
         let compacted = store
@@ -6278,11 +6328,9 @@ mod tests {
             .expect("compact");
         assert_eq!(compacted, 2, "the two decodable old full rows compact");
 
+        let (old_msg, old_pruned) = read(&old.id).await.expect("old exists");
         assert_eq!(
-            store
-                .pruned_tool_payloads(&agent_id, &old.id)
-                .await
-                .expect("pruned old"),
+            old_pruned,
             vec![
                 PrunedToolPayload {
                     block_ordinal: 1,
@@ -6295,6 +6343,20 @@ mod tests {
             ],
             "compacted fields, by stored ordinal; the thumbnails row is ignored"
         );
+        assert_eq!(old_msg.content[0], old_content[0], "text block untouched");
+        assert_eq!(
+            old_msg.content[1]["inputTruncated"], true,
+            "the compacted input is served as the stored slim preview + flags"
+        );
+        assert!(old_msg.content[1]["inputBytes"].is_number());
+        assert_ne!(old_msg.content[1]["input"], old_content[1]["input"]);
+        assert_eq!(
+            old_msg.content[2]["outputTruncated"], true,
+            "the compacted output is served as the stored slim preview + flags"
+        );
+        assert!(old_msg.content[2]["outputBytes"].is_number());
+        assert_ne!(old_msg.content[2]["output"], old_content[2]["output"]);
+
         let corrupt_rows = payload_rows(&store, &corrupt.id).await;
         assert_eq!(
             corrupt_rows.len(),
@@ -6305,47 +6367,37 @@ mod tests {
             corrupt_rows[0].0,
             crate::message_payload::KIND_TOOL_RESULT_OUTPUT
         );
+        let (corrupt_msg, corrupt_pruned) = read(&corrupt.id).await.expect("corrupt exists");
         assert!(
-            store
-                .pruned_tool_payloads(&agent_id, &corrupt.id)
-                .await
-                .expect("pruned corrupt")
-                .is_empty(),
+            corrupt_pruned.is_empty(),
             "a corrupt full row is not evidence of a prune"
         );
-        let hydrated = store
-            .get_agent_message_by_id(&agent_id, &corrupt.id)
-            .await
-            .expect("hydrate corrupt")
-            .expect("corrupt message exists");
         assert_eq!(
-            hydrated.content[0]["outputTruncated"], true,
+            corrupt_msg.content[0]["outputTruncated"], true,
             "hydration of the corrupt row serves the stored preview + slim flags"
         );
+
+        let (retained_msg, retained_pruned) = read(&retained.id).await.expect("retained exists");
         assert!(
-            store
-                .pruned_tool_payloads(&agent_id, &retained.id)
-                .await
-                .expect("pruned retained")
-                .is_empty(),
+            retained_pruned.is_empty(),
             "a retained full row is not pruned"
         );
-        assert!(store
-            .pruned_tool_payloads(&agent_id, &legacy.id)
-            .await
-            .expect("pruned legacy")
-            .is_empty());
-        assert!(store
-            .pruned_tool_payloads(&agent_id, "no-such-message")
-            .await
-            .expect("pruned unknown")
-            .is_empty());
+        assert_eq!(
+            retained_msg.content, retained_content,
+            "a retained full row hydrates in full, no flags"
+        );
+
+        let (legacy_msg, legacy_pruned) = read(&legacy.id).await.expect("legacy exists");
+        assert!(legacy_pruned.is_empty());
+        assert_eq!(legacy_msg.content, legacy_content);
+
+        assert!(read("no-such-message").await.is_none());
         assert!(
             store
-                .pruned_tool_payloads(&AgentId("someone-else".to_string()), &old.id)
+                .get_agent_message_by_id_with_pruned(&AgentId("someone-else".to_string()), &old.id)
                 .await
-                .expect("pruned wrong agent")
-                .is_empty(),
+                .expect("wrong agent read")
+                .is_none(),
             "the agent id scopes the lookup"
         );
     }

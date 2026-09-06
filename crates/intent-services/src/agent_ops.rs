@@ -2319,8 +2319,9 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
 }
 
 /// Flag the blocks of a stored message whose full tool body is no longer
-/// retained. `pruned` is the store's evidence
-/// ([`intent_store::Store::pruned_tool_payloads`]): the retention sweep
+/// retained. `pruned` is the store's evidence, read from the SAME snapshot as
+/// the hydrated body
+/// ([`intent_store::Store::get_agent_message_by_id_with_pruned`]): the retention sweep
 /// (`agents.toolPayloadRetentionDays`) replaced the block's full side row
 /// with a `*_replay` preview, so the hydrated read left the stored slim
 /// preview and its `inputTruncated` / `outputTruncated` (+ `*Bytes`) flags
@@ -3282,16 +3283,15 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
+        // One store snapshot for body + pruned metadata: a sweep committing
+        // between two separate reads would stamp a just-served full body as
+        // pruned (and without its `*Truncated` / `*Bytes` flags).
         let message = match self
             .store
-            .get_agent_message_by_id(&agent_id, &message_id)
+            .get_agent_message_by_id_with_pruned(&agent_id, &message_id)
             .await?
         {
-            Some(mut m) => {
-                let pruned = self
-                    .store
-                    .pruned_tool_payloads(&agent_id, &message_id)
-                    .await?;
+            Some((mut m, pruned)) => {
                 mark_pruned_tool_bodies(&mut m.content, &pruned);
                 m
             }
