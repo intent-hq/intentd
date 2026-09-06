@@ -2318,27 +2318,37 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
-/// Flag a `agent.getMessageBlock` result whose full tool body is no longer
-/// retained. The full-fidelity read splices every externalized full body
-/// back in and drops the write-time `inputTruncated` / `outputTruncated`
-/// slim flags as it does; a block that still carries one AFTER hydration has
-/// no full side row left — the retention sweep compacted it into a
-/// `*_replay` preview (`agents.toolPayloadRetentionDays`). Serve the stored
-/// preview and its existing flags untouched, PLUS the additive
-/// `inputPruned: true` / `outputPruned: true`, so the response never implies
-/// a full body. Under-budget and hydrated blocks carry no flag and are
-/// untouched.
-fn mark_pruned_tool_body(block: &mut Value) {
-    let Some(obj) = block.as_object_mut() else {
+/// Flag the blocks of a stored message whose full tool body is no longer
+/// retained. `pruned` is the store's evidence
+/// ([`intent_store::Store::pruned_tool_payloads`]): the retention sweep
+/// (`agents.toolPayloadRetentionDays`) replaced the block's full side row
+/// with a `*_replay` preview, so the hydrated read left the stored slim
+/// preview and its `inputTruncated` / `outputTruncated` (+ `*Bytes`) flags
+/// in place. Those blocks keep the preview and flags untouched and gain the
+/// additive `inputPruned: true` / `outputPruned: true`, so the response
+/// never implies a full body. A block that merely still carries a slim flag
+/// (corrupt or undecodable full row, body that arrived pre-flagged and was
+/// never extracted) is NOT pruned and is left alone — with retention off the
+/// served block is exactly what it was before the sweep existed. Ordinals
+/// index the STORED content array, so this runs before
+/// [`strip_anonymous_tool_blocks`] re-indexes it.
+fn mark_pruned_tool_bodies(content: &mut Value, pruned: &[intent_store::PrunedToolPayload]) {
+    let Some(blocks) = content.as_array_mut() else {
         return;
     };
-    for (truncated_flag, pruned_flag) in [
-        ("inputTruncated", "inputPruned"),
-        ("outputTruncated", "outputPruned"),
-    ] {
-        if obj.get(truncated_flag) == Some(&Value::Bool(true)) {
-            obj.insert(pruned_flag.to_string(), Value::Bool(true));
-        }
+    for p in pruned {
+        let Some(obj) = usize::try_from(p.block_ordinal)
+            .ok()
+            .and_then(|i| blocks.get_mut(i))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let flag = match p.field {
+            intent_store::PrunedToolField::ToolUseInput => "inputPruned",
+            intent_store::PrunedToolField::ToolResultOutput => "outputPruned",
+        };
+        obj.insert(flag.to_string(), Value::Bool(true));
     }
 }
 
@@ -3277,7 +3287,14 @@ impl Services {
             .get_agent_message_by_id(&agent_id, &message_id)
             .await?
         {
-            Some(m) => m,
+            Some(mut m) => {
+                let pruned = self
+                    .store
+                    .pruned_tool_payloads(&agent_id, &message_id)
+                    .await?;
+                mark_pruned_tool_bodies(&mut m.content, &pruned);
+                m
+            }
             // In-progress fallback (monorepo#3647): an unpersisted id that
             // matches the live-turn slot's in-flight message resolves from
             // the slot's streamed blocks, so blocks slim-truncated on the
@@ -3304,7 +3321,7 @@ impl Services {
             },
         };
         let message = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
-        let mut block = message
+        let block = message
             .content
             .as_array()
             .and_then(|blocks| {
@@ -3314,7 +3331,6 @@ impl Services {
             })
             .cloned()
             .ok_or_else(|| Error::InvalidParams(format!("unknown block id: {block_id}")))?;
-        mark_pruned_tool_body(&mut block);
         Ok(json!({ "block": block }))
     }
 

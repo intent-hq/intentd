@@ -138,6 +138,25 @@ pub(crate) fn is_replay_kind(kind: &str) -> bool {
     kind == KIND_TOOL_USE_INPUT_REPLAY || kind == KIND_TOOL_RESULT_OUTPUT_REPLAY
 }
 
+/// For a replay-preview `kind`: the pruned field it stands for plus the
+/// full-body `kind` it replaced (whose absence at the same ordinal proves
+/// the prune). `None` for full-body and thumbnails kinds.
+pub(crate) fn pruned_field_for(
+    kind: &str,
+) -> Option<(crate::agent_repo::PrunedToolField, &'static str)> {
+    match kind {
+        KIND_TOOL_USE_INPUT_REPLAY => Some((
+            crate::agent_repo::PrunedToolField::ToolUseInput,
+            KIND_TOOL_USE_INPUT,
+        )),
+        KIND_TOOL_RESULT_OUTPUT_REPLAY => Some((
+            crate::agent_repo::PrunedToolField::ToolResultOutput,
+            KIND_TOOL_RESULT_OUTPUT,
+        )),
+        _ => None,
+    }
+}
+
 /// The decoded body of a `*_replay` row: the replay-shaped preview of a
 /// pruned heavy body. Serialized as the JSON object
 /// `{"text": <middle-truncated stringified body>, "originalChars": <N>}`

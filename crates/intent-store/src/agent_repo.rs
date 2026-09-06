@@ -327,6 +327,26 @@ pub struct InterruptedAgent {
     pub reason: Option<String>,
 }
 
+/// The heavy field of a `tool_use` / `tool_result` content block whose full
+/// body the retention sweep has compacted away. Returned by
+/// [`Store::pruned_tool_payloads`]; the side-table `kind` strings behind it
+/// stay inside this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PrunedToolField {
+    /// `tool_use.input`.
+    ToolUseInput,
+    /// `tool_result.output`.
+    ToolResultOutput,
+}
+
+/// One retention-pruned heavy body of a message: the content-array index of
+/// the owning block plus which field was pruned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrunedToolPayload {
+    pub block_ordinal: i64,
+    pub field: PrunedToolField,
+}
+
 /// Per-session message inputs for the `AgentLite` projection (monorepo#958):
 /// everything the projection needs without hydrating the full transcript.
 /// The last-rows fields carry only the capped `text`-block strings of each
@@ -4225,6 +4245,54 @@ impl Store {
         Ok(total)
     }
 
+    /// The heavy tool bodies of one message that the retention sweep has
+    /// compacted ([`Store::compact_tool_payloads_before`]): every content
+    /// block whose side table holds a `*_replay` row and NO full-body row of
+    /// the same field. This is the store-side evidence `agent.getMessageBlock`
+    /// uses to flag a pruned block — a block that merely still carries its
+    /// slim `*Truncated` flags after hydration is NOT evidence (a corrupt or
+    /// undecodable full row, or a body that arrived pre-flagged and was never
+    /// extracted, looks the same yet was never pruned). One statement over
+    /// the `(message_id, block_ordinal, kind)` primary key; the replay kind
+    /// strings never leave this crate. Legacy messages (no side rows) and
+    /// unknown ids yield an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn pruned_tool_payloads(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Vec<PrunedToolPayload>> {
+        let rows = sqlx::query(
+            "SELECT block_ordinal, kind FROM agent_message_payload \
+             WHERE message_id = ? AND agent_id = ? AND block_ordinal >= 0",
+        )
+        .bind(message_id)
+        .bind(&agent_id.0)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list tool payload kinds failed: {e}")))?;
+        let present: Vec<(i64, String)> = rows
+            .iter()
+            .map(|r| (r.get::<i64, _>("block_ordinal"), r.get::<String, _>("kind")))
+            .collect();
+        let mut pruned: Vec<PrunedToolPayload> = present
+            .iter()
+            .filter_map(|(ordinal, kind)| {
+                let (field, full_kind) = crate::message_payload::pruned_field_for(kind)?;
+                let full_retained = present.iter().any(|(o, k)| o == ordinal && k == full_kind);
+                (!full_retained).then_some(PrunedToolPayload {
+                    block_ordinal: *ordinal,
+                    field,
+                })
+            })
+            .collect();
+        pruned.sort_by_key(|p| (p.block_ordinal, p.field));
+        Ok(pruned)
+    }
+
     /// The newest non-`system` message of an agent's log, hydrated as a
     /// single row — the pending-questions tail anchor (PROTOCOL §5.5). Trailing
     /// `system` rows are skipped inside SQL (a backwards walk over the
@@ -6116,6 +6184,169 @@ mod tests {
         assert_eq!(
             hydrated[1].content, new_content,
             "newer message still hydrates"
+        );
+    }
+
+    /// `pruned_tool_payloads` reports exactly the heavy fields the sweep
+    /// compacted (a `*_replay` row with no full row of the same field), and
+    /// nothing else: a still-truncated block whose full row is corrupt (the
+    /// sweep leaves it in place, hydration serves the stored preview + flags)
+    /// is NOT pruned, a retained full row is NOT pruned, thumbnails rows and
+    /// legacy / unknown messages yield nothing, and a wrong agent id yields
+    /// nothing.
+    #[tokio::test]
+    async fn pruned_tool_payloads_reports_only_compacted_fields() {
+        let tmp = TempDb::new("test-payload-pruned");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let old_ts = "2026-01-01T00:00:00Z";
+        let new_ts = "2026-06-01T00:00:00Z";
+        let cutoff = "2026-03-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-payload-pruned".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, old_ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-payload-pruned".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, old_ts, None))
+            .await
+            .expect("insert session");
+
+        let heavy_result = |call: &str, ch: char| {
+            serde_json::json!(
+                { "type": "tool_result", "toolCallId": call, "output": ch.to_string().repeat(10 * 1024) }
+            )
+        };
+        let old_content = serde_json::json!([
+            { "type": "text", "text": "hello" },
+            { "type": "tool_use", "id": "m:1", "name": "view", "toolCallId": "t1",
+              "input": { "blob": "w".repeat(12 * 1024) } },
+            heavy_result("t1", 'q'),
+        ]);
+        let old = store
+            .append_agent_message(&agent_id, "assistant", &old_content, old_ts)
+            .await
+            .expect("append old");
+        sqlx::query(
+            "INSERT INTO agent_message_payload \
+             (message_id, agent_id, block_ordinal, kind, encoding, body) \
+             VALUES (?, ?, -1, 'thumbnails', 'none', X'7B7D')",
+        )
+        .bind(&old.id)
+        .bind(&agent_id.0)
+        .execute(store.write_pool())
+        .await
+        .expect("seed thumbnails row");
+        let corrupt_content = serde_json::json!([heavy_result("t2", 'c')]);
+        let corrupt = store
+            .append_agent_message(&agent_id, "assistant", &corrupt_content, old_ts)
+            .await
+            .expect("append corrupt");
+        sqlx::query(
+            "UPDATE agent_message_payload SET encoding = 'zlib', body = X'DEADBEEF' \
+             WHERE message_id = ?",
+        )
+        .bind(&corrupt.id)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt full row");
+        let retained_content = serde_json::json!([heavy_result("t3", 'n')]);
+        let retained = store
+            .append_agent_message(&agent_id, "assistant", &retained_content, new_ts)
+            .await
+            .expect("append retained");
+        let legacy_content = serde_json::json!([{ "type": "text", "text": "no side rows" }]);
+        let legacy = store
+            .append_agent_message(&agent_id, "assistant", &legacy_content, old_ts)
+            .await
+            .expect("append legacy");
+
+        for id in [&old.id, &corrupt.id, &retained.id, &legacy.id] {
+            assert!(
+                store
+                    .pruned_tool_payloads(&agent_id, id)
+                    .await
+                    .expect("pruned before sweep")
+                    .is_empty(),
+                "nothing is pruned before the sweep"
+            );
+        }
+
+        let compacted = store
+            .compact_tool_payloads_before(cutoff, 2_000)
+            .await
+            .expect("compact");
+        assert_eq!(compacted, 2, "the two decodable old full rows compact");
+
+        assert_eq!(
+            store
+                .pruned_tool_payloads(&agent_id, &old.id)
+                .await
+                .expect("pruned old"),
+            vec![
+                PrunedToolPayload {
+                    block_ordinal: 1,
+                    field: PrunedToolField::ToolUseInput,
+                },
+                PrunedToolPayload {
+                    block_ordinal: 2,
+                    field: PrunedToolField::ToolResultOutput,
+                },
+            ],
+            "compacted fields, by stored ordinal; the thumbnails row is ignored"
+        );
+        let corrupt_rows = payload_rows(&store, &corrupt.id).await;
+        assert_eq!(
+            corrupt_rows.len(),
+            1,
+            "the undecodable full row is left in place"
+        );
+        assert_eq!(
+            corrupt_rows[0].0,
+            crate::message_payload::KIND_TOOL_RESULT_OUTPUT
+        );
+        assert!(
+            store
+                .pruned_tool_payloads(&agent_id, &corrupt.id)
+                .await
+                .expect("pruned corrupt")
+                .is_empty(),
+            "a corrupt full row is not evidence of a prune"
+        );
+        let hydrated = store
+            .get_agent_message_by_id(&agent_id, &corrupt.id)
+            .await
+            .expect("hydrate corrupt")
+            .expect("corrupt message exists");
+        assert_eq!(
+            hydrated.content[0]["outputTruncated"], true,
+            "hydration of the corrupt row serves the stored preview + slim flags"
+        );
+        assert!(
+            store
+                .pruned_tool_payloads(&agent_id, &retained.id)
+                .await
+                .expect("pruned retained")
+                .is_empty(),
+            "a retained full row is not pruned"
+        );
+        assert!(store
+            .pruned_tool_payloads(&agent_id, &legacy.id)
+            .await
+            .expect("pruned legacy")
+            .is_empty());
+        assert!(store
+            .pruned_tool_payloads(&agent_id, "no-such-message")
+            .await
+            .expect("pruned unknown")
+            .is_empty());
+        assert!(
+            store
+                .pruned_tool_payloads(&AgentId("someone-else".to_string()), &old.id)
+                .await
+                .expect("pruned wrong agent")
+                .is_empty(),
+            "the agent id scopes the lookup"
         );
     }
 

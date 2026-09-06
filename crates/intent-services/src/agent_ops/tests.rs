@@ -7634,50 +7634,82 @@ fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
     assert_eq!(passthrough.content, json!("raw"));
 }
 
-/// `agent.getMessageBlock` pruned-body flag: a block that still carries a
-/// write-time `inputTruncated` / `outputTruncated` slim flag AFTER the
-/// full-fidelity hydration has no full side row left (retention-pruned), so it
-/// gains the additive `inputPruned` / `outputPruned: true`; the existing flags
-/// and body are untouched. Hydrated / under-budget blocks (no slim flag), a
-/// `false` flag, and non-object blocks are never marked.
+/// `agent.getMessageBlock` pruned-body flag is driven by the store's
+/// evidence, not by the slim flags: only the `(ordinal, field)` pairs the
+/// store reports as compacted gain the additive `inputPruned` /
+/// `outputPruned: true` (existing flags and body untouched). A block that
+/// still carries `*Truncated` after hydration but is NOT in the store's list
+/// (corrupt / undecodable full row, pre-flagged legacy body) is left exactly
+/// as it was; out-of-range ordinals, non-object blocks and non-array content
+/// are ignored.
 #[test]
-fn mark_pruned_tool_body_flags_only_still_truncated_blocks() {
-    use crate::agent_ops::mark_pruned_tool_body;
-    let mut pruned_result = json!({
-        "type": "tool_result", "id": "b:1", "tool_use_id": "tc-1",
-        "output": "preview…", "outputTruncated": true, "outputBytes": 65536,
-    });
-    mark_pruned_tool_body(&mut pruned_result);
+fn mark_pruned_tool_bodies_flags_only_store_reported_blocks() {
+    use crate::agent_ops::mark_pruned_tool_bodies;
+    use intent_store::{PrunedToolField, PrunedToolPayload};
+    let mut content = json!([
+        { "type": "tool_use", "id": "tc-1", "name": "bash",
+          "input": { "cmd": "prev" }, "inputTruncated": true, "inputBytes": 9000 },
+        { "type": "tool_result", "id": "b:1", "tool_use_id": "tc-1",
+          "output": "preview…", "outputTruncated": true, "outputBytes": 65536 },
+        { "type": "tool_result", "id": "b:2", "tool_use_id": "tc-2",
+          "output": "corrupt-row preview", "outputTruncated": true, "outputBytes": 70000 },
+        { "type": "tool_result", "id": "b:3", "output": "full body" },
+        "not-an-object",
+    ]);
+    let before = content.clone();
+    let pruned = [
+        PrunedToolPayload {
+            block_ordinal: 0,
+            field: PrunedToolField::ToolUseInput,
+        },
+        PrunedToolPayload {
+            block_ordinal: 1,
+            field: PrunedToolField::ToolResultOutput,
+        },
+        PrunedToolPayload {
+            block_ordinal: 4,
+            field: PrunedToolField::ToolResultOutput,
+        },
+        PrunedToolPayload {
+            block_ordinal: 99,
+            field: PrunedToolField::ToolResultOutput,
+        },
+        PrunedToolPayload {
+            block_ordinal: -1,
+            field: PrunedToolField::ToolUseInput,
+        },
+    ];
+    mark_pruned_tool_bodies(&mut content, &pruned);
+
     assert_eq!(
-        pruned_result,
-        json!({
-            "type": "tool_result", "id": "b:1", "tool_use_id": "tc-1",
-            "output": "preview…", "outputTruncated": true, "outputBytes": 65536,
-            "outputPruned": true,
-        })
+        content[0],
+        json!({ "type": "tool_use", "id": "tc-1", "name": "bash",
+                "input": { "cmd": "prev" }, "inputTruncated": true, "inputBytes": 9000,
+                "inputPruned": true })
     );
+    assert!(content[0].get("outputPruned").is_none());
+    assert_eq!(
+        content[1],
+        json!({ "type": "tool_result", "id": "b:1", "tool_use_id": "tc-1",
+                "output": "preview…", "outputTruncated": true, "outputBytes": 65536,
+                "outputPruned": true })
+    );
+    assert!(content[1].get("inputPruned").is_none());
+    assert_eq!(
+        content[2], before[2],
+        "a still-truncated block the store does not report is NOT pruned"
+    );
+    assert_eq!(content[3], before[3], "a hydrated block gains no flag");
+    assert_eq!(content[4], before[4]);
+    assert_eq!(content.as_array().map(Vec::len), Some(5));
 
-    let mut pruned_use = json!({
-        "type": "tool_use", "id": "tc-1", "name": "bash",
-        "input": { "cmd": "prev" }, "inputTruncated": true, "inputBytes": 9000,
-    });
-    mark_pruned_tool_body(&mut pruned_use);
-    assert_eq!(pruned_use["inputPruned"], json!(true));
-    assert!(pruned_use.get("outputPruned").is_none());
+    let mut untouched = before.clone();
+    mark_pruned_tool_bodies(&mut untouched, &[]);
+    assert_eq!(untouched, before, "no store evidence → nothing flagged");
 
-    let hydrated = json!({ "type": "tool_result", "id": "b:2", "output": "full body" });
-    let mut untouched = hydrated.clone();
-    mark_pruned_tool_body(&mut untouched);
-    assert_eq!(untouched, hydrated, "a hydrated block gains no flag");
-
-    let not_truncated = json!({ "type": "tool_result", "id": "b:3", "outputTruncated": false });
-    let mut untouched = not_truncated.clone();
-    mark_pruned_tool_body(&mut untouched);
-    assert_eq!(untouched, not_truncated, "a false flag is not a prune");
-
-    let mut raw = json!("not-an-object");
-    mark_pruned_tool_body(&mut raw);
-    assert_eq!(raw, json!("not-an-object"));
+    let mut raw = json!("not-an-array");
+    mark_pruned_tool_bodies(&mut raw, &pruned);
+    assert_eq!(raw, json!("not-an-array"));
 }
 
 /// `agent_last_message_event_payload` (PROTOCOL §6.5): the id-only echo
