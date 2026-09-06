@@ -324,7 +324,7 @@ async fn workspace_round_trip_and_archive_filter() {
 }
 
 #[tokio::test]
-async fn workspace_setup_result_round_trips_insert_update_and_select() {
+async fn workspace_setup_result_round_trips_insert_dedicated_update_and_select() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let id = WorkspaceId::new();
@@ -347,7 +347,10 @@ async fn workspace_setup_result_round_trips_insert_update_and_select() {
         finished_at: Some("2026-09-04T20:01:00Z".to_string()),
         error: Some("setup failed".to_string()),
     });
-    store.update_workspace(&workspace).await.expect("update");
+    store
+        .update_workspace_setup_result(&id, workspace.setup_result.as_ref().unwrap())
+        .await
+        .expect("update setup result");
     let selected = store
         .list_workspaces(false)
         .await
@@ -356,6 +359,34 @@ async fn workspace_setup_result_round_trips_insert_update_and_select() {
         .find(|candidate| candidate.id == id)
         .expect("workspace in list");
     assert_eq!(selected.setup_result, workspace.setup_result);
+}
+
+#[tokio::test]
+async fn workspace_full_row_update_preserves_concurrent_setup_result() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let id = WorkspaceId::new();
+    let stale = sample_workspace(&id, "Setup result", false);
+    store.insert_workspace(&stale).await.expect("insert");
+    let running = SetupResult {
+        state: SetupResultState::Running,
+        started_at: Some("2026-09-04T20:00:00Z".to_string()),
+        ..SetupResult::default()
+    };
+    store
+        .update_workspace_setup_result(&id, &running)
+        .await
+        .expect("mark setup running");
+
+    assert!(stale.setup_result.is_none());
+    store
+        .update_workspace(&stale)
+        .await
+        .expect("update stale workspace row");
+    assert_eq!(
+        store.get_workspace(&id).await.unwrap().setup_result,
+        Some(running)
+    );
 }
 
 /// `unarchive_workspace_if_archived` is a single atomic flip: the archived

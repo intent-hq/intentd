@@ -275,9 +275,9 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace (full row replace, except `id` and the
-    /// guarded `last_activity`, see below), or `NotFound`. `activity` is
-    /// derived and never persisted (§9.9).
+    /// Update an existing workspace (full row replace, except `id`,
+    /// `setup_result`, and the guarded `last_activity`, see below), or
+    /// `NotFound`. `activity` is derived and never persisted (§9.9).
     ///
     /// `last_activity` is the one exception to the full-row replace
     /// (monorepo#1585): it goes through the same monotonic guard as
@@ -301,7 +301,7 @@ impl Store {
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, setup_result=?, checkout_mode=? WHERE id=?",
+             token_usage=?, setup_script=?, checkout_mode=? WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -336,7 +336,6 @@ impl Store {
         .bind(&ws.last_activity)
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
-        .bind(setup_result_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
         .bind(&ws.id.0)
         .execute(self.write_pool())
