@@ -1755,12 +1755,19 @@ mod session_tests {
         // §7.1 registry: a non-workspace_api tool completing while a batch is
         // pending must not claim it, even when its arguments are shaped
         // `{ code, summary }`. Codex `server`/`tool` metadata and namespaced
-        // titles are authoritative over the input-shape rule.
+        // titles are authoritative over the input-shape rule — in the mapper
+        // AND in the registry's input-shape claim gate, which sees the
+        // recorded input with the transcript writer's `_acpTitle` echo.
         use intent_core::turn_attachments::{
             AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
         };
         use intent_core::AgentId;
 
+        let recorded_input = |tc: &session::MappedToolCall| {
+            let mut input = tc.input.clone();
+            input["_acpTitle"] = json!(tc.title);
+            input
+        };
         let reg = TurnAttachmentRegistry::new();
         let agent = AgentId::from_string("agent-4491");
         let pending = || TurnAttachment {
@@ -1795,15 +1802,16 @@ mod session_tests {
                 panic!("expected tool call");
             };
             assert_eq!(tc.tool_name, "python_execute", "title={title}");
+            let input = recorded_input(&tc);
             reg.register(&agent, pending());
             assert!(
-                reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name)
+                reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name, Some(&input))
                     .is_empty(),
                 "foreign tool {title} must not claim the pending batch"
             );
             // The batch is still there for the daemon's own tool.
             assert_eq!(
-                reg.claim_at_tool_result(&agent, Some(&garbled), "workspace_api")
+                reg.claim_at_tool_result(&agent, Some(&garbled), "workspace_api", None)
                     .len(),
                 1,
                 "title={title}"
@@ -1825,9 +1833,18 @@ mod session_tests {
             panic!("expected tool call");
         };
         assert_eq!(tc.tool_name, "workspace_api");
+        let input = recorded_input(&tc);
         reg.register(&agent, pending());
         assert_eq!(
-            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name)
+            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name, Some(&input))
+                .len(),
+            1
+        );
+        // Second line of defense: were the name ever recorded as the prose
+        // title again, the same recorded input still opens the claim gate.
+        reg.register(&agent, pending());
+        assert_eq!(
+            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.title, Some(&input))
                 .len(),
             1
         );

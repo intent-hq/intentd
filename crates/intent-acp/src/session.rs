@@ -619,7 +619,9 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///     happen to be `{ code, summary }` keeps its own name.
 ///  3. A `raw_input` carrying the daemon's own `workspace_api` schema — an
 ///     object holding exactly a non-empty string `code` plus a string
-///     `summary` (an `_acpTitle` echo is tolerated) — is `workspace_api`
+///     `summary` (an `_acpTitle` echo is tolerated;
+///     [`intent_core::is_workspace_api_input`], shared with the §7.1
+///     registry's claim gate) — is `workspace_api`
 ///     regardless of the title. Auggie titles an MCP call with the
 ///     model-authored `summary` (plain prose, no `name`, `kind: other`), so
 ///     the input shape is the only identifier; it is checked before the
@@ -685,7 +687,7 @@ fn derive_tool_name_inner(
     if let Some(rewritten) = split_claude_mcp_title(title) {
         return strip_workspace_mcp_affix(&rewritten);
     }
-    if infer_workspace_api && raw_input.is_some_and(is_workspace_api_input) {
+    if infer_workspace_api && raw_input.is_some_and(intent_core::is_workspace_api_input) {
         return "workspace_api".to_string();
     }
     if let Some(name) = split_name_prefix(title) {
@@ -797,23 +799,6 @@ fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
         return Some("web-fetch".to_string());
     }
     None
-}
-
-/// The `workspace_api` MCP tool's input schema: a string `code` (the JS to
-/// run) plus a string `summary` (the model-authored one-line description),
-/// and nothing else. Both keys are required by the schema and no daemon tool
-/// carries that pair, so the exact shape identifies the tool on its own; any
-/// extra key (other than a daemon-stamped `_acpTitle` echo) means some other
-/// tool's arguments and disqualifies the match.
-fn is_workspace_api_input(input: &Value) -> bool {
-    let Some(obj) = input.as_object() else {
-        return false;
-    };
-    is_non_empty_string(obj.get("code"))
-        && obj.get("summary").is_some_and(Value::is_string)
-        && obj
-            .keys()
-            .all(|k| matches!(k.as_str(), "code" | "summary" | "_acpTitle"))
 }
 
 /// JS-truthy on a `path`-style field: present, a string, and non-empty.

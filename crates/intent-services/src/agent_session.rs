@@ -666,6 +666,16 @@ impl Transcript {
         self.blocks[i].get("name").and_then(Value::as_str)
     }
 
+    /// The recorded tool input for a known `toolCallId` (from its `tool_use`
+    /// block), or `None` when the id was never seen. Like the name, the input
+    /// usually arrives only on the first `tool_call` — the completion-side
+    /// registry claim's input-shape gate (intent-hq/intent#4491) resolves it
+    /// here.
+    fn tool_input_for(&self, tool_call_id: &str) -> Option<&Value> {
+        let &i = self.tool_use_index.get(tool_call_id)?;
+        self.blocks[i].get("input")
+    }
+
     fn into_blocks(mut self) -> Vec<Value> {
         self.flush_text();
         self.blocks
@@ -4713,16 +4723,21 @@ impl Services {
                 // the echoed output, `workspace_api` FIFO fallback). A hit
                 // yields the canonical resource items to attach — no echo
                 // parsing; a miss falls back to the legacy lift inside
-                // `record_tool`. `tool_call_update`s are name-less, so the
-                // FIFO gate resolves the name recorded at first sight.
+                // `record_tool`. `tool_call_update`s are name-less (and
+                // usually input-less), so the FIFO gates resolve the name
+                // and input recorded at first sight.
                 let known = transcript.tool_name_for(&tc.tool_call_id).is_some();
                 let registered: Vec<Value> = if tc.status == "completed" {
                     let name = transcript
                         .tool_name_for(&tc.tool_call_id)
                         .unwrap_or(&tc.tool_name)
                         .to_string();
+                    let input = transcript
+                        .tool_input_for(&tc.tool_call_id)
+                        .filter(|v| !v.is_null())
+                        .unwrap_or(&tc.input);
                     self.turn_attachments
-                        .claim_at_tool_result(agent_id, tc.output.as_ref(), &name)
+                        .claim_at_tool_result(agent_id, tc.output.as_ref(), &name, Some(input))
                         .iter()
                         .map(intent_core::TurnAttachment::resource_item)
                         .collect()
