@@ -49,6 +49,7 @@ impl ClassifyPath {
     }
 }
 
+#[must_use]
 pub fn classify(manifest: &Manifest, rel_path: &str) -> Assignment {
     let normalized = normalize_path(rel_path);
     let path = Path::new(&normalized);
@@ -60,13 +61,13 @@ pub fn classify(manifest: &Manifest, rel_path: &str) -> Assignment {
             if builder.add_line(None, pattern).is_err() {
                 continue;
             }
-            let Ok(matcher) = builder.build() else {
+            let Ok(gitignore) = builder.build() else {
                 continue;
             };
-            let matched = matcher.matched_path_or_any_parents(path, false);
-            if matched.is_ignore() {
+            let pattern_match = gitignore.matched_path_or_any_parents(path, false);
+            if pattern_match.is_ignore() {
                 assigned = Some(&region.id);
-            } else if matched.is_whitelist() && assigned == Some(region.id.as_str()) {
+            } else if pattern_match.is_whitelist() && assigned == Some(region.id.as_str()) {
                 assigned = None;
             }
         }

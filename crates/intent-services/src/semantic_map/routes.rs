@@ -36,6 +36,7 @@ pub struct RouteTransition {
     pub label: Option<String>,
 }
 
+#[must_use]
 pub fn derive_route(
     manifest: &Manifest,
     activities: &[MapActivity],
@@ -114,10 +115,10 @@ fn matches_filter(activity: &MapActivity, filter: &RouteFilter) -> bool {
     {
         return false;
     }
-    !filter
+    filter
         .until
         .as_deref()
-        .is_some_and(|until| activity.ts.as_str() > until)
+        .is_none_or(|until| activity.ts.as_str() <= until)
 }
 
 fn add_evidence(transition: &mut RouteTransition, path: Option<&str>) {

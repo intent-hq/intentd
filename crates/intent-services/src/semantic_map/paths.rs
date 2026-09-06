@@ -76,6 +76,11 @@ fn cache() -> &'static Mutex<HashMap<WorkspaceId, WorkspacePaths>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Loads the registered git-root prefixes used to normalize workspace paths.
+///
+/// # Errors
+///
+/// Returns an error when the workspace or its registered git roots cannot be loaded.
 pub async fn workspace_paths(
     store: &Store,
     workspace_id: &WorkspaceId,

@@ -36,10 +36,12 @@ pub struct MapActivity {
     pub ts: String,
 }
 
+#[must_use]
 pub fn project(manifest: &Manifest, event: &Event) -> Option<MapActivity> {
     project_with_paths(manifest, &WorkspacePaths::default(), event)
 }
 
+#[must_use]
 pub fn project_with_paths(
     manifest: &Manifest,
     workspace_paths: &WorkspacePaths,
@@ -88,17 +90,16 @@ pub fn project_with_paths(
                 )
             });
             let is_read = path.is_some() && is_read_tool(tool_name, tool_kind);
-            let region_id = is_read.then(|| {
-                classifier
-                    .classify(path.as_deref().expect("checked above"))
-                    .region_id
-            });
+            let region_id = path
+                .as_deref()
+                .filter(|_| is_read)
+                .map(|path| classifier.classify(path).region_id);
             let (agent_id, agent_name) = agent_identity(event);
             Some(MapActivity {
                 region_id,
                 agent_id,
                 agent_name,
-                path: is_read.then_some(path).flatten(),
+                path: path.filter(|_| is_read),
                 kind: if is_read {
                     MapActivityKind::Read
                 } else {
@@ -132,12 +133,11 @@ fn file_kind(event: &Event) -> Option<MapActivityKind> {
         Some("create" | "created") => Some(MapActivityKind::Create),
         Some("delete" | "deleted") => Some(MapActivityKind::Delete),
         Some("rename" | "renamed" | "move" | "moved") => Some(MapActivityKind::Move),
-        Some(_) => None,
         None if event.event_type == FILE_CHANGED => Some(MapActivityKind::Edit),
         None if event.event_type == FILE_CREATED => Some(MapActivityKind::Create),
         None if event.event_type == FILE_DELETED => Some(MapActivityKind::Delete),
         None if event.event_type == "file:renamed" => Some(MapActivityKind::Move),
-        None => None,
+        Some(_) | None => None,
     }
 }
 

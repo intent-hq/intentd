@@ -74,6 +74,11 @@ impl fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
+/// Parses and validates a semantic-map manifest.
+///
+/// # Errors
+///
+/// Returns an error when the document is not valid JSON or violates the manifest schema.
 pub fn parse_manifest(content: &str) -> Result<Manifest, ManifestError> {
     let json = fenced_json(content)?;
     let value: Value = serde_json::from_str(json)
@@ -213,6 +218,11 @@ pub struct ManifestLoader {
 }
 
 impl ManifestLoader {
+    /// Loads the workspace manifest from notes, reusing a cached valid manifest when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when notes cannot be loaded or the manifest note is invalid.
     pub async fn load(
         &self,
         store: &Store,
@@ -232,6 +242,11 @@ impl ManifestLoader {
             .map_err(ManifestLoadError::Parse)
     }
 
+    /// Finds, validates, and caches the manifest in a collection of notes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest note is invalid.
     pub fn load_from_notes(
         &self,
         workspace_id: &WorkspaceId,
@@ -369,11 +384,11 @@ mod tests {
         let workspace_id = WorkspaceId::from("ws-1");
         let older = note("older", "2026-01-01T00:00:00Z", "Older");
         let newer = note("newer", "2026-02-01T00:00:00Z", "Newer");
-        let loaded = loader
+        let initial_manifest = loader
             .load_from_notes(&workspace_id, &[newer.clone(), older])
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.regions[0].label, "Newer");
+        assert_eq!(initial_manifest.regions[0].label, "Newer");
 
         let event = Event {
             id: "event-1".into(),
@@ -393,10 +408,10 @@ mod tests {
         assert!(loader.invalidate_on_event(&event));
 
         let replacement = note("replacement", "2026-04-01T00:00:00Z", "Replacement");
-        let loaded = loader
+        let replacement_manifest = loader
             .load_from_notes(&workspace_id, &[newer, replacement])
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.regions[0].label, "Replacement");
+        assert_eq!(replacement_manifest.regions[0].label, "Replacement");
     }
 }
